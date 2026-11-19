@@ -703,9 +703,13 @@ async fn test_e2e_magpie_groups_masking_import_and_builtin_v1_gateway_protocols(
     .await;
     assert_eq!(st_grp, StatusCode::OK, "upsert group: {grp_val}");
 
-    // 4. Gateway /api/v1/magpie/v1/models lists `group/fast-pool`
-    let (st_mods, mods_val) =
+    // 4. Gateway /api/v1/magpie/v1/models requires auth and lists `group/fast-pool` for this user
+    let (st_unauth, _) =
         http_json(&router, "GET", "/api/v1/magpie/v1/models", None, None).await;
+    assert_eq!(st_unauth, StatusCode::UNAUTHORIZED);
+
+    let (st_mods, mods_val) =
+        http_json(&router, "GET", "/api/v1/magpie/v1/models", Some(&tok), None).await;
     assert_eq!(st_mods, StatusCode::OK);
     assert!(mods_val["data"]
         .as_array()
@@ -716,7 +720,7 @@ async fn test_e2e_magpie_groups_masking_import_and_builtin_v1_gateway_protocols(
         &router,
         "POST",
         "/api/v1/magpie/v1/chat/completions",
-        None,
+        Some(&tok),
         Some(json!({
             "model": "group/fast-pool",
             "messages": [{ "role": "user", "content": "Echo TOPSECRET_TOKEN and sk-livekey1234567890" }]
@@ -745,7 +749,7 @@ async fn test_e2e_magpie_groups_masking_import_and_builtin_v1_gateway_protocols(
         &router,
         "POST",
         "/api/v1/magpie/v1/responses",
-        None,
+        Some(&tok),
         Some(json!({ "model": "deepseek-chat", "input": "Responses check" })),
     )
     .await;
@@ -759,7 +763,7 @@ async fn test_e2e_magpie_groups_masking_import_and_builtin_v1_gateway_protocols(
         &router,
         "POST",
         "/api/v1/magpie/v1/messages",
-        None,
+        Some(&tok),
         Some(json!({
             "model": "deepseek-chat",
             "max_tokens": 64,
@@ -777,7 +781,7 @@ async fn test_e2e_magpie_groups_masking_import_and_builtin_v1_gateway_protocols(
         &router,
         "POST",
         "/api/v1/magpie/v1/chat/completions",
-        None,
+        Some(&tok),
         Some(json!({
             "model": "deepseek-chat",
             "stream": true,
@@ -976,7 +980,7 @@ async fn test_e2e_hermes_client_magpie_roundtrip_over_http() {
 async fn test_e2e_magpie_subscriptions_list_and_activate_endpoints() {
     let _env_read = ENV_RWLOCK.read().await;
     let (_dir, state, router) = boot_test_server();
-    let (_uid, tok) = register_user(&router, "magpie_sub_user").await;
+    let (uid, tok) = register_user(&router, "magpie_sub_user").await;
 
     // 1. Setup mock home with Google Vertex ADC and Codex credentials
     let temp_home = tempfile::tempdir().unwrap();
@@ -1009,9 +1013,13 @@ async fn test_e2e_magpie_subscriptions_list_and_activate_endpoints() {
     });
     std::fs::write(codex_dir.join("auth.json"), codex_auth.to_string()).unwrap();
 
-    // Discover in router
-    state.hermes.providers().refresh_discovered_subscriptions_in_home(home, Some(&codex_dir));
-    state.hermes.persist_providers_state();
+    // Discover in user's isolated router
+    let uid_str = uid.to_string();
+    state
+        .hermes
+        .providers_for_user(&uid_str)
+        .refresh_discovered_subscriptions_in_home(home, Some(&codex_dir));
+    state.hermes.persist_user_providers_state(&uid_str);
 
     // 2. GET /api/v1/hermes/magpie/subscriptions
     let (st_get, get_val) = http_json(
@@ -1291,7 +1299,7 @@ async fn test_e2e_magpie_subscription_selection_persists_across_restart_with_mul
 async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_redacts_secrets() {
     let _env_read = ENV_RWLOCK.read().await;
     let (_tmp, state, router) = boot_test_server();
-    let (_uid, tok) = register_user(&router, "plan_c_sync_user").await;
+    let (uid, tok) = register_user(&router, "plan_c_sync_user").await;
 
     // Simulate a desktop machine with Vertex AI ADC + Codex auth + Magpie proxy config.toml
     // running on a DIFFERENT host than the server (server itself has zero local credentials).
@@ -1374,21 +1382,29 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
     assert!(!sync_text.contains("codex-refresh-secret-999"));
     assert!(!sync_text.contains(mock_jwt));
 
-    // Verify Vertex AI was auto-activated and its in-memory VertexTokenManager is ready without disk
+    // Verify Vertex AI was auto-activated strictly in this user's router (NOT global router)
     let active_provider = sync_val["state"]["active_provider"]
         .as_str()
         .expect("active_provider");
     assert_eq!(active_provider, "google_vertex:desktop-user@vertex.example");
-    let snap = state.hermes.providers().snapshot();
+    assert!(
+        !state
+            .hermes
+            .providers()
+            .snapshot()
+            .providers
+            .contains_key(active_provider),
+        "user-synced credentials must NEVER leak into the global shared ProviderRouter"
+    );
+    let user_provs = state.hermes.providers_for_user(&uid.to_string());
+    let snap = user_provs.snapshot();
     let v_cfg = snap
         .providers
         .get(active_provider)
         .expect("synced vertex provider config");
     assert!(!v_cfg.headers.contains_key("x-adc-source-path"));
     assert!(
-        state
-            .hermes
-            .providers()
+        user_provs
             .get_or_create_vertex_manager(active_provider, v_cfg)
             .is_some(),
         "in-memory VertexTokenManager must be registered and retained without local ADC disk path"
@@ -1400,9 +1416,7 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
     assert_eq!(c_cfg.base_url, "https://chatgpt.com/backend-api/codex");
     assert!(!c_cfg.headers.contains_key("x-codex-source-path"));
     assert!(
-        state
-            .hermes
-            .providers()
+        user_provs
             .get_or_create_codex_manager(codex_id, c_cfg)
             .is_some(),
         "in-memory CodexTokenManager must be registered without local auth.json disk path"
@@ -1420,4 +1434,282 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
     assert_eq!(st_act, StatusCode::OK, "activate synced codex: {act_val}");
     assert_eq!(act_val["active_provider_id"].as_str(), Some(codex_id));
     assert_eq!(act_val["active_model"].as_str(), Some("gpt-4o"));
+}
+
+#[tokio::test]
+async fn test_e2e_per_user_provider_isolation_encrypted_restart_and_cross_device_reuse() {
+    let _env_read = ENV_RWLOCK.read().await;
+    let dir = tempfile::Builder::new()
+        .prefix("magpie_multitenant_")
+        .tempdir_in(std::env::temp_dir())
+        .expect("create tempdir");
+    let empty_home = tempfile::Builder::new()
+        .prefix("magpie_empty_home_")
+        .tempdir_in(std::env::temp_dir())
+        .expect("create empty home");
+    let (openai_base, _anthropic_base, _mock_state) = spawn_mock_upstreams().await;
+
+    // Boot 1: User Alice syncs Vertex ADC + adds custom provider + routing group + masking
+    let alice_uid: u64;
+    let bob_uid: u64;
+    {
+        let (state, router) = boot_test_server_in(dir.path());
+        isolate_empty_providers(&state, empty_home.path());
+
+        let (uid_a, tok_a) = register_user(&router, "alice_tenant").await;
+        let (uid_b, tok_b) = register_user(&router, "bob_tenant").await;
+        alice_uid = uid_a;
+        bob_uid = uid_b;
+
+        // 1. Alice configures a real provider + routing group + masking
+        let (st_up, up_val) = http_json(
+            &router,
+            "POST",
+            "/api/v1/hermes/magpie/providers",
+            Some(&tok_a),
+            Some(json!({
+                "provider_id": "alice_mock_openai",
+                "name": "Alice Private OpenAI",
+                "api_mode": "chat_completions",
+                "base_url": openai_base,
+                "api_key": "sk-alice-private-key-99999",
+                "default_model": "alice-gpt-4o",
+                "activate": true,
+                "allow_local_fallback": false
+            })),
+        )
+        .await;
+        assert_eq!(st_up, StatusCode::OK, "alice upsert provider: {up_val}");
+
+        let (st_grp, _) = http_json(
+            &router,
+            "POST",
+            "/api/v1/hermes/magpie/groups",
+            Some(&tok_a),
+            Some(json!({
+                "routing_strategy": "smart",
+                "group": {
+                    "id": "alice-pool",
+                    "name": "Alice Pool",
+                    "strategy": "rotate",
+                    "members": [{ "target": "alice_mock_openai/alice-gpt-4o", "weight": 1, "enabled": true }]
+                }
+            })),
+        )
+        .await;
+        assert_eq!(st_grp, StatusCode::OK);
+
+        // 2. Alice can call /api/v1/hermes/turns and /api/v1/magpie/v1/chat/completions
+        let (st_turn_a, turn_a) = http_json(
+            &router,
+            "POST",
+            "/api/v1/hermes/turns",
+            Some(&tok_a),
+            Some(json!({ "prompt": "Hello from Alice" })),
+        )
+        .await;
+        assert_eq!(st_turn_a, StatusCode::OK, "alice turn: {turn_a}");
+        assert!(
+            turn_a["response"]
+                .as_str()
+                .unwrap_or("")
+                .contains("MOCK_OPENAI_REPLY"),
+            "unexpected alice turn response: {turn_a}"
+        );
+
+        let (st_gw_a, gw_a) = http_json(
+            &router,
+            "POST",
+            "/api/v1/magpie/v1/chat/completions",
+            Some(&tok_a),
+            Some(json!({
+                "model": "group/alice-pool",
+                "messages": [{ "role": "user", "content": "Gateway check for Alice" }]
+            })),
+        )
+        .await;
+        assert_eq!(st_gw_a, StatusCode::OK, "alice gateway: {gw_a}");
+
+        // 3. STRICT ISOLATION: Bob must see ZERO of Alice's providers/groups and CANNOT invoke them
+        let (st_bob_state, bob_state) = http_json(
+            &router,
+            "GET",
+            "/api/v1/hermes/magpie/state",
+            Some(&tok_b),
+            None,
+        )
+        .await;
+        assert_eq!(st_bob_state, StatusCode::OK);
+        assert_eq!(bob_state["needs_provider_selection"].as_bool(), Some(true));
+        let bob_providers = bob_state["providers"].as_array().expect("providers array");
+        assert!(
+            !bob_providers
+                .iter()
+                .any(|p| p["provider_id"].as_str() == Some("alice_mock_openai")),
+            "Bob must NEVER see Alice's private provider: {bob_state}"
+        );
+        assert!(
+            bob_state["routing_groups"]
+                .as_array()
+                .is_some_and(|g| g.is_empty()),
+            "Bob must NEVER see Alice's routing groups: {bob_state}"
+        );
+
+        let (st_bob_mods, bob_mods) =
+            http_json(&router, "GET", "/api/v1/magpie/v1/models", Some(&tok_b), None).await;
+        assert_eq!(st_bob_mods, StatusCode::OK);
+        assert!(
+            !bob_mods["data"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .any(|m| m["id"].as_str() == Some("group/alice-pool")
+                    || m["id"].as_str() == Some("alice-gpt-4o")),
+            "Bob must NEVER see Alice's models: {bob_mods}"
+        );
+
+        // Bob cannot invoke Alice's provider via /api/v1/hermes/turns
+        let (st_bob_turn, bob_turn) = http_json(
+            &router,
+            "POST",
+            "/api/v1/hermes/turns",
+            Some(&tok_b),
+            Some(json!({ "prompt": "Try to burn Alice's quota" })),
+        )
+        .await;
+        assert_eq!(
+            st_bob_turn,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bob must be blocked with 503 needs_provider_selection, got {st_bob_turn}: {bob_turn}"
+        );
+        assert_eq!(bob_turn["needs_provider_selection"].as_bool(), Some(true));
+
+        // Bob cannot invoke Alice's provider via /api/v1/magpie/v1/chat/completions
+        let (st_bob_gw, _) = http_json(
+            &router,
+            "POST",
+            "/api/v1/magpie/v1/chat/completions",
+            Some(&tok_b),
+            Some(json!({
+                "model": "alice-gpt-4o",
+                "messages": [{ "role": "user", "content": "Steal quota" }]
+            })),
+        )
+        .await;
+        assert_ne!(st_bob_gw, StatusCode::OK, "Bob must NEVER call Alice's provider via gateway");
+
+        // Bob cannot delete Alice's provider
+        let (st_bob_del, _) = http_json(
+            &router,
+            "DELETE",
+            "/api/v1/hermes/magpie/providers/alice_mock_openai",
+            Some(&tok_b),
+            None,
+        )
+        .await;
+        assert_eq!(st_bob_del, StatusCode::NOT_FOUND);
+
+        // Unauthenticated gateway request is rejected with 401
+        let (st_noauth, _) = http_json(
+            &router,
+            "POST",
+            "/api/v1/magpie/v1/chat/completions",
+            None,
+            Some(json!({
+                "model": "alice-gpt-4o",
+                "messages": [{ "role": "user", "content": "Unauth probe" }]
+            })),
+        )
+        .await;
+        assert_eq!(st_noauth, StatusCode::UNAUTHORIZED);
+
+        // Verify persisted vault entry in SQLite is encrypted (no plaintext API key!)
+        let raw_vault = state
+            .hermes
+            .store()
+            .kv_get("user_providers_state", &alice_uid.to_string())
+            .expect("kv_get")
+            .expect("alice vault stored");
+        assert!(raw_vault.starts_with("enc:v1:"));
+        assert!(!raw_vault.contains("sk-alice-private-key-99999"));
+    }
+
+    // Boot 2: Full server restart + Alice logs in on a SECOND DEVICE -> immediate provider reuse!
+    {
+        let (state2, router2) = boot_test_server_in(dir.path());
+        isolate_empty_providers(&state2, empty_home.path());
+
+        let (st_login_a, login_a) = http_json(
+            &router2,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            Some(json!({
+                "username": "alice_tenant",
+                "password": "StrongPassword#2026",
+                "device_name": "alice_windows_second_device"
+            })),
+        )
+        .await;
+        assert_eq!(st_login_a, StatusCode::OK, "alice second device login: {login_a}");
+        let tok_a_dev2 = login_a["token"].as_str().expect("alice dev2 token").to_string();
+
+        let (st_login_b, login_b) = http_json(
+            &router2,
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            Some(json!({
+                "username": "bob_tenant",
+                "password": "StrongPassword#2026",
+                "device_name": "bob_device"
+            })),
+        )
+        .await;
+        assert_eq!(st_login_b, StatusCode::OK, "bob login: {login_b}");
+        let tok_b2 = login_b["token"].as_str().expect("bob token").to_string();
+
+        // Alice on device 2 immediately sees & uses her previously configured provider!
+        let (st_state_a2, state_a2) = http_json(
+            &router2,
+            "GET",
+            "/api/v1/hermes/magpie/state",
+            Some(&tok_a_dev2),
+            None,
+        )
+        .await;
+        assert_eq!(st_state_a2, StatusCode::OK);
+        assert_eq!(state_a2["active_provider"].as_str(), Some("alice_mock_openai"));
+        assert_eq!(state_a2["active_model"].as_str(), Some("alice-gpt-4o"));
+
+        let (st_turn_a2, turn_a2) = http_json(
+            &router2,
+            "POST",
+            "/api/v1/hermes/turns",
+            Some(&tok_a_dev2),
+            Some(json!({ "prompt": "Hello from Alice's Windows laptop" })),
+        )
+        .await;
+        assert_eq!(st_turn_a2, StatusCode::OK, "alice dev2 turn: {turn_a2}");
+        assert!(
+            turn_a2["response"]
+                .as_str()
+                .unwrap_or("")
+                .contains("MOCK_OPENAI_REPLY"),
+            "unexpected alice dev2 turn response: {turn_a2}"
+        );
+
+        // Bob STILL cannot see or use Alice's provider after restart
+        let (st_bob_state2, bob_state2) = http_json(
+            &router2,
+            "GET",
+            "/api/v1/hermes/magpie/state",
+            Some(&tok_b2),
+            None,
+        )
+        .await;
+        assert_eq!(st_bob_state2, StatusCode::OK);
+        assert_eq!(bob_state2["needs_provider_selection"].as_bool(), Some(true));
+        assert!(bob_uid != alice_uid);
+    }
 }

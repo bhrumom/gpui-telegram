@@ -16,7 +16,7 @@ use gpui_telegram_agent::hermes::providers::{
     ProviderRequest, ProviderResponse, ProviderRouter, ProviderRouterState, ProviderStreamEvent,
     ProviderToolCall, ProviderToolSpec, SubscriptionAccount, SubscriptionKind,
 };
-use gpui_telegram_core::types::ChatId;
+use gpui_telegram_core::types::{ChatId, UserId};
 use magpie_gateway::{
     all_presets, inbound_anthropic_to_unified, inbound_chat_completions_to_unified,
     inbound_responses_to_unified, parse_dotenv_providers, parse_magpie_import_link,
@@ -110,8 +110,17 @@ fn provider_to_magpie_view(cfg: &ProviderConfig, snap: &ProviderRouterState) -> 
     }
 }
 
-fn build_magpie_state_json(state: &AppState) -> Value {
-    let router = state.hermes.providers();
+fn is_loopback_bind_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    matches!(h.as_str(), "127.0.0.1" | "localhost" | "::1")
+}
+
+fn user_router(state: &AppState, user_id: UserId) -> ProviderRouter {
+    state.hermes.providers_for_user(&user_id.0.to_string())
+}
+
+fn build_magpie_state_json_for_user(state: &AppState, user_id: UserId) -> Value {
+    let router = user_router(state, user_id);
     let snap = router.snapshot();
     let mut provider_list: Vec<&ProviderConfig> = snap.providers.values().collect();
     provider_list.sort_by(|a, b| a.id.cmp(&b.id));
@@ -142,20 +151,26 @@ fn build_magpie_state_json(state: &AppState) -> Value {
         "routing_strategy": snap.routing_strategy,
         "masking": snap.masking,
         "recent_route_traces": snap.recent_route_traces,
+        "user_scoped": true,
     })
 }
 
-fn persist_and_sync_all(state: &AppState) {
-    state.hermes.persist_providers_state();
-    state.fabushi_bots.sync_all_providers();
+fn persist_user_router(state: &AppState, user_id: UserId) {
+    state
+        .hermes
+        .persist_user_providers_state(&user_id.0.to_string());
 }
 
 /// GET /api/v1/hermes/magpie/state
 pub async fn magpie_state_get(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    (StatusCode::OK, Json(build_magpie_state_json(&state))).into_response()
+    (
+        StatusCode::OK,
+        Json(build_magpie_state_json_for_user(&state, auth.user_id)),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,10 +328,11 @@ fn apply_custom_or_existing_provider(
 
 async fn upsert_provider_impl(
     state: Arc<AppState>,
+    user_id: UserId,
     req: MagpieUpsertProviderRequest,
     path_id_override: Option<String>,
 ) -> Response {
-    let router = state.hermes.providers();
+    let router = user_router(&state, user_id);
     let preset_id_clean = req
         .preset_id
         .as_deref()
@@ -370,7 +386,7 @@ async fn upsert_provider_impl(
             }
         }
     } else {
-        match apply_custom_or_existing_provider(router, &req, path_id_override.as_deref()) {
+        match apply_custom_or_existing_provider(&router, &req, path_id_override.as_deref()) {
             Ok(cfg) => cfg,
             Err(resp) => return resp,
         }
@@ -380,7 +396,7 @@ async fn upsert_provider_impl(
         router.set_allow_local_fallback(allow_local);
     }
 
-    persist_and_sync_all(&state);
+    persist_user_router(&state, user_id);
     let snap = router.snapshot();
     let view = provider_to_magpie_view(&saved_cfg, &snap);
     (
@@ -388,7 +404,7 @@ async fn upsert_provider_impl(
         Json(json!({
             "ok": true,
             "provider": view,
-            "state": build_magpie_state_json(&state),
+            "state": build_magpie_state_json_for_user(&state, user_id),
         })),
     )
         .into_response()
@@ -396,19 +412,19 @@ async fn upsert_provider_impl(
 
 /// POST / PUT /api/v1/hermes/magpie/providers
 pub async fn magpie_providers_upsert(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MagpieUpsertProviderRequest>,
 ) -> Response {
-    upsert_provider_impl(state, req, None).await
+    upsert_provider_impl(state, auth.user_id, req, None).await
 }
 
 /// GET /api/v1/hermes/magpie/providers
 pub async fn magpie_providers_list(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let snap = state.hermes.providers().snapshot();
+    let snap = user_router(&state, auth.user_id).snapshot();
     let mut list: Vec<&ProviderConfig> = snap.providers.values().collect();
     list.sort_by(|a, b| a.id.cmp(&b.id));
     let providers: Vec<MagpieProviderView> = list
@@ -428,11 +444,11 @@ pub async fn magpie_providers_list(
 
 /// GET /api/v1/hermes/magpie/providers/{id}
 pub async fn magpie_provider_get(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let snap = state.hermes.providers().snapshot();
+    let snap = user_router(&state, auth.user_id).snapshot();
     let Some(cfg) = snap.providers.get(id.trim()) else {
         return err_resp(StatusCode::NOT_FOUND, "provider_not_found", "Provider not found");
     };
@@ -440,7 +456,7 @@ pub async fn magpie_provider_get(
         StatusCode::OK,
         Json(json!({
             "provider": provider_to_magpie_view(cfg, &snap),
-            "state": build_magpie_state_json(&state),
+            "state": build_magpie_state_json_for_user(&state, auth.user_id),
         })),
     )
         .into_response()
@@ -448,17 +464,17 @@ pub async fn magpie_provider_get(
 
 /// PUT / PATCH /api/v1/hermes/magpie/providers/{id}
 pub async fn magpie_provider_update(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<MagpieUpsertProviderRequest>,
 ) -> Response {
-    upsert_provider_impl(state, req, Some(id)).await
+    upsert_provider_impl(state, auth.user_id, req, Some(id)).await
 }
 
 /// DELETE /api/v1/hermes/magpie/providers/{id}
 pub async fn magpie_provider_delete(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
@@ -470,7 +486,7 @@ pub async fn magpie_provider_delete(
             "Cannot remove built-in local_hermes fallback provider",
         );
     }
-    let router = state.hermes.providers();
+    let router = user_router(&state, auth.user_id);
     if !router.remove_provider(&clean_id) {
         return err_resp(
             StatusCode::NOT_FOUND,
@@ -498,13 +514,13 @@ pub async fn magpie_provider_delete(
         }
     }
 
-    persist_and_sync_all(&state);
+    persist_user_router(&state, auth.user_id);
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "deleted_id": clean_id,
-            "state": build_magpie_state_json(&state),
+            "state": build_magpie_state_json_for_user(&state, auth.user_id),
         })),
     )
         .into_response()
@@ -520,13 +536,14 @@ pub struct MagpieProbeRequest {
 
 /// POST /api/v1/hermes/magpie/providers/{id}/probe
 pub async fn magpie_provider_probe(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Option<Json<MagpieProbeRequest>>,
 ) -> Response {
     let clean_id = id.trim();
-    let snap = state.hermes.providers().snapshot();
+    let u_router = user_router(&state, auth.user_id);
+    let snap = u_router.snapshot();
     let Some(cfg) = snap.providers.get(clean_id).cloned() else {
         return err_resp(
             StatusCode::NOT_FOUND,
@@ -567,6 +584,7 @@ pub async fn magpie_provider_probe(
     }
 
     let tmp_router = ProviderRouter::new();
+    tmp_router.sync_from_router(&u_router);
     tmp_router.set_allow_local_fallback(false);
     tmp_router.register_provider(ProviderConfig {
         enabled: true,
@@ -629,23 +647,37 @@ pub async fn magpie_provider_probe(
 
 /// POST /api/v1/hermes/magpie/subscriptions/scan
 pub async fn magpie_subscriptions_scan(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let router = state.hermes.providers();
-    let reg = router.refresh_local_subscriptions();
-    persist_and_sync_all(&state);
-    let subscriptions: Vec<SubscriptionAccount> = reg
-        .accounts
-        .iter()
-        .map(sanitize_subscription_account)
-        .collect();
+    let router = user_router(&state, auth.user_id);
+    // Only scan host-local OS credential paths when running on a local loopback server.
+    // On multi-tenant remote cloud servers (`0.0.0.0`), subscriptions come strictly from each
+    // user's client-side `POST /subscriptions/sync` so server OS credentials can never leak.
+    let (subscriptions, scanned_at_ms) = if is_loopback_bind_host(&state.config.host) {
+        let reg = router.refresh_local_subscriptions();
+        persist_user_router(&state, auth.user_id);
+        let subs: Vec<SubscriptionAccount> = reg
+            .accounts
+            .iter()
+            .map(sanitize_subscription_account)
+            .collect();
+        (subs, reg.scanned_at_ms)
+    } else {
+        let snap = router.snapshot();
+        let subs: Vec<SubscriptionAccount> = snap
+            .subscriptions
+            .iter()
+            .map(sanitize_subscription_account)
+            .collect();
+        (subs, Utc::now().timestamp_millis())
+    };
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "subscriptions": subscriptions,
-            "scanned_at_ms": reg.scanned_at_ms,
+            "scanned_at_ms": scanned_at_ms,
             "has_active_subscription": router.has_active_subscription(),
             "needs_provider_selection": router.needs_provider_selection(),
         })),
@@ -662,18 +694,18 @@ pub struct MagpieSubscriptionsSyncRequest {
 }
 
 /// POST /api/v1/hermes/magpie/subscriptions/sync
-/// Accepts client-discovered local AI subscriptions (Vertex AI ADC, Magpie logins, Codex, Claude,
-/// Gemini, etc.), registers their in-memory token managers & provider configs, optionally activates
-/// the best available subscription when no real provider is active yet, and returns sanitized state.
+/// Accepts client-discovered local AI subscriptions (Vertex AI ADC, Codex, Claude, Gemini, etc.),
+/// registers their in-memory token managers & provider configs strictly inside the authenticated
+/// user's isolated `ProviderRouter`, persists encrypted at rest, and returns sanitized state.
 pub async fn magpie_subscriptions_sync(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MagpieSubscriptionsSyncRequest>,
 ) -> Response {
     let synced_count = req.subscriptions.len();
-    let router = state.hermes.providers();
+    let router = user_router(&state, auth.user_id);
     let reg = router.ingest_client_subscriptions(req.subscriptions, req.auto_activate);
-    persist_and_sync_all(&state);
+    persist_user_router(&state, auth.user_id);
     let subscriptions: Vec<SubscriptionAccount> = reg
         .accounts
         .iter()
@@ -688,7 +720,7 @@ pub async fn magpie_subscriptions_sync(
             "scanned_at_ms": reg.scanned_at_ms,
             "has_active_subscription": router.has_active_subscription(),
             "needs_provider_selection": router.needs_provider_selection(),
-            "state": build_magpie_state_json(&state),
+            "state": build_magpie_state_json_for_user(&state, auth.user_id),
         })),
     )
         .into_response()
@@ -740,12 +772,12 @@ pub struct SubscriptionActivateRequest {
 
 /// GET /api/v1/hermes/magpie/subscriptions
 pub async fn magpie_subscriptions_get(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let router = state.hermes.providers();
+    let router = user_router(&state, auth.user_id);
     let snap = router.snapshot();
-    let subs = if snap.subscriptions.is_empty() {
+    let subs = if snap.subscriptions.is_empty() && is_loopback_bind_host(&state.config.host) {
         router.refresh_discovered_subscriptions().accounts
     } else {
         snap.subscriptions.clone()
@@ -808,7 +840,7 @@ static ACTIVATE_SYNC_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 
 /// POST /api/v1/hermes/magpie/subscriptions/{id}/activate
 pub async fn magpie_subscription_activate(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
@@ -829,11 +861,11 @@ pub async fn magpie_subscription_activate(
     };
 
     let _sync_guard = ACTIVATE_SYNC_LOCK.lock().await;
-    let router = state.hermes.providers();
+    let router = user_router(&state, auth.user_id);
     let res = router.activate_subscription_atomic(&id, req.model.as_deref());
     match res {
         Ok((cfg, active_model)) => {
-            persist_and_sync_all(&state);
+            persist_user_router(&state, auth.user_id);
             (
                 StatusCode::OK,
                 Json(json!({
@@ -854,10 +886,10 @@ pub async fn magpie_subscription_activate(
 
 /// GET /api/v1/hermes/magpie/groups
 pub async fn magpie_groups_get(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let snap = state.hermes.providers().snapshot();
+    let snap = user_router(&state, auth.user_id).snapshot();
     let mut groups: Vec<&RoutingGroup> = snap.routing_groups.values().collect();
     groups.sort_by(|a, b| a.id.cmp(&b.id));
     (
@@ -895,11 +927,11 @@ pub struct MagpieGroupsUpsertRequest {
 
 /// POST / PUT /api/v1/hermes/magpie/groups
 pub async fn magpie_groups_upsert(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MagpieGroupsUpsertRequest>,
 ) -> Response {
-    let router = state.hermes.providers();
+    let router = user_router(&state, auth.user_id);
 
     if let Some(raw_strategy) = req.routing_strategy.as_deref() {
         let Some(strategy) = RoutingStrategy::parse(raw_strategy) else {
@@ -945,7 +977,7 @@ pub async fn magpie_groups_upsert(
         );
     }
 
-    persist_and_sync_all(&state);
+    persist_user_router(&state, auth.user_id);
     let snap = router.snapshot();
     let mut groups: Vec<&RoutingGroup> = snap.routing_groups.values().collect();
     groups.sort_by(|a, b| a.id.cmp(&b.id));
@@ -955,7 +987,7 @@ pub async fn magpie_groups_upsert(
             "ok": true,
             "routing_groups": groups,
             "routing_strategy": snap.routing_strategy,
-            "state": build_magpie_state_json(&state),
+            "state": build_magpie_state_json_for_user(&state, auth.user_id),
         })),
     )
         .into_response()
@@ -968,27 +1000,27 @@ pub struct DeleteGroupQuery {
 
 /// DELETE /api/v1/hermes/magpie/groups/{id}
 pub async fn magpie_group_delete_path(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    delete_group_impl(&state, &id)
+    delete_group_impl(&state, auth.user_id, &id)
 }
 
 /// DELETE /api/v1/hermes/magpie/groups?id=...
 pub async fn magpie_groups_delete_query(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Query(q): Query<DeleteGroupQuery>,
 ) -> Response {
     let Some(id) = q.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return err_resp(StatusCode::BAD_REQUEST, "missing_group_id", "id query parameter required");
     };
-    delete_group_impl(&state, id)
+    delete_group_impl(&state, auth.user_id, id)
 }
 
-fn delete_group_impl(state: &AppState, id: &str) -> Response {
-    let router = state.hermes.providers();
+fn delete_group_impl(state: &AppState, user_id: UserId, id: &str) -> Response {
+    let router = user_router(state, user_id);
     if !router.delete_routing_group(id) {
         return err_resp(
             StatusCode::NOT_FOUND,
@@ -996,7 +1028,7 @@ fn delete_group_impl(state: &AppState, id: &str) -> Response {
             &format!("Routing group '{id}' not found"),
         );
     }
-    persist_and_sync_all(state);
+    persist_user_router(state, user_id);
     let snap = router.snapshot();
     let mut groups: Vec<&RoutingGroup> = snap.routing_groups.values().collect();
     groups.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1006,7 +1038,7 @@ fn delete_group_impl(state: &AppState, id: &str) -> Response {
             "ok": true,
             "routing_groups": groups,
             "routing_strategy": snap.routing_strategy,
-            "state": build_magpie_state_json(state),
+            "state": build_magpie_state_json_for_user(state, user_id),
         })),
     )
         .into_response()
@@ -1014,28 +1046,28 @@ fn delete_group_impl(state: &AppState, id: &str) -> Response {
 
 /// GET /api/v1/hermes/magpie/masking
 pub async fn magpie_masking_get(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let snap = state.hermes.providers().snapshot();
+    let snap = user_router(&state, auth.user_id).snapshot();
     (StatusCode::OK, Json(snap.masking)).into_response()
 }
 
 /// PUT / POST /api/v1/hermes/magpie/masking
 pub async fn magpie_masking_put(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<MaskingConfig>,
 ) -> Response {
-    let router = state.hermes.providers();
+    let router = user_router(&state, auth.user_id);
     router.set_masking_config(cfg.clone());
-    persist_and_sync_all(&state);
+    persist_user_router(&state, auth.user_id);
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "masking": cfg,
-            "state": build_magpie_state_json(&state),
+            "state": build_magpie_state_json_for_user(&state, auth.user_id),
         })),
     )
         .into_response()
@@ -1050,13 +1082,13 @@ pub struct MagpieMaskingPreviewRequest {
 
 /// POST /api/v1/hermes/magpie/masking/preview
 pub async fn magpie_masking_preview(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MagpieMaskingPreviewRequest>,
 ) -> Response {
     let cfg = req
         .config
-        .unwrap_or_else(|| state.hermes.providers().snapshot().masking);
+        .unwrap_or_else(|| user_router(&state, auth.user_id).snapshot().masking);
     let engine = MaskingEngine::new(cfg);
     let res = engine.preview_text(&req.text);
     (
@@ -1161,7 +1193,7 @@ fn register_imported_spec(
 
 /// POST /api/v1/hermes/magpie/import
 pub async fn magpie_import(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MagpieImportRequest>,
 ) -> Response {
@@ -1189,11 +1221,11 @@ pub async fn magpie_import(
         );
     }
 
-    let router = state.hermes.providers();
+    let router = user_router(&state, auth.user_id);
     let mut imported_ids = Vec::with_capacity(specs.len());
     for (idx, spec) in specs.iter().enumerate() {
         let should_activate = req.activate && idx == 0;
-        match register_imported_spec(router, spec, should_activate) {
+        match register_imported_spec(&router, spec, should_activate) {
             Ok(pid) => imported_ids.push(pid),
             Err(err) => {
                 return err_resp(StatusCode::BAD_REQUEST, "import_failed", &err.to_string());
@@ -1201,14 +1233,14 @@ pub async fn magpie_import(
         }
     }
 
-    persist_and_sync_all(&state);
+    persist_user_router(&state, auth.user_id);
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "imported_count": imported_ids.len(),
             "imported_provider_ids": imported_ids,
-            "state": build_magpie_state_json(&state),
+            "state": build_magpie_state_json_for_user(&state, auth.user_id),
         })),
     )
         .into_response()
@@ -1223,25 +1255,6 @@ enum GatewayResponseFormat {
     ChatCompletions,
     Responses,
     AnthropicMessages,
-}
-
-fn verify_optional_chat_scope(
-    headers: &HeaderMap,
-    state: &AppState,
-    payload: &Value,
-) -> Result<(), Response> {
-    let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) else {
-        return Ok(());
-    };
-    let Some(uid) = crate::routes::hermes::resolve_optional_bearer_user(headers, state) else {
-        return Err(err_resp(
-            StatusCode::UNAUTHORIZED,
-            "missing_token",
-            "Authenticated Bearer token is required when referencing chat_id",
-        ));
-    };
-    check_active_membership(state, ChatId(cid), uid)?;
-    Ok(())
 }
 
 fn unified_to_provider_request(req: UnifiedRequest) -> ProviderRequest {
@@ -1869,8 +1882,17 @@ async fn handle_gateway_completion(
     payload: Value,
     format: GatewayResponseFormat,
 ) -> Response {
-    if let Err(resp) = verify_optional_chat_scope(&headers, &state, &payload) {
-        return resp;
+    let Some(uid) = crate::routes::hermes::resolve_optional_bearer_user(&headers, &state) else {
+        return err_resp(
+            StatusCode::UNAUTHORIZED,
+            "missing_token",
+            "Authenticated Bearer token or x-api-key is required for AI gateway endpoints",
+        );
+    };
+    if let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) {
+        if let Err(resp) = check_active_membership(&state, ChatId(cid), uid) {
+            return resp;
+        }
     }
 
     let unified_res = match format {
@@ -1885,7 +1907,7 @@ async fn handle_gateway_completion(
         }
     };
 
-    let router = state.hermes.providers().clone();
+    let router = user_router(&state, uid);
     let stream_flag = unified.stream;
     let prov_req = unified_to_provider_request(unified);
 
@@ -1908,8 +1930,18 @@ async fn handle_gateway_completion(
 }
 
 /// GET /api/v1/magpie/v1/models
-pub async fn magpie_gateway_models(State(state): State<Arc<AppState>>) -> Response {
-    let snap = state.hermes.providers().snapshot();
+pub async fn magpie_gateway_models(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let Some(uid) = crate::routes::hermes::resolve_optional_bearer_user(&headers, &state) else {
+        return err_resp(
+            StatusCode::UNAUTHORIZED,
+            "missing_token",
+            "Authenticated Bearer token or x-api-key is required to list user models",
+        );
+    };
+    let snap = user_router(&state, uid).snapshot();
     let mut seen = HashSet::new();
     let mut data = Vec::new();
     let now = Utc::now().timestamp();

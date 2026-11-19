@@ -2812,7 +2812,11 @@ pub async fn handle_ai_bot_reply(
             base_system_prompt: bot_sp,
             bot_display_name,
             explicit_model: None,
-            bot_model: crate::routes::hermes::sanitize_model_override(state, bot_model),
+            bot_model: crate::routes::hermes::sanitize_model_override_for_user(
+                state,
+                Some(sender_id.0),
+                bot_model,
+            ),
             extra_context_sections,
             companion_apps: apps,
             help_bot_commands_suffix,
@@ -4682,7 +4686,11 @@ pub async fn miniapps_action(
                 Some(&bot.display_name),
                 copilot_persona,
                 None,
-                crate::routes::hermes::sanitize_model_override(&state, bot_model),
+                crate::routes::hermes::sanitize_model_override_for_user(
+                    &state,
+                    Some(auth.user_id.0),
+                    bot_model,
+                ),
                 &[],
                 true,
             );

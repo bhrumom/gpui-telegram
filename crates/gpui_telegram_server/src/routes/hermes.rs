@@ -905,13 +905,23 @@ pub(crate) fn sanitize_model_override_for_provider(
     })
 }
 
-pub(crate) fn sanitize_model_override(state: &AppState, raw: Option<String>) -> Option<String> {
-    let snap = state.hermes.providers().snapshot();
+pub(crate) fn sanitize_model_override_for_user(
+    state: &AppState,
+    user_id: Option<u64>,
+    raw: Option<String>,
+) -> Option<String> {
+    let uid_str = user_id.map(|u| u.to_string());
+    let snap = state.hermes.resolve_providers(uid_str.as_deref()).snapshot();
     let active_base_url = snap
         .providers
         .get(&snap.active_provider_id)
         .map(|p| p.base_url.as_str());
     sanitize_model_override_for_provider(raw, &snap.active_provider_id, active_base_url)
+}
+
+#[cfg(test)]
+pub(crate) fn sanitize_model_override(state: &AppState, raw: Option<String>) -> Option<String> {
+    sanitize_model_override_for_user(state, None, raw)
 }
 
 fn is_autonomous_policy_str(raw: &str) -> bool {
@@ -1009,7 +1019,7 @@ pub(crate) fn build_enriched_bot_turn_context(
         explicit_model,
         fallback_model,
     );
-    let effective_model = sanitize_model_override(state, raw_model);
+    let effective_model = sanitize_model_override_for_user(state, Some(user_id), raw_model);
 
     let now_ms = Utc::now().timestamp_millis();
     let profile = bot_id.and_then(|bid| {
@@ -1344,7 +1354,10 @@ pub(crate) fn format_live_bot_runtime_card_section(
     user_id: u64,
     bot_user_id: UserId,
 ) -> String {
-    let (active_provider, active_model, _) = state.hermes.providers().active_info();
+    let (active_provider, active_model, _) = state
+        .hermes
+        .providers_for_user(&user_id.to_string())
+        .active_info();
     let now_ms = Utc::now().timestamp_millis();
     let profile = state
         .db
@@ -1974,9 +1987,12 @@ pub(crate) async fn execute_bot_turn_streamed(
             }
             let mut err_consumer = StreamConsumerState::new();
             err_consumer.terminal_error = Some(format!("⚠️ **无法启动 AI 回复**：{err}"));
-            if target_engine.providers().needs_provider_selection() {
+            if target_engine
+                .providers_for_user(&params.sender_id.0.to_string())
+                .needs_provider_selection()
+            {
                 err_consumer.event_buttons.push(vec![InlineActionButton {
-                    text: "⚙️ 选择 AI 供应商 (Magpie)".to_string(),
+                    text: "⚙️ 选择 AI 供应商".to_string(),
                     callback_data: "hermes:open_ai_providers".to_string(),
                     url: None,
                 }]);
@@ -2232,13 +2248,14 @@ fn collect_available_models(
 }
 
 pub async fn hermes_status(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
     let engine = resolve_hermes_for_bot(&state, q.bot_id);
-    let (active_provider, active_model, api_mode) = engine.providers().active_info();
-    let snap = engine.providers().snapshot();
+    let user_provs = engine.providers_for_user(&auth.user_id.0.to_string());
+    let (active_provider, active_model, api_mode) = user_provs.active_info();
+    let snap = user_provs.snapshot();
     let available_models = collect_available_models(&snap);
     let mut provider_list: Vec<_> = snap.providers.values().collect();
     provider_list.sort_by(|a, b| a.id.cmp(&b.id));
@@ -2286,9 +2303,9 @@ pub async fn hermes_status(
             "active_provider": active_provider,
             "api_mode": api_mode.as_str(),
             "allow_local_fallback": snap.allow_local_fallback,
-            "has_active_subscription": engine.providers().has_active_subscription(),
-            "has_configured_provider": engine.providers().has_configured_provider(),
-            "needs_provider_selection": engine.providers().needs_provider_selection(),
+            "has_active_subscription": user_provs.has_active_subscription(),
+            "has_configured_provider": user_provs.has_configured_provider(),
+            "needs_provider_selection": user_provs.needs_provider_selection(),
             "available_models": available_models,
             "providers": providers,
             "toolsets_count": toolsets_count,
@@ -2361,7 +2378,7 @@ pub async fn hermes_turns_create(
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
 
-    let explicit_model = sanitize_model_override(&state, model.clone());
+    let explicit_model = sanitize_model_override_for_user(&state, Some(auth.user_id.0), model.clone());
     let bot_id_u64 = bot_id
         .as_deref()
         .and_then(|b| b.trim().trim_start_matches("bot_").parse::<u64>().ok());
@@ -2435,7 +2452,7 @@ pub async fn hermes_turns_create(
             };
             system_prompt = user_computer_sp.or(bot_sp);
         }
-        bot_fallback_model = sanitize_model_override(&state, bot_model);
+        bot_fallback_model = sanitize_model_override_for_user(&state, Some(auth.user_id.0), bot_model);
     }
     let (enriched_sp, effective_model) = build_enriched_bot_turn_context(
         &state,
@@ -2582,7 +2599,10 @@ pub async fn hermes_turns_create(
             (StatusCode::OK, Json(turn_result_to_json(&res))).into_response()
         }
         Err(e) => {
-            if engine.providers().needs_provider_selection() {
+            if engine
+                .providers_for_user(&auth.user_id.0.to_string())
+                .needs_provider_selection()
+            {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({
@@ -5269,10 +5289,11 @@ pub async fn hermes_kanban_cards_delete(
 // ============================================================================
 
 pub async fn hermes_providers_get(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let snap = state.hermes.providers().snapshot();
+    let uid = auth.user_id.0.to_string();
+    let snap = state.hermes.providers_for_user(&uid).snapshot();
     let available_models = collect_available_models(&snap);
     let mut list: Vec<&ProviderConfig> = snap.providers.values().collect();
     list.sort_by(|a, b| a.id.cmp(&b.id));
@@ -5294,7 +5315,7 @@ pub async fn hermes_providers_get(
 }
 
 pub async fn hermes_providers_put(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Response {
@@ -5313,7 +5334,9 @@ pub async fn hermes_providers_put(
         );
     }
 
-    let snap_before = state.hermes.providers().snapshot();
+    let uid = auth.user_id.0.to_string();
+    let user_provs = state.hermes.providers_for_user(&uid);
+    let snap_before = user_provs.snapshot();
     let mut cfg = snap_before
         .providers
         .get(&provider_id)
@@ -5370,14 +5393,14 @@ pub async fn hermes_providers_put(
         cfg.enabled = enabled;
     }
 
-    state.hermes.providers().register_provider(cfg);
+    user_provs.register_provider(cfg);
     if let Some(api_key) = payload
         .get("api_key")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let _ = state.hermes.providers().add_credential(
+        let _ = user_provs.add_credential(
             &provider_id,
             CredentialEntry::new(
                 format!("{provider_id}_api_key"),
@@ -5397,7 +5420,7 @@ pub async fn hermes_providers_put(
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if let Err(err) = state.hermes.providers().set_active(&provider_id, model_override) {
+        if let Err(err) = user_provs.set_active(&provider_id, model_override) {
             return err_resp(StatusCode::BAD_REQUEST, "provider_activation_error", &err.to_string());
         }
     }
@@ -5406,12 +5429,11 @@ pub async fn hermes_providers_put(
         .get("allow_local_fallback")
         .and_then(|v| v.as_bool())
     {
-        state.hermes.providers().set_allow_local_fallback(allow_local);
+        user_provs.set_allow_local_fallback(allow_local);
     }
 
-    state.hermes.persist_providers_state();
-    state.fabushi_bots.sync_all_providers();
-    let snap_after = state.hermes.providers().snapshot();
+    state.hermes.persist_user_providers_state(&uid);
+    let snap_after = user_provs.snapshot();
     match snap_after.providers.get(&provider_id) {
         Some(updated) => {
             let mut dto = provider_to_dto(
@@ -5821,7 +5843,7 @@ pub async fn hermes_talk_turn(
         bot_display_name.as_deref(),
         Some(voice_sys),
         None,
-        sanitize_model_override(&state, bot_model),
+        sanitize_model_override_for_user(&state, Some(auth.user_id.0), bot_model),
         &[],
         false,
     );
@@ -5935,11 +5957,16 @@ pub async fn hermes_talk_turn(
 // ============================================================================
 
 pub(crate) fn resolve_optional_bearer_user(headers: &HeaderMap, state: &AppState) -> Option<UserId> {
-    let auth_hdr = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let token = auth_hdr
-        .strip_prefix("Bearer ")
-        .or_else(|| auth_hdr.strip_prefix("bearer "))?
-        .trim();
+    let token = if let Some(auth_hdr) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        auth_hdr
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_hdr.strip_prefix("bearer "))
+            .map(str::trim)?
+    } else if let Some(api_key_hdr) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        api_key_hdr.trim()
+    } else {
+        return None;
+    };
     if token.is_empty() {
         return None;
     }
@@ -6121,7 +6148,12 @@ pub async fn openai_chat_completions(
         };
         let cmpl_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
         let created = Utc::now().timestamp();
-        let default_model = model.unwrap_or_else(|| sess_engine.providers().active_info().1);
+        let default_model = model.unwrap_or_else(|| {
+            sess_engine
+                .providers_for_user(&caller_uid.0.to_string())
+                .active_info()
+                .1
+        });
         let s = stream::unfold(
             (rx, AbortTaskOnDrop(Some(task)), false, false, cmpl_id, default_model),
             move |(mut rx, mut task_guard, mut finished, mut emitted_text, id, mdl)| async move {
@@ -6253,8 +6285,12 @@ pub async fn openai_chat_completions(
     }
 }
 
-pub async fn openai_models_list(State(state): State<Arc<AppState>>) -> Response {
-    let snap = state.hermes.providers().snapshot();
+pub async fn openai_models_list(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let uid_opt = resolve_optional_bearer_user(&headers, &state).map(|u| u.0.to_string());
+    let snap = state.hermes.resolve_providers(uid_opt.as_deref()).snapshot();
     let mut seen = HashSet::new();
     let mut data = Vec::new();
     let now = Utc::now().timestamp();
@@ -6804,12 +6840,10 @@ mod tests {
             "errored turn SSE must NOT emit [DONE]: {body_err}"
         );
 
-        // 2. Trigger a clean completed turn (allow local_hermes)
-        state.hermes.providers().set_allow_local_fallback(true);
-        let _ = state
-            .hermes
-            .providers()
-            .set_active("local_hermes", Some("hermes-local-v1"));
+        // 2. Trigger a clean completed turn (allow local_hermes for this user)
+        let user_provs = state.hermes.providers_for_user(&user.user_id.0.to_string());
+        user_provs.set_allow_local_fallback(true);
+        let _ = user_provs.set_active("local_hermes", Some("hermes-local-v1"));
         let mut ok_req = HermesTurnRequest::new("hello clean");
         ok_req.skip_slash_commands = true;
         ok_req.user_id = Some(user.user_id.0.to_string());

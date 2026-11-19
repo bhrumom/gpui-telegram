@@ -340,6 +340,7 @@ impl FabushiBotHost {
         if let Ok(instances) = self.instances.read() {
             for inst in instances.values() {
                 inst.hermes.sync_providers_from(upstream);
+                inst.hermes.share_user_providers_from(&self.host_hermes);
             }
         }
     }
@@ -572,6 +573,9 @@ impl FabushiBotHost {
             existing
                 .hermes
                 .sync_providers_from(self.host_hermes.providers());
+            existing
+                .hermes
+                .share_user_providers_from(&self.host_hermes);
             let prof_snap = existing.profile();
             self.register_in_core_registry(
                 spec.bot_user_id,
@@ -698,6 +702,7 @@ impl FabushiBotHost {
         };
         let bot_hermes = Arc::new(HermesEngine::new(bot_hermes_cfg)?);
         bot_hermes.sync_providers_from(self.host_hermes.providers());
+        bot_hermes.share_user_providers_from(&self.host_hermes);
         bot_hermes.set_bound_agent_id(&agent_id);
         if let Some(provider) = self
             .computer_provider

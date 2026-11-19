@@ -19,6 +19,7 @@ pub mod tools_terminal;
 pub mod tools_web_media;
 pub mod toolsets;
 pub mod trajectory;
+pub mod user_providers;
 
 use crate::computer::{ComputerCloudProvider, ComputerLeaseBroker};
 use crate::mcp::McpRegistry;
@@ -1602,6 +1603,23 @@ impl<'a> EngineCommandHost<'a> {
                 .kv_set("active_chat_session", &key, &val);
         }
     }
+
+    fn caller_user_id_str(&self) -> Option<String> {
+        self.caller_scope.as_ref().map(|sc| sc.user_id.to_string())
+    }
+
+    fn active_providers(&self) -> ProviderRouter {
+        let uid = self.caller_user_id_str();
+        self.engine.resolve_providers(uid.as_deref())
+    }
+
+    fn persist_active_providers(&self) {
+        if let Some(uid) = self.caller_user_id_str() {
+            self.engine.persist_user_providers_state(&uid);
+        } else {
+            self.engine.persist_providers_state();
+        }
+    }
 }
 
 impl CommandHost for EngineCommandHost<'_> {
@@ -1611,7 +1629,7 @@ impl CommandHost for EngineCommandHost<'_> {
 
     fn new_session(&mut self, title: Option<&str>) -> std::result::Result<String, String> {
         let _ = self.engine.store().end_session(&self.session_id);
-        let (_, model, api_mode) = self.engine.providers().active_info();
+        let (_, model, api_mode) = self.active_providers().active_info();
         let metadata = self
             .caller_scope
             .as_ref()
@@ -1830,7 +1848,7 @@ impl CommandHost for EngineCommandHost<'_> {
     }
 
     fn current_model_info(&self) -> CommandModelInfo {
-        let (provider_id, model, mode) = self.engine.providers().active_info();
+        let (provider_id, model, mode) = self.active_providers().active_info();
         CommandModelInfo {
             provider_id,
             model,
@@ -1840,7 +1858,7 @@ impl CommandHost for EngineCommandHost<'_> {
 
     fn set_model(&mut self, model: &str) -> std::result::Result<String, String> {
         self.ensure_bot_config_allowed()?;
-        let (prov, resolved_model) = self.engine.providers().set_active_model(model);
+        let (prov, resolved_model) = self.active_providers().set_active_model(model);
         let _ = self.engine.store().update_session(
             &self.session_id,
             SessionPatch {
@@ -1848,14 +1866,14 @@ impl CommandHost for EngineCommandHost<'_> {
                 ..Default::default()
             },
         );
-        self.engine.persist_providers_state();
+        self.persist_active_providers();
         Ok(format!("{prov}/{resolved_model}"))
     }
 
     fn list_providers(&self) -> Vec<CommandProviderInfo> {
-        let (active_id, _, _) = self.engine.providers().active_info();
-        self.engine
-            .providers()
+        let router = self.active_providers();
+        let (active_id, _, _) = router.active_info();
+        router
             .list_providers()
             .into_iter()
             .map(|p| CommandProviderInfo {
@@ -1871,12 +1889,11 @@ impl CommandHost for EngineCommandHost<'_> {
 
     fn set_provider(&mut self, provider_id: &str) -> std::result::Result<String, String> {
         self.ensure_bot_config_allowed()?;
-        let (prov, model) = self
-            .engine
-            .providers()
+        let router = self.active_providers();
+        let (prov, model) = router
             .set_active(provider_id, None)
             .map_err(|e| e.to_string())?;
-        let (_, _, mode) = self.engine.providers().active_info();
+        let (_, _, mode) = router.active_info();
         let _ = self.engine.store().update_session(
             &self.session_id,
             SessionPatch {
@@ -1885,7 +1902,7 @@ impl CommandHost for EngineCommandHost<'_> {
                 ..Default::default()
             },
         );
-        self.engine.persist_providers_state();
+        self.persist_active_providers();
         Ok(format!("Switched active provider to `{prov}` (model `{model}`, mode `{}`).", mode.as_str()))
     }
 
@@ -1893,8 +1910,7 @@ impl CommandHost for EngineCommandHost<'_> {
         self.ensure_bot_config_allowed()?;
         let parsed = ApiMode::parse(mode)
             .ok_or_else(|| format!("Unknown API mode '{mode}'. Use chat_completions, codex_responses, anthropic_messages, gemini_generate_content, or local_hermes."))?;
-        self.engine
-            .providers()
+        self.active_providers()
             .set_api_mode_for_active(parsed)
             .map_err(|e| e.to_string())?;
         let _ = self.engine.store().update_session(
@@ -1904,7 +1920,7 @@ impl CommandHost for EngineCommandHost<'_> {
                 ..Default::default()
             },
         );
-        self.engine.persist_providers_state();
+        self.persist_active_providers();
         Ok(parsed.as_str().to_string())
     }
 
@@ -2480,7 +2496,7 @@ impl CommandHost for EngineCommandHost<'_> {
     }
 
     fn status_report(&self) -> std::result::Result<String, String> {
-        let (provider_id, model, api_mode) = self.engine.providers().active_info();
+        let (provider_id, model, api_mode) = self.active_providers().active_info();
         let sess = self
             .engine
             .store()
@@ -2531,7 +2547,7 @@ impl CommandHost for EngineCommandHost<'_> {
             .store()
             .journal_mode()
             .unwrap_or_else(|_| "unknown".into());
-        let providers = self.engine.providers().list_providers();
+        let providers = self.active_providers().list_providers();
         let now_ms = Utc::now().timestamp_millis();
         let prov_summary: Vec<String> = providers
             .iter()
@@ -3159,6 +3175,7 @@ struct HermesEngineInner {
     skills: SkillsManager,
     honcho: HonchoDialectics,
     providers: ProviderRouter,
+    user_providers: RwLock<Arc<user_providers::UserProviderRegistry>>,
     security: Arc<RwLock<SecurityEngine>>,
     toolsets: Arc<RwLock<ToolsetRegistry>>,
     session_toolsets: RwLock<HashMap<String, Arc<RwLock<ToolsetRegistry>>>>,
@@ -3313,12 +3330,18 @@ impl HermesEngine {
         let security = SecurityEngine::new(config.workspace_root.clone())
             .with_mode(config.default_approval_mode);
 
+        let user_providers = Arc::new(user_providers::UserProviderRegistry::new(
+            store.clone(),
+            config.data_dir.as_deref(),
+        ));
+
         let inner = Arc::new(HermesEngineInner {
             store,
             memory,
             skills,
             honcho,
             providers,
+            user_providers: RwLock::new(user_providers),
             security: Arc::new(RwLock::new(security)),
             toolsets: Arc::new(RwLock::new(ToolsetRegistry::from_preset(config.default_preset))),
             session_toolsets: RwLock::new(HashMap::new()),
@@ -3377,6 +3400,71 @@ impl HermesEngine {
 
     pub fn providers(&self) -> &ProviderRouter {
         &self.inner.providers
+    }
+
+    /// Returns the isolated per-user `ProviderRouter` for `user_id`, loading and
+    /// decrypting persisted state on demand.
+    pub fn providers_for_user(&self, user_id: &str) -> ProviderRouter {
+        let reg = self
+            .inner
+            .user_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        reg.get_or_load(user_id, &self.inner.providers)
+    }
+
+    /// Resolves the active `ProviderRouter` for a turn or command: strictly
+    /// per-user when `user_id` is non-empty, otherwise falls back to the
+    /// platform base router.
+    pub fn resolve_providers(&self, user_id: Option<&str>) -> ProviderRouter {
+        if let Some(uid) = user_id.map(str::trim).filter(|s| !s.is_empty()) {
+            self.providers_for_user(uid)
+        } else {
+            self.inner.providers.clone()
+        }
+    }
+
+    /// Persists `user_id`'s isolated `ProviderRouterState` encrypted at rest.
+    pub fn persist_user_providers_state(&self, user_id: &str) {
+        let reg = self
+            .inner
+            .user_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Err(err) = reg.persist(user_id) {
+            tracing::warn!(user_id = %user_id, error = %err, "Failed to persist per-user provider state");
+        }
+    }
+
+    /// Clears `user_id`'s cached and persisted provider state.
+    pub fn reset_user_providers(&self, user_id: &str) {
+        let reg = self
+            .inner
+            .user_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        reg.reset_user(user_id);
+    }
+
+    /// Shares the host engine's `UserProviderRegistry` with a child bot engine
+    /// so every bot automatically routes turns through the calling user's own
+    /// isolated `ProviderRouter`.
+    pub fn share_user_providers_from(&self, host: &HermesEngine) {
+        let shared = host
+            .inner
+            .user_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut guard = self
+            .inner
+            .user_providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = shared;
     }
 
     pub fn sync_providers_from(&self, upstream: &ProviderRouter) {
@@ -4358,6 +4446,7 @@ impl HermesEngine {
                                         .run_moa_turn(
                                             &resolved_sid,
                                             &turn_id,
+                                            req.user_id.as_deref(),
                                             prompt,
                                             models,
                                             &tx,
@@ -4527,6 +4616,7 @@ impl HermesEngine {
         &self,
         session_id: &str,
         turn_id: &str,
+        caller_user_id: Option<&str>,
         prompt: &str,
         models: &[String],
         tx: &mpsc::Sender<HermesEvent>,
@@ -4554,7 +4644,8 @@ impl HermesEngine {
             .honcho
             .ingest_user_message(&user_id, Some(session_id), prompt);
 
-        let (active_prov, active_model, active_mode) = self.inner.providers.active_info();
+        let turn_providers = self.resolve_providers(caller_user_id);
+        let (active_prov, active_model, active_mode) = turn_providers.active_info();
         let meta = HermesEvent::Meta {
             session_id: session_id.to_string(),
             turn_id: turn_id.to_string(),
@@ -4594,7 +4685,7 @@ impl HermesEngine {
         );
         base_req.system_tiers = tiers_from_assembled(&assembled);
 
-        match coordinator.run(&self.inner.providers, base_req).await {
+        match coordinator.run(&turn_providers, base_req).await {
             Ok(moa) => {
                 let text = moa.synthesis;
                 let td = HermesEvent::TextDelta {
@@ -4872,7 +4963,8 @@ impl HermesEngine {
 
         let mut prefetch_hints: Vec<String> = resolved_refs.warnings.clone();
         let active_settings = self.session_settings(session_id);
-        let (active_prov, active_model, active_mode) = self.inner.providers.active_info();
+        let turn_providers = self.resolve_providers(req.user_id.as_deref());
+        let (active_prov, active_model, active_mode) = turn_providers.active_info();
         let chosen_model = req
             .model
             .as_deref()
@@ -5064,7 +5156,7 @@ impl HermesEngine {
                     cancel_flag.store(true, Ordering::SeqCst);
                     Err(providers::ProviderError::Transport("Stream client disconnected".to_string()))
                 }
-                res = self.inner.providers.complete(prov_req, Some(ptx)) => res,
+                res = turn_providers.complete(prov_req, Some(ptx)) => res,
             };
             let streamed_evs = if let Some(h) = forwarder_guard.0.take() {
                 h.await.unwrap_or_default()
@@ -5444,7 +5536,7 @@ impl HermesEngine {
                         cancel_flag.store(true, Ordering::SeqCst);
                         Err(providers::ProviderError::Transport("Stream client disconnected".to_string()))
                     }
-                    res = self.inner.providers.complete(final_req, Some(ptx)) => res,
+                    res = turn_providers.complete(final_req, Some(ptx)) => res,
                 };
                 let streamed_evs = if let Some(h) = forwarder_guard.0.take() {
                     h.await.unwrap_or_default()

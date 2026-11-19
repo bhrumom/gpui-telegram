@@ -5249,8 +5249,9 @@ async fn chats_agent_runs(
     );
 
     let (bot_sp, bot_model, _) = crate::routes::hermes::load_bot_persona_config(&state, bot_user_id);
-    let explicit_model = crate::routes::hermes::sanitize_model_override(
+    let explicit_model = crate::routes::hermes::sanitize_model_override_for_user(
         &state,
+        Some(auth.user_id.0),
         payload
             .get("model")
             .or_else(|| payload.get("model_id"))
@@ -5263,8 +5264,11 @@ async fn chats_agent_runs(
             .map(|i| i.settings().preferred_model)
             .filter(|m| !m.trim().is_empty())
     });
-    let sanitized_bot_model =
-        crate::routes::hermes::sanitize_model_override(&state, fallback_instance_model);
+    let sanitized_bot_model = crate::routes::hermes::sanitize_model_override_for_user(
+        &state,
+        Some(auth.user_id.0),
+        fallback_instance_model,
+    );
     let explicit_sp = payload
         .get("system_prompt")
         .and_then(|v| v.as_str())
