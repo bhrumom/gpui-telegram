@@ -92,6 +92,7 @@ pub struct AppState {
     pub action_approval_secret: [u8; 32],
     pub multi_agent_groups: Arc<RwLock<HashMap<ChatId, GroupMultiAgentRoom>>>,
     pub agent_capability_key: Arc<ed25519_dalek::SigningKey>,
+    pub update_relay: Arc<crate::routes::updates::UpdateRelayState>,
 }
 
 impl Default for AppState {
@@ -543,6 +544,7 @@ impl AppState {
             action_approval_secret,
             multi_agent_groups: Arc::new(RwLock::new(HashMap::new())),
             agent_capability_key,
+            update_relay: Arc::new(crate::routes::updates::UpdateRelayState::new()),
         }
     }
 
@@ -759,6 +761,8 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         // --- Public Routes ---
         .route("/health", get(health_check))
         .route("/api/v1/status", get(server_status))
+        .route("/api/v1/updates/latest-mac.json", get(routes::updates::updates_latest_manifest))
+        .route("/api/v1/updates/assets/{tag}/{filename}", get(routes::updates::updates_download_asset))
         .route("/api/v1/auth/register", post(auth_register))
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/phone/send-code", post(routes::auth_factors::phone_send_code))
@@ -1209,7 +1213,10 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             CompressionLayer::new().gzip(true).compress_when(
                 tower_http::compression::predicate::Predicate::and(
                     tower_http::compression::DefaultPredicate::new(),
-                    tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
+                    tower_http::compression::predicate::Predicate::and(
+                        tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
+                        tower_http::compression::predicate::NotForContentType::new("application/octet-stream"),
+                    ),
                 ),
             ),
         )
@@ -1237,7 +1244,8 @@ async fn server_status() -> Json<Value> {
             "messaging_pts", "reactions", "polls", "media_cas_206",
             "stickers", "gifs", "stories", "calls_webrtc", "tantivy_search",
             "statistics", "export", "wallet_stars", "acp_durable",
-            "hermes_agent", "hermes_gateway", "openai_compat", "acp_json_rpc"
+            "hermes_agent", "hermes_gateway", "openai_compat", "acp_json_rpc",
+            "auto_update_relay"
         ]
     }))
 }

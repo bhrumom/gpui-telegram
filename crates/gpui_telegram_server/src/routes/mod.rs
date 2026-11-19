@@ -18,6 +18,7 @@ pub mod social;
 pub mod sync_polls;
 pub mod tailnet;
 pub mod telegram_bot_api;
+pub mod updates;
 pub mod users;
 
 use crate::db::schema::{ChatMemberRecord, ChatRecord, UserRecord};

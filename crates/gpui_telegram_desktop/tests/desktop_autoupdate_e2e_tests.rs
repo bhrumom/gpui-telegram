@@ -2,14 +2,19 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui_telegram_desktop::app::{
     compare_semver, is_newer_version, parse_github_release_json, parse_release_manifest,
-    DesktopUpdateState, DesktopUpdater, CURRENT_APP_VERSION,
+    AvailableUpdateInfo, DesktopUpdateState, DesktopUpdater, UpdaterNetworkOptions,
+    CURRENT_APP_VERSION,
 };
 use gpui_telegram_desktop::views::boxes::AboutBox;
 use gpui_telegram_desktop::views::settings::sections::SettingsAdvancedSections;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn create_mock_app_bundle(root: &Path, version: &str) -> std::path::PathBuf {
     let app = root.join("Fabushi.app");
@@ -59,6 +64,68 @@ fn sha256_hex(path: &Path) -> String {
     format!("{:x}", digest)
 }
 
+fn create_mock_app_zip(root: &Path, version: &str) -> (std::path::PathBuf, Vec<u8>, String) {
+    let build_dir = root.join(format!("build_v{}", version.replace('.', "_")));
+    let upgraded_app = create_mock_app_bundle(&build_dir, version);
+    let zip_path = root.join(format!("Fabushi-{version}-macos-arm64.zip"));
+    let zip_ok = if Path::new("/usr/bin/ditto").exists() {
+        Command::new("/usr/bin/ditto")
+            .args([
+                "-c",
+                "-k",
+                "--sequesterRsrc",
+                "--keepParent",
+                &upgraded_app.to_string_lossy(),
+                &zip_path.to_string_lossy(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    } else {
+        Command::new("zip")
+            .current_dir(&build_dir)
+            .args(["-qr", &zip_path.to_string_lossy(), "Fabushi.app"])
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(zip_ok, "archive creation for e2e test must succeed");
+    let bytes = fs::read(&zip_path).unwrap();
+    let sha = sha256_hex(&zip_path);
+    (zip_path, bytes, sha)
+}
+
+async fn read_http_request_head(sock: &mut tokio::net::TcpStream) -> String {
+    let mut buf = Vec::with_capacity(2048);
+    let mut tmp = [0u8; 512];
+    loop {
+        let n = sock.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 8192 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn extract_range_start(req: &str) -> Option<usize> {
+    for line in req.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("range:") {
+            let trimmed = rest.trim();
+            if let Some(bytes_part) = trimmed.strip_prefix("bytes=") {
+                if let Some((start_s, _)) = bytes_part.split_once('-') {
+                    return start_s.trim().parse::<usize>().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn test_semver_comparison_and_prerelease_rules() {
     assert_eq!(compare_semver("1.2.1", "1.2.0"), Ordering::Greater);
@@ -87,14 +154,14 @@ fn test_parse_manifest_and_github_release_fallback_json() {
         "release_notes": "Auto-update support",
         "platforms": {
             "darwin-arm64": {
-                "zip_url": "https://github.com/bhrum/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-arm64.zip",
+                "zip_url": "https://github.com/bhrumom/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-arm64.zip",
                 "zip_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "zip_size": 12345678,
-                "dmg_url": "https://github.com/bhrum/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-arm64.dmg",
-                "pkg_url": "https://github.com/bhrum/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-arm64.pkg"
+                "dmg_url": "https://github.com/bhrumom/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-arm64.dmg",
+                "pkg_url": "https://github.com/bhrumom/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-arm64.pkg"
             },
             "darwin-x86_64": {
-                "zip_url": "https://github.com/bhrum/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-x86_64.zip",
+                "zip_url": "https://github.com/bhrumom/gpui-telegram/releases/download/v1.3.0/Fabushi-1.3.0-macos-x86_64.zip",
                 "zip_sha256": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
                 "zip_size": 12345678
             }
@@ -275,7 +342,7 @@ fn test_settings_advanced_and_about_fabushi_integration() {
 
     let about_fabushi = AboutBox::new_fabushi();
     assert!(about_fabushi.version_text.contains(CURRENT_APP_VERSION));
-    assert_eq!(about_fabushi.github_url, "https://github.com/bhrum/gpui-telegram");
+    assert_eq!(about_fabushi.github_url, "https://github.com/bhrumom/gpui-telegram");
 
     let mut adv = SettingsAdvancedSections::new();
     assert_eq!(adv.current_version, CURRENT_APP_VERSION);
@@ -297,4 +364,330 @@ fn test_settings_advanced_and_about_fabushi_integration() {
     adv.sync_update_snapshot(&snap);
     assert_eq!(adv.latest_version.as_deref(), Some("1.9.0"));
     assert!(adv.update_available);
+}
+
+#[test]
+fn test_resumable_http_download_recovers_from_midstream_drops_via_206_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_zip_path, bytes, sha) = create_mock_app_zip(tmp.path(), "1.3.0");
+    let total = bytes.len();
+    assert!(total > 300);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let observed_ranges = Arc::new(Mutex::new(Vec::<Option<usize>>::new()));
+        let observed_clone = observed_ranges.clone();
+        let bytes_srv = bytes.clone();
+
+        let srv = tokio::spawn(async move {
+            let cut1 = total / 3;
+            let cut2 = (total * 2) / 3;
+            for req_idx in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let req = read_http_request_head(&mut sock).await;
+                let range_start = extract_range_start(&req);
+                observed_clone.lock().unwrap().push(range_start);
+                match req_idx {
+                    0 => {
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = sock.write_all(hdr.as_bytes()).await;
+                        let _ = sock.write_all(&bytes_srv[..cut1]).await;
+                        let _ = sock.shutdown().await;
+                    }
+                    1 => {
+                        let start = range_start.expect("second request must send Range header");
+                        let rem = total - start;
+                        let hdr = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {rem}\r\nContent-Range: bytes {start}-{}/{total}\r\nConnection: close\r\n\r\n",
+                            total - 1
+                        );
+                        let _ = sock.write_all(hdr.as_bytes()).await;
+                        let _ = sock.write_all(&bytes_srv[start..cut2]).await;
+                        let _ = sock.shutdown().await;
+                    }
+                    _ => {
+                        let start = range_start.expect("third request must send Range header");
+                        let rem = total - start;
+                        let hdr = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {rem}\r\nContent-Range: bytes {start}-{}/{total}\r\nConnection: close\r\n\r\n",
+                            total - 1
+                        );
+                        let _ = sock.write_all(hdr.as_bytes()).await;
+                        let _ = sock.write_all(&bytes_srv[start..]).await;
+                        let _ = sock.shutdown().await;
+                    }
+                }
+            }
+        });
+
+        let info = AvailableUpdateInfo {
+            version: "1.3.0".to_string(),
+            asset_url: format!("http://{addr}/Fabushi-1.3.0-macos-arm64.zip"),
+            sha256: Some(sha),
+            size_bytes: Some(total as u64),
+            release_notes: None,
+            dmg_url: None,
+            pkg_url: None,
+        };
+        let opts = UpdaterNetworkOptions {
+            chunk_idle_timeout: Some(Duration::from_secs(2)),
+            max_stall_retries: Some(5),
+            ..Default::default()
+        };
+        let mut saw_100 = false;
+        let staged = DesktopUpdater::download_and_stage_update_with_options(
+            &info,
+            &tmp.path().join("updates"),
+            &opts,
+            |_, _, pct| {
+                if pct == 100 {
+                    saw_100 = true;
+                }
+            },
+        )
+        .await
+        .expect("resumable download across two midstream drops must succeed");
+
+        srv.await.unwrap();
+        assert!(saw_100);
+        assert!(staged.join("Contents/Info.plist").is_file());
+        let plist = fs::read_to_string(staged.join("Contents/Info.plist")).unwrap();
+        assert!(plist.contains("<string>1.3.0</string>"));
+        let ranges = observed_ranges.lock().unwrap().clone();
+        assert_eq!(ranges, vec![None, Some(total / 3), Some((total * 2) / 3)]);
+    });
+}
+
+#[test]
+fn test_chunk_idle_timeout_triggers_stream_recovery_without_decoding_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_zip_path, bytes, sha) = create_mock_app_zip(tmp.path(), "1.3.0");
+    let total = bytes.len();
+    let half = total / 2;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bytes_srv = bytes.clone();
+
+        let srv = tokio::spawn(async move {
+            // Request 1: send first half then stall silently past chunk_idle_timeout.
+            let (mut sock1, _) = listener.accept().await.unwrap();
+            let req1 = read_http_request_head(&mut sock1).await;
+            assert!(extract_range_start(&req1).is_none());
+            let hdr1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock1.write_all(hdr1.as_bytes()).await;
+            let _ = sock1.write_all(&bytes_srv[..half]).await;
+            let _ = sock1.flush().await;
+
+            // Request 2: resume from `half` via 206 Partial Content while sock1 remains stalled.
+            let (mut sock2, _) = listener.accept().await.unwrap();
+            let req2 = read_http_request_head(&mut sock2).await;
+            let start = extract_range_start(&req2).expect("resumed request must carry Range header");
+            assert_eq!(start, half);
+            let rem = total - start;
+            let hdr2 = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {rem}\r\nContent-Range: bytes {start}-{}/{total}\r\nConnection: close\r\n\r\n",
+                total - 1
+            );
+            let _ = sock2.write_all(hdr2.as_bytes()).await;
+            let _ = sock2.write_all(&bytes_srv[start..]).await;
+            let _ = sock2.shutdown().await;
+            drop(sock1);
+        });
+
+        let info = AvailableUpdateInfo {
+            version: "1.3.0".to_string(),
+            asset_url: format!("http://{addr}/Fabushi-1.3.0-macos-arm64.zip"),
+            sha256: Some(sha),
+            size_bytes: Some(total as u64),
+            release_notes: None,
+            dmg_url: None,
+            pkg_url: None,
+        };
+        let opts = UpdaterNetworkOptions {
+            chunk_idle_timeout: Some(Duration::from_millis(150)),
+            max_stall_retries: Some(3),
+            ..Default::default()
+        };
+        let staged = DesktopUpdater::download_and_stage_update_with_options(
+            &info,
+            &tmp.path().join("updates"),
+            &opts,
+            |_, _, _| {},
+        )
+        .await
+        .expect("idle timeout recovery must resume via Range and succeed");
+
+        srv.await.unwrap();
+        assert!(staged.join("Contents/Info.plist").is_file());
+    });
+}
+
+#[test]
+fn test_manual_retry_preserves_part_file_and_resumes_from_offset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_zip_path, bytes, sha) = create_mock_app_zip(tmp.path(), "1.3.0");
+    let total = bytes.len();
+    let half = total / 2;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bytes_srv = bytes.clone();
+        let retry_range_seen = Arc::new(Mutex::new(None::<usize>));
+        let retry_range_clone = retry_range_seen.clone();
+
+        let srv = tokio::spawn(async move {
+            // Attempt 1 (will fail due to max_stall_retries = 1 after early EOF at `half`).
+            let (mut sock1, _) = listener.accept().await.unwrap();
+            let req1 = read_http_request_head(&mut sock1).await;
+            assert!(extract_range_start(&req1).is_none());
+            let hdr1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock1.write_all(hdr1.as_bytes()).await;
+            let _ = sock1.write_all(&bytes_srv[..half]).await;
+            let _ = sock1.shutdown().await;
+
+            // Attempt 2 (manual retry by user): must resume from `half`.
+            let (mut sock2, _) = listener.accept().await.unwrap();
+            let req2 = read_http_request_head(&mut sock2).await;
+            let start = extract_range_start(&req2).expect("manual retry must send Range header");
+            *retry_range_clone.lock().unwrap() = Some(start);
+            let rem = total - start;
+            let hdr2 = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {rem}\r\nContent-Range: bytes {start}-{}/{total}\r\nConnection: close\r\n\r\n",
+                total - 1
+            );
+            let _ = sock2.write_all(hdr2.as_bytes()).await;
+            let _ = sock2.write_all(&bytes_srv[start..]).await;
+            let _ = sock2.shutdown().await;
+        });
+
+        let staging_root = tmp.path().join("updates");
+        let info = AvailableUpdateInfo {
+            version: "1.3.0".to_string(),
+            asset_url: format!("http://{addr}/Fabushi-1.3.0-macos-arm64.zip"),
+            sha256: Some(sha),
+            size_bytes: Some(total as u64),
+            release_notes: None,
+            dmg_url: None,
+            pkg_url: None,
+        };
+        let opts = UpdaterNetworkOptions {
+            chunk_idle_timeout: Some(Duration::from_millis(500)),
+            max_stall_retries: Some(1),
+            ..Default::default()
+        };
+
+        let first_res =
+            DesktopUpdater::download_and_stage_update_with_options(&info, &staging_root, &opts, |_, _, _| {})
+                .await;
+        assert!(first_res.is_err(), "first run with max_stall_retries=1 should stop after early EOF");
+
+        let part_file = staging_root.join("stage-1.3.0/update.zip.part");
+        assert!(part_file.is_file(), ".part file must remain on disk for manual retry");
+        assert_eq!(fs::metadata(&part_file).unwrap().len(), half as u64);
+
+        let second_res =
+            DesktopUpdater::download_and_stage_update_with_options(&info, &staging_root, &opts, |_, _, _| {})
+                .await
+                .expect("manual retry must resume from preserved .part offset and succeed");
+        srv.await.unwrap();
+
+        assert_eq!(*retry_range_seen.lock().unwrap(), Some(half));
+        assert!(second_res.join("Contents/Info.plist").is_file());
+    });
+}
+
+#[test]
+fn test_server_relay_404_falls_back_to_primary_asset_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_zip_path, bytes, sha) = create_mock_app_zip(tmp.path(), "1.3.0");
+    let total = bytes.len();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+
+        let relay_path_seen = Arc::new(Mutex::new(String::new()));
+        let relay_path_clone = relay_path_seen.clone();
+
+        let relay_srv = tokio::spawn(async move {
+            let (mut sock, _) = relay_listener.accept().await.unwrap();
+            let req = read_http_request_head(&mut sock).await;
+            if let Some(first_line) = req.lines().next() {
+                *relay_path_clone.lock().unwrap() = first_line.to_string();
+            }
+            let body = "Not Found";
+            let resp = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let bytes_srv = bytes.clone();
+        let primary_srv = tokio::spawn(async move {
+            let (mut sock, _) = primary_listener.accept().await.unwrap();
+            let _req = read_http_request_head(&mut sock).await;
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(hdr.as_bytes()).await;
+            let _ = sock.write_all(&bytes_srv).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let info = AvailableUpdateInfo {
+            version: "1.3.0".to_string(),
+            asset_url: format!(
+                "http://{primary_addr}/releases/download/v1.3.0/Fabushi-1.3.0-macos-arm64.zip"
+            ),
+            sha256: Some(sha),
+            size_bytes: Some(total as u64),
+            release_notes: None,
+            dmg_url: None,
+            pkg_url: None,
+        };
+        let opts = UpdaterNetworkOptions {
+            server_url: Some(format!("http://{relay_addr}")),
+            release_download_base_override: Some(format!(
+                "http://{primary_addr}/releases/download/"
+            )),
+            max_stall_retries: Some(1),
+            ..Default::default()
+        };
+
+        let staged = DesktopUpdater::download_and_stage_update_with_options(
+            &info,
+            &tmp.path().join("updates"),
+            &opts,
+            |_, _, _| {},
+        )
+        .await
+        .expect("404 from relay mirror must immediately fall back to primary asset_url");
+
+        relay_srv.await.unwrap();
+        primary_srv.await.unwrap();
+
+        assert!(relay_path_seen
+            .lock()
+            .unwrap()
+            .contains("/api/v1/updates/assets/v1.3.0/Fabushi-1.3.0-macos-arm64.zip"));
+        assert!(staged.join("Contents/Info.plist").is_file());
+    });
 }

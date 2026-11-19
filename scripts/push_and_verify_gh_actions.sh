@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-DEFAULT_REMOTE_URL="${GITHUB_REPO_URL:-git@github.com:bhrum/gpui-telegram.git}"
+DEFAULT_REMOTE_URL="${GITHUB_REPO_URL:-git@github.com:bhrumom/gpui-telegram.git}"
 REMOTE_URL="${1:-${DEFAULT_REMOTE_URL}}"
 COMMIT_MSG="${COMMIT_MSG:-feat(desktop): migrate 1:1 telegramdesktop features, GPUI UI/UX & GitHub Actions CI}"
 

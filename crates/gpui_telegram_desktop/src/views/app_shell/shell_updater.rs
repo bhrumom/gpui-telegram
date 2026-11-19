@@ -6,7 +6,8 @@ use gpui::*;
 use tokio::sync::mpsc;
 
 use crate::app::updater::{
-    DesktopUpdateState, DesktopUpdater, CURRENT_APP_VERSION,
+    format_download_progress_text, DesktopUpdateState, DesktopUpdater, UpdaterNetworkOptions,
+    CURRENT_APP_VERSION,
 };
 use crate::i18n::tr_str;
 use crate::views::shell::AppShell;
@@ -22,6 +23,14 @@ enum DownloadProgressEvent {
 }
 
 impl AppShell {
+    fn updater_network_options(&self) -> UpdaterNetworkOptions {
+        UpdaterNetworkOptions {
+            proxy: self.client.config.proxy.clone(),
+            server_url: Some(self.client.config.server_url.clone()),
+            ..Default::default()
+        }
+    }
+
     fn sync_updater_state_to_views(&mut self, cx: &mut Context<Self>) {
         let is_zh = self.theme_state.is_chinese_locale;
         let snap = self.overlays.updater_state.to_snapshot(is_zh);
@@ -75,14 +84,16 @@ impl AppShell {
         self.sync_updater_state_to_views(cx);
 
         let feed_override = self.client.config.update_feed_url.clone();
+        let net_opts = self.updater_network_options();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = runtime
                 .spawn(async move {
-                    DesktopUpdater::check_for_updates(
+                    DesktopUpdater::check_for_updates_with_options(
                         feed_override.as_deref(),
                         CURRENT_APP_VERSION,
+                        &net_opts,
                     )
                     .await
                 })
@@ -170,15 +181,17 @@ impl AppShell {
         self.sync_updater_state_to_views(cx);
 
         let staging_root = self.preferences_dir.join("updates");
+        let net_opts = self.updater_network_options();
         let runtime = self.client.runtime().clone();
         let (tx, mut rx) = mpsc::unbounded_channel::<DownloadProgressEvent>();
 
         let dl_info = info.clone();
         runtime.spawn(async move {
             let tx_progress = tx.clone();
-            let res = DesktopUpdater::download_and_stage_update(
+            let res = DesktopUpdater::download_and_stage_update_with_options(
                 &dl_info,
                 &staging_root,
+                &net_opts,
                 move |downloaded_bytes, total_bytes, progress_pct| {
                     let _ = tx_progress.send(DownloadProgressEvent::Progress {
                         downloaded_bytes,
@@ -382,13 +395,18 @@ impl AppShell {
                 )
             }
             DesktopUpdateState::Downloading {
-                info, progress_pct, ..
+                info,
+                downloaded_bytes,
+                total_bytes,
+                progress_pct,
             } => {
-                let text = if is_zh {
-                    format!("正在下载 Fabushi v{} ({progress_pct}%)…", info.version)
-                } else {
-                    format!("Downloading Fabushi v{} ({progress_pct}%)…", info.version)
-                };
+                let text = format_download_progress_text(
+                    &info.version,
+                    *downloaded_bytes,
+                    *total_bytes,
+                    *progress_pct,
+                    is_zh,
+                );
                 Some(
                     div()
                         .id("in-app-update-downloading-banner")

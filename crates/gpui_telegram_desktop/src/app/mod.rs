@@ -29,8 +29,8 @@ pub use preferences::{
 pub use updater::{
     compare_semver, is_newer_version, parse_github_release_json, parse_release_manifest,
     AvailableUpdateInfo, DesktopUpdateSnapshot, DesktopUpdateState, DesktopUpdater,
-    PlatformAssetEntry, UpdateReleaseManifest, CURRENT_APP_VERSION, DEFAULT_GITHUB_LATEST_API_URL,
-    DEFAULT_GITHUB_REPO, DEFAULT_MANIFEST_URL,
+    PlatformAssetEntry, UpdateReleaseManifest, UpdaterNetworkOptions, CURRENT_APP_VERSION,
+    DEFAULT_GITHUB_LATEST_API_URL, DEFAULT_GITHUB_REPO, DEFAULT_MANIFEST_URL,
 };
 
 

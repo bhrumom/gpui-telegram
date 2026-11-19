@@ -1,28 +1,71 @@
 //! Native Fabushi Desktop auto-updater & one-click self-installer.
 //!
-//! Checks `bhrum/gpui-telegram` GitHub Releases (primary `latest-mac.json` manifest
+//! Checks `bhrumom/gpui-telegram` GitHub Releases (primary `latest-mac.json` manifest
 //! with automatic fallback to GitHub Releases API `/releases/latest`), downloads and
 //! SHA-256 verifies `.zip`/`.tar.gz` update archives, unpacks the staged `.app` bundle,
 //! and atomically replaces the installed application bundle before relaunching.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use futures::StreamExt;
+use gpui_telegram_client::net::proxy::ClientProxyConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_GITHUB_REPO: &str = "bhrum/gpui-telegram";
+pub const DEFAULT_GITHUB_REPO: &str = "bhrumom/gpui-telegram";
 pub const DEFAULT_MANIFEST_URL: &str =
-    "https://github.com/bhrum/gpui-telegram/releases/latest/download/latest-mac.json";
+    "https://github.com/bhrumom/gpui-telegram/releases/latest/download/latest-mac.json";
 pub const DEFAULT_GITHUB_LATEST_API_URL: &str =
-    "https://api.github.com/repos/bhrum/gpui-telegram/releases/latest";
+    "https://api.github.com/repos/bhrumom/gpui-telegram/releases/latest";
 pub const CURRENT_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Network, proxy, relay, and stall-retry tuning options for [`DesktopUpdater`].
+#[derive(Debug, Clone, Default)]
+pub struct UpdaterNetworkOptions {
+    pub proxy: Option<ClientProxyConfig>,
+    pub server_url: Option<String>,
+    pub connect_timeout: Option<Duration>,
+    pub chunk_idle_timeout: Option<Duration>,
+    pub max_stall_retries: Option<usize>,
+    #[doc(hidden)]
+    pub release_download_base_override: Option<String>,
+}
+
+/// Formats human-readable download progress text including MB transferred when total size is known.
+pub(crate) fn format_download_progress_text(
+    version: &str,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    progress_pct: u8,
+    is_chinese: bool,
+) -> String {
+    if downloaded_bytes > 0 {
+        if let Some(total) = total_bytes.filter(|&t| t > 0) {
+            let dl_mb = downloaded_bytes as f64 / (1024.0 * 1024.0);
+            let total_mb = total as f64 / (1024.0 * 1024.0);
+            return if is_chinese {
+                format!(
+                    "正在下载 Fabushi v{version} ({progress_pct}% · {dl_mb:.1}/{total_mb:.1} MB)…"
+                )
+            } else {
+                format!(
+                    "Downloading Fabushi v{version} ({progress_pct}% · {dl_mb:.1}/{total_mb:.1} MB)…"
+                )
+            };
+        }
+    }
+    if is_chinese {
+        format!("正在下载 Fabushi v{version} ({progress_pct}%)…")
+    } else {
+        format!("Downloading Fabushi v{version} ({progress_pct}%)…")
+    }
+}
 
 /// Metadata describing an installable update release discovered by the updater.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,15 +235,20 @@ impl DesktopUpdateState {
                 is_busy: false,
             },
             Self::Downloading {
-                info, progress_pct, ..
+                info,
+                downloaded_bytes,
+                total_bytes,
+                progress_pct,
             } => DesktopUpdateSnapshot {
                 current_version: current,
                 latest_version: Some(info.version.clone()),
-                status_text: if is_chinese {
-                    format!("正在下载 Fabushi v{} ({progress_pct}%)…", info.version)
-                } else {
-                    format!("Downloading Fabushi v{} ({progress_pct}%)…", info.version)
-                },
+                status_text: format_download_progress_text(
+                    &info.version,
+                    *downloaded_bytes,
+                    *total_bytes,
+                    *progress_pct,
+                    is_chinese,
+                ),
                 progress_pct: Some(*progress_pct),
                 is_busy: true,
             },
@@ -554,12 +602,328 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn build_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent(format!("Fabushi-Desktop/{CURRENT_APP_VERSION}"))
-        .timeout(Duration::from_secs(60))
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DownloadStageMeta {
+    version: String,
+    asset_url: String,
+    sha256: Option<String>,
+    size_bytes: Option<u64>,
+}
+
+fn format_reqwest_error(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        let msg = cause.to_string();
+        if !msg.is_empty() && !parts.iter().any(|existing| existing.contains(&msg)) {
+            parts.push(msg);
+        }
+        src = cause.source();
+    }
+    if e.is_timeout() && !parts.iter().any(|p| p.to_ascii_lowercase().contains("timed out")) {
+        parts.push("operation timed out".to_string());
+    }
+    if e.is_connect() && !parts.iter().any(|p| p.to_ascii_lowercase().contains("connect")) {
+        parts.push("connection failed".to_string());
+    }
+    parts.join(": ")
+}
+
+fn configure_http_builder(
+    mut builder: reqwest::ClientBuilder,
+    opts: &UpdaterNetworkOptions,
+    use_proxy: bool,
+) -> Result<reqwest::ClientBuilder, String> {
+    builder = builder.user_agent(format!("Fabushi-Desktop/{CURRENT_APP_VERSION}"));
+    if use_proxy {
+        if let Some(proxy_cfg) = opts.proxy.as_ref().filter(|p| !p.is_direct()) {
+            if let Some(rp) = proxy_cfg
+                .to_reqwest_proxy()
+                .map_err(|e| format!("Invalid updater proxy configuration: {e}"))?
+            {
+                builder = builder.proxy(rp);
+            }
+        }
+    }
+    Ok(builder)
+}
+
+fn build_metadata_http_client(
+    opts: &UpdaterNetworkOptions,
+    use_proxy: bool,
+    total_timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    let connect_timeout = opts.connect_timeout.unwrap_or(Duration::from_secs(15));
+    let builder = configure_http_builder(reqwest::Client::builder(), opts, use_proxy)?
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout);
+    builder
         .build()
-        .map_err(|e| format!("Failed to construct HTTP client: {e}"))
+        .map_err(|e| format!("Failed to construct metadata HTTP client: {e}"))
+}
+
+fn build_download_http_client(
+    opts: &UpdaterNetworkOptions,
+    use_proxy: bool,
+) -> Result<reqwest::Client, String> {
+    let connect_timeout = opts.connect_timeout.unwrap_or(Duration::from_secs(20));
+    let idle_timeout = opts.chunk_idle_timeout.unwrap_or(Duration::from_secs(45));
+    // Intentionally omit `.timeout(...)` so slow multi-minute downloads succeed while chunks flow.
+    let builder = configure_http_builder(reqwest::Client::builder(), opts, use_proxy)?
+        .connect_timeout(connect_timeout)
+        .read_timeout(idle_timeout)
+        .tcp_keepalive(Duration::from_secs(15))
+        .http1_only();
+    builder
+        .build()
+        .map_err(|e| format!("Failed to construct download HTTP client: {e}"))
+}
+
+fn is_safe_release_segment(seg: &str, max_len: usize) -> bool {
+    !seg.is_empty()
+        && seg.len() <= max_len
+        && !seg.contains("..")
+        && seg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn extract_github_release_coords<'a>(
+    asset_url: &'a str,
+    base_override: Option<&str>,
+) -> Option<(&'a str, &'a str)> {
+    let raw_prefix = base_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://github.com/bhrumom/gpui-telegram/releases/download/");
+    let trimmed = asset_url.trim();
+    let rest = if let Some(r) = trimmed.strip_prefix(raw_prefix) {
+        r.trim_start_matches('/')
+    } else {
+        return None;
+    };
+    let (tag, filename) = rest.split_once('/')?;
+    if filename.contains('/') || !is_safe_release_segment(tag, 64) || !is_safe_release_segment(filename, 128) {
+        return None;
+    }
+    Some((tag, filename))
+}
+
+fn valid_http_base_url(server_url: Option<&str>) -> Option<String> {
+    let trimmed = server_url.map(str::trim).filter(|s| !s.is_empty())?;
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.trim_end_matches('/').to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_download_candidates(
+    info: &AvailableUpdateInfo,
+    opts: &UpdaterNetworkOptions,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let (Some(base), Some((tag, filename))) = (
+        valid_http_base_url(opts.server_url.as_deref()),
+        extract_github_release_coords(&info.asset_url, opts.release_download_base_override.as_deref()),
+    ) {
+        candidates.push(format!("{base}/api/v1/updates/assets/{tag}/{filename}"));
+    }
+    let primary = info.asset_url.trim().to_string();
+    if !candidates.iter().any(|c| c == &primary) {
+        candidates.push(primary);
+    }
+    candidates
+}
+
+fn parse_content_range(header_val: &str) -> Option<(u64, u64, Option<u64>)> {
+    let trimmed = header_val.trim();
+    let rest = trimmed
+        .strip_prefix("bytes ")
+        .or_else(|| trimmed.strip_prefix("BYTES "))
+        .or_else(|| {
+            if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("bytes ") {
+                Some(&trimmed[6..])
+            } else {
+                None
+            }
+        })?
+        .trim();
+    let (range_part, total_part) = rest.split_once('/')?;
+    let (start_s, end_s) = range_part.split_once('-')?;
+    let start = start_s.trim().parse::<u64>().ok()?;
+    let end = end_s.trim().parse::<u64>().ok()?;
+    if start > end {
+        return None;
+    }
+    let total = match total_part.trim() {
+        "*" => None,
+        other => {
+            let t = other.parse::<u64>().ok()?;
+            if end >= t {
+                return None;
+            }
+            Some(t)
+        }
+    };
+    Some((start, end, total))
+}
+
+fn compute_progress_pct(downloaded: u64, total: Option<u64>) -> u8 {
+    match total {
+        Some(t) if t > 0 => ((downloaded.saturating_mul(100)) / t).min(100) as u8,
+        _ => {
+            if downloaded == 0 {
+                0
+            } else {
+                50
+            }
+        }
+    }
+}
+
+fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("Failed opening archive for SHA-256 verification: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("Failed reading archive for SHA-256 verification: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn prepare_stage_dir(staging_root: &Path, version: &str) -> Result<PathBuf, String> {
+    fs::create_dir_all(staging_root).map_err(|e| {
+        format!(
+            "Failed to create staging root {}: {e}",
+            staging_root.display()
+        )
+    })?;
+    let clean_ver = normalize_version_string(version);
+    let safe_ver: String = clean_ver
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stage_name = if safe_ver.is_empty() {
+        "stage-unknown".to_string()
+    } else {
+        format!("stage-{safe_ver}")
+    };
+    if let Ok(entries) = fs::read_dir(staging_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("stage-") && name != stage_name {
+                        let _ = fs::remove_dir_all(&path);
+                    }
+                }
+            }
+        }
+    }
+    let stage_dir = staging_root.join(&stage_name);
+    fs::create_dir_all(&stage_dir)
+        .map_err(|e| format!("Failed to create staging directory: {e}"))?;
+    Ok(stage_dir)
+}
+
+fn stage_meta_matches(meta_path: &Path, info: &AvailableUpdateInfo) -> bool {
+    let Ok(raw) = fs::read_to_string(meta_path) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<DownloadStageMeta>(&raw) else {
+        return false;
+    };
+    if normalize_version_string(&meta.version) != normalize_version_string(&info.version) {
+        return false;
+    }
+    match (meta.sha256.as_deref(), info.sha256.as_deref()) {
+        (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
+        (None, None) => meta.asset_url == info.asset_url,
+        _ => false,
+    }
+}
+
+fn save_stage_meta(meta_path: &Path, info: &AvailableUpdateInfo) {
+    let meta = DownloadStageMeta {
+        version: info.version.clone(),
+        asset_url: info.asset_url.clone(),
+        sha256: info.sha256.clone(),
+        size_bytes: info.size_bytes,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+        let _ = fs::write(meta_path, json);
+    }
+}
+
+fn next_active_candidate(current: usize, total: usize, skipped: &HashSet<usize>) -> usize {
+    if total <= 1 {
+        return 0;
+    }
+    for offset in 1..=total {
+        let idx = (current + offset) % total;
+        if !skipped.contains(&idx) {
+            return idx;
+        }
+    }
+    current.min(total - 1)
+}
+
+fn retry_backoff_delay(consecutive_stalls: usize, chunk_timeout: Duration) -> Duration {
+    let base_ms: u64 = if chunk_timeout < Duration::from_secs(2) {
+        25
+    } else {
+        500
+    };
+    let shift = consecutive_stalls.saturating_sub(1).min(3);
+    Duration::from_millis((base_ms.saturating_mul(1u64 << shift)).min(4000))
+}
+
+async fn send_metadata_get(
+    url: &str,
+    accept_header: Option<&str>,
+    opts: &UpdaterNetworkOptions,
+    timeout: Duration,
+) -> Result<reqwest::Response, String> {
+    let has_proxy = opts.proxy.as_ref().is_some_and(|p| !p.is_direct());
+    let fallback_direct = opts.proxy.as_ref().is_some_and(|p| p.fallback_to_direct);
+    let mut attempt_flags = Vec::with_capacity(2);
+    if has_proxy {
+        attempt_flags.push(true);
+        if fallback_direct {
+            attempt_flags.push(false);
+        }
+    } else {
+        attempt_flags.push(false);
+    }
+    let mut last_err = String::new();
+    for use_proxy in attempt_flags {
+        let client = build_metadata_http_client(opts, use_proxy, timeout)?;
+        let mut req = client.get(url);
+        if let Some(accept) = accept_header {
+            req = req.header("Accept", accept);
+        }
+        match req.send().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                last_err = format_reqwest_error(&e);
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn parse_any_release_payload(body: &str) -> Result<AvailableUpdateInfo, String> {
@@ -644,17 +1008,32 @@ impl DesktopUpdater {
         feed_override: Option<&str>,
         current_version: &str,
     ) -> Result<Option<AvailableUpdateInfo>, String> {
+        Self::check_for_updates_with_options(
+            feed_override,
+            current_version,
+            &UpdaterNetworkOptions::default(),
+        )
+        .await
+    }
+
+    /// Checks for updates using explicit proxy, relay server, and timeout options.
+    pub async fn check_for_updates_with_options(
+        feed_override: Option<&str>,
+        current_version: &str,
+        opts: &UpdaterNetworkOptions,
+    ) -> Result<Option<AvailableUpdateInfo>, String> {
         let trimmed_override = feed_override.map(str::trim).filter(|s| !s.is_empty());
         let info = if let Some(custom_url) = trimmed_override {
             if let Some(local_path) = file_url_to_path(custom_url) {
-                let body = fs::read_to_string(&local_path)
-                    .map_err(|e| format!("Failed to read local update feed {}: {e}", local_path.display()))?;
+                let body = fs::read_to_string(&local_path).map_err(|e| {
+                    format!(
+                        "Failed to read local update feed {}: {e}",
+                        local_path.display()
+                    )
+                })?;
                 parse_any_release_payload(&body)?
             } else {
-                let client = build_http_client()?;
-                let resp = client
-                    .get(custom_url)
-                    .send()
+                let resp = send_metadata_get(custom_url, None, opts, Duration::from_secs(30))
                     .await
                     .map_err(|e| format!("Update check request failed: {e}"))?;
                 if !resp.status().is_success() {
@@ -667,44 +1046,68 @@ impl DesktopUpdater {
                 parse_any_release_payload(&body)?
             }
         } else {
-            let client = build_http_client()?;
-            let manifest_attempt = async {
-                let resp = client
-                    .get(DEFAULT_MANIFEST_URL)
-                    .send()
+            let mut relay_info: Option<AvailableUpdateInfo> = None;
+            if let Some(base) = valid_http_base_url(opts.server_url.as_deref()) {
+                let relay_url = format!("{base}/api/v1/updates/latest-mac.json");
+                if let Ok(resp) =
+                    send_metadata_get(&relay_url, None, opts, Duration::from_secs(8)).await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(body) = resp.text().await {
+                            if let Ok(parsed) = parse_release_manifest(&body) {
+                                relay_info = Some(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(info) = relay_info {
+                info
+            } else {
+                let manifest_attempt = async {
+                    let resp = send_metadata_get(
+                        DEFAULT_MANIFEST_URL,
+                        None,
+                        opts,
+                        Duration::from_secs(30),
+                    )
                     .await
                     .map_err(|e| format!("Manifest check failed: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("Manifest returned HTTP {}", resp.status()));
-                }
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| format!("Failed reading manifest body: {e}"))?;
-                parse_release_manifest(&body)
-            }
-            .await;
-
-            match manifest_attempt {
-                Ok(info) => info,
-                Err(_) => {
-                    let resp = client
-                        .get(DEFAULT_GITHUB_LATEST_API_URL)
-                        .header("Accept", "application/vnd.github+json")
-                        .send()
-                        .await
-                        .map_err(|e| format!("GitHub release check failed: {e}"))?;
                     if !resp.status().is_success() {
-                        return Err(format!(
-                            "GitHub releases API returned HTTP {}",
-                            resp.status()
-                        ));
+                        return Err(format!("Manifest returned HTTP {}", resp.status()));
                     }
                     let body = resp
                         .text()
                         .await
-                        .map_err(|e| format!("Failed reading GitHub release response: {e}"))?;
-                    parse_github_release_json(&body)?
+                        .map_err(|e| format!("Failed reading manifest body: {e}"))?;
+                    parse_release_manifest(&body)
+                }
+                .await;
+
+                match manifest_attempt {
+                    Ok(info) => info,
+                    Err(_) => {
+                        let resp = send_metadata_get(
+                            DEFAULT_GITHUB_LATEST_API_URL,
+                            Some("application/vnd.github+json"),
+                            opts,
+                            Duration::from_secs(30),
+                        )
+                        .await
+                        .map_err(|e| format!("GitHub release check failed: {e}"))?;
+                        if !resp.status().is_success() {
+                            return Err(format!(
+                                "GitHub releases API returned HTTP {}",
+                                resp.status()
+                            ));
+                        }
+                        let body = resp
+                            .text()
+                            .await
+                            .map_err(|e| format!("Failed reading GitHub release response: {e}"))?;
+                        parse_github_release_json(&body)?
+                    }
                 }
             }
         };
@@ -720,21 +1123,27 @@ impl DesktopUpdater {
     pub async fn download_and_stage_update(
         info: &AvailableUpdateInfo,
         staging_root: &Path,
+        on_progress: impl FnMut(u64, Option<u64>, u8),
+    ) -> Result<PathBuf, String> {
+        Self::download_and_stage_update_with_options(
+            info,
+            staging_root,
+            &UpdaterNetworkOptions::default(),
+            on_progress,
+        )
+        .await
+    }
+
+    /// Resumably streams `info.asset_url` (with HTTP `206` Range resume, proxy/relay failover, and
+    /// per-chunk idle timeout recovery), validates SHA-256 if present, extracts the `.app` bundle,
+    /// and returns its staged path.
+    pub async fn download_and_stage_update_with_options(
+        info: &AvailableUpdateInfo,
+        staging_root: &Path,
+        opts: &UpdaterNetworkOptions,
         mut on_progress: impl FnMut(u64, Option<u64>, u8),
     ) -> Result<PathBuf, String> {
-        fs::create_dir_all(staging_root)
-            .map_err(|e| format!("Failed to create staging root {}: {e}", staging_root.display()))?;
-
-        let stage_dir = staging_root.join(format!(
-            "stage-{}-{}",
-            normalize_version_string(&info.version),
-            std::process::id()
-        ));
-        if stage_dir.exists() {
-            let _ = fs::remove_dir_all(&stage_dir);
-        }
-        fs::create_dir_all(&stage_dir)
-            .map_err(|e| format!("Failed to create staging directory: {e}"))?;
+        let stage_dir = prepare_stage_dir(staging_root, &info.version)?;
 
         let lower_url = info.asset_url.to_ascii_lowercase();
         let archive_ext = if lower_url.ends_with(".tar.gz") || lower_url.ends_with(".tgz") {
@@ -743,11 +1152,11 @@ impl DesktopUpdater {
             "zip"
         };
         let archive_path = stage_dir.join(format!("update.{archive_ext}"));
-
-        let mut hasher = Sha256::new();
-        let mut downloaded: u64 = 0;
+        let part_path = stage_dir.join(format!("update.{archive_ext}.part"));
+        let meta_path = stage_dir.join("download.meta.json");
 
         if let Some(src_path) = file_url_to_path(&info.asset_url) {
+            let _ = fs::remove_file(&part_path);
             let bytes = fs::read(&src_path).map_err(|e| {
                 format!(
                     "Failed to read local update archive {}: {e}",
@@ -755,52 +1164,319 @@ impl DesktopUpdater {
                 )
             })?;
             let total = Some(bytes.len() as u64);
-            hasher.update(&bytes);
-            downloaded = bytes.len() as u64;
             fs::write(&archive_path, &bytes)
                 .map_err(|e| format!("Failed to copy local update archive: {e}"))?;
-            on_progress(downloaded, total, 100);
+            save_stage_meta(&meta_path, info);
+            on_progress(bytes.len() as u64, total, 100);
         } else {
-            let client = build_http_client()?;
-            let resp = client
-                .get(&info.asset_url)
-                .send()
-                .await
-                .map_err(|e| format!("Failed downloading update archive: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("Download returned HTTP {}", resp.status()));
-            }
-            let total = resp.content_length().or(info.size_bytes);
-            let mut file = fs::File::create(&archive_path)
-                .map_err(|e| format!("Failed creating update archive file: {e}"))?;
-            let mut stream = resp.bytes_stream();
-            let mut last_pct: u8 = 0;
-            on_progress(0, total, 0);
-            while let Some(chunk_res) = stream.next().await {
-                let chunk = chunk_res
-                    .map_err(|e| format!("Stream error while downloading update: {e}"))?;
-                file.write_all(&chunk)
-                    .map_err(|e| format!("Disk write error while saving update: {e}"))?;
-                hasher.update(&chunk);
-                downloaded = downloaded.saturating_add(chunk.len() as u64);
-                let pct = match total {
-                    Some(t) if t > 0 => ((downloaded.saturating_mul(100)) / t).min(100) as u8,
-                    _ => 50,
+            // Reuse a verified complete archive already on disk if present.
+            if archive_path.is_file() {
+                let archive_len = fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+                let reuse_ok = if let Some(expected) = info.sha256.as_deref() {
+                    compute_file_sha256(&archive_path)
+                        .map(|h| h.eq_ignore_ascii_case(expected.trim()))
+                        .unwrap_or(false)
+                } else {
+                    stage_meta_matches(&meta_path, info)
+                        && info.size_bytes.is_some_and(|sz| sz > 0 && archive_len == sz)
                 };
-                if pct != last_pct {
-                    last_pct = pct;
-                    on_progress(downloaded, total, pct);
+                if reuse_ok {
+                    on_progress(archive_len, Some(archive_len), 100);
+                } else {
+                    let _ = fs::remove_file(&archive_path);
                 }
             }
-            file.sync_all()
-                .map_err(|e| format!("Failed flushing downloaded archive: {e}"))?;
-            on_progress(downloaded, total.or(Some(downloaded)), 100);
+
+            if !archive_path.is_file() {
+                let max_bytes = info.size_bytes.unwrap_or(u64::MAX);
+                let part_len = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                if !stage_meta_matches(&meta_path, info) || part_len > max_bytes {
+                    let _ = fs::remove_file(&part_path);
+                }
+                save_stage_meta(&meta_path, info);
+
+                // If a previous interrupted run already finished writing all expected bytes, promote it.
+                if part_path.is_file() {
+                    let cur_len = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                    if cur_len > 0 && info.size_bytes == Some(cur_len) {
+                        if let Some(expected) = info.sha256.as_deref() {
+                            if compute_file_sha256(&part_path)
+                                .is_ok_and(|h| h.eq_ignore_ascii_case(expected.trim()))
+                            {
+                                fs::rename(&part_path, &archive_path).map_err(|e| {
+                                    format!("Failed finalizing cached partial archive: {e}")
+                                })?;
+                                on_progress(cur_len, Some(cur_len), 100);
+                            } else {
+                                let _ = fs::remove_file(&part_path);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !archive_path.is_file() {
+                let candidates = resolve_download_candidates(info, opts);
+                let max_stalls = opts.max_stall_retries.unwrap_or(6).max(1);
+                let max_total_segments: usize = 64;
+                let chunk_timeout = opts.chunk_idle_timeout.unwrap_or(Duration::from_secs(45));
+                let fallback_direct = opts.proxy.as_ref().is_some_and(|p| p.fallback_to_direct);
+
+                let mut skipped_candidates: HashSet<usize> = HashSet::new();
+                let mut candidate_idx: usize = 0;
+                let mut consecutive_stalls: usize = 0;
+                let mut total_segments: usize = 0;
+                let mut use_proxy = opts.proxy.as_ref().is_some_and(|p| !p.is_direct());
+                let mut last_error: Option<String> = None;
+                let mut last_pct: u8 = 255;
+
+                while !archive_path.is_file() {
+                    if total_segments >= max_total_segments || consecutive_stalls >= max_stalls {
+                        return Err(last_error.unwrap_or_else(|| {
+                            "Update download stalled repeatedly across resume attempts".to_string()
+                        }));
+                    }
+                    if skipped_candidates.contains(&candidate_idx) {
+                        candidate_idx =
+                            next_active_candidate(candidate_idx, candidates.len(), &skipped_candidates);
+                    }
+                    total_segments += 1;
+
+                    let existing_len = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                    let client = build_download_http_client(opts, use_proxy)?;
+                    let url = &candidates[candidate_idx];
+                    let mut req = client
+                        .get(url)
+                        .header(reqwest::header::ACCEPT_ENCODING, "identity");
+                    if existing_len > 0 {
+                        req = req.header(reqwest::header::RANGE, format!("bytes={existing_len}-"));
+                    }
+
+                    let resp = match req.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = Some(format!(
+                                "Failed downloading update archive: {}",
+                                format_reqwest_error(&e)
+                            ));
+                            if use_proxy && fallback_direct {
+                                use_proxy = false;
+                            }
+                            candidate_idx = next_active_candidate(
+                                candidate_idx,
+                                candidates.len(),
+                                &skipped_candidates,
+                            );
+                            consecutive_stalls += 1;
+                            if consecutive_stalls < max_stalls && total_segments < max_total_segments
+                            {
+                                tokio::time::sleep(retry_backoff_delay(
+                                    consecutive_stalls,
+                                    chunk_timeout,
+                                ))
+                                .await;
+                            }
+                            continue;
+                        }
+                    };
+
+                    let status = resp.status();
+                    let is_mirror = candidates.len() > 1 && url != &info.asset_url;
+                    if is_mirror && matches!(status.as_u16(), 404 | 405 | 501) {
+                        skipped_candidates.insert(candidate_idx);
+                        candidate_idx = next_active_candidate(
+                            candidate_idx,
+                            candidates.len(),
+                            &skipped_candidates,
+                        );
+                        continue;
+                    }
+
+                    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                        if part_path.is_file() {
+                            if let Some(expected) = info.sha256.as_deref() {
+                                if compute_file_sha256(&part_path)
+                                    .is_ok_and(|h| h.eq_ignore_ascii_case(expected.trim()))
+                                {
+                                    fs::rename(&part_path, &archive_path).map_err(|e| {
+                                        format!("Failed finalizing downloaded archive: {e}")
+                                    })?;
+                                    let final_len = fs::metadata(&archive_path)
+                                        .map(|m| m.len())
+                                        .unwrap_or(existing_len);
+                                    on_progress(final_len, Some(final_len), 100);
+                                    break;
+                                }
+                            }
+                            let _ = fs::remove_file(&part_path);
+                        }
+                        last_error = Some(format!("Download returned HTTP {status}"));
+                        consecutive_stalls += 1;
+                        continue;
+                    }
+
+                    if !status.is_success() {
+                        last_error = Some(format!("Download returned HTTP {status}"));
+                        candidate_idx = next_active_candidate(
+                            candidate_idx,
+                            candidates.len(),
+                            &skipped_candidates,
+                        );
+                        consecutive_stalls += 1;
+                        if consecutive_stalls < max_stalls && total_segments < max_total_segments {
+                            tokio::time::sleep(retry_backoff_delay(
+                                consecutive_stalls,
+                                chunk_timeout,
+                            ))
+                            .await;
+                        }
+                        continue;
+                    }
+
+                    let (mut file, mut downloaded, total) =
+                        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                            let parsed_range = resp
+                                .headers()
+                                .get(reqwest::header::CONTENT_RANGE)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(parse_content_range);
+                            let Some((start, _end, cr_total)) = parsed_range else {
+                                let _ = fs::remove_file(&part_path);
+                                last_error = Some(
+                                    "Server returned 206 Partial Content without a valid Content-Range header".to_string(),
+                                );
+                                consecutive_stalls += 1;
+                                continue;
+                            };
+                            if existing_len == 0 || start != existing_len {
+                                let _ = fs::remove_file(&part_path);
+                                last_error = Some(format!(
+                                    "Server Content-Range offset mismatch (requested {existing_len}, got {start})"
+                                ));
+                                consecutive_stalls += 1;
+                                continue;
+                            }
+                            let file = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&part_path)
+                                .map_err(|e| format!("Failed opening partial archive for append: {e}"))?;
+                            let total = cr_total
+                                .or_else(|| {
+                                    resp.content_length()
+                                        .map(|cl| existing_len.saturating_add(cl))
+                                })
+                                .or(info.size_bytes);
+                            (file, existing_len, total)
+                        } else {
+                            let file = fs::File::create(&part_path)
+                                .map_err(|e| format!("Failed creating update archive file: {e}"))?;
+                            let total = resp.content_length().or(info.size_bytes);
+                            (file, 0, total)
+                        };
+
+                    let init_pct = compute_progress_pct(downloaded, total);
+                    if init_pct != last_pct {
+                        last_pct = init_pct;
+                        on_progress(downloaded, total, init_pct);
+                    }
+
+                    let mut stream = resp.bytes_stream();
+                    let mut bytes_this_segment: u64 = 0;
+                    let mut segment_err: Option<String> = None;
+
+                    loop {
+                        match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                            Ok(Some(Ok(chunk))) => {
+                                if !chunk.is_empty() {
+                                    file.write_all(&chunk).map_err(|e| {
+                                        format!("Disk write error while saving update: {e}")
+                                    })?;
+                                    downloaded = downloaded.saturating_add(chunk.len() as u64);
+                                    bytes_this_segment =
+                                        bytes_this_segment.saturating_add(chunk.len() as u64);
+                                    let pct = compute_progress_pct(downloaded, total);
+                                    if pct != last_pct {
+                                        last_pct = pct;
+                                        on_progress(downloaded, total, pct);
+                                    }
+                                }
+                            }
+                            Ok(Some(Err(e))) => {
+                                let _ = file.sync_data();
+                                segment_err = Some(format!(
+                                    "Stream error while downloading update: {}",
+                                    format_reqwest_error(&e)
+                                ));
+                                break;
+                            }
+                            Ok(None) => {
+                                file.sync_all().map_err(|e| {
+                                    format!("Failed flushing downloaded archive: {e}")
+                                })?;
+                                if let Some(exp_total) = total {
+                                    if downloaded < exp_total {
+                                        segment_err = Some(format!(
+                                            "Update stream ended early ({downloaded}/{exp_total} bytes)"
+                                        ));
+                                        break;
+                                    }
+                                }
+                                drop(file);
+                                fs::rename(&part_path, &archive_path).map_err(|e| {
+                                    format!("Failed finalizing downloaded archive: {e}")
+                                })?;
+                                on_progress(downloaded, total.or(Some(downloaded)), 100);
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = file.sync_data();
+                                segment_err = Some(format!(
+                                    "Stream error while downloading update: stalled for {}s without receiving data",
+                                    chunk_timeout.as_secs().max(1)
+                                ));
+                                break;
+                            }
+                        }
+                    }
+
+                    if archive_path.is_file() {
+                        break;
+                    }
+
+                    if let Some(err_msg) = segment_err {
+                        last_error = Some(err_msg);
+                        if bytes_this_segment >= 32 * 1024 {
+                            consecutive_stalls = 0;
+                        } else {
+                            consecutive_stalls += 1;
+                            if bytes_this_segment == 0 && use_proxy && fallback_direct {
+                                use_proxy = false;
+                            }
+                            candidate_idx = next_active_candidate(
+                                candidate_idx,
+                                candidates.len(),
+                                &skipped_candidates,
+                            );
+                            if consecutive_stalls < max_stalls && total_segments < max_total_segments
+                            {
+                                tokio::time::sleep(retry_backoff_delay(
+                                    consecutive_stalls,
+                                    chunk_timeout,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        let actual_hex = format!("{:x}", hasher.finalize());
         if let Some(expected) = info.sha256.as_deref() {
+            let actual_hex = compute_file_sha256(&archive_path)?;
             if !actual_hex.eq_ignore_ascii_case(expected.trim()) {
                 let _ = fs::remove_file(&archive_path);
+                let _ = fs::remove_file(&part_path);
                 return Err(format!(
                     "SHA-256 verification failed: expected {}, got {}",
                     expected, actual_hex
@@ -809,6 +1485,9 @@ impl DesktopUpdater {
         }
 
         let extract_dir = stage_dir.join("extracted");
+        if extract_dir.exists() {
+            let _ = fs::remove_dir_all(&extract_dir);
+        }
         fs::create_dir_all(&extract_dir)
             .map_err(|e| format!("Failed creating extraction dir: {e}"))?;
 
@@ -852,6 +1531,7 @@ impl DesktopUpdater {
         let staged_app = find_app_bundle_in_dir(&extract_dir)
             .ok_or_else(|| "Extracted update archive did not contain a valid .app bundle".to_string())?;
         verify_staged_app_bundle(&staged_app)?;
+        let _ = fs::remove_file(&archive_path);
         Ok(staged_app)
     }
 

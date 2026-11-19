@@ -10,7 +10,7 @@ Generates in dist/:
 4. Fabushi-{version}-macos-{arch}.zip (auto-update self-replacement archive)
 5. Fabushi-{version}-macos-{arch}.dmg (drag-to-Applications disk image, on macOS)
 6. Fabushi-{version}-macos-{arch}.pkg (click-to-install macOS installer, on macOS)
-7. latest-mac.json (in-app auto-updater manifest for bhrum/gpui-telegram GitHub Releases)
+7. latest-mac.json (in-app auto-updater manifest for bhrumom/gpui-telegram GitHub Releases)
 8. gpui_telegram_desktop-v{version}-macos-{arch}.tar.gz + universal_or_arm64 alias
 9. SHA256SUMS & RELEASE_NOTES.md
 
@@ -32,10 +32,11 @@ import subprocess
 import argparse
 import platform
 import tempfile
+import base64
 from pathlib import Path
 from datetime import datetime, timezone
 
-GITHUB_REPO = "bhrum/gpui-telegram"
+GITHUB_REPO = "bhrumom/gpui-telegram"
 
 
 def log(msg: str):
@@ -100,6 +101,30 @@ def parse_args():
         "--install-to-applications",
         action="store_true",
         help="Install the built Fabushi.app into /Applications and register with LaunchServices & Spotlight",
+    )
+    parser.add_argument(
+        "--sign-identity",
+        type=str,
+        default=os.environ.get("MACOS_CODESIGN_IDENTITY", "").strip() or None,
+        help="Developer ID Application signing identity (defaults to $MACOS_CODESIGN_IDENTITY)",
+    )
+    parser.add_argument(
+        "--installer-sign-identity",
+        type=str,
+        default=os.environ.get("MACOS_INSTALLER_IDENTITY", "").strip() or None,
+        help="Developer ID Installer signing identity for .pkg (defaults to $MACOS_INSTALLER_IDENTITY)",
+    )
+    parser.add_argument(
+        "--entitlements",
+        type=str,
+        default=os.environ.get("MACOS_ENTITLEMENTS", "").strip() or None,
+        help="Path to entitlements plist for hardened runtime signing",
+    )
+    parser.add_argument(
+        "--notarize",
+        action="store_true",
+        default=os.environ.get("APPLE_NOTARIZE", "").strip().lower() in ("1", "true", "yes"),
+        help="Submit signed macOS artifacts to Apple notarytool and staple tickets",
     )
     return parser.parse_args()
 
@@ -227,12 +252,56 @@ def generate_icns(repo_root: Path, output_icns: Path) -> bool:
         shutil.rmtree(temp_iconset, ignore_errors=True)
 
 
-def adhoc_codesign_bundle(app_dir: Path):
+def codesign_bundle(
+    app_dir: Path,
+    sign_identity: str | None = None,
+    entitlements: Path | None = None,
+):
     if platform.system() != "Darwin":
         return
     if shutil.which("xattr"):
         subprocess.run(["xattr", "-cr", str(app_dir)], check=False, capture_output=True)
-    if shutil.which("codesign"):
+    if not shutil.which("codesign"):
+        return
+
+    if sign_identity:
+        macos_dir = app_dir / "Contents" / "MacOS"
+        if macos_dir.is_dir():
+            for bin_item in sorted(macos_dir.iterdir()):
+                if bin_item.is_file() and os.access(bin_item, os.X_OK):
+                    cmd = [
+                        "codesign",
+                        "--force",
+                        "--options",
+                        "runtime",
+                        "--timestamp",
+                        "--sign",
+                        sign_identity,
+                    ]
+                    if entitlements and entitlements.is_file():
+                        cmd.extend(["--entitlements", str(entitlements)])
+                    cmd.append(str(bin_item))
+                    subprocess.run(cmd, check=True)
+
+        bundle_cmd = [
+            "codesign",
+            "--force",
+            "--options",
+            "runtime",
+            "--timestamp",
+            "--sign",
+            sign_identity,
+        ]
+        if entitlements and entitlements.is_file():
+            bundle_cmd.extend(["--entitlements", str(entitlements)])
+        bundle_cmd.append(str(app_dir))
+        subprocess.run(bundle_cmd, check=True)
+        subprocess.run(
+            ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_dir)],
+            check=True,
+        )
+        log(f"Developer ID signed & verified {app_dir.name} ({sign_identity})")
+    else:
         try:
             subprocess.run(
                 ["codesign", "--force", "--deep", "--sign", "-", str(app_dir)],
@@ -244,6 +313,97 @@ def adhoc_codesign_bundle(app_dir: Path):
             log(f"WARNING: codesign ad-hoc failed for {app_dir.name}: {e}")
 
 
+def resolve_notarytool_args(work_dir: Path) -> list[str]:
+    apple_id = os.environ.get("APPLE_ID", "").strip()
+    apple_team_id = (
+        os.environ.get("APPLE_TEAM_ID", "").strip()
+        or os.environ.get("APPLE_TEAM_ID_RESOLVED", "").strip()
+    )
+    apple_password = os.environ.get("APPLE_APP_SPECIFIC_PASSWORD", "").strip()
+
+    api_key_id = os.environ.get("APP_STORE_CONNECT_API_KEY_ID", "").strip()
+    api_issuer_id = os.environ.get("APP_STORE_CONNECT_API_ISSUER_ID", "").strip()
+    api_key_b64 = os.environ.get("APP_STORE_CONNECT_API_KEY_BASE64", "").strip()
+
+    if api_key_id and api_issuer_id and api_key_b64:
+        key_path = work_dir / f"AuthKey_{api_key_id}.p8"
+        key_bytes = base64.b64decode(api_key_b64)
+        key_path.write_bytes(key_bytes)
+        os.chmod(key_path, 0o600)
+        return ["--key", str(key_path), "--key-id", api_key_id, "--issuer", api_issuer_id]
+
+    if apple_id and apple_team_id and apple_password:
+        return ["--apple-id", apple_id, "--team-id", apple_team_id, "--password", apple_password]
+
+    raise RuntimeError(
+        "Apple notarization requested but credentials are missing. "
+        "Configure APP_STORE_CONNECT_API_KEY_ID/ISSUER_ID/BASE64 or APPLE_ID/APPLE_TEAM_ID/APPLE_APP_SPECIFIC_PASSWORD."
+    )
+
+
+def notarize_and_staple_target(target_path: Path, is_app_bundle: bool = False):
+    """Submits a .app (via temporary ditto zip), .dmg, or .pkg to Apple notarytool and staples the ticket."""
+    if platform.system() != "Darwin":
+        return
+
+    work_dir = Path(tempfile.mkdtemp(prefix="fabushi-notary-"))
+    try:
+        auth_args = resolve_notarytool_args(work_dir)
+        submit_file = target_path
+        if is_app_bundle:
+            submit_file = work_dir / f"{target_path.stem}.zip"
+            subprocess.run(
+                [
+                    "ditto",
+                    "-c",
+                    "-k",
+                    "--sequesterRsrc",
+                    "--keepParent",
+                    str(target_path),
+                    str(submit_file),
+                ],
+                check=True,
+            )
+
+        log(f"Submitting {submit_file.name} to Apple notarytool...")
+        res = subprocess.run(
+            [
+                "xcrun",
+                "notarytool",
+                "submit",
+                str(submit_file),
+                *auth_args,
+                "--wait",
+                "--output-format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            log(f"ERROR: notarytool submit failed for {target_path.name}:\n{res.stdout}\n{res.stderr}")
+            raise RuntimeError(f"notarytool submit failed for {target_path.name}")
+
+        payload = json.loads(res.stdout)
+        status = payload.get("status")
+        submission_id = payload.get("id", "unknown")
+        log(f"notarytool result for {target_path.name}: status={status} id={submission_id}")
+        if status != "Accepted":
+            log_res = subprocess.run(
+                ["xcrun", "notarytool", "log", submission_id, *auth_args],
+                capture_output=True,
+                text=True,
+            )
+            log(f"notarytool rejection log:\n{log_res.stdout}\n{log_res.stderr}")
+            raise RuntimeError(f"Apple notarization rejected {target_path.name}: {payload}")
+
+        subprocess.run(["xcrun", "stapler", "staple", "-v", str(target_path)], check=True)
+        subprocess.run(["xcrun", "stapler", "validate", "-v", str(target_path)], check=True)
+        log(f"Stapled & validated Apple notarization ticket on {target_path.name}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def build_macos_app_bundle(
     repo_root: Path,
     dist_dir: Path,
@@ -252,6 +412,8 @@ def build_macos_app_bundle(
     app_name: str,
     bundle_id: str,
     version: str,
+    sign_identity: str | None = None,
+    entitlements: Path | None = None,
 ) -> Path:
     app_dir = dist_dir / f"{app_name}.app"
     contents_dir = app_dir / "Contents"
@@ -305,6 +467,10 @@ def build_macos_app_bundle(
     <string>NSApplication</string>
     <key>NSRequiresAquaSystemAppearance</key>
     <false/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Fabushi needs microphone access for voice messages and calls.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Fabushi needs camera access for video calls and media capture.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Fabushi Contributors. Apache-2.0.</string>
     <key>CFBundleURLTypes</key>
@@ -351,13 +517,110 @@ def build_macos_app_bundle(
         )
         log(f"Bundled desktop assets into {dest_assets}")
 
-    # 5. Ad-hoc codesign on macOS
-    adhoc_codesign_bundle(app_dir)
+    # 5. Sign app bundle (Developer ID hardened runtime if configured, else ad-hoc)
+    codesign_bundle(app_dir, sign_identity=sign_identity, entitlements=entitlements)
     log(f"Successfully constructed macOS App Bundle: {app_dir}")
     return app_dir
 
 
-def mirror_compat_bundle(primary_app: Path, dist_dir: Path, compat_name: str = "GPUI Telegram") -> Path:
+def build_macos_installer_app(
+    repo_root: Path,
+    dist_dir: Path,
+    app_name: str,
+    bundle_id: str,
+    version: str,
+    sign_identity: str | None = None,
+) -> Path | None:
+    """Builds a native Swift/AppKit 1-click installer wizard app ('Install Fabushi.app') for the DMG."""
+    if platform.system() != "Darwin":
+        return None
+    swift_src = repo_root / "scripts" / "macos" / "FabushiInstaller.swift"
+    swiftc_bin = shutil.which("swiftc")
+    if not swift_src.is_file() or not swiftc_bin:
+        log("FabushiInstaller.swift or swiftc unavailable; skipping native installer wizard app.")
+        return None
+
+    installer_name = f"Install {app_name}"
+    installer_app = dist_dir / f"{installer_name}.app"
+    if installer_app.exists():
+        shutil.rmtree(installer_app)
+
+    contents_dir = installer_app / "Contents"
+    macos_dir = contents_dir / "MacOS"
+    resources_dir = contents_dir / "Resources"
+    macos_dir.mkdir(parents=True, exist_ok=True)
+    resources_dir.mkdir(parents=True, exist_ok=True)
+
+    exec_name = "FabushiInstaller"
+    dest_bin = macos_dir / exec_name
+    log(f"Compiling native macOS installer wizard: {installer_app.name}...")
+    subprocess.run(
+        [
+            swiftc_bin,
+            "-O",
+            "-framework",
+            "Cocoa",
+            str(swift_src),
+            "-o",
+            str(dest_bin),
+        ],
+        check=True,
+    )
+    os.chmod(dest_bin, 0o755)
+
+    installer_bundle_id = f"{bundle_id}.installer"
+    info_plist = contents_dir / "Info.plist"
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>{installer_name}</string>
+    <key>CFBundleDisplayName</key>
+    <string>{installer_name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>{installer_bundle_id}</string>
+    <key>CFBundleVersion</key>
+    <string>{version}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>{version}</string>
+    <key>CFBundleExecutable</key>
+    <string>{exec_name}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
+"""
+    info_plist.write_text(plist_content, encoding="utf-8")
+    os.chmod(info_plist, 0o644)
+
+    pkg_info = contents_dir / "PkgInfo"
+    pkg_info.write_bytes(b"APPL????\n")
+    os.chmod(pkg_info, 0o644)
+
+    generate_icns(repo_root, resources_dir / "AppIcon.icns")
+    codesign_bundle(installer_app, sign_identity=sign_identity, entitlements=None)
+    log(f"Successfully constructed native installer wizard: {installer_app}")
+    return installer_app
+
+
+def mirror_compat_bundle(
+    primary_app: Path,
+    dist_dir: Path,
+    compat_name: str = "GPUI Telegram",
+    sign_identity: str | None = None,
+    entitlements: Path | None = None,
+) -> Path:
     """Maintains dist/GPUI Telegram.app mirror for existing CI & evidence verification scripts."""
     compat_app = dist_dir / f"{compat_name}.app"
     if compat_app == primary_app:
@@ -368,7 +631,8 @@ def mirror_compat_bundle(primary_app: Path, dist_dir: Path, compat_name: str = "
         subprocess.run(["ditto", str(primary_app), str(compat_app)], check=True)
     else:
         shutil.copytree(primary_app, compat_app, symlinks=True)
-    adhoc_codesign_bundle(compat_app)
+    if not sign_identity:
+        codesign_bundle(compat_app, sign_identity=None, entitlements=entitlements)
     log(f"Mirrored compatibility bundle: {compat_app}")
     return compat_app
 
@@ -416,7 +680,16 @@ def create_app_zip(dist_dir: Path, app_dir: Path, app_name: str, version: str, a
     return zip_path
 
 
-def create_macos_dmg(dist_dir: Path, app_dir: Path, app_name: str, version: str, arch: str) -> Path | None:
+def create_macos_dmg(
+    dist_dir: Path,
+    app_dir: Path,
+    app_name: str,
+    version: str,
+    arch: str,
+    installer_app: Path | None = None,
+    sign_identity: str | None = None,
+    notarize: bool = False,
+) -> Path | None:
     if platform.system() != "Darwin" or not shutil.which("hdiutil"):
         log("hdiutil unavailable on this host, skipping .dmg creation.")
         return None
@@ -431,6 +704,14 @@ def create_macos_dmg(dist_dir: Path, app_dir: Path, app_name: str, version: str,
             subprocess.run(["ditto", str(app_dir), str(staged_app)], check=True)
         else:
             shutil.copytree(app_dir, staged_app, symlinks=True)
+
+        if installer_app and installer_app.exists():
+            staged_installer = stage_dir / installer_app.name
+            if shutil.which("ditto"):
+                subprocess.run(["ditto", str(installer_app), str(staged_installer)], check=True)
+            else:
+                shutil.copytree(installer_app, staged_installer, symlinks=True)
+
         os.symlink("/Applications", stage_dir / "Applications")
 
         subprocess.run(
@@ -450,6 +731,24 @@ def create_macos_dmg(dist_dir: Path, app_dir: Path, app_name: str, version: str,
             capture_output=True,
         )
         os.chmod(dmg_path, 0o644)
+
+        if sign_identity and shutil.which("codesign"):
+            subprocess.run(
+                [
+                    "codesign",
+                    "--force",
+                    "--timestamp",
+                    "--sign",
+                    sign_identity,
+                    str(dmg_path),
+                ],
+                check=True,
+            )
+            log(f"Developer ID signed macOS DMG: {dmg_path.name}")
+
+        if notarize:
+            notarize_and_staple_target(dmg_path, is_app_bundle=False)
+
         log(f"Created macOS DMG installer: {dmg_path} ({dmg_path.stat().st_size} bytes)")
         return dmg_path
     finally:
@@ -463,10 +762,19 @@ def create_macos_pkg(
     bundle_id: str,
     version: str,
     arch: str,
+    installer_sign_identity: str | None = None,
+    notarize: bool = False,
 ) -> Path | None:
     if platform.system() != "Darwin" or not shutil.which("pkgbuild"):
         log("pkgbuild unavailable on this host, skipping .pkg creation.")
         return None
+    if notarize and not installer_sign_identity:
+        log(
+            "Skipping unsigned .pkg in notarized release mode (no Developer ID Installer certificate in keychain). "
+            "Users should install via the signed & notarized .dmg (includes 1-click Install Fabushi.app)."
+        )
+        return None
+
     pkg_path = dist_dir / f"{app_name}-{version}-macos-{arch}.pkg"
     if pkg_path.exists():
         pkg_path.unlink()
@@ -478,10 +786,31 @@ def create_macos_pkg(
         apps_dir.mkdir(parents=True, exist_ok=True)
         staged_app = apps_dir / app_dir.name
         if shutil.which("ditto"):
-            subprocess.run(["ditto", "--norsrc", str(app_dir), str(staged_app)], check=True)
+            subprocess.run(["ditto", str(app_dir), str(staged_app)], check=True)
         else:
             shutil.copytree(app_dir, staged_app, symlinks=True)
-        adhoc_codesign_bundle(staged_app)
+
+        # Post-install script: register in LaunchServices & open Fabushi for the active GUI user
+        scripts_dir = work_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        postinstall = scripts_dir / "postinstall"
+        postinstall.write_text(
+            f"""#!/bin/bash
+set -euo pipefail
+APP_PATH="/Applications/{app_name}.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+if [ -x "$LSREGISTER" ]; then
+  "$LSREGISTER" -f "$APP_PATH" || true
+fi
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
+  sudo -u "$CONSOLE_USER" /usr/bin/open -a "$APP_PATH" || true
+fi
+exit 0
+""",
+            encoding="utf-8",
+        )
+        os.chmod(postinstall, 0o755)
 
         comp_plist = work_dir / "components.plist"
         subprocess.run(
@@ -508,6 +837,8 @@ def create_macos_pkg(
                 str(pkg_root),
                 "--component-plist",
                 str(comp_plist),
+                "--scripts",
+                str(scripts_dir),
                 "--identifier",
                 bundle_id,
                 "--version",
@@ -522,13 +853,12 @@ def create_macos_pkg(
         )
 
         if shutil.which("productbuild"):
+            prod_cmd = ["productbuild", "--package", str(comp_pkg)]
+            if installer_sign_identity:
+                prod_cmd.extend(["--sign", installer_sign_identity, "--timestamp"])
+            prod_cmd.append(str(pkg_path))
             subprocess.run(
-                [
-                    "productbuild",
-                    "--package",
-                    str(comp_pkg),
-                    str(pkg_path),
-                ],
+                prod_cmd,
                 check=True,
                 capture_output=True,
                 env=pkg_env,
@@ -537,6 +867,10 @@ def create_macos_pkg(
             shutil.copy2(comp_pkg, pkg_path)
 
         os.chmod(pkg_path, 0o644)
+
+        if notarize and installer_sign_identity:
+            notarize_and_staple_target(pkg_path, is_app_bundle=False)
+
         log(f"Created macOS PKG click-to-install package: {pkg_path} ({pkg_path.stat().st_size} bytes)")
         return pkg_path
     finally:
@@ -722,7 +1056,7 @@ def install_to_applications(app_dir: Path, app_name: str):
     else:
         shutil.copytree(app_dir, target_app, symlinks=True)
 
-    adhoc_codesign_bundle(target_app)
+    codesign_bundle(target_app, sign_identity=None)
 
     lsregister = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
     if Path(lsregister).exists():
@@ -776,7 +1110,15 @@ def main():
     # Step 4: Package standalone binary
     package_standalone_bin(dist_dir, release_bin, args.binary_name)
 
-    # Step 5: Package primary Fabushi.app + compatibility GPUI Telegram.app mirror
+    # Step 5: Package primary Fabushi.app + native Install Fabushi.app wizard
+    entitlements_path = (
+        Path(args.entitlements).resolve()
+        if args.entitlements
+        else (repo_root / "scripts" / "macos" / "entitlements.plist")
+    )
+    if not entitlements_path.is_file():
+        entitlements_path = None
+
     app_dir = build_macos_app_bundle(
         repo_root=repo_root,
         dist_dir=dist_dir,
@@ -785,16 +1127,66 @@ def main():
         app_name=args.app_name,
         bundle_id=args.bundle_id,
         version=version,
+        sign_identity=args.sign_identity,
+        entitlements=entitlements_path,
     )
-    compat_dir = mirror_compat_bundle(app_dir, dist_dir, "GPUI Telegram")
+    installer_app = build_macos_installer_app(
+        repo_root=repo_root,
+        dist_dir=dist_dir,
+        app_name=args.app_name,
+        bundle_id=args.bundle_id,
+        version=version,
+        sign_identity=args.sign_identity,
+    )
+
+    if args.notarize and platform.system() == "Darwin":
+        if not args.sign_identity:
+            raise RuntimeError("--notarize requires --sign-identity / MACOS_CODESIGN_IDENTITY")
+        notarize_and_staple_target(app_dir, is_app_bundle=True)
+        subprocess.run(
+            ["spctl", "--assess", "--type", "execute", "--verbose=4", str(app_dir)],
+            check=True,
+        )
+        if installer_app and installer_app.exists():
+            notarize_and_staple_target(installer_app, is_app_bundle=True)
+            subprocess.run(
+                ["spctl", "--assess", "--type", "execute", "--verbose=4", str(installer_app)],
+                check=True,
+            )
+
+    compat_dir = mirror_compat_bundle(
+        app_dir,
+        dist_dir,
+        "GPUI Telegram",
+        sign_identity=args.sign_identity,
+        entitlements=entitlements_path,
+    )
 
     # Step 6: Generate Release Notes
     notes_file = generate_release_notes(dist_dir, args.app_name, version, git_commit, arch)
 
     # Step 7: Create ZIP, DMG, PKG & latest-mac.json
     zip_path = create_app_zip(dist_dir, app_dir, args.app_name, version, arch)
-    dmg_path = create_macos_dmg(dist_dir, app_dir, args.app_name, version, arch)
-    pkg_path = create_macos_pkg(dist_dir, app_dir, args.app_name, args.bundle_id, version, arch)
+    dmg_path = create_macos_dmg(
+        dist_dir,
+        app_dir,
+        args.app_name,
+        version,
+        arch,
+        installer_app=installer_app,
+        sign_identity=args.sign_identity,
+        notarize=args.notarize,
+    )
+    pkg_path = create_macos_pkg(
+        dist_dir,
+        app_dir,
+        args.app_name,
+        args.bundle_id,
+        version,
+        arch,
+        installer_sign_identity=args.installer_sign_identity,
+        notarize=args.notarize,
+    )
     generate_latest_mac_manifest(dist_dir, version, arch, zip_path, dmg_path, pkg_path)
 
     # Step 8: Create legacy Release Tarball Archives (preserving CI compatibility)
