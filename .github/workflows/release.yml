@@ -263,6 +263,9 @@ jobs:
   release-windows-x86_64:
     name: Build Windows x86_64 Installer & Portable Archive (16-CGU ThinLTO)
     runs-on: windows-latest
+    env:
+      RUSTC_WRAPPER: ""
+      SCCACHE_GHA_ENABLED: "false"
     steps:
       - uses: actions/checkout@v4
       - name: Setup Protobuf Compiler (protoc)
@@ -275,7 +278,6 @@ jobs:
             choco install innosetup -y --no-progress
           }
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -288,7 +290,6 @@ jobs:
           VERSION="${TAG_NAME#v}"
           cargo build --release --bin gpui_telegram_desktop --bin gpui_telegram_server --bin gpui-tg-cli
           python scripts/package_windows.py --version "$VERSION" --require-installer
-          sccache --show-stats || true
       - name: Smoke Test Windows Release Artifacts
         shell: bash
         run: |
