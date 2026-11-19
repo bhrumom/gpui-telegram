@@ -2549,3 +2549,90 @@ async fn headless_body_altery_inline_webapp_custom_url_and_live_bot_pin_banner(a
     .expect("assert custom_url sent and resolved with #tgWebAppData");
 }
 
+#[test]
+fn test_bot_attach_webview_webmcp_dispatch_takeover_and_bridge_response() {
+    use gpui_telegram_desktop::components::bots::bot_attach_web_view::{
+        BotAttachWebView, BotWebViewPendingAction,
+    };
+    use gpui_telegram_proto::miniapp_contracts::{MiniAppControlMode, MiniAppWebMcpCommand};
+
+    let prev_offline = std::env::var_os("GPUI_OFFLINE_TEST");
+    unsafe {
+        std::env::set_var("GPUI_OFFLINE_TEST", "1");
+    }
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("GPUI_OFFLINE_TEST", v),
+                    None => std::env::remove_var("GPUI_OFFLINE_TEST"),
+                }
+            }
+        }
+    }
+    let _env_guard = RestoreEnv(prev_offline);
+
+    let mut wv = BotAttachWebView::new();
+    wv.bot_username = "fabushi_bot".to_string();
+    wv.bot_id = 777001;
+    wv.ui_schema.title = "全球法布施".to_string();
+    wv.is_floating_pip = true;
+    wv.disclaimer_accepted = true;
+
+    // 1. Dispatch a WebMCP call_tool command -> enters AiControlling and emits WebMcpResponseReady in headless fallback
+    wv.dispatch_webmcp_command(MiniAppWebMcpCommand {
+        request_id: "req_wmcp_1".to_string(),
+        bot_username: "fabushi_bot".to_string(),
+        short_name: "fabushi".to_string(),
+        chat_id: 100,
+        bot_user_id: 777001,
+        app_title: "全球法布施".to_string(),
+        operation: "call_tool".to_string(),
+        tool_name: Some("fabushi_send_dharma".to_string()),
+        arguments: serde_json::json!({ "sutra": "金刚经" }),
+        status_message: Some("AI 正在发送金刚经".to_string()),
+    });
+    assert_eq!(wv.control_mode, MiniAppControlMode::AiControlling);
+    assert_eq!(wv.active_webmcp_tool.as_deref(), Some("fabushi_send_dharma"));
+    let pending = wv.take_pending_actions();
+    assert!(matches!(
+        pending.as_slice(),
+        [BotWebViewPendingAction::WebMcpResponseReady(resp)]
+            if resp.request_id == "req_wmcp_1" && resp.ok
+    ));
+
+    // 2. Simulate live bridge webmcp_response event from JS
+    wv.handle_bridge_event(
+        "webmcp_response",
+        r#"{"request_id":"req_live_2","ok":true,"result":{"sent":true},"tools":[],"state_summary":{"sutra":"心经"},"control_mode":"ai_controlling"}"#,
+    );
+    assert_eq!(
+        wv.last_webmcp_state_summary.as_ref().and_then(|v| v["sutra"].as_str()),
+        Some("心经")
+    );
+    let bridge_pending = wv.take_pending_actions();
+    assert!(matches!(
+        bridge_pending.as_slice(),
+        [BotWebViewPendingAction::WebMcpResponseReady(resp)]
+            if resp.request_id == "req_live_2" && resp.ok
+    ));
+
+    // 3. Request human takeover -> opens overlay and transitions to WaitingForTakeover
+    wv.dispatch_webmcp_command(MiniAppWebMcpCommand {
+        request_id: "req_take_3".to_string(),
+        bot_username: "fabushi_bot".to_string(),
+        short_name: "fabushi".to_string(),
+        chat_id: 100,
+        bot_user_id: 777001,
+        app_title: "全球法布施".to_string(),
+        operation: "request_takeover".to_string(),
+        tool_name: None,
+        arguments: serde_json::json!({ "reason": "请扫码登录" }),
+        status_message: Some("请扫码登录".to_string()),
+    });
+    assert_eq!(wv.control_mode, MiniAppControlMode::WaitingForTakeover);
+    assert!(wv.is_open);
+    assert!(!wv.is_floating_pip);
+}
+

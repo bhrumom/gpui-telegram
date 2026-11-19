@@ -90,6 +90,7 @@ fn test_conversation_stage_demo_messages_cover_11_canonical_cards() {
             MessageContent::Invoice { .. } => has_invoice = true,
             MessageContent::BotKeyboard { .. } => has_bot_keyboard = true,
             MessageContent::GenerativeCard(_) => {}
+            MessageContent::LocalBotAssistCard(_) => {}
         }
         if msg.bot_keyboard.is_some() {
             has_bot_keyboard = true;
@@ -1524,4 +1525,31 @@ fn test_unified_sidebar_collapsed_constants() {
     assert!((nav_rail::NAV_RAIL_WIDTH - 52.0).abs() < f32::EPSILON);
     assert!((chat_sidebar::DEFAULT_WIDTH - 288.0).abs() < f32::EPSILON);
     assert!((chat_sidebar::COLLAPSED_WIDTH - 64.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn test_conversation_stage_bot_thinking_avatar_activity_lifecycle_and_chat_switch_reset() {
+    let mut stage = gpui_telegram_desktop::views::ConversationStage::new();
+    stage.set_chat(777, "全球法布施", "bot", "法", 0x2AABEE);
+    stage.is_bot_chat = true;
+    assert_eq!(stage.bot_activity_state, "idle");
+
+    stage.set_bot_activity("thinking", Some("正在分析意图...".to_string()));
+    assert_eq!(stage.bot_activity_state, "thinking");
+    assert_eq!(stage.bot_activity_detail.as_deref(), Some("正在分析意图..."));
+
+    stage.set_bot_activity("tool", Some("fabushi_send_dharma".to_string()));
+    assert_eq!(stage.bot_activity_state, "tool");
+    assert_eq!(stage.bot_activity_detail.as_deref(), Some("fabushi_send_dharma"));
+
+    stage.set_bot_activity("idle", None);
+    assert_eq!(stage.bot_activity_state, "idle");
+    assert!(stage.bot_activity_detail.is_none());
+
+    // Switching to another chat resets bot activity & bot flag cleanly
+    stage.set_bot_activity("thinking", Some("正在思考".to_string()));
+    stage.set_chat(888, "Alice", "online", "AL", 0x5588EE);
+    assert!(!stage.is_bot_chat);
+    assert_eq!(stage.bot_activity_state, "idle");
+    assert!(stage.bot_activity_detail.is_none());
 }

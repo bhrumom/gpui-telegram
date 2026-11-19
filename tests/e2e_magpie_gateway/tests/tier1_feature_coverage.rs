@@ -720,7 +720,8 @@ fn test_tier1_usage_session_affinity_ttl() {
 #[tokio::test]
 async fn test_tier1_usage_jsonl_ledger_persistence() {
     let (_dir, state, _router) = boot_test_server();
-    let store = state.hermes.store();
+    let core = state.fabushi_core();
+    let store = core.store();
 
     // Create session and record message turns
     let session = store

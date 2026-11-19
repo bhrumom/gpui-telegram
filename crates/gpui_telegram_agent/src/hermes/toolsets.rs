@@ -177,7 +177,7 @@ impl ToolsetId {
             Self::Vision => "Multimodal image inspection and metadata probing",
             Self::ImageGen => "Image generation via provider APIs or deterministic local synthesis",
             Self::VideoGen => "Video generation adapter and storyboard synthesis",
-            Self::Browser => "Chrome DevTools Protocol browser navigation, snapshot, click, type, screenshot",
+            Self::Browser => "Pure Obscura stealth headless browser navigation, redacted DOM snapshot, zero-knowledge Vault login/fill, QR polling, and click captcha assist",
             Self::AudioTts => "Text-to-speech synthesis with local PCM/RIFF WAVE fallback",
             Self::AudioStt => "Speech-to-text transcription and WAV audio inspection",
             Self::Cronjob => "Scheduled recurring automation jobs, history, and immediate triggers",
@@ -897,6 +897,7 @@ pub struct HermesToolContext {
     pub platform_im_bridge: Option<Arc<dyn PlatformImBridge>>,
     pub http_client: reqwest::Client,
     pub browser_cdp_url: Option<String>,
+    pub bot_browser: Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>>,
     pub terminal_backend: TerminalBackendConfig,
 }
 
@@ -937,6 +938,7 @@ impl HermesToolContext {
             platform_im_bridge: None,
             http_client,
             browser_cdp_url: std::env::var("HERMES_BROWSER_CDP_URL").ok(),
+            bot_browser: None,
             terminal_backend: TerminalBackendConfig::default(),
         }
     }
@@ -1016,6 +1018,14 @@ impl HermesToolContext {
         self
     }
 
+    pub fn with_bot_browser(
+        mut self,
+        orchestrator: Arc<bot_browser::orchestrator::BotBrowserOrchestrator>,
+    ) -> Self {
+        self.bot_browser = Some(orchestrator);
+        self
+    }
+
     pub fn cancel(&self) {
         self.cancellation.store(true, Ordering::SeqCst);
     }
@@ -1057,7 +1067,7 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "toolset_list",
             ToolsetId::Core,
-            "List all 28 Hermes toolsets, their enabled status, and included tools.",
+            "List all Fabushi toolsets, their enabled status, and included tools.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1070,7 +1080,7 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "toolset_enable",
             ToolsetId::Core,
-            "Enable a Hermes toolset, preset bundle, or custom toolset by name.",
+            "Enable a Fabushi toolset, preset bundle, or custom toolset by name.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1341,7 +1351,7 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             ToolRiskLevel::High,
             false,
         ),
-        // 5. Web & Browser (7)
+        // 5. Web & Pure Obscura Browser + Zero-Knowledge Vault / Assist (12)
         HermesToolSpec::new(
             "web_search",
             ToolsetId::Web,
@@ -1378,11 +1388,12 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "browser_navigate",
             ToolsetId::Browser,
-            "Navigate a Chrome DevTools Protocol (CDP) browser tab to a URL.",
+            "Navigate the Obscura headless browser session to an http/https URL.",
             json!({
                 "type": "object",
                 "properties": {
                     "url": { "type": "string" },
+                    "session_id": { "type": "string" },
                     "cdp_url": { "type": "string" }
                 },
                 "required": ["url"]
@@ -1393,10 +1404,11 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "browser_snapshot",
             ToolsetId::Browser,
-            "Capture DOM accessibility/text snapshot of the active CDP browser tab.",
+            "Capture a redacted DOM accessibility/text snapshot of the active Obscura browser session (password/OTP input values are forced to [REDACTED]).",
             json!({
                 "type": "object",
                 "properties": {
+                    "session_id": { "type": "string" },
                     "cdp_url": { "type": "string" },
                     "selector": { "type": "string" }
                 }
@@ -1407,10 +1419,11 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "browser_click",
             ToolsetId::Browser,
-            "Click an element by CSS selector or coordinates in the active CDP browser tab.",
+            "Click an element by CSS selector or page coordinates in the active Obscura browser session.",
             json!({
                 "type": "object",
                 "properties": {
+                    "session_id": { "type": "string" },
                     "selector": { "type": "string" },
                     "x": { "type": "number" },
                     "y": { "type": "number" },
@@ -1423,10 +1436,11 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "browser_type",
             ToolsetId::Browser,
-            "Type text into a focused or selected element in the active CDP browser tab.",
+            "Type non-secret text into a focused or selected element in the active Obscura browser session (refuses password/OTP fields; use vault_request_card / vault_fill for credentials).",
             json!({
                 "type": "object",
                 "properties": {
+                    "session_id": { "type": "string" },
                     "text": { "type": "string" },
                     "selector": { "type": "string" },
                     "submit": { "type": "boolean" },
@@ -1440,10 +1454,11 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "browser_screenshot",
             ToolsetId::Browser,
-            "Capture a PNG screenshot of the active CDP browser tab.",
+            "Capture a PNG screenshot of the active Obscura browser session.",
             json!({
                 "type": "object",
                 "properties": {
+                    "session_id": { "type": "string" },
                     "full_page": { "type": "boolean" },
                     "output_path": { "type": "string" },
                     "cdp_url": { "type": "string" }
@@ -1451,6 +1466,113 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             }),
             ToolRiskLevel::ReadOnly,
             true,
+        ),
+        HermesToolSpec::new(
+            "vault_list",
+            ToolsetId::Browser,
+            "List non-secret credential metadata (credential_id, origin, account_hint, has_totp, reuse_policy) stored in the Vault for the active page's true origin. Never returns plaintext secrets.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                }
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "vault_request_card",
+            ToolsetId::Browser,
+            "Emit a local-only GPUI secure login card so the user can enter username, password, and optional TOTP secret directly into the encrypted Vault without revealing secrets to the AI.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string" },
+                    "site_title": { "type": "string" },
+                    "username_selector": { "type": "string" },
+                    "password_selector": { "type": "string" },
+                    "totp_selector": { "type": "string" },
+                    "submit_selector": { "type": "string" },
+                    "selectors": {
+                        "type": "object",
+                        "properties": {
+                            "username_selector": { "type": "string" },
+                            "password_selector": { "type": "string" },
+                            "totp_selector": { "type": "string" },
+                            "submit_selector": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["username_selector", "password_selector"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
+        ),
+        HermesToolSpec::new(
+            "vault_fill",
+            ToolsetId::Browser,
+            "Atomically decrypt and inject Vault credentials (plus optional auto-computed TOTP) directly via CDP Input.insertText after strict origin verification and reuse confirmation. Never exposes secrets to the AI.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string" },
+                    "credential_id": { "type": "string" },
+                    "username_selector": { "type": "string" },
+                    "password_selector": { "type": "string" },
+                    "totp_selector": { "type": "string" },
+                    "submit_selector": { "type": "string" },
+                    "selectors": {
+                        "type": "object",
+                        "properties": {
+                            "username_selector": { "type": "string" },
+                            "password_selector": { "type": "string" },
+                            "totp_selector": { "type": "string" },
+                            "submit_selector": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["credential_id", "username_selector", "password_selector"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
+        ),
+        HermesToolSpec::new(
+            "human_assist_qr",
+            ToolsetId::Browser,
+            "Crop a login QR code element, display it on a local GPUI card, silently refresh every 3s, and resolve automatically when the page redirects or auth cookies appear.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string" },
+                    "qr_selector": { "type": "string" },
+                    "success_url_contains": { "type": "string" },
+                    "auth_cookie_names": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["qr_selector"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
+        ),
+        HermesToolSpec::new(
+            "human_assist_click",
+            ToolsetId::Browser,
+            "Crop a captcha or verification element, display it on a local GPUI click card, wait for user clicks, and dispatch scaled page coordinates.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string" },
+                    "target_selector": { "type": "string" },
+                    "instruction": { "type": "string" },
+                    "max_clicks": { "type": "integer", "minimum": 1, "maximum": 16 }
+                },
+                "required": ["target_selector", "instruction"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
         ),
         // 6. Audio, Voice, Vision, ImageGen, VideoGen (6)
         HermesToolSpec::new(
@@ -2434,7 +2556,7 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
                 "type": "object",
                 "properties": {
                     "chat_id": { "type": "integer" },
-                    "poll_id": { "type": "string", "description": "Poll identifier (string or numeric poll ID)." },
+                    "poll_id": { "type": ["string", "integer"], "description": "Poll identifier (string or numeric poll ID)." },
                     "option_ids": { "type": "array", "items": { "type": "integer" } },
                     "option_index": { "type": "integer" }
                 },
@@ -2477,6 +2599,72 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
                     "query_id": { "type": "string" }
                 },
                 "required": ["bot_username", "short_name", "action_type"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
+        ),
+        HermesToolSpec::new(
+            "webmcp_list_miniapps",
+            ToolsetId::PlatformIm,
+            "List available or published Mini Apps across the platform (not limited to the current bot) with bot_username, short_name, title, and web_url.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Optional search keyword to filter Mini Apps." }
+                }
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "webmcp_discover",
+            ToolsetId::PlatformIm,
+            "Open or attach any Mini App in the user's real-time floating window, discover all live WebMCP tools (navigator.modelContext + universal page controls), and read its current live state.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "bot_username": { "type": "string", "description": "Optional bot username; defaults to the active companion bot's Mini App." },
+                    "short_name": { "type": "string", "description": "Optional Mini App short_name; defaults to the bot's primary Mini App." },
+                    "chat_id": { "type": "integer" },
+                    "start_param": { "type": "string" }
+                }
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "webmcp_call_tool",
+            ToolsetId::PlatformIm,
+            "Execute a WebMCP tool in real time on a Mini App (live floating WebView or server fallback), returning verified execution output and live state.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "bot_username": { "type": "string", "description": "Optional bot username; defaults to the active companion bot's Mini App." },
+                    "short_name": { "type": "string", "description": "Optional Mini App short_name; defaults to the bot's primary Mini App." },
+                    "tool_name": { "type": "string" },
+                    "arguments": { "type": "object" },
+                    "status_message": { "type": "string", "description": "Short Chinese/user-language progress status displayed in the Mini App floating window." },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": ["tool_name"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
+        ),
+        HermesToolSpec::new(
+            "miniapp_request_takeover",
+            ToolsetId::PlatformIm,
+            "Pause AI control of a Mini App and prompt the user via the floating window to take over manually (e.g. login, payment, manual selection), optionally waiting until the user clicks finish.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "bot_username": { "type": "string", "description": "Optional bot username; defaults to the active companion bot's Mini App." },
+                    "short_name": { "type": "string", "description": "Optional Mini App short_name; defaults to the bot's primary Mini App." },
+                    "reason": { "type": "string" },
+                    "wait_for_finish": { "type": "boolean" },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": ["reason"]
             }),
             ToolRiskLevel::Medium,
             false,
@@ -3078,6 +3266,33 @@ fn validate_platform_im_args(spec_name: &str, args: &Value) -> Result<(), String
                 return Err("delete_message requires positive 'message_id' or non-empty 'message_ids'".into());
             }
         }
+        "webmcp_discover" | "webmcp_call_tool" | "miniapp_request_takeover" => {
+            for key in ["bot_username", "short_name"] {
+                if let Some(val) = obj.get(key).filter(|v| !v.is_null()) {
+                    if !val.as_str().is_some_and(|s| !s.trim().is_empty()) {
+                        return Err(format!("{spec_name} '{key}' must be a non-empty string"));
+                    }
+                }
+            }
+            if spec_name == "webmcp_call_tool" {
+                let has_tool = obj
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty());
+                if !has_tool {
+                    return Err("webmcp_call_tool requires non-empty 'tool_name'".into());
+                }
+            }
+            if spec_name == "miniapp_request_takeover" {
+                let has_reason = obj
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty());
+                if !has_reason {
+                    return Err("miniapp_request_takeover requires non-empty 'reason'".into());
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -3469,13 +3684,18 @@ mod tests {
             ("vote_poll", json!({ "poll_id": "p1", "option_ids": [0] })),
             ("launch_miniapp", json!({ "bot_username": "b", "short_name": "app" })),
             ("invoke_miniapp_action", json!({ "bot_username": "b", "short_name": "app", "action_type": "main_button_click" })),
+            ("webmcp_list_miniapps", json!({ "query": "fabushi" })),
+            ("webmcp_discover", json!({ "bot_username": "fabushi_bot", "short_name": "fabushi" })),
+            ("webmcp_call_tool", json!({ "bot_username": "fabushi_bot", "short_name": "fabushi", "tool_name": "fabushi_send_dharma", "arguments": { "sutra": "金刚经" } })),
+            ("miniapp_request_takeover", json!({ "bot_username": "fabushi_bot", "short_name": "fabushi", "reason": "Manual verification required" })),
         ];
 
         for (name, args) in &tools_and_args {
             let res = HermesToolExecutor::execute(name, args.clone(), &ctx).await;
             assert!(res.success, "{name} failed: {}", res.output);
         }
-        assert_eq!(recorded.lock().unwrap().len(), 14);
+        assert_eq!(recorded.lock().unwrap().len(), 18);
         assert_eq!(recorded.lock().unwrap()[0].1["chat_id"], 555);
+        assert!(HermesToolExecutor::execute("webmcp_call_tool", json!({ "bot_username": "b", "short_name": "app", "tool_name": "   " }), &ctx).await.success == false);
     }
 }

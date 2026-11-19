@@ -366,13 +366,13 @@ async fn test_tier5_exact_subscription_activation_and_atomic_concurrency() {
 
     let (_dir, state, router) = boot_test_server();
     state
-        .hermes
+        .fabushi_core()
         .providers()
         .refresh_local_subscriptions_in_home(temp.path(), None);
 
     // 1. Exact ID matching: activating magpie_codex:user10 MUST return Err/404, NOT match user1!
     let err_res = state
-        .hermes
+        .fabushi_core()
         .providers()
         .activate_subscription("magpie_codex:user10", None);
     assert!(
@@ -646,13 +646,13 @@ async fn test_tier5_vertex_401_invalidation_refresh_and_fabushi_bot_propagation(
     let (_dir, state, app_router) = boot_test_server();
     isolate_empty_providers(&state, temp_home.path());
     state
-        .hermes
+        .fabushi_core()
         .providers()
         .refresh_local_subscriptions_in_home(temp_home.path(), None);
 
     // Override base_url on the discovered vertex provider to point at our mock Vertex server
     let mut v_cfg = state
-        .hermes
+        .fabushi_core()
         .providers()
         .snapshot()
         .providers
@@ -660,8 +660,8 @@ async fn test_tier5_vertex_401_invalidation_refresh_and_fabushi_bot_propagation(
         .cloned()
         .expect("vertex provider discovered");
     v_cfg.base_url = format!("http://{v_addr}/v1");
-    state.hermes.providers().register_provider(v_cfg);
-    state.hermes.providers().register_vertex_token_manager(
+    state.fabushi_core().providers().register_provider(v_cfg);
+    state.fabushi_core().providers().register_vertex_token_manager(
         "google_vertex:bot@vertex.test",
         VertexTokenManager::new(VertexAdcCredentials {
             client_id: "cid".to_string(),
@@ -673,11 +673,11 @@ async fn test_tier5_vertex_401_invalidation_refresh_and_fabushi_bot_propagation(
         .with_token_url(format!("http://{oauth_addr}/token")),
     );
     state
-        .hermes
+        .fabushi_core()
         .providers()
         .activate_subscription("google_vertex:bot@vertex.test", None)
         .unwrap();
-    state.hermes.persist_providers_state();
+    state.fabushi_core().persist_providers_state();
     state.fabushi_bots.sync_all_providers();
 
     let (_uid, tok) = register_user(&app_router, "tier5_vertex_bot_user").await;
@@ -1713,7 +1713,7 @@ async fn test_tier5_subscription_account_header_redaction_in_state_and_scan() {
     let (_dir, state, app_router) = boot_test_server();
     isolate_empty_providers(&state, temp_home.path());
     state
-        .hermes
+        .fabushi_core()
         .providers()
         .refresh_local_subscriptions_in_home(temp_home.path(), None);
     let (_uid, tok) = register_user(&app_router, "tier5_sub_hdr_user").await;

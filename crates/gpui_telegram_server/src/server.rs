@@ -77,9 +77,8 @@ pub struct AppState {
     pub talk_coordinator: Arc<RwLock<gpui_telegram_agent::TalkCoordinator>>,
     pub talk_sessions: Arc<RwLock<HashMap<String, gpui_telegram_agent::TalkCoordinator>>>,
     pub user_active_talk_sessions: Arc<RwLock<HashMap<UserId, String>>>,
-    pub acp_runner: Arc<gpui_telegram_agent::acp::AcpRunner>,
-    pub hermes: Arc<gpui_telegram_agent::hermes::HermesEngine>,
     pub fabushi_bots: Arc<gpui_telegram_agent::fabushi_bot::FabushiBotHost>,
+    pub webmcp_broker: Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>,
     pub self_weak: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
     pub computers: Arc<crate::routes::computers::ComputerControlService>,
     pub tailnet: Arc<crate::routes::tailnet::TailnetCoordService>,
@@ -121,8 +120,16 @@ impl AppState {
         Ok(Self::with_db(config, Arc::new(db)))
     }
 
-    pub fn with_acp_runner(mut self, runner: gpui_telegram_agent::acp::AcpRunner) -> Self {
-        self.acp_runner = Arc::new(runner);
+    pub fn fabushi_core(&self) -> Arc<gpui_telegram_agent::hermes::HermesEngine> {
+        self.fabushi_bots.core_engine()
+    }
+
+    pub fn acp_runner(&self) -> Arc<gpui_telegram_agent::acp::AcpRunner> {
+        self.fabushi_bots.acp_runner()
+    }
+
+    pub fn with_acp_runner(self, runner: gpui_telegram_agent::acp::AcpRunner) -> Self {
+        self.fabushi_bots.set_acp_runner(Arc::new(runner));
         self
     }
 
@@ -153,29 +160,6 @@ impl AppState {
 
         let workspace_root = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let hermes_data_dir = if config.is_in_memory() {
-            None
-        } else {
-            let db_path = std::path::PathBuf::from(config.resolve_db_path());
-            let parent = db_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            Some(parent.join("hermes"))
-        };
-        let hermes_cfg = gpui_telegram_agent::hermes::HermesEngineConfig {
-            workspace_root,
-            data_dir: hermes_data_dir,
-            default_model: config.default_agent_model.clone(),
-            ..Default::default()
-        };
-        let hermes = Arc::new(
-            gpui_telegram_agent::hermes::HermesEngine::new(hermes_cfg).unwrap_or_else(|err| {
-                tracing::warn!("Falling back to in-memory HermesEngine: {}", err);
-                gpui_telegram_agent::hermes::HermesEngine::in_memory()
-                    .expect("Failed to initialize in-memory HermesEngine")
-            }),
-        );
         let computers = Arc::new(crate::routes::computers::ComputerControlService::new(
             db.clone(),
         ));
@@ -183,12 +167,13 @@ impl AppState {
             db.clone(),
         ));
         computers.set_tailnet_service(tailnet.clone());
-        hermes.set_computer_provider(computers.clone());
 
         let fabushi_bots = if config.is_in_memory() {
             Arc::new(
-                gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_ephemeral(hermes.clone())
-                    .expect("Failed to initialize ephemeral FabushiBotHost"),
+                gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_unified_ephemeral(
+                    &config.default_agent_model,
+                )
+                .expect("Failed to initialize ephemeral unified FabushiBotHost"),
             )
         } else {
             let db_path = std::path::PathBuf::from(config.resolve_db_path());
@@ -197,19 +182,32 @@ impl AppState {
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| std::path::Path::new("."));
             let agents_dir = parent.join("fabushi_agents");
-            Arc::new(
-                gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_with_dir(
-                    agents_dir,
-                    hermes.clone(),
-                )
-                .expect("Failed to initialize FabushiBotHost"),
+            let legacy_hermes_dir = parent.join("hermes");
+            let core_cfg = gpui_telegram_agent::hermes::HermesEngineConfig {
+                workspace_root,
+                data_dir: None,
+                default_model: config.default_agent_model.clone(),
+                ..Default::default()
+            };
+            let host = gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_unified(
+                agents_dir,
+                core_cfg,
+                Some(&legacy_hermes_dir),
             )
+            .unwrap_or_else(|err| {
+                tracing::warn!("Falling back to ephemeral FabushiBotHost: {}", err);
+                gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_unified_ephemeral(
+                    &config.default_agent_model,
+                )
+                .expect("Failed to initialize ephemeral unified FabushiBotHost")
+            });
+            Arc::new(host)
         };
         fabushi_bots.set_computer_provider(computers.clone());
         let self_weak: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>> =
             Arc::new(std::sync::OnceLock::new());
 
-        let provider_snap = hermes.providers().snapshot();
+        let provider_snap = fabushi_bots.core_engine().providers().snapshot();
         let active_api_mode = provider_snap
             .providers
             .get(&provider_snap.active_provider_id)
@@ -221,12 +219,7 @@ impl AppState {
             api_mode = %active_api_mode,
             allow_local_fallback = provider_snap.allow_local_fallback,
             configured_providers = provider_snap.providers.len(),
-            "Hermes provider router initialized"
-        );
-
-        let acp_runner = Arc::new(
-            gpui_telegram_agent::acp::AcpRunner::new(&config.default_agent_model)
-                .with_hermes_engine(hermes.clone()),
+            "Fabushi Agent provider router initialized"
         );
 
         let mut hydrated_tasks = HashMap::new();
@@ -345,6 +338,10 @@ impl AppState {
                 Arc::downgrade(&search_indexer),
             ),
         );
+        let webmcp_broker = Arc::new(crate::miniapp_webmcp::MiniAppWebMcpBroker::new(
+            Arc::downgrade(&gateway_hub),
+            self_weak.clone(),
+        ));
         let im_bridge = Arc::new(crate::hermes_im_bridge::ServerPlatformImBridge::new(
             db.clone(),
             message_pipeline.clone(),
@@ -352,14 +349,15 @@ impl AppState {
             Arc::downgrade(&gateway_hub),
             Arc::downgrade(&search_indexer),
             Arc::downgrade(&hybrid_memory),
+            Arc::downgrade(&webmcp_broker),
+            self_weak.clone(),
         ));
-        hermes.set_platform_im_bridge(im_bridge.clone());
-        hermes.set_agentic_backend(db.clone());
         fabushi_bots.set_platform_im_bridge(im_bridge);
         fabushi_bots.set_agentic_backend(db.clone());
         gateway_hub.set_pipeline(message_pipeline.clone(), db.clone());
         gateway_hub.set_search_indexer(search_indexer.clone());
         gateway_hub.set_signaling_hub(signaling_hub.clone());
+        gateway_hub.set_webmcp_broker(webmcp_broker.clone());
 
         let teammate_bridge = Arc::new(ServerFabushiTeammateBridge {
             db: db.clone(),
@@ -370,7 +368,7 @@ impl AppState {
         hydrate_all_fabushi_bots(&db, &fabushi_bots);
 
         if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            let hermes_weak = Arc::downgrade(&hermes);
+            let fabushi_weak = Arc::downgrade(&fabushi_bots);
             let db_weak = Arc::downgrade(&db);
             let pipeline_weak = Arc::downgrade(&message_pipeline);
             let hub_weak = Arc::downgrade(&gateway_hub);
@@ -381,7 +379,7 @@ impl AppState {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let Some(hermes) = hermes_weak.upgrade() else { return; };
+                    let Some(fabushi_bots) = fabushi_weak.upgrade() else { return; };
                     let Some(db) = db_weak.upgrade() else { return; };
                     let Some(pipeline) = pipeline_weak.upgrade() else { return; };
                     let Some(hub) = hub_weak.upgrade() else { return; };
@@ -415,33 +413,37 @@ impl AppState {
                         }
                     }
 
-                    if let Ok(outcomes) = hermes.run_due_cron_jobs().await {
-                        for out in outcomes {
-                            if out.status == "completed" {
-                                if let Some(cid) = out.target_chat_id {
-                                    let bot_hint = hermes
-                                        .store()
-                                        .get_cron_job(&out.job_id)
-                                        .ok()
-                                        .flatten()
-                                        .and_then(|j| j.deliver_to);
-                                    deliver_proactive_message_raw(
-                                        &db,
-                                        &pipeline,
-                                        &hub,
-                                        ChatId(cid),
-                                        bot_hint.as_deref(),
-                                        &out.response_text,
-                                    );
-                                }
+                    for (bot_uid, engine, out) in fabushi_bots.run_all_due_cron_jobs().await {
+                        if out.status == "completed" {
+                            if let Some(cid) = out.target_chat_id {
+                                let bot_hint = engine
+                                    .store()
+                                    .get_cron_job(&out.job_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|j| j.deliver_to)
+                                    .or_else(|| bot_uid.map(|u| u.to_string()));
+                                deliver_proactive_message_raw(
+                                    &db,
+                                    &pipeline,
+                                    &hub,
+                                    ChatId(cid),
+                                    bot_hint.as_deref(),
+                                    &out.response_text,
+                                );
                             }
                         }
                     }
 
-                    if let Ok(Some(hb)) = hermes.tick_heartbeat_if_due().await {
+                    for (bot_uid, engine, hb) in fabushi_bots.tick_all_due_heartbeats().await {
                         if !hb.suppressed {
                             if let Some(cid) = hb.target_chat_id {
-                                let bot_hint = hermes.store().kv_get("heartbeat", "bot_id").ok().flatten();
+                                let bot_hint = engine
+                                    .store()
+                                    .kv_get("heartbeat", "bot_id")
+                                    .ok()
+                                    .flatten()
+                                    .or_else(|| bot_uid.map(|u| u.to_string()));
                                 deliver_proactive_message_raw(
                                     &db,
                                     &pipeline,
@@ -529,9 +531,8 @@ impl AppState {
             talk_coordinator: Arc::new(RwLock::new(gpui_telegram_agent::TalkCoordinator::new())),
             talk_sessions: Arc::new(RwLock::new(HashMap::new())),
             user_active_talk_sessions: Arc::new(RwLock::new(HashMap::new())),
-            acp_runner,
-            hermes,
             fabushi_bots,
+            webmcp_broker,
             self_weak,
             computers,
             tailnet,
@@ -585,7 +586,7 @@ impl AppState {
         approval_gates: Arc<tokio::sync::RwLock<HashMap<String, gpui_telegram_agent::tasks::ApprovalGate>>>,
     ) -> Self {
         let mut state = Self::new(config);
-        state.acp_runner = acp_runner;
+        state.fabushi_bots.set_acp_runner(acp_runner);
         state.task_registry = task_registry;
         state.approval_gates = approval_gates;
         state
@@ -921,6 +922,57 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/agent/runs", post(agent_runs))
         .route("/api/v1/agent/turn", post(agent_turn))
         .route("/api/v1/chats/{chat_id}/agent-runs", post(chats_agent_runs))
+        // --- Unified Fabushi Agent Routes (canonical `/api/v1/fabushi/*` + `/api/v1/hermes/*` aliases) ---
+        .route("/api/v1/fabushi/status", get(routes::hermes::hermes_status))
+        .route("/api/v1/fabushi/turns", post(routes::hermes::hermes_turns_create))
+        .route("/api/v1/fabushi/turns/{id}/events", get(routes::hermes::hermes_turn_events))
+        .route("/api/v1/fabushi/command", post(routes::hermes::hermes_command_run))
+        .route("/api/v1/fabushi/commands", get(routes::hermes::hermes_commands_list))
+        .route("/api/v1/fabushi/sessions", get(routes::hermes::hermes_sessions_list))
+        .route("/api/v1/fabushi/sessions/search", post(routes::hermes::hermes_sessions_search))
+        .route("/api/v1/fabushi/sessions/{id}", get(routes::hermes::hermes_session_get))
+        .route("/api/v1/fabushi/sessions/{id}/branch", post(routes::hermes::hermes_session_branch))
+        .route("/api/v1/fabushi/sessions/{id}/compress", post(routes::hermes::hermes_session_compress))
+        .route("/api/v1/fabushi/sessions/{id}/undo", post(routes::hermes::hermes_session_undo))
+        .route("/api/v1/fabushi/sessions/{id}/export", post(routes::hermes::hermes_session_export))
+        .route("/api/v1/fabushi/memory", get(routes::hermes::hermes_memory_get).put(routes::hermes::hermes_memory_put))
+        .route("/api/v1/fabushi/memory/action", post(routes::hermes::hermes_memory_action))
+        .route("/api/v1/fabushi/soul", get(routes::hermes::hermes_soul_get).put(routes::hermes::hermes_soul_put))
+        .route("/api/v1/fabushi/honcho", get(routes::hermes::hermes_honcho_get).post(routes::hermes::hermes_honcho_post))
+        .route("/api/v1/fabushi/skills", get(routes::hermes::hermes_skills_list).post(routes::hermes::hermes_skills_create))
+        .route("/api/v1/fabushi/skills/{name}", get(routes::hermes::hermes_skill_get).patch(routes::hermes::hermes_skill_patch).delete(routes::hermes::hermes_skill_delete))
+        .route("/api/v1/fabushi/skills/{name}/approve", post(routes::hermes::hermes_skill_approve))
+        .route("/api/v1/fabushi/toolsets", get(routes::hermes::hermes_toolsets_get).put(routes::hermes::hermes_toolsets_put))
+        .route("/api/v1/fabushi/approvals", get(routes::hermes::hermes_approvals_list))
+        .route("/api/v1/fabushi/approvals/{id}/decide", post(routes::hermes::hermes_approval_decide))
+        .route("/api/v1/fabushi/cron", get(routes::hermes::hermes_cron_list).post(routes::hermes::hermes_cron_create))
+        .route("/api/v1/fabushi/cron/{id}", patch(routes::hermes::hermes_cron_patch).delete(routes::hermes::hermes_cron_delete))
+        .route("/api/v1/fabushi/cron/{id}/run", post(routes::hermes::hermes_cron_run))
+        .route("/api/v1/fabushi/heartbeat", get(routes::hermes::hermes_heartbeat_get).post(routes::hermes::hermes_heartbeat_post))
+        .route("/api/v1/fabushi/kanban/boards", get(routes::hermes::hermes_kanban_boards_list).post(routes::hermes::hermes_kanban_boards_create))
+        .route("/api/v1/fabushi/kanban/boards/{id}", get(routes::hermes::hermes_kanban_board_get))
+        .route("/api/v1/fabushi/kanban/cards", post(routes::hermes::hermes_kanban_cards_create))
+        .route("/api/v1/fabushi/kanban/cards/{id}", patch(routes::hermes::hermes_kanban_cards_patch).delete(routes::hermes::hermes_kanban_cards_delete))
+        .route("/api/v1/fabushi/providers", get(routes::hermes::hermes_providers_get).put(routes::hermes::hermes_providers_put))
+        .route("/api/v1/fabushi/magpie/state", get(routes::magpie_api::magpie_state_get))
+        .route("/api/v1/fabushi/magpie/providers", get(routes::magpie_api::magpie_providers_list).post(routes::magpie_api::magpie_providers_upsert).put(routes::magpie_api::magpie_providers_upsert))
+        .route("/api/v1/fabushi/magpie/providers/{id}", get(routes::magpie_api::magpie_provider_get).put(routes::magpie_api::magpie_provider_update).patch(routes::magpie_api::magpie_provider_update).delete(routes::magpie_api::magpie_provider_delete))
+        .route("/api/v1/fabushi/magpie/providers/{id}/probe", post(routes::magpie_api::magpie_provider_probe))
+        .route("/api/v1/fabushi/magpie/subscriptions", get(routes::magpie_api::magpie_subscriptions_get))
+        .route("/api/v1/fabushi/magpie/subscriptions/{id}/activate", post(routes::magpie_api::magpie_subscription_activate))
+        .route("/api/v1/fabushi/magpie/subscriptions/scan", post(routes::magpie_api::magpie_subscriptions_scan))
+        .route("/api/v1/fabushi/magpie/subscriptions/sync", post(routes::magpie_api::magpie_subscriptions_sync))
+        .route("/api/v1/fabushi/magpie/models/catalog", get(routes::magpie_api::magpie_models_catalog_get))
+        .route("/api/v1/fabushi/magpie/groups", get(routes::magpie_api::magpie_groups_get).post(routes::magpie_api::magpie_groups_upsert).put(routes::magpie_api::magpie_groups_upsert).delete(routes::magpie_api::magpie_groups_delete_query))
+        .route("/api/v1/fabushi/magpie/groups/{id}", delete(routes::magpie_api::magpie_group_delete_path))
+        .route("/api/v1/fabushi/magpie/masking", get(routes::magpie_api::magpie_masking_get).put(routes::magpie_api::magpie_masking_put).post(routes::magpie_api::magpie_masking_put))
+        .route("/api/v1/fabushi/magpie/masking/preview", post(routes::magpie_api::magpie_masking_preview))
+        .route("/api/v1/fabushi/magpie/import", post(routes::magpie_api::magpie_import))
+        .route("/api/v1/fabushi/usage", get(routes::hermes::hermes_usage_get))
+        .route("/api/v1/fabushi/rollback", post(routes::hermes::hermes_rollback_post))
+        .route("/api/v1/fabushi/terminal/processes", get(routes::hermes::hermes_terminal_processes_get))
+        .route("/api/v1/fabushi/talk/turn", post(routes::hermes::hermes_talk_turn))
+        .route("/api/v1/fabushi/acp", post(routes::hermes::hermes_acp_rpc))
         .route("/api/v1/hermes/status", get(routes::hermes::hermes_status))
         .route("/api/v1/hermes/turns", post(routes::hermes::hermes_turns_create))
         .route("/api/v1/hermes/turns/{id}/events", get(routes::hermes::hermes_turn_events))
@@ -2881,9 +2933,9 @@ pub(crate) fn ensure_default_ai_bot(db: &crate::db::ServerDatabase) -> UserId {
             user_id: bot_id,
             username: Some("fabushi_ai_bot".into()),
             phone: None,
-            first_name: "Telegram AI Bot".into(),
+            first_name: "Fabushi AI".into(),
             last_name: None,
-            bio: Some("Official AI Agent Assistant".into()),
+            bio: Some("Official Fabushi AI Agent".into()),
             password_hash: None,
             is_bot: true,
             is_verified: true,
@@ -5091,7 +5143,7 @@ async fn agent_runs(
         thinking_budget_tokens,
     };
 
-    let mut rx = match state.acp_runner.execute_turn_stream(input).await {
+    let mut rx = match state.acp_runner().execute_turn_stream(input).await {
         Ok(rx) => rx,
         Err(err) => {
             return (
@@ -5159,7 +5211,7 @@ async fn chats_agent_runs(
         .as_ref()
         .map(|k| format!("{}:{}:{}", auth.user_id.0, chat_id.0, k));
     if let Some(ref key) = scoped_idem_key {
-        if let Ok(Some(cached)) = state.hermes.store().kv_get("chat_agent_run_idem", key) {
+        if let Ok(Some(cached)) = state.fabushi_core().store().kv_get("chat_agent_run_idem", key) {
             if let Ok(val) = serde_json::from_str::<Value>(&cached) {
                 return (StatusCode::OK, Json(val)).into_response();
             }
@@ -5312,7 +5364,7 @@ async fn chats_agent_runs(
     let target_hermes = bot_instance
         .as_ref()
         .map(|i| i.hermes())
-        .unwrap_or_else(|| Arc::clone(&state.hermes));
+        .unwrap_or_else(|| state.fabushi_core());
     if let Some(ref sid) = explicit_sid {
         if let Ok(Some(existing)) = target_hermes.store().get_session(sid) {
             if existing.chat_id != Some(chat_id.0) {
@@ -5421,7 +5473,7 @@ async fn chats_agent_runs(
 
     if let Some(ref key) = scoped_idem_key {
         if let Ok(raw) = serde_json::to_string(&resp_json) {
-            let _ = state.hermes.store().kv_set("chat_agent_run_idem", key, &raw);
+            let _ = state.fabushi_core().store().kv_set("chat_agent_run_idem", key, &raw);
         }
     }
 
@@ -5465,7 +5517,7 @@ async fn agent_turn(
         thinking_budget_tokens,
     };
 
-    let mut rx = match state.acp_runner.execute_turn_stream(input).await {
+    let mut rx = match state.acp_runner().execute_turn_stream(input).await {
         Ok(rx) => rx,
         Err(err) => {
             return (

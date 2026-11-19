@@ -192,6 +192,41 @@ impl RowHeightCache {
             MessageContent::GenerativeCard(card) => {
                 (64.0 + (card.components.len() as f32 * 28.0) + margin).clamp(64.0, 600.0)
             }
+            MessageContent::LocalBotAssistCard(card) => {
+                use bot_browser::{AssistCardPayload, AssistCardStatus};
+                let h = match &card.payload {
+                    AssistCardPayload::VaultLogin { status, .. } => match status {
+                        AssistCardStatus::AwaitingUser | AssistCardStatus::TimedOutResumable => {
+                            340.0
+                        }
+                        _ => 112.0,
+                    },
+                    AssistCardPayload::ReuseConfirm { status, .. } => match status {
+                        AssistCardStatus::AwaitingUser | AssistCardStatus::TimedOutResumable => {
+                            210.0
+                        }
+                        _ => 112.0,
+                    },
+                    AssistCardPayload::QrLogin { status, .. } => match status {
+                        AssistCardStatus::AwaitingUser | AssistCardStatus::TimedOutResumable => {
+                            290.0
+                        }
+                        _ => 112.0,
+                    },
+                    AssistCardPayload::ClickCaptcha {
+                        status,
+                        element_rect,
+                        ..
+                    } => match status {
+                        AssistCardStatus::AwaitingUser | AssistCardStatus::TimedOutResumable => {
+                            let (_, disp_h) = compute_captcha_display_size(element_rect);
+                            disp_h + 150.0
+                        }
+                        _ => 112.0,
+                    },
+                };
+                h + margin
+            }
         };
         estimated.clamp(24.0, 600.0)
     }
@@ -362,10 +397,18 @@ pub struct ConversationStage {
     pub more_menu_open: bool,
     pub toast_banner: Option<String>,
     pub active_fabushi_bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>,
+    pub is_bot_chat: bool,
+    pub bot_activity_state: String,
+    pub bot_activity_detail: Option<String>,
     pub bot_description_card: Option<String>,
     pub show_bot_start_bar: bool,
     pub is_viewer_owner_fabushi_bot: bool,
     pub pending_bot_start: bool,
+    pub bot_assist_login_drafts: HashMap<String, BotAssistLoginDraft>,
+    pub bot_assist_click_drafts: HashMap<String, BotAssistClickDraft>,
+    pub active_bot_card_field: Option<(String, BotAssistLoginField)>,
+    pub bot_assist_ime_preedit: Option<String>,
+    pub pending_bot_assist_action: Option<BotAssistCardAction>,
 }
 
 impl ConversationStage {
@@ -464,10 +507,18 @@ impl ConversationStage {
             more_menu_open: bool::default(),
             toast_banner: None,
             active_fabushi_bot: None,
+            is_bot_chat: false,
+            bot_activity_state: "idle".to_string(),
+            bot_activity_detail: None,
             bot_description_card: None,
             show_bot_start_bar: false,
             is_viewer_owner_fabushi_bot: false,
             pending_bot_start: false,
+            bot_assist_login_drafts: HashMap::new(),
+            bot_assist_click_drafts: HashMap::new(),
+            active_bot_card_field: None,
+            bot_assist_ime_preedit: None,
+            pending_bot_assist_action: None,
         };
         stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
         stage
@@ -485,8 +536,12 @@ impl ConversationStage {
         self.expanded_quotes.clear();
         self.bot_description_card = None;
         self.show_bot_start_bar = false;
+        self.is_bot_chat = false;
+        self.bot_activity_state = "idle".to_string();
+        self.bot_activity_detail = None;
         self.is_viewer_owner_fabushi_bot = false;
         self.pending_bot_start = false;
+        self.clear_all_bot_card_drafts();
     }
 
     pub fn sync_measured_row_heights(&mut self) -> bool {
@@ -522,7 +577,20 @@ impl ConversationStage {
         &mut self,
         bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>,
     ) {
+        if bot.is_some() {
+            self.is_bot_chat = true;
+        }
         self.active_fabushi_bot = bot;
+    }
+
+    pub fn set_bot_activity(&mut self, state: &str, detail: Option<String>) {
+        let trimmed = state.trim();
+        self.bot_activity_state = if trimmed.is_empty() {
+            "idle".to_string()
+        } else {
+            trimmed.to_string()
+        };
+        self.bot_activity_detail = detail.filter(|d| !d.trim().is_empty());
     }
 
     pub fn set_bot_prestart_state(
@@ -557,8 +625,14 @@ impl ConversationStage {
             self.message_ttl_seconds = 0;
             self.bot_description_card = None;
             self.show_bot_start_bar = false;
+            self.is_bot_chat = false;
+            self.bot_activity_state = "idle".to_string();
+            self.bot_activity_detail = None;
             self.is_viewer_owner_fabushi_bot = false;
             self.pending_bot_start = false;
+            self.active_bot_card_field = None;
+            self.bot_assist_ime_preedit = None;
+            self.pending_bot_assist_action = None;
         }
         self.active_chat_id = Some(chat_id);
         self.chat_title = title.to_string();
@@ -768,6 +842,8 @@ impl Render for ConversationStage {
                 &self.chat_avatar_initials,
                 self.chat_avatar_url.as_deref(),
                 self.active_fabushi_bot.as_ref(),
+                self.is_bot_chat,
+                &self.bot_activity_state,
                 self.select_mode_active,
                 self.selected_message_ids.len(),
                 self.message_ttl_seconds,
@@ -1040,6 +1116,89 @@ impl Render for ConversationStage {
                         el.child(div().id("stage-top-spacer").w_full().h(px(top_spacer_height)).flex_shrink_0())
                     })
                     .children(message_rows)
+                    .when(
+                        self.is_bot_chat
+                            && !self.bot_activity_state.is_empty()
+                            && !self.bot_activity_state.eq_ignore_ascii_case("idle"),
+                        |el| {
+                            let (agent_seed, shape, color) = self
+                                .active_fabushi_bot
+                                .as_ref()
+                                .map(|fab| {
+                                    (
+                                        fab.agent_id.clone(),
+                                        fab.avatar_shape.clone(),
+                                        fab.avatar_color.clone(),
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    let seed = format!(
+                                        "bot_{}_{}",
+                                        self.active_chat_id.unwrap_or(0),
+                                        self.chat_title
+                                    );
+                                    (
+                                        seed.clone(),
+                                        gpui_telegram_proto::miniapp_contracts::resolve_grok_persona_shape(&seed, None),
+                                        gpui_telegram_proto::miniapp_contracts::resolve_grok_persona_color(&seed, None),
+                                    )
+                                });
+                            let persona_state =
+                                crate::components::grok_bot_avatar::GrokPersonaState::from_activity_str(
+                                    &self.bot_activity_state,
+                                    true,
+                                );
+                            let status_label = match self.bot_activity_state.as_str() {
+                                "tool" => self
+                                    .bot_activity_detail
+                                    .as_deref()
+                                    .map(|t| format!("正在调用工具: {t}"))
+                                    .unwrap_or_else(|| "正在执行工具...".to_string()),
+                                "writing" => self
+                                    .bot_activity_detail
+                                    .clone()
+                                    .unwrap_or_else(|| "正在组织回复...".to_string()),
+                                _ => self
+                                    .bot_activity_detail
+                                    .clone()
+                                    .unwrap_or_else(|| "正在深度思考...".to_string()),
+                            };
+                            el.child(
+                                div()
+                                    .id("stage-bot-thinking-indicator")
+                                    .px(px(14.0))
+                                    .py(px(8.0))
+                                    .mx(px(10.0))
+                                    .my(px(4.0))
+                                    .rounded(px(14.0))
+                                    .bg(rgb(self.palette.card_bg))
+                                    .border_1()
+                                    .border_color(rgb(self.palette.border_fg))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(
+                                        crate::components::grok_bot_avatar::render_grok_bot_avatar(
+                                            crate::components::grok_bot_avatar::GrokBotAvatarProps::new(
+                                                &agent_seed,
+                                                &shape,
+                                                &color,
+                                                30.0,
+                                            )
+                                            .with_state(persona_state)
+                                            .with_surface_bg(self.palette.card_bg),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(self.palette.text_secondary))
+                                            .child(status_label),
+                                    ),
+                            )
+                        },
+                    )
                     .when(bottom_spacer_height > 0.0, |el| {
                         el.child(div().id("stage-bottom-spacer").w_full().h(px(bottom_spacer_height)).flex_shrink_0())
                     }),

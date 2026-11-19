@@ -59,8 +59,8 @@ pub struct BotSlashCommandItem {
 
 fn default_hermes_slash_commands() -> Vec<HermesSlashOption> {
     let entries: &[(&str, &[&str], &str, &str, &str, bool)] = &[
-        ("help", &["h", "?"], "/help [command]", "Session", "List Hermes slash commands & help", true),
-        ("new", &["reset"], "/new [title]", "Session", "Start a new Hermes agent session", true),
+        ("help", &["h", "?"], "/help [command]", "Session", "List Fabushi slash commands & help", true),
+        ("new", &["reset"], "/new [title]", "Session", "Start a new Fabushi agent session", true),
         ("clear", &[], "/clear", "Session", "Clear messages in the active session", false),
         ("compact", &["compress"], "/compact [focus]", "Session", "Compress conversation context window", true),
         ("undo", &[], "/undo", "Session", "Undo last turn and restore session state", false),
@@ -68,18 +68,18 @@ fn default_hermes_slash_commands() -> Vec<HermesSlashOption> {
         ("branch", &[], "/branch [name]", "Session", "Fork current session into a new branch", true),
         ("branches", &[], "/branches", "Session", "List all branches in current session", false),
         ("checkout", &[], "/checkout <branch>", "Session", "Switch to an existing session branch", true),
-        ("search", &[], "/search <query>", "Inspection & Export", "FTS5 search across past Hermes sessions", true),
+        ("search", &[], "/search <query>", "Inspection & Export", "FTS5 search across past Fabushi sessions", true),
         ("history", &[], "/history [limit]", "Inspection & Export", "Show current session message history", true),
-        ("sessions", &[], "/sessions", "Session", "List recent Hermes sessions", false),
+        ("sessions", &[], "/sessions", "Session", "List recent Fabushi sessions", false),
         ("export", &["save"], "/export [sharegpt|openai|anthropic]", "Inspection & Export", "Export session transcript", true),
         ("usage", &["cost"], "/usage", "Inspection & Export", "Show token usage & estimated cost summary", false),
         ("insights", &[], "/insights [days]", "Inspection & Export", "Show workspace productivity & tool insights", true),
-        ("status", &[], "/status", "Inspection & Export", "Show Hermes runtime health & active config", false),
-        ("doctor", &[], "/doctor", "Inspection & Export", "Run Hermes diagnostics & provider checks", false),
+        ("status", &[], "/status", "Inspection & Export", "Show Fabushi runtime health & active config", false),
+        ("doctor", &[], "/doctor", "Inspection & Export", "Run Fabushi diagnostics & provider checks", false),
         ("model", &[], "/model <name>", "Model & Provider", "Switch active LLM model", true),
         ("provider", &[], "/provider <id>", "Model & Provider", "Switch active provider / fallback chain", true),
         ("api-mode", &[], "/api-mode <chat_completions|codex_responses|anthropic_messages|local_hermes>", "Model & Provider", "Select API transport mode", true),
-        ("toolsets", &[], "/toolsets [preset|toggle]", "Tools & Skills", "Inspect or toggle the 28 Hermes toolsets", true),
+        ("toolsets", &[], "/toolsets [preset|toggle]", "Tools & Skills", "Inspect or toggle the 28 Fabushi toolsets", true),
         ("tools", &[], "/tools", "Tools & Skills", "List active tools in current session", false),
         ("skills", &[], "/skills [filter]", "Tools & Skills", "Browse installed SKILL.md skills", true),
         ("skill", &[], "/skill <view|create|enable|disable> <name>", "Tools & Skills", "Inspect or manage a specific SKILL.md", true),
@@ -110,8 +110,8 @@ fn default_hermes_slash_commands() -> Vec<HermesSlashOption> {
         ("verbose", &[], "/verbose [on|off]", "Modes & UI", "Toggle verbose tool call streaming", true),
         ("reasoning", &[], "/reasoning [on|off|budget]", "Model & Provider", "Configure chain-of-thought reasoning", true),
         ("debug", &[], "/debug [on|off]", "Inspection & Export", "Toggle raw turn debug telemetry", true),
-        ("config", &[], "/config", "Modes & UI", "Open Hermes Agent Studio configuration", false),
-        ("version", &[], "/version", "Inspection & Export", "Print Hermes Rust engine build info", false),
+        ("config", &[], "/config", "Modes & UI", "Open Fabushi Agent Studio configuration", false),
+        ("version", &[], "/version", "Inspection & Export", "Print Fabushi Rust engine build info", false),
     ];
     let mut out = Vec::with_capacity(64);
     for (name, aliases, syntax, cat, desc, accepts_args) in entries {

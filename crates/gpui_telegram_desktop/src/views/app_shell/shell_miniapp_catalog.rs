@@ -422,8 +422,12 @@ impl AppShell {
             }
         }
         self.sidebar.update(cx, |sb, sb_cx| {
-            sb.bot_fabushi_visuals = visuals;
-            sb.bot_grok_avatars = grok_visuals;
+            for (cid, vis) in visuals {
+                sb.bot_fabushi_visuals.insert(cid, vis);
+            }
+            for (cid, grok) in grok_visuals {
+                sb.bot_grok_avatars.insert(cid, grok);
+            }
             for cid in companion_cids {
                 sb.bot_ids.insert(cid);
             }
@@ -447,6 +451,9 @@ impl AppShell {
             })
             .cloned();
         self.stage.update(cx, |st, st_cx| {
+            if active_fab.is_some() {
+                st.is_bot_chat = true;
+            }
             st.set_active_fabushi_bot(active_fab.clone());
             st_cx.notify();
         });
@@ -1312,6 +1319,106 @@ impl AppShell {
 
     /// Launches a Mini-App overlay, optionally preserving a custom `web_app.url` deep link.
     #[allow(clippy::too_many_arguments)]
+    /// Routes an incoming server WebMCP command either to the matching mounted Mini App overlay
+    /// or auto-launches it silently in Floating PiP mode so AI can inspect and control it live.
+    pub fn launch_miniapp_for_webmcp(
+        &mut self,
+        cmd: gpui_telegram_proto::miniapp_contracts::MiniAppWebMcpCommand,
+        cx: &mut Context<Self>,
+    ) {
+        let want_takeover = cmd.operation == "request_takeover";
+        let mode = if want_takeover {
+            gpui_telegram_proto::miniapp_contracts::MiniAppControlMode::WaitingForTakeover
+        } else {
+            gpui_telegram_proto::miniapp_contracts::MiniAppControlMode::AiControlling
+        };
+        let status_text = cmd
+            .status_message
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                if want_takeover {
+                    "AI 请求您接管控制".to_string()
+                } else {
+                    format!(
+                        "AI 正在操控: {}",
+                        cmd.tool_name.as_deref().unwrap_or(&cmd.operation)
+                    )
+                }
+            });
+        self.miniapps.floating_pip_status =
+            Some(crate::views::app_shell::shell_state::FloatingPipStatus {
+                bot_username: cmd.bot_username.trim_start_matches('@').to_string(),
+                short_name: cmd.short_name.clone(),
+                chat_id: cmd.chat_id,
+                bot_user_id: cmd.bot_user_id.max(0) as u64,
+                app_title: cmd.app_title.clone(),
+                mode,
+                status_text: status_text.clone(),
+                active_tool: cmd.tool_name.clone(),
+            });
+
+        let already_matches = self.miniapps.miniapp_overlay.as_ref().is_some_and(|ov| {
+            let w = ov.read(cx);
+            w.bot_username
+                .trim_start_matches('@')
+                .eq_ignore_ascii_case(cmd.bot_username.trim_start_matches('@'))
+                && w.current_short_name().eq_ignore_ascii_case(&cmd.short_name)
+                && !w.is_loading
+        });
+
+        if already_matches {
+            if let Some(ref ov) = self.miniapps.miniapp_overlay {
+                let open_now = ov.read(cx).is_open;
+                if want_takeover {
+                    self.miniapps.is_miniapp_minimized = false;
+                } else if !open_now {
+                    self.miniapps.is_miniapp_minimized = true;
+                }
+                ov.update(cx, |w, wcx| {
+                    if want_takeover {
+                        w.is_open = true;
+                        w.is_floating_pip = false;
+                    } else if !w.is_open {
+                        w.is_floating_pip = true;
+                    }
+                    w.dispatch_webmcp_command(cmd);
+                    wcx.notify();
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        let bot_un = cmd.bot_username.clone();
+        let short = cmd.short_name.clone();
+        let src_chat = (cmd.chat_id > 0).then_some(cmd.chat_id as u64);
+        self.miniapps.pending_webmcp_commands.push_back(cmd);
+        self.launch_miniapp_with_url(
+            &bot_un,
+            &short,
+            src_chat,
+            MiniAppLaunchMode::CompactSheet,
+            None,
+            None,
+            cx,
+        );
+        if want_takeover {
+            self.miniapps.is_miniapp_minimized = false;
+        } else {
+            self.miniapps.is_miniapp_minimized = true;
+            if let Some(ref ov) = self.miniapps.miniapp_overlay {
+                ov.update(cx, |w, wcx| {
+                    w.is_open = false;
+                    w.is_floating_pip = true;
+                    w.disclaimer_accepted = true;
+                    wcx.notify();
+                });
+            }
+        }
+        cx.notify();
+    }
+
     pub fn launch_miniapp_with_url(
         &mut self,
         bot_username: &str,
@@ -1382,8 +1489,38 @@ impl AppShell {
                         if uid > 0 && shell.miniapps.accepted_app_tos_bots.contains(&uid) {
                             ctx.app.app_tos_accepted = true;
                         }
+                        let match_bot = ctx.app.bot_username.trim_start_matches('@').to_string();
+                        let match_short = ctx.app.short_name.clone();
+                        let mut queued_cmds = Vec::new();
+                        let mut remaining = std::collections::VecDeque::new();
+                        while let Some(c) = shell.miniapps.pending_webmcp_commands.pop_front() {
+                            if c.bot_username
+                                .trim_start_matches('@')
+                                .eq_ignore_ascii_case(&match_bot)
+                                && c.short_name.eq_ignore_ascii_case(&match_short)
+                            {
+                                queued_cmds.push(c);
+                            } else {
+                                remaining.push_back(c);
+                            }
+                        }
+                        shell.miniapps.pending_webmcp_commands = remaining;
+                        let stay_in_pip = shell.miniapps.is_miniapp_minimized
+                            && !queued_cmds.iter().any(|c| c.operation == "request_takeover");
                         let _ = ov_weak.update(cx, |w, w_cx| {
                             w.load_context(ctx);
+                            if stay_in_pip {
+                                w.is_open = false;
+                                w.is_floating_pip = true;
+                                w.disclaimer_accepted = true;
+                            } else if queued_cmds.iter().any(|c| c.operation == "request_takeover") {
+                                w.is_open = true;
+                                w.is_floating_pip = false;
+                                w.disclaimer_accepted = true;
+                            }
+                            for cmd in queued_cmds {
+                                w.dispatch_webmcp_command(cmd);
+                            }
                             w_cx.notify();
                         });
                         shell.refresh_recent_miniapps(cx);
@@ -1670,19 +1807,28 @@ impl AppShell {
         } else {
             MiniAppLaunchMode::AttachMenu
         };
-        if !bot_username.trim().is_empty() && !short_name.trim().is_empty() {
+        // Always prefer parsing canonical `/miniapps/{bot}/{short}` or `gpui-miniapp://{bot}/{short}`
+        // from `url` first so localized button labels (e.g. "全球法布施") never masquerade as `short_name`.
+        if parse_miniapp_uri(url).is_some()
+            && self.launch_miniapp_from_uri(url, active_chat, mode, cx)
+        {
+            return;
+        }
+        let short_trimmed = short_name.trim();
+        let short_is_valid_slug = !short_trimmed.is_empty()
+            && short_trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !bot_username.trim().is_empty() && short_is_valid_slug {
             self.request_launch_miniapp_with_confirm_and_url(
                 bot_username,
-                short_name,
+                short_trimmed,
                 active_chat,
                 mode,
                 None,
                 custom_url,
                 cx,
             );
-            return;
-        }
-        if parse_miniapp_uri(url).is_some() && self.launch_miniapp_from_uri(url, active_chat, mode, cx) {
             return;
         }
         let target_un = bot_username.trim().trim_start_matches('@');
@@ -1884,6 +2030,7 @@ impl AppShell {
             st.chat_avatar_color = color;
             st.is_group_chat = false;
             st.is_saved_messages = false;
+            st.is_bot_chat = true;
             st.pinned_message = None;
             st.set_bot_prestart_state(
                 Some(description.to_string()),

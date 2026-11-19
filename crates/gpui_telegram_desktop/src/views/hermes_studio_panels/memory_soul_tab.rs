@@ -197,7 +197,7 @@ pub fn render_memory_soul_tab(
                             studio_section_card("Bot SOUL.md Persona", IconName::BotRobot, pal)
                                 .child(studio_input_box(
                                     &ws.soul_persona_draft,
-                                    "Persona display name (e.g. Hermes)",
+                                    "Persona display name (e.g. Fabushi)",
                                     StudioInputTarget::SoulPersonaName,
                                     ws.active_input,
                                     pal,

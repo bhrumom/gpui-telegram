@@ -253,7 +253,8 @@ pub fn boot_test_server() -> (TempDir, Arc<AppState>, Router) {
 }
 
 pub fn isolate_empty_providers(state: &AppState, empty_home: &Path) {
-    let providers = state.hermes.providers();
+    let core = state.fabushi_core();
+    let providers = core.providers();
     for p in providers.list_providers() {
         if p.id != "local_hermes" {
             providers.remove_provider(&p.id);
@@ -261,7 +262,7 @@ pub fn isolate_empty_providers(state: &AppState, empty_home: &Path) {
     }
     providers.refresh_local_subscriptions_in_home(empty_home, Some(empty_home));
     providers.set_allow_local_fallback(false);
-    state.hermes.persist_providers_state();
+    core.persist_providers_state();
     state.fabushi_bots.sync_all_providers();
 }
 

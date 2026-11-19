@@ -333,7 +333,7 @@ impl AppShell {
                     Some(title)
                 }
             })
-            .unwrap_or_else(|| "Hermes AI".to_string());
+            .unwrap_or_else(|| "Fabushi AI".to_string());
         let callee_id = chat_opt
             .and_then(|cid| {
                 self.session_sync
@@ -385,7 +385,7 @@ impl AppShell {
         let overlay = cx.new(|_| {
             let mut o = CallOverlay::new_live(
                 peer_name.clone(),
-                Some("Hermes Voice Agent".to_string()),
+                Some("Fabushi Voice Agent".to_string()),
                 None,
                 pal,
                 lang,
@@ -399,7 +399,7 @@ impl AppShell {
                 tr_str(
                     lang,
                     "正在建立 AI 全双工语音会话...",
-                    "Connecting Hermes AI Talk Mode...",
+                    "Connecting Fabushi AI Talk Mode...",
                 ),
                 false,
             );

@@ -2502,5 +2502,233 @@ const TELEGRAM_WEB_APP_JS: &str = r#"(function () {
 
   window.Telegram = window.Telegram || {};
   window.Telegram.WebApp = webApp;
+
+  (function installUniversalWebMcp() {
+    var existing = window.__GPUI_WEBMCP__ || {};
+    var toolsMap = existing._tools || {};
+    function readAppStateSummary() {
+      try {
+        if (window.__FABUSHI_TEST_HOOK__ && typeof window.__FABUSHI_TEST_HOOK__.getState === 'function') {
+          var vm = window.__FABUSHI_TEST_HOOK__.getState();
+          if (vm) {
+            return {
+              kind: 'fabushi_wasm',
+              active_tab: vm.active_tab,
+              is_transferring: vm.is_transferring,
+              current_sending_scripture: vm.current_sending_scripture,
+              current_sending_country: vm.current_sending_country,
+              global_sent_count: vm.global_sent_count,
+              global_data_sent_formatted: vm.global_data_sent_formatted,
+              is_in_session: vm.is_in_session,
+              chant_count: vm.chant_count,
+              locked_practice: vm.locked_practice,
+              profile: vm.profile
+            };
+          }
+        }
+        if (window.STATE && typeof window.STATE === 'object') {
+          return { kind: 'schema_miniapp', state: window.STATE };
+        }
+      } catch (_) {}
+      return {
+        kind: 'generic_dom',
+        title: document.title || '',
+        url: String(window.location && window.location.href || ''),
+        main_button: { is_visible: !!mainButton.isVisible, text: mainButton.text },
+        secondary_button: { is_visible: !!secondaryButton.isVisible, text: secondaryButton.text }
+      };
+    }
+    function inspectPage() {
+      var controls = [];
+      try {
+        var nodes = document.querySelectorAll('button, a, input, select, textarea, [role="button"], .chip');
+        for (var i = 0; i < nodes.length && controls.length < 48; i++) {
+          var el = nodes[i];
+          var tag = (el.tagName || '').toLowerCase();
+          var text = (el.innerText || el.textContent || el.value || '').trim().slice(0, 64);
+          controls.push({
+            index: i,
+            tag: tag,
+            id: el.id || null,
+            type: el.type || null,
+            placeholder: el.placeholder || null,
+            text: text,
+            disabled: !!el.disabled
+          });
+        }
+      } catch (_) {}
+      return {
+        title: document.title || '',
+        headings: Array.prototype.slice.call(document.querySelectorAll('h1,h2,h3'), 0, 8).map(function (h) {
+          return (h.innerText || h.textContent || '').trim().slice(0, 80);
+        }),
+        controls: controls,
+        state_summary: readAppStateSummary()
+      };
+    }
+    function builtinTools() {
+      return {
+        get_state: {
+          name: 'get_state',
+          description: '读取当前小程序运行状态或页面结构摘要',
+          inputSchema: { type: 'object', properties: {} },
+          annotations: { readOnlyHint: true },
+          execute: function () { return readAppStateSummary(); }
+        },
+        page_inspect: {
+          name: 'page_inspect',
+          description: '探测当前页面中的标题、按钮、输入框与可交互组件',
+          inputSchema: { type: 'object', properties: {} },
+          annotations: { readOnlyHint: true },
+          execute: function () { return inspectPage(); }
+        },
+        page_click: {
+          name: 'page_click',
+          description: '点击指定 CSS selector 或包含指定文案的按钮/卡片',
+          inputSchema: {
+            type: 'object',
+            properties: { selector: { type: 'string' }, text: { type: 'string' } }
+          },
+          execute: function (args) {
+            var a = args || {};
+            var target = null;
+            if (a.selector) target = document.querySelector(String(a.selector));
+            if (!target && a.text) {
+              var needle = String(a.text).trim();
+              var els = document.querySelectorAll('button, a, [role="button"], .chip, .card, .btn');
+              for (var i = 0; i < els.length; i++) {
+                var txt = (els[i].innerText || els[i].textContent || '').trim();
+                if (txt.indexOf(needle) !== -1) { target = els[i]; break; }
+              }
+            }
+            if (!target) throw new Error('未找到可点击目标元素');
+            target.click();
+            return { clicked: (target.innerText || target.id || target.tagName || '').trim().slice(0, 80), state: readAppStateSummary() };
+          }
+        },
+        page_fill: {
+          name: 'page_fill',
+          description: '填写输入框或更新指定 Mini App 组件字段并触发变更事件',
+          inputSchema: {
+            type: 'object',
+            required: ['value'],
+            properties: { selector: { type: 'string' }, widget_id: { type: 'string' }, value: {} }
+          },
+          execute: function (args) {
+            var a = args || {};
+            if (a.widget_id && typeof window.dispatchAction === 'function') {
+              return Promise.resolve(window.dispatchAction('widget_event', a.widget_id, a.value)).then(function () {
+                return { updated_widget: a.widget_id, state: readAppStateSummary() };
+              });
+            }
+            var inp = a.selector ? document.querySelector(String(a.selector)) : document.querySelector('input, textarea, select');
+            if (!inp) throw new Error('未找到可填写的输入框');
+            inp.value = a.value == null ? '' : String(a.value);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return { filled: inp.id || inp.tagName, value: inp.value, state: readAppStateSummary() };
+          }
+        },
+        page_press_main_button: {
+          name: 'page_press_main_button',
+          description: '点击 Mini App 底部主操作按钮（MainButton）',
+          inputSchema: { type: 'object', properties: {} },
+          execute: function () {
+            mainButton._fireClick();
+            return { pressed: 'main_button', state: readAppStateSummary() };
+          }
+        },
+        page_press_secondary_button: {
+          name: 'page_press_secondary_button',
+          description: '点击 Mini App 底部次按钮（SecondaryButton）',
+          inputSchema: { type: 'object', properties: {} },
+          execute: function () {
+            secondaryButton._fireClick();
+            return { pressed: 'secondary_button', state: readAppStateSummary() };
+          }
+        }
+      };
+    }
+    function listDescriptors() {
+      var merged = {};
+      var builtins = builtinTools();
+      var bk = Object.keys(builtins);
+      for (var i = 0; i < bk.length; i++) merged[bk[i]] = builtins[bk[i]];
+      var tk = Object.keys(toolsMap);
+      for (var j = 0; j < tk.length; j++) merged[tk[j]] = toolsMap[tk[j]];
+      return Object.keys(merged).map(function (name) {
+        var t = merged[name];
+        return {
+          name: t.name,
+          description: String(t.description || ''),
+          input_schema: t.inputSchema || { type: 'object', properties: {} },
+          read_only: !!(t.annotations && t.annotations.readOnlyHint)
+        };
+      });
+    }
+    function registerTool(def) {
+      if (!def || !def.name || typeof def.execute !== 'function') return;
+      toolsMap[String(def.name)] = def;
+    }
+    var modelContext = {
+      registerTool: registerTool,
+      unregisterTool: function (name) { delete toolsMap[String(name || '')]; },
+      provideContext: function (ctx) {
+        toolsMap = {};
+        var arr = (ctx && Array.isArray(ctx.tools)) ? ctx.tools : [];
+        for (var i = 0; i < arr.length; i++) registerTool(arr[i]);
+      },
+      clearContext: function () { toolsMap = {}; }
+    };
+    try {
+      if (!navigator.modelContext) {
+        Object.defineProperty(navigator, 'modelContext', { value: modelContext, configurable: true });
+      } else {
+        navigator.modelContext.registerTool = modelContext.registerTool;
+        navigator.modelContext.unregisterTool = modelContext.unregisterTool;
+        navigator.modelContext.provideContext = modelContext.provideContext;
+        navigator.modelContext.clearContext = modelContext.clearContext;
+      }
+    } catch (_) {}
+    window.__GPUI_WEBMCP__ = {
+      _tools: toolsMap,
+      discover: listDescriptors,
+      readState: readAppStateSummary,
+      invoke: function (requestId, operation, toolName, args) {
+        function reply(ok, result, err) {
+          postToHost('webmcp_response', {
+            request_id: String(requestId || ''),
+            ok: !!ok,
+            result: result == null ? {} : result,
+            error: err ? String(err) : null,
+            tools: operation === 'discover' ? listDescriptors() : [],
+            state_summary: readAppStateSummary(),
+            control_mode: 'ai_controlling'
+          });
+        }
+        try {
+          if (operation === 'discover') {
+            reply(true, { count: listDescriptors().length }, null);
+            return;
+          }
+          if (operation === 'get_state') {
+            reply(true, readAppStateSummary(), null);
+            return;
+          }
+          var builtins = builtinTools();
+          var t = toolsMap[toolName] || builtins[toolName];
+          if (!t || typeof t.execute !== 'function') {
+            reply(false, {}, '未注册的 WebMCP 工具: ' + String(toolName || ''));
+            return;
+          }
+          Promise.resolve(t.execute(args || {}))
+            .then(function (res) { reply(true, res, null); })
+            .catch(function (e) { reply(false, {}, e && e.message ? e.message : String(e)); });
+        } catch (e) {
+          reply(false, {}, e && e.message ? e.message : String(e));
+        }
+      }
+    };
+  })();
 })();
 "#;

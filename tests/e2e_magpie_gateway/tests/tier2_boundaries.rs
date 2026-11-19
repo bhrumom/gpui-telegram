@@ -203,7 +203,7 @@ async fn test_tier2_upstream_timeout_and_hang() {
     assert_eq!(mock_prov_state.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Verify wire-level 504 registered in router runtime circuit-breaker metrics
-    let metrics = state.hermes.providers().route_metrics_snapshot();
+    let metrics = state.fabushi_core().providers().route_metrics_snapshot();
     let seat = metrics
         .seats
         .get("deepseek/deepseek-chat")
@@ -308,7 +308,7 @@ async fn test_tier2_upstream_circuit_breaker_ladders() {
     assert_eq!(mock_prov_state.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Verify wire-level 429 registered in router runtime circuit-breaker metrics
-    let metrics = state.hermes.providers().route_metrics_snapshot();
+    let metrics = state.fabushi_core().providers().route_metrics_snapshot();
     let seat = metrics
         .seats
         .get("deepseek/deepseek-chat")

@@ -213,14 +213,18 @@ impl AppShell {
 
         if is_ai_bot {
             let lang = self.active_lang_id();
+            let thinking_txt =
+                tr_str(lang, "AI 助手正在思考...", "Assistant is thinking...").to_string();
             self.sidebar.update(cx, |sb, sb_cx| {
-                sb.set_typing(
-                    active_chat_id,
-                    Some(
-                        tr_str(lang, "AI 助手正在思考...", "Assistant is thinking...").to_string(),
-                    ),
-                );
+                sb.set_typing(active_chat_id, Some(thinking_txt.clone()));
                 sb_cx.notify();
+            });
+            self.stage.update(cx, |st, st_cx| {
+                if st.active_chat_id == Some(active_chat_id) {
+                    st.is_bot_chat = true;
+                    st.set_bot_activity("thinking", Some(thinking_txt));
+                    st_cx.notify();
+                }
             });
         }
     }

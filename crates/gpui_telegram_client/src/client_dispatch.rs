@@ -5,6 +5,7 @@ use gpui_telegram_proto::contracts::{
     CallSignalRequest, ChatFolderDto, DraftDto, ForumTopicDto, StoryDto,
 };
 use gpui_telegram_proto::message::{MessageItem, ReactionCount};
+use gpui_telegram_proto::miniapp_contracts::{MiniAppControlMode, MiniAppWebMcpCommand};
 use gpui_telegram_proto::sync::{ChatActionEvent, TypingEvent, UpdateEvent};
 use gpui_telegram_proto::ws::WsServerFrame;
 use gpui_telegram_proto::{PollCard, TodoCard};
@@ -88,6 +89,23 @@ pub enum ClientDomainEvent {
         to_agent: String,
         hop: u32,
         max_hops: u32,
+    },
+    BotActivityChanged {
+        chat_id: ChatId,
+        bot_user_id: UserId,
+        state: String,
+        detail: Option<String>,
+    },
+    MiniAppWebMcpCommand(MiniAppWebMcpCommand),
+    MiniAppControlStatus {
+        bot_username: String,
+        short_name: String,
+        chat_id: ChatId,
+        bot_user_id: UserId,
+        app_title: String,
+        mode: MiniAppControlMode,
+        status_text: String,
+        active_tool: Option<String>,
     },
     ChatAction {
         chat_id: Option<ChatId>,
@@ -293,6 +311,43 @@ pub(crate) fn apply_update_event(
                 to_agent,
                 hop,
                 max_hops,
+            });
+        }
+        UpdateEvent::BotActivityChanged {
+            chat_id,
+            bot_user_id,
+            state,
+            detail,
+        } => {
+            out_events.push(ClientDomainEvent::BotActivityChanged {
+                chat_id,
+                bot_user_id,
+                state,
+                detail,
+            });
+        }
+        UpdateEvent::MiniAppWebMcpCommand(cmd) => {
+            out_events.push(ClientDomainEvent::MiniAppWebMcpCommand(cmd));
+        }
+        UpdateEvent::MiniAppControlStatus {
+            bot_username,
+            short_name,
+            chat_id,
+            bot_user_id,
+            app_title,
+            mode,
+            status_text,
+            active_tool,
+        } => {
+            out_events.push(ClientDomainEvent::MiniAppControlStatus {
+                bot_username,
+                short_name,
+                chat_id,
+                bot_user_id,
+                app_title,
+                mode,
+                status_text,
+                active_tool,
             });
         }
     }

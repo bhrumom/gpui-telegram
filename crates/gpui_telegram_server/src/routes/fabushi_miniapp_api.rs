@@ -299,7 +299,7 @@ fn ensure_fabushi_user(state: &AppState, auth: &FabushiAuth) -> Result<UserProfi
         .map_err(|e| e.to_string())
 }
 
-fn sync_summary_and_maybe_notify(
+pub(crate) fn sync_summary_and_maybe_notify(
     state: &Arc<AppState>,
     uid: i64,
     bot_hint: Option<&BotRegistryRecord>,

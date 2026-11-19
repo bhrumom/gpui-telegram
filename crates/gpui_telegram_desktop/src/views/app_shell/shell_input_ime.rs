@@ -15,6 +15,7 @@ use crate::views::composer::ime_machine::KeyAction;
 use crate::views::global_tasks_workspace::StudioInputTarget;
 use crate::views::nav_rail::NavDestination;
 use crate::views::shell::{ActiveWorkspacePanel, AppShell};
+use crate::views::stage::cards::BotAssistCardAction;
 
 fn backspace_string(target: &mut String, is_alt: bool) -> bool {
     if is_alt { delete_prev_word(target) } else { pop_last_char(target) }
@@ -48,6 +49,12 @@ impl AppShell {
             && self.inspector.read(cx).is_bot_input_active()
     }
 
+    /// Returns `true` when an in-transcript Bot Assist Vault Login card input field is focused.
+    pub fn is_bot_card_input_active(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::Chats
+            && self.stage.read(cx).active_bot_card_field.is_some()
+    }
+
     fn set_composer_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
         self.composer.update(cx, |c, c_cx| {
             c.is_input_focused = focused;
@@ -68,6 +75,7 @@ impl AppShell {
             || self.is_studio_input_active(cx)
             || self.is_settings_input_active(cx)
             || self.is_inspector_bot_input_active(cx)
+            || self.is_bot_card_input_active(cx)
             || self.stage.read(cx).search_open
     }
 
@@ -144,6 +152,13 @@ impl AppShell {
             let (committed, bot_pre) = self.inspector.read(cx).active_bot_input_text_and_preedit(cx);
             return (committed, bot_pre.or_else(pre));
         }
+        if self.is_bot_card_input_active(cx) {
+            let st = self.stage.read(cx);
+            return (
+                st.active_bot_card_text().to_string(),
+                st.bot_assist_ime_preedit.clone().or_else(pre),
+            );
+        }
         if self.is_studio_input_active(cx) { return (String::new(), pre()); }
         if sb.search_focused { return (sb.search_query.clone(), pre()); }
         if self.stage.read(cx).search_open { return (self.stage.read(cx).search_query.clone(), pre()); }
@@ -200,6 +215,12 @@ impl AppShell {
             self.settings_router.update(cx, |sr, scx| { sr.clear_active_input(scx); });
         } else if self.is_inspector_bot_input_active(cx) {
             self.inspector.update(cx, |ins, icx| { let _ = ins.clear_active_bot_input(icx); });
+        } else if self.is_bot_card_input_active(cx) {
+            self.stage.update(cx, |st, stcx| {
+                st.bot_assist_ime_preedit = None;
+                st.clear_active_bot_card_field();
+                stcx.notify();
+            });
         } else if self.sidebar.read(cx).search_focused {
             self.sidebar.update(cx, |sb, scx| { sb.set_search_query(""); scx.notify(); });
         } else if self.stage.read(cx).search_open {
@@ -257,6 +278,12 @@ impl AppShell {
             if !txt.is_empty() {
                 self.inspector.update(cx, |ins, icx| { let _ = ins.push_bot_input_text(&txt, icx); });
             }
+        } else if self.is_bot_card_input_active(cx) {
+            self.stage.update(cx, |st, stcx| {
+                st.bot_assist_ime_preedit = None;
+                st.insert_bot_card_text(&clean);
+                stcx.notify();
+            });
         } else if self.sidebar.read(cx).search_focused {
             self.sidebar.update(cx, |sb, scx| {
                 let mut q = sb.search_query.clone();
@@ -284,7 +311,15 @@ impl AppShell {
     }
 
     fn dismiss_pre_auth_escape(&mut self, is_shift: bool, cx: &mut Context<Self>) -> bool {
-        if self.ime.ime_preedit.take().is_some() { return true; }
+        if self.ime.ime_preedit.take().is_some() {
+            if self.is_bot_card_input_active(cx) {
+                self.stage.update(cx, |st, stcx| {
+                    st.bot_assist_ime_preedit = None;
+                    stcx.notify();
+                });
+            }
+            return true;
+        }
         if self.composer.read(cx).ime_machine.is_composing() {
             self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_cancel(); c.sync_autocomplete(); ccx.notify(); });
             return true;
@@ -373,6 +408,14 @@ impl AppShell {
         if self.stage.read(cx).is_selecting_messages() {
             self.stage.update(cx, |st, stcx| {
                 st.clear_selected_messages();
+                stcx.notify();
+            });
+            return true;
+        }
+        if self.is_bot_card_input_active(cx) {
+            self.ime.clear_preedit();
+            self.stage.update(cx, |st, stcx| {
+                st.blur_bot_card_input();
                 stcx.notify();
             });
             return true;
@@ -583,6 +626,53 @@ impl AppShell {
                 return true;
             }
         }
+        if self.is_bot_card_input_active(cx) {
+            match key {
+                "tab" => {
+                    self.ime.clear_preedit();
+                    self.stage.update(cx, |st, stcx| {
+                        st.bot_assist_ime_preedit = None;
+                        st.cycle_bot_card_field(is_shift);
+                        stcx.notify();
+                    });
+                }
+                "backspace" => {
+                    if self.ime.ime_preedit.take().is_some() {
+                        self.stage.update(cx, |st, stcx| {
+                            st.bot_assist_ime_preedit = None;
+                            stcx.notify();
+                        });
+                    } else {
+                        self.stage.update(cx, |st, stcx| {
+                            st.backspace_bot_card_field(is_alt);
+                            stcx.notify();
+                        });
+                    }
+                }
+                "enter" => {
+                    if self.take_ime_preedit_commit(cx) || self.ime.take_just_committed() {
+                        return true;
+                    }
+                    let submitted = self.stage.update(cx, |st, stcx| {
+                        let cid = st.active_bot_card_field.as_ref().map(|(id, _)| id.clone());
+                        if let Some(ref card_id) = cid {
+                            st.pending_bot_assist_action =
+                                Some(BotAssistCardAction::SubmitLogin {
+                                    card_id: card_id.clone(),
+                                });
+                            stcx.notify();
+                        }
+                        cid.is_some()
+                    });
+                    if submitted {
+                        self.handle_stage_pending_actions(cx);
+                    }
+                }
+                _ => return false,
+            }
+            cx.notify();
+            return true;
+        }
         if self.stage.read(cx).search_open && !self.sidebar.read(cx).search_focused {
             match key {
                 "backspace" => {
@@ -779,6 +869,11 @@ impl EntityInputHandler for AppShell {
                 });
             } else if self.is_inspector_bot_input_active(cx) {
                 self.inspector.update(cx, |ins, icx| ins.set_bot_ime_preedit(None, icx));
+            } else if self.is_bot_card_input_active(cx) {
+                self.stage.update(cx, |st, stcx| {
+                    st.bot_assist_ime_preedit = None;
+                    stcx.notify();
+                });
             }
             if !non_composer {
                 self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_cancel(); c.sync_autocomplete(); ccx.notify(); });
@@ -809,6 +904,11 @@ impl EntityInputHandler for AppShell {
                 });
             } else if self.is_inspector_bot_input_active(cx) {
                 self.inspector.update(cx, |ins, icx| ins.set_bot_ime_preedit(Some(new_text), icx));
+            } else if self.is_bot_card_input_active(cx) {
+                self.stage.update(cx, |st, stcx| {
+                    st.bot_assist_ime_preedit = Some(new_text.to_string());
+                    stcx.notify();
+                });
             }
         } else {
             self.composer.update(cx, |c, ccx| {
@@ -840,6 +940,14 @@ impl EntityInputHandler for AppShell {
                 + px((char_count as f32 * 7.0).min(220.0)))
                 .max(element_bounds.origin.x + px(40.0));
             let caret_y = element_bounds.origin.y + px(380.0);
+            return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))));
+        }
+        if self.is_bot_card_input_active(cx) {
+            let caret_x = (element_bounds.origin.x + px(420.0)
+                + px((char_count as f32 * 7.5).min(240.0)))
+            .min(element_bounds.origin.x + element_bounds.size.width - px(80.0));
+            let caret_y = (element_bounds.origin.y + element_bounds.size.height - px(220.0))
+                .max(element_bounds.origin.y + px(100.0));
             return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))));
         }
         if centered_modal {

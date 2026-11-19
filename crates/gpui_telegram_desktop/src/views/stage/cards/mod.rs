@@ -1,6 +1,7 @@
 //! Canonical 11 Message Cards for ConversationStage (`SPEC-02-GPUI-COMPONENT-HIERARCHY` § 2.4).
 
 pub mod album_card;
+pub mod bot_assist_card;
 pub mod bot_keyboard;
 pub mod call_card;
 pub mod generative_card;
@@ -15,6 +16,11 @@ pub mod text_card;
 pub mod voice_card;
 
 pub use album_card::AlbumMessageView;
+pub use bot_assist_card::{
+    compute_captcha_display_size, mask_secret_bullets, pixel_to_normalized_click_point,
+    render_bot_assist_card, BotAssistCardAction, BotAssistCardModel, BotAssistClickDraft,
+    BotAssistLoginDraft, BotAssistLoginField,
+};
 pub use bot_keyboard::InlineBotKeyboardView;
 pub use call_card::CallMessageView;
 pub use generative_card::render_generative_card;

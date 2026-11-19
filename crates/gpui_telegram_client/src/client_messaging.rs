@@ -10,6 +10,7 @@ use gpui_telegram_core::types::{ChatId, MessageId, PeerId, TopicId, UserId};
 use gpui_telegram_proto::message::{
     MessageContent, MessageEntity, MessageItem, ReactionCount, ReplyHeader,
 };
+use gpui_telegram_proto::miniapp_contracts::{MiniAppTakeoverEvent, MiniAppWebMcpResponse};
 use gpui_telegram_proto::sync::{SyncGetDifferenceRequest, SyncGetDifferenceResponse, TypingAction, TypingEvent};
 use gpui_telegram_proto::ws::{WsClientFrame, WsServerFrame};
 
@@ -188,6 +189,14 @@ impl TelegramClient {
 
     pub fn unsubscribe_chat(&self, chat_id: i64) -> bool {
         self.send_ws_frame(WsClientFrame::UnsubscribeChat { chat_id })
+    }
+
+    pub fn send_webmcp_result(&self, resp: MiniAppWebMcpResponse) -> bool {
+        self.send_ws_frame(WsClientFrame::MiniAppWebMcpResult(resp))
+    }
+
+    pub fn send_miniapp_takeover_state(&self, evt: MiniAppTakeoverEvent) -> bool {
+        self.send_ws_frame(WsClientFrame::MiniAppTakeoverState(evt))
     }
 
     pub async fn get_chat_messages(

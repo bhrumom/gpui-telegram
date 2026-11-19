@@ -116,7 +116,7 @@ fn is_loopback_bind_host(host: &str) -> bool {
 }
 
 fn user_router(state: &AppState, user_id: UserId) -> ProviderRouter {
-    state.hermes.providers_for_user(&user_id.0.to_string())
+    state.fabushi_core().providers_for_user(&user_id.0.to_string())
 }
 
 fn build_magpie_state_json_for_user(state: &AppState, user_id: UserId) -> Value {
@@ -157,7 +157,7 @@ fn build_magpie_state_json_for_user(state: &AppState, user_id: UserId) -> Value 
 
 fn persist_user_router(state: &AppState, user_id: UserId) {
     state
-        .hermes
+        .fabushi_core()
         .persist_user_providers_state(&user_id.0.to_string());
 }
 

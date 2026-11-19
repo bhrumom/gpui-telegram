@@ -1,22 +1,31 @@
+use crate::db::miniapp_store::MiniAppRecord;
 use crate::db::{ChatMemberRecord, ChatRecord, ForumTopicRecord, ServerDatabase};
 use crate::messaging::pipeline::MessagePipeline;
+use crate::miniapp_webmcp::{
+    MiniAppWebMcpBroker, DEFAULT_TAKEOVER_WAIT_TIMEOUT, DEFAULT_WEBMCP_RPC_TIMEOUT,
+};
 use crate::search::hybrid_memory::HybridMemoryEngine;
 use crate::search::schema::{SearchDocument, SearchQueryParams};
 use crate::search::tantivy_indexer::TantivyIndexer;
-use crate::server::extract_message_content_text;
+use crate::server::{extract_message_content_text, AppState};
 use crate::sync::pts_engine::PtsEngine;
 use crate::ws::GatewayHub;
 use chrono::Utc;
+use fabushi_miniapp::storage;
+use fabushi_miniapp::sutras::{all_sutras, format_leaderboard_bytes, sutra_by_title};
 use gpui_telegram_agent::hermes::toolsets::{BoxFuture, PlatformImBridge, PlatformImCaller};
 use gpui_telegram_core::types::{ChatId, MsgId, PeerId, TopicId, UserId};
 use gpui_telegram_proto::cards::GenerativeCard;
 use gpui_telegram_proto::contracts::ForumTopicDto;
 use gpui_telegram_proto::message::{MessageContent, MessageItem, ReplyHeader};
-use gpui_telegram_proto::miniapp_contracts::{MiniAppManifestDto, MiniAppUiSchema};
+use gpui_telegram_proto::miniapp_contracts::{
+    MiniAppActionRequest, MiniAppManifestDto, MiniAppUiSchema, MiniAppWebMcpCommand,
+    WebMcpToolDescriptor,
+};
 use gpui_telegram_proto::sync::{PtsUpdate, ReactionEvent, UpdateEvent};
 use gpui_telegram_proto::ws::WsServerFrame;
 use serde_json::{json, Value};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use uuid::Uuid;
 
 pub struct ServerPlatformImBridge {
@@ -26,9 +35,12 @@ pub struct ServerPlatformImBridge {
     gateway_hub: Weak<GatewayHub>,
     search_indexer: Weak<TantivyIndexer>,
     hybrid_memory: Weak<HybridMemoryEngine>,
+    webmcp_broker: Weak<MiniAppWebMcpBroker>,
+    state_weak: Arc<OnceLock<Weak<AppState>>>,
 }
 
 impl ServerPlatformImBridge {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<ServerDatabase>,
         pipeline: Arc<MessagePipeline>,
@@ -36,6 +48,8 @@ impl ServerPlatformImBridge {
         gateway_hub: Weak<GatewayHub>,
         search_indexer: Weak<TantivyIndexer>,
         hybrid_memory: Weak<HybridMemoryEngine>,
+        webmcp_broker: Weak<MiniAppWebMcpBroker>,
+        state_weak: Arc<OnceLock<Weak<AppState>>>,
     ) -> Self {
         Self {
             db,
@@ -44,6 +58,8 @@ impl ServerPlatformImBridge {
             gateway_hub,
             search_indexer,
             hybrid_memory,
+            webmcp_broker,
+            state_weak,
         }
     }
 
@@ -152,6 +168,484 @@ impl ServerPlatformImBridge {
         } else if let Some(hub) = self.gateway_hub.upgrade() {
             hub.broadcast_to_chat_and_members(chat_id, None, WsServerFrame::Update(event));
         }
+    }
+
+    fn resolve_target_miniapp(
+        &self,
+        args: &Value,
+        caller: &PlatformImCaller,
+        caller_uid: UserId,
+    ) -> Result<(MiniAppRecord, Option<ChatId>), String> {
+        let explicit_bot = args
+            .get("bot_username")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().trim_start_matches('@').to_string())
+            .filter(|s| !s.is_empty());
+        let explicit_short = args
+            .get("short_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let app = if let (Some(bot_un), Some(short)) = (&explicit_bot, &explicit_short) {
+            self.db
+                .get_mini_app(bot_un, short)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("MiniApp '{bot_un}/{short}' not found"))?
+        } else if let Some(bot_un) = &explicit_bot {
+            let bot = self
+                .db
+                .get_bot_by_username(bot_un)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Bot '@{bot_un}' not found"))?;
+            self.db
+                .list_mini_apps_for_bot(bot.bot_user_id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("Bot '@{bot_un}' has no attached Mini App"))?
+        } else if let Some(bot_id) = caller.bot_id.filter(|&id| id > 0) {
+            let apps = self
+                .db
+                .list_mini_apps_for_bot(bot_id)
+                .map_err(|e| e.to_string())?;
+            if let Some(short) = &explicit_short {
+                apps.into_iter()
+                    .find(|a| a.short_name.eq_ignore_ascii_case(short))
+                    .ok_or_else(|| format!("MiniApp '{short}' not found on caller bot {bot_id}"))?
+            } else {
+                apps.into_iter()
+                    .next()
+                    .ok_or_else(|| format!("Caller bot {bot_id} has no attached Mini App"))?
+            }
+        } else {
+            return Err("'bot_username' and 'short_name' are required".to_string());
+        };
+
+        let explicit_chat = args.get("chat_id").and_then(|v| v.as_i64()).filter(|&c| c > 0);
+        let target_chat = if let Some(pinned) = caller.chat_id {
+            Self::reject_cross_chat_arg(args, pinned)?;
+            Some(ChatId(pinned)).filter(|c| c.0 > 0)
+        } else {
+            explicit_chat.map(ChatId)
+        };
+        if let Some(chat_id) = target_chat {
+            let _ = self.check_membership(chat_id, caller_uid)?;
+        }
+        Ok((app, target_chat))
+    }
+
+    fn headless_webmcp_catalog(app: &MiniAppRecord) -> Vec<WebMcpToolDescriptor> {
+        if app.short_name.eq_ignore_ascii_case("fabushi") {
+            return vec![
+                WebMcpToolDescriptor {
+                    name: "fabushi_get_status".to_string(),
+                    description: "读取全球法布施小程序当前功德档案、累计传输字节、近期禅修记录与锁定功课".to_string(),
+                    input_schema: json!({ "type": "object", "properties": {} }),
+                    read_only: true,
+                },
+                WebMcpToolDescriptor {
+                    name: "fabushi_send_dharma".to_string(),
+                    description: "发起全球法布施，发送指定佛经（如心经、金刚经、楞严经）到目标区域".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "sutra": { "type": "string", "description": "经文名称，例如 心经 / 金刚经 / 大悲咒" },
+                            "target_country": { "type": "string", "description": "目标地区代码，默认 ALL 代表全球" }
+                        }
+                    }),
+                    read_only: false,
+                },
+                WebMcpToolDescriptor {
+                    name: "fabushi_stop_dharma".to_string(),
+                    description: "停止当前正在进行的法布施传输".to_string(),
+                    input_schema: json!({ "type": "object", "properties": {} }),
+                    read_only: false,
+                },
+                WebMcpToolDescriptor {
+                    name: "fabushi_switch_tab".to_string(),
+                    description: "切换全球法布施小程序底部主标签（dharma / practice / discover）".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["tab"],
+                        "properties": { "tab": { "type": "string" } }
+                    }),
+                    read_only: false,
+                },
+                WebMcpToolDescriptor {
+                    name: "fabushi_record_practice".to_string(),
+                    description: "记录一次禅室共修或念诵次数到真实数据库功德簿".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "sutra": { "type": "string" },
+                            "duration_minutes": { "type": "integer" },
+                            "chant_count": { "type": "integer" },
+                            "note": { "type": "string" }
+                        }
+                    }),
+                    read_only: false,
+                },
+            ];
+        }
+
+        vec![
+            WebMcpToolDescriptor {
+                name: "get_state".to_string(),
+                description: format!("读取 {} 小程序当前界面状态与字段", app.title),
+                input_schema: json!({ "type": "object", "properties": {} }),
+                read_only: true,
+            },
+            WebMcpToolDescriptor {
+                name: "page_inspect".to_string(),
+                description: "探测当前网页可交互元素（按钮、输入框、表单项）".to_string(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+                read_only: true,
+            },
+            WebMcpToolDescriptor {
+                name: "page_click".to_string(),
+                description: "点击网页内匹配 selector 或按钮文案的元素".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "selector": { "type": "string" },
+                        "text": { "type": "string" }
+                    }
+                }),
+                read_only: false,
+            },
+            WebMcpToolDescriptor {
+                name: "page_fill".to_string(),
+                description: "填写输入框或更新指定组件值".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": {
+                        "selector": { "type": "string" },
+                        "widget_id": { "type": "string" },
+                        "value": {}
+                    }
+                }),
+                read_only: false,
+            },
+            WebMcpToolDescriptor {
+                name: "page_press_main_button".to_string(),
+                description: "点击 Mini App 底部主操作按钮".to_string(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+                read_only: false,
+            },
+        ]
+    }
+
+    fn resolve_sutra_title(raw: &str) -> (String, u64) {
+        let trimmed = raw.trim();
+        if let Some(exact) = sutra_by_title(trimmed) {
+            return (exact.title.to_string(), exact.content.len().max(1024) as u64);
+        }
+        let clean = trimmed.trim_matches(|c| matches!(c, '《' | '》' | ' '));
+        if let Some(exact) = sutra_by_title(clean) {
+            return (exact.title.to_string(), exact.content.len().max(1024) as u64);
+        }
+        if let Some(matched) = all_sutras().iter().find(|s| {
+            s.title.contains(clean) || clean.contains(&s.title) || s.id.eq_ignore_ascii_case(clean)
+        }) {
+            return (
+                matched.title.to_string(),
+                matched.content.len().max(1024) as u64,
+            );
+        }
+        (
+            if clean.is_empty() {
+                "心经".to_string()
+            } else {
+                clean.to_string()
+            },
+            1024,
+        )
+    }
+
+    fn execute_headless_webmcp_tool(
+        &self,
+        app: &MiniAppRecord,
+        caller_uid: UserId,
+        chat_id: i64,
+        tool_name: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let uid = caller_uid.0 as i64;
+        if app.short_name.eq_ignore_ascii_case("fabushi") {
+            let user_opt = self.db.get_user(caller_uid).ok().flatten();
+            let username = user_opt
+                .as_ref()
+                .and_then(|u| u.username.clone())
+                .unwrap_or_else(|| format!("user_{uid}"));
+            let display_name = user_opt
+                .as_ref()
+                .map(|u| {
+                    format!(
+                        "{} {}",
+                        u.first_name.trim(),
+                        u.last_name.as_deref().unwrap_or("").trim()
+                    )
+                    .trim()
+                    .to_string()
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| username.clone());
+            let _ = self.db.pool().with_conn(|conn| {
+                storage::ensure_profile(conn, uid, &username, &display_name, "", caller_uid.0 == 1)
+                    .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
+            });
+            let bot = self.db.get_bot_by_user_id(app.bot_user_id).ok().flatten();
+
+            match tool_name {
+                "fabushi_get_status" | "get_state" | "page_inspect" => {
+                    let profile = self
+                        .db
+                        .pool()
+                        .with_conn(|conn| {
+                            storage::get_profile(conn, uid)
+                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let practice_stats = self
+                        .db
+                        .pool()
+                        .with_conn(|conn| {
+                            storage::compute_practice_stats(conn, uid)
+                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
+                        })
+                        .ok();
+                    let practices = self
+                        .db
+                        .pool()
+                        .with_conn(|conn| {
+                            storage::list_practice_records(conn, uid, 5, 0)
+                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
+                        })
+                        .unwrap_or_default();
+                    return Ok(json!({
+                        "success": true,
+                        "mode": "headless_db",
+                        "profile": profile,
+                        "practice_stats": practice_stats,
+                        "total_transfer_human": format_leaderboard_bytes(profile.total_transfer_bytes),
+                        "recent_practices": practices,
+                    }));
+                }
+                "fabushi_send_dharma" => {
+                    let raw_sutra = args
+                        .get("sutra")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("心经");
+                    let (sutra, bytes) = Self::resolve_sutra_title(raw_sutra);
+                    let target = args
+                        .get("target_country")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("ALL")
+                        .to_string();
+                    let targets = vec![target];
+                    let res = self
+                        .db
+                        .pool()
+                        .with_conn(|conn| {
+                            storage::record_transfer(conn, uid, &sutra, "sutra", &targets, bytes, 1)
+                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    if let Some(state) = self.state_weak.get().and_then(|w| w.upgrade()) {
+                        crate::routes::fabushi_miniapp_api::sync_summary_and_maybe_notify(
+                            &state,
+                            uid,
+                            bot.as_ref(),
+                            None,
+                        );
+                    }
+                    return Ok(json!({
+                        "success": true,
+                        "mode": "headless_db",
+                        "sutra": sutra,
+                        "targets": targets,
+                        "transfer_bytes": bytes,
+                        "total_transfer_bytes": res.total_transfer_bytes,
+                        "total_transfer_human": format_leaderboard_bytes(res.total_transfer_bytes),
+                        "total_transfer_count": res.total_transfer_count,
+                    }));
+                }
+                "fabushi_record_practice" => {
+                    let raw_sutra = args
+                        .get("sutra")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("心经");
+                    let (sutra, _) = Self::resolve_sutra_title(raw_sutra);
+                    let duration_minutes = args
+                        .get("duration_minutes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(15)
+                        .max(1) as u32;
+                    let chant_count = args
+                        .get("chant_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(108)
+                        .max(1) as u32;
+                    let note = args.get("note").and_then(|v| v.as_str());
+                    let ps = self
+                        .db
+                        .pool()
+                        .with_conn(|conn| {
+                            storage::record_practice_session(
+                                conn,
+                                uid,
+                                &sutra,
+                                duration_minutes,
+                                chant_count,
+                                None,
+                                None,
+                                note,
+                            )
+                            .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    if let Some(state) = self.state_weak.get().and_then(|w| w.upgrade()) {
+                        crate::routes::fabushi_miniapp_api::sync_summary_and_maybe_notify(
+                            &state,
+                            uid,
+                            bot.as_ref(),
+                            None,
+                        );
+                    }
+                    return Ok(json!({
+                        "success": true,
+                        "mode": "headless_db",
+                        "record": ps.record,
+                        "total_practice_sessions": ps.profile.total_practice_sessions,
+                        "total_practice_chants": ps.profile.total_practice_chants,
+                    }));
+                }
+                other => {
+                    if let (Some(state), Some(bot_rec)) =
+                        (self.state_weak.get().and_then(|w| w.upgrade()), bot.as_ref())
+                    {
+                        let latest = self
+                            .db
+                            .get_latest_mini_app_state_for_bot_user(uid, app.bot_user_id)
+                            .ok()
+                            .flatten();
+                        let current_state = latest
+                            .as_ref()
+                            .and_then(|s| serde_json::from_str(&s.state_json).ok())
+                            .unwrap_or_else(|| json!({}));
+                        let req = MiniAppActionRequest {
+                            action_type: other.to_string(),
+                            value: Some(args.clone()),
+                            chat_id: Some(chat_id),
+                            ..Default::default()
+                        };
+                        let (next_state, toast, _, _) =
+                            crate::routes::fabushi_miniapp_api::handle_headless_fabushi_action(
+                                &state,
+                                bot_rec,
+                                app,
+                                caller_uid,
+                                &req,
+                                current_state,
+                            );
+                        return Ok(json!({
+                            "success": true,
+                            "mode": "headless_db",
+                            "toast": toast,
+                            "state": next_state,
+                        }));
+                    }
+                    return Ok(json!({
+                        "success": true,
+                        "mode": "headless_db",
+                        "note": format!("已记录指令 {other}；客户端未连接实时 WebView，已安全跳过界面操作"),
+                        "arguments": args,
+                    }));
+                }
+            }
+        }
+
+        let latest = self
+            .db
+            .get_latest_mini_app_state_for_bot_user(uid, app.bot_user_id)
+            .ok()
+            .flatten();
+        let current_state: Value = latest
+            .as_ref()
+            .and_then(|s| serde_json::from_str(&s.state_json).ok())
+            .unwrap_or_else(|| crate::routes::bots_miniapps::initial_state_for_app(app));
+
+        if matches!(tool_name, "get_state" | "page_inspect") {
+            return Ok(json!({
+                "success": true,
+                "mode": "headless_db",
+                "state": current_state,
+            }));
+        }
+
+        let mapped_req = match tool_name {
+            "page_fill" => MiniAppActionRequest {
+                action_type: "widget_event".to_string(),
+                widget_id: args
+                    .get("widget_id")
+                    .or_else(|| args.get("selector"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                value: args.get("value").cloned(),
+                chat_id: Some(chat_id),
+                ..Default::default()
+            },
+            "page_press_main_button" | "main_button_click" => MiniAppActionRequest {
+                action_type: "main_button_click".to_string(),
+                chat_id: Some(chat_id),
+                ..Default::default()
+            },
+            "page_press_secondary_button" | "secondary_button_click" => MiniAppActionRequest {
+                action_type: "secondary_button_click".to_string(),
+                chat_id: Some(chat_id),
+                ..Default::default()
+            },
+            other => MiniAppActionRequest {
+                action_type: other.to_string(),
+                widget_id: args.get("widget_id").and_then(|v| v.as_str()).map(str::to_string),
+                value: args.get("value").cloned(),
+                data: args.get("data").and_then(|v| v.as_str()).map(str::to_string),
+                chat_id: Some(chat_id),
+                ..Default::default()
+            },
+        };
+        let (next_state, toast, _, _) =
+            crate::routes::bots_miniapps::reduce_mini_app_action(app, current_state, &mapped_req);
+        let state_str = serde_json::to_string(&next_state).unwrap_or_else(|_| "{}".to_string());
+        if let Some(ref existing) = latest {
+            let _ = self
+                .db
+                .update_mini_app_session_state(&existing.query_id, &state_str);
+        } else {
+            let qid = format!("ma_{}", Uuid::new_v4().simple());
+            let _ = self.db.create_mini_app_session(
+                &qid,
+                uid,
+                &app.app_id,
+                app.bot_user_id,
+                chat_id,
+                "inline",
+                "",
+                "",
+                Utc::now().timestamp(),
+                &state_str,
+            );
+        }
+        Ok(json!({
+            "success": true,
+            "mode": "headless_db",
+            "toast": toast,
+            "state": next_state,
+        }))
     }
 }
 
@@ -1075,20 +1569,54 @@ impl PlatformImBridge for ServerPlatformImBridge {
                     let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
                     let execution = agent_manifest.execute_action(
                         action_type,
-                        &Value::Object(action_params),
+                        &Value::Object(action_params.clone()),
                         approved,
                     )?;
 
-                    let next_state = json!({
-                        "last_action": action_type,
-                        "widget_id": args.get("widget_id"),
-                        "value": args.get("value"),
-                        "data": args.get("data"),
-                        "invoked_by": caller_uid.0,
-                        "invoked_at_ms": now_ms,
-                    });
+                    let mapped_action = if let Some(wid) = action_type.strip_prefix("widget:") {
+                        ("widget_event".to_string(), Some(wid.to_string()))
+                    } else if action_type == "main_button" {
+                        ("main_button_click".to_string(), None)
+                    } else if action_type == "secondary_button" {
+                        ("secondary_button_click".to_string(), None)
+                    } else {
+                        (
+                            action_type.to_string(),
+                            args.get("widget_id")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                        )
+                    };
+                    let mut headless_args = serde_json::Map::new();
+                    if let Some(wid) = &mapped_action.1 {
+                        headless_args.insert("widget_id".to_string(), json!(wid));
+                    }
+                    if let Some(v) = args.get("value").filter(|v| !v.is_null()) {
+                        headless_args.insert("value".to_string(), v.clone());
+                    }
+                    if let Some(d) = args.get("data").filter(|v| !v.is_null()) {
+                        headless_args.insert("data".to_string(), d.clone());
+                    }
+                    for (k, v) in action_params {
+                        headless_args.entry(k).or_insert(v);
+                    }
+                    let reduced = self.execute_headless_webmcp_tool(
+                        &app,
+                        caller_uid,
+                        target_chat.unwrap_or(0),
+                        &mapped_action.0,
+                        &Value::Object(headless_args),
+                    )?;
+
+                    let mut next_state = reduced.get("state").cloned().unwrap_or_else(|| json!({}));
+                    if let Some(obj) = next_state.as_object_mut() {
+                        obj.insert("last_action".to_string(), json!(action_type));
+                        obj.insert("invoked_by".to_string(), json!(caller_uid.0));
+                        obj.insert("invoked_at_ms".to_string(), json!(now_ms));
+                    }
                     if let Some(qid) = args.get("query_id").and_then(|v| v.as_str()) {
-                        let state_str = serde_json::to_string(&next_state).unwrap_or_else(|_| "{}".into());
+                        let state_str =
+                            serde_json::to_string(&next_state).unwrap_or_else(|_| "{}".into());
                         self.db
                             .update_mini_app_session_state(qid, &state_str)
                             .map_err(|e| e.to_string())?;
@@ -1098,7 +1626,222 @@ impl PlatformImBridge for ServerPlatformImBridge {
                         "app_id": app.app_id,
                         "action_type": action_type,
                         "execution": execution,
+                        "headless_result": reduced,
                         "state": next_state,
+                    }))
+                }
+                "webmcp_list_miniapps" => {
+                    let uid = caller_uid.0 as i64;
+                    let mut seen = std::collections::HashSet::new();
+                    let mut items = Vec::new();
+                    let has_live_client = self
+                        .webmcp_broker
+                        .upgrade()
+                        .is_some_and(|b| b.has_connected_client(caller_uid));
+                    if let Some(bid) = caller.bot_id.filter(|&id| id > 0) {
+                        if let Ok(companion_apps) = self.db.list_mini_apps_for_bot(bid) {
+                            for app in companion_apps {
+                                let k = format!("{}/{}", app.bot_username, app.short_name);
+                                if seen.insert(k) {
+                                    items.push(json!({
+                                        "bot_username": app.bot_username,
+                                        "short_name": app.short_name,
+                                        "title": app.title,
+                                        "description": app.description,
+                                        "companion": true,
+                                        "has_live_client": has_live_client,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    for (app, _, _) in self
+                        .db
+                        .list_user_installed_mini_apps(uid)
+                        .unwrap_or_default()
+                    {
+                        let k = format!("{}/{}", app.bot_username, app.short_name);
+                        if seen.insert(k) {
+                            items.push(json!({
+                                "bot_username": app.bot_username,
+                                "short_name": app.short_name,
+                                "title": app.title,
+                                "description": app.description,
+                                "companion": false,
+                                "has_live_client": has_live_client,
+                            }));
+                        }
+                    }
+                    for app in self.db.search_published_mini_apps("", None).unwrap_or_default() {
+                        let k = format!("{}/{}", app.bot_username, app.short_name);
+                        if seen.insert(k) {
+                            items.push(json!({
+                                "bot_username": app.bot_username,
+                                "short_name": app.short_name,
+                                "title": app.title,
+                                "description": app.description,
+                                "companion": false,
+                                "has_live_client": has_live_client,
+                            }));
+                        }
+                    }
+                    Ok(json!({
+                        "miniapps": items,
+                        "count": items.len(),
+                        "has_live_client": has_live_client,
+                    }))
+                }
+                "webmcp_discover" => {
+                    let (app, target_chat) = self.resolve_target_miniapp(args, &caller, caller_uid)?;
+                    let chat_id = target_chat.map(|c| c.0).unwrap_or(0);
+                    if let Some(broker) = self.webmcp_broker.upgrade() {
+                        let cmd = MiniAppWebMcpCommand {
+                            request_id: format!("wmcp_{}", Uuid::new_v4().simple()),
+                            bot_username: app.bot_username.clone(),
+                            short_name: app.short_name.clone(),
+                            chat_id,
+                            bot_user_id: app.bot_user_id,
+                            app_title: app.title.clone(),
+                            operation: "discover".to_string(),
+                            tool_name: None,
+                            arguments: json!({}),
+                            status_message: Some(format!("正在发现 {} 的 WebMCP 工具...", app.title)),
+                        };
+                        if let Some(resp) = broker
+                            .dispatch_to_client(caller_uid, cmd, DEFAULT_WEBMCP_RPC_TIMEOUT)
+                            .await?
+                        {
+                            if !resp.ok {
+                                return Err(resp.error.unwrap_or_else(|| "WebMCP discover failed".into()));
+                            }
+                            return Ok(json!({
+                                "success": true,
+                                "mode": "live_webmcp",
+                                "bot_username": app.bot_username,
+                                "short_name": app.short_name,
+                                "app_title": app.title,
+                                "tools": resp.tools,
+                                "state_summary": resp.state_summary,
+                            }));
+                        }
+                    }
+                    let catalog = Self::headless_webmcp_catalog(&app);
+                    let state_res = self.execute_headless_webmcp_tool(
+                        &app,
+                        caller_uid,
+                        chat_id,
+                        "get_state",
+                        &json!({}),
+                    )?;
+                    Ok(json!({
+                        "success": true,
+                        "mode": "headless_fallback",
+                        "bot_username": app.bot_username,
+                        "short_name": app.short_name,
+                        "app_title": app.title,
+                        "tools": catalog,
+                        "state_summary": state_res,
+                    }))
+                }
+                "webmcp_call_tool" => {
+                    let tool = args
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "'tool_name' is required".to_string())?;
+                    let tool_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    let status_msg = args
+                        .get("status_message")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let (app, target_chat) = self.resolve_target_miniapp(args, &caller, caller_uid)?;
+                    let chat_id = target_chat.map(|c| c.0).unwrap_or(0);
+
+                    if let Some(broker) = self.webmcp_broker.upgrade() {
+                        let cmd = MiniAppWebMcpCommand {
+                            request_id: format!("wmcp_{}", Uuid::new_v4().simple()),
+                            bot_username: app.bot_username.clone(),
+                            short_name: app.short_name.clone(),
+                            chat_id,
+                            bot_user_id: app.bot_user_id,
+                            app_title: app.title.clone(),
+                            operation: "call_tool".to_string(),
+                            tool_name: Some(tool.to_string()),
+                            arguments: tool_args.clone(),
+                            status_message: status_msg,
+                        };
+                        if let Some(resp) = broker
+                            .dispatch_to_client(caller_uid, cmd, DEFAULT_WEBMCP_RPC_TIMEOUT)
+                            .await?
+                        {
+                            if !resp.ok {
+                                return Err(
+                                    resp.error
+                                        .unwrap_or_else(|| format!("WebMCP tool '{tool}' failed")),
+                                );
+                            }
+                            return Ok(json!({
+                                "success": true,
+                                "mode": "live_webmcp",
+                                "bot_username": app.bot_username,
+                                "short_name": app.short_name,
+                                "tool_name": tool,
+                                "result": resp.result,
+                                "state_summary": resp.state_summary,
+                            }));
+                        }
+                    }
+
+                    let fallback_res = self.execute_headless_webmcp_tool(
+                        &app,
+                        caller_uid,
+                        chat_id,
+                        tool,
+                        &tool_args,
+                    )?;
+                    Ok(json!({
+                        "success": true,
+                        "mode": "headless_fallback",
+                        "bot_username": app.bot_username,
+                        "short_name": app.short_name,
+                        "tool_name": tool,
+                        "result": fallback_res,
+                    }))
+                }
+                "miniapp_request_takeover" => {
+                    let reason = args
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "'reason' is required".to_string())?;
+                    let (app, target_chat) = self.resolve_target_miniapp(args, &caller, caller_uid)?;
+                    let chat_id = target_chat.unwrap_or(ChatId(0));
+                    let broker = self
+                        .webmcp_broker
+                        .upgrade()
+                        .ok_or_else(|| "WebMCP broker is unavailable".to_string())?;
+                    let evt = broker
+                        .request_takeover_and_wait(
+                            caller_uid,
+                            &app.bot_username,
+                            &app.short_name,
+                            chat_id,
+                            UserId(app.bot_user_id.max(0) as u64),
+                            &app.title,
+                            reason,
+                            DEFAULT_TAKEOVER_WAIT_TIMEOUT,
+                        )
+                        .await?;
+                    Ok(json!({
+                        "success": true,
+                        "resumed": true,
+                        "bot_username": app.bot_username,
+                        "short_name": app.short_name,
+                        "mode": evt.mode,
+                        "user_note": evt.user_note,
+                        "state_snapshot": evt.state_snapshot,
                     }))
                 }
                 other => Err(format!("Unsupported PlatformIm tool '{other}'")),
@@ -1197,7 +1940,7 @@ mod tests {
         )
         .expect("seed miniapp");
 
-        let ctx = state.hermes.build_tool_context_with_user(
+        let ctx = state.fabushi_core().build_tool_context_with_user(
             "sess_platform_im_test",
             None,
             None,
@@ -1466,7 +2209,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx_alice = state.hermes.build_tool_context_with_user(
+        let ctx_alice = state.fabushi_core().build_tool_context_with_user(
             "sess_alice_acl",
             None,
             None,
@@ -1476,7 +2219,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
         );
-        let ctx_eve = state.hermes.build_tool_context_with_user(
+        let ctx_eve = state.fabushi_core().build_tool_context_with_user(
             "sess_eve_acl",
             None,
             None,
@@ -1606,5 +2349,119 @@ mod tests {
             serde_json::from_str::<Value>(&s1_after.output).unwrap()["count"].as_u64().unwrap_or(0) >= 1,
             "deleting chat2 msg 1 must not delete chat3 msg 1"
         );
+    }
+
+    #[tokio::test]
+    async fn test_webmcp_list_discover_and_headless_execution_persists_real_state() {
+        let dir = TempDir::new().expect("create tempdir");
+        let db_path = dir.path().join("webmcp_headless_test.db");
+        let db = Arc::new(ServerDatabase::open(&db_path).expect("open db"));
+        let mut cfg = ServerConfig::default();
+        cfg.media_storage_path = dir.path().join("media").display().to_string();
+        let state = Arc::new(AppState::with_db(cfg, db.clone()));
+
+        let (alice, _, _) = state
+            .session_manager
+            .register("alice_webmcp", "Pass123456!", "Alice", None, "CLI")
+            .unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        db.create_user(&crate::db::schema::UserRecord {
+            user_id: alice.user_id,
+            username: Some("alice_webmcp".to_string()),
+            phone: None,
+            first_name: "Alice".to_string(),
+            last_name: None,
+            bio: None,
+            password_hash: None,
+            is_bot: false,
+            is_verified: false,
+            is_support: false,
+            is_scam: false,
+            is_fake: false,
+            profile_photo_file_id: None,
+            account_generation: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+        .unwrap();
+
+        let bot = db
+            .create_registered_bot(
+                alice.user_id.0 as i64,
+                "fabushi_bot",
+                "全球法布施",
+                "Fabushi companion bot",
+                "Global Dharma Offering",
+                "helpful",
+                "",
+                "/fabushi-miniapp",
+                "[]",
+                false,
+                true,
+            )
+            .expect("register fabushi_bot");
+        let bot_id = bot.bot_user_id;
+        db.create_or_upsert_mini_app_with_options(
+            bot_id,
+            "fabushi_bot",
+            "fabushi",
+            "全球法布施",
+            "Global Dharma Offering",
+            "spirituality",
+            "🪷",
+            Some("/fabushi-miniapp"),
+            "{}",
+            true,
+            true,
+            false,
+            "",
+            "",
+            None,
+            false,
+        )
+        .expect("seed fabushi miniapp");
+        let (chat_rec, _) = db.ensure_companion_bot_chat_record(alice.user_id, UserId(bot_id as u64)).unwrap();
+
+        let alice_uid_str = alice.user_id.0.to_string();
+        let mut ctx = state.fabushi_core().build_tool_context_with_user(
+            "sess_webmcp_test",
+            Some(chat_rec.0),
+            None,
+            Some(&alice_uid_str),
+            1,
+            Some(ToolsetPreset::Full),
+            0,
+            Arc::new(AtomicBool::new(false)),
+        );
+        ctx.bot_id = Some(bot_id);
+        assert!(ctx.platform_im_bridge.is_some());
+
+        let listed = HermesToolExecutor::execute("webmcp_list_miniapps", json!({}), &ctx).await;
+        assert!(listed.success, "webmcp_list_miniapps failed: {:?}", listed.error);
+        let listed_v: Value = serde_json::from_str(&listed.output).unwrap();
+        assert!(listed_v["count"].as_u64().unwrap_or(0) >= 1);
+
+        let disc = HermesToolExecutor::execute("webmcp_discover", json!({}), &ctx).await;
+        assert!(disc.success, "webmcp_discover failed: {:?}", disc.error);
+        let disc_v: Value = serde_json::from_str(&disc.output).unwrap();
+        assert!(disc_v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "fabushi_send_dharma"));
+
+        let called = HermesToolExecutor::execute(
+            "webmcp_call_tool",
+            json!({
+                "tool_name": "fabushi_send_dharma",
+                "arguments": { "sutra": "金刚经", "target_country": "ALL" }
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(called.success, "webmcp_call_tool failed: {:?}", called.error);
+        let called_v: Value = serde_json::from_str(&called.output).unwrap();
+        assert!(called_v["result"]["total_transfer_bytes"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(called_v["result"]["sutra"], "金刚经");
     }
 }

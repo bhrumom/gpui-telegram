@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use std::sync::Arc;
 
+use bot_browser::cdp::{CdpBridge, LoginFormSelectors, WsCdpTransport};
+use bot_browser::orchestrator::BotBrowserOrchestrator;
+use bot_browser::types::{BrowserSnapshot, NormalizedOrigin};
 use gpui_telegram_media::{
     compute_pcm_rms_level, decode_wav_pcm, encode_wav_i16, waveform_from_pcm_i16,
     ThumbnailGenerator,
@@ -27,6 +28,11 @@ pub async fn execute_web_media_tool(
         "browser_click" => tool_browser_click(args, ctx).await,
         "browser_type" => tool_browser_type(args, ctx).await,
         "browser_screenshot" => tool_browser_screenshot(args, ctx).await,
+        "vault_list" => tool_vault_list(args, ctx).await,
+        "vault_request_card" => tool_vault_request_card(args, ctx).await,
+        "vault_fill" => tool_vault_fill(args, ctx).await,
+        "human_assist_qr" => tool_human_assist_qr(args, ctx).await,
+        "human_assist_click" => tool_human_assist_click(args, ctx).await,
         "text_to_speech" => tool_text_to_speech(args, ctx).await,
         "speech_to_text" => tool_speech_to_text(args, ctx).await,
         "vision_analyze" => tool_vision_analyze(args, ctx).await,
@@ -627,284 +633,236 @@ fn percent_encode(input: &str) -> String {
 }
 
 // ----------------------------------------------------------------------------
-// Chrome DevTools Protocol (CDP) Browser Tools
+// Pure Obscura Browser & Zero-Knowledge Vault / Assist Tools
 // ----------------------------------------------------------------------------
 
-fn resolve_cdp_http_base(args: &Value, ctx: &HermesToolContext) -> String {
+fn resolve_session_id(args: &Value, ctx: &HermesToolContext) -> String {
+    args.get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| ctx.session_id.clone())
+}
+
+fn resolve_task_id(args: &Value, ctx: &HermesToolContext) -> String {
+    args.get("task_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("task_{}_{}", ctx.session_id, ctx.turn_index))
+}
+
+fn resolve_obscura_endpoint(args: &Value, ctx: &HermesToolContext) -> Option<String> {
     args.get("cdp_url")
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(ToString::to_string)
-        .or_else(|| ctx.browser_cdp_url.clone())
-        .or_else(|| std::env::var("HERMES_BROWSER_CDP_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:9222".into())
-}
-
-async fn resolve_cdp_ws_url(http_base: &str, ctx: &HermesToolContext) -> Result<String, String> {
-    if http_base.starts_with("ws://") || http_base.starts_with("wss://") {
-        return Ok(http_base.to_string());
-    }
-    let list_url = format!("{}/json/list", http_base.trim_end_matches('/'));
-    let resp = ctx
-        .http_client
-        .get(&list_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "Chrome CDP endpoint not reachable at {http_base} ({e}). Start Chrome with --remote-debugging-port=9222 or set HERMES_BROWSER_CDP_URL."
-            )
-        })?;
-    let targets: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed parsing CDP /json/list response: {e}"))?;
-    let ws_url = targets
-        .as_array()
-        .and_then(|arr| {
-            arr.iter()
-                .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-                .or_else(|| arr.first())
+        .or_else(|| {
+            ctx.browser_cdp_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
         })
-        .and_then(|t| t.get("webSocketDebuggerUrl"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "No active page target with webSocketDebuggerUrl in CDP /json/list".to_string())?;
-    Ok(ws_url.to_string())
+        .or_else(|| {
+            std::env::var("HERMES_BROWSER_CDP_URL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
 }
 
-async fn send_cdp_command(
-    http_base: &str,
-    method: &str,
-    params: Value,
+fn require_orchestrator<'a>(
+    tool_name: &str,
+    ctx: &'a HermesToolContext,
+) -> Result<&'a Arc<BotBrowserOrchestrator>, HermesToolResult> {
+    ctx.bot_browser.as_ref().ok_or_else(|| {
+        HermesToolResult::err(
+            tool_name,
+            "Obscura BotBrowserOrchestrator is not attached to HermesToolContext",
+        )
+    })
+}
+
+fn direct_obscura_bridge(
+    tool_name: &str,
+    args: &Value,
     ctx: &HermesToolContext,
-) -> Result<Value, String> {
-    let ws_url = resolve_cdp_ws_url(http_base, ctx).await?;
-    let rest = ws_url
-        .strip_prefix("ws://")
-        .ok_or_else(|| format!("Only ws:// local CDP WebSocket URLs supported natively (got '{ws_url}')"))?;
-    let (host_port, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
+) -> Result<CdpBridge, HermesToolResult> {
+    let Some(endpoint) = resolve_obscura_endpoint(args, ctx) else {
+        return Err(HermesToolResult::err(
+            tool_name,
+            "Obscura browser engine is not attached (HermesToolContext.bot_browser is None) and no Obscura CDP endpoint (cdp_url / HERMES_BROWSER_CDP_URL) was provided.",
+        ));
+    };
+    let transport = WsCdpTransport::with_client(
+        endpoint,
+        ctx.http_client.clone(),
+        std::time::Duration::from_secs(15),
+    );
+    Ok(CdpBridge::new(Arc::new(transport)))
+}
+
+fn parse_login_selectors(args: &Value) -> Result<LoginFormSelectors, String> {
+    let nested = args.get("selectors");
+    let extract = |key: &str| -> Option<String> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .or_else(|| nested.and_then(|obj| obj.get(key)).and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
     };
 
-    let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(host_port))
-        .await
-        .map_err(|_| format!("Timed out connecting to CDP WebSocket {host_port}"))?
-        .map_err(|e| format!("Failed connecting to CDP WebSocket {host_port}: {e}"))?;
+    let username_selector = extract("username_selector")
+        .ok_or_else(|| "Missing required 'username_selector'".to_string())?;
+    let password_selector = extract("password_selector")
+        .ok_or_else(|| "Missing required 'password_selector'".to_string())?;
+    let totp_selector = extract("totp_selector");
+    let submit_selector = extract("submit_selector");
 
-    let ws_key = base64_encode(uuid::Uuid::new_v4().as_bytes());
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    );
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|e| format!("CDP WS handshake write failed: {e}"))?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .await
-        .map_err(|e| format!("CDP WS handshake read failed: {e}"))?;
-    if !status_line.contains("101") {
-        return Err(format!("CDP WS handshake rejected: {}", status_line.trim()));
-    }
-    loop {
-        let mut hdr = String::new();
-        reader
-            .read_line(&mut hdr)
-            .await
-            .map_err(|e| format!("CDP WS header read failed: {e}"))?;
-        if hdr.trim().is_empty() {
-            break;
-        }
-    }
-
-    let payload = json!({ "id": 1, "method": method, "params": params }).to_string();
-    let frame = encode_ws_client_text_frame(payload.as_bytes());
-    reader
-        .get_mut()
-        .write_all(&frame)
-        .await
-        .map_err(|e| format!("CDP WS frame send failed: {e}"))?;
-
-    // Read frames until response with id == 1 arrives
-    for _ in 0..32 {
-        let frame_bytes = tokio::time::timeout(Duration::from_secs(5), read_ws_frame(&mut reader))
-            .await
-            .map_err(|_| format!("Timed out waiting for CDP response to '{method}'"))??;
-        if let Ok(msg) = serde_json::from_slice::<Value>(&frame_bytes) {
-            if msg.get("id").and_then(|v| v.as_u64()) == Some(1) {
-                if let Some(err) = msg.get("error") {
-                    return Err(format!("CDP error in '{method}': {err}"));
-                }
-                return Ok(msg.get("result").cloned().unwrap_or(json!({})));
-            }
-        }
-    }
-    Err(format!("Did not receive CDP response id=1 for '{method}'"))
+    Ok(LoginFormSelectors {
+        username_selector,
+        password_selector,
+        totp_selector,
+        submit_selector,
+    })
 }
 
-fn encode_ws_client_text_frame(payload: &[u8]) -> Vec<u8> {
-    let mask = [0x37u8, 0xFA, 0x21, 0x3D];
-    let mut frame = Vec::with_capacity(payload.len() + 14);
-    frame.push(0x81); // FIN + Text
-    let len = payload.len();
-    if len < 126 {
-        frame.push(0x80 | (len as u8));
-    } else if len <= 65535 {
-        frame.push(0x80 | 126);
-        frame.extend_from_slice(&(len as u16).to_be_bytes());
-    } else {
-        frame.push(0x80 | 127);
-        frame.extend_from_slice(&(len as u64).to_be_bytes());
+fn serialize_tool_json<T: Serialize>(tool_name: &str, value: &T) -> HermesToolResult {
+    match serde_json::to_value(value) {
+        Ok(structured) => {
+            let output = serde_json::to_string_pretty(&structured).unwrap_or_default();
+            HermesToolResult::ok(tool_name, output, Some(structured))
+        }
+        Err(e) => HermesToolResult::err(tool_name, format!("Failed serializing result: {e}")),
     }
-    frame.extend_from_slice(&mask);
-    for (idx, b) in payload.iter().enumerate() {
-        frame.push(b ^ mask[idx % 4]);
-    }
-    frame
 }
 
-async fn read_ws_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>, String> {
-    let mut hdr = [0u8; 2];
-    reader
-        .read_exact(&mut hdr)
-        .await
-        .map_err(|e| format!("WS frame header read failed: {e}"))?;
-    let masked = (hdr[1] & 0x80) != 0;
-    let mut len = (hdr[1] & 0x7F) as u64;
-    if len == 126 {
-        let mut ext = [0u8; 2];
-        reader.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
-        len = u16::from_be_bytes(ext) as u64;
-    } else if len == 127 {
-        let mut ext = [0u8; 8];
-        reader.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
-        len = u64::from_be_bytes(ext);
-    }
-    let mut mask_key = [0u8; 4];
-    if masked {
-        reader
-            .read_exact(&mut mask_key)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    let mut data = vec![0u8; len as usize];
-    reader
-        .read_exact(&mut data)
-        .await
-        .map_err(|e| format!("WS payload read failed: {e}"))?;
-    if masked {
-        for (i, b) in data.iter_mut().enumerate() {
-            *b ^= mask_key[i % 4];
-        }
-    }
-    Ok(data)
+fn snapshot_to_tool_result(snapshot: &BrowserSnapshot) -> HermesToolResult {
+    serialize_tool_json("browser_snapshot", snapshot)
+}
+
+fn is_sensitive_selector_str(selector: &str) -> bool {
+    let lower = selector.to_ascii_lowercase();
+    ["password", "passwd", "passcode", "pwd", "one-time-code", "totp"]
+        .iter()
+        .any(|m| lower.contains(m))
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == "otp")
 }
 
 async fn tool_browser_navigate(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let Some(url) = args.get("url").and_then(|v| v.as_str()) else {
+    let Some(url) = args.get("url").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
         return HermesToolResult::err("browser_navigate", "Missing required 'url'");
     };
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    match send_cdp_command(&cdp_base, "Page.navigate", json!({ "url": url }), ctx).await {
-        Ok(res) => HermesToolResult::ok(
+    let session_id = resolve_session_id(&args, ctx);
+
+    if let Some(orch) = ctx.bot_browser.as_ref() {
+        return match orch.browser_navigate(&session_id, url).await {
+            Ok(res) => HermesToolResult::ok(
+                "browser_navigate",
+                format!("Navigated Obscura session '{session_id}' to {url}"),
+                serde_json::to_value(&res).ok(),
+            ),
+            Err(e) => HermesToolResult::err("browser_navigate", e.to_string()),
+        };
+    }
+
+    let origin = match NormalizedOrigin::parse(url) {
+        Ok(o) => {
+            let host = o.host();
+            if host == "169.254.169.254" || host == "metadata.google.internal" {
+                return HermesToolResult::err("browser_navigate", "Blocked cloud metadata endpoint URL");
+            }
+            o
+        }
+        Err(e) => return HermesToolResult::err("browser_navigate", e.to_string()),
+    };
+    let bridge = match direct_obscura_bridge("browser_navigate", &args, ctx) {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
+    };
+    match bridge.navigate(url).await {
+        Ok(raw) => HermesToolResult::ok(
             "browser_navigate",
-            format!("Navigated browser tab to {url}"),
-            Some(res),
+            format!("Navigated Obscura page to {url}"),
+            Some(json!({ "session_id": session_id, "url": url, "origin": origin.as_str(), "cdp": raw })),
         ),
-        Err(e) => HermesToolResult::err("browser_navigate", e),
+        Err(e) => HermesToolResult::err("browser_navigate", e.to_string()),
     }
 }
 
 async fn tool_browser_snapshot(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    let selector = args.get("selector").and_then(|v| v.as_str());
-    let expr = match selector {
-        Some(sel) => format!(
-            "(() => {{ const el = document.querySelector({:?}); return JSON.stringify({{ title: document.title, url: location.href, text: el ? el.innerText : '' }}); }})()",
-            sel
-        ),
-        None => "(() => JSON.stringify({ title: document.title, url: location.href, text: document.body ? document.body.innerText.slice(0, 12000) : '' }))()".into(),
+    let selector = args
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let session_id = resolve_session_id(&args, ctx);
+
+    if let Some(orch) = ctx.bot_browser.as_ref() {
+        return match orch.tool_browser_snapshot(&session_id, selector).await {
+            Ok(snapshot) => snapshot_to_tool_result(&snapshot),
+            Err(e) => HermesToolResult::err("browser_snapshot", e.to_string()),
+        };
+    }
+
+    let bridge = match direct_obscura_bridge("browser_snapshot", &args, ctx) {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
     };
-    match send_cdp_command(
-        &cdp_base,
-        "Runtime.evaluate",
-        json!({ "expression": expr, "returnByValue": true }),
-        ctx,
-    )
-    .await
-    {
-        Ok(res) => {
-            let val_str = res
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            HermesToolResult::ok(
-                "browser_snapshot",
-                val_str.to_string(),
-                serde_json::from_str(val_str).ok(),
-            )
-        }
-        Err(e) => HermesToolResult::err("browser_snapshot", e),
+    match bridge.capture_redacted_snapshot(selector).await {
+        Ok(snapshot) => snapshot_to_tool_result(&snapshot),
+        Err(e) => HermesToolResult::err("browser_snapshot", e.to_string()),
     }
 }
 
 async fn tool_browser_click(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    if let Some(sel) = args.get("selector").and_then(|v| v.as_str()) {
-        let expr = format!(
-            "(() => {{ const el = document.querySelector({:?}); if (!el) return 'NOT_FOUND'; el.click(); return 'CLICKED'; }})()",
-            sel
-        );
-        return match send_cdp_command(
-            &cdp_base,
-            "Runtime.evaluate",
-            json!({ "expression": expr, "returnByValue": true }),
-            ctx,
-        )
-        .await
-        {
-            Ok(res) => HermesToolResult::ok(
-                "browser_click",
-                format!("Clicked selector '{sel}': {res}"),
-                Some(res),
-            ),
-            Err(e) => HermesToolResult::err("browser_click", e),
+    let selector = args
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let x = args.get("x").and_then(|v| v.as_f64());
+    let y = args.get("y").and_then(|v| v.as_f64());
+    let session_id = resolve_session_id(&args, ctx);
+
+    if let Some(orch) = ctx.bot_browser.as_ref() {
+        return match orch.browser_click(&session_id, selector, x, y).await {
+            Ok(res) => serialize_tool_json("browser_click", &res),
+            Err(e) => HermesToolResult::err("browser_click", e.to_string()),
         };
     }
 
-    if let (Some(x), Some(y)) = (
-        args.get("x").and_then(|v| v.as_f64()),
-        args.get("y").and_then(|v| v.as_f64()),
-    ) {
-        let _ = send_cdp_command(
-            &cdp_base,
-            "Input.dispatchMouseEvent",
-            json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1 }),
-            ctx,
-        )
-        .await;
-        return match send_cdp_command(
-            &cdp_base,
-            "Input.dispatchMouseEvent",
-            json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1 }),
-            ctx,
-        )
-        .await
-        {
+    let bridge = match direct_obscura_bridge("browser_click", &args, ctx) {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
+    };
+    if let Some(sel) = selector {
+        return match bridge.click_selector(sel).await {
             Ok(res) => HermesToolResult::ok(
                 "browser_click",
-                format!("Clicked coordinates ({x}, {y})"),
+                format!("Clicked selector '{sel}'"),
                 Some(res),
             ),
-            Err(e) => HermesToolResult::err("browser_click", e),
+            Err(e) => HermesToolResult::err("browser_click", e.to_string()),
         };
     }
-
+    if let (Some(px), Some(py)) = (x, y) {
+        return match bridge.click_coords(px, py).await {
+            Ok(res) => HermesToolResult::ok(
+                "browser_click",
+                format!("Clicked coordinates ({px}, {py})"),
+                Some(res),
+            ),
+            Err(e) => HermesToolResult::err("browser_click", e.to_string()),
+        };
+    }
     HermesToolResult::err("browser_click", "Provide either 'selector' or ('x', 'y')")
 }
 
@@ -912,69 +870,293 @@ async fn tool_browser_type(args: Value, ctx: &HermesToolContext) -> HermesToolRe
     let Some(text) = args.get("text").and_then(|v| v.as_str()) else {
         return HermesToolResult::err("browser_type", "Missing required 'text'");
     };
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    if let Some(sel) = args.get("selector").and_then(|v| v.as_str()) {
-        let focus_expr = format!("document.querySelector({:?})?.focus()", sel);
-        let _ = send_cdp_command(
-            &cdp_base,
-            "Runtime.evaluate",
-            json!({ "expression": focus_expr }),
-            ctx,
-        )
-        .await;
+    let selector = args
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
+    let session_id = resolve_session_id(&args, ctx);
+
+    if let Some(orch) = ctx.bot_browser.as_ref() {
+        return match orch.browser_type(&session_id, selector, text, submit).await {
+            Ok(res) => serialize_tool_json("browser_type", &res),
+            Err(e) => HermesToolResult::err("browser_type", e.to_string()),
+        };
     }
-    match send_cdp_command(&cdp_base, "Input.insertText", json!({ "text": text }), ctx).await {
-        Ok(res) => HermesToolResult::ok(
-            "browser_type",
-            format!("Typed {} character(s)", text.chars().count()),
-            Some(res),
-        ),
-        Err(e) => HermesToolResult::err("browser_type", e),
+
+    if let Some(sel) = selector {
+        if is_sensitive_selector_str(sel) {
+            return HermesToolResult::err(
+                "browser_type",
+                "Refusing to type into password/OTP field via browser_type; use vault_request_card / vault_fill.",
+            );
+        }
+    }
+    let bridge = match direct_obscura_bridge("browser_type", &args, ctx) {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
+    };
+    if let Some(sel) = selector {
+        let sel_json = serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".to_string());
+        let focus_expr = format!("document.querySelector({sel_json})?.focus()");
+        if let Err(e) = bridge.evaluate_script(&focus_expr).await {
+            return HermesToolResult::err("browser_type", e.to_string());
+        }
+    }
+    match bridge.insert_text(text).await {
+        Ok(_) => {
+            if submit {
+                let _ = bridge
+                    .transport()
+                    .send_command(
+                        "Input.dispatchKeyEvent",
+                        json!({
+                            "type": "keyDown",
+                            "key": "Enter",
+                            "code": "Enter",
+                            "text": "\r",
+                            "windowsVirtualKeyCode": 13
+                        }),
+                    )
+                    .await;
+                let _ = bridge
+                    .transport()
+                    .send_command(
+                        "Input.dispatchKeyEvent",
+                        json!({
+                            "type": "keyUp",
+                            "key": "Enter",
+                            "code": "Enter",
+                            "windowsVirtualKeyCode": 13
+                        }),
+                    )
+                    .await;
+            }
+            HermesToolResult::ok(
+                "browser_type",
+                format!("Typed {} character(s)", text.chars().count()),
+                Some(json!({ "chars_typed": text.chars().count(), "submitted": submit })),
+            )
+        }
+        Err(e) => HermesToolResult::err("browser_type", e.to_string()),
     }
 }
 
 async fn tool_browser_screenshot(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    let capture_beyond = args
+    let full_page = args
         .get("full_page")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    match send_cdp_command(
-        &cdp_base,
-        "Page.captureScreenshot",
-        json!({ "format": "png", "captureBeyondViewport": capture_beyond }),
-        ctx,
-    )
-    .await
-    {
-        Ok(res) => {
-            let b64 = res.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let mut out_path = None;
-            if let Some(raw_p) = args.get("output_path").and_then(|v| v.as_str()) {
-                if let Ok(sec) = ctx.security.read() {
-                    if let Ok(resolved) = sec.validate_path(Path::new(raw_p)) {
-                        if let Ok(bytes) = base64_decode(&b64) {
-                            let _ = fs::write(&resolved, bytes);
-                            out_path = Some(resolved.display().to_string());
-                        }
-                    }
+    let session_id = resolve_session_id(&args, ctx);
+
+    let png_bytes = if let Some(orch) = ctx.bot_browser.as_ref() {
+        match orch.browser_screenshot(&session_id, full_page).await {
+            Ok(bytes) => bytes,
+            Err(e) => return HermesToolResult::err("browser_screenshot", e.to_string()),
+        }
+    } else {
+        let bridge = match direct_obscura_bridge("browser_screenshot", &args, ctx) {
+            Ok(b) => b,
+            Err(err_res) => return err_res,
+        };
+        match bridge.capture_screenshot_png(full_page).await {
+            Ok(bytes) => bytes,
+            Err(e) => return HermesToolResult::err("browser_screenshot", e.to_string()),
+        }
+    };
+
+    let mut out_path = None;
+    if let Some(raw_p) = args.get("output_path").and_then(|v| v.as_str()) {
+        if let Ok(sec) = ctx.security.read() {
+            if let Ok(resolved) = sec.validate_path(Path::new(raw_p)) {
+                if let Some(parent) = resolved.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if fs::write(&resolved, &png_bytes).is_ok() {
+                    out_path = Some(resolved.display().to_string());
                 }
             }
-            HermesToolResult::ok(
-                "browser_screenshot",
-                format!("Captured browser screenshot ({} base64 chars)", b64.len()),
-                Some(json!({ "format": "png", "output_path": out_path })),
-            )
-            .with_artifact(HermesToolArtifact {
-                kind: "image".into(),
-                name: "browser_screenshot.png".into(),
-                mime_type: "image/png".into(),
-                path: out_path,
-                data_base64: Some(b64),
-                metadata: json!({ "source": "cdp" }),
-            })
         }
-        Err(e) => HermesToolResult::err("browser_screenshot", e),
+    }
+
+    let b64 = base64_encode(&png_bytes);
+    HermesToolResult::ok(
+        "browser_screenshot",
+        format!("Captured Obscura screenshot ({} bytes)", png_bytes.len()),
+        Some(json!({ "format": "png", "byte_len": png_bytes.len(), "output_path": out_path })),
+    )
+    .with_artifact(HermesToolArtifact {
+        kind: "image".into(),
+        name: "browser_screenshot.png".into(),
+        mime_type: "image/png".into(),
+        path: out_path,
+        data_base64: Some(b64),
+        metadata: json!({ "source": "obscura" }),
+    })
+}
+
+async fn tool_vault_list(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let orch = match require_orchestrator("vault_list", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let session_id = resolve_session_id(&args, ctx);
+    match orch.tool_vault_list(&session_id).await {
+        Ok(res) => serialize_tool_json("vault_list", &res),
+        Err(e) => HermesToolResult::err("vault_list", e.to_string()),
+    }
+}
+
+async fn tool_vault_request_card(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let orch = match require_orchestrator("vault_request_card", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let selectors = match parse_login_selectors(&args) {
+        Ok(s) => s,
+        Err(msg) => return HermesToolResult::err("vault_request_card", msg),
+    };
+    let session_id = resolve_session_id(&args, ctx);
+    let task_id = resolve_task_id(&args, ctx);
+    let site_title = args
+        .get("site_title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Site Login");
+
+    match orch
+        .tool_vault_request_card(&session_id, &task_id, ctx.chat_id, site_title, selectors)
+        .await
+    {
+        Ok(res) => serialize_tool_json("vault_request_card", &res),
+        Err(e) => HermesToolResult::err("vault_request_card", e.to_string()),
+    }
+}
+
+async fn tool_vault_fill(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let orch = match require_orchestrator("vault_fill", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let Some(credential_id) = args
+        .get("credential_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("vault_fill", "Missing required 'credential_id'");
+    };
+    let selectors = match parse_login_selectors(&args) {
+        Ok(s) => s,
+        Err(msg) => return HermesToolResult::err("vault_fill", msg),
+    };
+    let session_id = resolve_session_id(&args, ctx);
+    let task_id = resolve_task_id(&args, ctx);
+
+    match orch
+        .tool_vault_fill(
+            &session_id,
+            &task_id,
+            ctx.chat_id,
+            credential_id,
+            selectors,
+        )
+        .await
+    {
+        Ok(res) => serialize_tool_json("vault_fill", &res),
+        Err(e) => HermesToolResult::err("vault_fill", e.to_string()),
+    }
+}
+
+async fn tool_human_assist_qr(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let orch = match require_orchestrator("human_assist_qr", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let Some(qr_selector) = args
+        .get("qr_selector")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("human_assist_qr", "Missing required 'qr_selector'");
+    };
+    let success_url_contains = args
+        .get("success_url_contains")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let auth_cookie_names: Vec<String> = args
+        .get("auth_cookie_names")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let session_id = resolve_session_id(&args, ctx);
+    let task_id = resolve_task_id(&args, ctx);
+
+    match orch
+        .tool_human_assist_qr(
+            &session_id,
+            &task_id,
+            ctx.chat_id,
+            qr_selector,
+            success_url_contains,
+            auth_cookie_names,
+        )
+        .await
+    {
+        Ok(res) => serialize_tool_json("human_assist_qr", &res),
+        Err(e) => HermesToolResult::err("human_assist_qr", e.to_string()),
+    }
+}
+
+async fn tool_human_assist_click(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let orch = match require_orchestrator("human_assist_click", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let Some(target_selector) = args
+        .get("target_selector")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("human_assist_click", "Missing required 'target_selector'");
+    };
+    let instruction = args
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Please click the requested verification points");
+    let max_clicks = args
+        .get("max_clicks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3)
+        .clamp(1, 16) as u8;
+    let session_id = resolve_session_id(&args, ctx);
+    let task_id = resolve_task_id(&args, ctx);
+
+    match orch
+        .tool_human_assist_click(
+            &session_id,
+            &task_id,
+            ctx.chat_id,
+            target_selector,
+            instruction,
+            max_clicks,
+        )
+        .await
+    {
+        Ok(res) => serialize_tool_json("human_assist_click", &res),
+        Err(e) => HermesToolResult::err("human_assist_click", e.to_string()),
     }
 }
 

@@ -70,20 +70,20 @@ fn test_derive_initials_numeric_unicode_and_profile_inspector_sync() {
     assert_eq!(inspector.profile.avatar_initials, "23");
     assert_eq!(inspector.profile.status, "");
 
-    inspector.set_peer("23", "Custom Hermes persona", "23", 0x2AABEE);
+    inspector.set_peer("23", "Custom Fabushi persona", "23", 0x2AABEE);
     inspector.sync_profile_details(
         "@custom_ai_bot".to_string(),
         String::new(),
-        "Hermes AI Bot".to_string(),
+        "Fabushi AI Bot".to_string(),
         None,
-        vec![("Engine".to_string(), "hermes-rust".to_string())],
+        vec![("Engine".to_string(), "fabushi-agent".to_string())],
     );
     assert_eq!(inspector.profile.username, "@custom_ai_bot");
-    assert_eq!(inspector.profile.status, "Hermes AI Bot");
-    assert_eq!(inspector.profile.bio, "Custom Hermes persona");
+    assert_eq!(inspector.profile.status, "Fabushi AI Bot");
+    assert_eq!(inspector.profile.bio, "Custom Fabushi persona");
     assert_eq!(
         inspector.profile.facts,
-        vec![("Engine".to_string(), "hermes-rust".to_string())]
+        vec![("Engine".to_string(), "fabushi-agent".to_string())]
     );
 }
 
@@ -300,7 +300,7 @@ fn test_global_tasks_workspace_6_hermes_studio_tabs_and_state_sync() {
 
     ws.sync_studio_status(HermesStatusDto {
         healthy: true,
-        engine: "hermes-rust".to_string(),
+        engine: "fabushi-agent".to_string(),
         active_model: "claude-sonnet-4".to_string(),
         active_provider: "anthropic".to_string(),
         api_mode: "anthropic_messages".to_string(),

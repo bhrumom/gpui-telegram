@@ -7,6 +7,7 @@ pub mod domain;
 pub mod hermes_im_bridge;
 pub mod media;
 pub mod messaging;
+pub mod miniapp_webmcp;
 pub mod push;
 pub mod routes;
 pub mod search;

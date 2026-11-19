@@ -1068,6 +1068,43 @@ impl ServerDatabase {
         Ok(out)
     }
 
+    /// Returns `true` if the bot owns at least one published Mini App (`is_published = 1`).
+    pub fn bot_has_published_miniapp(&self, bot_user_id: i64) -> bool {
+        self.pool
+            .with_reader(|conn| {
+                let exists: i64 = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mini_apps WHERE bot_user_id = ?1 AND is_published = 1)",
+                        params![bot_user_id],
+                        |r| r.get(0),
+                    )
+                    .map_db()?;
+                Ok(exists != 0)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if `user_id` already participates in a chat with `bot_user_id`.
+    pub fn user_has_dm_with_bot(&self, user_id: i64, bot_user_id: i64) -> bool {
+        self.pool
+            .with_reader(|conn| {
+                let exists: i64 = conn
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM chat_members m1
+                            INNER JOIN chat_members m2 ON m1.chat_id = m2.chat_id
+                            INNER JOIN chats c ON c.chat_id = m1.chat_id
+                            WHERE m1.user_id = ?1 AND m2.user_id = ?2 AND c.chat_type IN (0, 4)
+                        )",
+                        params![user_id, bot_user_id],
+                        |r| r.get(0),
+                    )
+                    .map_db()?;
+                Ok(exists != 0)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn regenerate_bot_token(&self, bot_user_id: i64) -> Result<BotRegistryRecord> {
         let new_token = generate_bot_token(bot_user_id);
         let now_ms = chrono::Utc::now().timestamp_millis();

@@ -283,7 +283,7 @@ impl GlobalTasksWorkspace {
             active_input: StudioInputTarget::None,
             status_summary: HermesStatusDto {
                 healthy: true,
-                engine: "hermes-rust".to_string(),
+                engine: "fabushi-agent".to_string(),
                 active_model: "hermes-local-v1".to_string(),
                 active_provider: "local_hermes".to_string(),
                 api_mode: "local_hermes".to_string(),
@@ -313,7 +313,7 @@ impl GlobalTasksWorkspace {
             user_edit_draft: String::new(),
             snapshot_frozen_label: "Session Snapshot Frozen (Synced)".to_string(),
             soul_state: HermesSoulDto::default(),
-            soul_persona_draft: "Hermes".to_string(),
+            soul_persona_draft: "Fabushi".to_string(),
             soul_content_draft: String::new(),
             honcho_state: HermesHonchoStateDto::default(),
             honcho_query_draft: String::new(),

@@ -100,7 +100,7 @@ pub(crate) fn resolve_hermes_for_bot(state: &AppState, bot_id: Option<u64>) -> A
             }
         }
     }
-    Arc::clone(&state.hermes)
+    state.fabushi_core()
 }
 
 fn resolve_hermes_for_session(
@@ -111,15 +111,7 @@ fn resolve_hermes_for_session(
     if bot_id.is_some() {
         return resolve_hermes_for_bot(state, bot_id);
     }
-    if state.hermes.store().get_session(session_id).ok().flatten().is_some() {
-        return Arc::clone(&state.hermes);
-    }
-    for inst in state.fabushi_bots.list_instances() {
-        if inst.hermes().store().get_session(session_id).ok().flatten().is_some() {
-            return inst.hermes();
-        }
-    }
-    Arc::clone(&state.hermes)
+    state.fabushi_bots.engine_for_session(None, session_id)
 }
 
 pub(crate) fn map_proto_buttons(
@@ -257,7 +249,8 @@ fn resolve_effective_bot_id(
     engine: &Arc<HermesEngine>,
 ) -> Option<u64> {
     explicit_bot_id.or_else(|| {
-        if Arc::ptr_eq(engine, &state.hermes) {
+        let core = state.fabushi_core();
+        if Arc::ptr_eq(engine, &core) {
             None
         } else {
             state
@@ -649,15 +642,14 @@ pub(crate) fn load_bot_persona_config(
     bot_user_id: UserId,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let key = bot_user_id.0.to_string();
-    let kv_soul = state
-        .hermes
+    let core = state.fabushi_core();
+    let kv_soul = core
         .store()
         .kv_get("bot_soul", &key)
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-    let kv_persona = state
-        .hermes
+    let kv_persona = core
         .store()
         .kv_get("bot_persona", &key)
         .ok()
@@ -791,7 +783,7 @@ pub(crate) fn save_bot_persona_kv(
         "updated_at_ms": Utc::now().timestamp_millis(),
     });
     if let Ok(raw) = serde_json::to_string(&payload) {
-        let _ = state.hermes.store().kv_set("bot_persona", &key, &raw);
+        let _ = state.fabushi_core().store().kv_set("bot_persona", &key, &raw);
     }
 }
 
@@ -911,7 +903,10 @@ pub(crate) fn sanitize_model_override_for_user(
     raw: Option<String>,
 ) -> Option<String> {
     let uid_str = user_id.map(|u| u.to_string());
-    let snap = state.hermes.resolve_providers(uid_str.as_deref()).snapshot();
+    let snap = state
+        .fabushi_core()
+        .resolve_providers(uid_str.as_deref())
+        .snapshot();
     let active_base_url = snap
         .providers
         .get(&snap.active_provider_id)
@@ -939,8 +934,9 @@ pub(crate) fn bot_execution_policy_is_yolo(
     bot_user_id: UserId,
 ) -> bool {
     let key = bot_user_id.0.to_string();
+    let core = state.fabushi_core();
     for ns in ["ai_bot_profile", "bot_soul", "bot_persona"] {
-        if let Ok(Some(raw)) = state.hermes.store().kv_get(ns, &key) {
+        if let Ok(Some(raw)) = core.store().kv_get(ns, &key) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
                 if let Some(policy) = val
                     .get("execution_policy")
@@ -1054,14 +1050,14 @@ pub(crate) fn build_enriched_bot_turn_context(
 
     let mut prompt_blocks: Vec<String> = Vec::new();
     let persona_body = computer_enriched
-        .unwrap_or_else(|| "You are an autonomous Hermes AI Telegram Assistant.".to_string());
+        .unwrap_or_else(|| "You are an autonomous Fabushi Bot AI Assistant.".to_string());
     let has_soul_header = persona_body.trim_start().starts_with("# ");
     if !has_soul_header {
         let name_label = bot_display_name
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("Hermes Assistant");
-        prompt_blocks.push(format!("# {name_label}\n- Role: Autonomous AI Telegram Agent\n\n## Persona\n{persona_body}"));
+            .unwrap_or("Fabushi Bot");
+        prompt_blocks.push(format!("# {name_label}\n- Role: Autonomous Fabushi Bot Agent\n\n## Persona\n{persona_body}"));
     } else {
         prompt_blocks.push(persona_body);
     }
@@ -1121,8 +1117,10 @@ pub(crate) fn build_enriched_bot_turn_context(
     if !combined_so_far.contains("## Directives") {
         prompt_blocks.push(
             "## Directives\n\
-             - Execute multi-step requests iteratively using Hermes tools (`computer_list`, `computer_status`, `computer_lease_acquire`, `computer_exec`, `computer_file`, `computer_configure_cloud`, `computer_bind`, `terminal`, `read_file`, `write_file`, `search_files`, `skill_list`, `skill_view`, `skill_manage`, `memory`) until the task is genuinely verified.\n\
+             - Execute multi-step requests iteratively using your available Fabushi Bot & WebMCP tools (`webmcp_list_miniapps`, `webmcp_discover`, `webmcp_call_tool`, `miniapp_request_takeover`, `computer_list`, `computer_status`, `computer_lease_acquire`, `computer_exec`, `computer_file`, `terminal`, `read_file`, `write_file`, `search_files`, `skill_list`, `skill_view`, `skill_manage`, `memory`) until the task is genuinely verified.\n\
+             - When controlling a companion Mini App (such as @fabushi_bot / 全球法布施 or any attached Mini App), call `webmcp_discover` first if needed and use `webmcp_call_tool` to inspect state or trigger real actions; use `miniapp_request_takeover` if manual user interaction is needed.\n\
              - Base all answers strictly on verified tool outputs and live state; never fabricate results or suppress tool/provider failures.\n\
+             - Never claim to be \"Hermes-local-v1\" or invent a local model when backed by a configured provider/model.\n\
              - Never disclose raw SSH passwords, private keys, API keys, or tokens.\n\
              - Capture reusable procedures or user preferences with `skill_manage` / `memory` when helpful, and respond in the user's language."
                 .to_string(),
@@ -1176,6 +1174,25 @@ impl BotTypingGuard {
         );
     }
 
+    pub(crate) fn emit_activity(
+        state: &AppState,
+        chat_id: ChatId,
+        bot_user_id: UserId,
+        activity: &str,
+        detail: Option<String>,
+    ) {
+        broadcast_chat_event(
+            state,
+            chat_id,
+            UpdateEvent::BotActivityChanged {
+                chat_id,
+                bot_user_id,
+                state: activity.to_string(),
+                detail,
+            },
+        );
+    }
+
     fn stop_inner(&mut self) {
         if self.stopped {
             return;
@@ -1185,6 +1202,7 @@ impl BotTypingGuard {
             handle.abort();
         }
         Self::emit_typing(&self.state, self.chat_id, self.bot_user_id, TypingAction::Cancel);
+        Self::emit_activity(&self.state, self.chat_id, self.bot_user_id, "idle", None);
     }
 }
 
@@ -1355,7 +1373,7 @@ pub(crate) fn format_live_bot_runtime_card_section(
     bot_user_id: UserId,
 ) -> String {
     let (active_provider, active_model, _) = state
-        .hermes
+        .fabushi_core()
         .providers_for_user(&user_id.to_string())
         .active_info();
     let now_ms = Utc::now().timestamp_millis();
@@ -1836,6 +1854,13 @@ pub(crate) async fn execute_bot_turn_streamed(
 ) {
     let typing_guard =
         BotTypingGuard::start(Arc::clone(state), params.chat_id, params.bot_user_id);
+    BotTypingGuard::emit_activity(
+        state,
+        params.chat_id,
+        params.bot_user_id,
+        "thinking",
+        Some("正在理解请求...".to_string()),
+    );
 
     let bot_inst = crate::routes::bots_miniapps::ensure_fabushi_bot_hydrated(
         state,
@@ -1844,7 +1869,7 @@ pub(crate) async fn execute_bot_turn_streamed(
     let target_engine = bot_inst
         .as_ref()
         .map(|i| i.hermes())
-        .unwrap_or_else(|| Arc::clone(&state.hermes));
+        .unwrap_or_else(|| state.fabushi_core());
     let mut exec_guard = state.fabushi_bots.begin_bot_execution(
         params.bot_user_id.0 as i64,
         params.chat_id.0,
@@ -1957,21 +1982,38 @@ pub(crate) async fn execute_bot_turn_streamed(
         _ => params.prompt.clone(),
     };
 
+    let has_online_computer = state
+        .db
+        .list_computer_nodes(params.sender_id.0, None, Utc::now().timestamp_millis())
+        .unwrap_or_default()
+        .iter()
+        .any(|n| n.online);
+    let configured_thinking = bot_inst
+        .as_ref()
+        .map(|inst| inst.settings().thinking_level)
+        .unwrap_or_else(|| "auto".to_string());
+    let adaptive_profile = FabushiBotHost::classify_adaptive_turn(
+        &params.prompt,
+        effective_model.as_deref().unwrap_or(""),
+        &configured_thinking,
+        !params.companion_apps.is_empty(),
+        has_online_computer,
+    );
+
     let mut req = HermesTurnRequest::new(final_prompt)
         .with_chat_bot(params.chat_id.0, params.bot_user_id.0.to_string());
     req.session_id = session_id_opt;
     req.bot_name = params.bot_display_name.clone();
     req.user_id = Some(params.sender_id.0.to_string());
-    req.source = "telegram_bot".to_string();
+    req.source = "fabushi_bot".to_string();
     req.preset = Some(
         bot_inst
             .as_ref()
             .map(|inst| FabushiBotHost::toolset_preset_for_name(&inst.settings().toolset_preset))
             .unwrap_or(ToolsetPreset::HermesTelegram),
     );
-    req.thinking_budget_tokens = bot_inst.as_ref().and_then(|inst| {
-        FabushiBotHost::thinking_budget_for_level(&inst.settings().thinking_level)
-    });
+    req.adaptive_toolsets = adaptive_profile.toolsets;
+    req.thinking_budget_tokens = adaptive_profile.thinking_budget_tokens;
     req.model = effective_model;
     req.system_prompt = fabushi_sp;
     req.skip_slash_commands = skip_slash;
@@ -1998,13 +2040,41 @@ pub(crate) async fn execute_bot_turn_streamed(
                 }]);
             }
             flush_streamed_bot_message(state, &params, &mut err_consumer, true);
-            typing_guard.finish();
+            state
+        .webmcp_broker
+        .mark_idle_for_bot(params.sender_id, params.bot_user_id);
+    typing_guard.finish();
             return;
         }
     };
 
-    const EDIT_THROTTLE: Duration = Duration::from_millis(350);
+    const EDIT_THROTTLE: Duration = Duration::from_millis(120);
     let mut consumer = StreamConsumerState::new();
+    let mut last_activity: (String, Option<String>) = (
+        "thinking".to_string(),
+        Some("正在理解请求...".to_string()),
+    );
+    let update_bot_activity = |ev: &HermesEvent, last: &mut (String, Option<String>)| {
+        let next: Option<(&str, Option<String>)> = match ev {
+            HermesEvent::ThinkingDelta { .. } => Some(("thinking", None)),
+            HermesEvent::ToolStart { tool_name, .. } => {
+                Some(("tool", Some(tool_name.clone())))
+            }
+            HermesEvent::ToolResult { .. } => {
+                Some(("thinking", Some("正在整理执行结果...".to_string())))
+            }
+            HermesEvent::TextDelta { text, .. } if !text.trim().is_empty() => {
+                Some(("writing", None))
+            }
+            _ => None,
+        };
+        if let Some((act, det)) = next {
+            if last.0 != act || (act == "tool" && last.1 != det) {
+                *last = (act.to_string(), det.clone());
+                BotTypingGuard::emit_activity(state, params.chat_id, params.bot_user_id, act, det);
+            }
+        }
+    };
 
     enum LoopWake {
         FlushTimer,
@@ -2029,8 +2099,10 @@ pub(crate) async fn execute_bot_turn_streamed(
             }
             LoopWake::Event(None) => break,
             LoopWake::Event(Some(first_ev)) => {
+                update_bot_activity(&first_ev, &mut last_activity);
                 let mut flush_now = consumer.apply_event(first_ev);
                 while let Ok(next_ev) = rx.try_recv() {
+                    update_bot_activity(&next_ev, &mut last_activity);
                     if consumer.apply_event(next_ev) {
                         flush_now = true;
                     }
@@ -2038,7 +2110,9 @@ pub(crate) async fn execute_bot_turn_streamed(
                 consumer.dirty = true;
                 if consumer.saw_terminal_event {
                     if consumer.needs_provider_button
-                        && target_engine.providers().needs_provider_selection()
+                        && target_engine
+                            .providers_for_user(&params.sender_id.0.to_string())
+                            .needs_provider_selection()
                         && !consumer
                             .event_buttons
                             .iter()
@@ -2066,7 +2140,9 @@ pub(crate) async fn execute_bot_turn_streamed(
 
     if !consumer.saw_terminal_event {
         if consumer.needs_provider_button
-            && target_engine.providers().needs_provider_selection()
+            && target_engine
+                .providers_for_user(&params.sender_id.0.to_string())
+                .needs_provider_selection()
             && !consumer
                 .event_buttons
                 .iter()
@@ -2090,6 +2166,9 @@ pub(crate) async fn execute_bot_turn_streamed(
         }
     }
 
+    state
+        .webmcp_broker
+        .mark_idle_for_bot(params.sender_id, params.bot_user_id);
     typing_guard.finish();
 }
 
@@ -2297,7 +2376,7 @@ pub async fn hermes_status(
         StatusCode::OK,
         Json(json!({
             "healthy": true,
-            "engine": "hermes-rust",
+            "engine": "fabushi-agent",
             "scoped_bot_id": q.bot_id,
             "active_model": active_model,
             "active_provider": active_provider,
@@ -2549,6 +2628,7 @@ pub async fn hermes_turns_create(
             .get("thinking_budget_tokens")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize),
+        adaptive_toolsets: None,
         preset: payload
             .get("preset")
             .and_then(|v| v.as_str())
@@ -2869,9 +2949,10 @@ pub async fn hermes_commands_list(
     State(state): State<Arc<AppState>>,
     Query(query): Query<CommandsQuery>,
 ) -> Response {
+    let core = state.fabushi_core();
     let list = match query.prefix.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(prefix) => state.hermes.autocomplete_commands(prefix),
-        None => state.hermes.list_commands(),
+        Some(prefix) => core.autocomplete_commands(prefix),
+        None => core.list_commands(),
     };
     let commands: Vec<Value> = list
         .into_iter()
@@ -2926,7 +3007,8 @@ pub async fn hermes_sessions_list(
         .as_deref()
         .and_then(|s| s.trim().parse::<u64>().ok());
     let engine = resolve_hermes_for_bot(&state, bot_id_u64);
-    let filter_bot_id = if bot_id_u64.is_some() && !Arc::ptr_eq(&engine, &state.hermes) {
+    let core = state.fabushi_core();
+    let filter_bot_id = if bot_id_u64.is_some() && !Arc::ptr_eq(&engine, &core) {
         None
     } else {
         q.bot_id.filter(|s| !s.trim().is_empty())
@@ -2971,14 +3053,10 @@ pub async fn hermes_sessions_list(
         limit: None,
         offset: None,
     };
-    let mut combined = match state.hermes.store().list_sessions(make_filter()) {
-        Ok(list) => list,
-        Err(e) => return map_telegram_err(e),
-    };
-    let mut seen: std::collections::HashSet<String> =
-        combined.iter().map(|s| s.id.clone()).collect();
-    for inst in state.fabushi_bots.list_instances() {
-        if let Ok(list) = inst.hermes().store().list_sessions(make_filter()) {
+    let mut combined = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, eng) in state.fabushi_bots.all_engines() {
+        if let Ok(list) = eng.store().list_sessions(make_filter()) {
             for s in list {
                 if seen.insert(s.id.clone()) {
                     combined.push(s);
@@ -3112,14 +3190,10 @@ pub async fn hermes_sessions_search(
     }
 
     let search_limit = limit.saturating_mul(4).max(100);
-    let mut all_hits = match state.hermes.store().session_search(&query, session_id, search_limit) {
-        Ok(hits) => filter_authorized_hits(&state.hermes, hits),
-        Err(e) => return map_telegram_err(e),
-    };
-    for inst in state.fabushi_bots.list_instances() {
-        let bot_engine = inst.hermes();
-        if let Ok(hits) = bot_engine.store().session_search(&query, session_id, search_limit) {
-            all_hits.extend(filter_authorized_hits(&bot_engine, hits));
+    let mut all_hits = Vec::new();
+    for (_, eng) in state.fabushi_bots.all_engines() {
+        if let Ok(hits) = eng.store().session_search(&query, session_id, search_limit) {
+            all_hits.extend(filter_authorized_hits(&eng, hits));
         }
     }
     all_hits.truncate(limit);
@@ -3468,25 +3542,18 @@ pub async fn hermes_soul_get(
             return resp;
         }
         let engine = resolve_hermes_for_bot(&state, Some(bot_id));
-        if let Ok(Some(raw)) = state
-            .hermes
-            .store()
-            .kv_get("bot_soul", &bot_id.to_string())
-        {
+        let core = state.fabushi_core();
+        if let Ok(Some(raw)) = core.store().kv_get("bot_soul", &bot_id.to_string()) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
                 return (StatusCode::OK, Json(val)).into_response();
             }
         }
-        if let Ok(Some(raw)) = state
-            .hermes
-            .store()
-            .kv_get("bot_persona", &bot_id.to_string())
-        {
+        if let Ok(Some(raw)) = core.store().kv_get("bot_persona", &bot_id.to_string()) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
                 let persona_name = val
                     .get("persona_name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("Hermes Bot")
+                    .unwrap_or("Fabushi Bot")
                     .to_string();
                 let sp = val
                     .get("system_prompt")
@@ -3509,7 +3576,7 @@ pub async fn hermes_soul_get(
                     .into_response();
             }
         }
-        if !Arc::ptr_eq(&engine, &state.hermes) && engine.memory().has_soul() {
+        if state.fabushi_bots.get_by_user_id(bot_id as i64).is_some() && engine.memory().has_soul() {
             if let Ok(profile) = engine.memory().read_soul() {
                 let preferred_model = state
                     .fabushi_bots
@@ -3551,7 +3618,7 @@ pub async fn hermes_soul_get(
         }
     }
 
-    match state.hermes.memory().read_soul() {
+    match state.fabushi_core().memory().read_soul() {
         Ok(profile) => (
             StatusCode::OK,
             Json(json!({
@@ -3593,7 +3660,7 @@ pub async fn hermes_soul_put(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("Hermes")
+        .unwrap_or("Fabushi")
         .to_string();
     let content = payload
         .get("content")
@@ -3629,7 +3696,8 @@ pub async fn hermes_soul_put(
 
     if let Some(bid) = bot_id {
         let engine = resolve_hermes_for_bot(&state, Some(bid));
-        if !Arc::ptr_eq(&engine, &state.hermes) {
+        let core = state.fabushi_core();
+        if state.fabushi_bots.get_by_user_id(bid as i64).is_some() {
             if !content.trim().is_empty() {
                 let _ = engine.memory().write_soul_raw(&content);
             } else {
@@ -3676,19 +3744,19 @@ pub async fn hermes_soul_put(
             "updated_at_ms": now_ms,
         });
         if let Ok(raw) = serde_json::to_string(&dto) {
-            if let Err(e) = state.hermes.store().kv_set("bot_soul", &bid.to_string(), &raw) {
+            if let Err(e) = core.store().kv_set("bot_soul", &bid.to_string(), &raw) {
                 return map_telegram_err(e);
             }
-            let _ = state
-                .hermes
+            let _ = core
                 .store()
                 .kv_set("bot_persona", &bid.to_string(), &raw);
         }
         return (StatusCode::OK, Json(dto)).into_response();
     }
 
+    let core = state.fabushi_core();
     let profile = if !content.trim().is_empty() {
-        match state.hermes.memory().write_soul_raw(&content) {
+        match core.memory().write_soul_raw(&content) {
             Ok(p) => p,
             Err(e) => return map_telegram_err(e),
         }
@@ -3699,7 +3767,7 @@ pub async fn hermes_soul_put(
             system_prompt.as_deref().unwrap_or(""),
         );
         p.raw_markdown = p.to_markdown();
-        if let Err(e) = state.hermes.memory().write_soul(&p) {
+        if let Err(e) = core.memory().write_soul(&p) {
             return map_telegram_err(e);
         }
         p
@@ -4291,9 +4359,8 @@ pub async fn hermes_approvals_list(
     if q.bot_id.is_some() {
         engines.push(resolve_hermes_for_bot(&state, q.bot_id));
     } else {
-        engines.push(Arc::clone(&state.hermes));
-        for inst in state.fabushi_bots.list_instances() {
-            engines.push(inst.hermes());
+        for (_, eng) in state.fabushi_bots.all_engines() {
+            engines.push(eng);
         }
     }
 
@@ -4388,10 +4455,12 @@ pub(crate) fn apply_hermes_approval_decision(
         }
     };
 
-    let mut candidate_engines = vec![Arc::clone(&state.hermes)];
-    for inst in state.fabushi_bots.list_instances() {
-        candidate_engines.push(inst.hermes());
-    }
+    let candidate_engines: Vec<Arc<HermesEngine>> = state
+        .fabushi_bots
+        .all_engines()
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
 
     for engine in candidate_engines {
         let mem_sid = engine.security().read().ok().and_then(|sec| {
@@ -4507,6 +4576,7 @@ pub async fn hermes_approval_decide(
 
 fn authorize_cron_job_access(
     state: &AppState,
+    engine: &HermesEngine,
     user_id: UserId,
     job: &CronJobRecord,
 ) -> std::result::Result<(), Response> {
@@ -4516,12 +4586,19 @@ fn authorize_cron_job_access(
     if let Some(cid) = job.target_chat_id.or(job.origin_chat_id) {
         check_active_membership(state, ChatId(cid), user_id).map(|_| ())
     } else {
-        let owner = state
-            .hermes
+        let owner = engine
             .store()
             .kv_get("cron_job_owner", &job.id)
             .ok()
-            .flatten();
+            .flatten()
+            .or_else(|| {
+                state
+                    .fabushi_core()
+                    .store()
+                    .kv_get("cron_job_owner", &job.id)
+                    .ok()
+                    .flatten()
+            });
         if owner.as_deref() == Some(user_id.0.to_string().as_str()) {
             Ok(())
         } else {
@@ -4534,25 +4611,74 @@ fn authorize_cron_job_access(
     }
 }
 
+fn resolve_engine_for_cron_job(
+    state: &AppState,
+    bot_id: Option<u64>,
+    job_id: &str,
+) -> std::result::Result<Option<(Arc<HermesEngine>, CronJobRecord)>, Response> {
+    if bot_id.is_some() {
+        let eng = resolve_hermes_for_bot(state, bot_id);
+        return match eng.store().get_cron_job(job_id) {
+            Ok(Some(j)) => Ok(Some((eng, j))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(map_telegram_err(e)),
+        };
+    }
+    for (_, eng) in state.fabushi_bots.all_engines() {
+        match eng.store().get_cron_job(job_id) {
+            Ok(Some(j)) => return Ok(Some((eng, j))),
+            Ok(None) => continue,
+            Err(e) => return Err(map_telegram_err(e)),
+        }
+    }
+    Ok(None)
+}
+
 pub async fn hermes_cron_list(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    match state.hermes.store().list_cron_jobs(false) {
-        Ok(list) => {
-            let jobs: Vec<Value> = list
-                .iter()
-                .filter(|j| authorize_cron_job_access(&state, auth.user_id, j).is_ok())
-                .map(cron_to_dto)
-                .collect();
-            (
-                StatusCode::OK,
-                Json(json!({ "jobs": jobs, "total": jobs.len() })),
-            )
-                .into_response()
-        }
-        Err(e) => map_telegram_err(e),
+    if q.bot_id.is_some() {
+        let engine = resolve_hermes_for_bot(&state, q.bot_id);
+        return match engine.store().list_cron_jobs(false) {
+            Ok(list) => {
+                let jobs: Vec<Value> = list
+                    .iter()
+                    .filter(|j| authorize_cron_job_access(&state, &engine, auth.user_id, j).is_ok())
+                    .map(cron_to_dto)
+                    .collect();
+                (
+                    StatusCode::OK,
+                    Json(json!({ "jobs": jobs, "total": jobs.len() })),
+                )
+                    .into_response()
+            }
+            Err(e) => map_telegram_err(e),
+        };
     }
+
+    let mut seen = HashSet::new();
+    let mut jobs = Vec::new();
+    for (_, engine) in state.fabushi_bots.all_engines() {
+        match engine.store().list_cron_jobs(false) {
+            Ok(list) => {
+                for j in list {
+                    if authorize_cron_job_access(&state, &engine, auth.user_id, &j).is_ok()
+                        && seen.insert(j.id.clone())
+                    {
+                        jobs.push(cron_to_dto(&j));
+                    }
+                }
+            }
+            Err(e) => return map_telegram_err(e),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "jobs": jobs, "total": jobs.len() })),
+    )
+        .into_response()
 }
 
 fn authorize_cron_bot_for_chat(
@@ -4578,6 +4704,7 @@ fn authorize_cron_bot_for_chat(
 pub async fn hermes_cron_create(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
     Json(payload): Json<Value>,
 ) -> Response {
     let job_id = payload
@@ -4641,7 +4768,10 @@ pub async fn hermes_cron_create(
             };
             (Some(Some(bid.to_string())), Some(bid))
         }
-        None => (None, None),
+        None => match q.bot_id.filter(|id| *id > 0) {
+            Some(qid) => (Some(Some(qid.to_string())), Some(qid)),
+            None => (None, None),
+        },
     };
     let bot_id = requested_bid.map(|id| id.to_string());
     let enabled = payload.get("enabled").and_then(|v| v.as_bool());
@@ -4665,40 +4795,44 @@ pub async fn hermes_cron_create(
         .or_else(|| routine.compute_next_run(Utc::now()).map(|dt| dt.timestamp_millis()));
 
     if let Some(ref existing_id) = job_id {
-        if let Ok(Some(existing)) = state.hermes.store().get_cron_job(existing_id) {
-            if let Err(resp) = authorize_cron_job_access(&state, auth.user_id, &existing) {
-                return resp;
-            }
-            let existing_bid = existing.deliver_to.as_deref().and_then(parse_bot_id_str_u64);
-            let effective_cid = match target_chat_patch {
-                Some(new_opt) => new_opt,
-                None => existing.target_chat_id.or(existing.origin_chat_id),
-            };
-            let effective_bid = match deliver_to_patch {
-                Some(ref opt) => opt.as_deref().and_then(parse_bot_id_str_u64),
-                None => existing_bid,
-            };
-            if let Some(bid) = effective_bid {
-                if let Err(resp) =
-                    authorize_cron_bot_for_chat(&state, auth.user_id, bid, effective_cid)
-                {
+        match resolve_engine_for_cron_job(&state, requested_bid.or(q.bot_id), existing_id) {
+            Ok(Some((eng, existing))) => {
+                if let Err(resp) = authorize_cron_job_access(&state, &eng, auth.user_id, &existing) {
                     return resp;
                 }
+                let existing_bid = existing.deliver_to.as_deref().and_then(parse_bot_id_str_u64);
+                let effective_cid = match target_chat_patch {
+                    Some(new_opt) => new_opt,
+                    None => existing.target_chat_id.or(existing.origin_chat_id),
+                };
+                let effective_bid = match deliver_to_patch {
+                    Some(ref opt) => opt.as_deref().and_then(parse_bot_id_str_u64),
+                    None => existing_bid,
+                };
+                if let Some(bid) = effective_bid {
+                    if let Err(resp) =
+                        authorize_cron_bot_for_chat(&state, auth.user_id, bid, effective_cid)
+                    {
+                        return resp;
+                    }
+                }
+                let patch = CronJobPatch {
+                    name: (!name.is_empty()).then_some(name),
+                    schedule: (!schedule.is_empty()).then_some(schedule),
+                    prompt: (!prompt.is_empty()).then_some(prompt),
+                    target_chat_id: target_chat_patch,
+                    deliver_to: deliver_to_patch,
+                    enabled,
+                    next_run_at: next_run_at.map(Some),
+                    ..Default::default()
+                };
+                return match eng.store().update_cron_job(existing_id, patch) {
+                    Ok(rec) => (StatusCode::OK, Json(cron_to_dto(&rec))).into_response(),
+                    Err(e) => map_telegram_err(e),
+                };
             }
-            let patch = CronJobPatch {
-                name: (!name.is_empty()).then_some(name),
-                schedule: (!schedule.is_empty()).then_some(schedule),
-                prompt: (!prompt.is_empty()).then_some(prompt),
-                target_chat_id: target_chat_patch,
-                deliver_to: deliver_to_patch,
-                enabled,
-                next_run_at: next_run_at.map(Some),
-                ..Default::default()
-            };
-            return match state.hermes.store().update_cron_job(existing_id, patch) {
-                Ok(rec) => (StatusCode::OK, Json(cron_to_dto(&rec))).into_response(),
-                Err(e) => map_telegram_err(e),
-            };
+            Ok(None) => {}
+            Err(resp) => return resp,
         }
     }
 
@@ -4708,7 +4842,8 @@ pub async fn hermes_cron_create(
         }
     }
 
-    match state.hermes.store().create_cron_job(CreateCronJobRequest {
+    let engine = resolve_hermes_for_bot(&state, requested_bid.or(q.bot_id));
+    match engine.store().create_cron_job(CreateCronJobRequest {
         id: job_id,
         name,
         schedule,
@@ -4726,8 +4861,7 @@ pub async fn hermes_cron_create(
         next_run_at,
     }) {
         Ok(rec) => {
-            let _ = state
-                .hermes
+            let _ = engine
                 .store()
                 .kv_set("cron_job_owner", &rec.id, &auth.user_id.0.to_string());
             (StatusCode::CREATED, Json(cron_to_dto(&rec))).into_response()
@@ -4740,14 +4874,16 @@ pub async fn hermes_cron_patch(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
+    Query(q): Query<OptionalBotScopeQuery>,
     Json(payload): Json<Value>,
 ) -> Response {
-    let existing = match state.hermes.store().get_cron_job(&job_id) {
-        Ok(Some(j)) => j,
+    let scoped_bid = q.bot_id.or_else(|| parse_bot_id_u64(payload.get("bot_id")));
+    let (engine, existing) = match resolve_engine_for_cron_job(&state, scoped_bid, &job_id) {
+        Ok(Some(pair)) => pair,
         Ok(None) => return err_resp(StatusCode::NOT_FOUND, "cron_not_found", "Cron job not found"),
-        Err(e) => return map_telegram_err(e),
+        Err(resp) => return resp,
     };
-    if let Err(resp) = authorize_cron_job_access(&state, auth.user_id, &existing) {
+    if let Err(resp) = authorize_cron_job_access(&state, &engine, auth.user_id, &existing) {
         return resp;
     }
     let is_admin = caller_is_admin(&state, auth.user_id);
@@ -4834,7 +4970,7 @@ pub async fn hermes_cron_patch(
         ..Default::default()
     };
 
-    match state.hermes.store().update_cron_job(&job_id, patch) {
+    match engine.store().update_cron_job(&job_id, patch) {
         Ok(rec) => (StatusCode::OK, Json(cron_to_dto(&rec))).into_response(),
         Err(e) => map_telegram_err(e),
     }
@@ -4844,16 +4980,17 @@ pub async fn hermes_cron_delete(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    let existing = match state.hermes.store().get_cron_job(&job_id) {
-        Ok(Some(j)) => j,
+    let (engine, existing) = match resolve_engine_for_cron_job(&state, q.bot_id, &job_id) {
+        Ok(Some(pair)) => pair,
         Ok(None) => return err_resp(StatusCode::NOT_FOUND, "cron_not_found", "Cron job not found"),
-        Err(e) => return map_telegram_err(e),
+        Err(resp) => return resp,
     };
-    if let Err(resp) = authorize_cron_job_access(&state, auth.user_id, &existing) {
+    if let Err(resp) = authorize_cron_job_access(&state, &engine, auth.user_id, &existing) {
         return resp;
     }
-    match state.hermes.store().delete_cron_job(&job_id) {
+    match engine.store().delete_cron_job(&job_id) {
         Ok(true) => (
             StatusCode::OK,
             Json(json!({ "deleted": true, "job_id": job_id })),
@@ -4868,18 +5005,19 @@ pub async fn hermes_cron_run(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    let existing = match state.hermes.store().get_cron_job(&job_id) {
-        Ok(Some(j)) => j,
+    let (engine, existing) = match resolve_engine_for_cron_job(&state, q.bot_id, &job_id) {
+        Ok(Some(pair)) => pair,
         Ok(None) => return err_resp(StatusCode::NOT_FOUND, "cron_not_found", "Cron job not found"),
-        Err(e) => return map_telegram_err(e),
+        Err(resp) => return resp,
     };
-    if let Err(resp) = authorize_cron_job_access(&state, auth.user_id, &existing) {
+    if let Err(resp) = authorize_cron_job_access(&state, &engine, auth.user_id, &existing) {
         return resp;
     }
     let deliver_to = existing.deliver_to;
 
-    match state.hermes.run_cron_job_now(&job_id).await {
+    match engine.run_cron_job_now(&job_id).await {
         Ok(outcome) => {
             if outcome.status == "completed" {
                 if let Some(cid) = outcome.target_chat_id {
@@ -4902,17 +5040,18 @@ pub async fn hermes_cron_run(
 pub async fn hermes_heartbeat_get(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    let cfg = state.hermes.heartbeat().status();
-    let existing_bid = state
-        .hermes
+    let engine = resolve_hermes_for_bot(&state, q.bot_id);
+    let cfg = engine.heartbeat().status();
+    let existing_bid = engine
         .store()
         .kv_get("heartbeat", "bot_id")
         .ok()
         .flatten()
-        .and_then(|s| parse_bot_id_str_u64(&s));
-    let owner = state
-        .hermes
+        .and_then(|s| parse_bot_id_str_u64(&s))
+        .or(q.bot_id);
+    let owner = engine
         .store()
         .kv_get("heartbeat", "owner_user_id")
         .ok()
@@ -4958,19 +5097,21 @@ pub async fn hermes_heartbeat_get(
 pub async fn hermes_heartbeat_post(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
     Json(payload): Json<Value>,
 ) -> Response {
-    let mut cfg: HeartbeatConfig = state.hermes.heartbeat().status();
+    let scoped_bid = q.bot_id.or_else(|| parse_bot_id_u64(payload.get("bot_id")));
+    let engine = resolve_hermes_for_bot(&state, scoped_bid);
+    let mut cfg: HeartbeatConfig = engine.heartbeat().status();
     let existing_cid = cfg.target_chat_id;
-    let existing_bid = state
-        .hermes
+    let existing_bid = engine
         .store()
         .kv_get("heartbeat", "bot_id")
         .ok()
         .flatten()
-        .and_then(|s| parse_bot_id_str_u64(&s));
-    let existing_owner = state
-        .hermes
+        .and_then(|s| parse_bot_id_str_u64(&s))
+        .or(scoped_bid);
+    let existing_owner = engine
         .store()
         .kv_get("heartbeat", "owner_user_id")
         .ok()
@@ -5031,7 +5172,7 @@ pub async fn hermes_heartbeat_post(
             };
             Some(Some(bid))
         }
-        None => None,
+        None => q.bot_id.filter(|id| *id > 0).map(Some),
     };
     let effective_bid = match bot_id_patch {
         Some(opt) => opt,
@@ -5065,31 +5206,29 @@ pub async fn hermes_heartbeat_post(
             cfg.prompt = prompt.to_string();
         }
     }
-    let _ = state
-        .hermes
+    let _ = engine
         .store()
         .kv_set("heartbeat", "owner_user_id", &auth.user_id.0.to_string());
     match bot_id_patch {
         Some(Some(bid)) => {
-            let _ = state
-                .hermes
+            let _ = engine
                 .store()
                 .kv_set("heartbeat", "bot_id", &bid.to_string());
         }
         Some(None) => {
-            let _ = state.hermes.store().kv_delete("heartbeat", "bot_id");
+            let _ = engine.store().kv_delete("heartbeat", "bot_id");
         }
         None => {}
     }
 
-    state.hermes.heartbeat().set_config(cfg.clone());
-    let bot_id = state
-        .hermes
+    engine.heartbeat().set_config(cfg.clone());
+    let bot_id = engine
         .store()
         .kv_get("heartbeat", "bot_id")
         .ok()
         .flatten()
-        .and_then(|s| parse_bot_id_str_u64(&s));
+        .and_then(|s| parse_bot_id_str_u64(&s))
+        .or(scoped_bid);
 
     (
         StatusCode::OK,
@@ -5109,19 +5248,52 @@ pub async fn hermes_heartbeat_post(
 // Kanban Boards & Cards
 // ============================================================================
 
+fn resolve_engine_for_kanban_board(
+    state: &AppState,
+    bot_id: Option<u64>,
+    board_id: &str,
+) -> Arc<HermesEngine> {
+    if bot_id.is_some() {
+        return resolve_hermes_for_bot(state, bot_id);
+    }
+    for (_, eng) in state.fabushi_bots.all_engines() {
+        if eng.store().get_kanban_board(board_id).ok().flatten().is_some() {
+            return eng;
+        }
+    }
+    state.fabushi_core()
+}
+
+fn resolve_engine_for_kanban_card(
+    state: &AppState,
+    bot_id: Option<u64>,
+    card_id: &str,
+) -> Arc<HermesEngine> {
+    if bot_id.is_some() {
+        return resolve_hermes_for_bot(state, bot_id);
+    }
+    for (_, eng) in state.fabushi_bots.all_engines() {
+        if eng.store().get_kanban_card(card_id).ok().flatten().is_some() {
+            return eng;
+        }
+    }
+    state.fabushi_core()
+}
+
 pub async fn hermes_kanban_boards_list(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    let boards = match state.hermes.store().list_kanban_boards() {
+    let engine = resolve_hermes_for_bot(&state, q.bot_id);
+    let boards = match engine.store().list_kanban_boards() {
         Ok(b) => b,
         Err(e) => return map_telegram_err(e),
     };
     let dtos: Vec<Value> = boards
         .iter()
         .map(|board| {
-            let cards = state
-                .hermes
+            let cards = engine
                 .store()
                 .list_kanban_cards(&board.id, None)
                 .unwrap_or_default();
@@ -5138,8 +5310,10 @@ pub async fn hermes_kanban_boards_list(
 pub async fn hermes_kanban_boards_create(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
     Json(payload): Json<Value>,
 ) -> Response {
+    let engine = resolve_hermes_for_bot(&state, q.bot_id.or_else(|| parse_bot_id_u64(payload.get("bot_id"))));
     let name = payload
         .get("name")
         .and_then(|v| v.as_str())
@@ -5157,8 +5331,7 @@ pub async fn hermes_kanban_boards_create(
                 .filter_map(|v| v.as_str().map(ToString::to_string))
                 .collect()
         });
-    match state
-        .hermes
+    match engine
         .store()
         .create_kanban_board(name, description, columns)
     {
@@ -5171,11 +5344,12 @@ pub async fn hermes_kanban_board_get(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(board_id): Path<String>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    match state.hermes.store().get_kanban_board(&board_id) {
+    let engine = resolve_engine_for_kanban_board(&state, q.bot_id, &board_id);
+    match engine.store().get_kanban_board(&board_id) {
         Ok(Some(board)) => {
-            let cards = state
-                .hermes
+            let cards = engine
                 .store()
                 .list_kanban_cards(&board.id, None)
                 .unwrap_or_default();
@@ -5189,6 +5363,7 @@ pub async fn hermes_kanban_board_get(
 pub async fn hermes_kanban_cards_create(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
     Json(payload): Json<Value>,
 ) -> Response {
     let board_id = payload
@@ -5196,6 +5371,8 @@ pub async fn hermes_kanban_cards_create(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let scoped_bid = q.bot_id.or_else(|| parse_bot_id_u64(payload.get("bot_id")));
+    let engine = resolve_engine_for_kanban_board(&state, scoped_bid, &board_id);
     let title = payload
         .get("title")
         .and_then(|v| v.as_str())
@@ -5225,7 +5402,7 @@ pub async fn hermes_kanban_cards_create(
             .map(ToString::to_string),
         labels: None,
     };
-    match state.hermes.store().create_kanban_card(req) {
+    match engine.store().create_kanban_card(req) {
         Ok(card) => (StatusCode::CREATED, Json(card_to_dto(&card))).into_response(),
         Err(e) => map_telegram_err(e),
     }
@@ -5235,8 +5412,11 @@ pub async fn hermes_kanban_cards_patch(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(card_id): Path<String>,
+    Query(q): Query<OptionalBotScopeQuery>,
     Json(payload): Json<Value>,
 ) -> Response {
+    let scoped_bid = q.bot_id.or_else(|| parse_bot_id_u64(payload.get("bot_id")));
+    let engine = resolve_engine_for_kanban_card(&state, scoped_bid, &card_id);
     let patch = KanbanCardPatch {
         title: payload
             .get("title")
@@ -5262,7 +5442,7 @@ pub async fn hermes_kanban_cards_patch(
         position: payload.get("position").and_then(|v| v.as_i64()),
         ..Default::default()
     };
-    match state.hermes.store().update_kanban_card(&card_id, patch) {
+    match engine.store().update_kanban_card(&card_id, patch) {
         Ok(card) => (StatusCode::OK, Json(card_to_dto(&card))).into_response(),
         Err(e) => map_telegram_err(e),
     }
@@ -5272,8 +5452,10 @@ pub async fn hermes_kanban_cards_delete(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Path(card_id): Path<String>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    match state.hermes.store().delete_kanban_card(&card_id) {
+    let engine = resolve_engine_for_kanban_card(&state, q.bot_id, &card_id);
+    match engine.store().delete_kanban_card(&card_id) {
         Ok(true) => (
             StatusCode::OK,
             Json(json!({ "deleted": true, "card_id": card_id })),
@@ -5293,7 +5475,7 @@ pub async fn hermes_providers_get(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     let uid = auth.user_id.0.to_string();
-    let snap = state.hermes.providers_for_user(&uid).snapshot();
+    let snap = state.fabushi_core().providers_for_user(&uid).snapshot();
     let available_models = collect_available_models(&snap);
     let mut list: Vec<&ProviderConfig> = snap.providers.values().collect();
     list.sort_by(|a, b| a.id.cmp(&b.id));
@@ -5335,7 +5517,8 @@ pub async fn hermes_providers_put(
     }
 
     let uid = auth.user_id.0.to_string();
-    let user_provs = state.hermes.providers_for_user(&uid);
+    let core = state.fabushi_core();
+    let user_provs = core.providers_for_user(&uid);
     let snap_before = user_provs.snapshot();
     let mut cfg = snap_before
         .providers
@@ -5432,7 +5615,7 @@ pub async fn hermes_providers_put(
         user_provs.set_allow_local_fallback(allow_local);
     }
 
-    state.hermes.persist_user_providers_state(&uid);
+    core.persist_user_providers_state(&uid);
     let snap_after = user_provs.snapshot();
     match snap_after.providers.get(&provider_id) {
         Some(updated) => {
@@ -5456,13 +5639,14 @@ pub async fn hermes_providers_put(
 pub async fn hermes_usage_get(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    let summary = match state.hermes.store().usage_summary(None, None) {
+    let engine = resolve_hermes_for_bot(&state, q.bot_id);
+    let summary = match engine.store().usage_summary(None, None) {
         Ok(s) => s,
         Err(e) => return map_telegram_err(e),
     };
-    let tool_calls: u64 = state
-        .hermes
+    let tool_calls: u64 = engine
         .store()
         .insights(None, None)
         .map(|i| i.top_tools.iter().map(|t| t.call_count.max(0) as u64).sum())
@@ -5559,8 +5743,22 @@ pub async fn hermes_rollback_post(
 pub async fn hermes_terminal_processes_get(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
+    Query(q): Query<OptionalBotScopeQuery>,
 ) -> Response {
-    let list = state.hermes.processes().list().await;
+    let mut list = Vec::new();
+    let mut seen = HashSet::new();
+    if q.bot_id.is_some() {
+        let engine = resolve_hermes_for_bot(&state, q.bot_id);
+        list.extend(engine.processes().list().await);
+    } else {
+        for (_, engine) in state.fabushi_bots.all_engines() {
+            for p in engine.processes().list().await {
+                if seen.insert(p.process_id.clone()) {
+                    list.push(p);
+                }
+            }
+        }
+    }
     let processes: Vec<Value> = list
         .into_iter()
         .map(|p| {
@@ -5829,7 +6027,7 @@ pub async fn hermes_talk_turn(
 
     let voice_sys = format!(
         "{} Keep responses concise and natural for real-time voice playback{}.",
-        bot_sp.unwrap_or_else(|| "You are Hermes Voice Assistant.".to_string()),
+        bot_sp.unwrap_or_else(|| "You are Fabushi Voice Assistant.".to_string()),
         voice_preset
             .as_deref()
             .map(|v| format!(" (voice preset: {v})"))
@@ -6087,7 +6285,7 @@ pub async fn openai_chat_completions(
         }
         eng
     } else {
-        Arc::clone(&state.hermes)
+        state.fabushi_core()
     };
     let session_id = explicit_session_id
         .unwrap_or_else(|| format!("openai_{}", Uuid::new_v4().simple()));
@@ -6115,6 +6313,7 @@ pub async fn openai_chat_completions(
         model: model.clone(),
         system_prompt: (!sys_parts.is_empty()).then(|| sys_parts.join("\n\n")),
         thinking_budget_tokens: None,
+        adaptive_toolsets: None,
         preset: None,
         max_iterations: None,
         max_tokens: payload
@@ -6290,7 +6489,10 @@ pub async fn openai_models_list(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     let uid_opt = resolve_optional_bearer_user(&headers, &state).map(|u| u.0.to_string());
-    let snap = state.hermes.resolve_providers(uid_opt.as_deref()).snapshot();
+    let snap = state
+        .fabushi_core()
+        .resolve_providers(uid_opt.as_deref())
+        .snapshot();
     let mut seen = HashSet::new();
     let mut data = Vec::new();
     let now = Utc::now().timestamp();
@@ -6541,7 +6743,7 @@ mod tests {
 
         let (_dir, state) = test_state("hermes_sanitize_model");
         use gpui_telegram_agent::hermes::providers::{ApiMode, CredentialPool, ProviderConfig};
-        state.hermes.providers().register_provider(ProviderConfig {
+        state.fabushi_core().providers().register_provider(ProviderConfig {
             id: "magpie_test".to_string(),
             name: "Magpie Test".to_string(),
             api_mode: ApiMode::ChatCompletions,
@@ -6555,7 +6757,7 @@ mod tests {
             ..Default::default()
         });
         state
-            .hermes
+            .fabushi_core()
             .providers()
             .set_active("magpie_test", None)
             .expect("activate magpie_test");
@@ -6564,7 +6766,7 @@ mod tests {
             None
         );
 
-        state.hermes.providers().register_provider(ProviderConfig {
+        state.fabushi_core().providers().register_provider(ProviderConfig {
             id: "deepseek_test".to_string(),
             name: "DeepSeek Test".to_string(),
             api_mode: ApiMode::ChatCompletions,
@@ -6578,7 +6780,7 @@ mod tests {
             ..Default::default()
         });
         state
-            .hermes
+            .fabushi_core()
             .providers()
             .set_active("deepseek_test", None)
             .expect("activate deepseek_test");
@@ -6764,7 +6966,7 @@ mod tests {
         .expect("resolve policy");
         assert!(is_yolo, "default bot computer policy AlwaysAllowAuthorized must map to Yolo");
         let mode = state
-            .hermes
+            .fabushi_core()
             .security()
             .read()
             .expect("sec lock")
@@ -6784,9 +6986,10 @@ mod tests {
             .register("sse_ev_user", "Pass123456!", "SseUser", None, "CLI")
             .unwrap();
 
+        let core = state.fabushi_core();
         // 1. Trigger a PROVIDER_ERROR turn via run_turn_stream (remove all providers, disable local fallback)
         {
-            let provs = state.hermes.providers();
+            let provs = core.providers();
             for p in provs.list_providers() {
                 if p.id != "local_hermes" {
                     provs.remove_provider(&p.id);
@@ -6798,7 +7001,7 @@ mod tests {
         req.skip_slash_commands = true;
         req.user_id = Some(user.user_id.0.to_string());
         req.session_id = Some(format!("sse_ev_sess_{}", user.user_id.0));
-        let mut rx = state.hermes.run_turn_stream(req).await.expect("stream start");
+        let mut rx = core.run_turn_stream(req).await.expect("stream start");
         let mut err_turn_id = String::new();
         while let Some(ev) = rx.recv().await {
             if let HermesEvent::Meta { turn_id, .. } = ev {
@@ -6808,7 +7011,7 @@ mod tests {
         assert!(!err_turn_id.is_empty());
         // Wait briefly for record_turn_events to settle after channel close
         for _ in 0..50 {
-            if !state.hermes.get_turn_events(&err_turn_id).is_empty() {
+            if !core.get_turn_events(&err_turn_id).is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6841,16 +7044,16 @@ mod tests {
         );
 
         // 2. Trigger a clean completed turn (allow local_hermes for this user)
-        let user_provs = state.hermes.providers_for_user(&user.user_id.0.to_string());
+        let user_provs = core.providers_for_user(&user.user_id.0.to_string());
         user_provs.set_allow_local_fallback(true);
         let _ = user_provs.set_active("local_hermes", Some("hermes-local-v1"));
         let mut ok_req = HermesTurnRequest::new("hello clean");
         ok_req.skip_slash_commands = true;
         ok_req.user_id = Some(user.user_id.0.to_string());
         ok_req.session_id = Some(format!("sse_ev_sess_{}", user.user_id.0));
-        let ok_res = state.hermes.run_turn(ok_req).await.expect("clean turn");
+        let ok_res = core.run_turn(ok_req).await.expect("clean turn");
         for _ in 0..50 {
-            if !state.hermes.get_turn_events(&ok_res.turn_id).is_empty() {
+            if !core.get_turn_events(&ok_res.turn_id).is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6935,7 +7138,8 @@ mod tests {
             .register("abort_user", "Pass123456!", "AbortUser", None, "CLI")
             .unwrap();
         {
-            let provs = state.hermes.providers();
+            let core = state.fabushi_core();
+            let provs = core.providers();
             for p in provs.list_providers() {
                 if p.id != "local_hermes" {
                     provs.remove_provider(&p.id);

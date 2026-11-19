@@ -39,7 +39,7 @@ pub fn render_skills_hub_tab(
         .gap(px(14.0))
         .child(
             studio_section_card(
-                tr_str(&lang, "SKILL.md 技能中心", "Hermes Skills Hub (SKILL.md)"),
+                tr_str(&lang, "SKILL.md 技能中心", "Fabushi Skills Hub (SKILL.md)"),
                 IconName::FileDoc,
                 pal,
             )

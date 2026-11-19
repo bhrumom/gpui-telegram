@@ -139,19 +139,19 @@ impl AppShell {
             let servers_res = client.list_mcp_servers().await;
             let tools_res = client.list_mcp_tools().await;
             let status_res = client.hermes_status_for_bot(active_bot_id).await.ok();
-            let kanban_res = client.hermes_kanban_boards().await.ok();
+            let kanban_res = client.hermes_kanban_boards_for_bot(active_bot_id).await.ok();
             let approvals_res = client.hermes_list_approvals_for_bot(active_bot_id).await.ok();
             let skills_res = client.hermes_list_skills_for_bot(active_bot_id).await.ok();
             let memory_res = client.hermes_get_memory_for_bot(active_bot_id).await.ok();
             let soul_res = client.hermes_get_soul(active_bot_id).await.ok();
             let honcho_res = client.hermes_get_honcho_for_bot(active_bot_id).await.ok();
             let toolsets_res = client.hermes_list_toolsets_for_bot(active_bot_id).await.ok();
-            let procs_res = client.hermes_terminal_processes().await.ok();
-            let cron_res = client.hermes_list_cron().await.ok();
-            let hb_res = client.hermes_get_heartbeat().await.ok();
+            let procs_res = client.hermes_terminal_processes_for_bot(active_bot_id).await.ok();
+            let cron_res = client.hermes_list_cron_for_bot(active_bot_id).await.ok();
+            let hb_res = client.hermes_get_heartbeat_for_bot(active_bot_id).await.ok();
             let sessions_res = client.hermes_list_sessions_for_bot(active_bot_id).await.ok();
             let providers_res = client.hermes_list_providers().await.ok();
-            let usage_res = client.hermes_usage_stats().await.ok();
+            let usage_res = client.hermes_usage_stats_for_bot(active_bot_id).await.ok();
             let cmds_res = client.hermes_list_commands(None).await.ok();
             let magpie_res = client.hermes.magpie_state(&tok_magpie).await.ok();
             let _ = weak.update(app, |shell, cx| {
@@ -249,15 +249,18 @@ impl AppShell {
             TasksWorkspaceAction::CreateKanbanBoard(name) => {
                 spawn_and_refresh!(
                     cx,
-                    client.hermes_kanban_create_board(&HermesCreateKanbanBoardRequest {
-                        name,
-                        columns: Some(vec![
-                            "Backlog".into(),
-                            "In Progress".into(),
-                            "Review".into(),
-                            "Done".into(),
-                        ]),
-                    })
+                    client.hermes_kanban_create_board_for_bot(
+                        active_bot_id,
+                        &HermesCreateKanbanBoardRequest {
+                            name,
+                            columns: Some(vec![
+                                "Backlog".into(),
+                                "In Progress".into(),
+                                "Review".into(),
+                                "Done".into(),
+                            ]),
+                        }
+                    )
                 );
             }
             TasksWorkspaceAction::CreateKanbanCard {
@@ -268,20 +271,24 @@ impl AppShell {
             } => {
                 spawn_and_refresh!(
                     cx,
-                    client.hermes_kanban_create_card(&HermesCreateKanbanCardRequest {
-                        board_id,
-                        title,
-                        description: None,
-                        column: Some(column),
-                        priority: Some(priority),
-                        assigned_agent: None,
-                    })
+                    client.hermes_kanban_create_card_for_bot(
+                        active_bot_id,
+                        &HermesCreateKanbanCardRequest {
+                            board_id,
+                            title,
+                            description: None,
+                            column: Some(column),
+                            priority: Some(priority),
+                            assigned_agent: None,
+                        }
+                    )
                 );
             }
             TasksWorkspaceAction::MoveKanbanCard { card_id, column } => {
                 spawn_and_refresh!(
                     cx,
-                    client.hermes_kanban_move_card(
+                    client.hermes_kanban_move_card_for_bot(
+                        active_bot_id,
                         &card_id,
                         &HermesMoveKanbanCardRequest {
                             column: Some(column),
@@ -291,7 +298,7 @@ impl AppShell {
                 );
             }
             TasksWorkspaceAction::DeleteKanbanCard(card_id) => {
-                spawn_and_refresh!(cx, client.hermes.kanban_delete_card(&token, &card_id));
+                spawn_and_refresh!(cx, client.hermes_kanban_delete_card_for_bot(active_bot_id, &card_id));
             }
             TasksWorkspaceAction::DecideHermesApproval {
                 approval_id,
@@ -328,11 +335,11 @@ impl AppShell {
             TasksWorkspaceAction::ToggleSkillEnabled { name, enabled } => {
                 spawn_and_refresh!(
                     cx,
-                    client.hermes.patch_skill(&token, &name, &json!({ "enabled": enabled }))
+                    client.hermes_patch_skill_for_bot(active_bot_id, &name, &json!({ "enabled": enabled }))
                 );
             }
             TasksWorkspaceAction::ApproveSkill(name) => {
-                spawn_and_refresh!(cx, client.hermes.approve_skill(&token, &name));
+                spawn_and_refresh!(cx, client.hermes_approve_skill_for_bot(active_bot_id, &name));
             }
             TasksWorkspaceAction::DeleteSkill(name) => {
                 spawn_and_refresh!(cx, client.hermes_delete_skill_for_bot(active_bot_id, &name));
@@ -569,7 +576,7 @@ impl AppShell {
             }
             TasksWorkspaceAction::PollTerminalProcesses => {
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    if let Ok(procs) = client.hermes_terminal_processes().await {
+                    if let Ok(procs) = client.hermes_terminal_processes_for_bot(active_bot_id).await {
                         let _ = weak.update(app, |s, cx| {
                             s.tasks_workspace.update(cx, |w, w_cx| {
                                 w.sync_terminal_processes(procs);
@@ -591,7 +598,7 @@ impl AppShell {
                             bot_id: active_bot_id,
                         })
                         .await;
-                    if let Ok(procs) = client.hermes_terminal_processes().await {
+                    if let Ok(procs) = client.hermes_terminal_processes_for_bot(active_bot_id).await {
                         let _ = weak.update(app, |s, cx| {
                             s.tasks_workspace.update(cx, |w, w_cx| {
                                 w.sync_terminal_processes(procs);
@@ -603,13 +610,16 @@ impl AppShell {
                 })
                 .detach();
             }
-            TasksWorkspaceAction::SaveCronJob(req) => {
-                spawn_and_refresh!(cx, client.hermes_save_cron(&req));
+            TasksWorkspaceAction::SaveCronJob(mut req) => {
+                if req.bot_id.is_none() {
+                    req.bot_id = active_bot_id;
+                }
+                spawn_and_refresh!(cx, client.hermes_save_cron_for_bot(active_bot_id, &req));
             }
             TasksWorkspaceAction::ToggleCronJob { job_id, enabled } => {
                 spawn_and_refresh!(
                     cx,
-                    client.hermes.update_cron(&token, &job_id, &json!({ "enabled": enabled }))
+                    client.hermes_update_cron_for_bot(active_bot_id, &job_id, &json!({ "enabled": enabled }))
                 );
             }
             TasksWorkspaceAction::RunCronNow(job_id) => {
@@ -622,7 +632,7 @@ impl AppShell {
                     .map(|j| j.name.clone())
                     .unwrap_or_else(|| job_id.clone());
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let res = client.hermes_run_cron(&job_id).await;
+                    let res = client.hermes_run_cron_for_bot(active_bot_id, &job_id).await;
                     let _ = weak.update(app, |s, cx| {
                         let (status, summary) = match res {
                             Ok(v) => (
@@ -653,11 +663,14 @@ impl AppShell {
                 .detach();
             }
             TasksWorkspaceAction::DeleteCronJob(job_id) => {
-                spawn_and_refresh!(cx, client.hermes_delete_cron(&job_id));
+                spawn_and_refresh!(cx, client.hermes_delete_cron_for_bot(active_bot_id, &job_id));
             }
-            TasksWorkspaceAction::SaveHeartbeat(cfg) => {
+            TasksWorkspaceAction::SaveHeartbeat(mut cfg) => {
+                if cfg.bot_id.is_none() {
+                    cfg.bot_id = active_bot_id;
+                }
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    if let Ok(saved) = client.hermes_save_heartbeat(&cfg).await {
+                    if let Ok(saved) = client.hermes_save_heartbeat_for_bot(active_bot_id, &cfg).await {
                         let _ = weak.update(app, |s, cx| {
                             s.tasks_workspace.update(cx, |w, w_cx| {
                                 w.sync_heartbeat(saved);

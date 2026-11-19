@@ -8,6 +8,7 @@ license.workspace = true
 gpui_telegram_core = { workspace = true }
 gpui_telegram_proto = { workspace = true }
 gpui_telegram_media = { workspace = true }
+bot-browser = { workspace = true }
 mahayana-host-runtime = { path = "../../inherited/host" }
 mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }
 fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
@@ -31,3 +32,8 @@ getrandom = { workspace = true }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
+
+[dev-dependencies]
+async-trait = { workspace = true }
+image = { workspace = true }
+zeroize = { workspace = true }

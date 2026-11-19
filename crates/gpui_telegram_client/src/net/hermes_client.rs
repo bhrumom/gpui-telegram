@@ -1593,7 +1593,18 @@ impl HermesClient {
         name: &str,
         patch: &Value,
     ) -> Result<HermesSkillDto, HttpClientError> {
-        let path = format!("/api/v1/hermes/skills/{}", percent_encode_rfc3986(name));
+        self.patch_skill_for_bot(token, None, name, patch).await
+    }
+
+    pub async fn patch_skill_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        name: &str,
+        patch: &Value,
+    ) -> Result<HermesSkillDto, HttpClientError> {
+        let base = format!("/api/v1/hermes/skills/{}", percent_encode_rfc3986(name));
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_json(Method::PATCH, &path, Some(token), Some(patch))
             .await
@@ -1621,10 +1632,20 @@ impl HermesClient {
         token: &str,
         name: &str,
     ) -> Result<HermesSkillDto, HttpClientError> {
-        let path = format!(
+        self.approve_skill_for_bot(token, None, name).await
+    }
+
+    pub async fn approve_skill_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        name: &str,
+    ) -> Result<HermesSkillDto, HttpClientError> {
+        let base = format!(
             "/api/v1/hermes/skills/{}/approve",
             percent_encode_rfc3986(name)
         );
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_json(Method::POST, &path, Some(token), Some(&serde_json::json!({})))
             .await
@@ -1708,10 +1729,19 @@ impl HermesClient {
     }
 
     pub async fn list_cron(&self, token: &str) -> Result<Vec<HermesCronJobDto>, HttpClientError> {
+        self.list_cron_for_bot(token, None).await
+    }
+
+    pub async fn list_cron_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+    ) -> Result<Vec<HermesCronJobDto>, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/cron", bot_id);
         self.http
             .request_vec_or_field(
                 Method::GET,
-                "/api/v1/hermes/cron",
+                &path,
                 Some(token),
                 &["jobs", "cron", "items"],
             )
@@ -1723,8 +1753,18 @@ impl HermesClient {
         token: &str,
         req: &HermesSaveCronRequest,
     ) -> Result<HermesCronJobDto, HttpClientError> {
+        self.save_cron_for_bot(token, None, req).await
+    }
+
+    pub async fn save_cron_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        req: &HermesSaveCronRequest,
+    ) -> Result<HermesCronJobDto, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/cron", bot_id.or(req.bot_id));
         self.http
-            .request_json(Method::POST, "/api/v1/hermes/cron", Some(token), Some(req))
+            .request_json(Method::POST, &path, Some(token), Some(req))
             .await
     }
 
@@ -1734,21 +1774,52 @@ impl HermesClient {
         job_id: &str,
         patch: &Value,
     ) -> Result<HermesCronJobDto, HttpClientError> {
-        let path = format!("/api/v1/hermes/cron/{}", percent_encode_rfc3986(job_id));
+        self.update_cron_for_bot(token, None, job_id, patch).await
+    }
+
+    pub async fn update_cron_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        job_id: &str,
+        patch: &Value,
+    ) -> Result<HermesCronJobDto, HttpClientError> {
+        let base = format!("/api/v1/hermes/cron/{}", percent_encode_rfc3986(job_id));
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_json(Method::PATCH, &path, Some(token), Some(patch))
             .await
     }
 
     pub async fn delete_cron(&self, token: &str, job_id: &str) -> Result<(), HttpClientError> {
-        let path = format!("/api/v1/hermes/cron/{}", percent_encode_rfc3986(job_id));
+        self.delete_cron_for_bot(token, None, job_id).await
+    }
+
+    pub async fn delete_cron_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        job_id: &str,
+    ) -> Result<(), HttpClientError> {
+        let base = format!("/api/v1/hermes/cron/{}", percent_encode_rfc3986(job_id));
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_empty(Method::DELETE, &path, Some(token), None::<&()>)
             .await
     }
 
     pub async fn run_cron(&self, token: &str, job_id: &str) -> Result<Value, HttpClientError> {
-        let path = format!("/api/v1/hermes/cron/{}/run", percent_encode_rfc3986(job_id));
+        self.run_cron_for_bot(token, None, job_id).await
+    }
+
+    pub async fn run_cron_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        job_id: &str,
+    ) -> Result<Value, HttpClientError> {
+        let base = format!("/api/v1/hermes/cron/{}/run", percent_encode_rfc3986(job_id));
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_json(Method::POST, &path, Some(token), Some(&serde_json::json!({})))
             .await
@@ -1758,13 +1829,17 @@ impl HermesClient {
         &self,
         token: &str,
     ) -> Result<HermesHeartbeatConfigDto, HttpClientError> {
+        self.get_heartbeat_for_bot(token, None).await
+    }
+
+    pub async fn get_heartbeat_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+    ) -> Result<HermesHeartbeatConfigDto, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/heartbeat", bot_id);
         self.http
-            .request_json(
-                Method::GET,
-                "/api/v1/hermes/heartbeat",
-                Some(token),
-                None::<&()>,
-            )
+            .request_json(Method::GET, &path, Some(token), None::<&()>)
             .await
     }
 
@@ -1773,8 +1848,18 @@ impl HermesClient {
         token: &str,
         cfg: &HermesHeartbeatConfigDto,
     ) -> Result<HermesHeartbeatConfigDto, HttpClientError> {
+        self.save_heartbeat_for_bot(token, None, cfg).await
+    }
+
+    pub async fn save_heartbeat_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        cfg: &HermesHeartbeatConfigDto,
+    ) -> Result<HermesHeartbeatConfigDto, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/heartbeat", bot_id.or(cfg.bot_id));
         self.http
-            .request_json(Method::POST, "/api/v1/hermes/heartbeat", Some(token), Some(cfg))
+            .request_json(Method::POST, &path, Some(token), Some(cfg))
             .await
     }
 
@@ -1782,10 +1867,19 @@ impl HermesClient {
         &self,
         token: &str,
     ) -> Result<Vec<HermesKanbanBoardDto>, HttpClientError> {
+        self.kanban_boards_for_bot(token, None).await
+    }
+
+    pub async fn kanban_boards_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+    ) -> Result<Vec<HermesKanbanBoardDto>, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/kanban/boards", bot_id);
         self.http
             .request_vec_or_field(
                 Method::GET,
-                "/api/v1/hermes/kanban/boards",
+                &path,
                 Some(token),
                 &["boards", "items"],
             )
@@ -1811,13 +1905,18 @@ impl HermesClient {
         token: &str,
         req: &HermesCreateKanbanBoardRequest,
     ) -> Result<HermesKanbanBoardDto, HttpClientError> {
+        self.kanban_create_board_for_bot(token, None, req).await
+    }
+
+    pub async fn kanban_create_board_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        req: &HermesCreateKanbanBoardRequest,
+    ) -> Result<HermesKanbanBoardDto, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/kanban/boards", bot_id);
         self.http
-            .request_json(
-                Method::POST,
-                "/api/v1/hermes/kanban/boards",
-                Some(token),
-                Some(req),
-            )
+            .request_json(Method::POST, &path, Some(token), Some(req))
             .await
     }
 
@@ -1826,13 +1925,18 @@ impl HermesClient {
         token: &str,
         req: &HermesCreateKanbanCardRequest,
     ) -> Result<HermesKanbanCardDto, HttpClientError> {
+        self.kanban_create_card_for_bot(token, None, req).await
+    }
+
+    pub async fn kanban_create_card_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        req: &HermesCreateKanbanCardRequest,
+    ) -> Result<HermesKanbanCardDto, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/kanban/cards", bot_id);
         self.http
-            .request_json(
-                Method::POST,
-                "/api/v1/hermes/kanban/cards",
-                Some(token),
-                Some(req),
-            )
+            .request_json(Method::POST, &path, Some(token), Some(req))
             .await
     }
 
@@ -1842,10 +1946,21 @@ impl HermesClient {
         card_id: &str,
         req: &HermesMoveKanbanCardRequest,
     ) -> Result<HermesKanbanCardDto, HttpClientError> {
-        let path = format!(
+        self.kanban_move_card_for_bot(token, None, card_id, req).await
+    }
+
+    pub async fn kanban_move_card_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        card_id: &str,
+        req: &HermesMoveKanbanCardRequest,
+    ) -> Result<HermesKanbanCardDto, HttpClientError> {
+        let base = format!(
             "/api/v1/hermes/kanban/cards/{}",
             percent_encode_rfc3986(card_id)
         );
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_json(Method::PATCH, &path, Some(token), Some(req))
             .await
@@ -1856,10 +1971,20 @@ impl HermesClient {
         token: &str,
         card_id: &str,
     ) -> Result<(), HttpClientError> {
-        let path = format!(
+        self.kanban_delete_card_for_bot(token, None, card_id).await
+    }
+
+    pub async fn kanban_delete_card_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        card_id: &str,
+    ) -> Result<(), HttpClientError> {
+        let base = format!(
             "/api/v1/hermes/kanban/cards/{}",
             percent_encode_rfc3986(card_id)
         );
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_empty(Method::DELETE, &path, Some(token), None::<&()>)
             .await
@@ -1869,8 +1994,17 @@ impl HermesClient {
         &self,
         token: &str,
     ) -> Result<HermesUsageSummaryDto, HttpClientError> {
+        self.usage_stats_for_bot(token, None).await
+    }
+
+    pub async fn usage_stats_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+    ) -> Result<HermesUsageSummaryDto, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/usage", bot_id);
         self.http
-            .request_json(Method::GET, "/api/v1/hermes/usage", Some(token), None::<&()>)
+            .request_json(Method::GET, &path, Some(token), None::<&()>)
             .await
     }
 
@@ -1922,10 +2056,19 @@ impl HermesClient {
         &self,
         token: &str,
     ) -> Result<Vec<HermesTerminalProcessDto>, HttpClientError> {
+        self.terminal_processes_for_bot(token, None).await
+    }
+
+    pub async fn terminal_processes_for_bot(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+    ) -> Result<Vec<HermesTerminalProcessDto>, HttpClientError> {
+        let path = with_bot_scope("/api/v1/hermes/terminal/processes", bot_id);
         self.http
             .request_vec_or_field(
                 Method::GET,
-                "/api/v1/hermes/terminal/processes",
+                &path,
                 Some(token),
                 &["processes", "items"],
             )

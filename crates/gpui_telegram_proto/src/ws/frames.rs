@@ -158,6 +158,8 @@ pub enum WsClientFrame {
         chat_id: ChatId,
         pts: u64,
     },
+    MiniAppWebMcpResult(crate::miniapp_contracts::MiniAppWebMcpResponse),
+    MiniAppTakeoverState(crate::miniapp_contracts::MiniAppTakeoverEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

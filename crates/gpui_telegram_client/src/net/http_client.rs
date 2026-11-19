@@ -2019,15 +2019,19 @@ impl HttpClient {
             avatar_shape: Option<String>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             avatar_color: Option<String>,
+            #[serde(default)]
+            require_existing: bool,
         }
 
         let client = self.client.clone();
         let url = format!("{}/api/v1/contacts/add", self.base_url);
         let token_owned = token.to_string();
+        let require_existing = !payload.is_bot;
         let body = AddContactWithAvatarPayload {
             base: payload,
             avatar_shape,
             avatar_color,
+            require_existing,
         };
 
         self.run_on_tokio(async move {

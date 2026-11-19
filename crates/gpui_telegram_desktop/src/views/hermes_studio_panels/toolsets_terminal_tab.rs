@@ -27,7 +27,7 @@ pub fn render_toolsets_terminal_tab(
         // 1. 28 Hermes Toolsets Toggle Grid + Preset Selector
         .child(
             studio_section_card(
-                format!("28 Hermes Toolsets (Preset: {})", ws.active_toolset_preset),
+                format!("28 Fabushi Toolsets (Preset: {})", ws.active_toolset_preset),
                 IconName::TerminalMcp,
                 pal,
             )

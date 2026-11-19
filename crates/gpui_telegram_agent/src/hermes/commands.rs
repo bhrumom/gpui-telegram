@@ -446,7 +446,7 @@ impl Default for StandaloneCommandHost {
             toolsets,
             memory_entries: Vec::new(),
             user_entries: Vec::new(),
-            soul_text: "Hermes autonomous local assistant.".to_string(),
+            soul_text: "Fabushi autonomous local assistant.".to_string(),
             toggles,
             yolo: false,
             queued: Vec::new(),
@@ -554,7 +554,7 @@ impl CommandHost for StandaloneCommandHost {
     fn list_providers(&self) -> Vec<CommandProviderInfo> {
         vec![CommandProviderInfo {
             id: self.provider_id.clone(),
-            name: "Local Hermes".into(),
+            name: "Local Fabushi".into(),
             api_mode: self.api_mode.clone(),
             default_model: self.model.clone(),
             active: true,
@@ -717,7 +717,7 @@ impl CommandHost for StandaloneCommandHost {
     }
 
     fn doctor_report(&self) -> Result<String, String> {
-        Ok("Hermes Doctor: all subsystems nominal.".into())
+        Ok("Fabushi Agent Diagnostics: all subsystems nominal.".into())
     }
 
     fn context_report(&self) -> Result<String, String> {
@@ -863,7 +863,7 @@ impl SlashCommandRegistry {
         use CommandCategory::*;
 
         // --- Session & History Management ---
-        self.add("help", &["h", "?"], "/help [command|category]", Session, "Show Hermes slash commands and usage help", true);
+        self.add("help", &["h", "?"], "/help [command|category]", Session, "Show Fabushi slash commands and usage help", true);
         self.add("new", &["start"], "/new [title]", Session, "Start a fresh conversation session", true);
         self.add("reset", &[], "/reset", Session, "Reset current conversation and reload fresh snapshot", false);
         self.add("clear", &[], "/clear", Session, "Clear messages in the active session", false);
@@ -882,7 +882,7 @@ impl SlashCommandRegistry {
         self.add("moa", &[], "/moa <prompt>", ModelAndProvider, "Run Mixture-of-Agents across multiple models/perspectives and synthesize", true);
 
         // --- Tools, Toolsets, Skills & MCP ---
-        self.add("toolsets", &[], "/toolsets [list|enable <name>|disable <name>|preset <name>]", ToolsAndSkills, "Inspect or toggle the 28 Hermes toolsets", true);
+        self.add("toolsets", &[], "/toolsets [list|enable <name>|disable <name>|preset <name>]", ToolsAndSkills, "Inspect or toggle the 28 Fabushi toolsets", true);
         self.add("tools", &[], "/tools [filter]", ToolsAndSkills, "List active tools exposed to the model", true);
         self.add("skills", &[], "/skills [search|list|approve <name>]", ToolsAndSkills, "List and manage SKILL.md skills", true);
         self.add("skill", &[], "/skill <name>", ToolsAndSkills, "View full instructions for a specific SKILL.md skill", true);
@@ -899,7 +899,7 @@ impl SlashCommandRegistry {
         // --- Search, History & Export ---
         self.add("search", &["find"], "/search <query>", InspectionAndExport, "Full-text search (FTS5 + CJK) across past sessions", true);
         self.add("history", &[], "/history [limit]", InspectionAndExport, "Show recent turns in the active session", true);
-        self.add("sessions", &[], "/sessions [limit]", InspectionAndExport, "List persisted Hermes sessions", true);
+        self.add("sessions", &[], "/sessions [limit]", InspectionAndExport, "List persisted Fabushi sessions", true);
         self.add("export", &[], "/export [sharegpt|openai|anthropic|native]", InspectionAndExport, "Export redacted training trajectory for this session", true);
         self.add("save", &[], "/save [path] [format]", InspectionAndExport, "Save redacted session trajectory or transcript to file", true);
 
@@ -911,12 +911,12 @@ impl SlashCommandRegistry {
         self.add("doctor", &[], "/doctor", InspectionAndExport, "Run diagnostics on SQLite DB, memory budgets, providers, and tools", false);
         self.add("diff", &[], "/diff", InspectionAndExport, "Show workspace git diff or modified checkpoint summary", false);
         self.add("context", &[], "/context", InspectionAndExport, "Inspect 3-tier system prompt tokens, frozen snapshot, and skill index", false);
-        self.add("version", &["ver"], "/version", InspectionAndExport, "Display Hermes Rust Engine version and protocol capabilities", false);
+        self.add("version", &["ver"], "/version", InspectionAndExport, "Display Fabushi Pure-Rust Agent Engine version and protocol capabilities", false);
 
         // --- Workflow, Cron, Kanban, Goals & Heartbeat ---
         self.add("cron", &[], "/cron [list|add <expr> <prompt>|pause <id>|resume <id>|run <id>|delete <id>|history]", WorkflowAndAutomation, "Manage scheduled cron jobs", true);
         self.add("jobs", &[], "/jobs", WorkflowAndAutomation, "List active cron jobs and background processes", false);
-        self.add("kanban", &[], "/kanban [board|add <title>|move <card_id> <col>|list]", WorkflowAndAutomation, "Manage Hermes Kanban boards and task cards", true);
+        self.add("kanban", &[], "/kanban [board|add <title>|move <card_id> <col>|list]", WorkflowAndAutomation, "Manage Fabushi Kanban boards and task cards", true);
         self.add("board", &[], "/board [board_id]", WorkflowAndAutomation, "Open or inspect the Kanban board", true);
         self.add("goal", &[], "/goal <objective>", WorkflowAndAutomation, "Run an autonomous multi-step /goal verification loop", true);
         self.add("heartbeat", &[], "/heartbeat [on|off|interval <secs>|status]", WorkflowAndAutomation, "Configure periodic proactive heartbeat ticks", true);
@@ -939,7 +939,7 @@ impl SlashCommandRegistry {
         self.add("verbose", &[], "/verbose [on|off]", ModesAndUi, "Toggle verbose tool output streaming", true);
         self.add("reasoning", &["think"], "/reasoning [on|off|budget <tokens>]", ModesAndUi, "Toggle or adjust model thinking/reasoning visibility", true);
         self.add("debug", &[], "/debug [on|off]", ModesAndUi, "Toggle runtime debug trace output", true);
-        self.add("config", &[], "/config [show|set <key> <val>]", ModesAndUi, "View or update Hermes runtime configuration", true);
+        self.add("config", &[], "/config [show|set <key> <val>]", ModesAndUi, "View or update Fabushi runtime configuration", true);
     }
 
     pub fn list_descriptors(&self) -> &[CommandDescriptor] {
@@ -1031,7 +1031,7 @@ impl SlashCommandRegistry {
                 match host.new_session(title) {
                     Ok(id) => CommandExecutionOutcome::ok(
                         canonical,
-                        format!("Started fresh Hermes session `{id}`."),
+                        format!("Started fresh Fabushi session `{id}`."),
                     )
                     .with_effect(CommandUiEffect::RefreshSessionState)
                     .with_mutated(vec!["session_id".into()]),
@@ -1235,7 +1235,7 @@ impl SlashCommandRegistry {
                         .collect();
                     CommandExecutionOutcome::ok(
                         canonical,
-                        format!("Hermes Toolsets ({}):\n{}", lines.len(), lines.join("\n")),
+                        format!("Fabushi Toolsets ({}):\n{}", lines.len(), lines.join("\n")),
                     )
                 } else {
                     match host.mutate_toolsets(action, arg) {
@@ -1272,7 +1272,7 @@ impl SlashCommandRegistry {
                     if lines.is_empty() {
                         "No matching skills found.".into()
                     } else {
-                        format!("Hermes Skills:\n{}", lines.join("\n"))
+                        format!("Fabushi Skills:\n{}", lines.join("\n"))
                     },
                 )
             }
@@ -1451,7 +1451,7 @@ impl SlashCommandRegistry {
 
             "version" => CommandExecutionOutcome::ok(
                 "version",
-                "Hermes Pure-Rust Agent Engine v1.0.0 (Wire Protocols: chat_completions, codex_responses, anthropic_messages, gemini_generate_content, local_hermes | 28 Toolsets | 61+ Slash Commands)",
+                "Fabushi Pure-Rust Agent Engine v1.0.0 (Wire Protocols: chat_completions, codex_responses, anthropic_messages, gemini_generate_content, local_hermes | 28 Toolsets | 61+ Slash Commands)",
             ),
 
             "cron" | "jobs" => {
@@ -1645,7 +1645,7 @@ impl SlashCommandRegistry {
 
             unknown => CommandExecutionOutcome::err(
                 unknown,
-                format!("Unknown Hermes slash command `/{unknown}`. Type `/help` to list all {} commands.", self.descriptors.len()),
+                format!("Unknown Fabushi slash command `/{unknown}`. Type `/help` to list all {} commands.", self.descriptors.len()),
             ),
         }
     }
@@ -1694,7 +1694,7 @@ impl SlashCommandRegistry {
         }
 
         let mut sections = vec![format!(
-            "Hermes Command Reference ({} commands):",
+            "Fabushi Command Reference ({} commands):",
             self.descriptors.len()
         )];
         for (cat, items) in by_cat {

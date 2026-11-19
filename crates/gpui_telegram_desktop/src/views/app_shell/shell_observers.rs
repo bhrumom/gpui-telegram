@@ -462,9 +462,21 @@ impl AppShell {
 
     fn observe_stage_composer_inspector_entities(&self, cx: &mut Context<Self>) {
         cx.observe(&self.stage, |shell, st, cx| {
-            let bot_start_clicked = st.update(cx, |s, _| std::mem::take(&mut s.pending_bot_start));
+            let (bot_start_clicked, bot_assist_act, card_input_active) = st.update(cx, |s, _| {
+                (
+                    std::mem::take(&mut s.pending_bot_start),
+                    s.pending_bot_assist_action.take(),
+                    s.active_bot_card_field.is_some(),
+                )
+            });
+            if card_input_active {
+                shell.composer.update(cx, |c, _| c.is_input_focused = false);
+            }
             if bot_start_clicked {
                 shell.materialize_prestart_bot_and_start(cx);
+            }
+            if let Some(act) = bot_assist_act {
+                shell.handle_bot_assist_card_action(act, cx);
             }
             shell.handle_stage_pending_actions(cx);
             let insp_open = st.read(cx).is_inspector_open;
@@ -489,6 +501,9 @@ impl AppShell {
                 });
             if focused {
                 shell.sidebar.update(cx, |sb, _| sb.search_focused = false);
+                if shell.stage.read(cx).active_bot_card_field.is_some() {
+                    shell.stage.update(cx, |st, _| st.blur_bot_card_input());
+                }
             }
             if let (Some(chat_id), Some(pid)) = (shell.stage.read(cx).active_chat_id, selected_send_as) {
                 if shell.session_sync.send_as_peers.chosen(chat_id) != Some(pid) {

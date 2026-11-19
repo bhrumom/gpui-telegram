@@ -66,11 +66,11 @@ async fn test_tier3_discovery_fallback_stream() {
     let (_dir, state, app_router) = boot_test_server();
     // Scan subscriptions into server
     state
-        .hermes
+        .fabushi_core()
         .providers()
         .refresh_local_subscriptions_in_home(temp.path(), None);
-    assert!(state.hermes.providers().has_active_subscription());
-    assert!(!state.hermes.providers().needs_provider_selection());
+    assert!(state.fabushi_core().providers().has_active_subscription());
+    assert!(!state.fabushi_core().providers().needs_provider_selection());
 
     let (_uid, tok) = register_user(&app_router, "tier3_fallback_user").await;
 

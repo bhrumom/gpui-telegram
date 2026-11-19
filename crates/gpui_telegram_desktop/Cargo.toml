@@ -18,6 +18,8 @@ gpui_telegram_proto = { workspace = true }
 gpui_telegram_media = { workspace = true }
 gpui_telegram_client = { workspace = true }
 gpui_telegram_agent = { workspace = true }
+bot-browser = { workspace = true }
+zeroize = { workspace = true }
 magpie_gateway = { workspace = true }
 gpui_telegram_webrtc = { workspace = true }
 gpui = { workspace = true }

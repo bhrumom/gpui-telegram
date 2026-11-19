@@ -702,6 +702,25 @@ impl TelegramClient {
         self.hermes.delete_skill_for_bot(&token, bot_id, name).await
     }
 
+    pub async fn hermes_patch_skill_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        name: &str,
+        patch: &serde_json::Value,
+    ) -> std::result::Result<HermesSkillDto, HttpClientError> {
+        let token = self.require_token()?;
+        self.hermes.patch_skill_for_bot(&token, bot_id, name, patch).await
+    }
+
+    pub async fn hermes_approve_skill_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        name: &str,
+    ) -> std::result::Result<HermesSkillDto, HttpClientError> {
+        let token = self.require_token()?;
+        self.hermes.approve_skill_for_bot(&token, bot_id, name).await
+    }
+
     pub async fn hermes_list_toolsets(
         &self,
     ) -> std::result::Result<Vec<HermesToolsetDto>, HttpClientError> {
@@ -758,70 +777,149 @@ impl TelegramClient {
     pub async fn hermes_list_cron(
         &self,
     ) -> std::result::Result<Vec<HermesCronJobDto>, HttpClientError> {
+        self.hermes_list_cron_for_bot(None).await
+    }
+
+    pub async fn hermes_list_cron_for_bot(
+        &self,
+        bot_id: Option<u64>,
+    ) -> std::result::Result<Vec<HermesCronJobDto>, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.list_cron(&token).await
+        self.hermes.list_cron_for_bot(&token, bot_id).await
     }
 
     pub async fn hermes_save_cron(
         &self,
         req: &HermesSaveCronRequest,
     ) -> std::result::Result<HermesCronJobDto, HttpClientError> {
+        self.hermes_save_cron_for_bot(None, req).await
+    }
+
+    pub async fn hermes_save_cron_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        req: &HermesSaveCronRequest,
+    ) -> std::result::Result<HermesCronJobDto, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.save_cron(&token, req).await
+        self.hermes.save_cron_for_bot(&token, bot_id, req).await
+    }
+
+    pub async fn hermes_update_cron_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        job_id: &str,
+        patch: &serde_json::Value,
+    ) -> std::result::Result<HermesCronJobDto, HttpClientError> {
+        let token = self.require_token()?;
+        self.hermes.update_cron_for_bot(&token, bot_id, job_id, patch).await
     }
 
     pub async fn hermes_delete_cron(
         &self,
         job_id: &str,
     ) -> std::result::Result<(), HttpClientError> {
+        self.hermes_delete_cron_for_bot(None, job_id).await
+    }
+
+    pub async fn hermes_delete_cron_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        job_id: &str,
+    ) -> std::result::Result<(), HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.delete_cron(&token, job_id).await
+        self.hermes.delete_cron_for_bot(&token, bot_id, job_id).await
     }
 
     pub async fn hermes_run_cron(
         &self,
         job_id: &str,
     ) -> std::result::Result<serde_json::Value, HttpClientError> {
+        self.hermes_run_cron_for_bot(None, job_id).await
+    }
+
+    pub async fn hermes_run_cron_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        job_id: &str,
+    ) -> std::result::Result<serde_json::Value, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.run_cron(&token, job_id).await
+        self.hermes.run_cron_for_bot(&token, bot_id, job_id).await
     }
 
     pub async fn hermes_get_heartbeat(
         &self,
     ) -> std::result::Result<HermesHeartbeatConfigDto, HttpClientError> {
+        self.hermes_get_heartbeat_for_bot(None).await
+    }
+
+    pub async fn hermes_get_heartbeat_for_bot(
+        &self,
+        bot_id: Option<u64>,
+    ) -> std::result::Result<HermesHeartbeatConfigDto, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.get_heartbeat(&token).await
+        self.hermes.get_heartbeat_for_bot(&token, bot_id).await
     }
 
     pub async fn hermes_save_heartbeat(
         &self,
         cfg: &HermesHeartbeatConfigDto,
     ) -> std::result::Result<HermesHeartbeatConfigDto, HttpClientError> {
+        self.hermes_save_heartbeat_for_bot(None, cfg).await
+    }
+
+    pub async fn hermes_save_heartbeat_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        cfg: &HermesHeartbeatConfigDto,
+    ) -> std::result::Result<HermesHeartbeatConfigDto, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.save_heartbeat(&token, cfg).await
+        self.hermes.save_heartbeat_for_bot(&token, bot_id, cfg).await
     }
 
     pub async fn hermes_kanban_boards(
         &self,
     ) -> std::result::Result<Vec<HermesKanbanBoardDto>, HttpClientError> {
+        self.hermes_kanban_boards_for_bot(None).await
+    }
+
+    pub async fn hermes_kanban_boards_for_bot(
+        &self,
+        bot_id: Option<u64>,
+    ) -> std::result::Result<Vec<HermesKanbanBoardDto>, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.kanban_boards(&token).await
+        self.hermes.kanban_boards_for_bot(&token, bot_id).await
     }
 
     pub async fn hermes_kanban_create_board(
         &self,
         req: &HermesCreateKanbanBoardRequest,
     ) -> std::result::Result<HermesKanbanBoardDto, HttpClientError> {
+        self.hermes_kanban_create_board_for_bot(None, req).await
+    }
+
+    pub async fn hermes_kanban_create_board_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        req: &HermesCreateKanbanBoardRequest,
+    ) -> std::result::Result<HermesKanbanBoardDto, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.kanban_create_board(&token, req).await
+        self.hermes.kanban_create_board_for_bot(&token, bot_id, req).await
     }
 
     pub async fn hermes_kanban_create_card(
         &self,
         req: &HermesCreateKanbanCardRequest,
     ) -> std::result::Result<HermesKanbanCardDto, HttpClientError> {
+        self.hermes_kanban_create_card_for_bot(None, req).await
+    }
+
+    pub async fn hermes_kanban_create_card_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        req: &HermesCreateKanbanCardRequest,
+    ) -> std::result::Result<HermesKanbanCardDto, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.kanban_create_card(&token, req).await
+        self.hermes.kanban_create_card_for_bot(&token, bot_id, req).await
     }
 
     pub async fn hermes_kanban_move_card(
@@ -829,15 +927,40 @@ impl TelegramClient {
         card_id: &str,
         req: &HermesMoveKanbanCardRequest,
     ) -> std::result::Result<HermesKanbanCardDto, HttpClientError> {
+        self.hermes_kanban_move_card_for_bot(None, card_id, req).await
+    }
+
+    pub async fn hermes_kanban_move_card_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        card_id: &str,
+        req: &HermesMoveKanbanCardRequest,
+    ) -> std::result::Result<HermesKanbanCardDto, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.kanban_move_card(&token, card_id, req).await
+        self.hermes.kanban_move_card_for_bot(&token, bot_id, card_id, req).await
+    }
+
+    pub async fn hermes_kanban_delete_card_for_bot(
+        &self,
+        bot_id: Option<u64>,
+        card_id: &str,
+    ) -> std::result::Result<(), HttpClientError> {
+        let token = self.require_token()?;
+        self.hermes.kanban_delete_card_for_bot(&token, bot_id, card_id).await
     }
 
     pub async fn hermes_usage_stats(
         &self,
     ) -> std::result::Result<HermesUsageSummaryDto, HttpClientError> {
+        self.hermes_usage_stats_for_bot(None).await
+    }
+
+    pub async fn hermes_usage_stats_for_bot(
+        &self,
+        bot_id: Option<u64>,
+    ) -> std::result::Result<HermesUsageSummaryDto, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.usage_stats(&token).await
+        self.hermes.usage_stats_for_bot(&token, bot_id).await
     }
 
     pub async fn hermes_list_providers(
@@ -866,8 +989,15 @@ impl TelegramClient {
     pub async fn hermes_terminal_processes(
         &self,
     ) -> std::result::Result<Vec<HermesTerminalProcessDto>, HttpClientError> {
+        self.hermes_terminal_processes_for_bot(None).await
+    }
+
+    pub async fn hermes_terminal_processes_for_bot(
+        &self,
+        bot_id: Option<u64>,
+    ) -> std::result::Result<Vec<HermesTerminalProcessDto>, HttpClientError> {
         let token = self.require_token()?;
-        self.hermes.terminal_processes(&token).await
+        self.hermes.terminal_processes_for_bot(&token, bot_id).await
     }
 
     pub async fn hermes_chat_completions(

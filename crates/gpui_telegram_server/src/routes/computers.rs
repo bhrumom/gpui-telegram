@@ -2809,7 +2809,9 @@ pub async fn bot_computer_put(
         if let Some(p) = persona_opt {
             let _ = state.db.sync_bot_ai_persona(bot_id, p, now_ms);
             let bot_key = bot_id.to_string();
-            if let Ok(Some(_existing_soul)) = state.hermes.store().kv_get("bot_soul", &bot_key) {
+            if let Ok(Some(_existing_soul)) =
+                state.fabushi_core().store().kv_get("bot_soul", &bot_key)
+            {
                 let soul_payload = json!({
                     "bot_id": bot_id,
                     "system_prompt": p,
@@ -2817,7 +2819,7 @@ pub async fn bot_computer_put(
                     "updated_at_ms": now_ms,
                 });
                 if let Ok(raw) = serde_json::to_string(&soul_payload) {
-                    let _ = state.hermes.store().kv_set("bot_soul", &bot_key, &raw);
+                    let _ = state.fabushi_core().store().kv_set("bot_soul", &bot_key, &raw);
                 }
             }
         }

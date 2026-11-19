@@ -29,7 +29,7 @@ use crate::views::app_shell::{
     build_account_record, compute_shell_palette,
     local_subscription_bridge::ShellMagpieLocalState,
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
-    ShellPanelState,
+    ShellBotBrowserState, ShellPanelState,
 };
 use crate::views::nav_rail::NavDestination;
 use crate::views::settings::{
@@ -112,6 +112,7 @@ pub struct AppShell {
     pub overlays: ShellOverlayState,
     pub computers: ShellComputersState,
     pub magpie_local: ShellMagpieLocalState,
+    pub bot_browser: ShellBotBrowserState,
     pub theme_state: ShellThemeVisualState,
 }
 
@@ -218,6 +219,7 @@ impl AppShell {
             overlays: ShellOverlayState::new(),
             computers: ShellComputersState::new(),
             magpie_local: ShellMagpieLocalState::new(),
+            bot_browser: ShellBotBrowserState::new(),
             theme_state: init_theme_state,
         };
 
@@ -360,6 +362,7 @@ impl AppShell {
         self.overlays.clear_overlays();
         self.miniapps.reset();
         self.computers.reset_on_logout();
+        self.bot_browser.reset_on_logout();
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
 

@@ -174,11 +174,27 @@ pub struct PrestartBotTarget {
     pub is_viewer_owner_fabushi: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct FloatingPipStatus {
+    pub bot_username: String,
+    pub short_name: String,
+    pub chat_id: i64,
+    pub bot_user_id: u64,
+    pub app_title: String,
+    pub mode: gpui_telegram_proto::miniapp_contracts::MiniAppControlMode,
+    pub status_text: String,
+    pub active_tool: Option<String>,
+}
+
 /// Active Mini App WebView sheets, NL bot creator modal, and catalog/bot registry caches.
 #[derive(Default)]
 pub struct ShellMiniAppState {
     pub miniapp_overlay: Option<Entity<BotAttachWebView>>,
     pub is_miniapp_minimized: bool,
+    pub floating_pip_status: Option<FloatingPipStatus>,
+    pub pending_webmcp_commands: std::collections::VecDeque<
+        gpui_telegram_proto::miniapp_contracts::MiniAppWebMcpCommand,
+    >,
     pub create_bot_box: Option<Entity<CreateManagedBotBoxPeers>>,
     pub bot_profile_box: Option<Entity<BotProfileBox>>,
     pub catalog_miniapps: Vec<MiniAppEntry>,

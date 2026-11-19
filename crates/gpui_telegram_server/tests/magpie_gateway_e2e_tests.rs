@@ -84,7 +84,8 @@ fn boot_test_server() -> (TempDir, Arc<AppState>, Router) {
 }
 
 fn isolate_empty_providers(state: &AppState, empty_home: &std::path::Path) {
-    let providers = state.hermes.providers();
+    let core = state.fabushi_core();
+    let providers = core.providers();
     for p in providers.list_providers() {
         if p.id != "local_hermes" {
             providers.remove_provider(&p.id);
@@ -92,7 +93,7 @@ fn isolate_empty_providers(state: &AppState, empty_home: &std::path::Path) {
     }
     providers.refresh_local_subscriptions_in_home(empty_home, Some(empty_home));
     providers.set_allow_local_fallback(false);
-    state.hermes.persist_providers_state();
+    core.persist_providers_state();
     state.fabushi_bots.sync_all_providers();
 }
 
@@ -1016,10 +1017,10 @@ async fn test_e2e_magpie_subscriptions_list_and_activate_endpoints() {
     // Discover in user's isolated router
     let uid_str = uid.to_string();
     state
-        .hermes
+        .fabushi_core()
         .providers_for_user(&uid_str)
         .refresh_discovered_subscriptions_in_home(home, Some(&codex_dir));
-    state.hermes.persist_user_providers_state(&uid_str);
+    state.fabushi_core().persist_user_providers_state(&uid_str);
 
     // 2. GET /api/v1/hermes/magpie/subscriptions
     let (st_get, get_val) = http_json(
@@ -1389,14 +1390,14 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
     assert_eq!(active_provider, "google_vertex:desktop-user@vertex.example");
     assert!(
         !state
-            .hermes
+            .fabushi_core()
             .providers()
             .snapshot()
             .providers
             .contains_key(active_provider),
         "user-synced credentials must NEVER leak into the global shared ProviderRouter"
     );
-    let user_provs = state.hermes.providers_for_user(&uid.to_string());
+    let user_provs = state.fabushi_core().providers_for_user(&uid.to_string());
     let snap = user_provs.snapshot();
     let v_cfg = snap
         .providers
@@ -1625,7 +1626,7 @@ async fn test_e2e_per_user_provider_isolation_encrypted_restart_and_cross_device
 
         // Verify persisted vault entry in SQLite is encrypted (no plaintext API key!)
         let raw_vault = state
-            .hermes
+            .fabushi_core()
             .store()
             .kv_get("user_providers_state", &alice_uid.to_string())
             .expect("kv_get")

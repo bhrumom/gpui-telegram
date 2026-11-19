@@ -214,6 +214,30 @@ pub fn render_dialog_row_item<V: 'static>(
             } else {
                 render_classic_circle()
             }
+        } else if meta.is_bot {
+            const DEFAULT_BOT_SHAPES: [&str; 6] = [
+                "circle", "squircle", "hexagon", "shield", "cloud", "diamond",
+            ];
+            const DEFAULT_BOT_COLORS: [&str; 6] = [
+                "blue", "cyan", "purple", "emerald", "amber", "rose",
+            ];
+            let idx = (item.id as usize) % DEFAULT_BOT_SHAPES.len();
+            render_grok_bot_avatar(
+                GrokBotAvatarProps::new(
+                    &format!("bot-{}", item.id),
+                    DEFAULT_BOT_SHAPES[idx],
+                    DEFAULT_BOT_COLORS[idx],
+                    avatar_size_px,
+                )
+                .with_state(if item.typing_indicator.is_some() {
+                    GrokPersonaState::Thinking
+                } else {
+                    GrokPersonaState::Idle
+                })
+                .with_follow_pointer(true)
+                .with_paused(false)
+                .with_surface_bg(row_bg_hex),
+            )
         } else {
             render_classic_circle()
         }

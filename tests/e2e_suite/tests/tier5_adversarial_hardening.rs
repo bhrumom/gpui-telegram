@@ -351,10 +351,10 @@ async fn test_tier5_hermes_platform_im_permission_boundaries_and_schema() {
         }).unwrap();
     }
 
-    let ctx_alice = state.hermes.build_tool_context_with_user("sess_alice", None, None, Some(&alice.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
-    let ctx_bob = state.hermes.build_tool_context_with_user("sess_bob", None, None, Some(&bob.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
-    let ctx_eve = state.hermes.build_tool_context_with_user("sess_eve", None, None, Some(&eve.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
-    let ctx_unauth = state.hermes.build_tool_context_with_user("sess_anon", None, None, None, 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
+    let ctx_alice = state.fabushi_core().build_tool_context_with_user("sess_alice", None, None, Some(&alice.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
+    let ctx_bob = state.fabushi_core().build_tool_context_with_user("sess_bob", None, None, Some(&bob.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
+    let ctx_eve = state.fabushi_core().build_tool_context_with_user("sess_eve", None, None, Some(&eve.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
+    let ctx_unauth = state.fabushi_core().build_tool_context_with_user("sess_anon", None, None, None, 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
 
     let r_chat = HermesToolExecutor::execute("create_channel", json!({ "title": "Alice Ops", "chat_type": "supergroup", "is_forum": true, "member_ids": [bob.user_id.0] }), &ctx_alice).await;
     assert!(r_chat.success);
@@ -403,7 +403,7 @@ async fn test_tier5_hermes_platform_im_permission_boundaries_and_schema() {
     }
 
     // Disabled toolset enforcement
-    let ctx_minimal = state.hermes.build_tool_context_with_user("sess_min", None, None, Some(&alice.user_id.0.to_string()), 1, Some(ToolsetPreset::Minimal), 0, Arc::new(AtomicBool::new(false)));
+    let ctx_minimal = state.fabushi_core().build_tool_context_with_user("sess_min", None, None, Some(&alice.user_id.0.to_string()), 1, Some(ToolsetPreset::Minimal), 0, Arc::new(AtomicBool::new(false)));
     assert!(!HermesToolExecutor::execute("send_message", json!({ "chat_id": chat_id, "text": "no" }), &ctx_minimal).await.success);
 
     // C2-03: ApprovalMode::Deny blocks High-risk PlatformIm tools
@@ -417,7 +417,7 @@ async fn test_tier5_hermes_platform_im_permission_boundaries_and_schema() {
     let chat_id_2 = serde_json::from_str::<Value>(&r_chat2.output).unwrap()["chat_id"].as_i64().unwrap();
     assert!(HermesToolExecutor::execute("send_message", json!({ "chat_id": chat_id_2, "text": "nuclear_launch_code_xyz" }), &ctx_alice).await.success);
 
-    let ctx_pinned_c1 = state.hermes.build_tool_context_with_user("sess_pinned_c1", Some(chat_id), None, Some(&alice.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
+    let ctx_pinned_c1 = state.fabushi_core().build_tool_context_with_user("sess_pinned_c1", Some(chat_id), None, Some(&alice.user_id.0.to_string()), 1, Some(ToolsetPreset::Full), 0, Arc::new(AtomicBool::new(false)));
     for (tool, cross_args) in [
         ("send_message", json!({ "chat_id": chat_id_2, "text": "exfil" })),
         ("search_messages", json!({ "chat_id": chat_id_2, "query": "nuclear_launch_code_xyz" })),
@@ -452,7 +452,7 @@ async fn test_tier5_hermes_platform_im_permission_boundaries_and_schema() {
     assert!(vote_cross_omitted.error.as_deref().unwrap_or("").contains("Cross-chat target mismatch"));
     let vote_bad_schema = HermesToolExecutor::execute("vote_poll", json!({ "chat_id": "bad_str", "poll_id": poll_c2, "option_index": 0 }), &ctx_pinned_c1).await;
     assert!(!vote_bad_schema.success);
-    let bridge = state.hermes.platform_im_bridge().unwrap();
+    let bridge = state.fabushi_core().platform_im_bridge().unwrap();
     let bridge_vote_err = bridge
         .execute_im_tool(
             "vote_poll",
@@ -972,7 +972,7 @@ async fn test_tier5_hermes_acp_command_openai_and_sibling_isolation() {
     let alice_turn_json: Value = serde_json::from_slice(&to_bytes(alice_turn_res.into_body(), usize::MAX).await.unwrap()).unwrap();
     let alice_turn_id = alice_turn_json["turn_id"].as_str().unwrap().to_string();
 
-    state.hermes.store().enqueue_approval(CreateApprovalRequest {
+    state.fabushi_core().store().enqueue_approval(CreateApprovalRequest {
         id: Some("apr_alice".into()),
         session_id: "alice_priv_sess".into(),
         command: "rm -rf /tmp/alice_secret_path".into(),
@@ -1070,8 +1070,8 @@ async fn test_tier5_hermes_acp_command_openai_and_sibling_isolation() {
         ).await.unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "Expected 403 on /command {cmd}");
     }
-    assert_eq!(state.hermes.security().read().unwrap().approvals.get_session_mode("alice_priv_sess"), ApprovalMode::Prompt);
-    assert!(!state.hermes.store().get_messages("alice_priv_sess", None).unwrap().is_empty());
+    assert_eq!(state.fabushi_core().security().read().unwrap().approvals.get_session_mode("alice_priv_sess"), ApprovalMode::Prompt);
+    assert!(!state.fabushi_core().store().get_messages("alice_priv_sess", None).unwrap().is_empty());
 
     for global_cmd in ["/sessions", "/search private secret"] {
         let r = app.clone().oneshot(
@@ -1102,7 +1102,7 @@ async fn test_tier5_hermes_acp_command_openai_and_sibling_isolation() {
             .body(Body::from(json!({"session_id":"alice_priv_sess","messages":[{"role":"user","content":"BOB_HIJACK_MARKER"}]}).to_string())).unwrap()
     ).await.unwrap();
     assert_eq!(oai_idor.status(), StatusCode::FORBIDDEN);
-    let alice_msgs = state.hermes.store().get_messages("alice_priv_sess", None).unwrap();
+    let alice_msgs = state.fabushi_core().store().get_messages("alice_priv_sess", None).unwrap();
     assert!(!alice_msgs.iter().any(|m| m.content.contains("BOB_HIJACK_MARKER")));
 
     // 4. Sibling endpoints isolation
@@ -2638,7 +2638,7 @@ async fn test_tier5_wave5_wave6_bot_computer_miniapp_talk_and_isolation() {
     let expected_hermes_sid = format!("hermes_{alice_talk_sid}");
     assert!(
         state
-            .hermes
+            .fabushi_core()
             .store()
             .get_session(&expected_hermes_sid)
             .unwrap()
@@ -3128,7 +3128,7 @@ async fn test_tier5_wave5_wave6_bot_computer_miniapp_talk_and_isolation() {
         .unwrap();
 
     state
-        .hermes
+        .fabushi_core()
         .memory()
         .add(MemoryTarget::Memory, "STD_BOT_HOST_SECRET")
         .unwrap();
@@ -3635,7 +3635,7 @@ async fn test_tier5_wave5_wave6_bot_computer_miniapp_talk_and_isolation() {
     }
     assert_eq!(
         state
-            .hermes
+            .fabushi_core()
             .store()
             .get_cron_job(&shared_cron_id)
             .unwrap()
@@ -4109,7 +4109,7 @@ async fn test_tier5_wave8_official_bot_install_and_talk_isolation() {
             );
             assert!(
                 state
-                    .hermes
+                    .fabushi_core()
                     .store()
                     .get_session(&format!("hermes_{rsid}"))
                     .unwrap()
@@ -4321,7 +4321,7 @@ async fn test_tier5_wave8_official_bot_install_and_talk_isolation() {
     assert_eq!(adm_c2_turn.status(), StatusCode::OK);
 
     let dave_hermes_rec = state
-        .hermes
+        .fabushi_core()
         .store()
         .get_session(&format!("hermes_{dave_sid}"))
         .unwrap()

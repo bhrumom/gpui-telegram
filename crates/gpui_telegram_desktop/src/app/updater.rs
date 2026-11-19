@@ -741,20 +741,9 @@ fn valid_http_base_url(server_url: Option<&str>) -> Option<String> {
 
 fn resolve_download_candidates(
     info: &AvailableUpdateInfo,
-    opts: &UpdaterNetworkOptions,
+    _opts: &UpdaterNetworkOptions,
 ) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let (Some(base), Some((tag, filename))) = (
-        valid_http_base_url(opts.server_url.as_deref()),
-        extract_github_release_coords(&info.asset_url, opts.release_download_base_override.as_deref()),
-    ) {
-        candidates.push(format!("{base}/api/v1/updates/assets/{tag}/{filename}"));
-    }
-    let primary = info.asset_url.trim().to_string();
-    if !candidates.iter().any(|c| c == &primary) {
-        candidates.push(primary);
-    }
-    candidates
+    vec![info.asset_url.trim().to_string()]
 }
 
 fn parse_content_range(header_val: &str) -> Option<(u64, u64, Option<u64>)> {
@@ -1067,68 +1056,48 @@ impl DesktopUpdater {
                 parse_any_release_payload(&body)?
             }
         } else {
-            let mut relay_info: Option<AvailableUpdateInfo> = None;
-            if let Some(base) = valid_http_base_url(opts.server_url.as_deref()) {
-                let relay_url = format!("{base}/api/v1/updates/latest-mac.json");
-                if let Ok(resp) =
-                    send_metadata_get(&relay_url, None, opts, Duration::from_secs(8)).await
-                {
-                    if resp.status().is_success() {
-                        if let Ok(body) = resp.text().await {
-                            if let Ok(parsed) = parse_release_manifest(&body) {
-                                relay_info = Some(parsed);
-                            }
-                        }
-                    }
+            let manifest_attempt = async {
+                let resp = send_metadata_get(
+                    DEFAULT_MANIFEST_URL,
+                    None,
+                    opts,
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| format!("Manifest check failed: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Manifest returned HTTP {}", resp.status()));
                 }
+                let body = resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("Failed reading manifest body: {e}"))?;
+                parse_release_manifest(&body)
             }
+            .await;
 
-            if let Some(info) = relay_info {
-                info
-            } else {
-                let manifest_attempt = async {
+            match manifest_attempt {
+                Ok(info) => info,
+                Err(_) => {
                     let resp = send_metadata_get(
-                        DEFAULT_MANIFEST_URL,
-                        None,
+                        DEFAULT_GITHUB_LATEST_API_URL,
+                        Some("application/vnd.github+json"),
                         opts,
                         Duration::from_secs(30),
                     )
                     .await
-                    .map_err(|e| format!("Manifest check failed: {e}"))?;
+                    .map_err(|e| format!("GitHub release check failed: {e}"))?;
                     if !resp.status().is_success() {
-                        return Err(format!("Manifest returned HTTP {}", resp.status()));
+                        return Err(format!(
+                            "GitHub releases API returned HTTP {}",
+                            resp.status()
+                        ));
                     }
                     let body = resp
                         .text()
                         .await
-                        .map_err(|e| format!("Failed reading manifest body: {e}"))?;
-                    parse_release_manifest(&body)
-                }
-                .await;
-
-                match manifest_attempt {
-                    Ok(info) => info,
-                    Err(_) => {
-                        let resp = send_metadata_get(
-                            DEFAULT_GITHUB_LATEST_API_URL,
-                            Some("application/vnd.github+json"),
-                            opts,
-                            Duration::from_secs(30),
-                        )
-                        .await
-                        .map_err(|e| format!("GitHub release check failed: {e}"))?;
-                        if !resp.status().is_success() {
-                            return Err(format!(
-                                "GitHub releases API returned HTTP {}",
-                                resp.status()
-                            ));
-                        }
-                        let body = resp
-                            .text()
-                            .await
-                            .map_err(|e| format!("Failed reading GitHub release response: {e}"))?;
-                        parse_github_release_json(&body)?
-                    }
+                        .map_err(|e| format!("Failed reading GitHub release response: {e}"))?;
+                    parse_github_release_json(&body)?
                 }
             }
         };

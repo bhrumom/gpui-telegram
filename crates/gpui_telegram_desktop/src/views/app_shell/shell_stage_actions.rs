@@ -500,6 +500,7 @@ impl AppShell {
                             st.is_muted_chat = rc.is_muted;
                             st.is_pinned_chat = rc.is_pinned;
                             st.is_peer_blocked = rc.is_blocked;
+                            st.is_bot_chat = rc.is_bot;
                             st.is_group_chat = rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3);
                             st.is_saved_messages = rc.chat_type == 5
                                 || rc.kind.as_deref() == Some("saved")
@@ -835,7 +836,7 @@ impl AppShell {
                                     resp.output
                                 }
                             }),
-                        Err(e) => format!("Hermes command failed: {}", e),
+                        Err(e) => format!("Fabushi command failed: {}", e),
                     }
                 };
                 let _ = weak.update(app, |shell, cx| {
@@ -1107,6 +1108,12 @@ impl AppShell {
                 || active_chat.and_then(|cid| self.session_sync.rich_chats_by_id.get(&cid)).is_some_and(|rc| rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3));
             let header = if is_group { tr_str(lang, "退出群组", "Leave Group") } else { tr_str(lang, "删除对话", "Delete Chat") };
             self.open_modal_dialog(header, ModalDialogKind::LeaveOrDeleteChat { peer_name, is_group }, 390.0, 230.0, cx);
+        }
+        let bot_assist_act = self
+            .stage
+            .update(cx, |st, _| st.pending_bot_assist_action.take());
+        if let Some(act) = bot_assist_act {
+            self.handle_bot_assist_card_action(act, cx);
         }
         if let Some(act) = bot_act {
             self.execute_hermes_inline_callback(act, cx);

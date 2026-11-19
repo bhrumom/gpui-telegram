@@ -126,6 +126,36 @@ impl AppShell {
                         shell.refresh_miniapps_catalog(None, cx);
                     }
                     cx.notify();
+                } else if let Err(err) = res {
+                    // Roll back the optimistic local dialog so non-existent/unverified contacts never appear as fake data.
+                    shell.sidebar.update(cx, |sb, sb_cx| {
+                        sb.dialogs.retain(|d| d.id != local_dialog_id);
+                        sb.bot_ids.remove(&local_dialog_id);
+                        sb.bot_grok_avatars.remove(&local_dialog_id);
+                        sb.bot_fabushi_visuals.remove(&local_dialog_id);
+                        if sb.active_chat_id == Some(local_dialog_id) {
+                            sb.active_chat_id = sb.dialogs.first().map(|d| d.id);
+                            sb.selection_revision = sb.selection_revision.wrapping_add(1);
+                        }
+                        sb_cx.notify();
+                    });
+                    let lang = shell.active_lang_id();
+                    let msg = if !is_bot {
+                        tr_str(
+                            lang,
+                            "未找到该注册用户，请核对对方的用户名或手机号",
+                            "User not found. Please check the username or phone number.",
+                        )
+                        .to_string()
+                    } else {
+                        format!(
+                            "{}: {}",
+                            tr_str(lang, "添加联系人失败", "Failed to add contact"),
+                            err
+                        )
+                    };
+                    shell.window_runtime.enqueue_toast(msg, 3200);
+                    cx.notify();
                 }
             });
         })

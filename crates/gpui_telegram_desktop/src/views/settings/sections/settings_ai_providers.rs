@@ -1547,7 +1547,7 @@ impl SettingsAiProvidersSections {
                     })
                     .child(settings_toggle_row(
                         IconName::BotRobot,
-                        tr_str(lang, "无供应商时允许本地回退 (hermes-local)", "Allow local hermes fallback when unconfigured"),
+                        tr_str(lang, "无供应商时允许本地回退 (fabushi-local)", "Allow local Fabushi fallback when unconfigured"),
                         None,
                         self.draft_allow_local_fallback,
                         pal,

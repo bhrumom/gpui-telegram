@@ -453,26 +453,36 @@ impl ChatSidebar {
             SidebarCreationModal::AddContact => {
                 let is_bot = self.contact_kind == AddContactKind::AiBot;
                 let lang = self.language_id.as_str();
+                let raw_secondary = self.creation_secondary_input.trim().trim_start_matches('@');
+                let tertiary = non_empty_trimmed(&self.creation_tertiary_input);
+
+                // For human friends, require a real username or phone number — never fabricate `@friend_user`.
+                if !is_bot && raw_secondary.is_empty() && tertiary.is_none() {
+                    return None;
+                }
+
                 let name = non_empty_trimmed(&self.creation_primary_input).unwrap_or_else(|| {
                     if is_bot {
                         tr_str(lang, "智能助手", "AI Assistant").to_string()
+                    } else if !raw_secondary.is_empty() {
+                        raw_secondary.to_string()
                     } else {
-                        tr_str(lang, "新联系人", "New Contact").to_string()
+                        tertiary.clone().unwrap_or_else(|| tr_str(lang, "新联系人", "New Contact").to_string())
                     }
                 });
 
-                let handle = {
-                    let raw = self.creation_secondary_input.trim().trim_start_matches('@');
-                    if raw.is_empty() {
-                        if is_bot { "custom_ai_bot" } else { "friend_user" }.to_string()
-                    } else if is_bot && !raw.ends_with("bot") {
-                        format!("{}_bot", raw)
+                let handle = if is_bot {
+                    if raw_secondary.is_empty() {
+                        "custom_ai_bot".to_string()
+                    } else if !raw_secondary.ends_with("bot") {
+                        format!("{}_bot", raw_secondary)
                     } else {
-                        raw.to_string()
+                        raw_secondary.to_string()
                     }
+                } else {
+                    raw_secondary.to_string()
                 };
 
-                let tertiary = non_empty_trimmed(&self.creation_tertiary_input);
                 let (av_shape, av_color) = if is_bot {
                     if self.creation_use_dynamic_avatar {
                         (
@@ -511,13 +521,18 @@ impl ChatSidebar {
                         "Bots".to_string(),
                     )
                 } else {
+                    let target_label = if !handle.is_empty() {
+                        format!("@{}", handle)
+                    } else {
+                        tertiary.clone().unwrap_or_else(|| name.clone())
+                    };
                     (
                         initials_or_fallback(&name, "FR"),
                         0x2AABEE,
                         if lang.eq_ignore_ascii_case("en") {
-                            format!("Added @{} to contacts", handle)
+                            format!("Verifying {}...", target_label)
                         } else {
-                            format!("已添加好友 @{}，开始聊天吧", handle)
+                            format!("正在验证 {}...", target_label)
                         },
                         "Personal".to_string(),
                     )
@@ -558,7 +573,7 @@ impl ChatSidebar {
                     local_dialog_id: local_id,
                     first_name: name,
                     last_name: None,
-                    username: Some(handle),
+                    username: if handle.is_empty() { None } else { Some(handle) },
                     phone: if is_bot { None } else { tertiary.clone() },
                     is_bot,
                     system_prompt: if is_bot { tertiary } else { None },

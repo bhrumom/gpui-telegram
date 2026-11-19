@@ -2,7 +2,9 @@
 
 use gpui::*;
 use gpui::prelude::FluentBuilder;
-use gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto;
+use gpui_telegram_proto::miniapp_contracts::{
+    resolve_grok_persona_color, resolve_grok_persona_shape, FabushiBotSummaryDto,
+};
 
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, GrokBotAvatarProps, GrokPersonaState,
@@ -60,6 +62,8 @@ pub fn render_stage_top_bar<V: 'static>(
     initials: &str,
     avatar_url: Option<&str>,
     active_fabushi_bot: Option<&FabushiBotSummaryDto>,
+    is_bot_chat: bool,
+    bot_activity_state: &str,
     select_mode_active: bool,
     selected_count: usize,
     message_ttl_seconds: u32,
@@ -230,7 +234,62 @@ pub fn render_stage_top_bar<V: 'static>(
                 })
                 .when(has_chat, |el| {
                     let avatar_size_px = palette.scaled_px(40.0);
-                    let avatar_el: AnyElement = if let Some(src) = img_src {
+                    let sub_lower = subtitle.to_ascii_lowercase();
+                    let is_typing = sub_lower.contains("typing")
+                        || subtitle.contains("输入")
+                        || subtitle.contains("思考")
+                        || (!bot_activity_state.trim().is_empty()
+                            && !bot_activity_state.eq_ignore_ascii_case("idle"));
+                    let fab_non_classic = active_fabushi_bot
+                        .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"));
+                    let show_dynamic_bot_avatar =
+                        fab_non_classic.is_some() || (is_bot_chat && (img_src.is_none() || is_typing));
+
+                    let avatar_el: AnyElement = if show_dynamic_bot_avatar {
+                        if let Some(fab) = fab_non_classic {
+                            let effective_state = if !bot_activity_state.trim().is_empty()
+                                && !bot_activity_state.eq_ignore_ascii_case("idle")
+                            {
+                                bot_activity_state
+                            } else {
+                                fab.execution_state.as_str()
+                            };
+                            render_grok_bot_avatar(
+                                GrokBotAvatarProps::new(
+                                    &fab.agent_id,
+                                    &fab.avatar_shape,
+                                    &fab.avatar_color,
+                                    avatar_size_px,
+                                )
+                                .with_state(GrokPersonaState::from_activity_str(
+                                    effective_state,
+                                    is_typing,
+                                ))
+                                .with_follow_pointer(true)
+                                .with_surface_bg(palette.topbar_bg),
+                            )
+                            .into_any_element()
+                        } else {
+                            let seed = format!("bot_{}_{}", chat_id.unwrap_or(0), title);
+                            let shape = resolve_grok_persona_shape(&seed, None);
+                            let color = resolve_grok_persona_color(&seed, None);
+                            let effective_state = if bot_activity_state.trim().is_empty() {
+                                "idle"
+                            } else {
+                                bot_activity_state
+                            };
+                            render_grok_bot_avatar(
+                                GrokBotAvatarProps::new(&seed, &shape, &color, avatar_size_px)
+                                    .with_state(GrokPersonaState::from_activity_str(
+                                        effective_state,
+                                        is_typing,
+                                    ))
+                                    .with_follow_pointer(true)
+                                    .with_surface_bg(palette.topbar_bg),
+                            )
+                            .into_any_element()
+                        }
+                    } else if let Some(src) = img_src {
                         div()
                             .w(px(avatar_size_px))
                             .h(px(avatar_size_px))
@@ -242,28 +301,6 @@ pub fn render_stage_top_bar<V: 'static>(
                             .justify_center()
                             .child(img(src).size_full().object_fit(ObjectFit::Cover))
                             .into_any_element()
-                    } else if let Some(fab) = active_fabushi_bot
-                        .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"))
-                    {
-                        let sub_lower = subtitle.to_ascii_lowercase();
-                        let is_typing = sub_lower.contains("typing")
-                            || subtitle.contains("输入")
-                            || subtitle.contains("思考");
-                        render_grok_bot_avatar(
-                            GrokBotAvatarProps::new(
-                                &fab.agent_id,
-                                &fab.avatar_shape,
-                                &fab.avatar_color,
-                                avatar_size_px,
-                            )
-                            .with_state(GrokPersonaState::from_activity_str(
-                                &fab.execution_state,
-                                is_typing,
-                            ))
-                            .with_follow_pointer(true)
-                            .with_surface_bg(palette.topbar_bg),
-                        )
-                        .into_any_element()
                     } else {
                         div()
                             .w(px(avatar_size_px))

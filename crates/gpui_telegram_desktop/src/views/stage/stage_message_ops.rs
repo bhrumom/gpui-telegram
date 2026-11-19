@@ -8,7 +8,9 @@ use crate::views::conversation_stage::{compute_attachment, ConversationStage, MS
 use crate::views::stage::cards::*;
 use crate::views::stage::history_view_highlight_manager::ChatPaintHighlight;
 use crate::views::stage::rich_meta::MessageRichMeta;
-use crate::views::stage::stage_bubble::{render_message_row_1to1, BubbleGroupLayout};
+use crate::views::stage::stage_bubble::{
+    render_message_row_1to1, BotAssistRenderContext, BubbleGroupLayout,
+};
 use crate::views::stage::stage_context_menu::{
     should_open_selector_below, ReactionOverlayLayout, ReactionOverlayMode,
 };
@@ -125,6 +127,9 @@ impl ConversationStage {
         self.row_heights_probe.borrow_mut().clear();
         self.more_menu_open = false;
         self.toast_banner = None;
+        self.active_bot_card_field = None;
+        self.bot_assist_ime_preedit = None;
+        self.pending_bot_assist_action = None;
         self.scroll_handle.set_offset(Point::default());
         self.is_anchored_to_bottom = true;
         self.row_height_cache.measured_heights.clear();
@@ -340,17 +345,29 @@ impl ConversationStage {
             return;
         }
 
-        // Keep local sending messages (id not yet confirmed by server)
+        // Keep local sending messages (id not yet confirmed by server) and strictly local bot cards
         let sending_messages: Vec<MessageItemModel> = self
             .messages
             .iter()
-            .filter(|m| m.delivery_status == DeliveryStatus::Sending)
+            .filter(|m| !m.is_local_only() && m.delivery_status == DeliveryStatus::Sending)
+            .cloned()
+            .collect();
+        let local_only_messages: Vec<MessageItemModel> = self
+            .messages
+            .iter()
+            .filter(|m| m.is_local_only())
             .cloned()
             .collect();
 
+        let existing_remote: Vec<MessageItemModel> = self
+            .messages
+            .iter()
+            .filter(|m| !m.is_local_only())
+            .cloned()
+            .collect();
         let mut existing_ids: std::collections::HashSet<u64> =
-            self.messages.iter().map(|m| m.id).collect();
-        let mut merged = self.messages.clone();
+            existing_remote.iter().map(|m| m.id).collect();
+        let mut merged = existing_remote;
 
         for s_msg in server_messages {
             if !existing_ids.contains(&s_msg.id) {
@@ -372,6 +389,12 @@ impl ConversationStage {
         for sending in sending_messages {
             if !existing_ids.contains(&sending.id) {
                 merged.push(sending);
+            }
+        }
+        // Re-append strictly local bot-assist cards in chronological order after remote messages
+        for local_msg in local_only_messages {
+            if !merged.iter().any(|m| m.id == local_msg.id) {
+                merged.push(local_msg);
             }
         }
 
@@ -695,6 +718,7 @@ impl ConversationStage {
             if new_pinned_state {
                 snippet_opt = match &m.content {
                     MessageContent::Text { text, .. } => Some(text.lines().next().unwrap_or(text).to_string()),
+                    MessageContent::LocalBotAssistCard(_) => Some("[安全存储卡片]".to_string()),
                     _ => Some("Pinned message".to_string()),
                 };
             }
@@ -704,6 +728,7 @@ impl ConversationStage {
         } else {
             self.pinned_message = self.messages.iter().find(|m| m.is_pinned).and_then(|m| match &m.content {
                 MessageContent::Text { text, .. } => Some(text.lines().next().unwrap_or(text).to_string()),
+                MessageContent::LocalBotAssistCard(_) => Some("[安全存储卡片]".to_string()),
                 _ => Some("Pinned message".to_string()),
             });
         }
@@ -970,6 +995,12 @@ impl ConversationStage {
                 &self.revealed_spoilers,
                 &self.expanded_quotes,
                 self.copied_code_msg,
+                Some(BotAssistRenderContext {
+                    login_drafts: &self.bot_assist_login_drafts,
+                    click_drafts: &self.bot_assist_click_drafts,
+                    active_field: self.active_bot_card_field.as_ref(),
+                    ime_preedit: self.bot_assist_ime_preedit.as_deref(),
+                }),
                 &self.palette,
                 &self.lang_id,
                 window,
@@ -1038,5 +1069,392 @@ impl ConversationStage {
         let count = self.pinned_tracker.count().max(entries.map(|v| v.len()).unwrap_or(0)).max(1);
         let active_idx = self.pinned_tracker.current_index.min(count.saturating_sub(1));
         Some((snippet, sender, thumb, count, active_idx))
+    }
+
+    /// Finds a `BotAssistCardModel` by `card_id` in the active stage messages or `chat_histories`.
+    pub fn find_bot_assist_card(&self, card_id: &str) -> Option<&BotAssistCardModel> {
+        self.messages
+            .iter()
+            .chain(self.chat_histories.values().flat_map(|v| v.iter()))
+            .find_map(|m| match &m.content {
+                MessageContent::LocalBotAssistCard(card) if card.card_id() == card_id => {
+                    Some(card)
+                }
+                _ => None,
+            })
+    }
+
+    fn find_bot_assist_payload(&self, card_id: &str) -> Option<&bot_browser::AssistCardPayload> {
+        self.find_bot_assist_card(card_id).map(|c| &c.payload)
+    }
+
+    /// Returns `true` if `card_id` refers to an editable login card (`AwaitingUser` or `TimedOutResumable`).
+    pub fn is_bot_card_editable(&self, card_id: &str) -> bool {
+        self.find_bot_assist_card(card_id)
+            .is_some_and(BotAssistCardModel::is_login_editable)
+    }
+
+    /// Zeroizes and clears all ephemeral Bot Assist login and click drafts.
+    pub fn clear_all_bot_card_drafts(&mut self) {
+        for draft in self.bot_assist_login_drafts.values_mut() {
+            draft.clear_and_zeroize();
+        }
+        self.bot_assist_login_drafts.clear();
+        self.bot_assist_click_drafts.clear();
+        self.active_bot_card_field = None;
+        self.bot_assist_ime_preedit = None;
+        self.pending_bot_assist_action = None;
+    }
+
+    /// Zeroizes and removes draft state for a specific `card_id`.
+    pub fn clear_bot_card_draft(&mut self, card_id: &str) {
+        if let Some(mut draft) = self.bot_assist_login_drafts.remove(card_id) {
+            draft.clear_and_zeroize();
+        }
+        self.bot_assist_click_drafts.remove(card_id);
+        if self
+            .active_bot_card_field
+            .as_ref()
+            .is_some_and(|(cid, _)| cid == card_id)
+        {
+            self.active_bot_card_field = None;
+            self.bot_assist_ime_preedit = None;
+        }
+    }
+
+    /// Focuses a login field on an editable `VaultLogin` card.
+    pub fn focus_bot_card_field(&mut self, card_id: &str, field: BotAssistLoginField) -> bool {
+        let Some(payload) = self.find_bot_assist_payload(card_id).cloned() else {
+            return false;
+        };
+        if !matches!(
+            payload,
+            bot_browser::AssistCardPayload::VaultLogin {
+                status: bot_browser::AssistCardStatus::AwaitingUser
+                    | bot_browser::AssistCardStatus::TimedOutResumable,
+                ..
+            }
+        ) {
+            return false;
+        }
+        for (cid, draft) in &mut self.bot_assist_login_drafts {
+            if cid != card_id {
+                draft.active_field = None;
+            }
+        }
+        let draft = self
+            .bot_assist_login_drafts
+            .entry(card_id.to_string())
+            .or_insert_with(|| BotAssistLoginDraft::for_payload(&payload));
+        draft.active_field = Some(field);
+        self.active_bot_card_field = Some((card_id.to_string(), field));
+        self.bot_assist_ime_preedit = None;
+        true
+    }
+
+    /// Blurs any focused Bot Assist card input without erasing draft contents.
+    pub fn blur_bot_card_input(&mut self) {
+        self.active_bot_card_field = None;
+        self.bot_assist_ime_preedit = None;
+        for draft in self.bot_assist_login_drafts.values_mut() {
+            draft.active_field = None;
+        }
+    }
+
+    /// Returns the committed text in the currently active Bot Assist card field, if any.
+    pub fn active_bot_card_text(&self) -> &str {
+        let Some((card_id, field)) = &self.active_bot_card_field else {
+            return "";
+        };
+        self.bot_assist_login_drafts
+            .get(card_id)
+            .map(|d| d.field_text(*field))
+            .unwrap_or("")
+    }
+
+    /// Inserts committed/pasted text into the active Bot Assist card field.
+    pub fn insert_bot_card_text(&mut self, text: &str) -> bool {
+        let Some((card_id, field)) = self.active_bot_card_field.clone() else {
+            return false;
+        };
+        if !self.is_bot_card_editable(&card_id) {
+            return false;
+        }
+        if let Some(draft) = self.bot_assist_login_drafts.get_mut(&card_id) {
+            draft.active_field = Some(field);
+            return draft.insert_text(text);
+        }
+        false
+    }
+
+    /// Backspaces a character or word from the active Bot Assist card field.
+    pub fn backspace_bot_card_field(&mut self, delete_word: bool) -> bool {
+        let Some((card_id, field)) = self.active_bot_card_field.clone() else {
+            return false;
+        };
+        if !self.is_bot_card_editable(&card_id) {
+            return false;
+        }
+        if let Some(draft) = self.bot_assist_login_drafts.get_mut(&card_id) {
+            draft.active_field = Some(field);
+            return draft.backspace(delete_word);
+        }
+        false
+    }
+
+    /// Zeroizes and clears the active Bot Assist card field.
+    pub fn clear_active_bot_card_field(&mut self) -> bool {
+        let Some((card_id, field)) = self.active_bot_card_field.clone() else {
+            return false;
+        };
+        if !self.is_bot_card_editable(&card_id) {
+            return false;
+        }
+        if let Some(draft) = self.bot_assist_login_drafts.get_mut(&card_id) {
+            draft.active_field = Some(field);
+            return draft.clear_active_field();
+        }
+        false
+    }
+
+    /// Cycles focus across `Username -> Password -> TotpSecret` on the active card.
+    pub fn cycle_bot_card_field(&mut self, reverse: bool) -> Option<BotAssistLoginField> {
+        let (card_id, current_field) = self.active_bot_card_field.clone()?;
+        if !self.is_bot_card_editable(&card_id) {
+            return None;
+        }
+        let draft = self.bot_assist_login_drafts.get_mut(&card_id)?;
+        draft.active_field = Some(current_field);
+        let next = draft.cycle_field(reverse);
+        self.active_bot_card_field = Some((card_id, next));
+        self.bot_assist_ime_preedit = None;
+        Some(next)
+    }
+
+    /// Toggles `show_password` for the given card's login draft.
+    pub fn toggle_bot_card_show_password(&mut self, card_id: &str) {
+        let Some(payload) = self.find_bot_assist_payload(card_id).cloned() else {
+            return;
+        };
+        let draft = self
+            .bot_assist_login_drafts
+            .entry(card_id.to_string())
+            .or_insert_with(|| BotAssistLoginDraft::for_payload(&payload));
+        draft.show_password = !draft.show_password;
+    }
+
+    /// Toggles `allow_auto_reuse` for the given card's login draft.
+    pub fn toggle_bot_card_auto_reuse(&mut self, card_id: &str) {
+        let Some(payload) = self.find_bot_assist_payload(card_id).cloned() else {
+            return;
+        };
+        let draft = self
+            .bot_assist_login_drafts
+            .entry(card_id.to_string())
+            .or_insert_with(|| BotAssistLoginDraft::for_payload(&payload));
+        draft.allow_auto_reuse = !draft.allow_auto_reuse;
+    }
+
+    /// Takes a `LocalLoginSubmission` from `card_id`'s draft while zeroizing the in-memory draft.
+    pub fn take_bot_card_login_submission(
+        &mut self,
+        card_id: &str,
+    ) -> Result<bot_browser::LocalLoginSubmission, String> {
+        if !self.is_bot_card_editable(card_id) {
+            return Err("当前登录卡片已锁定".to_string());
+        }
+        let Some(draft) = self.bot_assist_login_drafts.get_mut(card_id) else {
+            return Err("请输入账号和密码".to_string());
+        };
+        let res = draft.take_submission(card_id);
+        if res.is_ok() {
+            self.bot_assist_login_drafts.remove(card_id);
+            if self
+                .active_bot_card_field
+                .as_ref()
+                .is_some_and(|(cid, _)| cid == card_id)
+            {
+                self.active_bot_card_field = None;
+                self.bot_assist_ime_preedit = None;
+            }
+        }
+        res
+    }
+
+    /// Inserts or updates a strictly local `MessageContent::LocalBotAssistCard` message for `chat_id`.
+    pub fn upsert_bot_assist_card(
+        &mut self,
+        chat_id: u64,
+        local_msg_id: u64,
+        payload: bot_browser::AssistCardPayload,
+        timestamp: String,
+    ) {
+        let card_id = payload.card_id().to_string();
+        if matches!(
+            payload,
+            bot_browser::AssistCardPayload::VaultLogin {
+                status: bot_browser::AssistCardStatus::AwaitingUser
+                    | bot_browser::AssistCardStatus::TimedOutResumable,
+                ..
+            }
+        ) {
+            self.bot_assist_login_drafts
+                .entry(card_id.clone())
+                .or_insert_with(|| BotAssistLoginDraft::for_payload(&payload));
+        }
+        if matches!(
+            payload,
+            bot_browser::AssistCardPayload::ClickCaptcha {
+                status: bot_browser::AssistCardStatus::AwaitingUser
+                    | bot_browser::AssistCardStatus::TimedOutResumable,
+                ..
+            }
+        ) {
+            self.bot_assist_click_drafts
+                .entry(card_id.clone())
+                .or_default();
+        }
+
+        let model = MessageItemModel {
+            id: local_msg_id,
+            sender_id: 0,
+            sender_name: "安全助手".to_string(),
+            avatar_initials: "🔒".to_string(),
+            avatar_color: 0x1E293B,
+            direction: MessageDirection::Incoming,
+            timestamp,
+            delivery_status: DeliveryStatus::Read,
+            reply_to: None,
+            reactions: Vec::new(),
+            content: MessageContent::LocalBotAssistCard(BotAssistCardModel::new(payload)),
+            bot_keyboard: None,
+            is_pinned: false,
+        };
+
+        let upsert_in = |list: &mut Vec<MessageItemModel>| {
+            if let Some(existing) = list.iter_mut().find(|m| {
+                m.id == local_msg_id
+                    || matches!(
+                        &m.content,
+                        MessageContent::LocalBotAssistCard(c) if c.card_id() == card_id
+                    )
+            }) {
+                existing.content = model.content.clone();
+            } else {
+                list.push(model.clone());
+            }
+        };
+
+        let hist = self.chat_histories.entry(chat_id).or_default();
+        upsert_in(hist);
+
+        if self.active_chat_id == Some(chat_id) {
+            let was_at_bottom = self.is_at_bottom();
+            upsert_in(&mut self.messages);
+            self.row_heights_probe.borrow_mut().remove(&local_msg_id);
+            self.row_height_cache.measured_heights.remove(&local_msg_id);
+            self.row_height_cache.mark_dirty();
+            if was_at_bottom {
+                self.scroll_to_bottom();
+            }
+        }
+    }
+
+    /// Updates status/metadata on an existing `LocalBotAssistCard` and zeroizes drafts on terminal state.
+    pub fn update_bot_assist_card_status(
+        &mut self,
+        chat_id: Option<u64>,
+        card_id: &str,
+        status: bot_browser::AssistCardStatus,
+        status_note: Option<String>,
+        saved_credential_id: Option<String>,
+        saved_account_hint: Option<String>,
+        redirected_url: Option<String>,
+    ) -> bool {
+        let mut updated = false;
+        let mut matched_msg_id = None;
+        let apply_list = |list: &mut Vec<MessageItemModel>,
+                          updated_flag: &mut bool,
+                          msg_id_out: &mut Option<u64>| {
+            for m in list.iter_mut() {
+                if let MessageContent::LocalBotAssistCard(ref mut card) = m.content {
+                    if card.card_id() == card_id {
+                        card.apply_status_update(
+                            status,
+                            status_note.clone(),
+                            saved_credential_id.clone(),
+                            saved_account_hint.clone(),
+                            redirected_url.clone(),
+                        );
+                        *updated_flag = true;
+                        *msg_id_out = Some(m.id);
+                    }
+                }
+            }
+        };
+
+        apply_list(&mut self.messages, &mut updated, &mut matched_msg_id);
+        if let Some(cid) = chat_id {
+            if let Some(hist) = self.chat_histories.get_mut(&cid) {
+                apply_list(hist, &mut updated, &mut matched_msg_id);
+            }
+        } else {
+            for hist in self.chat_histories.values_mut() {
+                apply_list(hist, &mut updated, &mut matched_msg_id);
+            }
+        }
+
+        if matches!(
+            status,
+            bot_browser::AssistCardStatus::SavedAndLoggedIn
+                | bot_browser::AssistCardStatus::Completed
+                | bot_browser::AssistCardStatus::Denied
+                | bot_browser::AssistCardStatus::Expired
+                | bot_browser::AssistCardStatus::Cancelled
+        ) {
+            self.clear_bot_card_draft(card_id);
+        }
+        if updated {
+            if let Some(mid) = matched_msg_id {
+                self.row_heights_probe.borrow_mut().remove(&mid);
+                self.row_height_cache.measured_heights.remove(&mid);
+            }
+            self.row_height_cache.mark_dirty();
+        }
+        updated
+    }
+
+    /// Updates QR PNG image, countdown, and poll attempt on a `QrLogin` card.
+    pub fn refresh_bot_assist_qr(
+        &mut self,
+        chat_id: Option<u64>,
+        card_id: &str,
+        png_bytes: Vec<u8>,
+        countdown_secs: u32,
+        poll_attempt: u32,
+    ) -> bool {
+        let mut updated = false;
+        let apply_list = |list: &mut Vec<MessageItemModel>, updated_flag: &mut bool| {
+            for m in list.iter_mut() {
+                if let MessageContent::LocalBotAssistCard(ref mut card) = m.content {
+                    if card.card_id() == card_id
+                        && card.refresh_qr_image(png_bytes.clone(), countdown_secs, poll_attempt)
+                    {
+                        *updated_flag = true;
+                    }
+                }
+            }
+        };
+        apply_list(&mut self.messages, &mut updated);
+        if let Some(cid) = chat_id {
+            if let Some(hist) = self.chat_histories.get_mut(&cid) {
+                apply_list(hist, &mut updated);
+            }
+        } else {
+            for hist in self.chat_histories.values_mut() {
+                apply_list(hist, &mut updated);
+            }
+        }
+        updated
     }
 }

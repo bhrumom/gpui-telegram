@@ -26,7 +26,7 @@ impl AppShell {
     fn updater_network_options(&self) -> UpdaterNetworkOptions {
         UpdaterNetworkOptions {
             proxy: self.client.config.proxy.clone(),
-            server_url: Some(self.client.config.server_url.clone()),
+            server_url: None,
             ..Default::default()
         }
     }

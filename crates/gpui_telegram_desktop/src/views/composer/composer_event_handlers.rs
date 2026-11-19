@@ -957,7 +957,7 @@ impl CanonicalComposer {
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(rgb(pal.accent))
                                     .child(format!(
-                                        "Hermes Slash Commands ({}/{})",
+                                        "Fabushi Slash Commands ({}/{})",
                                         sel + 1,
                                         total_matches
                                     )),

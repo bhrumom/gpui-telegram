@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Reserved message ID base for strictly local bot-assist cards (never synced to MTProto/cloud).
+pub const BOT_ASSIST_LOCAL_MSG_ID_BASE: u64 = 0x7FFF_0000_0000_0000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageDirection {
     Outgoing,
@@ -188,6 +191,8 @@ pub enum MessageContent {
     },
     /// 12. Generative UI (A2UI) Dynamic Card
     GenerativeCard(gpui_telegram_proto::cards::GenerativeCard),
+    /// 13. Strictly Local Bot-Browser Assist Card (never synced to cloud/MTProto)
+    LocalBotAssistCard(super::bot_assist_card::BotAssistCardModel),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -210,6 +215,11 @@ pub struct MessageItemModel {
 impl MessageItemModel {
     pub fn is_outgoing(&self) -> bool {
         self.direction == MessageDirection::Outgoing
+    }
+
+    pub fn is_local_only(&self) -> bool {
+        matches!(self.content, MessageContent::LocalBotAssistCard(_))
+            || self.id >= BOT_ASSIST_LOCAL_MSG_ID_BASE
     }
 
     pub fn toggle_reaction(&mut self, emoji: &str) {

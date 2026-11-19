@@ -6025,7 +6025,7 @@ fn ensure_codex_payload_compat(base_url: &str, payload: &mut Value) {
             .unwrap_or(true);
         if empty_instructions {
             payload["instructions"] =
-                Value::String("You are Hermes, a helpful AI assistant.".to_string());
+                Value::String("You are Fabushi, a helpful AI assistant.".to_string());
         }
     }
     if should_strip_sampling_for_codex_backend(base_url) {

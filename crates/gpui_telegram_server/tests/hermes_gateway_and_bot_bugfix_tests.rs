@@ -388,7 +388,7 @@ async fn test_hermes_gateway_http_routes_openai_compat_and_acp_rpc() {
     let (st, status_json) = api(&app, Method::GET, "/api/v1/hermes/status", Some(&tok), None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(status_json["healthy"], true);
-    assert_eq!(status_json["engine"], "hermes-rust");
+    assert_eq!(status_json["engine"], "fabushi-agent");
     assert!(status_json["toolsets_count"].as_u64().unwrap() >= 28);
     assert!(status_json["tools_count"].as_u64().unwrap() >= 40);
 
@@ -664,7 +664,7 @@ async fn test_hermes_gateway_http_routes_openai_compat_and_acp_rpc() {
     assert_eq!(st, StatusCode::OK);
 
     let apr = state
-        .hermes
+        .fabushi_core()
         .store()
         .enqueue_approval(
             gpui_telegram_agent::hermes::state_db::CreateApprovalRequest {
@@ -860,7 +860,7 @@ async fn test_hermes_gateway_http_routes_openai_compat_and_acp_rpc() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(acp_init["jsonrpc"], "2.0");
-    assert_eq!(acp_init["result"]["serverInfo"]["name"], "hermes-rust-agent");
+    assert_eq!(acp_init["result"]["serverInfo"]["name"], "fabushi-agent");
 
     let (st, acp_tools) = api(
         &app,

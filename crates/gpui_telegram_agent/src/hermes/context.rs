@@ -14,6 +14,7 @@ use std::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextFileKind {
+    FabushiMd,
     HermesMd,
     AgentsMd,
     ClaudeMd,
@@ -23,6 +24,7 @@ pub enum ContextFileKind {
 impl ContextFileKind {
     pub fn file_name(&self) -> &'static str {
         match self {
+            Self::FabushiMd => ".fabushi.md",
             Self::HermesMd => ".hermes.md",
             Self::AgentsMd => "AGENTS.md",
             Self::ClaudeMd => "CLAUDE.md",
@@ -30,8 +32,9 @@ impl ContextFileKind {
         }
     }
 
-    pub fn all() -> [Self; 4] {
+    pub fn all() -> [Self; 5] {
         [
+            Self::FabushiMd,
             Self::HermesMd,
             Self::AgentsMd,
             Self::ClaudeMd,
@@ -1061,6 +1064,8 @@ impl PromptBuilder {
             "## Autonomous Execution & Self-Learning Doctrine\n\
              - Multi-step execution loop: follow `inspect -> execute -> verify -> report`. Chain tool calls iteratively across steps until the actual state is verified rather than guessing or stopping mid-task.\n\
              - Proactive tool usage: actively inspect and verify via `computer_*` (`computer_list`, `computer_status`, `computer_exec`, `computer_file`, `computer_screen`, `computer_use`), `terminal`, file tools (`read_file`, `write_file`, `patch`, `search_files`), web/browser tools, `memory`, and `skill_list` / `skill_view` / `skill_manage` instead of asking the user to run manual checks.\n\
+             - Universal Mini App control (WebMCP): whenever the user asks to inspect, operate, or trigger actions inside any Mini App (such as 全球法布施 or any other registered/open Mini App), ALWAYS use the WebMCP tools (`webmcp_list_miniapps`, `webmcp_discover`, `webmcp_call_tool`, `miniapp_request_takeover`, or `launch_miniapp`/`invoke_miniapp_action`) to execute real actions and report verified results—never simulate or fabricate Mini App results in text. If user interaction (login, confirmation, manual selection) is required, call `miniapp_request_takeover` and wait for the user to finish and hand control back.\n\
+             - Identity accuracy: when acting as a Fabushi Bot, identify yourself truthfully by your persona and actual Active Model shown in Runtime Context; never claim to be \"Hermes\" or \"Hermes-local-v1\" when backed by another model.\n\
              - Frictionless computer control: in authorized/`Yolo` sessions or bound online computers, invoke `computer_exec`, `computer_file`, `computer_screen`, or `computer_use` directly—control leases are acquired automatically when omitted.\n\
              - Resilient error recovery: when any tool returns a non-fatal error envelope (`{\"ok\": false, ...}`), inspect `error` and `hint`, adjust parameters or switch strategy, and continue.\n\
              - Self-learning loop: after complex multi-step workflows (5+ tool calls) or when discovering durable facts/preferences/procedures, persist facts via `memory` and create or refine reusable procedural skills via `skill_list` / `skill_view` / `skill_manage`."
@@ -1130,10 +1135,20 @@ impl PromptBuilder {
             .timestamp_utc
             .clone()
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let runtime_line = if input.volatile.source == "fabushi_bot" {
+            let trimmed_model = input.volatile.model.trim();
+            if !trimmed_model.is_empty() && !trimmed_model.eq_ignore_ascii_case("hermes-local-v1") {
+                format!("Runtime: Fabushi Bot | Active Model: {trimmed_model}")
+            } else {
+                "Runtime: Fabushi Bot".to_string()
+            }
+        } else {
+            format!("Source: {} | Model: {}", input.volatile.source, input.volatile.model)
+        };
         let mut t3_lines = vec![
             format!("Timestamp (UTC): {ts}"),
             format!("Session: {}", input.volatile.session_id),
-            format!("Source: {} | Model: {}", input.volatile.source, input.volatile.model),
+            runtime_line,
         ];
         if let Some(chat_id) = input.volatile.chat_id {
             t3_lines.push(format!("Chat ID: {chat_id}"));

@@ -570,7 +570,19 @@ impl AppShell {
                         overlay.update(cx, |wb, wcx| {
                             match &cmd {
                                 WorkbenchCommand::RefreshScreen => {
-                                    if out.frame_data_url.is_some() {
+                                    if out.stdout.contains("fallback_png") {
+                                        wb.update_frame_url(None);
+                                        wb.needs_screen_permission_guide = true;
+                                        wb.status_banner = Some(
+                                            tr_str(
+                                                &wb.language_id,
+                                                "未开启录屏权限：请点击「在“系统设置”中启用」，然后在系统设置中开启 Fabushi 开关",
+                                                "Screen Recording not enabled: click 'Enable in System Settings' and toggle Fabushi on",
+                                            )
+                                            .to_string(),
+                                        );
+                                    } else if out.frame_data_url.is_some() {
+                                        wb.needs_screen_permission_guide = false;
                                         wb.update_frame_url(out.frame_data_url.clone());
                                         wb.status_banner = Some(format!(
                                             "{} ({}ms)",
@@ -582,14 +594,18 @@ impl AppShell {
                                     }
                                 }
                                 WorkbenchCommand::SendGuiClick { x, y } => {
-                                    wb.status_banner = Some(if out.ok {
-                                        format!(
+                                    if out.ok {
+                                        wb.needs_accessibility_permission_guide = false;
+                                        wb.status_banner = Some(format!(
                                             "{} ({x}, {y})",
                                             tr_str(&wb.language_id, "远程点击已生效", "Click applied")
-                                        )
+                                        ));
                                     } else {
-                                        out.stderr.clone()
-                                    });
+                                        if out.stderr.contains("辅助功能") || out.stderr.to_ascii_lowercase().contains("accessibility") {
+                                            wb.needs_accessibility_permission_guide = true;
+                                        }
+                                        wb.status_banner = Some(out.stderr.clone());
+                                    }
                                 }
                                 WorkbenchCommand::SendGuiText { .. } => {
                                     wb.status_banner = Some(if out.ok {
@@ -629,6 +645,32 @@ impl AppShell {
                         });
                         if pending_hint {
                             shell.refresh_computers(cx);
+                        }
+                        if out.ok
+                            && matches!(
+                                cmd,
+                                WorkbenchCommand::SendGuiClick { .. }
+                                    | WorkbenchCommand::SendGuiText { .. }
+                            )
+                        {
+                            let nid_refresh = node_id.clone();
+                            let ov_refresh = overlay.clone();
+                            cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
+                                app.background_executor()
+                                    .timer(Duration::from_millis(260))
+                                    .await;
+                                let _ = weak_shell.update(app, |shell, cx| {
+                                    if shell.overlays.computer_overlay.is_some() {
+                                        shell.handle_workbench_command(
+                                            nid_refresh,
+                                            WorkbenchCommand::RefreshScreen,
+                                            ov_refresh,
+                                            cx,
+                                        );
+                                    }
+                                });
+                            })
+                            .detach();
                         }
                     }
                     Err(e) => {

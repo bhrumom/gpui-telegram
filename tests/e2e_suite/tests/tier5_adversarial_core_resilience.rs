@@ -1258,7 +1258,7 @@ async fn tier5_membership_normalization_kick_ban_leave_and_chat_authz() {
         .unwrap();
     assert_eq!(bob_rec.role, "member");
     assert_eq!(bob_rec.admin_rights, 0, "Demoted admin must have admin_rights reset to 0");
-    let bridge = state.hermes.platform_im_bridge().unwrap();
+    let bridge = state.fabushi_core().platform_im_bridge().unwrap();
     assert!(
         bridge
             .execute_im_tool(
@@ -2038,7 +2038,7 @@ async fn tier5_ws_sync_restricted_and_dm_block_authz_parity() {
     );
 
     // Sibling parity while Malloy is restricted: hermes_im_bridge + HTTP polls_create
-    let bridge = state.hermes.platform_im_bridge().unwrap();
+    let bridge = state.fabushi_core().platform_im_bridge().unwrap();
     assert!(
         bridge
             .execute_im_tool(

@@ -102,6 +102,9 @@ impl PtsEngine {
             UpdateEvent::AgentFloorChanged { .. } => "agent_floor_changed",
             UpdateEvent::AgentWorkspaceUpdated { .. } => "agent_workspace_updated",
             UpdateEvent::AgentHandoffEvent { .. } => "agent_handoff_event",
+            UpdateEvent::BotActivityChanged { .. } => "bot_activity_changed",
+            UpdateEvent::MiniAppWebMcpCommand(_) => "miniapp_webmcp_command",
+            UpdateEvent::MiniAppControlStatus { .. } => "miniapp_control_status",
         };
 
         let (new_pts, pts_update) = self.db.pool().with_transaction(|tx| {

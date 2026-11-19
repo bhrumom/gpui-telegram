@@ -467,6 +467,13 @@ def build_macos_app_bundle(
     <string>NSApplication</string>
     <key>NSRequiresAquaSystemAppearance</key>
     <false/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+    </dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Fabushi needs microphone access for voice messages and calls.</string>
     <key>NSCameraUsageDescription</key>

@@ -8,6 +8,29 @@ pub mod talk;
 pub mod tasks;
 pub mod wallet;
 
+/// Canonical unified Fabushi Agent facade combining the multi-bot host (`fabushi_bot`)
+/// and the embedded pure-Rust agent execution runtime (`hermes`).
+pub mod fabushi {
+    pub use crate::fabushi_bot::*;
+    pub use crate::hermes::state_db::HermesStateStore as FabushiStateStore;
+    pub use crate::hermes::toolsets::{
+        HermesToolContext as FabushiToolContext, HermesToolExecutor as FabushiToolExecutor,
+    };
+    pub use crate::hermes::{
+        CronRunOutcome, HeartbeatConfig, HeartbeatManager, HeartbeatTickOutcome,
+        HermesEngine as FabushiAgentEngine, HermesEngineConfig as FabushiEngineConfig,
+        HermesEvent as FabushiEvent, HermesTurnRequest as FabushiTurnRequest,
+        HermesTurnResult as FabushiTurnResult, MessageQueueManager, QueuedMessage,
+        RecordedToolStep, SessionRuntimeSettings,
+    };
+    pub type FabushiAgentHost = crate::fabushi_bot::FabushiBotHost;
+}
+
+pub use fabushi::{
+    FabushiAgentEngine, FabushiAgentHost, FabushiEngineConfig, FabushiEvent, FabushiStateStore,
+    FabushiToolContext, FabushiToolExecutor, FabushiTurnRequest, FabushiTurnResult,
+};
+
 pub use multi_agent::{
     FloorControlQueue, FloorPriority, LoopBudget, LoopBudgetExceededError, ScopedCapabilityToken,
     SharedGroupWorkspace, SharedWorkspaceEntry, DEFAULT_MAX_LOOP_HOPS,

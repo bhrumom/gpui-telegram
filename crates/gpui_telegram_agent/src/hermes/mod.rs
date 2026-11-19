@@ -130,6 +130,8 @@ pub struct HermesTurnRequest {
     pub system_prompt: Option<String>,
     pub thinking_budget_tokens: Option<usize>,
     pub preset: Option<ToolsetPreset>,
+    #[serde(default)]
+    pub adaptive_toolsets: Option<Vec<ToolsetId>>,
     pub max_iterations: Option<usize>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
@@ -1368,7 +1370,7 @@ impl HermesStateBridge for ToolContextBridge {
             let engine = HermesEngine { inner };
             let child_session_id = format!("sub_{}_{}", req.parent_session_id, req.task_id);
             let role_prompt = format!(
-                "You are a focused Hermes subagent in role '{}'. Complete the assigned task cleanly and concisely.\nAllowed toolsets: {:?}",
+                "You are a focused Fabushi subagent in role '{}'. Complete the assigned task cleanly and concisely.\nAllowed toolsets: {:?}",
                 req.role, req.toolsets
             );
             let child_req = HermesTurnRequest {
@@ -2569,7 +2571,7 @@ impl CommandHost for EngineCommandHost<'_> {
             .map(|m| m.list_tools().len())
             .unwrap_or(0);
         Ok(format!(
-            "Hermes Doctor Diagnostics:\n- Workspace exists: {} ({})\n- SQLite FTS5: {} | journal_mode: {}\n- Providers ({}): {}\n- Skills indexed: {} | MCP tools: {}\n- Hardcoded legacy remote gateway: NONE (pure-Rust runtime)",
+            "Fabushi Agent Diagnostics:\n- Workspace exists: {} ({})\n- SQLite FTS5: {} | journal_mode: {}\n- Providers ({}): {}\n- Skills indexed: {} | MCP tools: {}\n- Hardcoded legacy remote gateway: NONE (pure-Rust runtime)",
             ws.exists(),
             ws.display(),
             fts5,
@@ -4951,7 +4953,15 @@ impl HermesEngine {
             req.caller_owns_bot.unwrap_or(true) || req.caller_is_admin,
         );
 
-        let active_specs = HermesToolExecutor::list_specs(&tool_ctx);
+        let mut active_specs = HermesToolExecutor::list_specs(&tool_ctx);
+        if let Some(ref adaptive_ids) = req.adaptive_toolsets {
+            let allowed_set: HashSet<ToolsetId> = adaptive_ids
+                .iter()
+                .copied()
+                .chain([ToolsetId::Core, ToolsetId::PlatformIm])
+                .collect();
+            active_specs.retain(|spec| allowed_set.contains(&spec.toolset));
+        }
         let provider_tools: Vec<ProviderToolSpec> = active_specs
             .iter()
             .map(|s| ProviderToolSpec {
@@ -4972,18 +4982,34 @@ impl HermesEngine {
             .filter(|s| !s.is_empty())
             .unwrap_or(&active_model)
             .to_string();
+        let effective_display_model = if chosen_model.trim().is_empty()
+            || matches!(
+                chosen_model.trim().to_ascii_lowercase().as_str(),
+                "auto" | "default" | "hermes-local-v1"
+            ) {
+            active_model.clone()
+        } else {
+            chosen_model.clone()
+        };
 
         let persona_override = req
             .system_prompt
             .as_deref()
             .or(active_settings.system_prompt_override.as_deref());
-        let assembled = self.assemble_prompt_for_session_with_name(
+        let runtime_source = if req.source == "telegram_bot" || req.source == "chat_agent_run" || req.bot_id.is_some() {
+            "fabushi_bot"
+        } else {
+            req.source.as_str()
+        };
+        let assembled = self.assemble_prompt_for_session_with_runtime(
             session_id,
             req.chat_id.or(sess.chat_id),
             req.bot_id.as_deref().or(sess.bot_id.as_deref()),
             req.bot_name.as_deref(),
             persona_override,
             &prefetch_hints,
+            Some(&effective_display_model),
+            Some(runtime_source),
         );
         let _ = prefetch_hints.drain(..);
 
@@ -5643,6 +5669,30 @@ impl HermesEngine {
         persona_override: Option<&str>,
         ephemeral_prefetch: &[String],
     ) -> AssembledPrompt {
+        self.assemble_prompt_for_session_with_runtime(
+            session_id,
+            chat_id,
+            bot_id,
+            bot_name_hint,
+            persona_override,
+            ephemeral_prefetch,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_prompt_for_session_with_runtime(
+        &self,
+        session_id: &str,
+        chat_id: Option<i64>,
+        bot_id: Option<&str>,
+        bot_name_hint: Option<&str>,
+        persona_override: Option<&str>,
+        ephemeral_prefetch: &[String],
+        resolved_model: Option<&str>,
+        runtime_source: Option<&str>,
+    ) -> AssembledPrompt {
         let ws_ctx: Option<DiscoveredWorkspaceContext> =
             WorkspaceContextDiscovery::discover(&self.inner.config.workspace_root, None).ok();
         let mem_snap = self
@@ -5673,7 +5723,7 @@ impl HermesEngine {
             }
         };
         if let Some(hint) = bot_name_hint.map(str::trim).filter(|s| !s.is_empty()) {
-            if soul.name == "Hermes" || soul.name.trim().is_empty() {
+            if soul.name == "Hermes" || soul.name == "Fabushi Bot" || soul.name.trim().is_empty() {
                 soul.name = hint.to_string();
             }
         }
@@ -5701,7 +5751,16 @@ impl HermesEngine {
             .read()
             .map(|s| s.approvals.get_session_mode(session_id))
             .unwrap_or(ApprovalMode::Prompt);
-        let (_, model, _) = self.inner.providers.active_info();
+        let model = resolved_model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| self.inner.providers.active_info().1);
+        let source = runtime_source
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("fabushi_bot")
+            .to_string();
 
         PromptBuilder::new().build(PromptBuildInput {
             soul: Some(&soul),
@@ -5714,7 +5773,7 @@ impl HermesEngine {
                 session_id: session_id.to_string(),
                 chat_id,
                 bot_id: bot_id.map(ToString::to_string),
-                source: "hermes".to_string(),
+                source,
                 model,
                 timestamp_utc: None,
                 voice_mode: settings.voice_mode,
@@ -5908,7 +5967,7 @@ impl HermesEngine {
                 "result": {
                     "protocolVersion": "1.0",
                     "serverInfo": {
-                        "name": "hermes-rust-agent",
+                        "name": "fabushi-agent",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "capabilities": {
@@ -6948,7 +7007,7 @@ mod tests {
         let rpc = engine
             .acp_json_rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }))
             .await;
-        assert_eq!(rpc["result"]["serverInfo"]["name"], "hermes-rust-agent");
+        assert_eq!(rpc["result"]["serverInfo"]["name"], "fabushi-agent");
     }
 
     async fn spawn_mock_openai_server(
@@ -7665,5 +7724,42 @@ mod tests {
         .await
         .expect("upstream socket must close within 250ms after drop(rx)");
         let _ = srv.await;
+    }
+
+    #[test]
+    fn test_fabushi_runtime_prompt_injects_real_model_never_hermes_local_v1() {
+        let (_dir, engine) = test_engine();
+        let assembled = engine.assemble_prompt_for_session_with_runtime(
+            "s_fabushi_model",
+            Some(42),
+            Some("8001"),
+            Some("全球法布施"),
+            Some("你是全球法布施慈悲修行助手"),
+            &[],
+            Some("claude-sonnet-4.5"),
+            Some("fabushi_bot"),
+        );
+        assert!(
+            assembled
+                .combined_system_prompt
+                .contains("Runtime: Fabushi Bot | Active Model: claude-sonnet-4.5"),
+            "missing real model in runtime context: {}",
+            assembled.tier3_volatile.content
+        );
+        assert!(!assembled.combined_system_prompt.contains("hermes-local-v1"));
+        assert!(!assembled.combined_system_prompt.contains("Source: hermes"));
+
+        let fallback_assembled = engine.assemble_prompt_for_session_with_runtime(
+            "s_fabushi_fallback",
+            Some(43),
+            Some("8002"),
+            Some("测试助手"),
+            Some("测试人格"),
+            &[],
+            Some("hermes-local-v1"),
+            Some("fabushi_bot"),
+        );
+        assert!(fallback_assembled.tier3_volatile.content.contains("Runtime: Fabushi Bot"));
+        assert!(!fallback_assembled.tier3_volatile.content.contains("hermes-local-v1"));
     }
 }

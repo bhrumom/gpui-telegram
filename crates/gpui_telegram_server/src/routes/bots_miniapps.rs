@@ -2767,6 +2767,19 @@ pub async fn handle_ai_bot_reply(
 
     let (bot_sp, bot_model, _) = crate::routes::hermes::load_bot_persona_config(state, bot_user_id);
     let mut extra_context_sections = Vec::new();
+    if !apps.is_empty() {
+        let mut app_lines = vec![
+            "## Companion Mini Apps (WebMCP Live Control)".to_string(),
+            "此机器人绑定了真实可交互的小程序。当用户请求发送经典、启动/停止全球法布施、切换标签页、查询实时功德、补录共修记录或操作页面功能时，无论上方历史对话是否出现过旧版纯文本回复，**绝对禁止**模仿历史纯文本编造字节数或假称“Hermes-local-v1”，必须主动调用 `webmcp_call_tool`（例如 `fabushi_send_dharma` / `fabushi_get_status` / `fabushi_switch_tab` / `fabushi_record_practice`）或 `webmcp_discover` 真实操控小程序并基于工具返回结果作答；若需要用户手动登录、验证码或人工确认，请调用 `miniapp_request_takeover` 暂停等待用户结束接管后继续。当用户询问你是什么模型时，请如实回答你在 Fabushi Agent 运行时上所连接的真实 Active Model。".to_string(),
+        ];
+        for app in &apps {
+            app_lines.push(format!(
+                "- `@{} / {}` ({}) url=`{}`",
+                app.bot_username, app.short_name, app.title, app.web_url
+            ));
+        }
+        extra_context_sections.push(app_lines.join("\n"));
+    }
     if latest_state_val.is_some() || !cloud_kv.is_empty() {
         let mut ctx_note = vec!["## Live Companion Mini App State".to_string()];
         if let Some(ref st) = latest_state_val {
@@ -3680,6 +3693,7 @@ pub async fn fabushi_bots_list(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     let is_admin = crate::routes::hermes::caller_is_admin(&state, auth.user_id);
+    let uid = auth.user_id.0 as i64;
     match state.db.list_all_bots() {
         Ok(records) => {
             let bots: Vec<FabushiBotSummaryDto> = records
@@ -3687,9 +3701,13 @@ pub async fn fabushi_bots_list(
                 .filter(|b| {
                     b.bot_user_id != BOTFATHER_USER_ID as i64
                         && !b.is_standard_bot
-                        && (is_admin || b.is_official || b.owner_user_id == auth.user_id.0 as i64)
+                        && (is_admin
+                            || b.is_official
+                            || b.owner_user_id == uid
+                            || state.db.bot_has_published_miniapp(b.bot_user_id)
+                            || state.db.user_has_dm_with_bot(uid, b.bot_user_id))
                 })
-                .map(|b| build_fabushi_bot_summary(&state, auth.user_id.0 as i64, b, None))
+                .map(|b| build_fabushi_bot_summary(&state, uid, b, None))
                 .collect();
             (
                 StatusCode::OK,
@@ -3839,7 +3857,11 @@ pub async fn fabushi_bot_get(
 ) -> Response {
     match resolve_bot_record_by_key(&state, &bot_id) {
         Ok(Some(bot)) if bot.bot_user_id != BOTFATHER_USER_ID as i64 => {
-            if !bot.is_official {
+            let uid = auth.user_id.0 as i64;
+            let public_visible = bot.is_official
+                || state.db.bot_has_published_miniapp(bot.bot_user_id)
+                || state.db.user_has_dm_with_bot(uid, bot.bot_user_id);
+            if !public_visible {
                 if let Err(resp) = crate::routes::hermes::caller_owns_bot_or_admin(
                     &state,
                     auth.user_id,
@@ -3848,7 +3870,7 @@ pub async fn fabushi_bot_get(
                     return resp;
                 }
             }
-            let summary = build_fabushi_bot_summary(&state, auth.user_id.0 as i64, &bot, None);
+            let summary = build_fabushi_bot_summary(&state, uid, &bot, None);
             (StatusCode::OK, Json(summary)).into_response()
         }
         Ok(_) => err_resp(StatusCode::NOT_FOUND, "bot_not_found", "Fabushi bot not found"),
@@ -5084,20 +5106,49 @@ pub async fn serve_miniapp_html(
     };
     let init_data = params.get("init_data").cloned().unwrap_or_default();
 
-    if let Ok(Some(bundle_html)) = state.db.get_mini_app_hosted_bundle(&app.app_id) {
+    let is_builtin_fabushi = bot.username.eq_ignore_ascii_case("fabushi_bot")
+        && app.short_name.eq_ignore_ascii_case("fabushi");
+    let hosted_bundle = if is_builtin_fabushi {
+        Some(fabushi_miniapp::hosted_bundle_html().to_string())
+    } else {
+        state.db.get_mini_app_hosted_bundle(&app.app_id).ok().flatten()
+    };
+    if let Some(bundle_html) = hosted_bundle {
         let init_escaped = serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into());
-        let inject = format!(
-            r#"<script>window.__TG_INIT_DATA__ = {}; window.__TG_BOT_ID__ = {};</script><script src="/js/telegram-web-app.js"></script>"#,
+        let has_tg_sdk = bundle_html.contains("/js/telegram-web-app.js");
+        let inject_init = format!(
+            r#"<script>window.__TG_INIT_DATA__ = {}; window.__TG_BOT_ID__ = {};</script>"#,
             init_escaped, bot.bot_user_id
         );
-        let final_html = if let Some(idx) = bundle_html.find("</head>") {
-            let mut s = String::with_capacity(bundle_html.len() + inject.len() + 1);
+        let inject_full = if has_tg_sdk {
+            inject_init.clone()
+        } else {
+            format!(r#"{inject_init}<script src="/js/telegram-web-app.js"></script>"#)
+        };
+        let final_html = if has_tg_sdk {
+            if let Some(idx) = bundle_html.find("<script src=\"/js/telegram-web-app.js\"") {
+                let mut s = String::with_capacity(bundle_html.len() + inject_init.len() + 1);
+                s.push_str(&bundle_html[..idx]);
+                s.push_str(&inject_init);
+                s.push_str(&bundle_html[idx..]);
+                s
+            } else if let Some(idx) = bundle_html.find("</head>") {
+                let mut s = String::with_capacity(bundle_html.len() + inject_init.len() + 1);
+                s.push_str(&bundle_html[..idx]);
+                s.push_str(&inject_init);
+                s.push_str(&bundle_html[idx..]);
+                s
+            } else {
+                format!("{}\n{}", inject_init, bundle_html)
+            }
+        } else if let Some(idx) = bundle_html.find("</head>") {
+            let mut s = String::with_capacity(bundle_html.len() + inject_full.len() + 1);
             s.push_str(&bundle_html[..idx]);
-            s.push_str(&inject);
+            s.push_str(&inject_full);
             s.push_str(&bundle_html[idx..]);
             s
         } else {
-            format!("{}\n{}", inject, bundle_html)
+            format!("{}\n{}", inject_full, bundle_html)
         };
         return (StatusCode::OK, Html(final_html)).into_response();
     }

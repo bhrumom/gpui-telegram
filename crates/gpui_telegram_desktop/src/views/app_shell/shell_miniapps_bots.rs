@@ -4,7 +4,7 @@ use gpui::{AppContext, AsyncApp, ClipboardItem, Context, Entity, WeakEntity};
 use gpui_telegram_proto::miniapp_contracts::{
     derive_safe_agent_id, normalize_fabushi_avatar_color, normalize_fabushi_avatar_shape,
     parse_miniapp_uri, AllowSendMessageRequest, BotRegistryEntry, CreateBotRequest,
-    FabushiBotSummaryDto, MiniAppLaunchMode,
+    FabushiBotSummaryDto, MiniAppControlMode, MiniAppLaunchMode, MiniAppTakeoverEvent,
 };
 
 use crate::components::bots::bot_attach_web_view::{BotAttachWebView, BotWebViewPendingAction};
@@ -478,6 +478,7 @@ impl AppShell {
             match act {
                 BotWebViewPendingAction::Close => {
                     self.miniapps.is_miniapp_minimized = false;
+                    self.miniapps.floating_pip_status = None;
                     self.miniapps.miniapp_overlay = None;
                     cx.notify();
                 }
@@ -838,6 +839,102 @@ impl AppShell {
                     CloudStorageOp::Delete { key },
                     cx,
                 ),
+                BotWebViewPendingAction::TakeoverMiniApp => {
+                    let (bot_username, short_name, chat_id, bot_user_id, title) = {
+                        let w = overlay.read(cx);
+                        (
+                            w.bot_username.trim_start_matches('@').to_string(),
+                            w.current_short_name(),
+                            w.target_chat_i64().unwrap_or(0),
+                            w.bot_id as i64,
+                            w.ui_schema.title.clone(),
+                        )
+                    };
+                    self.miniapps.is_miniapp_minimized = false;
+                    self.miniapps.floating_pip_status =
+                        Some(crate::views::app_shell::shell_state::FloatingPipStatus {
+                            bot_username: bot_username.clone(),
+                            short_name: short_name.clone(),
+                            chat_id,
+                            bot_user_id: bot_user_id.max(0) as u64,
+                            app_title: title,
+                            mode: MiniAppControlMode::UserTakeover,
+                            status_text: "手动接管中".to_string(),
+                            active_tool: None,
+                        });
+                    if !bot_username.is_empty() && !short_name.is_empty() {
+                        self.client.send_miniapp_takeover_state(MiniAppTakeoverEvent {
+                            bot_username,
+                            short_name,
+                            chat_id,
+                            bot_user_id,
+                            mode: MiniAppControlMode::UserTakeover,
+                            user_note: None,
+                            state_snapshot: None,
+                        });
+                    }
+                    cx.notify();
+                }
+                BotWebViewPendingAction::FinishTakeoverAndResumeAi {
+                    user_note,
+                    state_snapshot,
+                } => {
+                    let (bot_username, short_name, chat_id, bot_user_id, title, cached_snap) = {
+                        let w = overlay.read(cx);
+                        (
+                            w.bot_username.trim_start_matches('@').to_string(),
+                            w.current_short_name(),
+                            w.target_chat_i64().unwrap_or(0),
+                            w.bot_id as i64,
+                            w.ui_schema.title.clone(),
+                            w.last_webmcp_state_summary.clone(),
+                        )
+                    };
+                    self.miniapps.floating_pip_status =
+                        Some(crate::views::app_shell::shell_state::FloatingPipStatus {
+                            bot_username: bot_username.clone(),
+                            short_name: short_name.clone(),
+                            chat_id,
+                            bot_user_id: bot_user_id.max(0) as u64,
+                            app_title: title,
+                            mode: MiniAppControlMode::AiControlling,
+                            status_text: "已交还控制权，等待 AI 继续".to_string(),
+                            active_tool: None,
+                        });
+                    if !bot_username.is_empty() && !short_name.is_empty() {
+                        self.client.send_miniapp_takeover_state(MiniAppTakeoverEvent {
+                            bot_username,
+                            short_name,
+                            chat_id,
+                            bot_user_id,
+                            mode: MiniAppControlMode::Idle,
+                            user_note,
+                            state_snapshot: state_snapshot.or(cached_snap),
+                        });
+                    }
+                    cx.notify();
+                }
+                BotWebViewPendingAction::SwitchToFloatingPip => {
+                    self.miniapps.is_miniapp_minimized = true;
+                    overlay.update(cx, |w, wcx| {
+                        w.is_floating_pip = true;
+                        w.is_open = false;
+                        wcx.notify();
+                    });
+                    cx.notify();
+                }
+                BotWebViewPendingAction::ExpandFromFloatingPip => {
+                    self.miniapps.is_miniapp_minimized = false;
+                    overlay.update(cx, |w, wcx| {
+                        w.is_floating_pip = false;
+                        w.is_open = true;
+                        wcx.notify();
+                    });
+                    cx.notify();
+                }
+                BotWebViewPendingAction::WebMcpResponseReady(resp) => {
+                    self.client.send_webmcp_result(resp);
+                }
             }
         }
     }

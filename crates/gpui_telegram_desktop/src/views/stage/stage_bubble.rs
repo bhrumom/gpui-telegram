@@ -9,6 +9,9 @@ use std::rc::Rc;
 
 use crate::components::grok_bot_avatar::{render_grok_persona_avatar, GrokPersonaState};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use super::cards::bot_assist_card::{
+    render_bot_assist_card, BotAssistClickDraft, BotAssistLoginDraft, BotAssistLoginField,
+};
 use super::cards::models::{
     DeliveryStatus, MessageContent, MessageDirection, MessageItemModel,
 };
@@ -362,6 +365,14 @@ fn compute_definite_bubble_width(
     Some(needed_w.clamp(eff_min_w, eff_max_w).ceil())
 }
 
+#[derive(Clone, Copy)]
+pub struct BotAssistRenderContext<'a> {
+    pub login_drafts: &'a HashMap<String, BotAssistLoginDraft>,
+    pub click_drafts: &'a HashMap<String, BotAssistClickDraft>,
+    pub active_field: Option<&'a (String, BotAssistLoginField)>,
+    pub ime_preedit: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_message_row_1to1<V: 'static>(
     msg: &MessageItemModel,
@@ -382,6 +393,7 @@ pub fn render_message_row_1to1<V: 'static>(
     revealed_spoilers: &HashSet<(u64, usize)>,
     expanded_quotes: &HashSet<(u64, usize)>,
     copied_code_msg: Option<u64>,
+    bot_assist: Option<BotAssistRenderContext<'_>>,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     window: &Window,
@@ -453,15 +465,24 @@ pub fn render_message_row_1to1<V: 'static>(
         )
     };
 
-    let bubble_hex = match (is_outgoing, is_selected) {
-        (true, true) => palette.msg_out_selected_bg,
-        (true, false) => palette.msg_out_bg,
-        (false, true) => palette.msg_in_selected_bg,
-        (false, false) => palette.msg_in_bg,
+    let is_local_bot_card = matches!(msg.content, MessageContent::LocalBotAssistCard(_));
+    let bubble_hex = if is_local_bot_card {
+        if is_selected {
+            0x1E293B
+        } else {
+            0x151922
+        }
+    } else {
+        match (is_outgoing, is_selected) {
+            (true, true) => palette.msg_out_selected_bg,
+            (true, false) => palette.msg_out_bg,
+            (false, true) => palette.msg_in_selected_bg,
+            (false, false) => palette.msg_in_bg,
+        }
     };
 
     let body_el = render_bubble_inner_content(
-        msg, meta, is_outgoing, revealed_spoilers, expanded_quotes, copied_code_msg, palette, lang_id, cx, on_action.clone(),
+        msg, meta, is_outgoing, revealed_spoilers, expanded_quotes, copied_code_msg, bot_assist, palette, lang_id, cx, on_action.clone(),
     );
 
     let eff_min_w = palette.scaled_px(MSG_MIN_WIDTH);
@@ -509,7 +530,10 @@ pub fn render_message_row_1to1<V: 'static>(
         .rounded_br(px(br))
         .rounded_bl(px(bl))
         .bg(rgb(bubble_hex))
-        .when(is_fabushi && (!is_outgoing || !palette.mode.is_dark()) && !is_selected && highlight_alpha <= 0.01, |el| {
+        .when(is_local_bot_card && !is_selected && highlight_alpha <= 0.01, |el| {
+            el.border_1().border_color(rgb(0x2A3140))
+        })
+        .when(is_fabushi && !is_local_bot_card && (!is_outgoing || !palette.mode.is_dark()) && !is_selected && highlight_alpha <= 0.01, |el| {
             el.border_1().border_color(rgb(palette.border_fg))
         })
         .when(is_selected, |el| el.border_1().border_color(rgb(palette.accent)))
@@ -781,7 +805,7 @@ pub fn render_message_row_1to1<V: 'static>(
         );
     }
 
-    if let Some(overlay_mode) = reaction_overlay_mode.filter(|_| !has_any_selection) {
+    if let Some(overlay_mode) = reaction_overlay_mode.filter(|_| !has_any_selection && !msg.is_local_only()) {
         let chosen_emojis: Vec<String> = msg
             .reactions
             .iter()
@@ -990,6 +1014,7 @@ pub fn render_message_row_1to1<V: 'static>(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_bubble_inner_content<V: 'static>(
     msg: &MessageItemModel,
     meta: Option<&MessageRichMeta>,
@@ -997,6 +1022,7 @@ fn render_bubble_inner_content<V: 'static>(
     revealed_spoilers: &HashSet<(u64, usize)>,
     expanded_quotes: &HashSet<(u64, usize)>,
     copied_code_msg: Option<u64>,
+    bot_assist: Option<BotAssistRenderContext<'_>>,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
@@ -1147,6 +1173,30 @@ fn render_bubble_inner_content<V: 'static>(
             super::cards::render_generative_card(msg_id, card, palette, cx, move |this, ia, cx| {
                 a_i(this, BubbleUiAction::Interactive(ia), cx);
             })
+        }
+        MessageContent::LocalBotAssistCard(card) => {
+            let cid = card.card_id();
+            let login_draft = bot_assist.as_ref().and_then(|ba| ba.login_drafts.get(cid));
+            let click_draft = bot_assist.as_ref().and_then(|ba| ba.click_drafts.get(cid));
+            let active_field = bot_assist
+                .as_ref()
+                .and_then(|ba| ba.active_field)
+                .and_then(|(active_cid, field)| (active_cid == cid).then_some(*field));
+            let ime_preedit = bot_assist
+                .as_ref()
+                .filter(|_| active_field.is_some())
+                .and_then(|ba| ba.ime_preedit);
+            let a_i = on_action.clone();
+            render_bot_assist_card(
+                card,
+                login_draft,
+                active_field,
+                ime_preedit,
+                click_draft,
+                palette,
+                cx,
+                move |this, ia, cx| a_i(this, BubbleUiAction::Interactive(ia), cx),
+            )
         }
         MessageContent::Service { text, .. } => div().text_size(px(12.0)).child(text.clone()).into_any_element(),
     }

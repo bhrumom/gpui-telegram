@@ -74,6 +74,7 @@ impl ConversationStage {
                 }
                 MessageContent::Poll { question, .. } => question.clone(),
                 MessageContent::Location { title, address, .. } => format!("{} {}", title, address),
+                MessageContent::LocalBotAssistCard(_) => "[安全存储卡片]".to_string(),
                 _ => msg.sender_name.clone(),
             };
             if hay.to_lowercase().contains(&q) || msg.sender_name.to_lowercase().contains(&q) {
@@ -274,10 +275,22 @@ impl ConversationStage {
                 self.selected_message_ids.clear();
             }
             TopBarUiAction::ForwardSelected => {
-                if !self.selected_message_ids.is_empty() {
-                    self.pending_forward_message_ids = Some(self.selected_message_ids.clone());
-                    self.selected_message_ids.clear();
+                let remote_ids: Vec<u64> = self
+                    .selected_message_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        !self
+                            .messages
+                            .iter()
+                            .find(|m| m.id == *id)
+                            .is_some_and(MessageItemModel::is_local_only)
+                    })
+                    .collect();
+                if !remote_ids.is_empty() {
+                    self.pending_forward_message_ids = Some(remote_ids);
                 }
+                self.selected_message_ids.clear();
                 self.select_mode_active = false;
             }
             TopBarUiAction::CopySelected => {
@@ -287,9 +300,22 @@ impl ConversationStage {
             TopBarUiAction::DeleteSelected => {
                 if !self.selected_message_ids.is_empty() {
                     let ids = self.selected_message_ids.clone();
+                    let remote_ids: Vec<u64> = ids
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            !self
+                                .messages
+                                .iter()
+                                .find(|m| m.id == *id)
+                                .is_some_and(MessageItemModel::is_local_only)
+                        })
+                        .collect();
                     self.delete_messages_by_ids(&ids);
                     self.sync_pinned_tracker();
-                    self.pending_delete_message_ids = Some(ids);
+                    if !remote_ids.is_empty() {
+                        self.pending_delete_message_ids = Some(remote_ids);
+                    }
                 }
                 self.select_mode_active = false;
             }
@@ -548,6 +574,15 @@ impl ConversationStage {
                 self.toggle_select_message(msg_id);
             }
             BubbleUiAction::OpenContextMenu(msg_id, pos) => {
+                if self
+                    .messages
+                    .iter()
+                    .find(|m| m.id == msg_id)
+                    .is_some_and(MessageItemModel::is_local_only)
+                {
+                    cx.notify();
+                    return;
+                }
                 self.reaction_picker_msg_id = None;
                 self.hovered_reaction_bar_id = None;
                 self.hovered_reaction_bridge_id = None;
@@ -676,6 +711,48 @@ impl ConversationStage {
                 InteractiveCardAction::GenerativeButton(_msg_id, _btn_id, payload) => {
                     self.pending_bot_action = Some(payload);
                 }
+                InteractiveCardAction::BotAssist(ba) => match ba {
+                    BotAssistCardAction::FocusLoginField { card_id, field } => {
+                        self.focus_bot_card_field(&card_id, field);
+                    }
+                    BotAssistCardAction::ToggleShowPassword { card_id } => {
+                        self.toggle_bot_card_show_password(&card_id);
+                    }
+                    BotAssistCardAction::ToggleAutoReuse { card_id } => {
+                        self.toggle_bot_card_auto_reuse(&card_id);
+                    }
+                    BotAssistCardAction::ClickCaptchaPoint { card_id, point } => {
+                        let max_clicks = self
+                            .find_bot_assist_card(&card_id)
+                            .and_then(|c| match &c.payload {
+                                bot_browser::AssistCardPayload::ClickCaptcha {
+                                    max_clicks,
+                                    status:
+                                        bot_browser::AssistCardStatus::AwaitingUser
+                                        | bot_browser::AssistCardStatus::TimedOutResumable,
+                                    ..
+                                } => Some(*max_clicks),
+                                _ => None,
+                            });
+                        if let Some(cap) = max_clicks {
+                            self.bot_assist_click_drafts
+                                .entry(card_id)
+                                .or_default()
+                                .push_point(point, cap);
+                        }
+                    }
+                    BotAssistCardAction::ResetCaptchaClicks { card_id } => {
+                        if let Some(draft) = self.bot_assist_click_drafts.get_mut(&card_id) {
+                            draft.clear();
+                        }
+                    }
+                    BotAssistCardAction::SubmitLogin { .. }
+                    | BotAssistCardAction::ApproveReuse { .. }
+                    | BotAssistCardAction::CancelCard { .. }
+                    | BotAssistCardAction::SubmitCaptchaClicks { .. } => {
+                        self.pending_bot_assist_action = Some(ba);
+                    }
+                },
             },
             BubbleUiAction::Context(ca) => {
                 self.handle_context_action(ca, cx);
@@ -737,6 +814,7 @@ impl ConversationStage {
                         MessageContent::Media { caption, .. } | MessageContent::Album { caption, .. } => {
                             caption.clone().unwrap_or_else(|| "Media".to_string())
                         }
+                        MessageContent::LocalBotAssistCard(_) => "[安全存储卡片]".to_string(),
                         _ => "Message".to_string(),
                     };
                     self.pending_reply = Some(ReplyReference {
@@ -752,10 +830,17 @@ impl ConversationStage {
                 }
             }
             ContextMenuAction::TogglePin(msg_id) => {
-                let will_pin = self.messages.iter().find(|m| m.id == msg_id).map(|m| !m.is_pinned).unwrap_or(true);
-                self.toggle_pin_message(msg_id);
-                self.sync_pinned_tracker();
-                self.pending_pin_toggle = Some((msg_id, will_pin));
+                if !self
+                    .messages
+                    .iter()
+                    .find(|m| m.id == msg_id)
+                    .is_some_and(MessageItemModel::is_local_only)
+                {
+                    let will_pin = self.messages.iter().find(|m| m.id == msg_id).map(|m| !m.is_pinned).unwrap_or(true);
+                    self.toggle_pin_message(msg_id);
+                    self.sync_pinned_tracker();
+                    self.pending_pin_toggle = Some((msg_id, will_pin));
+                }
             }
             ContextMenuAction::CopyText(msg_id) => {
                 if let Some(t) = self.copy_message_text(msg_id) {
@@ -764,7 +849,14 @@ impl ConversationStage {
                 }
             }
             ContextMenuAction::Forward(msg_id) => {
-                self.pending_forward_message_ids = Some(vec![msg_id]);
+                if !self
+                    .messages
+                    .iter()
+                    .find(|m| m.id == msg_id)
+                    .is_some_and(MessageItemModel::is_local_only)
+                {
+                    self.pending_forward_message_ids = Some(vec![msg_id]);
+                }
             }
             ContextMenuAction::Translate(msg_id) => {
                 if let Some(meta) = self.message_meta.get_mut(&msg_id) {
@@ -774,9 +866,16 @@ impl ConversationStage {
             }
             ContextMenuAction::Select(msg_id) => self.toggle_select_message(msg_id),
             ContextMenuAction::Delete(msg_id) => {
+                let is_local = self
+                    .messages
+                    .iter()
+                    .find(|m| m.id == msg_id)
+                    .is_some_and(MessageItemModel::is_local_only);
                 self.delete_message(msg_id);
                 self.sync_pinned_tracker();
-                self.pending_delete_message_ids = Some(vec![msg_id]);
+                if !is_local {
+                    self.pending_delete_message_ids = Some(vec![msg_id]);
+                }
             }
             ContextMenuAction::CloseMenu => {}
         }

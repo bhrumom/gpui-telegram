@@ -7,6 +7,7 @@ pub mod global_menu_mac;
 pub mod integration_mac;
 pub mod launcher_mac;
 pub mod mac_iconv_helper;
+pub mod macos_permissions_drag;
 pub mod main_window_mac;
 pub mod native_event_mac;
 pub mod notifications_manager_mac;

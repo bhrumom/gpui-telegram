@@ -1619,6 +1619,88 @@ pub fn sanitize_webapp_custom_url(raw: &str) -> Option<String> {
     None
 }
 
+// ============================================================================
+// Universal Mini App WebMCP & Human Takeover Contracts
+// ============================================================================
+
+/// Descriptor of a WebMCP tool exposed by a Mini App (`navigator.modelContext`) or host fallback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WebMcpToolDescriptor {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Live AI/user control state of an attached or floating Mini App.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiniAppControlMode {
+    #[default]
+    Idle,
+    AiControlling,
+    WaitingForTakeover,
+    UserTakeover,
+}
+
+/// Command dispatched from server AI tool execution to a connected desktop client Mini App WebView.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MiniAppWebMcpCommand {
+    pub request_id: String,
+    pub bot_username: String,
+    pub short_name: String,
+    #[serde(default)]
+    pub chat_id: i64,
+    #[serde(default)]
+    pub bot_user_id: i64,
+    #[serde(default)]
+    pub app_title: String,
+    /// `"discover"` | `"call_tool"` | `"get_state"` | `"request_takeover"`
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+}
+
+/// Response returned from the client Mini App WebView back to the server WebMCP broker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MiniAppWebMcpResponse {
+    pub request_id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub result: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<WebMcpToolDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_summary: Option<serde_json::Value>,
+    #[serde(default)]
+    pub control_mode: MiniAppControlMode,
+}
+
+/// Human takeover / handback lifecycle event emitted by the desktop client for a Mini App.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MiniAppTakeoverEvent {
+    pub bot_username: String,
+    pub short_name: String,
+    #[serde(default)]
+    pub chat_id: i64,
+    #[serde(default)]
+    pub bot_user_id: i64,
+    pub mode: MiniAppControlMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_snapshot: Option<serde_json::Value>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

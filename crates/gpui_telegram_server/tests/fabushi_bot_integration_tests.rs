@@ -464,7 +464,7 @@ async fn per_bot_hermes_isolation_memory_skills_soul_and_status() {
 #[tokio::test]
 async fn patch_fabushi_bot_and_provider_sync_propagation() {
     let (_dir, state, router) = boot_temp_server("fabushi_e2e_patch_sync");
-    let (_uid, token) = register_user(&router, "fabushi_patch_owner").await;
+    let (uid, token) = register_user(&router, "fabushi_patch_owner").await;
 
     let (st_c, val_c) = http_json(
         &router,
@@ -546,7 +546,7 @@ async fn patch_fabushi_bot_and_provider_sync_propagation() {
         .fabushi_bots
         .get_by_user_id(bot_id)
         .expect("hydrated instance");
-    let bot_prov_snap = inst.hermes().providers().snapshot();
+    let bot_prov_snap = inst.hermes().providers_for_user(&uid.to_string()).snapshot();
     assert_eq!(bot_prov_snap.active_provider_id, "openrouter");
     let or_cfg = bot_prov_snap
         .providers
@@ -1006,5 +1006,492 @@ async fn botfather_newbot_and_setavatar_callbacks_persist_grok_avatar() {
             .to_string()
             .contains("bf:set_shape:avatar_menu_test_bot:wedge"),
         "Expected /setavatar to emit shape/color inline keyboard: {menu_reply}"
+    );
+}
+
+#[tokio::test]
+async fn published_companion_miniapp_bot_is_first_class_fabushi_bot_for_normal_user() {
+    let (_dir, state, router) = boot_temp_server("fabushi_companion_visibility");
+    let (_owner_uid, owner_token) = register_user(&router, "companion_owner_u").await;
+    let (_viewer_uid, viewer_token) = register_user(&router, "companion_viewer_u").await;
+
+    // Owner creates a custom Fabushi bot + attaches a published Mini App (like @fabushi_bot).
+    let req = CreateFabushiBotRequest {
+        display_name: "Dharma Companion".to_string(),
+        username: Some("dharma_companion_bot".to_string()),
+        agent_id: None,
+        description: "Published companion Mini App bot".to_string(),
+        title: "Companion Guide".to_string(),
+        avatar_shape: Some("blob".to_string()),
+        avatar_color: Some("teal".to_string()),
+        preferred_model: Some("gpt-4o".to_string()),
+        thinking_level: None,
+        approval_mode: None,
+        toolset_preset: None,
+    };
+    let (st_create, val_create) = http_json(
+        &router,
+        "POST",
+        "/api/v1/fabushi-bots",
+        Some(&owner_token),
+        Some(serde_json::to_value(&req).unwrap()),
+    )
+    .await;
+    assert_eq!(st_create, StatusCode::CREATED, "create bot: {val_create}");
+    let created: FabushiBotCreateResponse = serde_json::from_value(val_create).unwrap();
+
+    // Without a published Mini App or DM, viewer should NOT see another user's private bot.
+    let (_st_list1, list1) =
+        http_json(&router, "GET", "/api/v1/fabushi-bots", Some(&viewer_token), None).await;
+    let bots1: Vec<FabushiBotSummaryDto> =
+        serde_json::from_value(list1["bots"].clone()).unwrap();
+    assert!(
+        bots1.iter().all(|b| b.bot_user_id != created.bot.bot_user_id),
+        "Unpublished private bot must stay hidden from unrelated users"
+    );
+
+    // Publish a companion Mini App under this bot.
+    state
+        .db
+        .create_or_upsert_mini_app_with_options(
+            created.bot.bot_user_id,
+            "dharma_companion_bot",
+            "dharma",
+            "Dharma Companion MiniApp",
+            "Published Mini App",
+            "tools",
+            "🪷",
+            Some("/fabushi-miniapp"),
+            "{}",
+            true,
+            true,
+            false,
+            "",
+            "",
+            None,
+            false,
+        )
+        .unwrap();
+
+    // Now viewer sees it in GET /api/v1/fabushi-bots AND can fetch GET /api/v1/fabushi-bots/{id}.
+    let (st_list2, list2) =
+        http_json(&router, "GET", "/api/v1/fabushi-bots", Some(&viewer_token), None).await;
+    assert_eq!(st_list2, StatusCode::OK);
+    let bots2: Vec<FabushiBotSummaryDto> =
+        serde_json::from_value(list2["bots"].clone()).unwrap();
+    assert!(
+        bots2.iter().any(|b| b.bot_user_id == created.bot.bot_user_id),
+        "Published companion Mini App bot must appear as first-class Fabushi Bot: {bots2:?}"
+    );
+    let (st_get, get_val) = http_json(
+        &router,
+        "GET",
+        &format!("/api/v1/fabushi-bots/{}", created.bot.bot_user_id),
+        Some(&viewer_token),
+        None,
+    )
+    .await;
+    assert_eq!(st_get, StatusCode::OK, "GET single published companion bot: {get_val}");
+}
+
+#[tokio::test]
+async fn webmcp_ws_rpc_roundtrip_and_human_takeover_resume() {
+    use gpui_telegram_core::types::UserId;
+    use gpui_telegram_proto::miniapp_contracts::{
+        MiniAppControlMode, MiniAppTakeoverEvent, MiniAppWebMcpCommand, MiniAppWebMcpResponse,
+    };
+    use gpui_telegram_proto::sync::UpdateEvent;
+    use gpui_telegram_proto::ws::{WsClientFrame, WsServerFrame};
+    use tokio::sync::mpsc;
+
+    let (_dir, state, _router) = boot_temp_server("fabushi_webmcp_ws");
+    let uid = UserId(9001);
+    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsServerFrame>();
+    let (reply_tx, _reply_rx) = mpsc::unbounded_channel::<WsServerFrame>();
+    state.gateway_hub.register(uid, ws_tx);
+
+    let broker = Arc::clone(&state.webmcp_broker);
+    let hub = Arc::clone(&state.gateway_hub);
+    tokio::spawn(async move {
+        while let Some(frame) = ws_rx.recv().await {
+            if let WsServerFrame::Update(UpdateEvent::MiniAppWebMcpCommand(cmd)) = frame {
+                if cmd.operation == "call_tool" {
+                    hub.handle_client_frame(
+                        uid,
+                        WsClientFrame::MiniAppWebMcpResult(MiniAppWebMcpResponse {
+                            request_id: cmd.request_id,
+                            ok: true,
+                            result: json!({ "dispatched": true, "sutra": "心经" }),
+                            error: None,
+                            tools: vec![],
+                            state_summary: Some(json!({ "is_transferring": true })),
+                            control_mode: MiniAppControlMode::AiControlling,
+                        }),
+                        &reply_tx,
+                    );
+                } else if cmd.operation == "request_takeover" {
+                    hub.handle_client_frame(
+                        uid,
+                        WsClientFrame::MiniAppTakeoverState(MiniAppTakeoverEvent {
+                            bot_username: cmd.bot_username.clone(),
+                            short_name: cmd.short_name.clone(),
+                            chat_id: cmd.chat_id,
+                            bot_user_id: cmd.bot_user_id,
+                            mode: MiniAppControlMode::UserTakeover,
+                            user_note: None,
+                            state_snapshot: None,
+                        }),
+                        &reply_tx,
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    hub.handle_client_frame(
+                        uid,
+                        WsClientFrame::MiniAppTakeoverState(MiniAppTakeoverEvent {
+                            bot_username: cmd.bot_username,
+                            short_name: cmd.short_name,
+                            chat_id: cmd.chat_id,
+                            bot_user_id: cmd.bot_user_id,
+                            mode: MiniAppControlMode::Idle,
+                            user_note: Some("已完成登录确认".to_string()),
+                            state_snapshot: Some(json!({ "logged_in": true })),
+                        }),
+                        &reply_tx,
+                    );
+                }
+            }
+        }
+    });
+
+    let rpc_resp = broker
+        .dispatch_to_client(
+            uid,
+            MiniAppWebMcpCommand {
+                request_id: "req_live_call_1".to_string(),
+                bot_username: "fabushi_bot".to_string(),
+                short_name: "fabushi".to_string(),
+                chat_id: 55,
+                bot_user_id: 777001,
+                app_title: "全球法布施".to_string(),
+                operation: "call_tool".to_string(),
+                tool_name: Some("fabushi_send_dharma".to_string()),
+                arguments: json!({ "sutra": "心经" }),
+                status_message: None,
+            },
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("rpc ok")
+        .expect("connected client");
+    assert!(rpc_resp.ok);
+    assert_eq!(rpc_resp.result["sutra"], "心经");
+
+    let takeover_res = broker
+        .request_takeover_and_wait(
+            uid,
+            "fabushi_bot",
+            "fabushi",
+            gpui_telegram_core::types::ChatId(55),
+            UserId(777001),
+            "全球法布施",
+            "需要手动扫码确认",
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("takeover resumed");
+    assert_eq!(takeover_res.mode, MiniAppControlMode::Idle);
+    assert_eq!(takeover_res.user_note.as_deref(), Some("已完成登录确认"));
+    assert_eq!(takeover_res.state_snapshot.unwrap()["logged_in"], true);
+}
+
+#[tokio::test]
+async fn hermes_fused_into_fabushi_single_runtime_and_bot_scoped_studio() {
+    let (_dir, state, router) = boot_temp_server("fabushi_fused_runtime");
+    let (_uid, token) = register_user(&router, "fused_owner_1").await;
+
+    // 1. Official default bot 777_000 (@fabushi_ai_bot) must bind directly to `state.fabushi_core()`
+    let official_inst = state
+        .fabushi_bots
+        .get_by_user_id(777_000)
+        .expect("Official default Fabushi AI bot 777_000 hydrated");
+    assert!(
+        Arc::ptr_eq(&official_inst.hermes(), &state.fabushi_core()),
+        "Official default bot 777_000 must share the exact single core Fabushi engine (no split-brain)"
+    );
+    assert!(
+        state
+            .fabushi_bots
+            .all_engines()
+            .iter()
+            .filter(|(_, eng)| Arc::ptr_eq(eng, &state.fabushi_core()))
+            .count()
+            == 1,
+        "all_engines() must deduplicate core_engine so cron/heartbeat never double-fire"
+    );
+
+    // 2. Canonical `/api/v1/fabushi/status` and `/api/v1/hermes/status` compatibility alias both
+    // report the unified `fabushi-agent` engine.
+    for path in ["/api/v1/fabushi/status", "/api/v1/hermes/status"] {
+        let (st, val) = http_json(&router, "GET", path, Some(&token), None).await;
+        assert_eq!(st, StatusCode::OK, "GET {path}: {val}");
+        assert_eq!(val["engine"], "fabushi-agent", "GET {path}: {val}");
+    }
+
+    // 3. Create a custom Fabushi Bot and verify Studio Kanban / Cron / Heartbeat isolation & wiring
+    let (st, created_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/fabushi-bots",
+        Some(&token),
+        Some(serde_json::to_value(CreateFabushiBotRequest {
+            display_name: "Fused Worker".to_string(),
+            username: Some("fused_worker_bot".to_string()),
+            agent_id: None,
+            description: "Scoped automation bot".to_string(),
+            title: "Automation Worker".to_string(),
+            avatar_shape: None,
+            avatar_color: None,
+            preferred_model: None,
+            thinking_level: None,
+            approval_mode: None,
+            toolset_preset: None,
+        })
+        .unwrap()),
+    )
+    .await;
+    assert!(
+        st == StatusCode::OK || st == StatusCode::CREATED,
+        "create custom fabushi bot: {created_val}"
+    );
+    let created: FabushiBotCreateResponse =
+        serde_json::from_value(created_val).expect("deserialize create bot response");
+    let custom_bot_id = created.bot.bot_user_id as u64;
+    let custom_inst = state
+        .fabushi_bots
+        .get_by_user_id(custom_bot_id as i64)
+        .expect("custom bot instance hydrated");
+    assert!(
+        !Arc::ptr_eq(&custom_inst.hermes(), &state.fabushi_core()),
+        "Custom user bot must retain an isolated engine workspace under fabushi_agents/"
+    );
+
+    // Create Kanban board scoped to custom_bot_id
+    let (st, kb_val) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/fabushi/kanban/boards?bot_id={custom_bot_id}"),
+        Some(&token),
+        Some(json!({ "name": "Worker Isolated Board", "columns": ["Backlog", "Done"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "create scoped board: {kb_val}");
+    let board_id = kb_val["board_id"].as_str().expect("board_id").to_string();
+
+    let (st, unscoped_boards) = http_json(
+        &router,
+        "GET",
+        "/api/v1/fabushi/kanban/boards",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        unscoped_boards["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["board_id"].as_str() != Some(board_id.as_str())),
+        "Core kanban boards list must remain isolated from custom bot boards"
+    );
+
+    let (st, scoped_boards) = http_json(
+        &router,
+        "GET",
+        &format!("/api/v1/fabushi/kanban/boards?bot_id={custom_bot_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        scoped_boards["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["board_id"].as_str() == Some(board_id.as_str())),
+        "Bot-scoped kanban boards GET must return custom bot's board"
+    );
+
+    // Create Cron job & Heartbeat scoped to custom_bot_id
+    let (st, cron_val) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/fabushi/cron?bot_id={custom_bot_id}"),
+        Some(&token),
+        Some(json!({
+            "name": "Scoped Cron Job",
+            "schedule": "0 8 * * *",
+            "prompt": "Check scoped queue",
+            "enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "create scoped cron: {cron_val}");
+    let job_id = cron_val["job_id"].as_str().expect("job_id").to_string();
+    assert!(
+        custom_inst
+            .hermes()
+            .store()
+            .get_cron_job(&job_id)
+            .unwrap()
+            .is_some(),
+        "Cron job must be stored inside custom bot's isolated engine"
+    );
+    assert!(
+        state
+            .fabushi_core()
+            .store()
+            .get_cron_job(&job_id)
+            .unwrap()
+            .is_none(),
+        "Bot-scoped cron job must not leak into core engine store"
+    );
+
+    let (st, hb_val) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/fabushi/heartbeat?bot_id={custom_bot_id}"),
+        Some(&token),
+        Some(json!({ "enabled": true, "interval_secs": 180, "prompt": "Worker heartbeat" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "save scoped heartbeat: {hb_val}");
+    assert_eq!(hb_val["enabled"], true);
+    assert!(custom_inst.hermes().heartbeat().status().enabled);
+    assert!(!state.fabushi_core().heartbeat().status().enabled);
+
+    // 4. Verify non-destructive migration from legacy `<parent>/hermes/` into `<agents_root>/fabushi-ai-bot/`
+    let mig_dir = TempDirGuard::new("fabushi_legacy_hermes_mig");
+    let legacy_dir = mig_dir.path().join("hermes");
+    let agents_dir = mig_dir.path().join("fabushi_agents");
+    std::fs::create_dir_all(&legacy_dir).expect("create legacy hermes dir");
+    std::fs::write(legacy_dir.join("MEMORY.md"), "# Legacy Memory\nimportant fact\n")
+        .expect("write legacy memory");
+    std::fs::write(legacy_dir.join("SOUL.md"), "# Migrated Soul\nLegacy persona\n")
+        .expect("write legacy soul");
+
+    let host = gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_unified(
+        &agents_dir,
+        gpui_telegram_agent::hermes::HermesEngineConfig::default(),
+        Some(&legacy_dir),
+    )
+    .expect("new_unified migration");
+    let migrated_core_dir = agents_dir.join("fabushi-ai-bot");
+    assert_eq!(
+        std::fs::read_to_string(migrated_core_dir.join("MEMORY.md")).unwrap(),
+        "# Legacy Memory\nimportant fact\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(migrated_core_dir.join("SOUL.md")).unwrap(),
+        "# Migrated Soul\nLegacy persona\n"
+    );
+    assert!(legacy_dir.join("MEMORY.md").exists(), "legacy files must never be deleted");
+    assert_eq!(host.core_engine().bound_agent_id().as_deref(), Some("fabushi-ai-bot"));
+}
+
+#[tokio::test]
+async fn serve_miniapp_html_prefers_fresh_builtin_fabushi_webmcp_bundle_over_stale_db_html() {
+    let (_dir, state, router) = boot_temp_server("fabushi_miniapp_fresh_html");
+    let (_uid, token) = register_user(&router, "fabushi_publisher").await;
+
+    let (st_bot, bot_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/bots",
+        Some(&token),
+        Some(json!({
+            "display_name": "全球法布施",
+            "username": "fabushi_bot",
+            "description": "全球法布施与净心禅室",
+            "about": "全球法布施官方伴生机器人",
+            "allow_attach_menu": true,
+            "attach_peer_types": ["users", "bots", "groups"],
+            "menu_button_text": "全球法布施",
+            "menu_button_url": "/miniapps/fabushi_bot/fabushi"
+        })),
+    )
+    .await;
+    assert_eq!(st_bot, StatusCode::CREATED, "create @fabushi_bot: {bot_val}");
+    let bot_token = bot_val["bot_token"].as_str().expect("bot_token").to_string();
+
+    let (st_pub, pub_val) = http_json(
+        &router,
+        "POST",
+        &format!("/bot{bot_token}/publishMiniApp"),
+        None,
+        Some(json!({
+            "short_name": "fabushi",
+            "title": "全球法布施",
+            "description": "全球法布施与净心禅室",
+            "category": "lifestyle",
+            "icon_emoji": "🪷",
+            "web_url": "/miniapps/fabushi_bot/fabushi",
+            "is_main_app": true,
+            "html_bundle": "<html><head></head><body>OLD LEGACY NO WEBMCP</body></html>"
+        })),
+    )
+    .await;
+    assert_eq!(st_pub, StatusCode::OK, "publishMiniApp: {pub_val}");
+    let app_id = pub_val["result"]["app_id"]
+        .as_str()
+        .expect("app_id in publishMiniApp result");
+    state
+        .db
+        .upsert_mini_app_hosted_bundle(
+            app_id,
+            "<html><head></head><body>OLD LEGACY NO WEBMCP</body></html>",
+        )
+        .expect("persist stale db bundle");
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/miniapps/fabushi_bot/fabushi?init_data=test_init_123")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.expect("GET miniapp html");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8 html");
+
+    assert!(
+        !html.contains("OLD LEGACY NO WEBMCP"),
+        "serve_miniapp_html must bypass stale DB html for official fabushi_bot/fabushi"
+    );
+    assert!(
+        html.contains("navigator.modelContext"),
+        "fresh bundle must register WebMCP navigator.modelContext tools"
+    );
+    assert!(
+        html.contains("fabushi_send_dharma"),
+        "fresh bundle must expose fabushi_send_dharma tool"
+    );
+    assert!(
+        html.contains(r#"window.__TG_INIT_DATA__ = "test_init_123""#),
+        "injected init_data script missing: {html}"
+    );
+    let init_pos = html
+        .find("window.__TG_INIT_DATA__")
+        .expect("init_data script position");
+    let sdk_pos = html
+        .find("/js/telegram-web-app.js")
+        .expect("telegram-web-app.js position");
+    assert!(
+        init_pos < sdk_pos,
+        "window.__TG_INIT_DATA__ must be injected before /js/telegram-web-app.js"
+    );
+    assert_eq!(
+        html.matches("/js/telegram-web-app.js").count(),
+        1,
+        "telegram-web-app.js script tag must not be duplicated"
     );
 }

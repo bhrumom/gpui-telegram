@@ -610,35 +610,15 @@ fn test_manual_retry_preserves_part_file_and_resumes_from_offset() {
 }
 
 #[test]
-fn test_server_relay_404_falls_back_to_primary_asset_url() {
+fn test_direct_download_bypasses_backend_relay() {
     let tmp = tempfile::tempdir().unwrap();
     let (_zip_path, bytes, sha) = create_mock_app_zip(tmp.path(), "1.3.0");
     let total = bytes.len();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay_addr = relay_listener.local_addr().unwrap();
         let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_addr = primary_listener.local_addr().unwrap();
-
-        let relay_path_seen = Arc::new(Mutex::new(String::new()));
-        let relay_path_clone = relay_path_seen.clone();
-
-        let relay_srv = tokio::spawn(async move {
-            let (mut sock, _) = relay_listener.accept().await.unwrap();
-            let req = read_http_request_head(&mut sock).await;
-            if let Some(first_line) = req.lines().next() {
-                *relay_path_clone.lock().unwrap() = first_line.to_string();
-            }
-            let body = "Not Found";
-            let resp = format!(
-                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        });
 
         let bytes_srv = bytes.clone();
         let primary_srv = tokio::spawn(async move {
@@ -664,7 +644,8 @@ fn test_server_relay_404_falls_back_to_primary_asset_url() {
             pkg_url: None,
         };
         let opts = UpdaterNetworkOptions {
-            server_url: Some(format!("http://{relay_addr}")),
+            // Even if server_url is populated, the updater must NOT use backend relay.
+            server_url: Some("http://127.0.0.1:9".to_string()),
             release_download_base_override: Some(format!(
                 "http://{primary_addr}/releases/download/"
             )),
@@ -679,15 +660,9 @@ fn test_server_relay_404_falls_back_to_primary_asset_url() {
             |_, _, _| {},
         )
         .await
-        .expect("404 from relay mirror must immediately fall back to primary asset_url");
+        .expect("updater must download directly from primary asset_url without contacting relay");
 
-        relay_srv.await.unwrap();
         primary_srv.await.unwrap();
-
-        assert!(relay_path_seen
-            .lock()
-            .unwrap()
-            .contains("/api/v1/updates/assets/v1.3.0/Fabushi-1.3.0-macos-arm64.zip"));
         assert!(staged.join("Contents/Info.plist").is_file());
     });
 }

@@ -7,6 +7,7 @@ use gpui::{App, AppContext, AsyncApp, Context, WeakEntity};
 use gpui_telegram_core::types::{ChatId, MessageId};
 use gpui_telegram_proto::contracts::CallSignalRequest as CallSignalPayload;
 use gpui_telegram_proto::message::{MessageItem as Message, ReactionCount};
+use gpui_telegram_proto::miniapp_contracts::MiniAppControlMode;
 use gpui_telegram_proto::sync::{TypingAction, UpdateEvent};
 use gpui_telegram_webrtc::SignalingFrame;
 
@@ -423,6 +424,7 @@ fn extract_stage_message_snippet(msg: &MessageItemModel) -> Option<String> {
         MessageContent::Poll { question, .. } => Some(question.clone()),
         MessageContent::Invoice { title, .. } => Some(title.clone()),
         MessageContent::Service { text, .. } => Some(text.clone()),
+        MessageContent::LocalBotAssistCard(_) => Some("[安全存储卡片]".to_string()),
         _ => Some("Pinned message".to_string()),
     }
 }
@@ -962,6 +964,12 @@ impl AppShell {
                                 sb.set_typing(target_chat_u64, None);
                                 sb_cx.notify();
                             });
+                            self.stage.update(cx, |st, st_cx| {
+                                if st.active_chat_id == Some(target_chat_u64) && st.is_bot_chat {
+                                    st.set_bot_activity("idle", None);
+                                    st_cx.notify();
+                                }
+                            });
                         }
                         action => {
                             let is_self_echo =
@@ -978,8 +986,16 @@ impl AppShell {
                                     action,
                                 );
                                 self.sidebar.update(cx, |sb, sb_cx| {
-                                    sb.set_typing(target_chat_u64, indicator);
+                                    sb.set_typing(target_chat_u64, indicator.clone());
                                     sb_cx.notify();
+                                });
+                                self.stage.update(cx, |st, st_cx| {
+                                    if st.active_chat_id == Some(target_chat_u64) && st.is_bot_chat {
+                                        if st.bot_activity_state.eq_ignore_ascii_case("idle") {
+                                            st.set_bot_activity("thinking", indicator);
+                                            st_cx.notify();
+                                        }
+                                    }
                                 });
                             }
                         }
@@ -1158,6 +1174,102 @@ impl AppShell {
                 self.apply_call_updated_event(call_id, state, signal, cx);
             }
             UpdateEvent::StoryUpdated { .. } | UpdateEvent::ForumTopicChanged { .. } => {
+                cx.notify();
+            }
+            UpdateEvent::BotActivityChanged {
+                chat_id: ev_chat,
+                bot_user_id: _,
+                state,
+                detail,
+            } => {
+                let target_chat_u64 = if ev_chat.0 > 0 {
+                    ev_chat.0 as u64
+                } else if chat_id.0 > 0 {
+                    chat_id.0 as u64
+                } else {
+                    0
+                };
+                if target_chat_u64 > 0 {
+                    let is_idle = state.trim().is_empty() || state.eq_ignore_ascii_case("idle");
+                    let sidebar_indicator = if is_idle {
+                        None
+                    } else {
+                        Some(match state.as_str() {
+                            "tool" => detail
+                                .as_deref()
+                                .map(|t| format!("正在调用 {t}..."))
+                                .unwrap_or_else(|| "正在调用工具...".to_string()),
+                            "writing" => detail
+                                .clone()
+                                .unwrap_or_else(|| "正在组织回复...".to_string()),
+                            _ => detail
+                                .clone()
+                                .unwrap_or_else(|| "AI 正在思考...".to_string()),
+                        })
+                    };
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.bot_ids.insert(target_chat_u64);
+                        sb.set_typing(target_chat_u64, sidebar_indicator);
+                        sb_cx.notify();
+                    });
+                    self.stage.update(cx, |st, st_cx| {
+                        if st.active_chat_id == Some(target_chat_u64) {
+                            st.is_bot_chat = true;
+                            st.set_bot_activity(&state, detail);
+                            st_cx.notify();
+                        }
+                    });
+                }
+                cx.notify();
+            }
+            UpdateEvent::MiniAppWebMcpCommand(cmd) => {
+                self.launch_miniapp_for_webmcp(cmd, cx);
+            }
+            UpdateEvent::MiniAppControlStatus {
+                bot_username,
+                short_name,
+                chat_id: ev_chat,
+                bot_user_id,
+                app_title,
+                mode,
+                status_text,
+                active_tool,
+            } => {
+                let clean_un = bot_username.trim().trim_start_matches('@').to_string();
+                let next_status =
+                    crate::views::app_shell::shell_state::FloatingPipStatus {
+                        bot_username: clean_un.clone(),
+                        short_name: short_name.clone(),
+                        chat_id: ev_chat.0,
+                        bot_user_id: bot_user_id.0,
+                        app_title,
+                        mode,
+                        status_text: status_text.clone(),
+                        active_tool: active_tool.clone(),
+                    };
+                self.miniapps.floating_pip_status = if mode == MiniAppControlMode::Idle
+                    && !self.miniapps.is_miniapp_minimized
+                    && self.miniapps.miniapp_overlay.is_none()
+                {
+                    None
+                } else {
+                    Some(next_status)
+                };
+                if let Some(ref ov) = self.miniapps.miniapp_overlay {
+                    let matches = {
+                        let w = ov.read(cx);
+                        w.bot_username
+                            .trim_start_matches('@')
+                            .eq_ignore_ascii_case(&clean_un)
+                            && w.current_short_name().eq_ignore_ascii_case(&short_name)
+                    };
+                    if matches {
+                        ov.update(cx, |w, wcx| {
+                            w.apply_control_status(mode, &status_text, active_tool.as_deref());
+                            wcx.notify();
+                        });
+                    }
+                }
                 cx.notify();
             }
             _ => {}

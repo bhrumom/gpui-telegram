@@ -4,7 +4,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_proto::computer_contracts::{PendingComputerCommandDto, RemoteComputerOp};
 use gpui_telegram_proto::contracts::chats::CreateChatRequest;
-use gpui_telegram_proto::miniapp_contracts::GROK_AVATAR_SHAPES;
+use gpui_telegram_proto::miniapp_contracts::{
+    MiniAppControlMode, MiniAppTakeoverEvent, GROK_AVATAR_SHAPES,
+};
 
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, trigger_grok_avatar_bounce, trigger_grok_avatar_spin,
@@ -76,9 +78,12 @@ impl AppShell {
             .into_any_element()
     }
 
-    /// Renders the fullscreen `ComputerWorkbench` overlay layer.
+    /// Renders the centered, responsive `ComputerWorkbench` overlay layer.
     pub fn render_remote_computer_overlay(&self, overlay: Entity<ComputerWorkbench>) -> AnyElement {
-        fullscreen_occluded_layer(overlay)
+        modal_backdrop_shell("computer-workbench-backdrop", 0x000000A6)
+            .p(px(20.0))
+            .child(overlay)
+            .into_any_element()
     }
 
     /// Renders the Talk Mode / WebRTC call overlay plus AI voice controls when active.
@@ -156,57 +161,418 @@ impl AppShell {
                 .is_some_and(|b| b.read(cx).is_visible);
 
         if let Some(ref ov) = self.miniapps.miniapp_overlay {
-            let should_hide_native = !ov.read(cx).is_open || has_top_modal;
-            if should_hide_native && ov.read(cx).is_native_webview_visible() {
-                ov.update(cx, |w, _| w.hide_native_webview());
+            let ov_read = ov.read(cx);
+            let is_bg_pip = ov_read.is_floating_pip && !ov_read.is_open;
+            let should_hide_native = (!ov_read.is_open && !is_bg_pip) || has_top_modal;
+            let needs_park_pip = is_bg_pip && !has_top_modal && ov_read.disclaimer_accepted;
+            let needs_sync = ov_read.external_modal_occluding != has_top_modal
+                || (should_hide_native && ov_read.is_native_webview_visible());
+            let _ = ov_read;
+            if needs_sync || needs_park_pip {
+                ov.update(cx, |w, _| {
+                    w.external_modal_occluding = has_top_modal;
+                    if should_hide_native {
+                        w.hide_native_webview();
+                    } else if needs_park_pip {
+                        w.park_native_webview_for_pip();
+                    }
+                });
             }
-        }
-
-        if self.miniapps.is_miniapp_minimized {
-            if let Some(ov) = self.miniapps.miniapp_overlay.clone() {
-                let (title, bot_un) = {
-                    let w = ov.read(cx);
-                    let t = if !w.ui_schema.title.is_empty() { w.ui_schema.title.clone() }
-                        else if let Some(ref b) = w.active_bot { b.name.clone() }
-                        else { "Mini App".to_string() };
-                    let u = if !w.bot_username.is_empty() { format!("@{}", w.bot_username.trim_start_matches('@')) } else { String::new() };
-                    (t, u)
-                };
+            if is_bg_pip {
                 layers.push(
-                    div().id("minimized-miniapp-pill").cursor_pointer().absolute().bottom(px(86.0)).right(px(24.0))
-                        .px(px(12.0)).py(px(8.0)).rounded(px(20.0)).bg(rgb(pal.modal_bg)).border_1().border_color(rgb(pal.accent))
-                        .flex().items_center().gap(px(8.0))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                            this.miniapps.is_miniapp_minimized = false;
-                            if let Some(ref ov) = this.miniapps.miniapp_overlay {
-                                ov.update(cx, |w, wcx| { w.is_open = true; wcx.notify(); });
-                            }
-                            cx.notify();
-                        }))
-                        .child(tg_icon(IconName::BotRobot, 16.0, pal.accent))
-                        .child(
-                            div().flex().flex_col()
-                                .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(title))
-                                .when(!bot_un.is_empty(), |col| col.child(div().text_size(px(10.5)).text_color(rgb(pal.text_link)).child(bot_un))),
-                        )
-                        .child(div().px(px(7.0)).py(px(2.0)).rounded(px(10.0)).bg(rgb(pal.accent)).text_size(px(11.0)).text_color(rgb(0xFFFFFF)).child(tr_str(lang, "恢复", "Restore")))
-                        .child(
-                            div().id("minimized-miniapp-close-btn").cursor_pointer().w(px(22.0)).h(px(22.0)).rounded_full()
-                                .hover(move |s| s.bg(rgb(pal.hover_bg))).flex().items_center().justify_center()
-                                .text_size(px(12.0)).text_color(rgb(pal.text_secondary))
-                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.miniapps.is_miniapp_minimized = false;
-                                    if let Some(ov) = this.miniapps.miniapp_overlay.take() {
-                                        ov.update(cx, |w, _| w.close());
-                                    }
-                                    cx.notify();
-                                }))
-                                .child("×"),
-                        )
+                    div()
+                        .id("miniapp-pip-bg-mount")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .opacity(0.01)
+                        .overflow_hidden()
+                        .child(ov.clone())
                         .into_any_element(),
                 );
             }
+        }
+
+        let overlay_open = self
+            .miniapps
+            .miniapp_overlay
+            .as_ref()
+            .is_some_and(|ov| ov.read(cx).is_open);
+        let pip_active = !overlay_open
+            && (self.miniapps.is_miniapp_minimized
+                || self
+                    .miniapps
+                    .floating_pip_status
+                    .as_ref()
+                    .is_some_and(|s| s.mode != MiniAppControlMode::Idle));
+
+        if pip_active {
+            let pip_from_overlay = self.miniapps.miniapp_overlay.as_ref().map(|ov| {
+                let w = ov.read(cx);
+                let title = if !w.ui_schema.title.trim().is_empty() {
+                    w.ui_schema.title.clone()
+                } else if let Some(ref b) = w.active_bot {
+                    b.name.clone()
+                } else {
+                    "Mini App".to_string()
+                };
+                (
+                    title,
+                    w.bot_username.trim_start_matches('@').to_string(),
+                    w.current_short_name(),
+                    w.target_chat_i64().unwrap_or(0),
+                    w.bot_id,
+                    w.control_mode,
+                    w.control_status_text.clone(),
+                    w.active_webmcp_tool.clone(),
+                    w.last_webmcp_state_summary.clone(),
+                )
+            });
+            let (
+                title,
+                raw_bot_un,
+                short_name,
+                chat_id,
+                bot_uid,
+                ctrl_mode,
+                status_text,
+                active_tool,
+                state_snap,
+            ) = if let Some(ref ps) = self.miniapps.floating_pip_status {
+                let title = if !ps.app_title.trim().is_empty() {
+                    ps.app_title.clone()
+                } else if let Some(ref o) = pip_from_overlay {
+                    o.0.clone()
+                } else {
+                    ps.short_name.clone()
+                };
+                (
+                    title,
+                    ps.bot_username.trim_start_matches('@').to_string(),
+                    ps.short_name.clone(),
+                    ps.chat_id,
+                    ps.bot_user_id,
+                    ps.mode,
+                    ps.status_text.clone(),
+                    ps.active_tool.clone(),
+                    pip_from_overlay.and_then(|o| o.8),
+                )
+            } else if let Some(o) = pip_from_overlay {
+                o
+            } else {
+                (
+                    "Mini App".to_string(),
+                    String::new(),
+                    String::new(),
+                    0,
+                    0,
+                    MiniAppControlMode::Idle,
+                    String::new(),
+                    None,
+                    None,
+                )
+            };
+
+            let bot_un_display = if !raw_bot_un.is_empty() {
+                format!("@{raw_bot_un}")
+            } else {
+                String::new()
+            };
+            let is_takeover = ctrl_mode == MiniAppControlMode::UserTakeover;
+            let is_waiting = ctrl_mode == MiniAppControlMode::WaitingForTakeover;
+            let is_ai = ctrl_mode == MiniAppControlMode::AiControlling;
+            let badge_label = match ctrl_mode {
+                MiniAppControlMode::Idle => tr_str(lang, "运行中", "Active"),
+                MiniAppControlMode::AiControlling => tr_str(lang, "AI 操控中", "AI Controlling"),
+                MiniAppControlMode::WaitingForTakeover => tr_str(lang, "等待接管", "Needs Takeover"),
+                MiniAppControlMode::UserTakeover => tr_str(lang, "手动接管中", "User Takeover"),
+            };
+            let badge_color = if is_takeover {
+                0xD97706
+            } else if is_waiting {
+                0xDC2626
+            } else {
+                pal.accent
+            };
+            let detail_line = active_tool
+                .as_deref()
+                .map(|t| format!("WebMCP: {t}"))
+                .filter(|_| is_ai)
+                .unwrap_or_else(|| status_text.clone());
+
+            let b_un_take = raw_bot_un.clone();
+            let s_name_take = short_name.clone();
+            let snap_finish = state_snap.clone();
+            let b_un_fin = raw_bot_un.clone();
+            let s_name_fin = short_name.clone();
+            let b_un_close = raw_bot_un.clone();
+            let s_name_close = short_name.clone();
+            let snap_close = state_snap;
+
+            layers.push(
+                div()
+                    .id("minimized-miniapp-pill")
+                    .cursor_pointer()
+                    .absolute()
+                    .bottom(px(86.0))
+                    .right(px(24.0))
+                    .w(px(320.0))
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .rounded(px(16.0))
+                    .bg(rgb(pal.modal_bg))
+                    .border_1()
+                    .border_color(rgb(badge_color))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.miniapps.is_miniapp_minimized = false;
+                            if let Some(ref ov) = this.miniapps.miniapp_overlay {
+                                ov.update(cx, |w, wcx| {
+                                    w.is_open = true;
+                                    w.is_floating_pip = false;
+                                    wcx.notify();
+                                });
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("miniapp-floating-pip-card")
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .child(tg_icon(IconName::BotRobot, 17.0, badge_color))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .min_w(px(0.0))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.0))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(rgb(pal.text_primary))
+                                                            .child(title),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .px(px(6.0))
+                                                            .py(px(1.5))
+                                                            .rounded(px(999.0))
+                                                            .bg(rgb(badge_color))
+                                                            .text_size(px(10.0))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(rgb(0xFFFFFF))
+                                                            .child(badge_label),
+                                                    ),
+                                            )
+                                            .when(!bot_un_display.is_empty(), |col| {
+                                                col.child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(pal.text_link))
+                                                        .child(bot_un_display),
+                                                )
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("minimized-miniapp-close-btn")
+                                    .cursor_pointer()
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded_full()
+                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if is_takeover && !b_un_close.is_empty() {
+                                                this.client.send_miniapp_takeover_state(
+                                                    MiniAppTakeoverEvent {
+                                                        bot_username: b_un_close.clone(),
+                                                        short_name: s_name_close.clone(),
+                                                        chat_id,
+                                                        bot_user_id: bot_uid as i64,
+                                                        mode: MiniAppControlMode::Idle,
+                                                        user_note: None,
+                                                        state_snapshot: snap_close.clone(),
+                                                    },
+                                                );
+                                            }
+                                            this.miniapps.is_miniapp_minimized = false;
+                                            this.miniapps.floating_pip_status = None;
+                                            if let Some(ov) = this.miniapps.miniapp_overlay.take() {
+                                                ov.update(cx, |w, _| w.close());
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    )
+                    .when(!detail_line.trim().is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(rgb(pal.text_secondary))
+                                .child(detail_line),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(6.0))
+                            .when(is_ai || is_waiting, |row| {
+                                row.child(
+                                    div()
+                                        .id("pip-takeover-btn")
+                                        .cursor_pointer()
+                                        .px(px(9.0))
+                                        .py(px(4.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(0xF59E0B))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xFFFFFF))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.miniapps.is_miniapp_minimized = false;
+                                                if let Some(ref ov) = this.miniapps.miniapp_overlay {
+                                                    ov.update(cx, |w, wcx| {
+                                                        w.is_open = true;
+                                                        w.is_floating_pip = false;
+                                                        w.control_mode =
+                                                            MiniAppControlMode::UserTakeover;
+                                                        w.control_status_text =
+                                                            "手动接管中".to_string();
+                                                        wcx.notify();
+                                                    });
+                                                }
+                                                if let Some(ref mut ps) =
+                                                    this.miniapps.floating_pip_status
+                                                {
+                                                    ps.mode = MiniAppControlMode::UserTakeover;
+                                                    ps.status_text =
+                                                        "用户正在手动接管小程序".to_string();
+                                                    ps.active_tool = None;
+                                                }
+                                                if !b_un_take.is_empty() {
+                                                    this.client.send_miniapp_takeover_state(
+                                                        MiniAppTakeoverEvent {
+                                                            bot_username: b_un_take.clone(),
+                                                            short_name: s_name_take.clone(),
+                                                            chat_id,
+                                                            bot_user_id: bot_uid as i64,
+                                                            mode: MiniAppControlMode::UserTakeover,
+                                                            user_note: None,
+                                                            state_snapshot: None,
+                                                        },
+                                                    );
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "✋ 接管控制", "Take Over")),
+                                )
+                            })
+                            .when(is_takeover, |row| {
+                                row.child(
+                                    div()
+                                        .id("pip-finish-takeover-btn")
+                                        .cursor_pointer()
+                                        .px(px(9.0))
+                                        .py(px(4.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(0x16A34A))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xFFFFFF))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(ref ov) = this.miniapps.miniapp_overlay {
+                                                    ov.update(cx, |w, wcx| {
+                                                        w.control_mode =
+                                                            MiniAppControlMode::AiControlling;
+                                                        w.control_status_text =
+                                                            "已结束接管，AI 继续执行".to_string();
+                                                        wcx.notify();
+                                                    });
+                                                }
+                                                if let Some(ref mut ps) =
+                                                    this.miniapps.floating_pip_status
+                                                {
+                                                    ps.mode = MiniAppControlMode::AiControlling;
+                                                    ps.status_text =
+                                                        "已交还控制权，AI 继续中".to_string();
+                                                }
+                                                if !b_un_fin.is_empty() {
+                                                    this.client.send_miniapp_takeover_state(
+                                                        MiniAppTakeoverEvent {
+                                                            bot_username: b_un_fin.clone(),
+                                                            short_name: s_name_fin.clone(),
+                                                            chat_id,
+                                                            bot_user_id: bot_uid as i64,
+                                                            mode: MiniAppControlMode::Idle,
+                                                            user_note: None,
+                                                            state_snapshot: snap_finish.clone(),
+                                                        },
+                                                    );
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "✅ 结束接管，AI 继续", "Finish & Resume")),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("pip-expand-btn")
+                                    .px(px(9.0))
+                                    .py(px(4.0))
+                                    .rounded(px(8.0))
+                                    .bg(rgb(pal.accent))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xFFFFFF))
+                                    .child(tr_str(lang, "展开", "Restore")),
+                            ),
+                    )
+                    .into_any_element(),
+            );
         }
         if let Some(overlay) = self.miniapps.miniapp_overlay.clone().filter(|ov| ov.read(cx).is_open) {
             layers.push(
@@ -987,7 +1353,20 @@ impl AppShell {
                                 div().id("creation-modal-submit-btn").cursor_pointer().px(px(16.0)).py(px(7.0)).rounded(px(8.0))
                                     .bg(rgb(pal.accent)).text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.active_button_fg))
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                        this.sidebar.update(cx, |sb, scx| { sb.submit_creation_modal(); scx.notify(); });
+                                        let created = this.sidebar.update(cx, |sb, scx| {
+                                            let res = sb.submit_creation_modal();
+                                            scx.notify();
+                                            res
+                                        });
+                                        if created.is_none() {
+                                            let msg = tr_str(
+                                                this.active_lang_id(),
+                                                "请输入对方的真实用户名或手机号",
+                                                "Please enter a registered username or phone number",
+                                            )
+                                            .to_string();
+                                            this.window_runtime.enqueue_toast(msg, 2600);
+                                        }
                                         cx.notify();
                                     }))
                                     .child(submit_lbl),
@@ -1083,10 +1462,10 @@ impl AppShell {
         Self::render_workspace_modal_shell("telegram-task-center-modal-backdrop", "telegram-task-center-modal-box", 760.0, 640.0, self.theme_state.palette, body, cx)
     }
 
-    /// Renders the Hermes Agent Studio panel inside the Task Center modal.
+    /// Renders the Fabushi Agent Studio panel inside the Task Center modal.
     pub fn render_task_center_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.active_lang_id();
-        self.render_studio_modal_panel(IconName::Poll, tr_str(lang, "Hermes 智能体工作台", "Hermes Agent Studio"), cx)
+        self.render_studio_modal_panel(IconName::Poll, tr_str(lang, "Fabushi 智能体工作台", "Fabushi Agent Studio"), cx)
     }
 
     /// Renders the centered MCP Tools modal overlay (`#telegram-mcp-tools-modal-box`).
@@ -1095,10 +1474,10 @@ impl AppShell {
         Self::render_workspace_modal_shell("telegram-mcp-tools-modal-backdrop", "telegram-mcp-tools-modal-box", 760.0, 640.0, self.theme_state.palette, body, cx)
     }
 
-    /// Renders the Hermes Toolsets & Terminal Studio panel inside the MCP Tools modal.
+    /// Renders the Fabushi Toolsets & Terminal Studio panel inside the MCP Tools modal.
     pub fn render_mcp_tools_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let lang = self.active_lang_id();
-        self.render_studio_modal_panel(IconName::TerminalMcp, tr_str(lang, "Hermes 工具集与终端工作台", "Hermes Toolsets & Terminal Studio"), cx)
+        self.render_studio_modal_panel(IconName::TerminalMcp, tr_str(lang, "Fabushi 工具集与终端工作台", "Fabushi Toolsets & Terminal Studio"), cx)
     }
 
     /// Renders the bottom-left floating account quick-action popover overlay.

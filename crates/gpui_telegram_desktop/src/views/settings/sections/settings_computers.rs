@@ -856,6 +856,13 @@ impl SettingsComputersSections {
                 )
             })
             .child(self.render_tailnet_mesh_card(pal, lang))
+            .when(cfg!(target_os = "macos"), |col| {
+                col.child(settings_subsection_title(
+                    tr_str(lang, "系统权限", "System Permissions"),
+                    pal,
+                ))
+                .child(self.render_macos_permissions_card(pal, lang, cx))
+            })
             .child(settings_subsection_title(
                 tr_str(lang, "本地电脑", "Local Computers"),
                 pal,
@@ -866,6 +873,141 @@ impl SettingsComputersSections {
                 pal,
             ))
             .child(cloud_card)
+            .into_any_element()
+    }
+
+    fn render_macos_permissions_card(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::platform::mac::macos_permissions_drag::{
+            has_accessibility_permission, has_screen_recording_permission,
+            open_accessibility_settings, open_screen_recording_settings,
+        };
+
+        let screen_ok = has_screen_recording_permission();
+        let ax_ok = has_accessibility_permission();
+
+        let perm_row = |id: &'static str,
+                        title: &'static str,
+                        desc: &'static str,
+                        granted: bool,
+                        on_open: fn()| {
+            let badge_color = if granted { pal.success } else { pal.accent };
+            let badge_label = if granted {
+                tr_str(lang, "已开启", "Enabled")
+            } else {
+                tr_str(lang, "未开启", "Not Enabled")
+            };
+            div()
+                .px(px(16.0))
+                .py(px(12.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.text_primary))
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(7.0))
+                                        .py(px(1.5))
+                                        .rounded(px(999.0))
+                                        .bg(TdesktopThemePalette::rgba_with_alpha(
+                                            badge_color,
+                                            0.14,
+                                        ))
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(badge_color))
+                                        .child(badge_label),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(pal.text_secondary))
+                                .child(desc),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(id)
+                        .cursor_pointer()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(999.0))
+                        .bg(if granted {
+                            rgb(pal.input_bg).into()
+                        } else {
+                            TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
+                        })
+                        .border_1()
+                        .border_color(rgb(if granted { pal.border_fg } else { pal.accent }))
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(if granted {
+                            pal.text_secondary
+                        } else {
+                            pal.accent
+                        }))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                            on_open();
+                        })
+                        .child(tr_str(
+                            lang,
+                            "在“系统设置”中启用",
+                            "Enable in System Settings",
+                        )),
+                )
+        };
+
+        settings_card(pal)
+            .child(perm_row(
+                "settings-perm-screen-btn",
+                tr_str(lang, "录屏与系统录音", "Screen Recording"),
+                tr_str(
+                    lang,
+                    "用于实时查看远程桌面画面",
+                    "Required to view the live remote desktop screen",
+                ),
+                screen_ok,
+                open_screen_recording_settings,
+            ))
+            .child(div().h(px(1.0)).mx(px(16.0)).bg(rgb(pal.border_fg)))
+            .child(perm_row(
+                "settings-perm-ax-btn",
+                tr_str(lang, "辅助功能", "Accessibility"),
+                tr_str(
+                    lang,
+                    "用于远程鼠标点击与键盘操控",
+                    "Required to send remote mouse clicks and keystrokes",
+                ),
+                ax_ok,
+                open_accessibility_settings,
+            ))
             .into_any_element()
     }
 

@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui::{Bounds, Context, Pixels, Window};
 use gpui_telegram_proto::miniapp_contracts::{
     CloudStorageItem, MiniAppActionButton, MiniAppActionRequest, MiniAppActionResponse,
-    MiniAppLaunchContext, MiniAppUiSchema,
+    MiniAppControlMode, MiniAppLaunchContext, MiniAppUiSchema, MiniAppWebMcpCommand,
+    MiniAppWebMcpResponse, WebMcpToolDescriptor,
 };
 
 #[cfg(target_os = "macos")]
@@ -157,6 +158,14 @@ pub enum BotWebViewPendingAction {
         short_name: String,
         key: String,
     },
+    TakeoverMiniApp,
+    FinishTakeoverAndResumeAi {
+        user_note: Option<String>,
+        state_snapshot: Option<serde_json::Value>,
+    },
+    SwitchToFloatingPip,
+    ExpandFromFloatingPip,
+    WebMcpResponseReady(MiniAppWebMcpResponse),
 }
 
 /// Authentic BotAttachWebView component state + full Telegram Desktop Mini App interactive shell.
@@ -201,6 +210,14 @@ pub struct BotAttachWebView {
     pub cloud_key_draft: String,
     pub cloud_value_draft: String,
     pub pending_actions: VecDeque<BotWebViewPendingAction>,
+    pub external_modal_occluding: bool,
+    pub control_mode: MiniAppControlMode,
+    pub control_status_text: String,
+    pub active_webmcp_tool: Option<String>,
+    pub is_floating_pip: bool,
+    pub last_webmcp_state_summary: Option<serde_json::Value>,
+    pub pending_webmcp_queue: VecDeque<MiniAppWebMcpCommand>,
+    pub webmcp_page_ready: bool,
     #[cfg(target_os = "macos")]
     pub(crate) macos_webview: Option<MacOsWkWebView>,
     #[cfg(target_os = "macos")]
@@ -250,6 +267,14 @@ impl BotAttachWebView {
             cloud_key_draft: String::new(),
             cloud_value_draft: String::new(),
             pending_actions: VecDeque::new(),
+            external_modal_occluding: false,
+            control_mode: MiniAppControlMode::Idle,
+            control_status_text: String::new(),
+            active_webmcp_tool: None,
+            is_floating_pip: false,
+            last_webmcp_state_summary: None,
+            pending_webmcp_queue: VecDeque::new(),
+            webmcp_page_ready: false,
             #[cfg(target_os = "macos")]
             macos_webview: None,
             #[cfg(target_os = "macos")]
@@ -343,12 +368,21 @@ impl BotAttachWebView {
         self.is_dirty = false;
         self.is_loading = false;
         self.status_toast = None;
+        self.webmcp_page_ready = false;
+        self.last_webmcp_state_summary = None;
         self.launch_context = Some(ctx);
     }
 
     pub fn close(&mut self) {
         self.destroy_native_webview();
         self.is_open = false;
+        self.is_floating_pip = false;
+        self.control_mode = MiniAppControlMode::Idle;
+        self.control_status_text.clear();
+        self.active_webmcp_tool = None;
+        self.last_webmcp_state_summary = None;
+        self.pending_webmcp_queue.clear();
+        self.webmcp_page_ready = false;
         self.active_bot = None;
         self.url.clear();
         self.app_id = None;
@@ -682,6 +716,143 @@ impl BotAttachWebView {
         }
     }
 
+    /// Parks the native child `WKWebView` in a 1x1 near-transparent frame so background PiP WebMCP executes smoothly.
+    pub fn park_native_webview_for_pip(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(ref mut wv) = self.macos_webview {
+            wv.park_for_pip();
+        }
+    }
+
+    /// Updates live AI/takeover control status metadata shown in chrome banner and Floating PiP card.
+    pub fn apply_control_status(
+        &mut self,
+        mode: MiniAppControlMode,
+        status_text: &str,
+        active_tool: Option<&str>,
+    ) {
+        self.control_mode = mode;
+        if !status_text.trim().is_empty() {
+            self.control_status_text = status_text.to_string();
+        }
+        self.active_webmcp_tool = active_tool.map(|s| s.to_string());
+    }
+
+    /// Enqueues or immediately executes a server WebMCP command against this Mini App WebView.
+    pub fn dispatch_webmcp_command(&mut self, cmd: MiniAppWebMcpCommand) {
+        if cmd.operation == "request_takeover" {
+            self.control_mode = MiniAppControlMode::WaitingForTakeover;
+            self.control_status_text = cmd
+                .status_message
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "AI 请求您手动接管小程序".to_string());
+            self.active_webmcp_tool = None;
+            self.is_open = true;
+            self.is_floating_pip = false;
+            self.disclaimer_accepted = true;
+            return;
+        }
+
+        self.control_mode = MiniAppControlMode::AiControlling;
+        self.active_webmcp_tool = cmd.tool_name.clone();
+        self.control_status_text = cmd
+            .status_message
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                cmd.tool_name
+                    .as_deref()
+                    .map(|t| format!("正在调用 {t}"))
+                    .unwrap_or_else(|| "AI 正在读取小程序状态".to_string())
+            });
+        self.pending_webmcp_queue.push_back(cmd);
+        self.flush_pending_webmcp_queue();
+    }
+
+    /// Flushes queued WebMCP commands into the live `WKWebView` (or headless test fallback).
+    pub fn flush_pending_webmcp_queue(&mut self) {
+        if self.pending_webmcp_queue.is_empty() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let use_headless_fallback = MacOsWkWebView::is_headless_or_offline_test_env();
+        #[cfg(not(target_os = "macos"))]
+        let use_headless_fallback = true;
+
+        if use_headless_fallback {
+            while let Some(cmd) = self.pending_webmcp_queue.pop_front() {
+                let is_discover = cmd.operation == "discover";
+                let tools = if is_discover {
+                    vec![
+                        WebMcpToolDescriptor {
+                            name: "get_state".to_string(),
+                            description: "Read Mini App UI state".to_string(),
+                            input_schema: serde_json::json!({ "type": "object" }),
+                            read_only: true,
+                        },
+                        WebMcpToolDescriptor {
+                            name: "page_inspect".to_string(),
+                            description: "Inspect Mini App controls".to_string(),
+                            input_schema: serde_json::json!({ "type": "object" }),
+                            read_only: true,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let summary = serde_json::json!({
+                    "title": self.ui_schema.title,
+                    "bot_username": self.bot_username,
+                    "short_name": self.current_short_name(),
+                    "control_mode": "ai_controlling",
+                });
+                self.last_webmcp_state_summary = Some(summary.clone());
+                self.pending_actions
+                    .push_back(BotWebViewPendingAction::WebMcpResponseReady(
+                        MiniAppWebMcpResponse {
+                            request_id: cmd.request_id,
+                            ok: true,
+                            result: serde_json::json!({
+                                "headless_desktop": true,
+                                "operation": cmd.operation,
+                                "tool_name": cmd.tool_name,
+                            }),
+                            error: None,
+                            tools,
+                            state_summary: Some(summary),
+                            control_mode: MiniAppControlMode::AiControlling,
+                        },
+                    ));
+            }
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if !self.webmcp_page_ready {
+                return;
+            }
+            let Some(ref wv) = self.macos_webview else {
+                return;
+            };
+            while let Some(cmd) = self.pending_webmcp_queue.pop_front() {
+                let req_lit = serde_json::to_string(&cmd.request_id).unwrap_or_else(|_| "\"\"".to_string());
+                let op_lit = serde_json::to_string(&cmd.operation).unwrap_or_else(|_| "\"\"".to_string());
+                let tool_lit = cmd
+                    .tool_name
+                    .as_deref()
+                    .and_then(|t| serde_json::to_string(t).ok())
+                    .unwrap_or_else(|| "null".to_string());
+                let args_lit = serde_json::to_string(&cmd.arguments).unwrap_or_else(|_| "{}".to_string());
+                let js = format!(
+                    "(function(){{try{{if(window.__GPUI_WEBMCP__&&typeof window.__GPUI_WEBMCP__.invoke==='function'){{window.__GPUI_WEBMCP__.invoke({req_lit},{op_lit},{tool_lit},{args_lit});}}else if(window.TelegramWebviewProxy&&typeof window.TelegramWebviewProxy.postEvent==='function'){{window.TelegramWebviewProxy.postEvent('webmcp_response',JSON.stringify({{request_id:{req_lit},ok:false,result:{{}},error:'WebMCP runtime not ready on page',tools:[],control_mode:'ai_controlling'}}));}}}}catch(e){{try{{window.TelegramWebviewProxy&&window.TelegramWebviewProxy.postEvent('webmcp_response',JSON.stringify({{request_id:{req_lit},ok:false,result:{{}},error:String(e),tools:[],control_mode:'ai_controlling'}}));}}catch(_){{}}}}}})();"
+                );
+                wv.evaluate_js(&js);
+            }
+        }
+    }
+
     /// Detaches and releases the native child `WKWebView` (`removeFromSuperview`).
     pub fn destroy_native_webview(&mut self) {
         #[cfg(target_os = "macos")]
@@ -695,6 +866,7 @@ impl BotAttachWebView {
 
     /// Reloads the live `WKWebView` when attached, or queues an HTTP reload action in headless mode.
     pub fn reload_webview(&mut self) {
+        self.webmcp_page_ready = false;
         #[cfg(target_os = "macos")]
         if let Some(ref wv) = self.macos_webview {
             wv.reload();
@@ -779,8 +951,15 @@ impl BotAttachWebView {
                 if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
                     wv.load_url(&resolved_url);
                 }
-                wv.sync_bounds(bounds, visible);
+                if visible {
+                    wv.sync_bounds(bounds, true);
+                } else if self.is_floating_pip {
+                    wv.park_for_pip();
+                } else {
+                    wv.sync_bounds(bounds, false);
+                }
             }
+            self.flush_pending_webmcp_queue();
             had_events
         }
         #[cfg(not(target_os = "macos"))]
@@ -949,6 +1128,25 @@ impl BotAttachWebView {
                 if let Some(color) = parsed.get("color").and_then(|v| v.as_str()) {
                     let clean = color.trim();
                     self.background_color_override = (!clean.is_empty()).then(|| clean.to_string());
+                }
+            }
+            "__gpui_webmcp_page_ready" | "web_app_ready" | "iframe_ready" => {
+                self.webmcp_page_ready = true;
+                self.flush_pending_webmcp_queue();
+            }
+            "webmcp_response" => {
+                if let Ok(resp) = serde_json::from_str::<MiniAppWebMcpResponse>(event_data) {
+                    if let Some(ref summary) = resp.state_summary {
+                        self.last_webmcp_state_summary = Some(summary.clone());
+                    }
+                    self.active_webmcp_tool = None;
+                    if resp.ok {
+                        self.control_status_text = "AI 操作已完成，等待下一步指令".to_string();
+                    } else if let Some(ref err) = resp.error {
+                        self.control_status_text = format!("操作提示: {err}");
+                    }
+                    self.pending_actions
+                        .push_back(BotWebViewPendingAction::WebMcpResponseReady(resp));
                 }
             }
             _ => {}

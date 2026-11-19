@@ -5,6 +5,7 @@ use gpui::prelude::FluentBuilder;
 
 use crate::i18n::tr_key_or;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use super::cards::bot_assist_card::BotAssistCardAction;
 use super::cards::models::{
     CallDirection, CallType, InlineButtonType, InlineKeyboardButton, InvoiceStatus, PollOption,
     PollType,
@@ -18,6 +19,7 @@ pub enum InteractiveCardAction {
     PayInvoice(u64, String, u64),
     BotButton(u64, InlineButtonType),
     GenerativeButton(u64, String, String),
+    BotAssist(BotAssistCardAction),
 }
 
 pub fn render_poll_card<V: 'static>(

@@ -186,6 +186,9 @@ pub fn overlay_rich_message_metadata(
         .filter_map(|r| u64::try_from(r.message_id).ok().map(|id| (id, r)))
         .collect();
     for model in models.iter_mut() {
+        if model.is_local_only() {
+            continue;
+        }
         let Some(r) = by_id.get(&model.id) else {
             continue;
         };
@@ -744,6 +747,7 @@ fn message_content_preview(content: &MessageContent) -> String {
         MessageContent::Invoice { title, .. } => title.clone(),
         MessageContent::BotKeyboard { .. } => "Keyboard".to_string(),
         MessageContent::GenerativeCard(card) => card.title.clone(),
+        MessageContent::LocalBotAssistCard(_) => "[安全存储卡片]".to_string(),
     }
 }
 
@@ -801,6 +805,62 @@ pub fn apply_fenced_history_response(
         messages,
         &std::collections::HashSet::new(),
     )
+}
+
+/// Applies authoritative server-fetched chat history for `chat_id`, updating remote messages
+/// normally while preserving existing strictly-local `MessageContent::LocalBotAssistCard` items
+/// (and unsent `DeliveryStatus::Sending` drafts) in chronological order after remote messages.
+pub fn apply_authoritative_chat_history(
+    stage: &mut ConversationStage,
+    chat_id: u64,
+    mut server_models: Vec<MessageItemModel>,
+    protected_reaction_msg_ids: &HashSet<u64>,
+) {
+    let existing_refs: Vec<MessageItemModel> = if stage.active_chat_id == Some(chat_id) {
+        stage.messages.clone()
+    } else {
+        stage
+            .chat_histories
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let mut existing_by_id: HashMap<u64, &MessageItemModel> =
+        HashMap::with_capacity(existing_refs.len());
+    for prev in &existing_refs {
+        existing_by_id.insert(prev.id, prev);
+    }
+
+    for m in &mut server_models {
+        if let Some(prev) = existing_by_id.get(&m.id) {
+            if protected_reaction_msg_ids.contains(&m.id) {
+                m.reactions = prev.reactions.clone();
+            }
+            m.is_pinned = m.is_pinned || prev.is_pinned;
+        }
+    }
+
+    let mut reconciled = server_models;
+    for prev in &existing_refs {
+        if !prev.is_local_only()
+            && prev.delivery_status == DeliveryStatus::Sending
+            && !reconciled.iter().any(|m| m.id == prev.id)
+        {
+            reconciled.push(prev.clone());
+        }
+    }
+    for prev in &existing_refs {
+        if prev.is_local_only() && !reconciled.iter().any(|m| m.id == prev.id) {
+            reconciled.push(prev.clone());
+        }
+    }
+
+    if stage.active_chat_id == Some(chat_id) {
+        stage.messages = reconciled.clone();
+        stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
+    }
+    stage.chat_histories.insert(chat_id, reconciled);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -861,33 +921,11 @@ pub fn apply_fenced_history_response_preserving(
         }
     }
 
-    if stage.active_chat_id == Some(chat_id) {
-        let should_scroll_to_bottom =
-            stage.messages.is_empty() || stage.is_anchored_to_bottom || stage.is_at_bottom();
-        stage.merge_historical_messages_preserving(models, &effective_protected);
-        stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
-        if should_scroll_to_bottom {
-            stage.scroll_to_bottom();
-        }
-        stage.chat_histories.insert(chat_id, stage.messages.clone());
-    } else {
-        if !effective_protected.is_empty() {
-            for m in &mut models {
-                if effective_protected.contains(&m.id) {
-                    if let Some(prev) = existing_refs.iter().find(|e| e.id == m.id) {
-                        m.reactions = prev.reactions.clone();
-                    }
-                }
-            }
-        }
-        for prev in &existing_refs {
-            if prev.delivery_status == DeliveryStatus::Sending
-                && !models.iter().any(|m| m.id == prev.id)
-            {
-                models.push(prev.clone());
-            }
-        }
-        stage.chat_histories.insert(chat_id, models);
+    let should_scroll_to_bottom = stage.active_chat_id == Some(chat_id)
+        && (stage.messages.is_empty() || stage.is_anchored_to_bottom || stage.is_at_bottom());
+    apply_authoritative_chat_history(stage, chat_id, models, &effective_protected);
+    if should_scroll_to_bottom {
+        stage.scroll_to_bottom();
     }
     true
 }

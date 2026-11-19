@@ -233,6 +233,10 @@ pub async fn contacts_add_or_upsert(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let explicit_is_bot = payload.get("is_bot").and_then(|v| v.as_bool()).unwrap_or(false);
+    let require_existing = payload
+        .get("require_existing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let phone = payload
         .get("phone")
         .and_then(|v| v.as_str())
@@ -313,20 +317,58 @@ pub async fn contacts_add_or_upsert(
         }
     });
 
-    let target_uid = if let Some(uid_num) = payload.get("user_id").and_then(|v| v.as_u64()) {
-        UserId(uid_num)
+    let matched_existing_uid = if let Some(uid_num) = payload.get("user_id").and_then(|v| v.as_u64()) {
+        Some(UserId(uid_num))
     } else if is_botfather_alias {
-        UserId(crate::db::miniapp_store::BOTFATHER_USER_ID)
+        Some(UserId(crate::db::miniapp_store::BOTFATHER_USER_ID))
     } else if let Ok(Some(bot)) = state.db.get_bot_by_username(&slug) {
-        UserId(bot.bot_user_id as u64)
-    } else if let Ok(Some(ex)) = state.db.get_user_by_username(&slug) {
-        if ex.user_id != auth.user_id {
-            ex.user_id
-        } else {
-            UserId(500_000 + (Utc::now().timestamp_micros().unsigned_abs() % 400_000))
-        }
+        Some(UserId(bot.bot_user_id as u64))
+    } else if raw_un.is_some() {
+        state
+            .db
+            .get_user_by_username(&slug)
+            .ok()
+            .flatten()
+            .map(|ex| ex.user_id)
     } else {
-        UserId(500_000 + (Utc::now().timestamp_micros().unsigned_abs() % 400_000))
+        None
+    }
+    .or_else(|| {
+        phone
+            .as_deref()
+            .and_then(|p| state.db.get_user_by_phone(p).ok().flatten())
+            .map(|ex| ex.user_id)
+    });
+
+    if require_existing && !pre_is_bot {
+        match matched_existing_uid {
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": "user_not_found",
+                        "message": "User not found. Please check the username or phone number."
+                    })),
+                )
+                    .into_response();
+            }
+            Some(uid) if uid == auth.user_id => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "cannot_add_self",
+                        "message": "Cannot add yourself as a contact."
+                    })),
+                )
+                    .into_response();
+            }
+            Some(_) => {}
+        }
+    }
+
+    let target_uid = match matched_existing_uid {
+        Some(uid) if uid != auth.user_id => uid,
+        _ => UserId(500_000 + (Utc::now().timestamp_micros().unsigned_abs() % 400_000)),
     };
 
     let existing_user = state.db.get_user(target_uid).ok().flatten();

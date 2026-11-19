@@ -16,7 +16,7 @@ use crate::computer::ComputerCloudProvider;
 use crate::hermes::memory::{MemoryTarget, SoulProfile};
 use crate::hermes::security::ApprovalMode;
 use crate::hermes::toolsets::{
-    AgenticStateBackend, FabushiTeammateHandler, PlatformImBridge, ToolsetPreset,
+    AgenticStateBackend, FabushiTeammateHandler, PlatformImBridge, ToolsetId, ToolsetPreset,
 };
 use crate::hermes::{HermesEngine, HermesEngineConfig};
 use chrono::Utc;
@@ -53,6 +53,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tempfile::TempDir;
+
+pub const OFFICIAL_DEFAULT_BOT_USER_ID: i64 = 777_000;
+pub const OFFICIAL_DEFAULT_AGENT_ID: &str = "fabushi-ai-bot";
 
 #[derive(Debug, Clone)]
 pub struct FabushiBotProvisionSpec {
@@ -113,6 +116,10 @@ pub struct FabushiBotInstance {
 }
 
 impl FabushiBotInstance {
+    pub fn engine(&self) -> Arc<HermesEngine> {
+        Arc::clone(&self.hermes)
+    }
+
     pub fn hermes(&self) -> Arc<HermesEngine> {
         Arc::clone(&self.hermes)
     }
@@ -167,7 +174,12 @@ impl FabushiBotInstance {
         let effective_model = if !settings.preferred_model.trim().is_empty() {
             settings.preferred_model.clone()
         } else {
-            self.hermes.providers().active_info().1
+            let active = self.hermes.providers().active_info().1;
+            if active.eq_ignore_ascii_case("hermes-local-v1") {
+                String::new()
+            } else {
+                active
+            }
         };
 
         FabushiBotSummaryDto {
@@ -229,10 +241,75 @@ impl Drop for FabushiExecutionGuard {
     }
 }
 
+fn copy_dir_recursive_missing(src: &Path, dst: &Path) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dst);
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive_missing(&src_path, &dst_path);
+        } else if src_path.is_file() && !dst_path.exists() {
+            let _ = std::fs::copy(&src_path, &dst_path);
+        }
+    }
+}
+
+/// Non-destructively migrates legacy `<data>/hermes/` runtime files into `<agents_root>/fabushi-ai-bot/`
+/// on first boot after unifying Hermes into Fabushi, preserving existing disk data without touching
+/// the legacy directory.
+fn migrate_legacy_hermes_dir(legacy_dir: &Path, target_dir: &Path) {
+    if !legacy_dir.exists() || legacy_dir == target_dir {
+        return;
+    }
+    if target_dir.join("hermes_state.db").exists() {
+        return;
+    }
+    if std::fs::create_dir_all(target_dir).is_err() {
+        return;
+    }
+
+    let mut migrated_files = 0usize;
+    for fname in [
+        "hermes_state.db",
+        "hermes_state.db-wal",
+        "hermes_state.db-shm",
+        "user_providers.enc",
+        "MEMORY.md",
+        "USER.md",
+        "SOUL.md",
+    ] {
+        let src = legacy_dir.join(fname);
+        let dst = target_dir.join(fname);
+        if src.is_file() && !dst.exists() && std::fs::copy(&src, &dst).is_ok() {
+            migrated_files += 1;
+        }
+    }
+    for dname in ["skills", "checkpoints"] {
+        let src = legacy_dir.join(dname);
+        let dst = target_dir.join(dname);
+        if src.is_dir() && !dst.exists() {
+            copy_dir_recursive_missing(&src, &dst);
+            migrated_files += 1;
+        }
+    }
+    if migrated_files > 0 {
+        tracing::info!(
+            from = %legacy_dir.display(),
+            to = %target_dir.display(),
+            migrated_items = migrated_files,
+            "Migrated legacy Hermes runtime data into unified Fabushi core agent"
+        );
+    }
+}
+
 pub struct FabushiBotHost {
     agents_root: PathBuf,
     _ephemeral_dir: Option<TempDir>,
-    host_hermes: Arc<HermesEngine>,
+    core_engine: Arc<HermesEngine>,
+    acp_runner: RwLock<Arc<AcpRunner>>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
     teammate_handler: RwLock<Option<Arc<dyn FabushiTeammateHandler>>>,
     platform_im_bridge: RwLock<Option<Arc<dyn PlatformImBridge>>>,
@@ -243,17 +320,40 @@ pub struct FabushiBotHost {
     core_registry: Arc<Mutex<BotRegistry>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptiveTurnProfile {
+    pub thinking_budget_tokens: Option<usize>,
+    pub toolsets: Option<Vec<ToolsetId>>,
+    pub tier: &'static str,
+}
+
 impl FabushiBotHost {
-    pub fn new_with_dir(
+    /// Constructs the single unified Fabushi Agent Host owning the core runtime engine
+    /// (`<agents_root>/fabushi-ai-bot/`, automatically bound to official bot `777_000`) and
+    /// migrating any legacy `<data>/hermes/` state on first run.
+    pub fn new_unified(
         agents_root: impl AsRef<Path>,
-        host_hermes: Arc<HermesEngine>,
+        mut core_config: HermesEngineConfig,
+        legacy_hermes_dir: Option<&Path>,
     ) -> Result<Self> {
         let root = agents_root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
+        let core_dir = root.join(OFFICIAL_DEFAULT_AGENT_ID);
+        std::fs::create_dir_all(&core_dir)?;
+        if let Some(legacy_dir) = legacy_hermes_dir {
+            migrate_legacy_hermes_dir(legacy_dir, &core_dir);
+        }
+        core_config.data_dir = Some(core_dir);
+        let default_model = core_config.default_model.clone();
+        let core_engine = Arc::new(HermesEngine::new(core_config)?);
+        core_engine.set_bound_agent_id(OFFICIAL_DEFAULT_AGENT_ID);
+        let acp_runner =
+            Arc::new(AcpRunner::new(&default_model).with_hermes_engine(Arc::clone(&core_engine)));
         Ok(Self {
             agents_root: root,
             _ephemeral_dir: None,
-            host_hermes,
+            core_engine,
+            acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
@@ -265,15 +365,32 @@ impl FabushiBotHost {
         })
     }
 
-    pub fn new_ephemeral(host_hermes: Arc<HermesEngine>) -> Result<Self> {
+    /// Constructs an ephemeral in-memory unified Fabushi Agent Host for tests and sandboxes.
+    pub fn new_unified_ephemeral(default_model: impl Into<String>) -> Result<Self> {
         let temp_dir = TempDir::new().map_err(|e| {
             TelegramError::Internal(format!("Failed to create ephemeral Fabushi agents dir: {e}"))
         })?;
         let root = temp_dir.path().to_path_buf();
+        let model = default_model.into();
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let core_cfg = HermesEngineConfig {
+            workspace_root,
+            data_dir: None,
+            default_model: model.clone(),
+            ..Default::default()
+        };
+        let core_engine = Arc::new(
+            HermesEngine::new(core_cfg)
+                .or_else(|_| HermesEngine::in_memory())?,
+        );
+        core_engine.set_bound_agent_id(OFFICIAL_DEFAULT_AGENT_ID);
+        let acp_runner =
+            Arc::new(AcpRunner::new(&model).with_hermes_engine(Arc::clone(&core_engine)));
         Ok(Self {
             agents_root: root,
             _ephemeral_dir: Some(temp_dir),
-            host_hermes,
+            core_engine,
+            acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
@@ -283,6 +400,135 @@ impl FabushiBotHost {
             username_index: RwLock::new(HashMap::new()),
             core_registry: Arc::new(Mutex::new(BotRegistry::default())),
         })
+    }
+
+    pub fn new_with_dir(
+        agents_root: impl AsRef<Path>,
+        core_engine: Arc<HermesEngine>,
+    ) -> Result<Self> {
+        let root = agents_root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        let default_model = core_engine.providers().active_info().1;
+        let acp_runner =
+            Arc::new(AcpRunner::new(&default_model).with_hermes_engine(Arc::clone(&core_engine)));
+        Ok(Self {
+            agents_root: root,
+            _ephemeral_dir: None,
+            core_engine,
+            acp_runner: RwLock::new(acp_runner),
+            computer_provider: RwLock::new(None),
+            teammate_handler: RwLock::new(None),
+            platform_im_bridge: RwLock::new(None),
+            agentic_backend: RwLock::new(None),
+            instances: RwLock::new(HashMap::new()),
+            agent_id_index: RwLock::new(HashMap::new()),
+            username_index: RwLock::new(HashMap::new()),
+            core_registry: Arc::new(Mutex::new(BotRegistry::default())),
+        })
+    }
+
+    pub fn new_ephemeral(core_engine: Arc<HermesEngine>) -> Result<Self> {
+        let temp_dir = TempDir::new().map_err(|e| {
+            TelegramError::Internal(format!("Failed to create ephemeral Fabushi agents dir: {e}"))
+        })?;
+        let root = temp_dir.path().to_path_buf();
+        let default_model = core_engine.providers().active_info().1;
+        let acp_runner =
+            Arc::new(AcpRunner::new(&default_model).with_hermes_engine(Arc::clone(&core_engine)));
+        Ok(Self {
+            agents_root: root,
+            _ephemeral_dir: Some(temp_dir),
+            core_engine,
+            acp_runner: RwLock::new(acp_runner),
+            computer_provider: RwLock::new(None),
+            teammate_handler: RwLock::new(None),
+            platform_im_bridge: RwLock::new(None),
+            agentic_backend: RwLock::new(None),
+            instances: RwLock::new(HashMap::new()),
+            agent_id_index: RwLock::new(HashMap::new()),
+            username_index: RwLock::new(HashMap::new()),
+            core_registry: Arc::new(Mutex::new(BotRegistry::default())),
+        })
+    }
+
+    pub fn core_engine(&self) -> Arc<HermesEngine> {
+        Arc::clone(&self.core_engine)
+    }
+
+    pub fn acp_runner(&self) -> Arc<AcpRunner> {
+        self.acp_runner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_acp_runner(&self, runner: Arc<AcpRunner>) {
+        let mut guard = self.acp_runner.write().unwrap_or_else(|e| e.into_inner());
+        *guard = runner;
+    }
+
+    pub fn engine_for_bot(&self, bot_user_id: Option<i64>) -> Arc<HermesEngine> {
+        if let Some(uid) = bot_user_id {
+            if let Some(inst) = self.get_by_user_id(uid) {
+                return inst.engine();
+            }
+        }
+        Arc::clone(&self.core_engine)
+    }
+
+    /// Returns all active agent engines deduplicated by pointer identity (`core_engine` appears once,
+    /// associated with bot `777_000` when hydrated).
+    pub fn all_engines(&self) -> Vec<(Option<i64>, Arc<HermesEngine>)> {
+        let list = self.list_instances();
+        let core_bot_id = list
+            .iter()
+            .find(|inst| Arc::ptr_eq(&inst.hermes, &self.core_engine))
+            .map(|inst| inst.bot_user_id);
+        let mut out = vec![(core_bot_id, Arc::clone(&self.core_engine))];
+        for inst in list {
+            if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                out.push((Some(inst.bot_user_id), inst.engine()));
+            }
+        }
+        out
+    }
+
+    pub fn engine_for_session(&self, bot_user_id: Option<i64>, session_id: &str) -> Arc<HermesEngine> {
+        if bot_user_id.is_some() {
+            return self.engine_for_bot(bot_user_id);
+        }
+        for (_, engine) in self.all_engines() {
+            if engine.store().get_session(session_id).ok().flatten().is_some() {
+                return engine;
+            }
+        }
+        Arc::clone(&self.core_engine)
+    }
+
+    pub async fn run_all_due_cron_jobs(
+        &self,
+    ) -> Vec<(Option<i64>, Arc<HermesEngine>, crate::hermes::CronRunOutcome)> {
+        let mut out = Vec::new();
+        for (bot_uid, engine) in self.all_engines() {
+            if let Ok(outcomes) = engine.run_due_cron_jobs().await {
+                for outcome in outcomes {
+                    out.push((bot_uid, Arc::clone(&engine), outcome));
+                }
+            }
+        }
+        out
+    }
+
+    pub async fn tick_all_due_heartbeats(
+        &self,
+    ) -> Vec<(Option<i64>, Arc<HermesEngine>, crate::hermes::HeartbeatTickOutcome)> {
+        let mut out = Vec::new();
+        for (bot_uid, engine) in self.all_engines() {
+            if let Ok(Some(hb)) = engine.tick_heartbeat_if_due().await {
+                out.push((bot_uid, Arc::clone(&engine), hb));
+            }
+        }
+        out
     }
 
     pub fn agents_root(&self) -> &Path {
@@ -293,9 +539,12 @@ impl FabushiBotHost {
         if let Ok(mut guard) = self.computer_provider.write() {
             *guard = Some(Arc::clone(&provider));
         }
+        self.core_engine.set_computer_provider(Arc::clone(&provider));
         if let Ok(instances) = self.instances.read() {
             for inst in instances.values() {
-                inst.hermes.set_computer_provider(Arc::clone(&provider));
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_computer_provider(Arc::clone(&provider));
+                }
             }
         }
     }
@@ -304,9 +553,12 @@ impl FabushiBotHost {
         if let Ok(mut guard) = self.teammate_handler.write() {
             *guard = Some(Arc::clone(&handler));
         }
+        self.core_engine.set_teammate_handler(Arc::clone(&handler));
         if let Ok(instances) = self.instances.read() {
             for inst in instances.values() {
-                inst.hermes.set_teammate_handler(Arc::clone(&handler));
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_teammate_handler(Arc::clone(&handler));
+                }
             }
         }
     }
@@ -315,10 +567,12 @@ impl FabushiBotHost {
         if let Ok(mut guard) = self.platform_im_bridge.write() {
             *guard = Some(Arc::clone(&bridge));
         }
-        self.host_hermes.set_platform_im_bridge(Arc::clone(&bridge));
+        self.core_engine.set_platform_im_bridge(Arc::clone(&bridge));
         if let Ok(instances) = self.instances.read() {
             for inst in instances.values() {
-                inst.hermes.set_platform_im_bridge(Arc::clone(&bridge));
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_platform_im_bridge(Arc::clone(&bridge));
+                }
             }
         }
     }
@@ -327,20 +581,24 @@ impl FabushiBotHost {
         if let Ok(mut guard) = self.agentic_backend.write() {
             *guard = Some(Arc::clone(&backend));
         }
-        self.host_hermes.set_agentic_backend(Arc::clone(&backend));
+        self.core_engine.set_agentic_backend(Arc::clone(&backend));
         if let Ok(instances) = self.instances.read() {
             for inst in instances.values() {
-                inst.hermes.set_agentic_backend(Arc::clone(&backend));
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_agentic_backend(Arc::clone(&backend));
+                }
             }
         }
     }
 
     pub fn sync_all_providers(&self) {
-        let upstream = self.host_hermes.providers();
+        let upstream = self.core_engine.providers();
         if let Ok(instances) = self.instances.read() {
             for inst in instances.values() {
-                inst.hermes.sync_providers_from(upstream);
-                inst.hermes.share_user_providers_from(&self.host_hermes);
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.sync_providers_from(upstream);
+                    inst.hermes.share_user_providers_from(&self.core_engine);
+                }
             }
         }
     }
@@ -350,6 +608,7 @@ impl FabushiBotHost {
             "off" | "none" | "0" => "off".to_string(),
             "low" | "fast" => "low".to_string(),
             "high" | "deep" => "high".to_string(),
+            "auto" | "adaptive" | "smart" => "auto".to_string(),
             _ => "medium".to_string(),
         }
     }
@@ -360,6 +619,167 @@ impl FabushiBotHost {
             "low" | "fast" => Some(1024),
             "high" | "deep" => Some(12_288),
             _ => Some(4096),
+        }
+    }
+
+    pub fn is_thinking_required_model(model_id: &str) -> bool {
+        let lower = model_id.trim().to_ascii_lowercase();
+        lower.contains("gemini-2.5-pro") || lower.contains("o1") || lower.contains("o3")
+    }
+
+    /// AI-adaptive turn execution classifier: dynamically adjusts thinking depth and toolset surface
+    /// per turn based on prompt complexity and context so conversational turns respond immediately
+    /// while Mini App / engineering tasks retain full tooling and reasoning budget.
+    pub fn classify_adaptive_turn(
+        prompt: &str,
+        model_id: &str,
+        configured_thinking_level: &str,
+        has_companion_miniapp: bool,
+        has_online_computer: bool,
+    ) -> AdaptiveTurnProfile {
+        let norm_level = configured_thinking_level.trim().to_ascii_lowercase();
+        if matches!(norm_level.as_str(), "off" | "none" | "0") {
+            return AdaptiveTurnProfile {
+                thinking_budget_tokens: Self::is_thinking_required_model(model_id).then_some(256),
+                toolsets: None,
+                tier: "off",
+            };
+        }
+        if matches!(norm_level.as_str(), "high" | "deep") {
+            return AdaptiveTurnProfile {
+                thinking_budget_tokens: Some(12_288),
+                toolsets: None,
+                tier: "high",
+            };
+        }
+
+        let trimmed = prompt.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let char_count = trimmed.chars().count();
+
+        let is_complex_engineering = char_count > 220
+            || trimmed.contains("```")
+            || [
+                "architecture",
+                "refactor",
+                "debug",
+                "analyze",
+                "analysis",
+                "compare",
+                "plan",
+                "step-by-step",
+                "terminal",
+                "shell",
+                "command",
+                "compile",
+                "deploy",
+                "server",
+                "ssh",
+                "computer",
+                "写代码",
+                "修改文件",
+                "排查",
+                "架构",
+                "深度思考",
+                "详细分析",
+                "执行命令",
+                "终端",
+                "服务器",
+                "部署",
+                "编译",
+            ]
+            .iter()
+            .any(|kw| lower.contains(kw) || trimmed.contains(kw));
+
+        if is_complex_engineering {
+            let budget = if matches!(norm_level.as_str(), "low" | "fast") {
+                Some(1024)
+            } else {
+                Some(4096)
+            };
+            return AdaptiveTurnProfile {
+                thinking_budget_tokens: budget,
+                toolsets: None,
+                tier: "deep",
+            };
+        }
+
+        let is_miniapp_or_action = [
+            "miniapp",
+            "mini app",
+            "webmcp",
+            "小程序",
+            "打开",
+            "操控",
+            "操作",
+            "法布施",
+            "金刚经",
+            "心经",
+            "地藏经",
+            "阿弥陀经",
+            "法华经",
+            "楞严经",
+            "华严经",
+            "药师经",
+            "禅室",
+            "共修",
+            "功德",
+            "榜单",
+            "排行榜",
+            "发送",
+            "broadcast",
+            "dharma",
+            "sutra",
+            "chant",
+            "zen",
+            "http://",
+            "https://",
+            "browser",
+            "搜索",
+            "查询",
+            "查一下",
+            "search",
+            "remind",
+            "cron",
+            "poll",
+            "kanban",
+            "接管",
+            "takeover",
+        ]
+        .iter()
+        .any(|kw| lower.contains(kw) || trimmed.contains(kw));
+
+        if is_miniapp_or_action {
+            let mut sets = vec![
+                ToolsetId::Core,
+                ToolsetId::PlatformIm,
+                ToolsetId::Memory,
+                ToolsetId::Skills,
+                ToolsetId::Web,
+                ToolsetId::Browser,
+                ToolsetId::Todo,
+                ToolsetId::Reasoning,
+            ];
+            if has_online_computer
+                && (lower.contains("computer") || trimmed.contains("电脑") || trimmed.contains("桌面"))
+            {
+                sets.push(ToolsetId::ComputerUse);
+            }
+            return AdaptiveTurnProfile {
+                thinking_budget_tokens: Some(1024),
+                toolsets: Some(sets),
+                tier: "action",
+            };
+        }
+
+        let mut fast_sets = vec![ToolsetId::Core, ToolsetId::PlatformIm, ToolsetId::Memory];
+        if has_companion_miniapp {
+            fast_sets.push(ToolsetId::Skills);
+        }
+        AdaptiveTurnProfile {
+            thinking_budget_tokens: Self::is_thinking_required_model(model_id).then_some(256),
+            toolsets: Some(fast_sets),
+            tier: "fast",
         }
     }
 
@@ -570,12 +990,14 @@ impl FabushiBotHost {
                 }
                 Self::write_settings_json(get_sand_settings_path(&existing.agent_dir).as_path(), &st);
             }
-            existing
-                .hermes
-                .sync_providers_from(self.host_hermes.providers());
-            existing
-                .hermes
-                .share_user_providers_from(&self.host_hermes);
+            if !Arc::ptr_eq(&existing.hermes, &self.core_engine) {
+                existing
+                    .hermes
+                    .sync_providers_from(self.core_engine.providers());
+                existing
+                    .hermes
+                    .share_user_providers_from(&self.core_engine);
+            }
             let prof_snap = existing.profile();
             self.register_in_core_registry(
                 spec.bot_user_id,
@@ -587,11 +1009,15 @@ impl FabushiBotHost {
             return Ok(existing);
         }
 
-        let agent_id = self.resolve_unique_agent_id(
-            spec.agent_id.as_deref(),
-            &spec.username,
-            spec.bot_user_id,
-        )?;
+        let agent_id = if spec.bot_user_id == OFFICIAL_DEFAULT_BOT_USER_ID {
+            OFFICIAL_DEFAULT_AGENT_ID.to_string()
+        } else {
+            self.resolve_unique_agent_id(
+                spec.agent_id.as_deref(),
+                &spec.username,
+                spec.bot_user_id,
+            )?
+        };
         let agent_dir = self.agents_root.join(&agent_id);
         std::fs::create_dir_all(&agent_dir)?;
 
@@ -671,7 +1097,14 @@ impl FabushiBotHost {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
-            .unwrap_or_else(|| self.host_hermes.providers().active_info().1);
+            .unwrap_or_else(|| {
+                let active = self.core_engine.providers().active_info().1;
+                if active.eq_ignore_ascii_case("hermes-local-v1") {
+                    String::new()
+                } else {
+                    active
+                }
+            });
         let thinking_level = Self::normalize_thinking_level(spec.thinking_level.as_deref());
         let approval_mode = Self::normalize_approval_mode_name(spec.approval_mode.as_deref());
         let toolset_preset = Self::normalize_toolset_preset_name(spec.toolset_preset.as_deref());
@@ -689,46 +1122,68 @@ impl FabushiBotHost {
         };
         Self::write_settings_json(&settings_path, &runtime_settings);
 
-        // Initialize isolated per-Bot HermesEngine absorbing all Hermes tools, skills, memory,
-        // Honcho, checkpoints & slash commands inside `<agents_root>/<agent_id>/`.
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let bot_hermes_cfg = HermesEngineConfig {
-            workspace_root,
-            data_dir: Some(agent_dir.clone()),
-            default_model: preferred_model.clone(),
-            default_preset: Self::toolset_preset_for_name(&toolset_preset),
-            default_approval_mode: Self::approval_mode_for_name(&approval_mode),
-            ..Default::default()
+        // Bind official default bot (777_000) directly onto `core_engine` so there is ONLY ONE
+        // core Fabushi Agent runtime; all other bots receive strictly isolated per-bot workspaces
+        // sharing the host's user provider registry and bridges.
+        let (bot_hermes, acp_runner) = if spec.bot_user_id == OFFICIAL_DEFAULT_BOT_USER_ID {
+            let engine = Arc::clone(&self.core_engine);
+            engine.set_bound_agent_id(&agent_id);
+            if spec.approval_mode.is_some() {
+                if let Ok(mut sec) = engine.security().write() {
+                    sec.approvals.default_mode = Self::approval_mode_for_name(&approval_mode);
+                }
+            }
+            if spec.toolset_preset.is_some() {
+                if let Ok(mut reg) = engine.toolsets().write() {
+                    reg.apply_preset(Self::toolset_preset_for_name(&toolset_preset));
+                }
+            }
+            (engine, self.acp_runner())
+        } else {
+            let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let bot_hermes_cfg = HermesEngineConfig {
+                workspace_root,
+                data_dir: Some(agent_dir.clone()),
+                default_model: preferred_model.clone(),
+                default_preset: Self::toolset_preset_for_name(&toolset_preset),
+                default_approval_mode: Self::approval_mode_for_name(&approval_mode),
+                ..Default::default()
+            };
+            let engine = Arc::new(HermesEngine::new(bot_hermes_cfg)?);
+            engine.sync_providers_from(self.core_engine.providers());
+            engine.share_user_providers_from(&self.core_engine);
+            engine.set_bound_agent_id(&agent_id);
+            if let Some(provider) = self
+                .computer_provider
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+            {
+                engine.set_computer_provider(provider);
+            } else if let Some(provider) = self.core_engine.computer_provider() {
+                engine.set_computer_provider(provider);
+            }
+            if let Some(handler) = self.teammate_handler.read().ok().and_then(|g| g.clone()) {
+                engine.set_teammate_handler(handler);
+            } else if let Some(handler) = self.core_engine.teammate_handler() {
+                engine.set_teammate_handler(handler);
+            }
+            if let Some(bridge) = self.platform_im_bridge.read().ok().and_then(|g| g.clone()) {
+                engine.set_platform_im_bridge(bridge);
+            } else if let Some(bridge) = self.core_engine.platform_im_bridge() {
+                engine.set_platform_im_bridge(bridge);
+            }
+            if let Some(backend) = self.agentic_backend.read().ok().and_then(|g| g.clone()) {
+                engine.set_agentic_backend(backend);
+            } else if let Some(backend) = self.core_engine.agentic_backend() {
+                engine.set_agentic_backend(backend);
+            }
+            let runner =
+                Arc::new(AcpRunner::new(&preferred_model).with_hermes_engine(Arc::clone(&engine)));
+            (engine, runner)
         };
-        let bot_hermes = Arc::new(HermesEngine::new(bot_hermes_cfg)?);
-        bot_hermes.sync_providers_from(self.host_hermes.providers());
-        bot_hermes.share_user_providers_from(&self.host_hermes);
-        bot_hermes.set_bound_agent_id(&agent_id);
-        if let Some(provider) = self
-            .computer_provider
-            .read()
-            .ok()
-            .and_then(|g| g.clone())
-        {
-            bot_hermes.set_computer_provider(provider);
-        } else if let Some(provider) = self.host_hermes.computer_provider() {
-            bot_hermes.set_computer_provider(provider);
-        }
-        if let Some(handler) = self.teammate_handler.read().ok().and_then(|g| g.clone()) {
-            bot_hermes.set_teammate_handler(handler);
-        }
-        if let Some(bridge) = self.platform_im_bridge.read().ok().and_then(|g| g.clone()) {
-            bot_hermes.set_platform_im_bridge(bridge);
-        } else if let Some(bridge) = self.host_hermes.platform_im_bridge() {
-            bot_hermes.set_platform_im_bridge(bridge);
-        }
-        if let Some(backend) = self.agentic_backend.read().ok().and_then(|g| g.clone()) {
-            bot_hermes.set_agentic_backend(backend);
-        } else if let Some(backend) = self.host_hermes.agentic_backend() {
-            bot_hermes.set_agentic_backend(backend);
-        }
 
-        // Seed SOUL.md in this bot's isolated MemoryManager if empty and persona is provided
+        // Seed SOUL.md in this bot's MemoryManager if empty and persona is provided
         if !description.is_empty() && !bot_hermes.memory().has_soul() {
             let _ = bot_hermes.memory().write_soul(&SoulProfile::new(
                 &display_name,
@@ -740,9 +1195,6 @@ impl FabushiBotHost {
                 &description,
             ));
         }
-
-        let acp_runner =
-            Arc::new(AcpRunner::new(&preferred_model).with_hermes_engine(Arc::clone(&bot_hermes)));
 
         let instance = Arc::new(FabushiBotInstance {
             bot_user_id: spec.bot_user_id,

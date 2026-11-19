@@ -70,6 +70,8 @@ pub struct GatewayHub {
     search_indexer: Arc<RwLock<Option<Arc<crate::search::tantivy_indexer::TantivyIndexer>>>>,
     /// Optional WebRTC signaling hub for call session state & relay
     signaling_hub: Arc<RwLock<Option<Arc<crate::webrtc::signaling_hub::SignalingHub>>>>,
+    /// Optional WebMCP Mini App broker for RPC response & human takeover routing
+    webmcp_broker: Arc<RwLock<Option<Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>>>>,
     /// Optional CrossNodeEventBus for cluster-wide stateless event fan-out
     event_bus: Arc<RwLock<Option<Arc<dyn crate::bus::CrossNodeEventBus>>>>,
     /// Ordered outbound bus publisher channel
@@ -101,6 +103,7 @@ struct WeakGatewayHub {
     db: std::sync::Weak<RwLock<Option<Arc<crate::db::ServerDatabase>>>>,
     search_indexer: std::sync::Weak<RwLock<Option<Arc<crate::search::tantivy_indexer::TantivyIndexer>>>>,
     signaling_hub: std::sync::Weak<RwLock<Option<Arc<crate::webrtc::signaling_hub::SignalingHub>>>>,
+    webmcp_broker: std::sync::Weak<RwLock<Option<Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>>>>,
     event_bus: std::sync::Weak<RwLock<Option<Arc<dyn crate::bus::CrossNodeEventBus>>>>,
     outbound_bus_tx: std::sync::Weak<RwLock<Option<mpsc::UnboundedSender<(String, crate::bus::ServerEvent)>>>>,
     bus_tasks: std::sync::Weak<RwLock<Vec<tokio::task::AbortHandle>>>,
@@ -124,6 +127,7 @@ impl WeakGatewayHub {
             db: self.db.upgrade()?,
             search_indexer: self.search_indexer.upgrade()?,
             signaling_hub: self.signaling_hub.upgrade()?,
+            webmcp_broker: self.webmcp_broker.upgrade()?,
             event_bus: self.event_bus.upgrade()?,
             outbound_bus_tx: self.outbound_bus_tx.upgrade()?,
             bus_tasks: self.bus_tasks.upgrade()?,
@@ -169,6 +173,7 @@ impl Default for GatewayHub {
             db: Arc::new(RwLock::new(None)),
             search_indexer: Arc::new(RwLock::new(None)),
             signaling_hub: Arc::new(RwLock::new(None)),
+            webmcp_broker: Arc::new(RwLock::new(None)),
             event_bus: Arc::new(RwLock::new(None)),
             outbound_bus_tx: Arc::new(RwLock::new(None)),
             bus_tasks,
@@ -217,6 +222,17 @@ impl GatewayHub {
 
     pub fn signaling_hub(&self) -> Option<Arc<crate::webrtc::signaling_hub::SignalingHub>> {
         self.signaling_hub.read().clone()
+    }
+
+    pub fn set_webmcp_broker(&self, broker: Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>) {
+        *self.webmcp_broker.write() = Some(broker);
+    }
+
+    pub fn has_connected_user(&self, user_id: UserId) -> bool {
+        self.subscribers
+            .read()
+            .get(&user_id)
+            .is_some_and(|entries| !entries.is_empty())
     }
 
     pub fn set_session_revoked_handler(&self, handler: Arc<dyn Fn(u64, &str) + Send + Sync>) {
@@ -319,6 +335,9 @@ impl GatewayHub {
         let old_sh = self.signaling_hub.write().take();
         drop(old_sh);
 
+        let old_webmcp = self.webmcp_broker.write().take();
+        drop(old_webmcp);
+
         let old_bus = self.event_bus.write().take();
         drop(old_bus);
 
@@ -336,6 +355,7 @@ impl GatewayHub {
             db: Arc::downgrade(&self.db),
             search_indexer: Arc::downgrade(&self.search_indexer),
             signaling_hub: Arc::downgrade(&self.signaling_hub),
+            webmcp_broker: Arc::downgrade(&self.webmcp_broker),
             event_bus: Arc::downgrade(&self.event_bus),
             outbound_bus_tx: Arc::downgrade(&self.outbound_bus_tx),
             bus_tasks: Arc::downgrade(&self.bus_tasks),
@@ -1559,6 +1579,16 @@ impl GatewayHub {
                     message_id: 0,
                     pts,
                 });
+            }
+            WsClientFrame::MiniAppWebMcpResult(resp) => {
+                if let Some(broker) = self.webmcp_broker.read().clone() {
+                    broker.resolve_rpc_response(user_id, resp);
+                }
+            }
+            WsClientFrame::MiniAppTakeoverState(evt) => {
+                if let Some(broker) = self.webmcp_broker.read().clone() {
+                    broker.handle_takeover_event(user_id, evt);
+                }
             }
         }
     }

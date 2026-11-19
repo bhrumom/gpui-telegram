@@ -388,3 +388,62 @@ async fn test_fabushi_teammate_tools_execute_via_hermes_executor() {
     assert!(events[1].contains("create:coord-bot:name=QA Auditor"));
     assert!(events[2].contains("update:coord-bot->coord-bot"));
 }
+
+#[test]
+fn test_adaptive_turn_classifier_selects_depth_and_tools_automatically() {
+    let fast = FabushiBotHost::classify_adaptive_turn(
+        "你是什么模型",
+        "gpt-5",
+        "medium",
+        true,
+        false,
+    );
+    assert_eq!(fast.tier, "fast");
+    assert_eq!(fast.thinking_budget_tokens, None);
+    assert!(fast.toolsets.as_ref().is_some_and(|t| t.len() <= 4));
+
+    let fast_gem_pro = FabushiBotHost::classify_adaptive_turn(
+        "你好",
+        "gemini-2.5-pro",
+        "medium",
+        false,
+        false,
+    );
+    assert_eq!(fast_gem_pro.tier, "fast");
+    assert_eq!(fast_gem_pro.thinking_budget_tokens, Some(256));
+
+    let action = FabushiBotHost::classify_adaptive_turn(
+        "你可以帮我发送金刚经到全球吗",
+        "gpt-5",
+        "medium",
+        true,
+        false,
+    );
+    assert_eq!(action.tier, "action");
+    assert_eq!(action.thinking_budget_tokens, Some(1024));
+    assert!(action
+        .toolsets
+        .as_ref()
+        .is_some_and(|t| t.contains(&gpui_telegram_agent::hermes::toolsets::ToolsetId::PlatformIm)));
+
+    let deep = FabushiBotHost::classify_adaptive_turn(
+        "请深度分析并排查服务器端 Rust 异步死锁与编译配置问题，对比两种架构方案",
+        "gpt-5",
+        "medium",
+        false,
+        true,
+    );
+    assert_eq!(deep.tier, "deep");
+    assert_eq!(deep.thinking_budget_tokens, Some(4096));
+    assert!(deep.toolsets.is_none());
+
+    let explicit_high = FabushiBotHost::classify_adaptive_turn(
+        "你好",
+        "gpt-5",
+        "high",
+        false,
+        false,
+    );
+    assert_eq!(explicit_high.tier, "high");
+    assert_eq!(explicit_high.thinking_budget_tokens, Some(12_288));
+}

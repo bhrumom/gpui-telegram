@@ -489,21 +489,115 @@ async fn capture_screen_png_data_url(force_fallback: bool) -> (String, &'static 
 }
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CgPointFfi {
+    x: f64,
+    y: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn CGWarpMouseCursorPosition(new_cursor_position: CgPointFfi) -> i32;
+    fn CGEventCreateMouseEvent(
+        source: *const std::ffi::c_void,
+        mouse_type: u32,
+        mouse_cursor_position: CgPointFfi,
+        mouse_button: u32,
+    ) -> *mut std::ffi::c_void;
+    fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+#[cfg(target_os = "macos")]
+fn post_macos_left_click(px: i32, py: i32) -> Result<&'static str, String> {
+    const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+    const K_CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+    const K_CG_EVENT_MOUSE_MOVED: u32 = 5;
+    const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
+    const K_CG_HID_EVENT_TAP: u32 = 0;
+
+    unsafe {
+        if !AXIsProcessTrusted() {
+            return Err(
+                "macOS 辅助功能权限未授予：请在「系统设置 → 隐私与安全性 → 辅助功能」中允许 Fabushi 后重试"
+                    .to_string(),
+            );
+        }
+        let pt = CgPointFfi {
+            x: px as f64,
+            y: py as f64,
+        };
+        let _ = CGWarpMouseCursorPosition(pt);
+        let moved = CGEventCreateMouseEvent(
+            std::ptr::null(),
+            K_CG_EVENT_MOUSE_MOVED,
+            pt,
+            K_CG_MOUSE_BUTTON_LEFT,
+        );
+        if !moved.is_null() {
+            CGEventPost(K_CG_HID_EVENT_TAP, moved);
+            CFRelease(moved);
+        }
+        let down = CGEventCreateMouseEvent(
+            std::ptr::null(),
+            K_CG_EVENT_LEFT_MOUSE_DOWN,
+            pt,
+            K_CG_MOUSE_BUTTON_LEFT,
+        );
+        let up = CGEventCreateMouseEvent(
+            std::ptr::null(),
+            K_CG_EVENT_LEFT_MOUSE_UP,
+            pt,
+            K_CG_MOUSE_BUTTON_LEFT,
+        );
+        if down.is_null() || up.is_null() {
+            if !down.is_null() {
+                CFRelease(down);
+            }
+            if !up.is_null() {
+                CFRelease(up);
+            }
+            return Err("CoreGraphics failed to construct mouse click event".to_string());
+        }
+        CGEventPost(K_CG_HID_EVENT_TAP, down);
+        std::thread::sleep(Duration::from_millis(18));
+        CGEventPost(K_CG_HID_EVENT_TAP, up);
+        CFRelease(down);
+        CFRelease(up);
+        Ok("macos_coregraphics")
+    }
+}
+
+#[cfg(target_os = "macos")]
 async fn try_macos_gui_input(
     action: &str,
     x: Option<i32>,
     y: Option<i32>,
     text: Option<&str>,
     key: Option<&str>,
-) -> Option<&'static str> {
+) -> Result<Option<&'static str>, String> {
     if cfg!(test) || std::env::var_os("GPUI_OFFLINE_TEST").is_some() {
-        return None;
+        return Ok(None);
+    }
+
+    let action_lc = action.trim().to_ascii_lowercase();
+    if action_lc == "click" {
+        let Some((px, py)) = x.zip(y) else {
+            return Err("Missing x/y coordinates for click".to_string());
+        };
+        return post_macos_left_click(px, py).map(Some);
     }
 
     let mut cmd = tokio::process::Command::new("osascript");
-    match action.trim().to_ascii_lowercase().as_str() {
+    match action_lc.as_str() {
         "type" => {
-            let txt = text.filter(|s| !s.is_empty())?;
+            let Some(txt) = text.filter(|s| !s.is_empty()) else {
+                return Ok(None);
+            };
             cmd.args([
                 "-e",
                 "on run argv",
@@ -516,7 +610,9 @@ async fn try_macos_gui_input(
             ]);
         }
         "key" => {
-            let k = key.map(str::trim).filter(|s| !s.is_empty())?;
+            let Some(k) = key.map(str::trim).filter(|s| !s.is_empty()) else {
+                return Ok(None);
+            };
             let key_code = match k.to_ascii_lowercase().as_str() {
                 "enter" | "return" => Some(36u16),
                 "tab" => Some(48),
@@ -546,28 +642,24 @@ async fn try_macos_gui_input(
                     k,
                 ]);
             } else {
-                return None;
+                return Ok(None);
             }
         }
-        "click" => {
-            let (px, py) = (x?, y?);
-            let script = format!(
-                "ObjC.import('CoreGraphics'); \
-                 var pt = {{x: {px}, y: {py}}}; \
-                 var down = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDown, pt, $.kCGMouseButtonLeft); \
-                 var up = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseUp, pt, $.kCGMouseButtonLeft); \
-                 $.CGEventPost($.kCGHIDEventTap, down); \
-                 $.CGEventPost($.kCGHIDEventTap, up);"
-            );
-            cmd.args(["-l", "JavaScript", "-e", &script]);
-        }
-        _ => return None,
+        _ => return Ok(None),
     }
 
     cmd.kill_on_drop(true);
     match tokio::time::timeout(Duration::from_secs(2), cmd.output()).await {
-        Ok(Ok(output)) if output.status.success() => Some("macos_gui"),
-        _ => None,
+        Ok(Ok(output)) if output.status.success() => Ok(Some("macos_gui")),
+        Ok(Ok(output)) => {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if err.is_empty() {
+                Err("macOS 辅助功能权限未授予或系统事件被拦截".to_string())
+            } else {
+                Err(err)
+            }
+        }
+        _ => Err("macOS GUI input timed out".to_string()),
     }
 }
 
@@ -578,8 +670,8 @@ async fn try_macos_gui_input(
     _y: Option<i32>,
     _text: Option<&str>,
     _key: Option<&str>,
-) -> Option<&'static str> {
-    None
+) -> Result<Option<&'static str>, String> {
+    Ok(None)
 }
 
 /// Executes a `RemoteComputerOp` directly on the local host machine.
@@ -738,35 +830,45 @@ async fn execute_local_computer_op_inner(
             text,
             key,
         } => {
-            let delivered = try_macos_gui_input(
+            match try_macos_gui_input(
                 action,
                 *x,
                 *y,
                 text.as_deref(),
                 key.as_deref(),
             )
-            .await;
-            result.ok = true;
-            result.exit_code = 0;
-            if let Some(driver) = delivered {
-                result.stdout = format!(
-                    "gui_input delivered ({}): action={} x={:?} y={:?} text_len={} key={:?}",
-                    driver,
-                    action,
-                    x,
-                    y,
-                    text.as_ref().map(|t| t.len()).unwrap_or(0),
-                    key
-                );
-            } else {
-                result.stdout = format!(
-                    "gui_input acknowledged: action={} x={:?} y={:?} text_len={} key={:?}",
-                    action,
-                    x,
-                    y,
-                    text.as_ref().map(|t| t.len()).unwrap_or(0),
-                    key
-                );
+            .await
+            {
+                Ok(Some(driver)) => {
+                    result.ok = true;
+                    result.exit_code = 0;
+                    result.stdout = format!(
+                        "gui_input delivered ({}): action={} x={:?} y={:?} text_len={} key={:?}",
+                        driver,
+                        action,
+                        x,
+                        y,
+                        text.as_ref().map(|t| t.len()).unwrap_or(0),
+                        key
+                    );
+                }
+                Ok(None) => {
+                    result.ok = true;
+                    result.exit_code = 0;
+                    result.stdout = format!(
+                        "gui_input acknowledged: action={} x={:?} y={:?} text_len={} key={:?}",
+                        action,
+                        x,
+                        y,
+                        text.as_ref().map(|t| t.len()).unwrap_or(0),
+                        key
+                    );
+                }
+                Err(err_msg) => {
+                    result.ok = false;
+                    result.exit_code = 1;
+                    result.stderr = err_msg;
+                }
             }
         }
         RemoteComputerOp::TestConnection => {

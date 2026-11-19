@@ -3,7 +3,7 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_telegram_proto::miniapp_contracts::MiniAppActionRequest;
+use gpui_telegram_proto::miniapp_contracts::{MiniAppActionRequest, MiniAppControlMode};
 
 #[cfg(target_os = "macos")]
 use super::macos_wkwebview::MacOsWkWebView;
@@ -43,6 +43,28 @@ fn overflow_menu_btn(
 impl Render for BotAttachWebView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_open {
+            if self.is_floating_pip && self.disclaimer_accepted {
+                let entity = cx.entity().clone();
+                let pip_sync_canvas = canvas(
+                    |bounds, _, _| bounds,
+                    move |bounds, _, window, cx| {
+                        let _ = entity.update(cx, |this, entity_cx| {
+                            let had_events =
+                                this.sync_native_webview(window, bounds, false, entity_cx);
+                            if had_events {
+                                entity_cx
+                                    .spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                                        let _ = weak.update(app, |_, cx| cx.notify());
+                                    })
+                                    .detach();
+                            }
+                        });
+                    },
+                )
+                .w(px(1.0))
+                .h(px(1.0));
+                return pip_sync_canvas.into_any_element();
+            }
             self.hide_native_webview();
             return div().into_any_element();
         }
@@ -85,6 +107,8 @@ impl Render for BotAttachWebView {
         let is_full = self.is_fullscreen;
 
         let overlay_covering_webview = !self.disclaimer_accepted
+            || self.is_loading
+            || self.external_modal_occluding
             || self.write_access_prompt_open
             || self.menu_open
             || self.confirm_close_open
@@ -385,6 +409,166 @@ impl Render for BotAttachWebView {
                             ),
                     ),
             )
+            .when(self.control_mode != MiniAppControlMode::Idle, |el| {
+                let is_user_takeover = self.control_mode == MiniAppControlMode::UserTakeover;
+                let badge = match self.control_mode {
+                    MiniAppControlMode::Idle => "就绪",
+                    MiniAppControlMode::AiControlling => "🤖 AI 正在操控",
+                    MiniAppControlMode::WaitingForTakeover => "⏳ AI 请求您接管",
+                    MiniAppControlMode::UserTakeover => "✋ 您正在手动接管",
+                };
+                let detail = self
+                    .active_webmcp_tool
+                    .as_deref()
+                    .map(|t| format!("工具: {t}"))
+                    .unwrap_or_else(|| self.control_status_text.clone());
+                let accent_color = if is_user_takeover {
+                    0xF59E0B
+                } else {
+                    pal.accent
+                };
+                el.child(
+                    div()
+                        .id("miniapp-ai-control-banner")
+                        .w_full()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .bg(rgb(pal.card_bg))
+                        .border_b_1()
+                        .border_color(rgb(pal.border_fg))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .px(px(7.0))
+                                        .py(px(2.0))
+                                        .rounded(px(999.0))
+                                        .bg(rgb(accent_color))
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xFFFFFF))
+                                        .child(badge),
+                                )
+                                .when(!detail.trim().is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(pal.text_secondary))
+                                            .overflow_hidden()
+                                            .child(detail),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .when(!is_user_takeover, |row| {
+                                    row.child(
+                                        div()
+                                            .id("miniapp-banner-pip-btn")
+                                            .cursor_pointer()
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(7.0))
+                                            .bg(rgb(pal.menu_bg))
+                                            .hover(|s| s.bg(rgb(pal.hover_bg)))
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(pal.text_primary))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.is_floating_pip = true;
+                                                    this.is_open = false;
+                                                    this.pending_actions.push_back(
+                                                        BotWebViewPendingAction::SwitchToFloatingPip,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(tr_str(lang, "悬浮小窗", "Float PiP")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("miniapp-banner-takeover-btn")
+                                            .cursor_pointer()
+                                            .px(px(9.0))
+                                            .py(px(3.0))
+                                            .rounded(px(7.0))
+                                            .bg(rgb(pal.accent))
+                                            .hover(|s| s.bg(rgb(pal.accent_hover)))
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(0xFFFFFF))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.control_mode =
+                                                        MiniAppControlMode::UserTakeover;
+                                                    this.control_status_text =
+                                                        "手动接管中".to_string();
+                                                    this.pending_actions.push_back(
+                                                        BotWebViewPendingAction::TakeoverMiniApp,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(tr_str(lang, "✋ 接管控制", "Take Over")),
+                                    )
+                                })
+                                .when(is_user_takeover, |row| {
+                                    row.child(
+                                        div()
+                                            .id("miniapp-banner-finish-takeover-btn")
+                                            .cursor_pointer()
+                                            .px(px(9.0))
+                                            .py(px(3.0))
+                                            .rounded(px(7.0))
+                                            .bg(rgb(0x16A34A))
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(0xFFFFFF))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.control_mode =
+                                                        MiniAppControlMode::AiControlling;
+                                                    this.control_status_text =
+                                                        "已交还控制权，等待 AI 继续".to_string();
+                                                    this.pending_actions.push_back(
+                                                        BotWebViewPendingAction::FinishTakeoverAndResumeAi {
+                                                            user_note: None,
+                                                            state_snapshot: this
+                                                                .last_webmcp_state_summary
+                                                                .clone(),
+                                                        },
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(tr_str(
+                                                lang,
+                                                "✅ 结束接管，AI 继续",
+                                                "Done, Resume AI",
+                                            )),
+                                    )
+                                }),
+                        ),
+                )
+            })
             // 2. Overflow Menu (⋮)
             .when(self.menu_open, |el| {
                 let b_user_profile = self.bot_username.clone();

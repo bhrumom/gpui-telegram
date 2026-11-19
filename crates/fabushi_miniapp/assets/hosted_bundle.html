@@ -43,6 +43,7 @@
     #toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:20;background:rgba(20,24,36,.95);border:1px solid var(--gold);color:#fff;padding:9px 16px;border-radius:999px;font-size:12.5px;font-weight:600;display:none;max-width:90%;text-align:center}
     .ach-pop{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:19;padding:12px 18px;border-radius:16px;background:linear-gradient(135deg,#2A1E08,#141722);border:1px solid var(--gold);color:#fff;display:flex;align-items:center;gap:10px}
   </style>
+  <script src="/js/telegram-web-app.js"></script>
 </head>
 <body>
 <div id="app">
@@ -273,6 +274,163 @@
   filePicker.addEventListener('change', async () => { const f = filePicker.files && filePicker.files[0]; if (!f) return; let preview = null; if (f.size < 65536 && /text|json|md/.test(f.type || f.name)) preview = await f.text().catch(() => null); dispatch({ type: 'attach_custom_file', name: f.name, size_bytes: f.size, preview_text: preview }); filePicker.value = ''; });
   window.__FABUSHI_TEST_HOOK__ = { getState: () => lastVm, dispatch: cmd => dispatch(cmd), applyHttp: p => applyResult(callStr('fabushi_wasm_apply_http', typeof p === 'string' ? p : JSON.stringify(p))) };
 
+  let resolveBootReady = () => {};
+  const bootReadyPromise = new Promise(resolve => { resolveBootReady = resolve; });
+
+  function registerFabushiWebMcpTools() {
+    if (!navigator.modelContext || typeof navigator.modelContext.registerTool !== 'function') return;
+    const ensureReady = async () => {
+      if (!wasm || !lastVm) {
+        await Promise.race([
+          bootReadyPromise,
+          new Promise(r => setTimeout(r, 8000)),
+        ]);
+      }
+      if (!wasm || !lastVm) throw new Error('全球法布施 WASM 运行时尚未初始化完成');
+      return lastVm;
+    };
+    const snapshotSummary = () => {
+      if (!lastVm) return null;
+      return {
+        active_tab: lastVm.active_tab,
+        is_transferring: lastVm.is_transferring,
+        current_sending_scripture: lastVm.current_sending_scripture,
+        current_sending_country: lastVm.current_sending_country,
+        global_sent_count: lastVm.global_sent_count,
+        global_data_sent_formatted: lastVm.global_data_sent_formatted,
+        is_dharma_composer_mode: lastVm.is_dharma_composer_mode,
+        is_in_session: lastVm.is_in_session,
+        chant_count: lastVm.chant_count,
+        locked_practice: lastVm.locked_practice,
+        total_transfer_bytes: lastVm.profile?.total_transfer_bytes,
+        total_transfer_count: lastVm.profile?.total_transfer_count,
+        total_practice_sessions: lastVm.profile?.total_practice_sessions,
+        total_practice_chants: lastVm.profile?.total_practice_chants,
+      };
+    };
+    const tools = [
+      {
+        name: 'fabushi_get_status',
+        description: '读取全球法布施小程序当前实时状态（标签页、正在发送的经文与地区、累计字节、禅修会话与功德档案）',
+        inputSchema: { type: 'object', properties: {} },
+        annotations: { readOnlyHint: true },
+        execute: async () => { await ensureReady(); return snapshotSummary(); },
+      },
+      {
+        name: 'fabushi_switch_tab',
+        description: '切换全球法布施底部主标签页：home(全球法布施)、zen_room(禅室共修)、profile(我的功德)',
+        inputSchema: { type: 'object', required: ['tab'], properties: { tab: { type: 'string' } } },
+        execute: async ({ tab } = {}) => {
+          await ensureReady();
+          const mapTab = { home: 'home', dharma: 'home', zen_room: 'zen_room', zen: 'zen_room', practice: 'zen_room', profile: 'profile', discover: 'profile', me: 'profile' };
+          const target = mapTab[String(tab || 'home').toLowerCase()] || 'home';
+          dispatch({ type: 'select_tab', tab: target });
+          return snapshotSummary();
+        },
+      },
+      {
+        name: 'fabushi_send_dharma',
+        description: '直接在小程序界面选择指定经典（如金刚经、心经、大悲咒）与国家/全球节点（ALL）并发起全球法布施传输',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sutra: { type: 'string', description: '经文名称，例如 金刚经 / 心经 / 大悲咒' },
+            target_country: { type: 'string', description: '目标地区代码，ALL 代表全球' },
+            looping: { type: 'boolean', description: '是否开启循环布施' }
+          }
+        },
+        execute: async ({ sutra, target_country, looping } = {}) => {
+          await ensureReady();
+          dispatch({ type: 'select_tab', tab: 'home' });
+          dispatch({ type: 'activate_dharma_mode' });
+          const cleanSutra = String(sutra || '心经').replace(/[《》\s]/g, '').trim();
+          const found = (lastVm.sutras || []).find(su => su.title === cleanSutra || su.title.includes(cleanSutra) || cleanSutra.includes(su.title));
+          dispatch({ type: 'select_dharma_sutra', title: found ? found.title : cleanSutra });
+          if (target_country) {
+            const code = String(target_country).trim().toUpperCase();
+            if (code === 'ALL') dispatch({ type: 'toggle_region_all', selected: true });
+            else dispatch({ type: 'toggle_region_country', code });
+          } else if (!lastVm.country_list || !lastVm.country_list.length) {
+            dispatch({ type: 'toggle_region_all', selected: true });
+          }
+          if (typeof looping === 'boolean' && lastVm.is_looping !== looping) {
+            dispatch({ type: 'toggle_looping' });
+          }
+          dispatch({ type: 'submit_composer' });
+          return { dispatched: true, status: snapshotSummary() };
+        },
+      },
+      {
+        name: 'fabushi_stop_dharma',
+        description: '停止当前正在进行的全球法布施传输',
+        inputSchema: { type: 'object', properties: {} },
+        execute: async () => {
+          await ensureReady();
+          dispatch({ type: 'stop_transfer' });
+          return snapshotSummary();
+        },
+      },
+      {
+        name: 'fabushi_record_practice',
+        description: '在禅室共修补录一次念诵/共修功课记录',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sutra: { type: 'string' },
+            chant_count: { type: 'integer' },
+            duration_minutes: { type: 'integer' },
+            note: { type: 'string' }
+          }
+        },
+        execute: async ({ sutra, chant_count, duration_minutes, note } = {}) => {
+          await ensureReady();
+          const today = new Date().toISOString().slice(0, 10);
+          dispatch({
+            type: 'add_practice_record',
+            sutra_name: String(sutra || lastVm.locked_practice?.title || '心经').replace(/[《》\s]/g, ''),
+            chant_count: Number(chant_count) || 108,
+            duration_minutes: Number(duration_minutes) || 15,
+            record_date: today,
+            local_time: '08:00',
+            notes: note || 'AI WebMCP 共修记录'
+          });
+          return snapshotSummary();
+        },
+      },
+      {
+        name: 'fabushi_open_sheet',
+        description: '打开或关闭全球法布施小程序的弹窗（leaderboard / practice_leaderboard / sutra_reader / practice_records / region_selector）',
+        inputSchema: {
+          type: 'object',
+          required: ['sheet'],
+          properties: {
+            sheet: { type: 'string' },
+            open: { type: 'boolean' },
+            title: { type: 'string' }
+          }
+        },
+        execute: async ({ sheet, open = true, title = null } = {}) => {
+          await ensureReady();
+          const mapSheet = {
+            leaderboard: { type: 'open_leaderboard', open },
+            practice_leaderboard: { type: 'open_practice_leaderboard', open },
+            sutra_reader: { type: 'open_sutra_reader', open, title },
+            practice_records: { type: 'open_practice_records', open },
+            region_selector: { type: 'open_region_selector', open },
+          };
+          const cmd = mapSheet[String(sheet || '').toLowerCase()];
+          if (!cmd) throw new Error('未知弹窗名称: ' + sheet);
+          dispatch(cmd);
+          return snapshotSummary();
+        },
+      },
+    ];
+    for (const tool of tools) {
+      navigator.modelContext.registerTool(tool);
+    }
+  }
+  registerFabushiWebMcpTools();
+
   async function boot() {
     const resp = await fetch('/api/v1/fabushi-miniapp/app.wasm'), mod = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
     wasm = mod.instance.exports;
@@ -280,11 +438,12 @@
     let res = readResult(wasm.fabushi_wasm_init(Date.now(), -new Date().getTimezoneOffset(), canvas.clientWidth || 420, canvas.clientHeight || 780));
     if (tab) res = callStr('fabushi_wasm_set_initial_tab', tab);
     applyResult(res);
+    resolveBootReady();
     let lastTick = performance.now();
     const frame = now => { if (now - lastTick >= 33) { const dt = now - lastTick; lastTick = now; applyResult(readResult(wasm.fabushi_wasm_tick(dt, Date.now(), canvas.clientWidth || 420, canvas.clientHeight || 780))); } requestAnimationFrame(frame); };
     requestAnimationFrame(frame);
   }
-  boot().catch(err => { toastEl.textContent = 'WASM 加载失败: ' + err; toastEl.style.display = 'block'; });
+  boot().catch(err => { resolveBootReady(); toastEl.textContent = 'WASM 加载失败: ' + err; toastEl.style.display = 'block'; });
 })();
 </script>
 </body>

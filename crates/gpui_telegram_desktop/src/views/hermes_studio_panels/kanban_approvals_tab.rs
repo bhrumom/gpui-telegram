@@ -55,7 +55,7 @@ pub fn render_tasks_kanban_approvals_tab(
         // 1. Kanban Board (14-tool Kanban system)
         .child(
             studio_section_card(
-                tr_str(&lang, "Hermes 任务看板 (Kanban)", "Hermes Kanban Board"),
+                tr_str(&lang, "Fabushi 任务看板 (Kanban)", "Fabushi Kanban Board"),
                 IconName::Poll,
                 pal,
             )

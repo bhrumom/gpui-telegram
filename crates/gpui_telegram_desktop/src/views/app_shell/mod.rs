@@ -29,6 +29,7 @@ pub mod section_widget;
 pub mod semantic_tree;
 pub mod session;
 pub mod shell_actions;
+pub mod shell_bot_browser;
 pub mod shell_calls_rtc;
 pub mod shell_composer_actions;
 pub mod shell_computers_sync;
@@ -121,6 +122,7 @@ pub use shell_actions::{
     peer_avatar_color, resolve_active_target_chat_id, shell_mcp_to_entries,
     shell_tasks_to_acp_entries,
 };
+pub use shell_bot_browser::ShellBotBrowserState;
 pub use shell_panels::{
     localized_panel_label, parse_acp_tasks, parse_mcp_servers, parse_mcp_tools,
     render_empty_panel_notice, render_panel_header, ShellAcpTaskRow, ShellMcpServerRow,
@@ -136,12 +138,12 @@ pub use shell_theme::{
     tdesktop_mode_to_app_theme, toggle_desktop_theme_mode, ShellThemeTargets,
 };
 pub use shell_truth::{
-    apply_authoritative_chat_list, apply_fenced_chat_list_response,
-    apply_fenced_history_response, apply_fenced_history_response_preserving,
-    format_authoritative_timestamp, historical_message_to_model,
-    peer_subtitle_for_dialog, reset_account_conversation_views, select_authoritative_dialog,
-    try_consume_composer_for_send, validate_selected_send_target, SessionRequestFence,
-    VerifiedSendTarget,
+    apply_authoritative_chat_history, apply_authoritative_chat_list,
+    apply_fenced_chat_list_response, apply_fenced_history_response,
+    apply_fenced_history_response_preserving, format_authoritative_timestamp,
+    historical_message_to_model, peer_subtitle_for_dialog, reset_account_conversation_views,
+    select_authoritative_dialog, try_consume_composer_for_send, validate_selected_send_target,
+    SessionRequestFence, VerifiedSendTarget,
 };
 pub use support_autocomplete::SupportAutocomplete;
 pub use support_common::SupportCommon;

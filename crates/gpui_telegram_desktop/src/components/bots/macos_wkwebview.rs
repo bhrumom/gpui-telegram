@@ -99,6 +99,182 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
       }
     } catch (e) {}
   });
+  (function installEarlyWebMcp() {
+    var existing = window.__GPUI_WEBMCP__ || {};
+    var toolsMap = existing._tools || {};
+    function readStateSummary() {
+      try {
+        if (window.__FABUSHI_TEST_HOOK__ && typeof window.__FABUSHI_TEST_HOOK__.getState === 'function') {
+          var vm = window.__FABUSHI_TEST_HOOK__.getState();
+          if (vm) return vm;
+        }
+        if (window.STATE && typeof window.STATE === 'object') return window.STATE;
+      } catch (_) {}
+      return {
+        kind: 'external_webview',
+        title: document.title || '',
+        url: String(window.location && window.location.href || '')
+      };
+    }
+    function inspectPage() {
+      var controls = [];
+      try {
+        var nodes = document.querySelectorAll('button, a, input, select, textarea, [role="button"], .chip');
+        for (var i = 0; i < nodes.length && controls.length < 48; i++) {
+          var el = nodes[i];
+          controls.push({
+            index: i,
+            tag: (el.tagName || '').toLowerCase(),
+            id: el.id || null,
+            type: el.type || null,
+            placeholder: el.placeholder || null,
+            text: (el.innerText || el.textContent || el.value || '').trim().slice(0, 64),
+            disabled: !!el.disabled
+          });
+        }
+      } catch (_) {}
+      return { title: document.title || '', controls: controls, state_summary: readStateSummary() };
+    }
+    function builtins() {
+      return {
+        get_state: {
+          name: 'get_state',
+          description: '读取当前页面运行状态或摘要',
+          inputSchema: { type: 'object', properties: {} },
+          annotations: { readOnlyHint: true },
+          execute: function() { return readStateSummary(); }
+        },
+        page_inspect: {
+          name: 'page_inspect',
+          description: '探测当前页面可交互控件与结构',
+          inputSchema: { type: 'object', properties: {} },
+          annotations: { readOnlyHint: true },
+          execute: function() { return inspectPage(); }
+        },
+        page_click: {
+          name: 'page_click',
+          description: '点击匹配 selector 或文案的控件',
+          inputSchema: { type: 'object', properties: { selector: { type: 'string' }, text: { type: 'string' } } },
+          execute: function(args) {
+            var a = args || {};
+            var t = a.selector ? document.querySelector(String(a.selector)) : null;
+            if (!t && a.text) {
+              var needle = String(a.text).trim();
+              var els = document.querySelectorAll('button, a, [role="button"], .chip, .card, .btn');
+              for (var i = 0; i < els.length; i++) {
+                if ((els[i].innerText || els[i].textContent || '').indexOf(needle) !== -1) { t = els[i]; break; }
+              }
+            }
+            if (!t) throw new Error('未找到可点击目标元素');
+            t.click();
+            return { clicked: (t.innerText || t.id || t.tagName || '').trim().slice(0, 80), state: readStateSummary() };
+          }
+        },
+        page_fill: {
+          name: 'page_fill',
+          description: '填写输入框或更新组件值',
+          inputSchema: { type: 'object', required: ['value'], properties: { selector: { type: 'string' }, widget_id: { type: 'string' }, value: {} } },
+          execute: function(args) {
+            var a = args || {};
+            if (a.widget_id && typeof window.dispatchAction === 'function') {
+              return Promise.resolve(window.dispatchAction('widget_event', a.widget_id, a.value)).then(function() {
+                return { updated_widget: a.widget_id, state: readStateSummary() };
+              });
+            }
+            var inp = a.selector ? document.querySelector(String(a.selector)) : document.querySelector('input, textarea, select');
+            if (!inp) throw new Error('未找到输入框');
+            inp.value = a.value == null ? '' : String(a.value);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return { filled: inp.id || inp.tagName, value: inp.value, state: readStateSummary() };
+          }
+        },
+        page_press_main_button: {
+          name: 'page_press_main_button',
+          description: '触发 MainButton 点击',
+          inputSchema: { type: 'object', properties: {} },
+          execute: function() {
+            if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.MainButton && window.Telegram.WebApp.MainButton._fireClick) {
+              window.Telegram.WebApp.MainButton._fireClick();
+            }
+            return { pressed: 'main_button', state: readStateSummary() };
+          }
+        },
+        page_press_secondary_button: {
+          name: 'page_press_secondary_button',
+          description: '触发 SecondaryButton 点击',
+          inputSchema: { type: 'object', properties: {} },
+          execute: function() {
+            if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.SecondaryButton && window.Telegram.WebApp.SecondaryButton._fireClick) {
+              window.Telegram.WebApp.SecondaryButton._fireClick();
+            }
+            return { pressed: 'secondary_button', state: readStateSummary() };
+          }
+        }
+      };
+    }
+    function listDescriptors() {
+      var merged = {};
+      var b = builtins();
+      for (var bk in b) if (Object.prototype.hasOwnProperty.call(b, bk)) merged[bk] = b[bk];
+      for (var tk in toolsMap) if (Object.prototype.hasOwnProperty.call(toolsMap, tk)) merged[tk] = toolsMap[tk];
+      return Object.keys(merged).map(function(name) {
+        var t = merged[name];
+        return { name: t.name, description: String(t.description || ''), input_schema: t.inputSchema || { type: 'object', properties: {} }, read_only: !!(t.annotations && t.annotations.readOnlyHint) };
+      });
+    }
+    function registerTool(def) {
+      if (!def || !def.name || typeof def.execute !== 'function') return;
+      toolsMap[String(def.name)] = def;
+    }
+    var mc = {
+      registerTool: registerTool,
+      unregisterTool: function(n) { delete toolsMap[String(n || '')]; },
+      provideContext: function(c) { toolsMap = {}; var arr = (c && Array.isArray(c.tools)) ? c.tools : []; for (var i = 0; i < arr.length; i++) registerTool(arr[i]); },
+      clearContext: function() { toolsMap = {}; }
+    };
+    try {
+      if (!navigator.modelContext) Object.defineProperty(navigator, 'modelContext', { value: mc, configurable: true });
+      else {
+        navigator.modelContext.registerTool = mc.registerTool;
+        navigator.modelContext.unregisterTool = mc.unregisterTool;
+        navigator.modelContext.provideContext = mc.provideContext;
+        navigator.modelContext.clearContext = mc.clearContext;
+      }
+    } catch (_) {}
+    window.__GPUI_WEBMCP__ = {
+      _tools: toolsMap,
+      discover: listDescriptors,
+      readState: readStateSummary,
+      invoke: function(requestId, operation, toolName, args) {
+        function reply(ok, result, err) {
+          postBridgeEvent('webmcp_response', {
+            request_id: String(requestId || ''),
+            ok: !!ok,
+            result: result == null ? {} : result,
+            error: err ? String(err) : null,
+            tools: operation === 'discover' ? listDescriptors() : [],
+            state_summary: readStateSummary(),
+            control_mode: 'ai_controlling'
+          });
+        }
+        try {
+          if (operation === 'discover') { reply(true, { count: listDescriptors().length }, null); return; }
+          if (operation === 'get_state') { reply(true, readStateSummary(), null); return; }
+          var b = builtins();
+          var t = toolsMap[toolName] || b[toolName];
+          if (!t || typeof t.execute !== 'function') { reply(false, {}, '未注册的 WebMCP 工具: ' + String(toolName || '')); return; }
+          Promise.resolve(t.execute(args || {})).then(function(r) { reply(true, r, null); }).catch(function(e) { reply(false, {}, e && e.message ? e.message : String(e)); });
+        } catch (e) { reply(false, {}, e && e.message ? e.message : String(e)); }
+      }
+    };
+  })();
+  window.addEventListener('DOMContentLoaded', function() {
+    postBridgeEvent('__gpui_webmcp_page_ready', { url: String(window.location && window.location.href || '') });
+  });
+  if (document.readyState === 'interactive' || document.readyState === 'complete') {
+    postBridgeEvent('__gpui_webmcp_page_ready', { url: String(window.location && window.location.href || '') });
+  }
 })();
 "#;
 
@@ -395,6 +571,11 @@ impl MacOsWkWebView {
                 return None;
             }
 
+            let draws_bg_key = alloc_nsstring("drawsBackground");
+            let no_num: *mut Object = msg_send![class!(NSNumber), numberWithBool: NO];
+            let _: () = msg_send![webview, setValue: no_num forKey: draws_bg_key];
+            let _: () = msg_send![draws_bg_key, release];
+
             let _: () = msg_send![webview, setHidden: YES];
             let _: () = msg_send![parent_ns_view, addSubview: webview];
 
@@ -470,6 +651,30 @@ impl MacOsWkWebView {
         }
     }
 
+    /// Parks the WebView at a 1x1 near-transparent live frame during Floating PiP mode so
+    /// macOS does not throttle JS timers/WASM while hidden from the main full-screen overlay.
+    pub fn park_for_pip(&mut self) {
+        if self.webview.is_null() || self.parent_ns_view.is_null() {
+            return;
+        }
+        unsafe {
+            let rect = CgRect {
+                origin: CgPoint { x: 0.0, y: 0.0 },
+                size: CgSize {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            };
+            let _: () = msg_send![self.webview, setFrame: rect];
+            let alpha: f64 = 0.01;
+            let _: () = msg_send![self.webview, setAlphaValue: alpha];
+            let flag: BOOL = NO;
+            let _: () = msg_send![self.webview, setHidden: flag];
+            self.is_hidden = false;
+            self.last_frame = Some((0.0, 0.0, 1.0, 1.0));
+        }
+    }
+
     /// Synchronizes child `WKWebView` frame and visibility against GPUI canvas `bounds` (top-left origin).
     pub fn sync_bounds(&mut self, bounds: Bounds<Pixels>, visible: bool) {
         if self.webview.is_null() || self.parent_ns_view.is_null() {
@@ -500,6 +705,8 @@ impl MacOsWkWebView {
                 let _: () = msg_send![self.webview, setFrame: rect];
                 self.last_frame = Some(next_tuple);
             }
+            let alpha: f64 = 1.0;
+            let _: () = msg_send![self.webview, setAlphaValue: alpha];
         }
         self.set_hidden(false);
     }
