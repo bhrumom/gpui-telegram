@@ -45,38 +45,45 @@ pub struct SubscriptionActivateResponse {
 }
 
 pub fn sub_dto_to_account_dto(s: &MagpieSubscriptionDto) -> SubscriptionAccountDto {
-    let models = match s.kind.as_str() {
-        "google_vertex" | "google-vertex" => vec![
-            "gemini-2.5-flash".to_string(),
-            "gemini-2.5-pro".to_string(),
-            "gemini-1.5-pro".to_string(),
-        ],
-        "codex_chatgpt" | "codex" => {
-            let mut m = vec![];
-            if let Some(ref dm) = s.default_model {
-                m.push(dm.clone());
-            } else {
-                m.push("codex-mini-latest".to_string());
-            }
-            m.push("gpt-4o".to_string());
-            m.push("o3-mini".to_string());
-            m
-        }
-        "claude_code" | "claude" => vec![
-            "claude-sonnet-4-20250514".to_string(),
-            "claude-3-5-haiku-20241022".to_string(),
-            "claude-3-5-sonnet-20241022".to_string(),
-        ],
-        "gemini_code_assist" | "gemini" => vec![
-            "gemini-2.5-flash".to_string(),
-            "gemini-2.5-pro".to_string(),
-        ],
-        "github_copilot" => vec![
-            "gpt-4o".to_string(),
-            "claude-3-5-sonnet".to_string(),
-        ],
-        _ => s.default_model.clone().into_iter().collect(),
+    let mut models: Vec<String> = match s.kind.as_str() {
+        "google_vertex" | "google-vertex" => magpie_gateway::default_models_for_subscription_kind(
+            magpie_gateway::SubscriptionKind::GoogleVertex,
+        )
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect(),
+        "codex_chatgpt" | "codex" => magpie_gateway::default_models_for_subscription_kind(
+            magpie_gateway::SubscriptionKind::CodexChatGpt,
+        )
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect(),
+        "claude_code" | "claude" => magpie_gateway::default_models_for_subscription_kind(
+            magpie_gateway::SubscriptionKind::ClaudeCode,
+        )
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect(),
+        "gemini_code_assist" | "gemini" => magpie_gateway::default_models_for_subscription_kind(
+            magpie_gateway::SubscriptionKind::GeminiCodeAssist,
+        )
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect(),
+        "github_copilot" => magpie_gateway::default_models_for_subscription_kind(
+            magpie_gateway::SubscriptionKind::GitHubCopilot,
+        )
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect(),
+        _ => Vec::new(),
     };
+    if let Some(ref dm) = s.default_model {
+        let trimmed = dm.trim();
+        if !trimmed.is_empty() && !models.iter().any(|m| m == trimmed) {
+            models.insert(0, trimmed.to_string());
+        }
+    }
     SubscriptionAccountDto {
         id: s.id.clone(),
         account_id: s.account_id.clone().or_else(|| s.email.clone()),
@@ -143,6 +150,7 @@ pub enum AiProviderField {
 pub enum SettingsAiProvidersEvent {
     RefreshState,
     ScanSubscriptions,
+    FetchSubscriptionModels(String),
     ActivateSubscription {
         subscription_id: String,
         model: Option<String>,
@@ -170,6 +178,7 @@ pub struct SettingsAiProvidersSections {
     pub category: AiPresetCategory,
     pub state: Option<MagpieStateDto>,
     pub subscription_accounts: Vec<SubscriptionAccountDto>,
+    pub local_discovered_subscriptions: Vec<SubscriptionAccountDto>,
     pub selected_subscription_models: HashMap<String, String>,
     pub loading: bool,
     pub status_message: Option<String>,
@@ -223,6 +232,7 @@ impl SettingsAiProvidersSections {
             category: AiPresetCategory::All,
             state: None,
             subscription_accounts: Vec::new(),
+            local_discovered_subscriptions: Vec::new(),
             selected_subscription_models: HashMap::new(),
             loading: true,
             status_message: None,
@@ -288,7 +298,9 @@ impl SettingsAiProvidersSections {
         });
     }
 
-    /// Resolves effective discovered subscription accounts, falling back from server DTOs to state scan.
+    /// Resolves effective discovered subscription accounts, merging server DTOs with locally
+    /// discovered subscriptions (deduplicated by `id`) so local credentials remain visible even
+    /// when connected to a remote or legacy server.
     pub fn effective_subscriptions(&self) -> Vec<SubscriptionAccountDto> {
         let mut list = if !self.subscription_accounts.is_empty() {
             self.subscription_accounts.clone()
@@ -301,12 +313,37 @@ impl SettingsAiProvidersSections {
             Vec::new()
         };
 
+        if !self.local_discovered_subscriptions.is_empty() {
+            let mut seen: std::collections::HashSet<String> =
+                list.iter().map(|s| s.id.clone()).collect();
+            for local in &self.local_discovered_subscriptions {
+                if seen.insert(local.id.clone()) {
+                    list.push(local.clone());
+                }
+            }
+        }
+
         if let Some(ref st) = self.state {
             for sub in &mut list {
-                sub.active = sub.id == st.active_provider;
+                sub.active = sub.id == st.active_provider
+                    || (sub.kind == "google_vertex"
+                        && st.active_provider == "magpie_provider:google-vertex");
             }
         }
         list
+    }
+
+    /// Synchronizes client-side locally discovered subscription records into the view.
+    pub fn sync_local_subscriptions(&mut self, local_subs: Vec<SubscriptionAccountDto>) {
+        if let Some(ref st) = self.state {
+            let mut updated = local_subs;
+            for sa in &mut updated {
+                sa.active = sa.id == st.active_provider;
+            }
+            self.local_discovered_subscriptions = updated;
+        } else {
+            self.local_discovered_subscriptions = local_subs;
+        }
     }
 
     /// Synchronizes explicit `SubscriptionAccountDto` records fetched from the server.
@@ -1084,17 +1121,29 @@ impl SettingsAiProvidersSections {
                 let sub_id_for_act = sub.id.clone();
                 let is_active = sub.active;
                 let card_border_col = if is_active { pal.accent } else { pal.border_fg };
-                let plan_label = sub.plan.clone().unwrap_or_else(|| match sub.kind.as_str() {
-                    "google_vertex" | "google-vertex" => "Vertex ADC".to_string(),
-                    "codex_chatgpt" | "codex" => "ChatGPT Plus / Team".to_string(),
-                    "claude_code" | "claude" => "Claude CLI".to_string(),
-                    "gemini_code_assist" | "gemini" => "Gemini CLI".to_string(),
-                    _ => sub.kind.clone(),
-                });
+                let plan_label = match sub.plan.as_deref().map(str::trim) {
+                    Some("vertex_magpie") | Some("vertex_adc") => "Vertex ADC".to_string(),
+                    Some("code_assist") => "Code Assist".to_string(),
+                    Some(p) if !p.is_empty() => p.to_string(),
+                    _ => match sub.kind.as_str() {
+                        "google_vertex" | "google-vertex" => "Vertex ADC".to_string(),
+                        "codex_chatgpt" | "codex" => "ChatGPT Plus / Team".to_string(),
+                        "claude_code" | "claude" => "Claude CLI".to_string(),
+                        "gemini_code_assist" | "gemini" => "Gemini CLI".to_string(),
+                        _ => sub.kind.clone(),
+                    },
+                };
+                let display_label = sub
+                    .label
+                    .strip_prefix("Magpie ")
+                    .unwrap_or(&sub.label)
+                    .trim_end_matches(" (Magpie)")
+                    .to_string();
                 let account_str = sub.account_id.clone().unwrap_or_else(|| sub.kind.clone());
 
                 div()
                     .id(SharedString::from(format!("magpie-sub-card-{}", sub_id)))
+                    .w_full()
                     .p(px(12.0))
                     .rounded(px(10.0))
                     .bg(rgb(pal.input_bg))
@@ -1104,19 +1153,22 @@ impl SettingsAiProvidersSections {
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
-                    // Header row: Icon + Label + Plan + Active Badge
+                    // Header row: Icon + Title/Plan/Subtitle + Active Badge
                     .child(
                         div()
+                            .w_full()
                             .flex()
                             .items_start()
                             .justify_between()
+                            .gap(px(10.0))
                             .child(
                                 div()
                                     .flex()
-                                    .items_center()
+                                    .items_start()
                                     .gap(px(10.0))
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .w(px(36.0))
                                             .h(px(36.0))
                                             .rounded(px(8.0))
@@ -1137,19 +1189,20 @@ impl SettingsAiProvidersSections {
                                         div()
                                             .flex()
                                             .flex_col()
-                                            .gap(px(2.0))
+                                            .gap(px(3.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(rgb(pal.text_primary))
+                                                    .child(display_label),
+                                            )
                                             .child(
                                                 div()
                                                     .flex()
+                                                    .flex_wrap()
                                                     .items_center()
                                                     .gap(px(6.0))
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_color(rgb(pal.text_primary))
-                                                            .child(sub.label.clone()),
-                                                    )
                                                     .child(
                                                         div()
                                                             .px(px(6.0))
@@ -1162,18 +1215,19 @@ impl SettingsAiProvidersSections {
                                                             .font_weight(FontWeight::BOLD)
                                                             .text_color(rgb(pal.accent))
                                                             .child(plan_label),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.0))
+                                                            .text_color(rgb(pal.text_secondary))
+                                                            .child(format!("{} · {}", account_str, sub.kind)),
                                                     ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(pal.text_secondary))
-                                                    .child(format!("{} · {}", account_str, sub.kind)),
                                             ),
                                     ),
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .px(px(8.0))
                                     .py(px(3.5))
                                     .rounded(px(6.0))
@@ -1201,7 +1255,9 @@ impl SettingsAiProvidersSections {
                     // Available Models Badges
                     .when(!sub.models.is_empty(), |el| {
                         let sub_id_for_models = sub_id.clone();
+                        let sub_id_for_fetch = sub_id.clone();
                         let current_chosen = self.selected_subscription_models.get(&sub_id).cloned();
+                        let model_count = sub.models.len();
                         el.child(
                             div()
                                 .flex()
@@ -1209,13 +1265,36 @@ impl SettingsAiProvidersSections {
                                 .gap(px(4.0))
                                 .child(
                                     div()
-                                        .text_size(px(10.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_secondary))
-                                        .child(tr_str(
-                                            lang,
-                                            "可用模型 (点击选择激活模型):",
-                                            "Available Models (Click to select target):",
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(pal.text_secondary))
+                                                .child(if lang.starts_with("zh") {
+                                                    format!("可用模型 ({model_count} 个，点击选择激活模型):")
+                                                } else {
+                                                    format!("Available Models ({model_count}, click to select target):")
+                                                }),
+                                        )
+                                        .child(Self::pill_btn(
+                                            SharedString::from(format!("fetch-sub-models-{}", sub_id_for_fetch)),
+                                            tr_str(lang, "获取模型", "Fetch Models"),
+                                            pal.card_bg,
+                                            pal.accent,
+                                            move |this, _| {
+                                                this.loading = true;
+                                                this.pending_event = Some(
+                                                    SettingsAiProvidersEvent::FetchSubscriptionModels(
+                                                        sub_id_for_fetch.clone(),
+                                                    ),
+                                                );
+                                            },
+                                            cx,
                                         )),
                                 )
                                 .child(
@@ -1634,11 +1713,11 @@ impl SettingsAiProvidersSections {
                             )
                     })),
             )
-            // 3. Magpie 45+ Preset Catalog
+            // 3. Built-in 45+ Preset Catalog
             .child(
                 settings_card(pal)
                     .child(settings_subsection_title(
-                        tr_str(lang, "选择供应商预设 (Magpie 目录)", "Choose Provider Preset (Magpie Catalog)"),
+                        tr_str(lang, "选择供应商预设", "Choose Provider Preset"),
                         pal,
                     ))
                     .child(
@@ -2021,7 +2100,7 @@ impl SettingsAiProvidersSections {
             .child(
                 settings_card(pal)
                     .child(settings_subsection_title(
-                        tr_str(lang, "全局智能路由策略 (Magpie Routing)", "Global Routing Strategy"),
+                        tr_str(lang, "全局智能路由策略", "Global Routing Strategy"),
                         pal,
                     ))
                     .child(div().flex().flex_wrap().gap(px(6.0)).children(strategies.into_iter().map(
@@ -2349,15 +2428,15 @@ impl SettingsAiProvidersSections {
             .child(
                 settings_card(pal)
                     .child(settings_subsection_title(
-                        tr_str(lang, "一键导入配置 (magpie:// / .env)", "Import Config (magpie:// / .env)"),
+                        tr_str(lang, "一键导入配置 (.env / 导入链接)", "Import Config (.env / Import Link)"),
                         pal,
                     ))
                     .child(self.render_input_field(
                         "magpie-import-raw-input",
                         AiProviderField::ImportText,
-                        tr_str(lang, "粘贴导入链接或 .env 内容", "Paste magpie://import?... or .env lines"),
+                        tr_str(lang, "粘贴 .env 密钥或兼容导入链接", "Paste .env keys or import link"),
                         &self.import_raw_draft,
-                        "magpie://import?preset=deepseek&key=sk-... or DEEPSEEK_API_KEY=sk-...",
+                        "DEEPSEEK_API_KEY=sk-... / OPENAI_API_KEY=sk-...",
                         false,
                         pal,
                         cx,
@@ -2430,11 +2509,11 @@ impl Render for SettingsAiProvidersSections {
         settings_container(pal)
             .child(settings_section_header(
                 IconName::BotRobot,
-                tr_str(&lang, "AI 订阅与模型供应商 (Magpie)", "AI Subscriptions & Providers (Magpie)"),
+                tr_str(&lang, "AI 订阅与模型供应商", "AI Subscriptions & Providers"),
                 Some(tr_str(
                     &lang,
-                    "管理本地 CLI 订阅、45+ 供应商预设、智能路由组与隐私脱敏",
-                    "Manage local subscriptions, 45+ provider presets, smart routing groups, and privacy masking",
+                    "内置 AI 网关：自动发现本机订阅、45+ 供应商预设、智能路由与隐私脱敏",
+                    "Built-in AI gateway: local subscriptions, 45+ provider presets, smart routing, and privacy masking",
                 )),
                 pal,
             ))
@@ -2832,5 +2911,26 @@ mod tests {
             view.effective_subscriptions().is_empty(),
             "all subscriptions must be pruned when state.subscriptions becomes empty"
         );
+
+        // 5. Client-side locally discovered subscriptions remain visible when remote server
+        // returns empty state.subscriptions (legacy v1.3.0 server compatibility)
+        view.sync_local_subscriptions(vec![SubscriptionAccountDto {
+            id: "google_vertex:local@mac".to_string(),
+            account_id: Some("proj-local".to_string()),
+            kind: "google_vertex".to_string(),
+            label: "Google Vertex AI (local@mac)".to_string(),
+            plan: Some("vertex_adc".to_string()),
+            models: vec!["gemini-2.5-flash".to_string(), "gemini-2.5-pro".to_string()],
+            active: false,
+        }]);
+        let mut st5 = sample_state();
+        st5.active_provider = "google_vertex:local@mac".to_string();
+        st5.subscriptions = Vec::new();
+        view.sync_state(st5);
+
+        let eff5 = view.effective_subscriptions();
+        assert_eq!(eff5.len(), 1);
+        assert_eq!(eff5[0].id, "google_vertex:local@mac");
+        assert!(eff5[0].active, "local subscription must reflect active_provider from server state");
     }
 }

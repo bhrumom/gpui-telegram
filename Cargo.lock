@@ -3343,6 +3343,7 @@ dependencies = [
  "gpui_telegram_proto",
  "gpui_telegram_webrtc",
  "image",
+ "magpie_gateway",
  "mahayana-host-runtime",
  "mahayana-node-agent-coordinator",
  "objc",

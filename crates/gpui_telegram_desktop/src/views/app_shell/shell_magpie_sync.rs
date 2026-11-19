@@ -2,6 +2,7 @@
 //! `GlobalTasksWorkspace`, and the Magpie backend routes (`/api/v1/hermes/magpie/*`).
 
 use std::future::Future;
+use std::time::Duration;
 
 use gpui::{AsyncApp, ClipboardItem, Context, WeakEntity};
 use gpui_telegram_client::net::hermes_client::{
@@ -9,25 +10,16 @@ use gpui_telegram_client::net::hermes_client::{
 };
 
 use crate::i18n::tr_str;
-use crate::views::app_shell::shell_truth::SessionRequestFence;
-use crate::views::settings::sections::settings_ai_providers::{
-    SubscriptionAccountDto, SubscriptionActivateRequest, SubscriptionActivateResponse,
+use crate::views::app_shell::local_subscription_bridge::{
+    activate_subscription_with_local_fallback, discover_local_subscriptions_for_server,
+    enrich_items_with_live_catalog, fetch_live_models_catalog, fetch_models_for_subscription_live,
+    refresh_legacy_provider_token_once, sync_local_subscriptions_to_server,
 };
+use crate::views::app_shell::shell_truth::SessionRequestFence;
+use crate::views::settings::sections::settings_ai_providers::SubscriptionAccountDto;
 use crate::views::settings::sections::SettingsAiProvidersEvent;
 use crate::views::settings::settings_type::SettingsSectionType;
 use crate::views::shell::AppShell;
-
-fn url_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 3);
-    for b in input.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
-}
 
 async fn http_fetch_subscriptions(
     base_url: &str,
@@ -47,36 +39,6 @@ async fn http_fetch_subscriptions(
     resp.json::<Vec<SubscriptionAccountDto>>()
         .await
         .map_err(|e| format!("Failed to parse subscriptions JSON: {e}"))
-}
-
-async fn http_activate_subscription(
-    base_url: &str,
-    token: &str,
-    sub_id: &str,
-    model: Option<&str>,
-) -> Result<SubscriptionActivateResponse, String> {
-    let url = format!(
-        "{}/api/v1/hermes/magpie/subscriptions/{}/activate",
-        base_url.trim_end_matches('/'),
-        url_encode(sub_id)
-    );
-    let client = reqwest::Client::new();
-    let payload = SubscriptionActivateRequest {
-        model: model.map(str::to_string),
-    };
-    let resp = client
-        .post(&url)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP POST activate failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("Server returned status {}", resp.status()));
-    }
-    resp.json::<SubscriptionActivateResponse>()
-        .await
-        .map_err(|e| format!("Failed to parse activate response JSON: {e}"))
 }
 
 fn session_fence(shell: &AppShell) -> Option<SessionRequestFence> {
@@ -138,6 +100,9 @@ impl AppShell {
     ) {
         let lang = self.active_lang_id().to_string();
         let (summary, needs_sel) = summarize_magpie_for_main(&state, &lang);
+        let local_dtos = self
+            .magpie_local
+            .cached_dtos(Some(state.active_provider.as_str()));
         let state_for_ws = state.clone();
         self.settings_router.update(cx, |sr, scx| {
             if let Some(ref ap) = sr.settings_ai_providers {
@@ -145,6 +110,7 @@ impl AppShell {
                     if let Some(s) = subs {
                         view.sync_subscriptions(s);
                     }
+                    view.sync_local_subscriptions(local_dtos);
                     view.sync_state(state.clone());
                     vcx.notify();
                 });
@@ -172,7 +138,8 @@ impl AppShell {
         self.apply_magpie_state_and_subscriptions_to_views(state, None, cx);
     }
 
-    /// Fetches `/api/v1/hermes/magpie/state` and `/api/v1/hermes/magpie/subscriptions`, updating materialized desktop views.
+    /// Fetches `/api/v1/hermes/magpie/state` and `/api/v1/hermes/magpie/subscriptions`, while
+    /// refreshing client-side local AI subscription discovery on the desktop machine.
     pub fn refresh_magpie_state(&mut self, cx: &mut Context<Self>) {
         let Some(fence) = session_fence(self) else {
             return;
@@ -181,19 +148,29 @@ impl AppShell {
         let base_url = self.client.http_client.base_url.clone();
         let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let scan_base = base_url.clone();
+            let mut local_items = tokio::task::spawn_blocking(move || {
+                discover_local_subscriptions_for_server(&scan_base)
+            })
+            .await
+            .unwrap_or_default();
+            if let Ok(cat) = fetch_live_models_catalog(&base_url, &token, false).await {
+                enrich_items_with_live_catalog(&mut local_items, &cat);
+            }
             let res = client.hermes.magpie_state(&token).await;
             let subs_res = http_fetch_subscriptions(&base_url, &token).await;
             let _ = weak.update(app, |shell, cx| {
                 if !fence_matches(&fence, shell) {
                     return;
                 }
+                shell.magpie_local.discovered_items = local_items;
                 match res {
                     Ok(state) => {
                         let subs = subs_res.ok();
                         shell.apply_magpie_state_and_subscriptions_to_views(state, subs, cx);
                     }
                     Err(e) => {
-                        let msg = format!("Magpie sync error: {e}");
+                        let msg = format!("AI provider sync error: {e}");
                         shell.settings_router.update(cx, |sr, scx| {
                             if let Some(ref ap) = sr.settings_ai_providers {
                                 ap.update(scx, |view, vcx| {
@@ -205,6 +182,123 @@ impl AppShell {
                     }
                 }
             });
+        })
+        .detach();
+    }
+
+    /// Automatically runs once per authenticated session after startup/login: discovers local AI
+    /// subscriptions on this desktop machine, syncs them to the backend server, and auto-activates
+    /// the best available subscription if no real provider is active yet so the app works out-of-the-box.
+    pub fn bootstrap_local_subscriptions_on_startup(&mut self, cx: &mut Context<Self>) {
+        let Some(fence) = session_fence(self) else {
+            return;
+        };
+        if self.magpie_local.bootstrapped_auth_generation == Some(fence.auth_generation) {
+            return;
+        }
+        self.magpie_local.bootstrapped_auth_generation = Some(fence.auth_generation);
+
+        let token = fence.token.clone();
+        let base_url = self.client.http_client.base_url.clone();
+        let client = self.client.clone();
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let scan_base = base_url.clone();
+            let mut local_items = tokio::task::spawn_blocking(move || {
+                discover_local_subscriptions_for_server(&scan_base)
+            })
+            .await
+            .unwrap_or_default();
+            if let Ok(cat) = fetch_live_models_catalog(&base_url, &token, false).await {
+                enrich_items_with_live_catalog(&mut local_items, &cat);
+            }
+
+            let outcome =
+                sync_local_subscriptions_to_server(&client, &base_url, &token, local_items, true)
+                    .await;
+            let subs_res = http_fetch_subscriptions(&base_url, &token).await;
+
+            let _ = weak.update(app, |shell, cx| {
+                if !fence_matches(&fence, shell) {
+                    return;
+                }
+                shell.magpie_local.discovered_items = outcome.local_items;
+                if let Some(state) = outcome.state {
+                    let subs = subs_res.ok();
+                    shell.apply_magpie_state_and_subscriptions_to_views(state, subs, cx);
+                }
+                if let Some(act_id) = outcome.auto_activated_id {
+                    if outcome.used_legacy_fallback {
+                        shell.schedule_legacy_token_keepalive(
+                            act_id.clone(),
+                            outcome.auto_activated_model.clone(),
+                            cx,
+                        );
+                    }
+                    let lang = shell.active_lang_id().to_string();
+                    let display = outcome.auto_activated_label.unwrap_or(act_id);
+                    let toast = if lang.starts_with("zh") {
+                        format!("已自动发现并接入本机 AI 订阅：{display}")
+                    } else {
+                        format!("Auto-connected local AI subscription: {display}")
+                    };
+                    shell.window_runtime.enqueue_toast(toast, 3000);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Starts a lightweight background keep-alive refresher when an OAuth-backed local subscription
+    /// is synced to a legacy v1.3.0 server (which does not store refresh tokens server-side).
+    pub(crate) fn schedule_legacy_token_keepalive(
+        &mut self,
+        sub_id: String,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fence) = session_fence(self) else {
+            return;
+        };
+        self.magpie_local.legacy_keepalive_generation = self
+            .magpie_local
+            .legacy_keepalive_generation
+            .wrapping_add(1);
+        let keepalive_gen = self.magpie_local.legacy_keepalive_generation;
+        self.magpie_local.active_legacy_subscription_id = Some(sub_id.clone());
+        self.magpie_local.active_legacy_model = model.clone();
+
+        let token = fence.token.clone();
+        let base_url = self.client.http_client.base_url.clone();
+        let client = self.client.clone();
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            loop {
+                tokio::time::sleep(Duration::from_secs(40 * 60)).await;
+                let still_valid = weak
+                    .update(app, |shell, _| {
+                        fence_matches(&fence, shell)
+                            && shell.magpie_local.legacy_keepalive_generation == keepalive_gen
+                            && shell
+                                .magpie_local
+                                .active_legacy_subscription_id
+                                .as_deref()
+                                == Some(sub_id.as_str())
+                    })
+                    .unwrap_or(false);
+                if !still_valid {
+                    break;
+                }
+                let _ = refresh_legacy_provider_token_once(
+                    &client,
+                    &base_url,
+                    &token,
+                    &sub_id,
+                    model.as_deref(),
+                )
+                .await;
+            }
         })
         .detach();
     }
@@ -277,37 +371,89 @@ impl AppShell {
         let base_url = self.client.http_client.base_url.clone();
         let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let scan_res = client.hermes.magpie_scan_subscriptions(&token).await;
+            let scan_base = base_url.clone();
+            let mut local_items = tokio::task::spawn_blocking(move || {
+                discover_local_subscriptions_for_server(&scan_base)
+            })
+            .await
+            .unwrap_or_default();
+            if let Ok(cat) = fetch_live_models_catalog(&base_url, &token, true).await {
+                enrich_items_with_live_catalog(&mut local_items, &cat);
+            }
+
+            let is_local_server = magpie_gateway::is_loopback_server_url(&base_url);
+            let server_scan_count = if is_local_server {
+                client
+                    .hermes
+                    .magpie_scan_subscriptions(&token)
+                    .await
+                    .map(|r| r.subscriptions.iter().filter(|s| s.active).count())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            let outcome =
+                sync_local_subscriptions_to_server(&client, &base_url, &token, local_items, true)
+                    .await;
             let subs_res = http_fetch_subscriptions(&base_url, &token).await;
-            let state_res = client.hermes.magpie_state(&token).await;
+            let state_opt = match outcome.state {
+                Some(st) => Some(st),
+                None => client.hermes.magpie_state(&token).await.ok(),
+            };
+
             let _ = weak.update(app, |shell, cx| {
                 if !fence_matches(&fence, shell) {
                     return;
                 }
+                let local_active = outcome
+                    .local_items
+                    .iter()
+                    .filter(|s| s.account.active)
+                    .count();
+                let total_found = local_active.max(server_scan_count);
+                shell.magpie_local.discovered_items = outcome.local_items;
+
                 let lang = shell.active_lang_id().to_string();
-                let toast = match &scan_res {
-                    Ok(resp) => {
-                        let active = resp.subscriptions.iter().filter(|s| s.active).count();
-                        if active > 0 {
-                            if lang.starts_with("zh") {
-                                format!("扫描完成：检测到 {active} 个可用本地 AI 订阅凭据")
-                            } else {
-                                format!("Scan complete: detected {active} active AI credential(s)")
-                            }
-                        } else {
-                            tr_str(
-                                &lang,
-                                "扫描完成：未发现已登录的本地凭据，请在下方选择供应商预设",
-                                "Scan complete: no active local credentials found — select a provider preset below",
-                            )
-                            .to_string()
-                        }
+                let toast = if let Some(ref act_id) = outcome.auto_activated_id {
+                    let display = outcome
+                        .auto_activated_label
+                        .as_deref()
+                        .unwrap_or(act_id.as_str());
+                    if lang.starts_with("zh") {
+                        format!("扫描完成：发现 {total_found} 个本机凭据，已自动激活「{display}」")
+                    } else {
+                        format!("Scan complete: found {total_found} local credential(s), auto-activated \"{display}\"")
                     }
-                    Err(e) => format!("Subscription scan failed: {e}"),
+                } else if total_found > 0 {
+                    if lang.starts_with("zh") {
+                        format!("扫描完成：检测到 {total_found} 个可用本机 AI 订阅凭据")
+                    } else {
+                        format!("Scan complete: detected {total_found} active local AI credential(s)")
+                    }
+                } else if let Some(ref warn) = outcome.warning {
+                    format!("Subscription sync warning: {warn}")
+                } else {
+                    tr_str(
+                        &lang,
+                        "扫描完成：未发现已登录的本地凭据，请在下方选择供应商预设",
+                        "Scan complete: no active local credentials found — select a provider preset below",
+                    )
+                    .to_string()
                 };
-                if let Ok(state) = state_res {
+
+                if let Some(state) = state_opt {
                     let subs = subs_res.ok();
                     shell.apply_magpie_state_and_subscriptions_to_views(state, subs, cx);
+                }
+                if let Some(act_id) = outcome.auto_activated_id {
+                    if outcome.used_legacy_fallback {
+                        shell.schedule_legacy_token_keepalive(
+                            act_id,
+                            outcome.auto_activated_model,
+                            cx,
+                        );
+                    }
                 }
                 shell.settings_router.update(cx, |sr, scx| {
                     if let Some(ref ap) = sr.settings_ai_providers {
@@ -317,7 +463,7 @@ impl AppShell {
                         });
                     }
                 });
-                shell.window_runtime.enqueue_toast(toast, 2600);
+                shell.window_runtime.enqueue_toast(toast, 2800);
                 cx.notify();
             });
         })
@@ -339,12 +485,19 @@ impl AppShell {
         let client = self.client.clone();
         let sub_id = subscription_id.clone();
         let req_model = model.clone();
+        let cached_local = self.magpie_local.discovered_items.clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let act_res =
-                http_activate_subscription(&base_url, &token, &sub_id, req_model.as_deref()).await;
+            let act_res = activate_subscription_with_local_fallback(
+                &client,
+                &base_url,
+                &token,
+                &sub_id,
+                req_model.as_deref(),
+                &cached_local,
+            )
+            .await;
             let subs_res = http_fetch_subscriptions(&base_url, &token).await;
-            let state_res = client.hermes.magpie_state(&token).await;
 
             let _ = weak.update(app, |shell, cx| {
                 if !fence_matches(&fence, shell) {
@@ -353,20 +506,42 @@ impl AppShell {
                 let lang = shell.active_lang_id().to_string();
                 match act_res {
                     Ok(resp) => {
+                        let display_name = shell
+                            .magpie_local
+                            .discovered_items
+                            .iter()
+                            .find(|i| i.account.id == resp.active_provider_id)
+                            .map(|i| i.account.label.clone())
+                            .or_else(|| {
+                                resp.state.as_ref().and_then(|st| {
+                                    st.providers
+                                        .iter()
+                                        .find(|p| p.provider_id == resp.active_provider_id)
+                                        .map(|p| p.name.clone())
+                                })
+                            })
+                            .unwrap_or_else(|| resp.active_provider_id.clone());
                         let toast = if lang.starts_with("zh") {
                             format!(
                                 "已成功激活「{}」为主要模型供应商 (模型: {})",
-                                resp.active_provider_id, resp.active_model
+                                display_name, resp.active_model
                             )
                         } else {
                             format!(
                                 "Activated \"{}\" as primary provider ({})",
-                                resp.active_provider_id, resp.active_model
+                                display_name, resp.active_model
                             )
                         };
-                        if let Ok(state) = state_res {
+                        if let Some(state) = resp.state {
                             let subs = subs_res.ok();
                             shell.apply_magpie_state_and_subscriptions_to_views(state, subs, cx);
+                        }
+                        if resp.used_legacy_fallback {
+                            shell.schedule_legacy_token_keepalive(
+                                resp.active_provider_id,
+                                Some(resp.active_model),
+                                cx,
+                            );
                         }
                         shell.settings_router.update(cx, |sr, scx| {
                             if let Some(ref ap) = sr.settings_ai_providers {
@@ -470,6 +645,110 @@ impl AppShell {
         .detach();
     }
 
+    /// Live-fetches the latest models for a specific discovered subscription card from the
+    /// upstream provider API + `models.dev`, updates the card immediately, and notifies the user.
+    pub(crate) fn fetch_subscription_models_live(
+        &mut self,
+        subscription_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fence) = session_fence(self) else {
+            return;
+        };
+        let token = fence.token.clone();
+        let base_url = self.client.http_client.base_url.clone();
+        let cached = self.magpie_local.discovered_items.clone();
+        let target_id = subscription_id.clone();
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let item_opt = cached
+                .into_iter()
+                .find(|i| i.account.id == target_id)
+                .or_else(|| {
+                    discover_local_subscriptions_for_server(&base_url)
+                        .into_iter()
+                        .find(|i| i.account.id == target_id)
+                });
+            let fetch_res = match item_opt {
+                Some(item) => fetch_models_for_subscription_live(&base_url, &token, &item).await,
+                None => Err(format!("Subscription '{target_id}' not found locally")),
+            };
+
+            let _ = weak.update(app, |shell, cx| {
+                if !fence_matches(&fence, shell) {
+                    return;
+                }
+                let lang = shell.active_lang_id().to_string();
+                match fetch_res {
+                    Ok(outcome) => {
+                        let count = outcome.models.len();
+                        if let Some(entry) = shell
+                            .magpie_local
+                            .discovered_items
+                            .iter_mut()
+                            .find(|i| i.account.id == target_id)
+                        {
+                            entry.available_models = outcome.models.clone();
+                        }
+                        let active_pid = shell
+                            .settings_router
+                            .read(cx)
+                            .settings_ai_providers
+                            .as_ref()
+                            .and_then(|ap| {
+                                ap.read(cx)
+                                    .state
+                                    .as_ref()
+                                    .map(|s| s.active_provider.clone())
+                            });
+                        let local_dtos = shell
+                            .magpie_local
+                            .cached_dtos(active_pid.as_deref());
+                        let toast = if lang.starts_with("zh") {
+                            format!(
+                                "已从 {} 获取 {count} 个最新模型",
+                                outcome.source_label_zh
+                            )
+                        } else {
+                            format!(
+                                "Fetched {count} live models from {}",
+                                outcome.source_label_en
+                            )
+                        };
+                        shell.settings_router.update(cx, |sr, scx| {
+                            if let Some(ref ap) = sr.settings_ai_providers {
+                                ap.update(scx, |view, vcx| {
+                                    view.sync_local_subscriptions(local_dtos);
+                                    view.set_status(Some(toast.clone()), None);
+                                    vcx.notify();
+                                });
+                            }
+                        });
+                        shell.window_runtime.enqueue_toast(toast, 2800);
+                    }
+                    Err(err) => {
+                        let msg = if lang.starts_with("zh") {
+                            format!("获取模型失败: {err}")
+                        } else {
+                            format!("Failed to fetch models: {err}")
+                        };
+                        shell.settings_router.update(cx, |sr, scx| {
+                            if let Some(ref ap) = sr.settings_ai_providers {
+                                ap.update(scx, |view, vcx| {
+                                    view.set_status(None, Some(msg.clone()));
+                                    vcx.notify();
+                                });
+                            }
+                        });
+                        shell.window_runtime.enqueue_toast(msg, 3000);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Handles events emitted by `SettingsAiProvidersSections` via `SettingsRouter`.
     pub fn handle_ai_providers_settings_event(
         &mut self,
@@ -479,6 +758,9 @@ impl AppShell {
         match ev {
             SettingsAiProvidersEvent::RefreshState => self.refresh_magpie_state(cx),
             SettingsAiProvidersEvent::ScanSubscriptions => self.run_magpie_subscription_scan(cx),
+            SettingsAiProvidersEvent::FetchSubscriptionModels(sub_id) => {
+                self.fetch_subscription_models_live(sub_id.clone(), cx);
+            }
             SettingsAiProvidersEvent::ActivateSubscription {
                 subscription_id,
                 model,
@@ -657,7 +939,7 @@ impl AppShell {
                 let req = req.clone();
                 self.spawn_magpie_state_mutation(
                     "配置导入成功",
-                    "Magpie config imported",
+                    "AI provider config imported",
                     false,
                     move |c, tok| async move {
                         c.hermes

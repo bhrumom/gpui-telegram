@@ -14,6 +14,59 @@ use crate::views::composer::popups_ui::{render_autocomplete_popup, ComposerPopup
 use crate::views::composer::selector_ui::SelectorUiAction;
 use crate::views::composer::{AttachmentKind, KeyAction, TextStyleKind};
 
+/// Returns `true` only when `s` consists solely of Unicode Emoji characters (plus optional
+/// variation selectors / ZWJ / skin-tone modifiers) and contains at least one actual emoji symbol.
+/// Prevents CJK characters (e.g. "你", "你好") and punctuation from mistakenly opening the Sticker bar.
+fn is_emoji_only_sticker_query(s: &str) -> bool {
+    let mut has_emoji = false;
+    let mut count = 0usize;
+    for c in s.chars() {
+        let cp = c as u32;
+        let is_modifier = matches!(cp, 0xFE0E..=0xFE0F | 0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF);
+        let is_emoji = matches!(
+            cp,
+            0x1F300..=0x1F5FF
+                | 0x1F600..=0x1F64F
+                | 0x1F680..=0x1F6FF
+                | 0x1F700..=0x1F77F
+                | 0x1F780..=0x1F7FF
+                | 0x1F800..=0x1F8FF
+                | 0x1F900..=0x1F9FF
+                | 0x1FA00..=0x1FAFF
+                | 0x2600..=0x26FF
+                | 0x2700..=0x27BF
+                | 0x1F1E6..=0x1F1FF
+                | 0x231A..=0x231B
+                | 0x23E9..=0x23F3
+                | 0x23F8..=0x23FA
+                | 0x25AA..=0x25AB
+                | 0x25B6
+                | 0x25C0
+                | 0x25FB..=0x25FE
+                | 0x2B05..=0x2B07
+                | 0x2B1B..=0x2B1C
+                | 0x2B50
+                | 0x2B55
+                | 0x3030
+                | 0x303D
+                | 0x3297
+                | 0x3299
+        );
+        if is_emoji {
+            has_emoji = true;
+            count += 1;
+        } else if is_modifier {
+            continue;
+        } else {
+            return false;
+        }
+        if count > 3 {
+            return false;
+        }
+    }
+    has_emoji
+}
+
 impl CanonicalComposer {
     pub fn sync_autocomplete(&mut self) {
         let cur = self.ime_machine.cursor_index;
@@ -127,8 +180,7 @@ impl CanonicalComposer {
             let trimmed = text.trim();
             if self.suggest_stickers_by_emoji
                 && !trimmed.is_empty()
-                && trimmed.chars().count() <= 3
-                && trimmed.chars().all(|c| !c.is_ascii_alphanumeric() && !c.is_whitespace())
+                && is_emoji_only_sticker_query(trimmed)
             {
                 let mut rows: Vec<crate::views::composer::field_autocomplete::StickerRow> = self
                     .stickers_list
@@ -580,7 +632,7 @@ impl CanonicalComposer {
                     self.pending_launch_miniapp = Some((
                         self.bot_menu_controls.bot_id,
                         self.bot_menu_controls.bot_username.clone(),
-                        self.bot_menu_controls.text.clone(),
+                        String::new(),
                         self.bot_menu_controls.menu_url.clone(),
                     ));
                 }
@@ -638,7 +690,7 @@ impl CanonicalComposer {
                 self.pending_launch_miniapp = Some((
                     app.bot_id,
                     app.bot_username,
-                    app.title,
+                    String::new(),
                     app.webview_url,
                 ));
             }

@@ -11,10 +11,10 @@ use axum::Json;
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use gpui_telegram_agent::hermes::providers::{
-    ApiMode, CredentialEntry, CredentialPool, MagpiePresetApplyInput, ModelProfile, ProviderChatMessage,
-    ProviderConfig, ProviderError, ProviderMessageRole, ProviderRequest, ProviderResponse,
-    ProviderRouter, ProviderRouterState, ProviderStreamEvent, ProviderToolCall, ProviderToolSpec,
-    SubscriptionAccount, SubscriptionKind,
+    ApiMode, ClientSubscriptionSyncItem, CredentialEntry, CredentialPool, MagpiePresetApplyInput,
+    ModelProfile, ProviderChatMessage, ProviderConfig, ProviderError, ProviderMessageRole,
+    ProviderRequest, ProviderResponse, ProviderRouter, ProviderRouterState, ProviderStreamEvent,
+    ProviderToolCall, ProviderToolSpec, SubscriptionAccount, SubscriptionKind,
 };
 use gpui_telegram_core::types::ChatId;
 use magpie_gateway::{
@@ -651,6 +651,72 @@ pub async fn magpie_subscriptions_scan(
         })),
     )
         .into_response()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MagpieSubscriptionsSyncRequest {
+    #[serde(default)]
+    pub subscriptions: Vec<ClientSubscriptionSyncItem>,
+    #[serde(default = "default_true")]
+    pub auto_activate: bool,
+}
+
+/// POST /api/v1/hermes/magpie/subscriptions/sync
+/// Accepts client-discovered local AI subscriptions (Vertex AI ADC, Magpie logins, Codex, Claude,
+/// Gemini, etc.), registers their in-memory token managers & provider configs, optionally activates
+/// the best available subscription when no real provider is active yet, and returns sanitized state.
+pub async fn magpie_subscriptions_sync(
+    _auth: AuthBearer,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MagpieSubscriptionsSyncRequest>,
+) -> Response {
+    let synced_count = req.subscriptions.len();
+    let router = state.hermes.providers();
+    let reg = router.ingest_client_subscriptions(req.subscriptions, req.auto_activate);
+    persist_and_sync_all(&state);
+    let subscriptions: Vec<SubscriptionAccount> = reg
+        .accounts
+        .iter()
+        .map(sanitize_subscription_account)
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "synced_count": synced_count,
+            "subscriptions": subscriptions,
+            "scanned_at_ms": reg.scanned_at_ms,
+            "has_active_subscription": router.has_active_subscription(),
+            "needs_provider_selection": router.needs_provider_selection(),
+            "state": build_magpie_state_json(&state),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ModelsCatalogQuery {
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// GET /api/v1/hermes/magpie/models/catalog
+/// Fetches and caches the compact live model catalog from `https://models.dev/api.json` on the
+/// server so desktop clients get up-to-date model lists in <100ms without downloading 6+ MB directly.
+pub async fn magpie_models_catalog_get(
+    _auth: AuthBearer,
+    Query(q): Query<ModelsCatalogQuery>,
+) -> Response {
+    let cache_path = std::env::temp_dir().join("fabushi_models_dev_catalog_cache.json");
+    let http = reqwest::Client::new();
+    match magpie_gateway::fetch_models_dev_catalog(&http, Some(&cache_path), q.refresh).await {
+        Ok(catalog) => (StatusCode::OK, Json(catalog)).into_response(),
+        Err(err) => err_resp(
+            StatusCode::BAD_GATEWAY,
+            "models_catalog_fetch_failed",
+            &err,
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -147,6 +147,84 @@ pub fn resolve_gemini_endpoint_url(base_url: &str, model: &str, stream: bool) ->
     }
 }
 
+/// Recursively normalizes a JSON Schema object into Google Gemini / Vertex AI OpenAPI 3.0 Proto
+/// `Schema` format:
+/// - Converts JSON Schema union `"type": ["string", "null"]` or `["string", "integer"]` into a
+///   single scalar `"type"` string (setting `"nullable": true` when `"null"` was present).
+/// - Strips unsupported meta-keywords (`$schema`, `additionalProperties`, `default`, `title`,
+///   `examples`, `$defs`, `definitions`) that cause Vertex AI HTTP 400 `INVALID_ARGUMENT`.
+pub fn sanitize_schema_for_gemini(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            let mut inferred_nullable = false;
+
+            for (k, v) in map {
+                match k.as_str() {
+                    "$schema" | "additionalProperties" | "default" | "title" | "examples"
+                    | "$defs" | "definitions" | "$id" | "const" => continue,
+                    "type" => match v {
+                        Value::Array(arr) => {
+                            let mut chosen: Option<&str> = None;
+                            for item in arr {
+                                if let Some(s) = item.as_str() {
+                                    if s.eq_ignore_ascii_case("null") {
+                                        inferred_nullable = true;
+                                    } else if chosen.is_none() {
+                                        chosen = Some(s);
+                                    }
+                                }
+                            }
+                            out.insert(
+                                "type".to_string(),
+                                Value::String(chosen.unwrap_or("string").to_string()),
+                            );
+                        }
+                        Value::String(s) => {
+                            if s.eq_ignore_ascii_case("null") {
+                                inferred_nullable = true;
+                                out.insert("type".to_string(), Value::String("string".to_string()));
+                            } else {
+                                out.insert("type".to_string(), Value::String(s.clone()));
+                            }
+                        }
+                        _ => {}
+                    },
+                    "properties" => {
+                        if let Value::Object(props) = v {
+                            let mut clean_props = serde_json::Map::new();
+                            for (pk, pv) in props {
+                                clean_props.insert(pk.clone(), sanitize_schema_for_gemini(pv));
+                            }
+                            out.insert("properties".to_string(), Value::Object(clean_props));
+                        }
+                    }
+                    "items" => {
+                        out.insert("items".to_string(), sanitize_schema_for_gemini(v));
+                    }
+                    "anyOf" | "oneOf" | "allOf" => {
+                        if let Value::Array(arr) = v {
+                            let clean_arr: Vec<Value> =
+                                arr.iter().map(sanitize_schema_for_gemini).collect();
+                            out.insert(k.clone(), Value::Array(clean_arr));
+                        }
+                    }
+                    _ => {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
+            if inferred_nullable && !out.contains_key("nullable") {
+                out.insert("nullable".to_string(), Value::Bool(true));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_schema_for_gemini).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Build a native Google Gemini `generateContent` JSON request body from a `UnifiedRequest`.
 pub fn build_gemini_generate_content_payload(req: &UnifiedRequest) -> Value {
     let mut system_parts = Vec::new();
@@ -232,7 +310,7 @@ pub fn build_gemini_generate_content_payload(req: &UnifiedRequest) -> Value {
                 json!({
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters,
+                    "parameters": sanitize_schema_for_gemini(&t.parameters),
                 })
             })
             .collect();
@@ -2377,5 +2455,47 @@ mod tests {
             ProtocolError::Upstream(msg) => assert_eq!(msg, "openai_flat_err"),
             other => panic!("expected Upstream error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_sanitize_schema_for_gemini_converts_type_arrays_to_scalar_proto_schema() {
+        let req = UnifiedRequest {
+            model: "gemini-2.5-pro".to_string(),
+            system_prompt: String::new(),
+            messages: vec![UnifiedMessage {
+                role: UnifiedRole::User,
+                content: "hi".to_string(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                reasoning: None,
+            }],
+            tools: vec![
+                UnifiedToolSpec {
+                    name: "computer_bind".to_string(),
+                    description: "bind".to_string(),
+                    parameters: json!({
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "node_id": { "type": ["string", "null"], "description": "node" },
+                            "poll_id": { "type": ["string", "integer"] }
+                        }
+                    }),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            thinking_budget_tokens: None,
+        };
+        let payload = build_gemini_generate_content_payload(&req);
+        let params = &payload["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(params.get("$schema").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["node_id"]["type"].as_str(), Some("string"));
+        assert_eq!(params["properties"]["node_id"]["nullable"].as_bool(), Some(true));
+        assert_eq!(params["properties"]["poll_id"]["type"].as_str(), Some("string"));
     }
 }

@@ -663,7 +663,12 @@ impl AppShell {
                     cx.notify();
                     return true;
                 }
-                let action = self.composer.update(cx, |c, ccx| { let a = c.handle_enter(is_shift); ccx.notify(); a });
+                let action = self.composer.update(cx, |c, ccx| {
+                    c.ime_machine.reset_commit_fence();
+                    let a = c.handle_enter(is_shift);
+                    ccx.notify();
+                    a
+                });
                 if action == KeyAction::SendMessage {
                     self.composer.update(cx, |c, ccx| { c.submit_primary(); ccx.notify(); });
                     self.handle_composer_pending_actions(cx);
@@ -718,7 +723,7 @@ impl EntityInputHandler for AppShell {
             cx.notify();
             return;
         }
-        self.ime.just_committed_ime = true;
+        self.ime.mark_ime_committed();
         if let Some(p) = self.ime.ime_preedit.take().filter(|p| !p.is_empty()) { self.insert_committed_text(&p, cx); return; }
         if let Some(p) = self.composer.read(cx).ime_machine.preedit_text().map(str::to_string) {
             self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_commit(&p); ccx.notify(); });
@@ -730,8 +735,8 @@ impl EntityInputHandler for AppShell {
         let was_composing = self.has_active_ime_preedit(cx) || self.composer.read(cx).ime_machine.is_composing();
         self.insert_committed_text(text, cx);
         if was_composing {
-            if self.is_authenticated { self.ime.just_committed_ime = true; }
-            else { self.auth_wizard.update(cx, |w, _| w.ime.just_committed_ime = true); }
+            if self.is_authenticated { self.ime.mark_ime_committed(); }
+            else { self.auth_wizard.update(cx, |w, _| w.ime.mark_ime_committed()); }
         }
     }
 

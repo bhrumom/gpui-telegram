@@ -662,6 +662,7 @@ impl AppShell {
                 if let Some(ms) = magpie_res {
                     shell.apply_magpie_state_to_views(ms, cx);
                 }
+                shell.bootstrap_local_subscriptions_on_startup(cx);
 
                 cx.notify();
             });

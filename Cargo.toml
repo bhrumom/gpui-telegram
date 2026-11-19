@@ -75,7 +75,7 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-gzip"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "socks", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "socks", "stream", "gzip"] }
 tungstenite = "0.24"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures = "0.3"

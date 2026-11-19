@@ -1286,3 +1286,138 @@ async fn test_e2e_magpie_subscription_selection_persists_across_restart_with_mul
         );
     }
 }
+
+#[tokio::test]
+async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_redacts_secrets() {
+    let _env_read = ENV_RWLOCK.read().await;
+    let (_tmp, state, router) = boot_test_server();
+    let (_uid, tok) = register_user(&router, "plan_c_sync_user").await;
+
+    // Simulate a desktop machine with Vertex AI ADC + Codex auth + Magpie proxy config.toml
+    // running on a DIFFERENT host than the server (server itself has zero local credentials).
+    let client_home = tempfile::Builder::new()
+        .prefix("magpie_client_home_")
+        .tempdir_in(std::env::temp_dir())
+        .expect("create client home");
+    let gcloud_dir = client_home.path().join(".config").join("gcloud");
+    let codex_dir = client_home.path().join(".codex");
+    std::fs::create_dir_all(&gcloud_dir).unwrap();
+    std::fs::create_dir_all(&codex_dir).unwrap();
+
+    std::fs::write(
+        gcloud_dir.join("application_default_credentials.json"),
+        json!({
+            "account": "desktop-user@vertex.example",
+            "client_id": "vertex-client-id-sync",
+            "client_secret": "vertex-super-secret-xyz",
+            "quota_project_id": "vertex-proj-sync-01",
+            "refresh_token": "vertex-refresh-secret-abc",
+            "type": "authorized_user"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mock_jwt = "eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6ICJkZXNrdG9wX2NvZGV4QGV4YW1wbGUuY29tIiwgImV4cCI6IDQxMDI0NDQ4MDAsICJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOiB7ImNoYXRncHRfcGxhbl90eXBlIjogInRlYW0iLCAiY2hhdGdwdF9hY2NvdW50X2lkIjogImFjY3Rfc3luY18xIn19.sig";
+    std::fs::write(
+        codex_dir.join("auth.json"),
+        json!({
+            "tokens": {
+                "account_id": "acct_sync_1",
+                "access_token": mock_jwt,
+                "id_token": mock_jwt,
+                "refresh_token": "codex-refresh-secret-999"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "model = \"codex/gpt-6.1-sol\"\nopenai_base_url = \"http://127.0.0.1:3425/backend-api/codex\"\n",
+    )
+    .unwrap();
+
+    // Desktop client discovers subscriptions locally for a remote server
+    let synced_items = magpie_gateway::discover_syncable_subscriptions_in_home(
+        client_home.path(),
+        Some(&codex_dir),
+        true,
+    );
+    assert!(synced_items.len() >= 2, "expected Vertex + Codex discovered locally");
+
+    // Delete the client's temp home BEFORE posting to server to prove the server NEVER relies
+    // on reading client local disk paths!
+    drop(client_home);
+
+    // Client syncs discovered subscriptions to remote server
+    let (st_sync, sync_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/hermes/magpie/subscriptions/sync",
+        Some(&tok),
+        Some(json!({
+            "subscriptions": synced_items,
+            "auto_activate": true
+        })),
+    )
+    .await;
+    assert_eq!(st_sync, StatusCode::OK, "POST subscriptions/sync: {sync_val}");
+    assert_eq!(sync_val["ok"].as_bool(), Some(true));
+    assert_eq!(sync_val["has_active_subscription"].as_bool(), Some(true));
+    assert_eq!(sync_val["needs_provider_selection"].as_bool(), Some(false));
+
+    // Secrets must NEVER leak in sync response or state GET
+    let sync_text = sync_val.to_string();
+    assert!(!sync_text.contains("vertex-super-secret-xyz"));
+    assert!(!sync_text.contains("vertex-refresh-secret-abc"));
+    assert!(!sync_text.contains("codex-refresh-secret-999"));
+    assert!(!sync_text.contains(mock_jwt));
+
+    // Verify Vertex AI was auto-activated and its in-memory VertexTokenManager is ready without disk
+    let active_provider = sync_val["state"]["active_provider"]
+        .as_str()
+        .expect("active_provider");
+    assert_eq!(active_provider, "google_vertex:desktop-user@vertex.example");
+    let snap = state.hermes.providers().snapshot();
+    let v_cfg = snap
+        .providers
+        .get(active_provider)
+        .expect("synced vertex provider config");
+    assert!(!v_cfg.headers.contains_key("x-adc-source-path"));
+    assert!(
+        state
+            .hermes
+            .providers()
+            .get_or_create_vertex_manager(active_provider, v_cfg)
+            .is_some(),
+        "in-memory VertexTokenManager must be registered and retained without local ADC disk path"
+    );
+
+    // Verify Codex was normalized away from 127.0.0.1:3425 and its CodexTokenManager is registered
+    let codex_id = "codex:desktop_codex@example.com";
+    let c_cfg = snap.providers.get(codex_id).expect("synced codex provider config");
+    assert_eq!(c_cfg.base_url, "https://chatgpt.com/backend-api/codex");
+    assert!(!c_cfg.headers.contains_key("x-codex-source-path"));
+    assert!(
+        state
+            .hermes
+            .providers()
+            .get_or_create_codex_manager(codex_id, c_cfg)
+            .is_some(),
+        "in-memory CodexTokenManager must be registered without local auth.json disk path"
+    );
+
+    // Verify activating the synced Codex subscription works over HTTP
+    let (st_act, act_val) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/hermes/magpie/subscriptions/{codex_id}/activate"),
+        Some(&tok),
+        Some(json!({ "model": "gpt-4o" })),
+    )
+    .await;
+    assert_eq!(st_act, StatusCode::OK, "activate synced codex: {act_val}");
+    assert_eq!(act_val["active_provider_id"].as_str(), Some(codex_id));
+    assert_eq!(act_val["active_model"].as_str(), Some("gpt-4o"));
+}

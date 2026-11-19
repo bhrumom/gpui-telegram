@@ -27,6 +27,7 @@ use crate::i18n::tr_str;
 use crate::theme::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::app_shell::{
     build_account_record, compute_shell_palette,
+    local_subscription_bridge::ShellMagpieLocalState,
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
     ShellPanelState,
 };
@@ -110,6 +111,7 @@ pub struct AppShell {
     pub rtc_talk: ShellRtcTalkState,
     pub overlays: ShellOverlayState,
     pub computers: ShellComputersState,
+    pub magpie_local: ShellMagpieLocalState,
     pub theme_state: ShellThemeVisualState,
 }
 
@@ -215,6 +217,7 @@ impl AppShell {
             rtc_talk: ShellRtcTalkState::new(),
             overlays: ShellOverlayState::new(),
             computers: ShellComputersState::new(),
+            magpie_local: ShellMagpieLocalState::new(),
             theme_state: init_theme_state,
         };
 
@@ -725,7 +728,6 @@ impl Render for AppShell {
                     )
                     .child(self.inspector.clone()),
             )
-            .when_some(self.overlays.computer_overlay.clone(), |el, ov| el.child(self.render_remote_computer_overlay(ov)))
             .when_some(self.rtc_talk.talk_mode_overlay.clone(), |el, ov| el.child(self.render_talk_mode_overlay(ov, cx)))
             .when_some(self.overlays.media_viewer_overlay.clone(), |el, ov| el.child(self.render_media_viewer_overlay(ov)))
             .when_some(self.overlays.iv_viewer_overlay.clone(), |el, ov| el.child(self.render_iv_viewer_overlay(ov)))
@@ -738,6 +740,7 @@ impl Render for AppShell {
             .when(self.active_panel == ActiveWorkspacePanel::McpTools, |el| el.child(self.render_mcp_tools_modal_overlay(cx)))
             .when(account_popover_open, |el| el.child(self.render_account_popover_overlay(cx)))
             .child(self.modal_container.clone())
+            .when_some(self.overlays.computer_overlay.clone(), |el, ov| el.child(self.render_remote_computer_overlay(ov)))
             .when(self.overlays.is_passcode_locked, |el| el.child(self.render_passcode_lock_overlay(cx)))
             .when_some(
                 self.computers.pending_approvals.first().cloned(),

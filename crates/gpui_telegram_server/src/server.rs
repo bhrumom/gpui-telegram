@@ -959,6 +959,8 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/hermes/magpie/subscriptions", get(routes::magpie_api::magpie_subscriptions_get))
         .route("/api/v1/hermes/magpie/subscriptions/{id}/activate", post(routes::magpie_api::magpie_subscription_activate))
         .route("/api/v1/hermes/magpie/subscriptions/scan", post(routes::magpie_api::magpie_subscriptions_scan))
+        .route("/api/v1/hermes/magpie/subscriptions/sync", post(routes::magpie_api::magpie_subscriptions_sync))
+        .route("/api/v1/hermes/magpie/models/catalog", get(routes::magpie_api::magpie_models_catalog_get))
         .route("/api/v1/hermes/magpie/groups", get(routes::magpie_api::magpie_groups_get).post(routes::magpie_api::magpie_groups_upsert).put(routes::magpie_api::magpie_groups_upsert).delete(routes::magpie_api::magpie_groups_delete_query))
         .route("/api/v1/hermes/magpie/groups/{id}", delete(routes::magpie_api::magpie_group_delete_path))
         .route("/api/v1/hermes/magpie/masking", get(routes::magpie_api::magpie_masking_get).put(routes::magpie_api::magpie_masking_put).post(routes::magpie_api::magpie_masking_put))

@@ -5,6 +5,7 @@
 pub mod gateway;
 pub mod import;
 pub mod masking;
+pub mod models_catalog;
 pub mod presets;
 pub mod protocol;
 pub mod routing;
@@ -20,6 +21,12 @@ pub use import::{parse_dotenv_providers, parse_magpie_import_link, ImportError, 
 pub use masking::{
     mask_text, unmask_text, MaskResult, MaskingAction, MaskingConfig, MaskingEngine, MaskingHit,
     StreamingUnmasker,
+};
+pub use models_catalog::{
+    fetch_live_upstream_models, fetch_models_dev_catalog, merge_discovered_models,
+    models_dev_provider_id_for_subscription, parse_models_dev_json,
+    parse_openai_or_codex_models_response, parse_vertex_or_gemini_models_response,
+    CompactModelsCatalog, MODELS_DEV_API_URL, MODELS_DEV_CACHE_TTL_MS,
 };
 pub use presets::{
     all_presets, canonical_preset_alias, find_preset, resolve_preset_endpoints, MagpiePreset,
@@ -46,14 +53,15 @@ pub use routing::{
     MAX_RATE_REST_MS, OVERLOAD_REST_MS,
 };
 pub use subscriptions::{
-    decode_jwt_payload, discover_subscriptions_in_home, extract_jwt_exp_ms,
-    is_sensitive_header_name, parse_gcloud_config_default, parse_magpie_logins,
-    parse_magpie_providers, parse_vertex_adc_credentials, redact_header_value,
-    redact_oauth_error_body, scan_claude_dirs, scan_gemini_dirs, scan_magpie_dir, scan_vertex_adc,
-    CachedVertexToken, CodexTokenManager, GoogleOAuthTokenResponse, SubscriptionAccount,
-    SubscriptionKind, SubscriptionRegistry, TokenRefreshError, VertexAdcCredentials,
-    VertexTokenManager, DEFAULT_CODEX_CLIENT_ID, DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS,
-    GOOGLE_OAUTH2_TOKEN_URL, OPENAI_OAUTH2_TOKEN_URL,
+    decode_jwt_payload, default_models_for_subscription_kind, discover_subscriptions_in_home,
+    discover_syncable_subscriptions_in_home, extract_jwt_exp_ms, is_loopback_server_url, is_sensitive_header_name,
+    parse_gcloud_config_default, parse_magpie_logins, parse_magpie_providers,
+    parse_vertex_adc_credentials, redact_header_value, redact_oauth_error_body, scan_claude_dirs,
+    scan_gemini_dirs, scan_magpie_dir, scan_vertex_adc, CachedVertexToken,
+    ClientSubscriptionSyncItem, CodexOAuthCredentials, CodexTokenManager,
+    GoogleOAuthTokenResponse, SubscriptionAccount, SubscriptionKind, SubscriptionRegistry,
+    TokenRefreshError, VertexAdcCredentials, VertexTokenManager, DEFAULT_CODEX_CLIENT_ID,
+    DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS, GOOGLE_OAUTH2_TOKEN_URL, OPENAI_OAUTH2_TOKEN_URL,
 };
 pub use usage::{
     estimate_cost_usd, normalize_session_from_map, normalize_session_header, UsageLedger,

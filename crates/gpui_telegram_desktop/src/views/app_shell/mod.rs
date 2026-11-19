@@ -1,6 +1,7 @@
 //! Module definitions for `crates/gpui_telegram_desktop/src/views/app_shell`
 
 pub mod gift_resale_filter;
+pub mod local_subscription_bridge;
 pub mod main_window;
 pub mod modal_container;
 pub mod menu_action_with_thumbnail;

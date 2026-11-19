@@ -39,12 +39,16 @@ pub enum KeyAction {
     None,
 }
 
+/// Trailing macOS Return keydowns emitted in the same tick as an IME commit arrive within a few ms.
+const IME_COMMIT_FENCE_WINDOW_MS: u64 = 80;
+
 pub struct ImeSafetyMachine {
     pub state: ImeState,
     pub text_buffer: String,
     pub cursor_index: usize,
     /// Fence flag preventing trailing Cocoa Return keydown from dispatching a message
     pub just_committed: bool,
+    pub last_commit_at: Option<std::time::Instant>,
 }
 
 impl ImeSafetyMachine {
@@ -54,6 +58,7 @@ impl ImeSafetyMachine {
             text_buffer: String::new(),
             cursor_index: 0,
             just_committed: false,
+            last_commit_at: None,
         }
     }
 
@@ -65,12 +70,14 @@ impl ImeSafetyMachine {
             text_buffer,
             cursor_index,
             just_committed: false,
+            last_commit_at: None,
         }
     }
 
     /// Called when OS IME begins composition
     pub fn on_ime_start(&mut self) {
         self.just_committed = false;
+        self.last_commit_at = None;
         self.state = ImeState::Composing {
             preedit_text: String::new(),
             cursor_pos: 0,
@@ -80,6 +87,7 @@ impl ImeSafetyMachine {
     /// Called as user types phonetic/radical keystrokes in IME preedit window
     pub fn on_ime_update(&mut self, preedit: &str, cursor_pos: usize) {
         self.just_committed = false;
+        self.last_commit_at = None;
         self.state = ImeState::Composing {
             preedit_text: preedit.to_string(),
             cursor_pos,
@@ -94,17 +102,20 @@ impl ImeSafetyMachine {
         };
         // Set fence flag so trailing Return keydown within this tick is absorbed
         self.just_committed = true;
+        self.last_commit_at = Some(std::time::Instant::now());
     }
 
     /// Called when IME composition is canceled without committing
     pub fn on_ime_cancel(&mut self) {
         self.just_committed = false;
+        self.last_commit_at = None;
         self.state = ImeState::Idle;
     }
 
     /// Reset commit fence when user types non-IME characters or explicit resets
     pub fn reset_commit_fence(&mut self) {
         self.just_committed = false;
+        self.last_commit_at = None;
         if matches!(self.state, ImeState::Committed { .. }) {
             self.state = ImeState::Idle;
         }
@@ -112,11 +123,20 @@ impl ImeSafetyMachine {
 
     /// Process Enter key press with IME safety guard
     pub fn handle_enter_key(&mut self, is_shift: bool) -> KeyAction {
-        // If just committed via IME, consume the fence and suppress sending
+        let within_fence_window = self
+            .last_commit_at
+            .is_none_or(|t| t.elapsed() < std::time::Duration::from_millis(IME_COMMIT_FENCE_WINDOW_MS));
+
+        // If just committed via IME within the same tick, absorb the trailing Return keydown.
+        // If > 80ms have elapsed (e.g. user committed Chinese text via Space and later pressed Enter),
+        // treat Enter as an intentional send/newline keypress.
         if self.just_committed {
             self.just_committed = false;
+            self.last_commit_at = None;
             self.state = ImeState::Idle;
-            return KeyAction::ImeCandidateChosen;
+            if within_fence_window {
+                return KeyAction::ImeCandidateChosen;
+            }
         }
 
         match &self.state {
@@ -129,7 +149,17 @@ impl ImeSafetyMachine {
             ImeState::Committed { .. } => {
                 self.state = ImeState::Idle;
                 self.just_committed = false;
-                KeyAction::ImeCandidateChosen
+                self.last_commit_at = None;
+                if within_fence_window {
+                    KeyAction::ImeCandidateChosen
+                } else if is_shift {
+                    self.insert_text("\n");
+                    KeyAction::InsertNewline
+                } else if !self.text_buffer.trim().is_empty() {
+                    KeyAction::SendMessage
+                } else {
+                    KeyAction::None
+                }
             }
             ImeState::Idle => {
                 if is_shift {

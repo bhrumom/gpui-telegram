@@ -84,11 +84,16 @@ pub fn sanitize_paste_text(raw: &str, allow_newlines: bool) -> String {
     out
 }
 
+/// Maximum window within which a trailing `Enter` keydown following an IME commit is treated as
+/// part of the same IME confirmation event rather than an intentional submit/send keypress.
+const IME_TRAILING_ENTER_WINDOW_MS: u64 = 80;
+
 /// Tracks active IME marked composition text and post-commit Enter-key absorption state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TextInputController {
     pub ime_preedit: Option<String>,
     pub just_committed_ime: bool,
+    pub last_ime_commit_at: Option<std::time::Instant>,
 }
 
 impl TextInputController {
@@ -104,8 +109,23 @@ impl TextInputController {
         self.ime_preedit = None;
     }
 
+    /// Marks that an IME composition was just committed right now, starting the short trailing-Enter
+    /// guard window so Space-committed CJK text does not swallow a later intentional Enter send.
+    pub fn mark_ime_committed(&mut self) {
+        self.just_committed_ime = true;
+        self.last_ime_commit_at = Some(std::time::Instant::now());
+    }
+
     pub fn take_just_committed(&mut self) -> bool {
-        std::mem::take(&mut self.just_committed_ime)
+        let was_set = std::mem::take(&mut self.just_committed_ime);
+        let ts = self.last_ime_commit_at.take();
+        if !was_set {
+            return false;
+        }
+        match ts {
+            Some(t) => t.elapsed() < std::time::Duration::from_millis(IME_TRAILING_ENTER_WINDOW_MS),
+            None => true,
+        }
     }
 
     pub fn text_and_preedit(&self, committed: String) -> (String, Option<String>) {

@@ -1,12 +1,13 @@
 use crate::computer::{parse_cloud_credentials_from_prompt, redact_cloud_secrets};
 use chrono::Utc;
 pub use magpie_gateway::{
-    all_presets, find_preset, parse_dotenv_providers, parse_magpie_import_link,
-    parse_vertex_adc_credentials, resolve_preset_endpoints, CodexTokenManager, MaskResult,
-    MaskingAction, MaskingConfig, MaskingEngine, MaskingHit, ProtocolKind, RouteDecisionTrace,
-    RouteRuntimeMetrics, RoutingGroup, RoutingGroupMember, RoutingStrategy, StreamingUnmasker,
-    SubscriptionAccount, SubscriptionKind, SubscriptionRegistry, VertexAdcCredentials,
-    VertexTokenManager,
+    all_presets, discover_syncable_subscriptions_in_home, find_preset, is_loopback_server_url,
+    parse_dotenv_providers, parse_magpie_import_link, parse_vertex_adc_credentials,
+    resolve_preset_endpoints, ClientSubscriptionSyncItem, CodexOAuthCredentials, CodexTokenManager,
+    MaskResult, MaskingAction, MaskingConfig, MaskingEngine, MaskingHit, ProtocolKind,
+    RouteDecisionTrace, RouteRuntimeMetrics, RoutingGroup, RoutingGroupMember, RoutingStrategy,
+    StreamingUnmasker, SubscriptionAccount, SubscriptionKind, SubscriptionRegistry,
+    VertexAdcCredentials, VertexTokenManager,
 };
 use magpie_gateway::{
     build_gemini_generate_content_payload, discover_subscriptions_in_home, extract_jwt_exp_ms,
@@ -1004,6 +1005,10 @@ pub struct ProviderRouterState {
     pub masking: MaskingConfig,
     #[serde(default)]
     pub recent_route_traces: Vec<RouteDecisionTrace>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub synced_vertex_adcs: HashMap<String, VertexAdcCredentials>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub synced_codex_oauths: HashMap<String, CodexOAuthCredentials>,
 }
 
 impl Default for ProviderRouter {
@@ -1100,6 +1105,8 @@ impl ProviderRouter {
                 routing_strategy: RoutingStrategy::Smart,
                 masking: MaskingConfig::default(),
                 recent_route_traces: Vec::new(),
+                synced_vertex_adcs: HashMap::new(),
+                synced_codex_oauths: HashMap::new(),
             })),
             route_metrics: Arc::new(Mutex::new(RouteRuntimeMetrics::default())),
             http_client,
@@ -1641,6 +1648,29 @@ impl ProviderRouter {
         guard.routing_strategy = state.routing_strategy;
         guard.masking = state.masking.clone();
         guard.recent_route_traces = state.recent_route_traces.clone();
+        guard.synced_vertex_adcs = state.synced_vertex_adcs.clone();
+        guard.synced_codex_oauths = state.synced_codex_oauths.clone();
+        let synced_adcs = state.synced_vertex_adcs.clone();
+        let synced_codex = state.synced_codex_oauths.clone();
+        drop(guard);
+
+        if !synced_adcs.is_empty() {
+            for (pid, adc) in synced_adcs {
+                self.register_vertex_token_manager(&pid, VertexTokenManager::new(adc));
+            }
+        }
+        if !synced_codex.is_empty() {
+            for (pid, oauth) in synced_codex {
+                let mut mgr = CodexTokenManager::new(oauth.refresh_token);
+                if let Some(cid) = oauth.client_id.filter(|s| !s.trim().is_empty()) {
+                    mgr = mgr.with_client_id(cid);
+                }
+                if let Some(url) = oauth.token_url.filter(|s| !s.trim().is_empty()) {
+                    mgr = mgr.with_token_url(url);
+                }
+                self.register_codex_token_manager(&pid, mgr);
+            }
+        }
     }
 
     /// Synchronizes both `ProviderRouterState` and shared token managers (`VertexTokenManager`,
@@ -2175,6 +2205,170 @@ impl ProviderRouter {
         let reg = self.refresh_discovered_subscriptions_in_home(home, codex_home_override);
         self.rebuild_default_fallback_chain();
         reg
+    }
+
+    /// Ingests local AI subscriptions discovered on a desktop client machine (with unredacted
+    /// tokens and refreshable OAuth credentials) into this `ProviderRouter`.
+    ///
+    /// Unlike `refresh_discovered_subscriptions_in_home`, synced providers do NOT store local
+    /// filesystem paths (`x-adc-source-path` / `x-codex-source-path`) because those paths belong
+    /// to the client host rather than the remote server host. Instead, `VertexTokenManager` and
+    /// `CodexTokenManager` are registered directly in memory (and persisted in router state) so
+    /// server-side inference and token refresh work seamlessly across requests and restarts.
+    pub fn ingest_client_subscriptions(
+        &self,
+        items: Vec<ClientSubscriptionSyncItem>,
+        auto_activate: bool,
+    ) -> SubscriptionRegistry {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut vertex_to_register: Vec<(String, VertexAdcCredentials)> = Vec::new();
+        let mut codex_to_register: Vec<(String, CodexOAuthCredentials, Option<String>)> = Vec::new();
+
+        {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut synced_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for item in items {
+                let mut acc = item.account;
+                if acc.id.trim().is_empty() {
+                    continue;
+                }
+                acc.access_token = item.access_token.clone().or(acc.access_token);
+                if !item.raw_headers.is_empty() {
+                    acc.headers = item.raw_headers.clone();
+                }
+
+                let mut cfg = subscription_to_provider_config(&acc);
+                // Remote-synced subscriptions must never attempt local disk lookups on the server
+                cfg.headers.remove("x-adc-source-path");
+                cfg.headers.remove("x-codex-source-path");
+                if let Some(ref reg) = item.region_id {
+                    if !reg.trim().is_empty() {
+                        cfg.region_id = Some(reg.trim().to_string());
+                    }
+                }
+                if item.vertex_adc.is_some() {
+                    cfg.no_key_required = true;
+                }
+                if item.codex_oauth.is_some() && cfg.credentials.is_empty() {
+                    cfg.no_key_required = true;
+                }
+                for m in &item.available_models {
+                    if !m.trim().is_empty() && !cfg.fallback_models.contains(m) {
+                        cfg.fallback_models.push(m.clone());
+                    }
+                }
+
+                register_subscription_model_profiles(&mut guard, &cfg);
+                if let Some(existing) = guard.providers.get_mut(&cfg.id) {
+                    existing.name = cfg.name;
+                    existing.enabled = cfg.enabled;
+                    existing.api_mode = cfg.api_mode;
+                    existing.base_url = cfg.base_url;
+                    existing.is_subscription = true;
+                    existing.no_key_required = cfg.no_key_required;
+                    existing.headers = cfg.headers;
+                    if cfg.region_id.is_some() {
+                        existing.region_id = cfg.region_id;
+                    }
+                    if !cfg.credentials.is_empty() {
+                        existing.credentials = cfg.credentials;
+                    }
+                    if existing.default_model.is_empty() {
+                        existing.default_model = cfg.default_model;
+                    }
+                } else {
+                    guard.providers.insert(cfg.id.clone(), cfg);
+                }
+
+                if let Some(adc) = item.vertex_adc {
+                    guard.synced_vertex_adcs.insert(acc.id.clone(), adc.clone());
+                    vertex_to_register.push((acc.id.clone(), adc));
+                }
+                if let Some(oauth) = item.codex_oauth {
+                    guard
+                        .synced_codex_oauths
+                        .insert(acc.id.clone(), oauth.clone());
+                    codex_to_register.push((acc.id.clone(), oauth, acc.access_token.clone()));
+                }
+
+                synced_ids.insert(acc.id.clone());
+                if let Some(existing_sub) = guard.subscriptions.iter_mut().find(|s| s.id == acc.id) {
+                    *existing_sub = acc;
+                } else {
+                    guard.subscriptions.push(acc);
+                }
+            }
+
+            let needs_selection = !guard.providers.values().any(|p| {
+                p.enabled
+                    && p.id != "local_hermes"
+                    && p.api_mode != ApiMode::LocalHermes
+                    && (!p.credentials.is_empty() || p.no_key_required)
+            });
+
+            if auto_activate && (needs_selection || guard.active_provider_id == "local_hermes") {
+                let best_sub_id = guard
+                    .subscriptions
+                    .iter()
+                    .find(|s| s.active && s.kind == SubscriptionKind::GoogleVertex)
+                    .or_else(|| {
+                        guard
+                            .subscriptions
+                            .iter()
+                            .find(|s| s.active && s.kind == SubscriptionKind::CodexChatGpt)
+                    })
+                    .or_else(|| guard.subscriptions.iter().find(|s| s.active))
+                    .map(|s| s.id.clone());
+
+                if let Some(sub_id) = best_sub_id {
+                    let opt_pair = guard
+                        .providers
+                        .get(&sub_id)
+                        .map(|cfg| (cfg.id.clone(), cfg.default_model.clone()));
+                    if let Some((pid, model)) = opt_pair {
+                        guard.active_provider_id = pid;
+                        guard.active_model = model;
+                    }
+                }
+            }
+
+            if !guard.active_provider_id.is_empty() && guard.active_provider_id != "local_hermes" {
+                let active_id = guard.active_provider_id.clone();
+                for s in &mut guard.subscriptions {
+                    s.active = s.id == active_id;
+                }
+            }
+        }
+
+        for (pid, adc) in vertex_to_register {
+            self.register_vertex_token_manager(&pid, VertexTokenManager::new(adc));
+        }
+        for (pid, oauth, access_tok) in codex_to_register {
+            let mut mgr = CodexTokenManager::new(oauth.refresh_token);
+            if let Some(cid) = oauth.client_id.filter(|s| !s.trim().is_empty()) {
+                mgr = mgr.with_client_id(cid);
+            }
+            if let Some(url) = oauth.token_url.filter(|s| !s.trim().is_empty()) {
+                mgr = mgr.with_token_url(url);
+            }
+            if let Some(acc) = access_tok {
+                if let Some(exp_ms) = extract_jwt_exp_ms(&acc) {
+                    mgr.set_cached_token(magpie_gateway::CachedVertexToken {
+                        access_token: acc,
+                        expires_at_ms: exp_ms,
+                    });
+                }
+            }
+            self.register_codex_token_manager(&pid, mgr);
+        }
+
+        self.rebuild_default_fallback_chain();
+        let snap = self.snapshot();
+        SubscriptionRegistry {
+            accounts: snap.subscriptions,
+            scanned_at_ms: now_ms,
+        }
     }
 
     pub fn find_best_available_subscription(&self) -> Option<String> {
@@ -3185,7 +3379,10 @@ impl ProviderRouter {
                 builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
             }
             for (k, v) in &cfg.headers {
-                if !k.starts_with("x-adc-") && !k.starts_with("x-codex-") {
+                if !k.starts_with("x-adc-")
+                    && !k.starts_with("x-codex-")
+                    && !k.eq_ignore_ascii_case("x-goog-user-project")
+                {
                     builder = builder.header(k.as_str(), v.as_str());
                 }
             }

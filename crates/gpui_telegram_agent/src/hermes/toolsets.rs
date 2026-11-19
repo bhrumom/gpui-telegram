@@ -1977,8 +1977,8 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": ["string", "null"], "description": "Computer node_id to bind (or null/omitted to unbind)." },
-                    "computer_id": { "type": ["string", "null"], "description": "Optional alias for node_id." }
+                    "node_id": { "type": "string", "nullable": true, "description": "Computer node_id to bind (or null/omitted to unbind)." },
+                    "computer_id": { "type": "string", "nullable": true, "description": "Optional alias for node_id." }
                 }
             }),
             ToolRiskLevel::Low,
@@ -2434,7 +2434,7 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
                 "type": "object",
                 "properties": {
                     "chat_id": { "type": "integer" },
-                    "poll_id": { "type": ["string", "integer"] },
+                    "poll_id": { "type": "string", "description": "Poll identifier (string or numeric poll ID)." },
                     "option_ids": { "type": "array", "items": { "type": "integer" } },
                     "option_index": { "type": "integer" }
                 },

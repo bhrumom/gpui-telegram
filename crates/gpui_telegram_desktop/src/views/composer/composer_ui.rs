@@ -223,8 +223,20 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
     let composer_font = px(palette.scaled_px(palette.font_size_px as f32));
     let text_el = if is_empty {
         div()
+            .w_full()
+            .flex()
+            .items_center()
             .text_size(composer_font)
             .text_color(rgb(palette.text_secondary))
+            .when(is_focused, |el| {
+                el.child(
+                    div()
+                        .w(px(1.5))
+                        .h(px(palette.scaled_px(17.0)))
+                        .mr(px(2.0))
+                        .bg(rgb(palette.accent)),
+                )
+            })
             .child(tr_key_or(lang_id, "lng_message_ph", "Write a message..."))
             .into_any_element()
     } else if let Some((s, e)) = selection {

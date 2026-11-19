@@ -108,10 +108,10 @@ pub fn render_sessions_providers_tab(
                     })),
             ),
         )
-        // 2. API Mode, Fallback Chain & Magpie Providers
+        // 2. API Mode, Fallback Chain & Built-in AI Gateway Providers
         .child(
             studio_section_card(
-                tr_str(&lang, "API 协议模式与模型供应商 (Magpie)", "API Modes, Magpie Providers & Fallback Chain"),
+                tr_str(&lang, "API 协议模式与模型供应商", "API Modes, Providers & Fallback Chain"),
                 IconName::SettingsGear,
                 pal,
             )
@@ -150,7 +150,7 @@ pub fn render_sessions_providers_tab(
                                     } else {
                                         format!(
                                             "{}: {} / {} · {} subs · route={} · mask={}",
-                                            tr_str(&lang, "Magpie 已就绪", "Magpie Ready"),
+                                            tr_str(&lang, "AI 网关已就绪", "AI Gateway Ready"),
                                             ws.status_summary.active_provider,
                                             ws.status_summary.active_model,
                                             active_subs,
@@ -166,7 +166,7 @@ pub fn render_sessions_providers_tab(
                             .flex_wrap()
                             .gap(px(6.0))
                             .child(action_btn(
-                                tr_str(&lang, "选择 AI 供应商 (Magpie)", "Configure AI Providers (Magpie)"),
+                                tr_str(&lang, "配置 AI 供应商", "Configure AI Providers"),
                                 pal.accent,
                                 pal.active_button_fg,
                                 |this, _| {
