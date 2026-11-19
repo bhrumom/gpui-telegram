@@ -71,12 +71,23 @@ jobs:
           cargo build --release -p gpui_telegram_server --bin gpui_telegram_server
           ls -lh target/release/gpui_telegram_server
 
+      - name: Upload Compiled Linux Backend Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpui_telegram_server-linux-x86_64
+          path: target/release/gpui_telegram_server
+          retention-days: 7
+
       - name: Configure SSH Credentials from GitHub Secrets
         env:
           SSH_KEY: ${{ secrets.BACKEND_SSH_PRIVATE_KEY }}
           SSH_HOST: ${{ secrets.BACKEND_SSH_HOST }}
           SSH_PORT: ${{ secrets.BACKEND_SSH_PORT }}
         run: |
+          if [ -z "${SSH_HOST:-}" ] || [ -z "${SSH_KEY:-}" ]; then
+            echo "::notice::BACKEND_SSH_HOST / BACKEND_SSH_PRIVATE_KEY secrets are not configured; skipping automated SSH deploy (compiled binary uploaded as workflow artifact)."
+            exit 0
+          fi
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
@@ -88,12 +99,17 @@ jobs:
           SSH_HOST: ${{ secrets.BACKEND_SSH_HOST }}
           SSH_PORT: ${{ secrets.BACKEND_SSH_PORT }}
           SSH_USER: ${{ secrets.BACKEND_SSH_USER }}
+          SSH_KEY: ${{ secrets.BACKEND_SSH_PRIVATE_KEY }}
           DEPLOY_PATH: ${{ secrets.BACKEND_DEPLOY_PATH }}
           SERVICE_NAME: ${{ secrets.BACKEND_SERVICE_NAME }}
           BACKEND_ENV: ${{ secrets.BACKEND_ENV_FILE }}
           AI_BACKEND_ENV: ${{ secrets.AI_BACKEND_ENV_FILE }}
           AI_BACKEND_SERVICE: ${{ secrets.AI_BACKEND_SERVICE_NAME }}
         run: |
+          if [ -z "${SSH_HOST:-}" ] || [ -z "${SSH_KEY:-}" ]; then
+            echo "Skipping SSH deploy because GitHub Actions SSH secrets are not set."
+            exit 0
+          fi
           PORT_ARG="${SSH_PORT:-22}"
           REMOTE_DIR="${DEPLOY_PATH:-/opt/fabushi/gpui-server}"
           SVC="${SERVICE_NAME:-gpui-telegram-server}"
