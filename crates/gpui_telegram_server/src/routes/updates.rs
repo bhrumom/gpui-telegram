@@ -93,7 +93,9 @@ fn is_valid_release_filename(filename: &str) -> bool {
         || filename.starts_with("gpui_telegram")
         || filename.starts_with("gpui-tg-cli")
         || filename == "latest-mac.json"
+        || filename == "latest-windows.json"
         || filename == "SHA256SUMS"
+        || filename == "SHA256SUMS-windows.txt"
 }
 
 fn resolve_updates_cache_root(state: &AppState) -> PathBuf {

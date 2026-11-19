@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_GITHUB_REPO: &str = "bhrumom/gpui-telegram";
+#[cfg(target_os = "windows")]
+pub const DEFAULT_MANIFEST_URL: &str =
+    "https://github.com/bhrumom/gpui-telegram/releases/latest/download/latest-windows.json";
+#[cfg(not(target_os = "windows"))]
 pub const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/bhrumom/gpui-telegram/releases/latest/download/latest-mac.json";
 pub const DEFAULT_GITHUB_LATEST_API_URL: &str =
@@ -405,6 +409,10 @@ fn current_platform_keys() -> Vec<&'static str> {
         vec!["darwin-arm64", "macos-arm64", "darwin-universal", "macos-universal"]
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         vec!["darwin-x86_64", "darwin-x64", "macos-x86_64", "macos-x64", "darwin-universal", "macos-universal"]
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        vec!["windows-x86_64", "windows-x64", "win32-x64", "win-x64"]
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        vec!["windows-arm64", "windows-aarch64", "win32-arm64"]
     } else if cfg!(target_os = "linux") {
         vec!["linux-x86_64", "linux-arm64"]
     } else {
@@ -480,11 +488,24 @@ fn score_github_asset(name: &str) -> Option<i32> {
     }
     let is_zip = lower.ends_with(".zip");
     let is_tar = lower.ends_with(".tar.gz") || lower.ends_with(".tgz");
-    if !is_zip && !is_tar {
-        return None;
-    }
-    if lower.contains("linux") || lower.contains(".exe") || lower.contains("win32") {
-        return None;
+    let is_exe = lower.ends_with(".exe");
+    if cfg!(target_os = "windows") {
+        if !is_zip && !is_exe {
+            return None;
+        }
+        if lower.contains("macos") || lower.contains("darwin") || lower.contains("linux") {
+            return None;
+        }
+        if !lower.contains("windows") && !lower.contains("win64") && !lower.contains("win32") {
+            return None;
+        }
+    } else {
+        if !is_zip && !is_tar {
+            return None;
+        }
+        if lower.contains("linux") || lower.contains(".exe") || lower.contains("win32") || lower.contains("windows") {
+            return None;
+        }
     }
     let arch_score = if cfg!(target_arch = "aarch64") {
         if lower.contains("arm64") || lower.contains("aarch64") {

@@ -124,3 +124,28 @@ jobs:
         run: |
           sccache --show-stats || true
           python3 scripts/clean_build_garbage.py
+
+  windows-gpui-verify:
+    name: Windows x86_64 Turbo Check & Binary Build (sccache)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Protobuf Compiler (protoc)
+        uses: arduino/setup-protoc@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "windows-latest-turbo-v1"
+      - name: Check & Build Windows Desktop, Server & CLI Binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --workspace --lib --bins
+          cargo build --profile ci --bin gpui_telegram_desktop --bin gpui-tg-cli
+      - name: Report sccache Hit Statistics & Clean Temp Garbage
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          python scripts/clean_build_garbage.py

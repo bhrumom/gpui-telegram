@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 use gpui::*;
 use gpui_telegram_client::{ClientConfig, TelegramClient};
 use gpui_telegram_desktop::theme::TelegramAssetSource;
@@ -49,7 +51,11 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("")),
+                    title: Some(SharedString::from(if cfg!(target_os = "windows") {
+                        "Fabushi"
+                    } else {
+                        ""
+                    })),
                     ..Default::default()
                 }),
                 focus: true,
