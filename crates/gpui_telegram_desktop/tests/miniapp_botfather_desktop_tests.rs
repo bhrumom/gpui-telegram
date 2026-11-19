@@ -2634,5 +2634,13 @@ fn test_bot_attach_webview_webmcp_dispatch_takeover_and_bridge_response() {
     assert_eq!(wv.control_mode, MiniAppControlMode::WaitingForTakeover);
     assert!(wv.is_open);
     assert!(!wv.is_floating_pip);
+
+    // 4. Live PiP mode flag defaults true, can toggle to collapsed and restores on WebMCP dispatch
+    let mut live_wv = BotAttachWebView::new();
+    assert!(live_wv.pip_live_preview, "pip_live_preview should default true for live broadcast PiP");
+    live_wv.pip_live_preview = false;
+    assert!(!live_wv.pip_live_preview);
+    live_wv.close();
+    assert!(live_wv.pip_live_preview, "close() must reset pip_live_preview to true");
 }
 

@@ -44,26 +44,118 @@ impl Render for BotAttachWebView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_open {
             if self.is_floating_pip && self.disclaimer_accepted {
-                let entity = cx.entity().clone();
-                let pip_sync_canvas = canvas(
-                    |bounds, _, _| bounds,
-                    move |bounds, _, window, cx| {
-                        let _ = entity.update(cx, |this, entity_cx| {
-                            let had_events =
-                                this.sync_native_webview(window, bounds, false, entity_cx);
-                            if had_events {
-                                entity_cx
-                                    .spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                                        let _ = weak.update(app, |_, cx| cx.notify());
-                                    })
-                                    .detach();
-                            }
-                        });
-                    },
-                )
-                .w(px(1.0))
-                .h(px(1.0));
-                return pip_sync_canvas.into_any_element();
+                #[cfg(target_os = "macos")]
+                let use_headless = MacOsWkWebView::is_headless_or_offline_test_env();
+                #[cfg(not(target_os = "macos"))]
+                let use_headless = true;
+
+                let live_visible =
+                    self.pip_live_preview && !self.external_modal_occluding && !self.is_loading;
+
+                if !use_headless {
+                    let entity = cx.entity().clone();
+                    let pip_sync_canvas = canvas(
+                        |bounds, _, _| bounds,
+                        move |bounds, _, window, cx| {
+                            let _ = entity.update(cx, |this, entity_cx| {
+                                let had_events = this.sync_native_webview(
+                                    window,
+                                    bounds,
+                                    live_visible,
+                                    entity_cx,
+                                );
+                                if had_events {
+                                    entity_cx
+                                        .spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                                            let _ = weak.update(app, |_, cx| cx.notify());
+                                        })
+                                        .detach();
+                                }
+                            });
+                        },
+                    );
+                    if self.pip_live_preview {
+                        let pal = self.palette;
+                        let lang = self.language_id.as_str();
+                        return div()
+                            .id("miniapp-pip-live-canvas-wrap")
+                            .relative()
+                            .size_full()
+                            .bg(rgb(0x0B0E14))
+                            .child(pip_sync_canvas.absolute().inset_0())
+                            .when(self.is_loading, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(pal.text_secondary))
+                                        .child(tr_str(
+                                            lang,
+                                            "正在连接小程序实时画面...",
+                                            "Connecting Mini App live view...",
+                                        )),
+                                )
+                            })
+                            .into_any_element();
+                    }
+                    return pip_sync_canvas.w(px(1.0)).h(px(1.0)).into_any_element();
+                }
+
+                if self.pip_live_preview {
+                    let pal = self.palette;
+                    let lang = self.language_id.as_str();
+                    let title = if !self.ui_schema.title.trim().is_empty() {
+                        self.ui_schema.title.clone()
+                    } else {
+                        self.bot_username.clone()
+                    };
+                    let tool_line = self
+                        .active_webmcp_tool
+                        .as_deref()
+                        .map(|t| format!("WebMCP: {t}"))
+                        .unwrap_or_else(|| self.control_status_text.clone());
+                    let summary_line = self
+                        .last_webmcp_state_summary
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| tr_str(lang, "实时画中画运行中", "Live PiP running").to_string());
+                    return div()
+                        .id("miniapp-pip-headless-preview")
+                        .size_full()
+                        .p(px(12.0))
+                        .bg(rgb(0x0B0E14))
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xFFFFFF))
+                                .child(title),
+                        )
+                        .when(!tool_line.trim().is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(pal.accent))
+                                    .child(tool_line),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0xCBD5E1))
+                                .child(summary_line),
+                        )
+                        .into_any_element();
+                }
+                return div().w(px(1.0)).h(px(1.0)).into_any_element();
             }
             self.hide_native_webview();
             return div().into_any_element();
@@ -490,6 +582,7 @@ impl Render for BotAttachWebView {
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
                                                     this.is_floating_pip = true;
+                                                    this.pip_live_preview = true;
                                                     this.is_open = false;
                                                     this.pending_actions.push_back(
                                                         BotWebViewPendingAction::SwitchToFloatingPip,

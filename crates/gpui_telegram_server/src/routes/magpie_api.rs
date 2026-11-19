@@ -1301,6 +1301,7 @@ fn unified_to_provider_request(req: UnifiedRequest) -> ProviderRequest {
                         id: tc.id,
                         name: tc.name,
                         arguments: tc.arguments,
+                        thought_signature: tc.thought_signature,
                     })
                     .collect(),
                 reasoning: msg.reasoning,
@@ -1354,6 +1355,7 @@ fn provider_response_to_unified(resp: ProviderResponse) -> UnifiedResponse {
                 id: tc.id,
                 name: tc.name,
                 arguments: tc.arguments,
+                thought_signature: tc.thought_signature,
             })
             .collect(),
         finish_reason: resp.finish_reason,

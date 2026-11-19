@@ -45,6 +45,66 @@ fn talk_pill(bg: u32, border: Option<u32>, fg: u32, label: &'static str) -> Div 
     if let Some(b) = border { base.border_1().border_color(rgb(b)) } else { base.font_weight(FontWeight::SEMIBOLD) }
 }
 
+fn format_live_miniapp_telemetry(
+    lang: &str,
+    state_snap: Option<&serde_json::Value>,
+    is_ai: bool,
+    active_tool: Option<&str>,
+    status_text: &str,
+) -> String {
+    if is_ai {
+        if let Some(t) = active_tool.map(str::trim).filter(|s| !s.is_empty()) {
+            return format!(
+                "{}: {t}",
+                tr_str(lang, "AI 正在操控 WebMCP", "AI running WebMCP")
+            );
+        }
+    }
+    if let Some(snap) = state_snap {
+        if snap.get("is_transferring").and_then(|v| v.as_bool()) == Some(true) {
+            let sutra = snap
+                .get("current_sending_scripture")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("经典");
+            let country = snap
+                .get("current_sending_country")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("ALL");
+            let sent = snap
+                .get("global_data_sent_formatted")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("0 B");
+            return format!("发送中: 《{sutra}》 → {country} · 已传 {sent}");
+        }
+        if snap.get("is_in_session").and_then(|v| v.as_bool()) == Some(true) {
+            let chants = snap.get("chant_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            return format!("禅室共修进行中 · 念诵 {chants} 遍");
+        }
+        if let Some(sent) = snap
+            .get("global_data_sent_formatted")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let tab = snap
+                .get("active_tab")
+                .and_then(|v| v.as_str())
+                .unwrap_or("home");
+            return format!("已累计传经: {sent} · 页面: {tab}");
+        }
+    }
+    if !status_text.trim().is_empty() {
+        return status_text.to_string();
+    }
+    String::new()
+}
+
 impl AppShell {
     fn close_workspace_modal_to_chats(&mut self, cx: &mut Context<Self>) {
         self.active_panel = ActiveWorkspacePanel::Chats;
@@ -147,6 +207,12 @@ impl AppShell {
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id();
 
+        let sidebar_modal_open = {
+            let sb = self.sidebar.read(cx);
+            sb.is_contacts_modal_open
+                || sb.active_creation_modal.is_some()
+                || sb.is_account_popover_open
+        };
         let has_top_modal = self.miniapps.pending_miniapp_confirm.is_some()
             || self.miniapps.miniapp_tos_modal_open
             || self
@@ -158,13 +224,29 @@ impl AppShell {
                 .miniapps
                 .create_bot_box
                 .as_ref()
-                .is_some_and(|b| b.read(cx).is_visible);
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self.rtc_talk.talk_mode_overlay.is_some()
+            || self.overlays.media_viewer_overlay.is_some()
+            || self.overlays.iv_viewer_overlay.is_some()
+            || self.overlays.computer_overlay.is_some()
+            || self.overlays.is_passcode_locked
+            || self.active_panel != ActiveWorkspacePanel::Chats
+            || sidebar_modal_open
+            || self.modal_container.read(cx).is_modal_active();
 
+        let mut is_live_pip = false;
+        let mut pip_live_enabled = true;
         if let Some(ref ov) = self.miniapps.miniapp_overlay {
             let ov_read = ov.read(cx);
             let is_bg_pip = ov_read.is_floating_pip && !ov_read.is_open;
-            let should_hide_native = (!ov_read.is_open && !is_bg_pip) || has_top_modal;
-            let needs_park_pip = is_bg_pip && !has_top_modal && ov_read.disclaimer_accepted;
+            pip_live_enabled = ov_read.pip_live_preview;
+            is_live_pip = is_bg_pip
+                && ov_read.pip_live_preview
+                && !has_top_modal
+                && ov_read.disclaimer_accepted;
+            let should_hide_native =
+                (!ov_read.is_open && !is_bg_pip) || (ov_read.is_open && has_top_modal);
+            let needs_park_pip = is_bg_pip && !is_live_pip && ov_read.disclaimer_accepted;
             let needs_sync = ov_read.external_modal_occluding != has_top_modal
                 || (should_hide_native && ov_read.is_native_webview_visible());
             let _ = ov_read;
@@ -178,7 +260,7 @@ impl AppShell {
                     }
                 });
             }
-            if is_bg_pip {
+            if is_bg_pip && !is_live_pip {
                 layers.push(
                     div()
                         .id("miniapp-pip-bg-mount")
@@ -200,8 +282,14 @@ impl AppShell {
             .miniapp_overlay
             .as_ref()
             .is_some_and(|ov| ov.read(cx).is_open);
+        let overlay_floating_pip = self
+            .miniapps
+            .miniapp_overlay
+            .as_ref()
+            .is_some_and(|ov| ov.read(cx).is_floating_pip && !ov.read(cx).is_open);
         let pip_active = !overlay_open
             && (self.miniapps.is_miniapp_minimized
+                || overlay_floating_pip
                 || self
                     .miniapps
                     .floating_pip_status
@@ -284,8 +372,20 @@ impl AppShell {
             let is_waiting = ctrl_mode == MiniAppControlMode::WaitingForTakeover;
             let is_ai = ctrl_mode == MiniAppControlMode::AiControlling;
             let badge_label = match ctrl_mode {
-                MiniAppControlMode::Idle => tr_str(lang, "运行中", "Active"),
-                MiniAppControlMode::AiControlling => tr_str(lang, "AI 操控中", "AI Controlling"),
+                MiniAppControlMode::Idle => {
+                    if is_live_pip {
+                        tr_str(lang, "LIVE · 实时直播", "LIVE")
+                    } else {
+                        tr_str(lang, "运行中", "Active")
+                    }
+                }
+                MiniAppControlMode::AiControlling => {
+                    if is_live_pip {
+                        tr_str(lang, "LIVE · AI 操控中", "LIVE · AI")
+                    } else {
+                        tr_str(lang, "AI 操控中", "AI Controlling")
+                    }
+                }
                 MiniAppControlMode::WaitingForTakeover => tr_str(lang, "等待接管", "Needs Takeover"),
                 MiniAppControlMode::UserTakeover => tr_str(lang, "手动接管中", "User Takeover"),
             };
@@ -293,14 +393,24 @@ impl AppShell {
                 0xD97706
             } else if is_waiting {
                 0xDC2626
+            } else if is_live_pip {
+                0xEF4444
             } else {
                 pal.accent
             };
-            let detail_line = active_tool
-                .as_deref()
-                .map(|t| format!("WebMCP: {t}"))
-                .filter(|_| is_ai)
-                .unwrap_or_else(|| status_text.clone());
+            let detail_line = format_live_miniapp_telemetry(
+                lang,
+                state_snap.as_ref(),
+                is_ai,
+                active_tool.as_deref(),
+                &status_text,
+            );
+            let live_mount_overlay = if is_live_pip {
+                self.miniapps.miniapp_overlay.clone()
+            } else {
+                None
+            };
+            let has_toggle_overlay = self.miniapps.miniapp_overlay.is_some();
 
             let b_un_take = raw_bot_un.clone();
             let s_name_take = short_name.clone();
@@ -314,11 +424,10 @@ impl AppShell {
             layers.push(
                 div()
                     .id("minimized-miniapp-pill")
-                    .cursor_pointer()
                     .absolute()
-                    .bottom(px(86.0))
-                    .right(px(24.0))
-                    .w(px(320.0))
+                    .bottom(px(82.0))
+                    .right(px(20.0))
+                    .w(px(if is_live_pip { 340.0 } else { 300.0 }))
                     .px(px(12.0))
                     .py(px(10.0))
                     .rounded(px(16.0))
@@ -331,16 +440,8 @@ impl AppShell {
                     .gap(px(8.0))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.miniapps.is_miniapp_minimized = false;
-                            if let Some(ref ov) = this.miniapps.miniapp_overlay {
-                                ov.update(cx, |w, wcx| {
-                                    w.is_open = true;
-                                    w.is_floating_pip = false;
-                                    wcx.notify();
-                                });
-                            }
-                            cx.notify();
+                        cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
                         }),
                     )
                     .child(
@@ -368,6 +469,15 @@ impl AppShell {
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(6.0))
+                                                    .when(is_live_pip, |r| {
+                                                        r.child(
+                                                            div()
+                                                                .w(px(7.0))
+                                                                .h(px(7.0))
+                                                                .rounded_full()
+                                                                .bg(rgb(0xEF4444)),
+                                                        )
+                                                    })
                                                     .child(
                                                         div()
                                                             .text_size(px(13.0))
@@ -399,45 +509,104 @@ impl AppShell {
                             )
                             .child(
                                 div()
-                                    .id("minimized-miniapp-close-btn")
-                                    .cursor_pointer()
-                                    .w(px(22.0))
-                                    .h(px(22.0))
-                                    .rounded_full()
-                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(pal.text_secondary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            if is_takeover && !b_un_close.is_empty() {
-                                                this.client.send_miniapp_takeover_state(
-                                                    MiniAppTakeoverEvent {
-                                                        bot_username: b_un_close.clone(),
-                                                        short_name: s_name_close.clone(),
-                                                        chat_id,
-                                                        bot_user_id: bot_uid as i64,
-                                                        mode: MiniAppControlMode::Idle,
-                                                        user_note: None,
-                                                        state_snapshot: snap_close.clone(),
-                                                    },
-                                                );
-                                            }
-                                            this.miniapps.is_miniapp_minimized = false;
-                                            this.miniapps.floating_pip_status = None;
-                                            if let Some(ov) = this.miniapps.miniapp_overlay.take() {
-                                                ov.update(cx, |w, _| w.close());
-                                            }
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child("×"),
+                                    .gap(px(4.0))
+                                    .when(has_toggle_overlay, |row| {
+                                        row.child(
+                                            div()
+                                                .id("minimized-miniapp-toggle-live-btn")
+                                                .cursor_pointer()
+                                                .px(px(7.0))
+                                                .py(px(3.0))
+                                                .rounded(px(7.0))
+                                                .bg(rgb(pal.card_bg))
+                                                .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                                .text_size(px(11.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(pal.text_secondary))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        if let Some(ref ov) =
+                                                            this.miniapps.miniapp_overlay
+                                                        {
+                                                            ov.update(cx, |w, wcx| {
+                                                                w.is_floating_pip = true;
+                                                                w.pip_live_preview =
+                                                                    !w.pip_live_preview;
+                                                                wcx.notify();
+                                                            });
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(if pip_live_enabled {
+                                                    tr_str(lang, "收起", "Collapse")
+                                                } else {
+                                                    tr_str(lang, "直播", "Live")
+                                                }),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("minimized-miniapp-close-btn")
+                                            .cursor_pointer()
+                                            .w(px(22.0))
+                                            .h(px(22.0))
+                                            .rounded_full()
+                                            .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(px(12.0))
+                                            .text_color(rgb(pal.text_secondary))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    if is_takeover && !b_un_close.is_empty() {
+                                                        this.client.send_miniapp_takeover_state(
+                                                            MiniAppTakeoverEvent {
+                                                                bot_username: b_un_close.clone(),
+                                                                short_name: s_name_close.clone(),
+                                                                chat_id,
+                                                                bot_user_id: bot_uid as i64,
+                                                                mode: MiniAppControlMode::Idle,
+                                                                user_note: None,
+                                                                state_snapshot: snap_close.clone(),
+                                                            },
+                                                        );
+                                                    }
+                                                    this.miniapps.is_miniapp_minimized = false;
+                                                    this.miniapps.floating_pip_status = None;
+                                                    if let Some(ov) =
+                                                        this.miniapps.miniapp_overlay.take()
+                                                    {
+                                                        ov.update(cx, |w, _| w.close());
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child("×"),
+                                    ),
                             ),
                     )
+                    .when_some(live_mount_overlay, |card, ov_live| {
+                        card.child(
+                            div()
+                                .id("miniapp-pip-live-viewport")
+                                .w_full()
+                                .h(px(360.0))
+                                .rounded(px(12.0))
+                                .overflow_hidden()
+                                .bg(rgb(0x0B0E14))
+                                .border_1()
+                                .border_color(rgb(pal.border_fg))
+                                .child(ov_live),
+                        )
+                    })
                     .when(!detail_line.trim().is_empty(), |card| {
                         card.child(
                             div()
@@ -561,6 +730,7 @@ impl AppShell {
                             .child(
                                 div()
                                     .id("pip-expand-btn")
+                                    .cursor_pointer()
                                     .px(px(9.0))
                                     .py(px(4.0))
                                     .rounded(px(8.0))
@@ -568,6 +738,21 @@ impl AppShell {
                                     .text_size(px(11.5))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(0xFFFFFF))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.miniapps.is_miniapp_minimized = false;
+                                            if let Some(ref ov) = this.miniapps.miniapp_overlay {
+                                                ov.update(cx, |w, wcx| {
+                                                    w.is_open = true;
+                                                    w.is_floating_pip = false;
+                                                    wcx.notify();
+                                                });
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
                                     .child(tr_str(lang, "展开", "Restore")),
                             ),
                     )

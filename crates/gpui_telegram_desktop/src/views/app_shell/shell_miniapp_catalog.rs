@@ -1381,6 +1381,7 @@ impl AppShell {
                         w.is_floating_pip = false;
                     } else if !w.is_open {
                         w.is_floating_pip = true;
+                        w.pip_live_preview = true;
                     }
                     w.dispatch_webmcp_command(cmd);
                     wcx.notify();
@@ -1411,6 +1412,7 @@ impl AppShell {
                 ov.update(cx, |w, wcx| {
                     w.is_open = false;
                     w.is_floating_pip = true;
+                    w.pip_live_preview = true;
                     w.disclaimer_accepted = true;
                     wcx.notify();
                 });
@@ -1512,6 +1514,7 @@ impl AppShell {
                             if stay_in_pip {
                                 w.is_open = false;
                                 w.is_floating_pip = true;
+                                w.pip_live_preview = true;
                                 w.disclaimer_accepted = true;
                             } else if queued_cmds.iter().any(|c| c.operation == "request_takeover") {
                                 w.is_open = true;

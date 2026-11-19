@@ -918,6 +918,7 @@ impl AppShell {
                     self.miniapps.is_miniapp_minimized = true;
                     overlay.update(cx, |w, wcx| {
                         w.is_floating_pip = true;
+                        w.pip_live_preview = true;
                         w.is_open = false;
                         wcx.notify();
                     });

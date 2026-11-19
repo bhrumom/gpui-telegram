@@ -215,6 +215,7 @@ pub struct BotAttachWebView {
     pub control_status_text: String,
     pub active_webmcp_tool: Option<String>,
     pub is_floating_pip: bool,
+    pub pip_live_preview: bool,
     pub last_webmcp_state_summary: Option<serde_json::Value>,
     pub pending_webmcp_queue: VecDeque<MiniAppWebMcpCommand>,
     pub webmcp_page_ready: bool,
@@ -272,6 +273,7 @@ impl BotAttachWebView {
             control_status_text: String::new(),
             active_webmcp_tool: None,
             is_floating_pip: false,
+            pip_live_preview: true,
             last_webmcp_state_summary: None,
             pending_webmcp_queue: VecDeque::new(),
             webmcp_page_ready: false,
@@ -377,6 +379,7 @@ impl BotAttachWebView {
         self.destroy_native_webview();
         self.is_open = false;
         self.is_floating_pip = false;
+        self.pip_live_preview = true;
         self.control_mode = MiniAppControlMode::Idle;
         self.control_status_text.clear();
         self.active_webmcp_tool = None;
@@ -952,6 +955,12 @@ impl BotAttachWebView {
                     wv.load_url(&resolved_url);
                 }
                 if visible {
+                    let zoom = if self.is_floating_pip && !self.is_open {
+                        0.78
+                    } else {
+                        1.0
+                    };
+                    wv.set_page_zoom(zoom);
                     wv.sync_bounds(bounds, true);
                 } else if self.is_floating_pip {
                     wv.park_for_pip();

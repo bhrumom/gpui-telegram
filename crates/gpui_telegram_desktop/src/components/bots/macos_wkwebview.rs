@@ -479,6 +479,7 @@ pub struct MacOsWkWebView {
     loaded_url: String,
     is_hidden: bool,
     last_frame: Option<(f64, f64, f64, f64)>,
+    last_zoom: Option<f64>,
 }
 
 impl MacOsWkWebView {
@@ -589,6 +590,7 @@ impl MacOsWkWebView {
                     loaded_url: String::new(),
                     is_hidden: true,
                     last_frame: None,
+                    last_zoom: None,
                 },
                 notify_rx,
             ))
@@ -711,6 +713,19 @@ impl MacOsWkWebView {
         self.set_hidden(false);
     }
 
+    pub fn set_page_zoom(&mut self, zoom: f64) {
+        if self.webview.is_null() || self.last_zoom == Some(zoom) {
+            return;
+        }
+        unsafe {
+            let responds: BOOL = msg_send![self.webview, respondsToSelector: sel!(setPageZoom:)];
+            if responds != NO {
+                let _: () = msg_send![self.webview, setPageZoom: zoom];
+                self.last_zoom = Some(zoom);
+            }
+        }
+    }
+
     /// Dispatches a Telegram Mini App event back into the loaded `WKWebView`.
     pub fn dispatch_telegram_event(&self, event_type: &str, event_data_json: &str) {
         if self.webview.is_null() {
@@ -774,6 +789,7 @@ impl MacOsWkWebView {
         self.parent_ns_view = ptr::null_mut();
         self.loaded_url.clear();
         self.last_frame = None;
+        self.last_zoom = None;
     }
 }
 

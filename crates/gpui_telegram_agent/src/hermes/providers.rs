@@ -174,6 +174,8 @@ pub struct ProviderToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 impl ProviderToolCall {
@@ -5882,6 +5884,7 @@ async fn process_chat_completions_sse_line(
                 id: format!("call_{idx}"),
                 name: String::new(),
                 arguments: String::new(),
+                thought_signature: None,
             });
             if let Some(id) = tc.get("id").and_then(Value::as_str) {
                 if !id.is_empty() {
@@ -5970,6 +5973,7 @@ pub fn parse_chat_completions_json(
                 id,
                 name,
                 arguments,
+                thought_signature: None,
             });
         }
     }
@@ -6413,6 +6417,7 @@ fn process_codex_responses_sse_line(
                             id: call_id,
                             name,
                             arguments,
+                            thought_signature: None,
                         },
                     );
                 }
@@ -6496,6 +6501,7 @@ fn process_codex_responses_sse_line(
                             id: call_id,
                             name,
                             arguments,
+                            thought_signature: None,
                         };
                         if !state.tool_calls.iter().any(|existing| existing.id == tc.id) {
                             events.push(ProviderStreamEvent::ToolCallReady(tc.clone()));
@@ -6559,6 +6565,7 @@ fn process_codex_responses_sse_line(
                                         .filter(|s| !s.is_empty())
                                         .unwrap_or("{}")
                                         .to_string(),
+                                    thought_signature: None,
                                 };
                                 events.push(ProviderStreamEvent::ToolCallReady(tc.clone()));
                                 state.tool_calls.push(tc);
@@ -6661,6 +6668,7 @@ pub fn parse_codex_responses_json(
                             .filter(|s| !s.is_empty())
                             .unwrap_or("{}")
                             .to_string(),
+                        thought_signature: None,
                     });
                 }
                 _ => {}
@@ -6830,6 +6838,7 @@ async fn execute_anthropic_messages(
                 } else {
                     input_json
                 },
+                thought_signature: None,
             };
             if let Some(tx) = stream_tx {
                 let _ = tx.send(ProviderStreamEvent::ToolCallReady(tc.clone())).await;
@@ -7002,6 +7011,7 @@ async fn process_anthropic_sse_line(
                     } else {
                         input_json
                     },
+                    thought_signature: None,
                 };
                 if let Some(tx) = stream_tx {
                     let _ = tx.send(ProviderStreamEvent::ToolCallReady(tc.clone())).await;
@@ -7076,6 +7086,7 @@ pub fn parse_anthropic_messages_json(
                         id,
                         name,
                         arguments,
+                        thought_signature: None,
                     });
                 }
                 _ => {}
@@ -7140,6 +7151,7 @@ fn provider_request_to_unified(req: &ProviderRequest) -> UnifiedRequest {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
+                        thought_signature: tc.thought_signature.clone(),
                     })
                     .collect(),
                 reasoning: m.reasoning.clone(),
@@ -7175,6 +7187,7 @@ fn unified_to_provider_response(
                 id: tc.id,
                 name: tc.name,
                 arguments: tc.arguments,
+                thought_signature: tc.thought_signature,
             })
             .collect(),
         finish_reason: parsed.finish_reason,
@@ -7244,6 +7257,7 @@ async fn process_gemini_sse_line(
             id: tc.id,
             name: tc.name,
             arguments: tc.arguments,
+            thought_signature: tc.thought_signature,
         };
         if let Some(tx) = stream_tx {
             let _ = tx.send(ProviderStreamEvent::ToolCallReady(ptc.clone())).await;
@@ -7428,6 +7442,7 @@ fn detect_computer_tool_call(
                     id: format!("local_call_{}", Uuid_short()),
                     name: "computer_configure_cloud".to_string(),
                     arguments: args_val.to_string(),
+                    thought_signature: None,
                 });
             }
         }
@@ -7439,6 +7454,7 @@ fn detect_computer_tool_call(
             id: format!("local_call_{}", Uuid_short()),
             name: "computer_list".to_string(),
             arguments: "{}".to_string(),
+            thought_signature: None,
         });
     }
 
@@ -7454,6 +7470,7 @@ fn detect_computer_tool_call(
                 id: format!("local_call_{}", Uuid_short()),
                 name: "computer_exec".to_string(),
                 arguments: Value::Object(payload).to_string(),
+                thought_signature: None,
             });
         }
     }
@@ -7753,6 +7770,7 @@ fn parse_explicit_tool_directive(
                 id: format!("local_call_{}", Uuid_short()),
                 name: name.to_string(),
                 arguments: args_part.to_string(),
+                thought_signature: None,
             });
         }
     }
@@ -7774,6 +7792,7 @@ fn parse_explicit_tool_directive(
                 id: format!("local_call_{}", Uuid_short()),
                 name: name.to_string(),
                 arguments: json_args,
+                thought_signature: None,
             });
         }
     }
@@ -7792,6 +7811,7 @@ fn parse_explicit_tool_directive(
                 id: format!("local_call_{}", Uuid_short()),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": path }).to_string(),
+                thought_signature: None,
             });
         }
     }
@@ -7808,6 +7828,7 @@ fn parse_explicit_tool_directive(
             id: format!("local_call_{}", Uuid_short()),
             name: "list_dir".to_string(),
             arguments: json!({ "path": path }).to_string(),
+            thought_signature: None,
         });
     }
 
@@ -7820,6 +7841,7 @@ fn parse_explicit_tool_directive(
                 id: format!("local_call_{}", Uuid_short()),
                 name: "terminal".to_string(),
                 arguments: json!({ "command": cmd }).to_string(),
+                thought_signature: None,
             });
         }
     }
@@ -7838,6 +7860,7 @@ fn parse_explicit_tool_directive(
                 id: format!("local_call_{}", Uuid_short()),
                 name: "search_files".to_string(),
                 arguments: json!({ "query": query }).to_string(),
+                thought_signature: None,
             });
         }
     }
@@ -8504,6 +8527,7 @@ mod tests {
                         id: "toolu_1".into(),
                         name: "read_file".into(),
                         arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                        thought_signature: None,
                     }],
                     Some("Need to inspect workspace dependencies".into()),
                 ),
@@ -8843,6 +8867,7 @@ mod tests {
                         id: String::new(),
                         name: "shell_exec".into(),
                         arguments: "{}".into(),
+                        thought_signature: None,
                     }],
                     None,
                 ),

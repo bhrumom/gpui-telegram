@@ -907,6 +907,7 @@ async fn test_api_modes_fallback_moa_commands_trajectory_and_acp_runner() {
                     id: "call_1".into(),
                     name: "read_file".into(),
                     arguments: "{\"path\":\"config.toml\"}".into(),
+                    thought_signature: None,
                 }],
                 Some("Inspecting config first".into()),
             ),
