@@ -1133,6 +1133,15 @@ impl AppShell {
         let clean_custom_url = custom_url
             .as_deref()
             .and_then(sanitize_webapp_custom_url);
+        if self.try_restore_running_miniapp(
+            &bot_un,
+            &short,
+            start_param.as_deref(),
+            clean_custom_url.as_deref(),
+            cx,
+        ) {
+            return;
+        }
         let clean_lower = bot_un.to_ascii_lowercase();
         let prof_opt = self.miniapps.bot_profiles_cache.get(&clean_lower).cloned();
         let app_opt = prof_opt
@@ -1421,6 +1430,80 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Restores an already-running Mini App overlay if it matches the requested target,
+    /// avoiding a fresh `/launch` request or overwriting live WebView state.
+    pub fn try_restore_running_miniapp(
+        &mut self,
+        bot_username: &str,
+        short_name: &str,
+        start_param: Option<&str>,
+        custom_url: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let bot_un = bot_username.trim().trim_start_matches('@');
+        let short = short_name.trim();
+        if bot_un.is_empty() || short.is_empty() {
+            return false;
+        }
+        let Some(ov) = self.miniapps.miniapp_overlay.clone() else {
+            return false;
+        };
+        let server_base = self.client.http_client.base_url.clone();
+        let matches = {
+            let w = ov.read(cx);
+            let is_live = w.active_bot.is_some() || w.launch_context.is_some() || w.is_loading;
+            if !is_live {
+                false
+            } else {
+                let running_bot = w.bot_username.trim().trim_start_matches('@');
+                let bot_matches = (!running_bot.is_empty()
+                    && running_bot.eq_ignore_ascii_case(bot_un))
+                    || (w.bot_id > 0 && bot_un.parse::<u64>().ok() == Some(w.bot_id));
+                let running_short = w.current_short_name();
+                let url_matches = match custom_url {
+                    None => true,
+                    Some(cu) => {
+                        normalize_miniapp_url_for_reuse(cu, &server_base, bot_un, short)
+                            == normalize_miniapp_url_for_reuse(
+                                &w.url,
+                                &server_base,
+                                running_bot,
+                                &running_short,
+                            )
+                    }
+                };
+                let short_matches = running_short.eq_ignore_ascii_case(short)
+                    || (short.eq_ignore_ascii_case("app")
+                        && custom_url.is_some()
+                        && url_matches);
+                let req_sp = start_param.map(str::trim).filter(|s| !s.is_empty());
+                let running_sp = w
+                    .launch_context
+                    .as_ref()
+                    .and_then(|c| c.init_data.start_param.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let sp_matches = req_sp.is_none() || req_sp == running_sp;
+                bot_matches && short_matches && url_matches && sp_matches
+            }
+        };
+        if !matches {
+            return false;
+        }
+
+        self.miniapps.is_miniapp_minimized = false;
+        self.miniapps.pending_miniapp_confirm = None;
+        ov.update(cx, |w, w_cx| {
+            w.is_open = true;
+            w.is_floating_pip = false;
+            w.menu_open = false;
+            w.confirm_close_open = false;
+            w_cx.notify();
+        });
+        cx.notify();
+        true
+    }
+
     pub fn launch_miniapp_with_url(
         &mut self,
         bot_username: &str,
@@ -1429,6 +1512,52 @@ impl AppShell {
         launch_mode: MiniAppLaunchMode,
         start_param: Option<String>,
         custom_url: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.launch_miniapp_with_url_inner(
+            bot_username,
+            short_name,
+            source_chat_id,
+            launch_mode,
+            start_param,
+            custom_url,
+            false,
+            cx,
+        );
+    }
+
+    pub fn reload_miniapp_with_url(
+        &mut self,
+        bot_username: &str,
+        short_name: &str,
+        source_chat_id: Option<u64>,
+        launch_mode: MiniAppLaunchMode,
+        start_param: Option<String>,
+        custom_url: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.launch_miniapp_with_url_inner(
+            bot_username,
+            short_name,
+            source_chat_id,
+            launch_mode,
+            start_param,
+            custom_url,
+            true,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_miniapp_with_url_inner(
+        &mut self,
+        bot_username: &str,
+        short_name: &str,
+        source_chat_id: Option<u64>,
+        launch_mode: MiniAppLaunchMode,
+        start_param: Option<String>,
+        custom_url: Option<String>,
+        force_reload: bool,
         cx: &mut Context<Self>,
     ) {
         let bot_un = bot_username.trim().trim_start_matches('@').to_string();
@@ -1442,6 +1571,17 @@ impl AppShell {
         let clean_custom_url = custom_url
             .as_deref()
             .and_then(sanitize_webapp_custom_url);
+        if !force_reload
+            && self.try_restore_running_miniapp(
+                &bot_un,
+                &short,
+                start_param.as_deref(),
+                clean_custom_url.as_deref(),
+                cx,
+            )
+        {
+            return;
+        }
         let server_base = self.client.http_client.base_url.clone();
         let ov = self.ensure_miniapp_overlay(cx);
         self.miniapps.is_miniapp_minimized = false;
@@ -1459,8 +1599,10 @@ impl AppShell {
         ov.update(cx, |w, w_cx| {
             w.set_server_base_url(server_base);
             w.is_open = true;
+            w.is_floating_pip = false;
             w.is_loading = true;
             w.bot_username = bot_un.clone();
+            w.launching_short_name = short.clone();
             w.source_chat_id = source_chat_id.map(|id| id as i64);
             w.ui_schema.title = title_hint;
             if let Some(ref cu) = clean_custom_url {
@@ -2198,5 +2340,48 @@ impl AppShell {
             });
         })
         .detach();
+    }
+}
+
+fn normalize_miniapp_url_for_reuse(
+    raw_url: &str,
+    server_base: &str,
+    bot_un: &str,
+    short: &str,
+) -> String {
+    let without_frag = raw_url.split('#').next().unwrap_or("").trim();
+    if without_frag.is_empty()
+        || without_frag.to_ascii_lowercase().starts_with("gpui-miniapp://")
+    {
+        return format!(
+            "/miniapps/{}/{}",
+            bot_un.trim().trim_start_matches('@').to_ascii_lowercase(),
+            short.trim().to_ascii_lowercase()
+        );
+    }
+    let base = server_base.trim().trim_end_matches('/');
+    let stripped = if !base.is_empty() && without_frag.starts_with(base) {
+        let rest = &without_frag[base.len()..];
+        if rest.is_empty() { "/" } else { rest }
+    } else {
+        without_frag
+    };
+    let (path_raw, query_opt) = match stripped.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (stripped, None),
+    };
+    let trimmed_path = if path_raw.len() > 1 {
+        path_raw.trim_end_matches('/')
+    } else {
+        path_raw
+    };
+    let norm_path = if trimmed_path.to_ascii_lowercase().starts_with("/miniapps/") {
+        trimmed_path.to_ascii_lowercase()
+    } else {
+        trimmed_path.to_string()
+    };
+    match query_opt {
+        Some(q) if !q.is_empty() => format!("{norm_path}?{q}"),
+        _ => norm_path,
     }
 }

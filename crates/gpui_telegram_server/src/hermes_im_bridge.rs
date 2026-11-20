@@ -11,8 +11,6 @@ use crate::server::{extract_message_content_text, AppState};
 use crate::sync::pts_engine::PtsEngine;
 use crate::ws::GatewayHub;
 use chrono::Utc;
-use fabushi_miniapp::storage;
-use fabushi_miniapp::sutras::{all_sutras, format_leaderboard_bytes, sutra_by_title};
 use gpui_telegram_agent::hermes::toolsets::{BoxFuture, PlatformImBridge, PlatformImCaller};
 use gpui_telegram_core::types::{ChatId, MsgId, PeerId, TopicId, UserId};
 use gpui_telegram_proto::cards::GenerativeCard;
@@ -236,59 +234,6 @@ impl ServerPlatformImBridge {
     }
 
     fn headless_webmcp_catalog(app: &MiniAppRecord) -> Vec<WebMcpToolDescriptor> {
-        if app.short_name.eq_ignore_ascii_case("fabushi") {
-            return vec![
-                WebMcpToolDescriptor {
-                    name: "fabushi_get_status".to_string(),
-                    description: "读取全球法布施小程序当前功德档案、累计传输字节、近期禅修记录与锁定功课".to_string(),
-                    input_schema: json!({ "type": "object", "properties": {} }),
-                    read_only: true,
-                },
-                WebMcpToolDescriptor {
-                    name: "fabushi_send_dharma".to_string(),
-                    description: "发起全球法布施，发送指定佛经（如心经、金刚经、楞严经）到目标区域".to_string(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "sutra": { "type": "string", "description": "经文名称，例如 心经 / 金刚经 / 大悲咒" },
-                            "target_country": { "type": "string", "description": "目标地区代码，默认 ALL 代表全球" }
-                        }
-                    }),
-                    read_only: false,
-                },
-                WebMcpToolDescriptor {
-                    name: "fabushi_stop_dharma".to_string(),
-                    description: "停止当前正在进行的法布施传输".to_string(),
-                    input_schema: json!({ "type": "object", "properties": {} }),
-                    read_only: false,
-                },
-                WebMcpToolDescriptor {
-                    name: "fabushi_switch_tab".to_string(),
-                    description: "切换全球法布施小程序底部主标签（dharma / practice / discover）".to_string(),
-                    input_schema: json!({
-                        "type": "object",
-                        "required": ["tab"],
-                        "properties": { "tab": { "type": "string" } }
-                    }),
-                    read_only: false,
-                },
-                WebMcpToolDescriptor {
-                    name: "fabushi_record_practice".to_string(),
-                    description: "记录一次禅室共修或念诵次数到真实数据库功德簿".to_string(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "sutra": { "type": "string" },
-                            "duration_minutes": { "type": "integer" },
-                            "chant_count": { "type": "integer" },
-                            "note": { "type": "string" }
-                        }
-                    }),
-                    read_only: false,
-                },
-            ];
-        }
-
         vec![
             WebMcpToolDescriptor {
                 name: "get_state".to_string(),
@@ -337,33 +282,6 @@ impl ServerPlatformImBridge {
         ]
     }
 
-    fn resolve_sutra_title(raw: &str) -> (String, u64) {
-        let trimmed = raw.trim();
-        if let Some(exact) = sutra_by_title(trimmed) {
-            return (exact.title.to_string(), exact.content.len().max(1024) as u64);
-        }
-        let clean = trimmed.trim_matches(|c| matches!(c, '《' | '》' | ' '));
-        if let Some(exact) = sutra_by_title(clean) {
-            return (exact.title.to_string(), exact.content.len().max(1024) as u64);
-        }
-        if let Some(matched) = all_sutras().iter().find(|s| {
-            s.title.contains(clean) || clean.contains(&s.title) || s.id.eq_ignore_ascii_case(clean)
-        }) {
-            return (
-                matched.title.to_string(),
-                matched.content.len().max(1024) as u64,
-            );
-        }
-        (
-            if clean.is_empty() {
-                "心经".to_string()
-            } else {
-                clean.to_string()
-            },
-            1024,
-        )
-    }
-
     fn execute_headless_webmcp_tool(
         &self,
         app: &MiniAppRecord,
@@ -373,202 +291,6 @@ impl ServerPlatformImBridge {
         args: &Value,
     ) -> Result<Value, String> {
         let uid = caller_uid.0 as i64;
-        if app.short_name.eq_ignore_ascii_case("fabushi") {
-            let user_opt = self.db.get_user(caller_uid).ok().flatten();
-            let username = user_opt
-                .as_ref()
-                .and_then(|u| u.username.clone())
-                .unwrap_or_else(|| format!("user_{uid}"));
-            let display_name = user_opt
-                .as_ref()
-                .map(|u| {
-                    format!(
-                        "{} {}",
-                        u.first_name.trim(),
-                        u.last_name.as_deref().unwrap_or("").trim()
-                    )
-                    .trim()
-                    .to_string()
-                })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| username.clone());
-            let _ = self.db.pool().with_conn(|conn| {
-                storage::ensure_profile(conn, uid, &username, &display_name, "", caller_uid.0 == 1)
-                    .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
-            });
-            let bot = self.db.get_bot_by_user_id(app.bot_user_id).ok().flatten();
-
-            match tool_name {
-                "fabushi_get_status" | "get_state" | "page_inspect" => {
-                    let profile = self
-                        .db
-                        .pool()
-                        .with_conn(|conn| {
-                            storage::get_profile(conn, uid)
-                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
-                        })
-                        .map_err(|e| e.to_string())?;
-                    let practice_stats = self
-                        .db
-                        .pool()
-                        .with_conn(|conn| {
-                            storage::compute_practice_stats(conn, uid)
-                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
-                        })
-                        .ok();
-                    let practices = self
-                        .db
-                        .pool()
-                        .with_conn(|conn| {
-                            storage::list_practice_records(conn, uid, 5, 0)
-                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
-                        })
-                        .unwrap_or_default();
-                    return Ok(json!({
-                        "success": true,
-                        "mode": "headless_db",
-                        "profile": profile,
-                        "practice_stats": practice_stats,
-                        "total_transfer_human": format_leaderboard_bytes(profile.total_transfer_bytes),
-                        "recent_practices": practices,
-                    }));
-                }
-                "fabushi_send_dharma" => {
-                    let raw_sutra = args
-                        .get("sutra")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("心经");
-                    let (sutra, bytes) = Self::resolve_sutra_title(raw_sutra);
-                    let target = args
-                        .get("target_country")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("ALL")
-                        .to_string();
-                    let targets = vec![target];
-                    let res = self
-                        .db
-                        .pool()
-                        .with_conn(|conn| {
-                            storage::record_transfer(conn, uid, &sutra, "sutra", &targets, bytes, 1)
-                                .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
-                        })
-                        .map_err(|e| e.to_string())?;
-                    if let Some(state) = self.state_weak.get().and_then(|w| w.upgrade()) {
-                        crate::routes::fabushi_miniapp_api::sync_summary_and_maybe_notify(
-                            &state,
-                            uid,
-                            bot.as_ref(),
-                            None,
-                        );
-                    }
-                    return Ok(json!({
-                        "success": true,
-                        "mode": "headless_db",
-                        "sutra": sutra,
-                        "targets": targets,
-                        "transfer_bytes": bytes,
-                        "total_transfer_bytes": res.total_transfer_bytes,
-                        "total_transfer_human": format_leaderboard_bytes(res.total_transfer_bytes),
-                        "total_transfer_count": res.total_transfer_count,
-                    }));
-                }
-                "fabushi_record_practice" => {
-                    let raw_sutra = args
-                        .get("sutra")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("心经");
-                    let (sutra, _) = Self::resolve_sutra_title(raw_sutra);
-                    let duration_minutes = args
-                        .get("duration_minutes")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(15)
-                        .max(1) as u32;
-                    let chant_count = args
-                        .get("chant_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(108)
-                        .max(1) as u32;
-                    let note = args.get("note").and_then(|v| v.as_str());
-                    let ps = self
-                        .db
-                        .pool()
-                        .with_conn(|conn| {
-                            storage::record_practice_session(
-                                conn,
-                                uid,
-                                &sutra,
-                                duration_minutes,
-                                chant_count,
-                                None,
-                                None,
-                                note,
-                            )
-                            .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
-                        })
-                        .map_err(|e| e.to_string())?;
-                    if let Some(state) = self.state_weak.get().and_then(|w| w.upgrade()) {
-                        crate::routes::fabushi_miniapp_api::sync_summary_and_maybe_notify(
-                            &state,
-                            uid,
-                            bot.as_ref(),
-                            None,
-                        );
-                    }
-                    return Ok(json!({
-                        "success": true,
-                        "mode": "headless_db",
-                        "record": ps.record,
-                        "total_practice_sessions": ps.profile.total_practice_sessions,
-                        "total_practice_chants": ps.profile.total_practice_chants,
-                    }));
-                }
-                other => {
-                    if let (Some(state), Some(bot_rec)) =
-                        (self.state_weak.get().and_then(|w| w.upgrade()), bot.as_ref())
-                    {
-                        let latest = self
-                            .db
-                            .get_latest_mini_app_state_for_bot_user(uid, app.bot_user_id)
-                            .ok()
-                            .flatten();
-                        let current_state = latest
-                            .as_ref()
-                            .and_then(|s| serde_json::from_str(&s.state_json).ok())
-                            .unwrap_or_else(|| json!({}));
-                        let req = MiniAppActionRequest {
-                            action_type: other.to_string(),
-                            value: Some(args.clone()),
-                            chat_id: Some(chat_id),
-                            ..Default::default()
-                        };
-                        let (next_state, toast, _, _) =
-                            crate::routes::fabushi_miniapp_api::handle_headless_fabushi_action(
-                                &state,
-                                bot_rec,
-                                app,
-                                caller_uid,
-                                &req,
-                                current_state,
-                            );
-                        return Ok(json!({
-                            "success": true,
-                            "mode": "headless_db",
-                            "toast": toast,
-                            "state": next_state,
-                        }));
-                    }
-                    return Ok(json!({
-                        "success": true,
-                        "mode": "headless_db",
-                        "note": format!("已记录指令 {other}；客户端未连接实时 WebView，已安全跳过界面操作"),
-                        "arguments": args,
-                    }));
-                }
-            }
-        }
-
         let latest = self
             .db
             .get_latest_mini_app_state_for_bot_user(uid, app.bot_user_id)
@@ -2388,29 +2110,37 @@ mod tests {
         let bot = db
             .create_registered_bot(
                 alice.user_id.0 as i64,
-                "fabushi_bot",
-                "全球法布施",
-                "Fabushi companion bot",
-                "Global Dharma Offering",
+                "shop_bot",
+                "Shop Helper",
+                "Generic Mini App companion bot",
+                "Coffee & Shop Mini App",
                 "helpful",
                 "",
-                "/fabushi-miniapp",
+                "https://shop.example/app",
                 "[]",
                 false,
                 true,
             )
-            .expect("register fabushi_bot");
+            .expect("register shop_bot");
         let bot_id = bot.bot_user_id;
+        let schema_json = serde_json::json!({
+            "title": "Coffee Shop",
+            "widgets": [
+                { "id": "item_name", "kind": "TextInput", "label": "Item", "value": "Latte" }
+            ],
+            "main_button": { "text": "Place Order", "is_visible": true, "is_active": true }
+        })
+        .to_string();
         db.create_or_upsert_mini_app_with_options(
             bot_id,
-            "fabushi_bot",
-            "fabushi",
-            "全球法布施",
-            "Global Dharma Offering",
-            "spirituality",
-            "🪷",
-            Some("/fabushi-miniapp"),
-            "{}",
+            "shop_bot",
+            "shop",
+            "Coffee Shop",
+            "Order coffee via Mini App",
+            "shopping",
+            "☕",
+            Some("https://shop.example/app"),
+            &schema_json,
             true,
             true,
             false,
@@ -2419,7 +2149,7 @@ mod tests {
             None,
             false,
         )
-        .expect("seed fabushi miniapp");
+        .expect("seed shop miniapp");
         let (chat_rec, _) = db.ensure_companion_bot_chat_record(alice.user_id, UserId(bot_id as u64)).unwrap();
 
         let alice_uid_str = alice.user_id.0.to_string();
@@ -2444,24 +2174,46 @@ mod tests {
         let disc = HermesToolExecutor::execute("webmcp_discover", json!({}), &ctx).await;
         assert!(disc.success, "webmcp_discover failed: {:?}", disc.error);
         let disc_v: Value = serde_json::from_str(&disc.output).unwrap();
-        assert!(disc_v["tools"]
+        let tool_names: Vec<&str> = disc_v["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["name"] == "fabushi_send_dharma"));
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for expected in [
+            "get_state",
+            "page_inspect",
+            "page_click",
+            "page_fill",
+            "page_press_main_button",
+        ] {
+            assert!(
+                tool_names.contains(&expected),
+                "missing universal WebMCP tool '{expected}' in {tool_names:?}"
+            );
+        }
 
         let called = HermesToolExecutor::execute(
             "webmcp_call_tool",
             json!({
-                "tool_name": "fabushi_send_dharma",
-                "arguments": { "sutra": "金刚经", "target_country": "ALL" }
+                "tool_name": "page_fill",
+                "arguments": { "widget_id": "item_name", "value": "Matcha Latte" }
             }),
             &ctx,
         )
         .await;
         assert!(called.success, "webmcp_call_tool failed: {:?}", called.error);
         let called_v: Value = serde_json::from_str(&called.output).unwrap();
-        assert!(called_v["result"]["total_transfer_bytes"].as_u64().unwrap_or(0) > 0);
-        assert_eq!(called_v["result"]["sutra"], "金刚经");
+        assert_eq!(called_v["result"]["state"]["item_name"], "Matcha Latte");
+
+        let state_res = HermesToolExecutor::execute(
+            "webmcp_call_tool",
+            json!({ "tool_name": "get_state", "arguments": {} }),
+            &ctx,
+        )
+        .await;
+        assert!(state_res.success);
+        let state_v: Value = serde_json::from_str(&state_res.output).unwrap();
+        assert_eq!(state_v["result"]["state"]["item_name"], "Matcha Latte");
     }
 }

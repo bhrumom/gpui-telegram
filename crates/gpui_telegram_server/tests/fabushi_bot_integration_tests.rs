@@ -1400,9 +1400,9 @@ async fn hermes_fused_into_fabushi_single_runtime_and_bot_scoped_studio() {
 }
 
 #[tokio::test]
-async fn serve_miniapp_html_prefers_fresh_builtin_fabushi_webmcp_bundle_over_stale_db_html() {
-    let (_dir, state, router) = boot_temp_server("fabushi_miniapp_fresh_html");
-    let (_uid, token) = register_user(&router, "fabushi_publisher").await;
+async fn serve_miniapp_html_serves_latest_published_bundle_and_external_url_without_app_hardcoding() {
+    let (_dir, state, router) = boot_temp_server("miniapp_generic_html_serving");
+    let (_uid, token) = register_user(&router, "miniapp_publisher").await;
 
     let (st_bot, bot_val) = http_json(
         &router,
@@ -1410,52 +1410,53 @@ async fn serve_miniapp_html_prefers_fresh_builtin_fabushi_webmcp_bundle_over_sta
         "/api/v1/bots",
         Some(&token),
         Some(json!({
-            "display_name": "全球法布施",
-            "username": "fabushi_bot",
-            "description": "全球法布施与净心禅室",
-            "about": "全球法布施官方伴生机器人",
+            "display_name": "Generic Companion",
+            "username": "generic_app_bot",
+            "description": "Generic Mini App Bot",
+            "about": "Generic Mini App companion",
             "allow_attach_menu": true,
             "attach_peer_types": ["users", "bots", "groups"],
-            "menu_button_text": "全球法布施",
-            "menu_button_url": "/miniapps/fabushi_bot/fabushi"
+            "menu_button_text": "Open App",
+            "menu_button_url": "/miniapps/generic_app_bot/hosted"
         })),
     )
     .await;
-    assert_eq!(st_bot, StatusCode::CREATED, "create @fabushi_bot: {bot_val}");
+    assert_eq!(st_bot, StatusCode::CREATED, "create @generic_app_bot: {bot_val}");
     let bot_token = bot_val["bot_token"].as_str().expect("bot_token").to_string();
 
-    let (st_pub, pub_val) = http_json(
+    // 1. Publish a self-hosted HTML bundle (v1), then update it (v2) via standard Bot API
+    let (st_pub1, pub_val1) = http_json(
         &router,
         "POST",
         &format!("/bot{bot_token}/publishMiniApp"),
         None,
         Some(json!({
-            "short_name": "fabushi",
-            "title": "全球法布施",
-            "description": "全球法布施与净心禅室",
-            "category": "lifestyle",
-            "icon_emoji": "🪷",
-            "web_url": "/miniapps/fabushi_bot/fabushi",
+            "short_name": "hosted",
+            "title": "Generic Hosted App",
+            "description": "Self-hosted bundle",
+            "category": "tools",
+            "icon_emoji": "🧩",
+            "web_url": "/miniapps/generic_app_bot/hosted",
             "is_main_app": true,
-            "html_bundle": "<html><head></head><body>OLD LEGACY NO WEBMCP</body></html>"
+            "html_bundle": "<html><head></head><body>BUNDLE_V1</body></html>"
         })),
     )
     .await;
-    assert_eq!(st_pub, StatusCode::OK, "publishMiniApp: {pub_val}");
-    let app_id = pub_val["result"]["app_id"]
+    assert_eq!(st_pub1, StatusCode::OK, "publishMiniApp v1: {pub_val1}");
+    let app_id = pub_val1["result"]["app_id"]
         .as_str()
         .expect("app_id in publishMiniApp result");
     state
         .db
         .upsert_mini_app_hosted_bundle(
             app_id,
-            "<html><head></head><body>OLD LEGACY NO WEBMCP</body></html>",
+            "<html><head><script src=\"/js/telegram-web-app.js\"></script></head><body>BUNDLE_V2_GENERIC</body></html>",
         )
-        .expect("persist stale db bundle");
+        .expect("persist updated db bundle");
 
     let req = Request::builder()
         .method("GET")
-        .uri("/miniapps/fabushi_bot/fabushi?init_data=test_init_123")
+        .uri("/miniapps/generic_app_bot/hosted?init_data=test_init_123")
         .body(Body::empty())
         .unwrap();
     let resp = router.clone().oneshot(req).await.expect("GET miniapp html");
@@ -1464,16 +1465,8 @@ async fn serve_miniapp_html_prefers_fresh_builtin_fabushi_webmcp_bundle_over_sta
     let html = String::from_utf8(bytes.to_vec()).expect("utf8 html");
 
     assert!(
-        !html.contains("OLD LEGACY NO WEBMCP"),
-        "serve_miniapp_html must bypass stale DB html for official fabushi_bot/fabushi"
-    );
-    assert!(
-        html.contains("navigator.modelContext"),
-        "fresh bundle must register WebMCP navigator.modelContext tools"
-    );
-    assert!(
-        html.contains("fabushi_send_dharma"),
-        "fresh bundle must expose fabushi_send_dharma tool"
+        !html.contains("BUNDLE_V1") && html.contains("BUNDLE_V2_GENERIC"),
+        "serve_miniapp_html must serve the latest DB bundle generically without built-in bypass: {html}"
     );
     assert!(
         html.contains(r#"window.__TG_INIT_DATA__ = "test_init_123""#),
@@ -1493,5 +1486,37 @@ async fn serve_miniapp_html_prefers_fresh_builtin_fabushi_webmcp_bundle_over_sta
         html.matches("/js/telegram-web-app.js").count(),
         1,
         "telegram-web-app.js script tag must not be duplicated"
+    );
+
+    // 2. Publish an external HTTPS Mini App (no html_bundle) -> generic iframe wrapper with #tgWebAppData=
+    let (st_pub_ext, pub_ext_val) = http_json(
+        &router,
+        "POST",
+        &format!("/bot{bot_token}/publishMiniApp"),
+        None,
+        Some(json!({
+            "short_name": "external",
+            "title": "External Mini App",
+            "description": "Hosted externally like Telegram",
+            "category": "tools",
+            "icon_emoji": "🌐",
+            "web_url": "https://external-app.example/miniapp"
+        })),
+    )
+    .await;
+    assert_eq!(st_pub_ext, StatusCode::OK, "publish external miniapp: {pub_ext_val}");
+
+    let req_ext = Request::builder()
+        .method("GET")
+        .uri("/miniapps/generic_app_bot/external?init_data=ext_init_abc")
+        .body(Body::empty())
+        .unwrap();
+    let resp_ext = router.clone().oneshot(req_ext).await.expect("GET external miniapp html");
+    assert_eq!(resp_ext.status(), StatusCode::OK);
+    let bytes_ext = to_bytes(resp_ext.into_body(), usize::MAX).await.unwrap();
+    let html_ext = String::from_utf8(bytes_ext.to_vec()).expect("utf8 external html");
+    assert!(
+        html_ext.contains("https://external-app.example/miniapp#tgWebAppData=ext_init_abc"),
+        "external miniapp must render generic iframe wrapper with tgWebAppData hash: {html_ext}"
     );
 }

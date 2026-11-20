@@ -1390,7 +1390,7 @@ impl AppShell {
             } else {
                 MessageDirection::Incoming
             },
-            timestamp: msg.date.format("%H:%M").to_string(),
+            timestamp: msg.date.with_timezone(&chrono::Local).format("%H:%M").to_string(),
             delivery_status: DeliveryStatus::Read,
             reply_to: None,
             reactions: vec![],
@@ -1456,7 +1456,7 @@ impl AppShell {
             }
             if let Some(dialog) = sb.dialogs.iter_mut().find(|d| d.id == chat_u64) {
                 dialog.last_message = sb_preview_for_dialog;
-                dialog.timestamp = msg.date.format("%H:%M").to_string();
+                dialog.timestamp = msg.date.with_timezone(&chrono::Local).format("%H:%M").to_string();
                 if !is_current_chat && !is_outgoing {
                     dialog.unread_count += 1;
                 }

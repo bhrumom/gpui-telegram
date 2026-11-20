@@ -8,13 +8,8 @@ license.workspace = true
 name = "gpui_telegram_server"
 path = "src/main.rs"
 
-[[bin]]
-name = "publish_fabushi_miniapp"
-path = "src/bin/publish_fabushi_miniapp.rs"
-
 [dependencies]
 gpui_telegram_core = { workspace = true }
-fabushi_miniapp = { workspace = true, features = ["server"] }
 gpui_telegram_proto = { workspace = true }
 gpui_telegram_media = { workspace = true }
 gpui_telegram_webrtc = { workspace = true }

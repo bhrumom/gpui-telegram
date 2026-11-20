@@ -169,7 +169,8 @@ impl Render for DialogsEntry {
                                     .text_color(sub_color)
                                     .child(if self.data.time_id > 0 {
                                         let dt = chrono::DateTime::from_timestamp(self.data.time_id, 0)
-                                            .unwrap_or_else(|| chrono::Utc::now());
+                                            .unwrap_or_else(|| chrono::Utc::now())
+                                            .with_timezone(&chrono::Local);
                                         dt.format("%H:%M").to_string()
                                     } else {
                                         String::new()

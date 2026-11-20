@@ -1,7 +1,14 @@
+//! Standard external Mini App publisher CLI for 全球法布施 (`@fabushi_bot/fabushi`).
+//!
+//! Registers `@fabushi_bot` and publishes its external `web_url` (`fabushi_miniapp_server`)
+//! via standard `@BotFather` / Bot API (`publishMiniApp`, `setChatMenuButton`) endpoints.
+
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:18080";
+const DEFAULT_MINIAPP_URL: &str = "http://127.0.0.1:18090";
 const PUBLISHER_USERNAME: &str = "fabushi_official_publisher";
 const BOT_USERNAME: &str = "fabushi_bot";
 const BOT_DISPLAY_NAME: &str = "全球法布施";
@@ -9,12 +16,14 @@ const MINIAPP_SHORT_NAME: &str = "fabushi";
 const MINIAPP_TITLE: &str = "全球法布施";
 const MINIAPP_DESC: &str =
     "全球法布施与净心禅室 — 3D/2D地球弘法传递、八部经典诵读、禅坐敲木鱼与全球修行榜单";
-const MINIAPP_URL: &str = "/miniapps/fabushi_bot/fabushi";
 const BOTFATHER_USER_ID: i64 = 777_001;
 
 struct Config {
     server_url: String,
+    miniapp_url: String,
     password: String,
+    write_bot_token: Option<PathBuf>,
+    skip_miniapp_health_check: bool,
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -22,10 +31,19 @@ fn parse_args() -> Result<Config, String> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+    let mut miniapp_url = std::env::var("FABUSHI_MINIAPP_PUBLIC_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MINIAPP_URL.to_string());
     let password = std::env::var("FABUSHI_PUBLISHER_PASSWORD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "FabushiOfficial#2026".to_string());
+    let mut write_bot_token: Option<PathBuf> = std::env::var("FABUSHI_BOT_TOKEN_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
+    let mut skip_miniapp_health_check = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -36,9 +54,25 @@ fn parse_args() -> Result<Config, String> {
                 .next()
                 .ok_or_else(|| "--server-url requires a URL argument".to_string())?;
             server_url = val;
+        } else if let Some(val) = arg.strip_prefix("--miniapp-url=") {
+            miniapp_url = val.to_string();
+        } else if arg == "--miniapp-url" {
+            let val = args
+                .next()
+                .ok_or_else(|| "--miniapp-url requires a URL argument".to_string())?;
+            miniapp_url = val;
+        } else if let Some(val) = arg.strip_prefix("--write-bot-token=") {
+            write_bot_token = Some(PathBuf::from(val));
+        } else if arg == "--write-bot-token" {
+            let val = args
+                .next()
+                .ok_or_else(|| "--write-bot-token requires a file path".to_string())?;
+            write_bot_token = Some(PathBuf::from(val));
+        } else if arg == "--skip-miniapp-health-check" {
+            skip_miniapp_health_check = true;
         } else if arg == "-h" || arg == "--help" {
             println!(
-                "Usage: publish_fabushi_miniapp [--server-url <URL>] (default: {DEFAULT_SERVER_URL})"
+                "Usage: publish_fabushi_miniapp [--server-url <IM_URL>] [--miniapp-url <MINIAPP_URL>] [--write-bot-token <PATH>] [--skip-miniapp-health-check]"
             );
             std::process::exit(0);
         } else {
@@ -48,7 +82,10 @@ fn parse_args() -> Result<Config, String> {
 
     Ok(Config {
         server_url: server_url.trim_end_matches('/').to_string(),
+        miniapp_url: miniapp_url.trim_end_matches('/').to_string(),
         password,
+        write_bot_token,
+        skip_miniapp_health_check,
     })
 }
 
@@ -317,6 +354,7 @@ fn fabushi_ui_schema() -> Value {
 async fn create_or_update_fabushi_bot(
     client: &reqwest::Client,
     base: &str,
+    miniapp_url: &str,
     bearer: &str,
 ) -> Result<String, String> {
     let create_res = client
@@ -329,7 +367,7 @@ async fn create_or_update_fabushi_bot(
             "about": "全球法布施官方伴生机器人 · 打开主应用开启净心修行与全球普渡法布施",
             "ai_persona": "你是「全球法布施 (@fabushi_bot)」慈悲修行向导，协助行者进行全球法布施、八部经典持诵、禅室共修与修行功德查询。",
             "menu_button_text": BOT_DISPLAY_NAME,
-            "menu_button_url": MINIAPP_URL,
+            "menu_button_url": miniapp_url,
             "allow_attach_menu": true,
             "attach_peer_types": ["users", "bots", "groups", "channels"],
             "commands": [
@@ -372,6 +410,7 @@ async fn create_or_update_fabushi_bot(
 async fn publish_and_configure_bot_api(
     client: &reqwest::Client,
     base: &str,
+    miniapp_url: &str,
     bot_token: &str,
 ) -> Result<(), String> {
     let set_name_res = client
@@ -410,13 +449,12 @@ async fn publish_and_configure_bot_api(
             "description": MINIAPP_DESC,
             "category": "lifestyle",
             "icon_emoji": "🪷",
-            "web_url": MINIAPP_URL,
+            "web_url": miniapp_url,
             "is_main_app": true,
             "is_attach_enabled": true,
             "header_color": "#0B0E14",
             "background_color": "#0B0E14",
-            "ui_schema": fabushi_ui_schema(),
-            "html_bundle": fabushi_miniapp::hosted_bundle_html()
+            "ui_schema": fabushi_ui_schema()
         }))
         .send()
         .await
@@ -429,7 +467,9 @@ async fn publish_and_configure_bot_api(
     if !pub_status.is_success() || pub_body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return Err(format!("publishMiniApp failed: {pub_status} {pub_body}"));
     }
-    println!("Published Mini App @{BOT_USERNAME}/{MINIAPP_SHORT_NAME} ({MINIAPP_TITLE})");
+    println!(
+        "Published external Mini App @{BOT_USERNAME}/{MINIAPP_SHORT_NAME} ({MINIAPP_TITLE}) -> {miniapp_url}"
+    );
 
     let menu_res = client
         .post(format!("{base}/bot{bot_token}/setChatMenuButton"))
@@ -437,7 +477,7 @@ async fn publish_and_configure_bot_api(
             "menu_button": {
                 "type": "web_app",
                 "text": MINIAPP_TITLE,
-                "web_app": { "url": MINIAPP_URL }
+                "web_app": { "url": miniapp_url }
             }
         }))
         .send()
@@ -453,14 +493,16 @@ async fn publish_and_configure_bot_api(
             "setChatMenuButton failed: {menu_status} {menu_body}"
         ));
     }
-    println!("Configured WebApp menu button -> {MINIAPP_URL}");
+    println!("Configured WebApp menu button -> {miniapp_url}");
     Ok(())
 }
 
 async fn verify_published_endpoints(
     client: &reqwest::Client,
     base: &str,
+    miniapp_url: &str,
     bearer: &str,
+    skip_miniapp_health_check: bool,
 ) -> Result<(), String> {
     let miniapps_url =
         format!("{base}/api/v1/miniapps?q=%E5%85%A8%E7%90%83%E6%B3%95%E5%B8%83%E6%96%BD");
@@ -517,45 +559,85 @@ async fn verify_published_endpoints(
         ));
     }
 
-    let html_url = format!("{base}{MINIAPP_URL}");
+    let im_entry_url = format!("{base}/miniapps/{BOT_USERNAME}/{MINIAPP_SHORT_NAME}");
     let res3 = client
-        .get(&html_url)
+        .get(&im_entry_url)
         .send()
         .await
-        .map_err(|e| format!("GET {html_url} failed: {e}"))?;
+        .map_err(|e| format!("GET {im_entry_url} failed: {e}"))?;
     if res3.status() != reqwest::StatusCode::OK {
-        return Err(format!("{html_url} returned {}", res3.status()));
+        return Err(format!("{im_entry_url} returned {}", res3.status()));
     }
-    let html_body = res3
+    let im_html = res3
         .text()
         .await
-        .map_err(|e| format!("read {html_url} body: {e}"))?;
-    if !html_body.contains("/js/telegram-web-app.js") {
-        return Err(format!("{html_url} missing injected Telegram WebApp SDK"));
+        .map_err(|e| format!("read {im_entry_url} body: {e}"))?;
+    if !im_html.contains(miniapp_url) {
+        return Err(format!(
+            "{im_entry_url} did not reference external URL {miniapp_url}"
+        ));
     }
 
-    let wasm_url = format!("{base}/api/v1/fabushi-miniapp/app.wasm");
-    let res4 = client
-        .get(&wasm_url)
-        .send()
-        .await
-        .map_err(|e| format!("GET {wasm_url} failed: {e}"))?;
-    if res4.status() != reqwest::StatusCode::OK {
-        return Err(format!("{wasm_url} returned {}", res4.status()));
-    }
-    let wasm_bytes = res4
-        .bytes()
-        .await
-        .map_err(|e| format!("read {wasm_url} bytes: {e}"))?;
-    if !wasm_bytes.starts_with(b"\0asm") {
-        return Err(format!("{wasm_url} did not return valid WASM magic header"));
+    if !skip_miniapp_health_check {
+        let health_url = format!("{miniapp_url}/health");
+        let h_res = client
+            .get(&health_url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {health_url} failed: {e}"))?;
+        if h_res.status() != reqwest::StatusCode::OK {
+            return Err(format!("{health_url} returned {}", h_res.status()));
+        }
+
+        let ext_html_res = client
+            .get(format!("{miniapp_url}/"))
+            .send()
+            .await
+            .map_err(|e| format!("GET {miniapp_url}/ failed: {e}"))?;
+        if ext_html_res.status() != reqwest::StatusCode::OK {
+            return Err(format!(
+                "{miniapp_url}/ returned {}",
+                ext_html_res.status()
+            ));
+        }
+
+        let wasm_url = format!("{miniapp_url}/api/v1/fabushi-miniapp/app.wasm");
+        let res4 = client
+            .get(&wasm_url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {wasm_url} failed: {e}"))?;
+        if res4.status() != reqwest::StatusCode::OK {
+            return Err(format!("{wasm_url} returned {}", res4.status()));
+        }
+        let wasm_bytes = res4
+            .bytes()
+            .await
+            .map_err(|e| format!("read {wasm_url} bytes: {e}"))?;
+        if !wasm_bytes.starts_with(b"\0asm") {
+            return Err(format!("{wasm_url} did not return valid WASM magic header"));
+        }
     }
 
     println!(
-        "Verified 200 OK:\n  - {miniapps_url}\n  - {search_url}\n  - {html_url} ({} bytes)\n  - {wasm_url} ({} bytes)",
-        html_body.len(),
-        wasm_bytes.len()
+        "Verified 200 OK:\n  - {miniapps_url}\n  - {search_url}\n  - {im_entry_url} -> {miniapp_url}"
     );
+    Ok(())
+}
+
+fn write_token_file(path: &PathBuf, token: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create token dir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, format!("{token}\n"))
+        .map_err(|e| format!("write bot token to {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("Wrote @{BOT_USERNAME} Bot API token to {}", path.display());
     Ok(())
 }
 
@@ -577,9 +659,22 @@ async fn main() {
 
     let result = async {
         let bearer = register_or_login_publisher(&client, &cfg.server_url, &cfg.password).await?;
-        let bot_token = create_or_update_fabushi_bot(&client, &cfg.server_url, &bearer).await?;
-        publish_and_configure_bot_api(&client, &cfg.server_url, &bot_token).await?;
-        verify_published_endpoints(&client, &cfg.server_url, &bearer).await?;
+        let bot_token =
+            create_or_update_fabushi_bot(&client, &cfg.server_url, &cfg.miniapp_url, &bearer)
+                .await?;
+        if let Some(ref token_path) = cfg.write_bot_token {
+            write_token_file(token_path, &bot_token)?;
+        }
+        publish_and_configure_bot_api(&client, &cfg.server_url, &cfg.miniapp_url, &bot_token)
+            .await?;
+        verify_published_endpoints(
+            &client,
+            &cfg.server_url,
+            &cfg.miniapp_url,
+            &bearer,
+            cfg.skip_miniapp_health_check,
+        )
+        .await?;
         Ok::<(), String>(())
     }
     .await;

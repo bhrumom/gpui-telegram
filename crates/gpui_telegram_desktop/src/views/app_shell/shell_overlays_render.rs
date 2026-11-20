@@ -61,46 +61,26 @@ fn format_live_miniapp_telemetry(
         }
     }
     if let Some(snap) = state_snap {
-        if snap.get("is_transferring").and_then(|v| v.as_bool()) == Some(true) {
-            let sutra = snap
-                .get("current_sending_scripture")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("经典");
-            let country = snap
-                .get("current_sending_country")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("ALL");
-            let sent = snap
-                .get("global_data_sent_formatted")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("0 B");
-            return format!("发送中: 《{sutra}》 → {country} · 已传 {sent}");
-        }
-        if snap.get("is_in_session").and_then(|v| v.as_bool()) == Some(true) {
-            let chants = snap.get("chant_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            return format!("禅室共修进行中 · 念诵 {chants} 遍");
-        }
-        if let Some(sent) = snap
-            .get("global_data_sent_formatted")
+        if let Some(reported) = snap
+            .get("status_text")
+            .or_else(|| snap.get("pip_status_text"))
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let tab = snap
-                .get("active_tab")
-                .and_then(|v| v.as_str())
-                .unwrap_or("home");
-            return format!("已累计传经: {sent} · 页面: {tab}");
+            return reported.to_string();
         }
     }
     if !status_text.trim().is_empty() {
         return status_text.to_string();
+    }
+    if let Some(title) = state_snap
+        .and_then(|s| s.get("title"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return title.to_string();
     }
     String::new()
 }

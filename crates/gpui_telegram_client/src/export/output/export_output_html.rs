@@ -161,7 +161,7 @@ impl AbstractOutputWriter for ExportOutputHtmlOutput {
         let mut msgs_html = String::new();
         for m in messages {
             let date_str = chrono::DateTime::from_timestamp(m.date, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| m.date.to_string());
             msgs_html.push_str(&format!(
                 "<div class=\"message\"><span class=\"from\">{}</span><span class=\"date\">{}</span><div class=\"text\">{}</div></div>",

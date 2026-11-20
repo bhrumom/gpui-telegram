@@ -9,7 +9,6 @@ pub mod chat_lifecycle;
 pub mod computers;
 pub mod devices;
 pub mod e2ee;
-pub mod fabushi_miniapp_api;
 pub mod hermes;
 pub mod magpie_api;
 pub mod media;

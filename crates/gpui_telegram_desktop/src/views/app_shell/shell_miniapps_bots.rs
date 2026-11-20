@@ -492,7 +492,7 @@ impl AppShell {
                     chat_id,
                     custom_url,
                 } => {
-                    self.launch_miniapp_with_url(
+                    self.reload_miniapp_with_url(
                         &bot_username,
                         &short_name,
                         chat_id.filter(|&id| id > 0).map(|id| id as u64),

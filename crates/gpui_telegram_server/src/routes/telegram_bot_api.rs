@@ -2202,6 +2202,7 @@ const TELEGRAM_WEB_APP_JS: &str = r#"(function () {
           var m = localStorageReadMap();
           m[k] = v;
           localStorageWriteMap(m);
+          postToHost('web_app_cloud_storage_set', { key: k, value: v });
           return true;
         })
         .then(function () {
@@ -2249,6 +2250,7 @@ const TELEGRAM_WEB_APP_JS: &str = r#"(function () {
           var m = localStorageReadMap();
           delete m[k];
           localStorageWriteMap(m);
+          postToHost('web_app_cloud_storage_delete', { key: k });
           return true;
         })
         .then(function () {
@@ -2506,25 +2508,12 @@ const TELEGRAM_WEB_APP_JS: &str = r#"(function () {
   (function installUniversalWebMcp() {
     var existing = window.__GPUI_WEBMCP__ || {};
     var toolsMap = existing._tools || {};
+    var stateProvider = typeof existing._stateProvider === 'function' ? existing._stateProvider : null;
     function readAppStateSummary() {
       try {
-        if (window.__FABUSHI_TEST_HOOK__ && typeof window.__FABUSHI_TEST_HOOK__.getState === 'function') {
-          var vm = window.__FABUSHI_TEST_HOOK__.getState();
-          if (vm) {
-            return {
-              kind: 'fabushi_wasm',
-              active_tab: vm.active_tab,
-              is_transferring: vm.is_transferring,
-              current_sending_scripture: vm.current_sending_scripture,
-              current_sending_country: vm.current_sending_country,
-              global_sent_count: vm.global_sent_count,
-              global_data_sent_formatted: vm.global_data_sent_formatted,
-              is_in_session: vm.is_in_session,
-              chant_count: vm.chant_count,
-              locked_practice: vm.locked_practice,
-              profile: vm.profile
-            };
-          }
+        if (typeof stateProvider === 'function') {
+          var provided = stateProvider();
+          if (provided && typeof provided === 'object') return provided;
         }
         if (window.STATE && typeof window.STATE === 'object') {
           return { kind: 'schema_miniapp', state: window.STATE };
@@ -2670,6 +2659,19 @@ const TELEGRAM_WEB_APP_JS: &str = r#"(function () {
       if (!def || !def.name || typeof def.execute !== 'function') return;
       toolsMap[String(def.name)] = def;
     }
+    function setStateProvider(fn) {
+      stateProvider = typeof fn === 'function' ? fn : null;
+      if (window.__GPUI_WEBMCP__) window.__GPUI_WEBMCP__._stateProvider = stateProvider;
+    }
+    function reportStatus(statusOrSummary) {
+      var payload = {};
+      if (typeof statusOrSummary === 'string') {
+        payload = { status_text: statusOrSummary };
+      } else if (statusOrSummary && typeof statusOrSummary === 'object') {
+        payload = Object.assign({}, statusOrSummary);
+      }
+      postToHost('webmcp_state_update', payload);
+    }
     var modelContext = {
       registerTool: registerTool,
       unregisterTool: function (name) { delete toolsMap[String(name || '')]; },
@@ -2677,8 +2679,11 @@ const TELEGRAM_WEB_APP_JS: &str = r#"(function () {
         toolsMap = {};
         var arr = (ctx && Array.isArray(ctx.tools)) ? ctx.tools : [];
         for (var i = 0; i < arr.length; i++) registerTool(arr[i]);
+        if (ctx && typeof ctx.getState === 'function') setStateProvider(ctx.getState);
       },
-      clearContext: function () { toolsMap = {}; }
+      clearContext: function () { toolsMap = {}; setStateProvider(null); },
+      setStateProvider: setStateProvider,
+      reportStatus: reportStatus
     };
     try {
       if (!navigator.modelContext) {
@@ -2688,10 +2693,13 @@ const TELEGRAM_WEB_APP_JS: &str = r#"(function () {
         navigator.modelContext.unregisterTool = modelContext.unregisterTool;
         navigator.modelContext.provideContext = modelContext.provideContext;
         navigator.modelContext.clearContext = modelContext.clearContext;
+        navigator.modelContext.setStateProvider = modelContext.setStateProvider;
+        navigator.modelContext.reportStatus = modelContext.reportStatus;
       }
     } catch (_) {}
     window.__GPUI_WEBMCP__ = {
       _tools: toolsMap,
+      _stateProvider: stateProvider,
       discover: listDescriptors,
       readState: readAppStateSummary,
       invoke: function (requestId, operation, toolName, args) {

@@ -102,11 +102,12 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
   (function installEarlyWebMcp() {
     var existing = window.__GPUI_WEBMCP__ || {};
     var toolsMap = existing._tools || {};
+    var stateProvider = typeof existing._stateProvider === 'function' ? existing._stateProvider : null;
     function readStateSummary() {
       try {
-        if (window.__FABUSHI_TEST_HOOK__ && typeof window.__FABUSHI_TEST_HOOK__.getState === 'function') {
-          var vm = window.__FABUSHI_TEST_HOOK__.getState();
-          if (vm) return vm;
+        if (typeof stateProvider === 'function') {
+          var provided = stateProvider();
+          if (provided && typeof provided === 'object') return provided;
         }
         if (window.STATE && typeof window.STATE === 'object') return window.STATE;
       } catch (_) {}
@@ -227,11 +228,31 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
       if (!def || !def.name || typeof def.execute !== 'function') return;
       toolsMap[String(def.name)] = def;
     }
+    function setStateProvider(fn) {
+      stateProvider = typeof fn === 'function' ? fn : null;
+      if (window.__GPUI_WEBMCP__) window.__GPUI_WEBMCP__._stateProvider = stateProvider;
+    }
+    function reportStatus(statusOrSummary) {
+      var payload = {};
+      if (typeof statusOrSummary === 'string') {
+        payload = { status_text: statusOrSummary };
+      } else if (statusOrSummary && typeof statusOrSummary === 'object') {
+        payload = Object.assign({}, statusOrSummary);
+      }
+      postBridgeEvent('webmcp_state_update', payload);
+    }
     var mc = {
       registerTool: registerTool,
       unregisterTool: function(n) { delete toolsMap[String(n || '')]; },
-      provideContext: function(c) { toolsMap = {}; var arr = (c && Array.isArray(c.tools)) ? c.tools : []; for (var i = 0; i < arr.length; i++) registerTool(arr[i]); },
-      clearContext: function() { toolsMap = {}; }
+      provideContext: function(c) {
+        toolsMap = {};
+        var arr = (c && Array.isArray(c.tools)) ? c.tools : [];
+        for (var i = 0; i < arr.length; i++) registerTool(arr[i]);
+        if (c && typeof c.getState === 'function') setStateProvider(c.getState);
+      },
+      clearContext: function() { toolsMap = {}; setStateProvider(null); },
+      setStateProvider: setStateProvider,
+      reportStatus: reportStatus
     };
     try {
       if (!navigator.modelContext) Object.defineProperty(navigator, 'modelContext', { value: mc, configurable: true });
@@ -240,10 +261,13 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
         navigator.modelContext.unregisterTool = mc.unregisterTool;
         navigator.modelContext.provideContext = mc.provideContext;
         navigator.modelContext.clearContext = mc.clearContext;
+        navigator.modelContext.setStateProvider = mc.setStateProvider;
+        navigator.modelContext.reportStatus = mc.reportStatus;
       }
     } catch (_) {}
     window.__GPUI_WEBMCP__ = {
       _tools: toolsMap,
+      _stateProvider: stateProvider,
       discover: listDescriptors,
       readState: readStateSummary,
       invoke: function(requestId, operation, toolName, args) {

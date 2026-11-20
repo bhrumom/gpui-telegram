@@ -66,10 +66,11 @@ jobs:
           cache-on-failure: true
           shared-key: "ubuntu-22-backend-deploy-v1"
 
-      - name: Build Release gpui_telegram_server Binary (GLIBC 2.35 Compatible)
+      - name: Build Release gpui_telegram_server & External fabushi_miniapp_server Binaries (GLIBC 2.35 Compatible)
         run: |
           cargo build --release -p gpui_telegram_server --bin gpui_telegram_server
-          ls -lh target/release/gpui_telegram_server
+          cargo build --release -p fabushi_miniapp --features server --bin fabushi_miniapp_server --bin publish_fabushi_miniapp
+          ls -lh target/release/gpui_telegram_server target/release/fabushi_miniapp_server target/release/publish_fabushi_miniapp
 
       - name: Configure SSH Credentials from GitHub Secrets
         env:
@@ -117,10 +118,12 @@ jobs:
             -e "ssh -i ~/.ssh/deploy_key -p ${PORT_ARG} -o StrictHostKeyChecking=no" \
             ./ "${SSH_USER}@${SSH_HOST}:/tmp/gpui-server-sync/"
 
-          # 2. Upload compiled release binary and runtime .env secrets (never echoed)
+          # 2. Upload compiled release binaries and runtime .env secrets (never echoed)
           scp -i ~/.ssh/deploy_key -P "${PORT_ARG}" -o StrictHostKeyChecking=no \
             target/release/gpui_telegram_server \
-            "${SSH_USER}@${SSH_HOST}:/tmp/gpui_telegram_server.new"
+            target/release/fabushi_miniapp_server \
+            target/release/publish_fabushi_miniapp \
+            "${SSH_USER}@${SSH_HOST}:/tmp/"
 
           rm -f /tmp/gpui_backend.env /tmp/gpui_ai_backend.env
           if [ -n "${BACKEND_ENV:-}" ]; then
@@ -142,8 +145,10 @@ jobs:
           set -euo pipefail
           sudo mkdir -p "${REMOTE_DIR}/target/release" /opt/fabushi/data /opt/fabushi/logs
           sudo rsync -a --exclude 'target/' --exclude '.env' /tmp/gpui-server-sync/ "${REMOTE_DIR}/"
-          sudo mv /tmp/gpui_telegram_server.new "${REMOTE_DIR}/target/release/gpui_telegram_server"
-          sudo chmod 755 "${REMOTE_DIR}/target/release/gpui_telegram_server"
+          for bin_name in gpui_telegram_server fabushi_miniapp_server publish_fabushi_miniapp; do
+            sudo mv "/tmp/${bin_name}" "${REMOTE_DIR}/target/release/${bin_name}"
+            sudo chmod 755 "${REMOTE_DIR}/target/release/${bin_name}"
+          done
 
           sudo python3 - "${REMOTE_DIR}/.env" <<'PYEOF'
           import os, sys
@@ -198,6 +203,9 @@ jobs:
 
           sudo systemctl daemon-reload
           sudo systemctl restart "${SVC}"
+          if sudo systemctl list-unit-files | grep -q "^fabushi-miniapp-server.service"; then
+            sudo systemctl restart fabushi-miniapp-server || true
+          fi
           if [ -n "${AI_BACKEND_SERVICE:-}" ]; then
             sudo systemctl status "${AI_BACKEND_SERVICE}" --no-pager || true
           fi

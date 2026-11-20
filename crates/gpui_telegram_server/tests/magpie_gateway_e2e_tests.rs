@@ -445,18 +445,6 @@ async fn test_e2e_magpie_state_presets_no_subscription_provider_error_and_bot_bu
     .await;
     assert_eq!(st_cb, StatusCode::OK, "callback: {cb_val}");
     assert_eq!(cb_val["ok"].as_bool(), Some(true));
-
-    // 5. Mini App ask_ai still safely falls back to Dharma pure-Rust reply when unconfigured
-    let (st_ai, ai_val) = http_json(
-        &router,
-        "POST",
-        "/api/v1/fabushi-miniapp/ai-chat",
-        Some(&tok),
-        Some(json!({ "message": "请问如何修持金刚经？" })),
-    )
-    .await;
-    assert_eq!(st_ai, StatusCode::OK, "miniapp ai-chat fallback: {ai_val}");
-    assert!(ai_val["reply"].as_str().unwrap_or("").contains("金刚经"));
 }
 
 #[tokio::test]
@@ -576,22 +564,22 @@ async fn test_e2e_magpie_preset_persistence_probe_delete_and_miniapp_ai_chat() {
             .as_array()
             .is_some_and(|arr| arr.iter().any(|p| p["provider_id"].as_str() == Some("google"))));
 
-        // 5. Mini App ask_ai uses active Magpie/Hermes provider when configured
-        let (st_ai, ai_val) = http_json(
+        // 5. Hermes turn uses active Magpie/Hermes provider when configured
+        let (st_turn_live, turn_live_val) = http_json(
             &router2,
             "POST",
-            "/api/v1/fabushi-miniapp/ai-chat",
+            "/api/v1/hermes/turns",
             Some(&tok),
-            Some(json!({ "message": "What is compassion?" })),
+            Some(json!({ "prompt": "What is compassion?" })),
         )
         .await;
-        assert_eq!(st_ai, StatusCode::OK, "miniapp ai-chat live: {ai_val}");
+        assert_eq!(st_turn_live, StatusCode::OK, "hermes live turn: {turn_live_val}");
         assert!(
-            ai_val["reply"]
+            turn_live_val["response"]
                 .as_str()
                 .unwrap_or("")
                 .contains("MOCK_OPENAI_REPLY"),
-            "expected live Hermes/Magpie reply in ai-chat: {ai_val}"
+            "expected live Hermes/Magpie reply in turn response: {turn_live_val}"
         );
 
         // 6. Delete provider google; local_hermes stays protected

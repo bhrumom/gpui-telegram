@@ -12,6 +12,8 @@ pub mod sutras;
 
 #[cfg(feature = "server")]
 pub mod storage;
+#[cfg(feature = "server")]
+pub mod web_server;
 
 /// Cosmic dark glass design tokens ported from `lib/core/design_system/colors.dart` & `app_theme.dart`.
 pub mod theme {

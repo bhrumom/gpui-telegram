@@ -137,6 +137,36 @@
   }
   const segPill = (mode, can3d, cmdType, isZen) => h('div', { class: 'seg' + (isZen ? ' zen-seg' : '') }, ['two_d', 'three_d'].map(m => h('button', { class: mode === m ? 'on' : '', 'data-mode': m, text: (m === 'three_d' && !can3d ? '🔒 ' : '') + (m === 'two_d' ? '2D' : '3D'), onClick: () => dispatch({ type: cmdType, mode: m }) })));
 
+  const snapshotSummary = () => {
+    if (!lastVm) return null;
+    let status_text = '';
+    if (lastVm.is_transferring) {
+      status_text = `发送中: 《${lastVm.current_sending_scripture || '经典'}》 → ${lastVm.current_sending_country || 'ALL'} · 已传 ${lastVm.global_data_sent_formatted || '0 B'}`;
+    } else if (lastVm.is_in_session) {
+      status_text = `禅室共修进行中 · 念诵 ${lastVm.chant_count || 0} 遍`;
+    } else if (lastVm.global_data_sent_formatted && lastVm.global_sent_count > 0) {
+      status_text = `已累计传经: ${lastVm.global_data_sent_formatted} · 页面: ${lastVm.active_tab || 'home'}`;
+    }
+    return {
+      active_tab: lastVm.active_tab,
+      is_transferring: lastVm.is_transferring,
+      current_sending_scripture: lastVm.current_sending_scripture,
+      current_sending_country: lastVm.current_sending_country,
+      global_sent_count: lastVm.global_sent_count,
+      global_data_sent_formatted: lastVm.global_data_sent_formatted,
+      is_dharma_composer_mode: lastVm.is_dharma_composer_mode,
+      is_in_session: lastVm.is_in_session,
+      chant_count: lastVm.chant_count,
+      locked_practice: lastVm.locked_practice,
+      total_transfer_bytes: lastVm.profile?.total_transfer_bytes,
+      total_transfer_count: lastVm.profile?.total_transfer_count,
+      total_practice_sessions: lastVm.profile?.total_practice_sessions,
+      total_practice_chants: lastVm.profile?.total_practice_chants,
+      status_text,
+    };
+  };
+
+  let lastReportedStatus = '', lastStatusPushAt = 0;
   function syncLiveMetrics(vm) {
     const byId = id => document.getElementById(id), s = vm.strings;
     const oh = byId('online-home-pill'); if (oh) oh.textContent = `${s.online_global_prefix} ${vm.online_global_sending_count}`;
@@ -146,6 +176,14 @@
     const xp = byId('xfer-prog-bar'); if (xp) xp.style.width = `${Math.round(vm.current_country_progress * 100)}%`;
     const oz = byId('online-zen-pill'); if (oz) oz.textContent = `🧘 ${vm.online_zen_room_count}`;
     const zt = byId('zen-timer'); if (zt) zt.textContent = `⏱ ${vm.session_duration_formatted}`;
+    if (navigator.modelContext && typeof navigator.modelContext.reportStatus === 'function') {
+      const snap = snapshotSummary(), nowMs = Date.now();
+      if (snap && snap.status_text !== lastReportedStatus && (nowMs - lastStatusPushAt >= 800 || !snap.status_text)) {
+        lastReportedStatus = snap.status_text;
+        lastStatusPushAt = nowMs;
+        navigator.modelContext.reportStatus(snap);
+      }
+    }
   }
 
   function renderHud(vm) {
@@ -289,25 +327,9 @@
       if (!wasm || !lastVm) throw new Error('全球法布施 WASM 运行时尚未初始化完成');
       return lastVm;
     };
-    const snapshotSummary = () => {
-      if (!lastVm) return null;
-      return {
-        active_tab: lastVm.active_tab,
-        is_transferring: lastVm.is_transferring,
-        current_sending_scripture: lastVm.current_sending_scripture,
-        current_sending_country: lastVm.current_sending_country,
-        global_sent_count: lastVm.global_sent_count,
-        global_data_sent_formatted: lastVm.global_data_sent_formatted,
-        is_dharma_composer_mode: lastVm.is_dharma_composer_mode,
-        is_in_session: lastVm.is_in_session,
-        chant_count: lastVm.chant_count,
-        locked_practice: lastVm.locked_practice,
-        total_transfer_bytes: lastVm.profile?.total_transfer_bytes,
-        total_transfer_count: lastVm.profile?.total_transfer_count,
-        total_practice_sessions: lastVm.profile?.total_practice_sessions,
-        total_practice_chants: lastVm.profile?.total_practice_chants,
-      };
-    };
+    if (typeof navigator.modelContext.setStateProvider === 'function') {
+      navigator.modelContext.setStateProvider(snapshotSummary);
+    }
     const tools = [
       {
         name: 'fabushi_get_status',

@@ -2770,7 +2770,7 @@ pub async fn handle_ai_bot_reply(
     if !apps.is_empty() {
         let mut app_lines = vec![
             "## Companion Mini Apps (WebMCP Live Control)".to_string(),
-            "此机器人绑定了真实可交互的小程序。当用户请求发送经典、启动/停止全球法布施、切换标签页、查询实时功德、补录共修记录或操作页面功能时，无论上方历史对话是否出现过旧版纯文本回复，**绝对禁止**模仿历史纯文本编造字节数或假称“Hermes-local-v1”，必须主动调用 `webmcp_call_tool`（例如 `fabushi_send_dharma` / `fabushi_get_status` / `fabushi_switch_tab` / `fabushi_record_practice`）或 `webmcp_discover` 真实操控小程序并基于工具返回结果作答；若需要用户手动登录、验证码或人工确认，请调用 `miniapp_request_takeover` 暂停等待用户结束接管后继续。当用户询问你是什么模型时，请如实回答你在 Fabushi Agent 运行时上所连接的真实 Active Model。".to_string(),
+            "此机器人绑定了真实可交互的小程序。当用户请求查询小程序实时状态或操作小程序功能时，必须主动调用 `webmcp_discover` 发现当前小程序暴露的工具，再调用 `webmcp_call_tool` 执行真实操作并基于工具返回结果作答，严禁凭空编造数据或假称“Hermes-local-v1”；若需要用户手动登录、验证码或人工确认，请调用 `miniapp_request_takeover` 暂停等待用户结束接管后继续。当用户询问你是什么模型时，请如实回答你在 Fabushi Agent 运行时上所连接的真实 Active Model。".to_string(),
         ];
         for app in &apps {
             app_lines.push(format!(
@@ -4806,18 +4806,7 @@ pub async fn miniapps_action(
     }
 
     let (next_state, toast, chat_sync_msg, close_app) =
-        if app.short_name.eq_ignore_ascii_case("fabushi") {
-            crate::routes::fabushi_miniapp_api::handle_headless_fabushi_action(
-                &state,
-                &bot,
-                &app,
-                auth.user_id,
-                &req,
-                current_state,
-            )
-        } else {
-            reduce_mini_app_action(&app, current_state, &req)
-        };
+        reduce_mini_app_action(&app, current_state, &req);
     persist_session_state(&state, existing_session.as_ref(), uid, &app, companion_cid.0, &next_state);
     let synced_schema = sync_ui_schema_with_state(&base_schema, &next_state);
 
@@ -5106,13 +5095,11 @@ pub async fn serve_miniapp_html(
     };
     let init_data = params.get("init_data").cloned().unwrap_or_default();
 
-    let is_builtin_fabushi = bot.username.eq_ignore_ascii_case("fabushi_bot")
-        && app.short_name.eq_ignore_ascii_case("fabushi");
-    let hosted_bundle = if is_builtin_fabushi {
-        Some(fabushi_miniapp::hosted_bundle_html().to_string())
-    } else {
-        state.db.get_mini_app_hosted_bundle(&app.app_id).ok().flatten()
-    };
+    let hosted_bundle = state
+        .db
+        .get_mini_app_hosted_bundle(&app.app_id)
+        .ok()
+        .flatten();
     if let Some(bundle_html) = hosted_bundle {
         let init_escaped = serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into());
         let has_tg_sdk = bundle_html.contains("/js/telegram-web-app.js");

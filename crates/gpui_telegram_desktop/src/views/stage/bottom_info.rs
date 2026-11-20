@@ -118,8 +118,11 @@ impl Default for BottomInfoData {
 
 impl BottomInfoData {
     pub fn format_time_string(&self) -> String {
-        let hours = (self.date % 86400) / 3600;
-        let minutes = (self.date % 3600) / 60;
+        if let Some(dt) = chrono::DateTime::from_timestamp(self.date, 0) {
+            return dt.with_timezone(&chrono::Local).format("%H:%M").to_string();
+        }
+        let hours = self.date.rem_euclid(86400) / 3600;
+        let minutes = self.date.rem_euclid(3600) / 60;
         format!("{:02}:{:02}", hours, minutes)
     }
 

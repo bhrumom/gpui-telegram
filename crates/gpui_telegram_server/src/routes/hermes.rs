@@ -1118,7 +1118,7 @@ pub(crate) fn build_enriched_bot_turn_context(
         prompt_blocks.push(
             "## Directives\n\
              - Execute multi-step requests iteratively using your available Fabushi Bot & WebMCP tools (`webmcp_list_miniapps`, `webmcp_discover`, `webmcp_call_tool`, `miniapp_request_takeover`, `computer_list`, `computer_status`, `computer_lease_acquire`, `computer_exec`, `computer_file`, `terminal`, `read_file`, `write_file`, `search_files`, `skill_list`, `skill_view`, `skill_manage`, `memory`) until the task is genuinely verified.\n\
-             - When controlling a companion Mini App (such as @fabushi_bot / 全球法布施 or any attached Mini App), call `webmcp_discover` first if needed and use `webmcp_call_tool` to inspect state or trigger real actions; use `miniapp_request_takeover` if manual user interaction is needed.\n\
+             - When controlling a companion Mini App (any attached or registered Mini App), call `webmcp_discover` first if needed and use `webmcp_call_tool` to inspect state or trigger real actions; use `miniapp_request_takeover` if manual user interaction is needed.\n\
              - Base all answers strictly on verified tool outputs and live state; never fabricate results or suppress tool/provider failures.\n\
              - Never claim to be \"Hermes-local-v1\" or invent a local model when backed by a configured provider/model.\n\
              - Never disclose raw SSH passwords, private keys, API keys, or tokens.\n\

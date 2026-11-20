@@ -63,7 +63,8 @@ pub fn format_authoritative_timestamp(raw_ts: Option<i64>) -> String {
     } else {
         chrono::DateTime::from_timestamp(ts, 0)
     };
-    dt.map(|d| d.format("%H:%M").to_string()).unwrap_or_default()
+    dt.map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default()
 }
 
 pub fn derive_initials(title: &str) -> String {
@@ -1177,5 +1178,20 @@ mod tests {
         assert_eq!(reply.message_id, 1);
         assert_eq!(reply.sender_name, "Project Engineering");
         assert_eq!(reply.snippet, "Original announcement");
+    }
+
+    #[test]
+    fn format_authoritative_timestamp_uses_local_timezone() {
+        let secs = 1_700_000_000_i64;
+        let ms = secs * 1000;
+        let expected = chrono::DateTime::from_timestamp(secs, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(format_authoritative_timestamp(Some(secs)), expected);
+        assert_eq!(format_authoritative_timestamp(Some(ms)), expected);
+        assert_eq!(format_authoritative_timestamp(None), "");
+        assert_eq!(format_authoritative_timestamp(Some(0)), "");
     }
 }

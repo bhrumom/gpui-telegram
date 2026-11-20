@@ -24,7 +24,7 @@ pub(crate) fn format_ms_human(ms: i64) -> String {
         return String::new();
     }
     chrono::DateTime::from_timestamp_millis(ms)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| ms.to_string())
 }
 

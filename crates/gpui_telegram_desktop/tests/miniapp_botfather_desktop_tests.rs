@@ -154,6 +154,13 @@ fn dispatch_headless_target(target: &str) -> ! {
                 )
             })
         }
+        "test_headless_gpui_inline_webapp_restores_running_pip_miniapp_without_relaunch" => {
+            Runner::Async(|app| {
+                Box::pin(
+                    headless_body_inline_webapp_restores_running_pip_miniapp_without_relaunch(app),
+                )
+            })
+        }
         other => {
             eprintln!("unknown headless gpui test target: {other}");
             std::process::exit(101);
@@ -1483,6 +1490,16 @@ fn spawn_parity_mock_http_server(
                         let mut app =
                             build_shop_miniapp(st.app_tos_accepted, st.allows_write_to_pm, cid_opt);
                         app.is_installed = false;
+                        let mut bot = build_third_party_shop_bot();
+                        if path.starts_with("/api/v1/miniapps/fabushi_bot/fabushi") {
+                            app.bot_username = "fabushi_bot".to_string();
+                            app.short_name = "fabushi".to_string();
+                            app.title = "全球法布施".to_string();
+                            app.web_url = "/miniapps/fabushi_bot/fabushi".to_string();
+                            bot.username = "fabushi_bot".to_string();
+                            bot.display_name = "全球法布施".to_string();
+                            bot.menu_button_url = "/miniapps/fabushi_bot/fabushi".to_string();
+                        }
                         if let Some(cu) = req_json
                             .get("custom_url")
                             .and_then(|v| v.as_str())
@@ -1490,7 +1507,6 @@ fn spawn_parity_mock_http_server(
                         {
                             app.web_url = cu.to_string();
                         }
-                        let mut bot = build_third_party_shop_bot();
                         bot.allows_write_to_pm = st.allows_write_to_pm;
                         bot.app_tos_accepted = st.app_tos_accepted;
                         let ctx = MiniAppLaunchContext {
@@ -2635,12 +2651,288 @@ fn test_bot_attach_webview_webmcp_dispatch_takeover_and_bridge_response() {
     assert!(wv.is_open);
     assert!(!wv.is_floating_pip);
 
-    // 4. Live PiP mode flag defaults true, can toggle to collapsed and restores on WebMCP dispatch
+    // 4. Universal WebMCP state & CloudStorage bridge events work without app-specific hardcoding
+    wv.handle_bridge_event(
+        "webmcp_state_update",
+        r#"{"status_text":"发送中: 《心经》 → CN"}"#,
+    );
+    assert_eq!(
+        wv.last_webmcp_state_summary
+            .as_ref()
+            .and_then(|v| v["status_text"].as_str()),
+        Some("发送中: 《心经》 → CN")
+    );
+    wv.handle_bridge_event(
+        "web_app_cloud_storage_set",
+        r#"{"key":"k1","value":"v1"}"#,
+    );
+    let cs_pending = wv.take_pending_actions();
+    assert!(matches!(
+        cs_pending.as_slice(),
+        [BotWebViewPendingAction::CloudStorageSet { bot_username, key, value, .. }]
+            if bot_username == "fabushi_bot" && key == "k1" && value == "v1"
+    ));
+
+    // 5. Live PiP mode flag defaults true, can toggle to collapsed and restores on WebMCP dispatch
     let mut live_wv = BotAttachWebView::new();
     assert!(live_wv.pip_live_preview, "pip_live_preview should default true for live broadcast PiP");
     live_wv.pip_live_preview = false;
     assert!(!live_wv.pip_live_preview);
     live_wv.close();
     assert!(live_wv.pip_live_preview, "close() must reset pip_live_preview to true");
+}
+
+#[test]
+fn test_headless_gpui_inline_webapp_restores_running_pip_miniapp_without_relaunch() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_inline_webapp_restores_running_pip_miniapp_without_relaunch",
+    );
+}
+
+async fn headless_body_inline_webapp_restores_running_pip_miniapp_without_relaunch(
+    app: AsyncApp,
+) {
+    let seed_client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let (base_url, recorded_http, _mock_state) = spawn_parity_mock_http_server(
+        &seed_client,
+        ParityMockState {
+            chat_created: true,
+            chat_id: 600_000_777,
+            allows_write_to_pm: true,
+            app_tos_accepted: true,
+            is_blocked: false,
+            has_started_chat: true,
+            launched_once: false,
+        },
+    );
+    let client = new_isolated_client(base_url.clone());
+    let bot_cid = 600_000_777u64;
+    let bot_uid = 600_777u64;
+
+    let shell = app
+        .update(|cx| {
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_001);
+                s.session_sync.session_token = Some("tok_fabushi_reuse".to_string());
+                s.miniapps.accepted_app_tos_bots.insert(bot_uid);
+                s.session_sync.rich_chats_by_id.insert(
+                    bot_cid,
+                    HermesRichChatDto {
+                        chat_id: bot_cid as i64,
+                        title: "全球法布施".to_string(),
+                        is_bot: true,
+                        peer_user_id: Some(bot_uid),
+                        peer_username: Some("fabushi_bot".to_string()),
+                        menu_button_text: Some("全球法布施".to_string()),
+                        menu_button_url: Some("gpui-miniapp://fabushi_bot/fabushi".to_string()),
+                        has_mini_app: true,
+                        ..Default::default()
+                    },
+                );
+                s.stage.update(cx, |st, _| {
+                    st.set_chat(bot_cid, "全球法布施", "bot", "法", 0x7b1fa2);
+                    st.add_message(MessageItemModel {
+                        id: 901,
+                        sender_id: bot_uid,
+                        sender_name: "全球法布施".to_string(),
+                        avatar_initials: "法".to_string(),
+                        avatar_color: 0x7b1fa2,
+                        direction: MessageDirection::Incoming,
+                        timestamp: "09:15".to_string(),
+                        delivery_status: DeliveryStatus::Read,
+                        reply_to: None,
+                        reactions: vec![],
+                        content: MessageContent::Text {
+                            text: "全球法布施功德回执".to_string(),
+                            is_edited: false,
+                        },
+                        bot_keyboard: Some(vec![vec![InlineKeyboardButton {
+                            text: "🪷 打开 全球法布施".to_string(),
+                            button_type: InlineButtonType::WebApp(
+                                "gpui-miniapp://fabushi_bot/fabushi".to_string(),
+                            ),
+                        }]]),
+                        is_pinned: false,
+                    });
+                });
+                s
+            })
+        })
+        .expect("create shell");
+
+    // 1. Initial launch of @fabushi_bot/fabushi
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            s.launch_miniapp(
+                "fabushi_bot",
+                "fabushi",
+                Some(bot_cid),
+                MiniAppLaunchMode::InlineKeyboard,
+                None,
+                cx,
+            );
+        });
+    })
+    .expect("initial launch");
+
+    for _ in 0..50 {
+        app.background_executor()
+            .timer(std::time::Duration::from_millis(20))
+            .await;
+        let ready = app
+            .update(|cx| {
+                shell
+                    .read(cx)
+                    .miniapps
+                    .miniapp_overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.read(cx).launch_context.is_some())
+            })
+            .unwrap();
+        if ready {
+            break;
+        }
+    }
+
+    // 2. Simulate active transfer running in minimized Floating PiP
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            s.miniapps.is_miniapp_minimized = true;
+            if let Some(ref ov) = s.miniapps.miniapp_overlay {
+                ov.update(cx, |w, w_cx| {
+                    w.is_open = false;
+                    w.is_floating_pip = true;
+                    w.last_webmcp_state_summary = Some(json!({
+                        "is_transferring": true,
+                        "current_sending_scripture": "金刚经"
+                    }));
+                    w_cx.notify();
+                });
+            }
+            cx.notify();
+        });
+        let launch_count = recorded_http
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/api/v1/miniapps/fabushi_bot/fabushi/launch")
+            .count();
+        assert_eq!(launch_count, 1, "expected exactly 1 launch call before inline click");
+    })
+    .expect("minimize to floating pip");
+
+    // 3. Click inline message button `🪷 打开 全球法布施` -> MUST restore running overlay without relaunch
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            s.handle_stage_bot_button(
+                901,
+                InlineButtonType::WebApp("gpui-miniapp://fabushi_bot/fabushi".to_string()),
+                cx,
+            );
+        });
+        let s = shell.read(cx);
+        assert!(!s.miniapps.is_miniapp_minimized);
+        assert!(s.miniapps.pending_miniapp_confirm.is_none());
+        let ov = s
+            .miniapps
+            .miniapp_overlay
+            .as_ref()
+            .expect("miniapp_overlay must remain mounted")
+            .read(cx);
+        assert!(ov.is_open, "clicking inline button must expand running overlay");
+        assert!(!ov.is_floating_pip, "floating PiP flag must clear when expanded");
+        assert!(!ov.is_loading, "restoring running overlay must not reset to loading");
+        assert_eq!(
+            ov.last_webmcp_state_summary
+                .as_ref()
+                .and_then(|v| v["current_sending_scripture"].as_str()),
+            Some("金刚经"),
+            "running miniapp state must be preserved"
+        );
+    })
+    .expect("inline button restores running miniapp");
+
+    // 4. Minimize again and trigger `launch_miniapp_from_uri` with full server path URL -> also restores without relaunch
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            s.miniapps.is_miniapp_minimized = true;
+            if let Some(ref ov) = s.miniapps.miniapp_overlay {
+                ov.update(cx, |w, w_cx| {
+                    w.is_open = false;
+                    w.is_floating_pip = true;
+                    w_cx.notify();
+                });
+            }
+            assert!(s.launch_miniapp_from_uri(
+                &format!("{base_url}/miniapps/fabushi_bot/fabushi"),
+                Some(bot_cid),
+                MiniAppLaunchMode::InlineKeyboard,
+                cx,
+            ));
+        });
+        let s = shell.read(cx);
+        assert!(!s.miniapps.is_miniapp_minimized);
+        let ov = s.miniapps.miniapp_overlay.as_ref().unwrap().read(cx);
+        assert!(ov.is_open);
+        assert!(!ov.is_floating_pip);
+        assert!(!ov.is_loading);
+
+        let launch_count = recorded_http
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/api/v1/miniapps/fabushi_bot/fabushi/launch")
+            .count();
+        assert_eq!(
+            launch_count, 1,
+            "restoring running miniapp must NOT send a duplicate /launch request"
+        );
+    })
+    .expect("http url uri restores running miniapp");
+
+    // 5. Explicit reload (`reload_miniapp_with_url`) MUST still trigger a fresh /launch request
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            s.reload_miniapp_with_url(
+                "fabushi_bot",
+                "fabushi",
+                Some(bot_cid),
+                MiniAppLaunchMode::DirectLink,
+                None,
+                None,
+                cx,
+            );
+        });
+    })
+    .expect("explicit reload");
+
+    for _ in 0..50 {
+        app.background_executor()
+            .timer(std::time::Duration::from_millis(20))
+            .await;
+        let launch_count = recorded_http
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/api/v1/miniapps/fabushi_bot/fabushi/launch")
+            .count();
+        if launch_count >= 2 {
+            break;
+        }
+    }
+
+    app.update(|cx| {
+        let _ = shell.read(cx);
+        let launch_count = recorded_http
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/api/v1/miniapps/fabushi_bot/fabushi/launch")
+            .count();
+        assert_eq!(launch_count, 2, "explicit reload must invoke /launch");
+    })
+    .expect("assert explicit reload count");
 }
 

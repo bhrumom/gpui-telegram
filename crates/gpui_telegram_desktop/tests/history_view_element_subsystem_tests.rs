@@ -372,7 +372,6 @@ fn test_bottom_info_flags_and_time_format() {
     assert!(flags.contains(BottomInfoFlags::EDITED));
     assert!(!flags.contains(BottomInfoFlags::SILENT));
 
-    // Timestamp 1700000000: 1700000000 % 86400 = 80000 -> 80000 / 3600 = 22, 80000 % 3600 = 800 -> 800 / 60 = 13 -> "22:13"
     let info = BottomInfoData {
         date: 1700000000,
         edited_date: Some(1700000100),
@@ -382,7 +381,12 @@ fn test_bottom_info_flags_and_time_format() {
         replies: Some(3),
         forwards_count: Some(1),
     };
-    assert_eq!(info.format_time_string(), "22:13");
+    let expected = chrono::DateTime::from_timestamp(1700000000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string();
+    assert_eq!(info.format_time_string(), expected);
 }
 
 #[test]

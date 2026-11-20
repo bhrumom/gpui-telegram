@@ -219,6 +219,7 @@ pub struct BotAttachWebView {
     pub last_webmcp_state_summary: Option<serde_json::Value>,
     pub pending_webmcp_queue: VecDeque<MiniAppWebMcpCommand>,
     pub webmcp_page_ready: bool,
+    pub(crate) launching_short_name: String,
     #[cfg(target_os = "macos")]
     pub(crate) macos_webview: Option<MacOsWkWebView>,
     #[cfg(target_os = "macos")]
@@ -277,6 +278,7 @@ impl BotAttachWebView {
             last_webmcp_state_summary: None,
             pending_webmcp_queue: VecDeque::new(),
             webmcp_page_ready: false,
+            launching_short_name: String::new(),
             #[cfg(target_os = "macos")]
             macos_webview: None,
             #[cfg(target_os = "macos")]
@@ -355,6 +357,7 @@ impl BotAttachWebView {
             Some(ctx.app.app_id.clone())
         };
         self.bot_username = ctx.app.bot_username.clone();
+        self.launching_short_name = ctx.app.short_name.clone();
         self.companion_chat_id = Some(ctx.companion_chat_id);
         self.source_chat_id = ctx.source_chat_id;
         self.ui_schema = ctx.app.ui_schema.clone();
@@ -389,6 +392,7 @@ impl BotAttachWebView {
         self.active_bot = None;
         self.url.clear();
         self.app_id = None;
+        self.launching_short_name.clear();
         self.menu_open = false;
         self.confirm_close_open = false;
         self.write_access_prompt_open = false;
@@ -557,6 +561,10 @@ impl BotAttachWebView {
             .map(|b| b.short_name.clone())
             .filter(|s| !s.is_empty())
             .or_else(|| self.launch_context.as_ref().map(|c| c.app.short_name.clone()))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                (!self.launching_short_name.is_empty()).then(|| self.launching_short_name.clone())
+            })
             .unwrap_or_else(|| "app".to_string())
     }
 
@@ -1142,6 +1150,50 @@ impl BotAttachWebView {
             "__gpui_webmcp_page_ready" | "web_app_ready" | "iframe_ready" => {
                 self.webmcp_page_ready = true;
                 self.flush_pending_webmcp_queue();
+            }
+            "webmcp_state_update" => {
+                let summary = parsed.get("state_summary").cloned().unwrap_or(parsed);
+                if summary.is_object() {
+                    self.last_webmcp_state_summary = Some(summary);
+                } else if let Some(s) = summary.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    self.last_webmcp_state_summary = Some(serde_json::json!({ "status_text": s }));
+                }
+            }
+            "web_app_cloud_storage_set" => {
+                if let Some(key) = parsed
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let value = parsed
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.pending_actions
+                        .push_back(BotWebViewPendingAction::CloudStorageSet {
+                            bot_username: self.bot_username.clone(),
+                            short_name: self.current_short_name(),
+                            key: key.to_string(),
+                            value,
+                        });
+                }
+            }
+            "web_app_cloud_storage_delete" => {
+                if let Some(key) = parsed
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    self.pending_actions
+                        .push_back(BotWebViewPendingAction::CloudStorageDelete {
+                            bot_username: self.bot_username.clone(),
+                            short_name: self.current_short_name(),
+                            key: key.to_string(),
+                        });
+                }
             }
             "webmcp_response" => {
                 if let Ok(resp) = serde_json::from_str::<MiniAppWebMcpResponse>(event_data) {

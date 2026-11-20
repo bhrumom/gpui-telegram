@@ -315,12 +315,6 @@ impl AppState {
                 }
             }
         }
-        if let Err(e) = db.pool().with_conn(|conn| {
-            fabushi_miniapp::storage::init_fabushi_tables(conn)
-                .map_err(|err| gpui_telegram_core::error::TelegramError::Database(err.to_string()))
-        }) {
-            tracing::warn!(error = %e, "Failed to initialize fabushi_miniapp tables");
-        }
         let _ = db.seed_default_catalog_if_empty();
         let _ = db.seed_botfather_and_flagship_apps();
         let _ = ensure_default_ai_bot(&db);
@@ -1188,63 +1182,6 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route(
             "/miniapps/{bot_username}/{short_name}",
             get(routes::bots_miniapps::serve_miniapp_html),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/app.wasm",
-            get(routes::fabushi_miniapp_api::serve_app_wasm),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/assets/{*name}",
-            get(routes::fabushi_miniapp_api::serve_asset),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/bootstrap",
-            get(routes::fabushi_miniapp_api::bootstrap),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/transfer",
-            post(routes::fabushi_miniapp_api::record_transfer_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/practice/session",
-            post(routes::fabushi_miniapp_api::practice_session_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/practice/record",
-            get(routes::fabushi_miniapp_api::list_practice_records_handler)
-                .post(routes::fabushi_miniapp_api::create_practice_record_handler)
-                .put(routes::fabushi_miniapp_api::update_practice_record_body),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/practice/record/{id}",
-            put(routes::fabushi_miniapp_api::update_practice_record_by_id)
-                .delete(routes::fabushi_miniapp_api::delete_practice_record_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/profile",
-            get(routes::fabushi_miniapp_api::get_profile_handler)
-                .put(routes::fabushi_miniapp_api::update_profile_handler)
-                .post(routes::fabushi_miniapp_api::update_profile_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/membership",
-            post(routes::fabushi_miniapp_api::activate_membership_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/follow",
-            post(routes::fabushi_miniapp_api::follow_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/leaderboard",
-            get(routes::fabushi_miniapp_api::leaderboard_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/heartbeat",
-            post(routes::fabushi_miniapp_api::heartbeat_handler),
-        )
-        .route(
-            "/api/v1/fabushi-miniapp/ai-chat",
-            post(routes::fabushi_miniapp_api::ai_chat_handler),
         )
         .route(
             "/js/telegram-web-app.js",
