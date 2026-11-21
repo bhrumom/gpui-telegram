@@ -203,6 +203,19 @@ impl TelegramClient {
         self.send_ws_frame(WsClientFrame::MiniAppTakeoverState(evt))
     }
 
+    pub fn send_coding_host_event(
+        &self,
+        ev: gpui_telegram_proto::CodingHostEvent,
+    ) -> gpui_telegram_core::error::Result<()> {
+        if self.send_ws_frame(WsClientFrame::CodingHostEvent(ev)) {
+            Ok(())
+        } else {
+            Err(gpui_telegram_core::error::TelegramError::Network(
+                "WebSocket outbound channel is not connected".to_string(),
+            ))
+        }
+    }
+
     pub async fn get_chat_messages(
         &self,
         chat_id: u64,
@@ -375,5 +388,49 @@ impl TelegramClient {
             results.push(self.sync_chat_difference(cid, limit).await?);
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::TelegramClient;
+    use gpui_telegram_proto::{CodingHostEvent, CodingProviderKind, DetectedCodingProvider, WsClientFrame};
+
+    #[test]
+    fn send_coding_host_event_forwards_ws_frame_when_connected() {
+        let client = TelegramClient::new_with_url("http://127.0.0.1:0".to_string());
+        let ev = CodingHostEvent::HostRegister {
+            device_id: "dev-mac-1".to_string(),
+            display_name: "MacBook Pro".to_string(),
+            os_name: "macos".to_string(),
+            providers: vec![DetectedCodingProvider {
+                kind: CodingProviderKind::ClaudeCode,
+                display_name: "Claude Code".to_string(),
+                binary_path: Some("/usr/local/bin/claude".to_string()),
+                version: Some("1.0.2".to_string()),
+                installed: true,
+                recommended_username: "ClaudeCodeBot".to_string(),
+                supports_acp: true,
+                login_hint: String::new(),
+            }],
+        };
+
+        assert!(
+            client.send_coding_host_event(ev.clone()).is_err(),
+            "disconnected ws channel must return error"
+        );
+
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.ws_channel.attach_channels(out_tx, in_rx);
+
+        client
+            .send_coding_host_event(ev.clone())
+            .expect("connected ws channel must send CodingHostEvent");
+
+        match out_rx.try_recv().expect("expected outbound ws frame") {
+            WsClientFrame::CodingHostEvent(sent) => assert_eq!(sent, ev),
+            other => panic!("expected WsClientFrame::CodingHostEvent, got {other:?}"),
+        }
     }
 }

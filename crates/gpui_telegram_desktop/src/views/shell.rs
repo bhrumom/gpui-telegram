@@ -4,9 +4,9 @@
 //! Sidebar + Stage/Composer + Inspector, lazy `SettingsRouter`, and `shell_overlays_render` overlays.
 
 pub use crate::views::app_shell::shell_state::{
-    reconcile_stage_message_list, should_switch_to_chats_on_sidebar_selection, ShellComputersState,
-    ShellMiniAppState, ShellOverlayState, ShellRtcTalkState, ShellSessionSyncState,
-    ShellThemeVisualState,
+    reconcile_stage_message_list, should_switch_to_chats_on_sidebar_selection,
+    ShellCodingHostState, ShellComputersState, ShellMiniAppState, ShellOverlayState,
+    ShellRtcTalkState, ShellSessionSyncState, ShellThemeVisualState,
 };
 pub use crate::views::app_shell::shell_truth::*;
 pub use crate::views::auth::{
@@ -112,6 +112,7 @@ pub struct AppShell {
     pub rtc_talk: ShellRtcTalkState,
     pub overlays: ShellOverlayState,
     pub computers: ShellComputersState,
+    pub coding_host: ShellCodingHostState,
     pub magpie_local: ShellMagpieLocalState,
     pub bot_browser: ShellBotBrowserState,
     pub theme_state: ShellThemeVisualState,
@@ -219,6 +220,7 @@ impl AppShell {
             rtc_talk: ShellRtcTalkState::new(),
             overlays: ShellOverlayState::new(),
             computers: ShellComputersState::new(),
+            coding_host: ShellCodingHostState::new(),
             magpie_local: ShellMagpieLocalState::new(),
             bot_browser: ShellBotBrowserState::new(),
             theme_state: init_theme_state,
@@ -355,6 +357,18 @@ impl AppShell {
         self.refresh_tasks_and_mcp(cx);
         self.refresh_hermes_commands(cx);
         self.register_current_host_and_start_relay(cx);
+        if let Some(prev_rt) = self.coding_host.runtime.as_ref() {
+            if prev_rt.owner_user_id() != auth.user_id {
+                if let Some(old_rt) = self.coding_host.reset_on_logout() {
+                    self.client.runtime().spawn(async move {
+                        old_rt.shutdown().await;
+                    });
+                }
+            }
+        }
+        self.coding_host.registered_for_auth_gen = None;
+        self.ensure_coding_host_runtime(cx);
+        self.announce_coding_host_to_server(cx);
         self.bootstrap_local_bot_browser_and_vault_with_auth(vault_bootstrap, cx);
 
         let _ = ClientConfig::save_session(&StoredSession {
@@ -384,6 +398,11 @@ impl AppShell {
         self.overlays.clear_overlays();
         self.miniapps.reset();
         self.computers.reset_on_logout();
+        if let Some(coding_rt) = self.coding_host.reset_on_logout() {
+            client.runtime().spawn(async move {
+                coding_rt.shutdown().await;
+            });
+        }
         self.bot_browser.reset_on_logout();
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);

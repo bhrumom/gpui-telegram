@@ -31,6 +31,7 @@ pub mod session;
 pub mod shell_actions;
 pub mod shell_bot_browser;
 pub mod shell_calls_rtc;
+pub mod shell_coding_host;
 pub mod shell_composer_actions;
 pub mod shell_computers_sync;
 pub mod shell_dialogs_fetch;
@@ -129,9 +130,9 @@ pub use shell_panels::{
     ShellMcpToolRow, ShellPanelState,
 };
 pub use shell_state::{
-    reconcile_stage_message_list, should_switch_to_chats_on_sidebar_selection, ShellComputersState,
-    ShellMiniAppState, ShellOverlayState, ShellRtcTalkState, ShellSessionSyncState,
-    ShellThemeVisualState,
+    reconcile_stage_message_list, should_switch_to_chats_on_sidebar_selection,
+    ShellCodingHostState, ShellComputersState, ShellMiniAppState, ShellOverlayState,
+    ShellRtcTalkState, ShellSessionSyncState, ShellThemeVisualState,
 };
 pub use shell_theme::{
     compute_shell_palette, propagate_theme_and_locale, resolve_mode_from_preferences,

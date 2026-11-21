@@ -82,6 +82,8 @@ pub enum BotConfigFocusField {
     None,
     Persona,
     Model,
+    CodingWorkspace,
+    CodingModel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

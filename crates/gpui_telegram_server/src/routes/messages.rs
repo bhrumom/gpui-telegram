@@ -4,7 +4,7 @@ use crate::routes::{broadcast_chat_pts, check_active_membership, err_resp, map_t
 use crate::search::schema::SearchDocument;
 use crate::server::{
     detect_target_bots_in_chat, extract_message_content_text,
-    maybe_trigger_bot_reply_with_reply_to, AppState, AuthBearer,
+    maybe_trigger_bot_reply_with_context, AppState, AuthBearer,
 };
 use axum::{body::Bytes, extract::{Path, Query, State}, http::StatusCode, response::{IntoResponse, Json, Response}};
 use chrono::{DateTime, Utc};
@@ -370,12 +370,13 @@ pub async fn send_for_chat(state: &Arc<AppState>, auth_user: UserId, chat_id_raw
                     let tp = text_preview.clone();
                     tokio::spawn(async move {
                         if let Some(state_bg) = weak_state.upgrade() {
-                            maybe_trigger_bot_reply_with_reply_to(
+                            maybe_trigger_bot_reply_with_context(
                                 &state_bg,
                                 chat_id,
                                 auth_user,
                                 &tp,
                                 reply_to,
+                                topic_id,
                             )
                             .await;
                         }

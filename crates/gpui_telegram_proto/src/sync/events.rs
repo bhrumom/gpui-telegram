@@ -182,4 +182,5 @@ pub enum UpdateEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active_tool: Option<String>,
     },
+    CodingHostCommand(crate::coding_agent_contracts::CodingHostCommand),
 }

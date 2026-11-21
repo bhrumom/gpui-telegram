@@ -54,6 +54,14 @@ pub struct ContextInspector {
     pub persona_input: Option<Entity<TextInputController>>,
     pub model_input: Option<Entity<TextInputController>>,
     pub active_fabushi_bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>,
+    pub coding_draft_bot_id: i64,
+    pub coding_draft_workspace: String,
+    pub coding_draft_use_worktree: bool,
+    pub coding_draft_permission_mode: gpui_telegram_proto::CodingPermissionMode,
+    pub coding_draft_allow_group_members: bool,
+    pub coding_draft_model_override: String,
+    pub coding_workspace_input: Option<Entity<TextInputController>>,
+    pub coding_model_input: Option<Entity<TextInputController>>,
 }
 
 impl ContextInspector {
@@ -89,6 +97,14 @@ impl ContextInspector {
             persona_input: None,
             model_input: None,
             active_fabushi_bot: None,
+            coding_draft_bot_id: 0,
+            coding_draft_workspace: String::new(),
+            coding_draft_use_worktree: false,
+            coding_draft_permission_mode: gpui_telegram_proto::CodingPermissionMode::Ask,
+            coding_draft_allow_group_members: false,
+            coding_draft_model_override: String::new(),
+            coding_workspace_input: None,
+            coding_model_input: None,
         }
     }
 
@@ -178,6 +194,12 @@ impl ContextInspector {
         self.bot_draft_allow_cross_device = true;
         self.bot_draft_allow_cloud_self_config = true;
         self.active_fabushi_bot = None;
+        self.coding_draft_bot_id = 0;
+        self.coding_draft_workspace.clear();
+        self.coding_draft_use_worktree = false;
+        self.coding_draft_permission_mode = gpui_telegram_proto::CodingPermissionMode::Ask;
+        self.coding_draft_allow_group_members = false;
+        self.coding_draft_model_override.clear();
     }
 
     pub fn clear_peer(&mut self) { self.is_open = false; self.active_tab = InspectorTab::Profile; self.clear_peer_facts(); }
@@ -185,7 +207,63 @@ impl ContextInspector {
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) { self.palette = palette; }
     pub fn set_language(&mut self, lang: impl Into<String>) { self.language_id = lang.into(); }
     pub fn take_action(&mut self) -> Option<InspectorAction> { self.pending_action.take() }
-    pub fn set_active_fabushi_bot(&mut self, bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>) { self.active_fabushi_bot = bot; }
+    pub fn set_active_fabushi_bot(&mut self, bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>) {
+        self.active_fabushi_bot = bot.clone();
+        let editing_coding = self.subpage == InspectorSubpage::Main
+            && matches!(
+                self.bot_config_focus,
+                BotConfigFocusField::CodingWorkspace | BotConfigFocusField::CodingModel
+            );
+        if let Some(ref b) = bot {
+            if let Some(ref cfg) = b.coding_agent {
+                if self.coding_draft_bot_id != b.bot_user_id || !editing_coding {
+                    self.coding_draft_bot_id = b.bot_user_id;
+                    self.coding_draft_workspace = cfg.workspace_path.clone();
+                    self.coding_draft_use_worktree = cfg.use_worktree;
+                    self.coding_draft_permission_mode = cfg.permission_mode;
+                    self.coding_draft_allow_group_members = cfg.allow_group_members;
+                    self.coding_draft_model_override =
+                        cfg.model_override.clone().unwrap_or_default();
+                }
+                return;
+            }
+        }
+        self.coding_draft_bot_id = 0;
+    }
+
+    /// Commits the current Coding Agent inspector draft fields into `InspectorAction::PatchFabushiBot`.
+    pub fn save_coding_agent_config_action(&mut self) -> bool {
+        let Some(ref fab) = self.active_fabushi_bot else {
+            return false;
+        };
+        let Some(mut next_cfg) = fab.coding_agent.clone() else {
+            return false;
+        };
+        let target_bot_id = fab.bot_user_id.max(0) as u64;
+        if target_bot_id == 0 {
+            return false;
+        }
+        self.bot_config_focus = BotConfigFocusField::None;
+        let ws = self.coding_draft_workspace.trim().to_string();
+        if !ws.is_empty() {
+            next_cfg.workspace_path = ws;
+        }
+        next_cfg.use_worktree = self.coding_draft_use_worktree;
+        next_cfg.permission_mode = self.coding_draft_permission_mode;
+        next_cfg.allow_group_members = self.coding_draft_allow_group_members;
+        let model_trimmed = self.coding_draft_model_override.trim().to_string();
+        next_cfg.model_override = (!model_trimmed.is_empty()).then_some(model_trimmed);
+        let preferred_model = next_cfg.model_override.clone();
+        self.pending_action = Some(InspectorAction::PatchFabushiBot {
+            bot_id: target_bot_id,
+            req: gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
+                preferred_model,
+                coding_agent: Some(next_cfg),
+                ..Default::default()
+            },
+        });
+        true
+    }
     pub fn set_tab(&mut self, tab: InspectorTab) { self.active_tab = tab; }
     pub fn toggle_open(&mut self) { self.is_open = !self.is_open; }
     pub fn open(&mut self) { self.is_open = true; }
@@ -283,6 +361,12 @@ impl ContextInspector {
         if self.model_input.is_none() {
             self.model_input = Some(cx.new(|_| TextInputController::new()));
         }
+        if self.coding_workspace_input.is_none() {
+            self.coding_workspace_input = Some(cx.new(|_| TextInputController::new()));
+        }
+        if self.coding_model_input.is_none() {
+            self.coding_model_input = Some(cx.new(|_| TextInputController::new()));
+        }
     }
 
     pub fn sync_computers(&mut self, computers: Vec<ComputerNodeDto>) {
@@ -336,14 +420,24 @@ impl ContextInspector {
         self.is_open
             && self.active_tab == InspectorTab::Profile
             && self.profile.is_bot
-            && self.subpage == InspectorSubpage::BotConfigEditor
-            && self.bot_config_focus != BotConfigFocusField::None
+            && ((self.subpage == InspectorSubpage::BotConfigEditor
+                && matches!(
+                    self.bot_config_focus,
+                    BotConfigFocusField::Persona | BotConfigFocusField::Model
+                ))
+                || (self.subpage == InspectorSubpage::Main
+                    && matches!(
+                        self.bot_config_focus,
+                        BotConfigFocusField::CodingWorkspace | BotConfigFocusField::CodingModel
+                    )))
     }
 
     fn active_bot_controller(&self) -> Option<&Entity<TextInputController>> {
         match self.bot_config_focus {
             BotConfigFocusField::Persona => self.persona_input.as_ref(),
             BotConfigFocusField::Model => self.model_input.as_ref(),
+            BotConfigFocusField::CodingWorkspace => self.coding_workspace_input.as_ref(),
+            BotConfigFocusField::CodingModel => self.coding_model_input.as_ref(),
             BotConfigFocusField::None => None,
         }
     }
@@ -352,6 +446,8 @@ impl ContextInspector {
         match self.bot_config_focus {
             BotConfigFocusField::Persona => &self.bot_draft_persona,
             BotConfigFocusField::Model => &self.bot_draft_model,
+            BotConfigFocusField::CodingWorkspace => &self.coding_draft_workspace,
+            BotConfigFocusField::CodingModel => &self.coding_draft_model_override,
             BotConfigFocusField::None => "",
         }
     }
@@ -360,6 +456,8 @@ impl ContextInspector {
         match self.bot_config_focus {
             BotConfigFocusField::Persona => Some(&mut self.bot_draft_persona),
             BotConfigFocusField::Model => Some(&mut self.bot_draft_model),
+            BotConfigFocusField::CodingWorkspace => Some(&mut self.coding_draft_workspace),
+            BotConfigFocusField::CodingModel => Some(&mut self.coding_draft_model_override),
             BotConfigFocusField::None => None,
         }
     }
@@ -430,6 +528,8 @@ impl ContextInspector {
                 self.bot_config_focus = match self.bot_config_focus {
                     BotConfigFocusField::Persona => BotConfigFocusField::Model,
                     BotConfigFocusField::Model => BotConfigFocusField::Persona,
+                    BotConfigFocusField::CodingWorkspace => BotConfigFocusField::CodingModel,
+                    BotConfigFocusField::CodingModel => BotConfigFocusField::CodingWorkspace,
                     BotConfigFocusField::None => BotConfigFocusField::None,
                 };
                 cx.notify();
@@ -509,7 +609,15 @@ impl Render for ContextInspector {
         } else {
             InspectorSubpage::Main
         };
-        if is_bot_profile_tab && subpage == InspectorSubpage::BotConfigEditor {
+        if is_bot_profile_tab
+            && (subpage == InspectorSubpage::BotConfigEditor
+                || (subpage == InspectorSubpage::Main
+                    && self
+                        .active_fabushi_bot
+                        .as_ref()
+                        .and_then(|b| b.coding_agent.as_ref())
+                        .is_some()))
+        {
             self.ensure_bot_inputs(cx);
         }
         let lang = self.language_id.as_str();

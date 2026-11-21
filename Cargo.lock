@@ -3393,6 +3393,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_telegram_coding"
+version = "1.4.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "gpui_telegram_proto",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "gpui_telegram_core"
 version = "1.4.0"
 dependencies = [
@@ -3425,6 +3444,7 @@ dependencies = [
  "gpui",
  "gpui_telegram_agent",
  "gpui_telegram_client",
+ "gpui_telegram_coding",
  "gpui_telegram_core",
  "gpui_telegram_media",
  "gpui_telegram_proto",

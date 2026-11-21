@@ -1,10 +1,12 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_proto::miniapp_contracts::{
-    CLASSIC_INITIALS_AVATAR_SHAPE, GROK_AVATAR_SHAPES, PatchFabushiBotRequest,
+    FabushiBotSummaryDto, CLASSIC_INITIALS_AVATAR_SHAPE, GROK_AVATAR_SHAPES,
+    PatchFabushiBotRequest,
 };
 use gpui_telegram_proto::{
-    BotComputerProfileDto, ComputerNodeDto, ComputerNodeKind, ComputerRunPolicy,
+    BotComputerProfileDto, CodingAgentBotConfig, CodingPermissionMode, ComputerNodeDto,
+    ComputerNodeKind, ComputerRunPolicy,
 };
 
 use crate::components::grok_bot_avatar::{
@@ -807,6 +809,7 @@ fn render_owner_fabushi_and_computer_cards(
                                     bot_id: target_bot_id,
                                     req: PatchFabushiBotRequest {
                                         avatar_shape: Some(shape_owned.clone()),
+                                        coding_agent: None,
                                         ..Default::default()
                                     },
                                 });
@@ -869,6 +872,7 @@ fn render_owner_fabushi_and_computer_cards(
                                 bot_id: target_bot_id,
                                 req: PatchFabushiBotRequest {
                                     avatar_shape: Some(CLASSIC_INITIALS_AVATAR_SHAPE.to_string()),
+                                    coding_agent: None,
                                     ..Default::default()
                                 },
                             });
@@ -907,6 +911,7 @@ fn render_owner_fabushi_and_computer_cards(
                                     bot_id: target_bot_id,
                                     req: PatchFabushiBotRequest {
                                         avatar_color: Some(color_id.clone()),
+                                        coding_agent: None,
                                         ..Default::default()
                                     },
                                 });
@@ -944,6 +949,7 @@ fn render_owner_fabushi_and_computer_cards(
                                     bot_id: target_bot_id,
                                     req: PatchFabushiBotRequest {
                                         thinking_level: Some(lvl_owned.clone()),
+                                        coding_agent: None,
                                         ..Default::default()
                                     },
                                 });
@@ -982,6 +988,7 @@ fn render_owner_fabushi_and_computer_cards(
                                     bot_id: target_bot_id,
                                     req: PatchFabushiBotRequest {
                                         approval_mode: Some(mode_owned.clone()),
+                                        coding_agent: None,
                                         ..Default::default()
                                     },
                                 });
@@ -1069,6 +1076,16 @@ fn render_owner_fabushi_and_computer_cards(
                     )
                     .child(approval_row),
             )
+            .when_some(fab.coding_agent.clone(), |col, coding_cfg| {
+                col.child(render_coding_agent_inspector_card(
+                    &fab,
+                    &coding_cfg,
+                    inspector,
+                    pal,
+                    lang,
+                    cx,
+                ))
+            })
         })
         .child(
             div()
@@ -2309,4 +2326,284 @@ fn bot_toggle_row(
                 .when(!enabled, |el| el.justify_start())
                 .child(div().w(px(12.0)).h(px(12.0)).rounded_full().bg(rgb(0xFFFFFF))),
         )
+}
+
+fn render_coding_agent_inspector_card(
+    _fab: &FabushiBotSummaryDto,
+    coding_cfg: &CodingAgentBotConfig,
+    inspector: &ContextInspector,
+    pal: TdesktopThemePalette,
+    lang: &str,
+    cx: &mut Context<ContextInspector>,
+) -> AnyElement {
+    let provider_label = coding_cfg.provider_kind.display_name();
+    let supports_acp = coding_cfg.provider_kind.supports_acp();
+    let (ws_text, ws_preedit) = inspector
+        .coding_workspace_input
+        .as_ref()
+        .map(|c| {
+            c.read(cx)
+                .text_and_preedit(inspector.coding_draft_workspace.clone())
+        })
+        .unwrap_or_else(|| (inspector.coding_draft_workspace.clone(), None));
+    let (model_text, model_preedit) = inspector
+        .coding_model_input
+        .as_ref()
+        .map(|c| {
+            c.read(cx)
+                .text_and_preedit(inspector.coding_draft_model_override.clone())
+        })
+        .unwrap_or_else(|| (inspector.coding_draft_model_override.clone(), None));
+
+    let perm_choices = [
+        CodingPermissionMode::Ask,
+        CodingPermissionMode::AutoEdit,
+        CodingPermissionMode::FullAccess,
+    ];
+    let perm_row = div().flex().flex_wrap().gap(px(5.0)).children(
+        perm_choices.into_iter().enumerate().map(|(idx, mode)| {
+            let selected = inspector.coding_draft_permission_mode == mode;
+            let label = if lang.starts_with("zh") {
+                mode.label_zh()
+            } else {
+                mode.label_en()
+            };
+            div()
+                .id(SharedString::from(format!("coding-insp-perm-{idx}")))
+                .cursor_pointer()
+                .px(px(7.0))
+                .py(px(3.0))
+                .rounded(px(999.0))
+                .bg(if selected {
+                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16)
+                } else {
+                    rgb(pal.input_bg).into()
+                })
+                .border_1()
+                .border_color(rgb(if selected { pal.accent } else { pal.border_fg }))
+                .text_size(px(10.5))
+                .font_weight(if selected {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(rgb(if selected {
+                    pal.accent
+                } else {
+                    pal.text_primary
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.coding_draft_permission_mode = mode;
+                        cx.notify();
+                    }),
+                )
+                .child(label)
+        }),
+    );
+
+    div()
+        .id("coding-agent-inspector-card")
+        .w_full()
+        .p(px(12.0))
+        .rounded(px(14.0))
+        .bg(rgb(pal.card_bg))
+        .border_1()
+        .border_color(rgb(pal.border_fg))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(pal.text_primary))
+                        .child(tr_str(lang, "Coding Agent 配置", "Coding Agent Config")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .px(px(7.0))
+                                .py(px(2.0))
+                                .rounded(px(999.0))
+                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(pal.accent))
+                                .child(provider_label),
+                        )
+                        .when(supports_acp, |row| {
+                            row.child(
+                                div()
+                                    .px(px(5.0))
+                                    .py(px(2.0))
+                                    .rounded(px(999.0))
+                                    .bg(rgb(pal.input_bg))
+                                    .text_size(px(9.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child("ACP"),
+                            )
+                        }),
+                ),
+        )
+        .when_some(coding_cfg.bound_device_id.clone(), |col, dev_id| {
+            col.child(config_summary_row(
+                tr_str(lang, "绑定主机", "Bound Host"),
+                &dev_id,
+                pal,
+            ))
+        })
+        .child(
+            div()
+                .text_size(px(10.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(pal.text_secondary))
+                .child(tr_str(lang, "工作区路径", "Workspace Path")),
+        )
+        .child(
+            div()
+                .id("coding-insp-workspace-box")
+                .cursor_text()
+                .min_h(px(32.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(8.0))
+                .bg(rgb(pal.input_bg))
+                .border_1()
+                .border_color(rgb(
+                    if inspector.bot_config_focus == BotConfigFocusField::CodingWorkspace {
+                        pal.accent
+                    } else {
+                        pal.border_fg
+                    },
+                ))
+                .flex()
+                .items_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.ensure_bot_inputs(cx);
+                        this.bot_config_focus = BotConfigFocusField::CodingWorkspace;
+                        cx.notify();
+                    }),
+                )
+                .child(render_ime_text_preview(
+                    &ws_text,
+                    ws_preedit.as_deref(),
+                    "/path/to/repo",
+                    inspector.bot_config_focus == BotConfigFocusField::CodingWorkspace,
+                    false,
+                    pal.text_primary,
+                    pal,
+                )),
+        )
+        .child(bot_toggle_row(
+            "coding-insp-worktree-toggle",
+            tr_str(lang, "Git Worktree 隔离", "Git Worktree Isolation"),
+            inspector.coding_draft_use_worktree,
+            pal,
+            cx.listener(|this, _, _, cx| {
+                this.coding_draft_use_worktree = !this.coding_draft_use_worktree;
+                cx.notify();
+            }),
+        ))
+        .child(
+            div()
+                .text_size(px(10.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(pal.text_secondary))
+                .child(tr_str(lang, "权限模式", "Permission Mode")),
+        )
+        .child(perm_row)
+        .child(bot_toggle_row(
+            "coding-insp-group-toggle",
+            tr_str(lang, "允许群成员触发", "Allow Group Members"),
+            inspector.coding_draft_allow_group_members,
+            pal,
+            cx.listener(|this, _, _, cx| {
+                this.coding_draft_allow_group_members = !this.coding_draft_allow_group_members;
+                cx.notify();
+            }),
+        ))
+        .child(
+            div()
+                .text_size(px(10.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(pal.text_secondary))
+                .child(tr_str(lang, "模型覆盖（可选）", "Model Override (optional)")),
+        )
+        .child(
+            div()
+                .id("coding-insp-model-box")
+                .cursor_text()
+                .min_h(px(32.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(8.0))
+                .bg(rgb(pal.input_bg))
+                .border_1()
+                .border_color(rgb(
+                    if inspector.bot_config_focus == BotConfigFocusField::CodingModel {
+                        pal.accent
+                    } else {
+                        pal.border_fg
+                    },
+                ))
+                .flex()
+                .items_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.ensure_bot_inputs(cx);
+                        this.bot_config_focus = BotConfigFocusField::CodingModel;
+                        cx.notify();
+                    }),
+                )
+                .child(render_ime_text_preview(
+                    &model_text,
+                    model_preedit.as_deref(),
+                    tr_str(lang, "默认模型", "Provider default"),
+                    inspector.bot_config_focus == BotConfigFocusField::CodingModel,
+                    false,
+                    pal.text_primary,
+                    pal,
+                )),
+        )
+        .child(
+            div()
+                .id("coding-insp-save-btn")
+                .cursor_pointer()
+                .w_full()
+                .h(px(34.0))
+                .rounded(px(9.0))
+                .bg(rgb(pal.accent))
+                .hover(|s| s.bg(rgb(pal.accent_hover)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(pal.active_button_fg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.save_coding_agent_config_action();
+                        cx.notify();
+                    }),
+                )
+                .child(tr_str(lang, "保存 Coding Agent 配置", "Save Coding Agent Config")),
+        )
+        .into_any_element()
 }

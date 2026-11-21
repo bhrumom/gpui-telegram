@@ -17,7 +17,11 @@ use gpui_telegram_agent::fabushi_bot::{
     FabushiBotHost, FabushiBotInstance, FabushiBotPatch, FabushiBotProvisionSpec,
 };
 use gpui_telegram_agent::hermes::memory::MemoryTarget;
-use gpui_telegram_core::types::{ChatId, MsgId, PeerId, UserId};
+use gpui_telegram_core::types::{ChatId, MsgId, PeerId, TopicId, UserId};
+use gpui_telegram_proto::coding_agent_contracts::{
+    CodingAgentBotConfig, CodingApprovalDecision, CodingControlAction, CodingHostEvent,
+    CodingPermissionMode,
+};
 use gpui_telegram_proto::message::{InlineKeyboardButton, MessageContent, MessageItem};
 use gpui_telegram_proto::miniapp_contracts::{
     derive_safe_agent_id, normalize_fabushi_avatar_color, normalize_fabushi_avatar_shape,
@@ -111,6 +115,7 @@ pub fn bot_record_to_entry(bot: &BotRegistryRecord) -> BotRegistryEntry {
         allows_write_to_pm: false,
         app_tos_accepted: false,
         is_blocked_by_viewer: false,
+        coding_agent: bot.coding_agent_config(),
     }
 }
 
@@ -363,6 +368,7 @@ pub(crate) fn build_fabushi_bot_summary(
         skills_count,
         execution_state,
         companion_chat_id,
+        coding_agent: bot.coding_agent_config(),
     }
 }
 
@@ -2550,6 +2556,17 @@ pub fn send_bot_chat_reply(
     text: &str,
     kb_rows: Vec<Vec<InlineKeyboardButton>>,
 ) -> gpui_telegram_core::error::Result<MsgId> {
+    send_bot_chat_reply_in_topic(state, chat_id, bot_user_id, text, kb_rows, None)
+}
+
+pub fn send_bot_chat_reply_in_topic(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    bot_user_id: UserId,
+    text: &str,
+    kb_rows: Vec<Vec<InlineKeyboardButton>>,
+    topic_id: Option<TopicId>,
+) -> gpui_telegram_core::error::Result<MsgId> {
     let mut bot_msg = MessageItem::new(
         MsgId(0),
         chat_id,
@@ -2557,6 +2574,7 @@ pub fn send_bot_chat_reply(
         PeerId::Chat(chat_id),
         MessageContent::plain_text(text.trim()),
     );
+    bot_msg.topic_id = topic_id;
     bot_msg.flags.is_out = false;
     if !kb_rows.is_empty() {
         bot_msg.inline_keyboard = Some(kb_rows.clone());
@@ -2604,16 +2622,20 @@ pub fn ensure_companion_bot_dm_with_welcome(
             let (welcome_text, kb) = if bot_user_id.0 == BOTFATHER_USER_ID {
                 (build_botfather_welcome_text(), build_botfather_welcome_keyboard())
             } else if let Some(reg) = reg_opt {
-                let apps = state
-                    .db
-                    .list_mini_apps_for_bot(bot_user_id.0 as i64)
-                    .unwrap_or_default();
-                build_companion_bot_welcome_text_and_keyboard(
-                    &reg.display_name,
-                    &reg.username,
-                    &reg.description,
-                    &apps,
-                )
+                if let Some(cfg) = reg.coding_agent_config() {
+                    build_coding_agent_status_card_and_kb(state, &reg, &cfg)
+                } else {
+                    let apps = state
+                        .db
+                        .list_mini_apps_for_bot(bot_user_id.0 as i64)
+                        .unwrap_or_default();
+                    build_companion_bot_welcome_text_and_keyboard(
+                        &reg.display_name,
+                        &reg.username,
+                        &reg.description,
+                        &apps,
+                    )
+                }
             } else {
                 let user = state.db.get_user(bot_user_id).ok().flatten();
                 let title = user
@@ -2702,11 +2724,23 @@ pub async fn handle_ai_bot_reply(
     bot_user_id: UserId,
     text: &str,
 ) {
+    handle_ai_bot_reply_in_topic(state, chat_id, sender_id, bot_user_id, text, None).await;
+}
+
+pub async fn handle_ai_bot_reply_in_topic(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    sender_id: UserId,
+    bot_user_id: UserId,
+    text: &str,
+    topic_id: Option<TopicId>,
+) {
+    let _ = state.self_weak.set(Arc::downgrade(state));
     if bot_user_id.0 == BOTFATHER_USER_ID {
         let typing_guard =
             crate::routes::hermes::BotTypingGuard::start(Arc::clone(state), chat_id, bot_user_id);
         let (reply, kb) = handle_botfather_message(state, chat_id, sender_id, text).await;
-        let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &reply, kb);
+        let _ = send_bot_chat_reply_in_topic(state, chat_id, bot_user_id, &reply, kb, topic_id);
         typing_guard.finish();
         return;
     }
@@ -2718,6 +2752,12 @@ pub async fn handle_ai_bot_reply(
         .flatten();
     if reg_bot.as_ref().is_some_and(|b| b.is_standard_bot) {
         return;
+    }
+    if let Some(ref b) = reg_bot {
+        if let Some(cfg) = b.coding_agent_config() {
+            handle_coding_agent_bot_reply(state, chat_id, sender_id, b, cfg, text, topic_id).await;
+            return;
+        }
     }
     let apps = state
         .db
@@ -2836,6 +2876,1659 @@ pub async fn handle_ai_bot_reply(
         },
     )
     .await;
+}
+
+// ============================================================================
+// Coding Agent Bot Lifecycle, Commands, Probe & Callbacks
+// ============================================================================
+
+const CODING_AGENT_OWNER_ONLY_MSG: &str =
+    "🔒 该编程智能体仅限所有者操作（可在 Bot 设置中开启群成员权限）。";
+
+fn coding_agent_bot_commands() -> Vec<BotCommandSpec> {
+    vec![
+        BotCommandSpec {
+            command: "start".into(),
+            description: "查看编程智能体状态与工作区".into(),
+        },
+        BotCommandSpec {
+            command: "workspace".into(),
+            description: "绑定或切换本地项目目录".into(),
+        },
+        BotCommandSpec {
+            command: "worktree".into(),
+            description: "开关或管理 Git Worktree 隔离".into(),
+        },
+        BotCommandSpec {
+            command: "model".into(),
+            description: "查看或切换模型".into(),
+        },
+        BotCommandSpec {
+            command: "mode".into(),
+            description: "切换权限模式 (ask/auto_edit/full_access)".into(),
+        },
+        BotCommandSpec {
+            command: "diff".into(),
+            description: "查看本轮或指定回合的代码变更".into(),
+        },
+        BotCommandSpec {
+            command: "rollback".into(),
+            description: "回滚到指定检查点".into(),
+        },
+        BotCommandSpec {
+            command: "handoff".into(),
+            description: "交接当前上下文给其他 @Bot".into(),
+        },
+        BotCommandSpec {
+            command: "stop".into(),
+            description: "停止当前正在执行的任务".into(),
+        },
+        BotCommandSpec {
+            command: "new".into(),
+            description: "重置会话开启新对话".into(),
+        },
+        BotCommandSpec {
+            command: "status".into(),
+            description: "查看当前运行与主机连接状态".into(),
+        },
+        BotCommandSpec {
+            command: "login".into(),
+            description: "检查本地 CLI 登录授权状态".into(),
+        },
+        BotCommandSpec {
+            command: "help".into(),
+            description: "查看所有编程智能体命令说明".into(),
+        },
+    ]
+}
+
+fn persist_coding_agent_config(
+    state: &Arc<AppState>,
+    bot_user_id: i64,
+    cfg: &CodingAgentBotConfig,
+) {
+    if let Ok(json_str) = serde_json::to_string(cfg) {
+        let _ = state.db.update_bot_coding_agent_json(bot_user_id, &json_str);
+    }
+}
+
+fn coding_mode_inline_keyboard(bot_user_id: i64) -> Vec<Vec<InlineKeyboardButton>> {
+    vec![vec![
+        InlineKeyboardButton {
+            text: "🛡️ 每次询问 (ask)".to_string(),
+            callback_data: Some(format!("coding:mode:{bot_user_id}:ask")),
+            url: None,
+            web_app_url: None,
+        },
+        InlineKeyboardButton {
+            text: "✏️ 自动编辑 (auto_edit)".to_string(),
+            callback_data: Some(format!("coding:mode:{bot_user_id}:auto_edit")),
+            url: None,
+            web_app_url: None,
+        },
+        InlineKeyboardButton {
+            text: "⚡ 完全访问 (full_access)".to_string(),
+            callback_data: Some(format!("coding:mode:{bot_user_id}:full_access")),
+            url: None,
+            web_app_url: None,
+        },
+    ]]
+}
+
+fn build_coding_agent_status_card_and_kb(
+    state: &AppState,
+    reg_bot: &BotRegistryRecord,
+    cfg: &CodingAgentBotConfig,
+) -> (String, Vec<Vec<InlineKeyboardButton>>) {
+    let hosts = state
+        .coding_agent_broker
+        .hosts_for_user(reg_bot.owner_user_id.max(0) as u64);
+    let target_host = cfg
+        .bound_device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|dev| hosts.iter().find(|h| h.device_id == dev))
+        .or_else(|| hosts.iter().find(|h| h.online))
+        .or_else(|| hosts.first());
+    let host_line = match (cfg.bound_device_id.as_deref(), target_host) {
+        (_, Some(h)) if h.online => format!("🟢 在线 — {} (`{}`)", h.display_name, h.device_id),
+        (Some(dev), _) => format!("🔴 离线 — 绑定设备 `{dev}`"),
+        (None, Some(h)) => format!("🔴 离线 — {} (`{}`)", h.display_name, h.device_id),
+        (None, None) => "🔴 离线 — 暂无已注册桌面主机".to_string(),
+    };
+    let ws_display = if cfg.workspace_path.trim().is_empty() {
+        "未绑定（发送 `/workspace <本地路径>` 设置）".to_string()
+    } else {
+        format!("`{}`", cfg.workspace_path.trim())
+    };
+    let model_display = cfg
+        .model_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("CLI 默认");
+    let worktree_display = if cfg.use_worktree { "开启" } else { "关闭" };
+    let group_display = if cfg.allow_group_members {
+        "允许群成员"
+    } else {
+        "仅限所有者"
+    };
+
+    let text = format!(
+        "💻 **{}** (`@{}`) — 本地编程智能体\n\n\
+         • **引擎 Provider**：{} (`{}`)\n\
+         • **工作区目录**：{}\n\
+         • **Worktree 隔离**：{}\n\
+         • **权限模式**：{} (`{}`)\n\
+         • **模型覆盖**：`{}`\n\
+         • **群组权限**：{}\n\
+         • **本地主机**：{}\n\n\
+         直接发送编程任务即可在本地执行并实时流式回传结果；发送 `/help` 查看全部控制命令。",
+        reg_bot.display_name,
+        reg_bot.username,
+        cfg.provider_kind.display_name(),
+        cfg.provider_kind.as_str(),
+        ws_display,
+        worktree_display,
+        cfg.permission_mode.label_zh(),
+        cfg.permission_mode.as_str(),
+        model_display,
+        group_display,
+        host_line,
+    );
+    (text, coding_mode_inline_keyboard(reg_bot.bot_user_id))
+}
+
+fn build_coding_agent_help_text(reg_bot: &BotRegistryRecord, cfg: &CodingAgentBotConfig) -> String {
+    let mut lines = vec![format!(
+        "🛠️ **{} (`@{}`) 编程智能体命令列表**（{}）：",
+        reg_bot.display_name,
+        reg_bot.username,
+        cfg.provider_kind.display_name()
+    )];
+    for spec in coding_agent_bot_commands() {
+        lines.push(format!("• `/{}` — {}", spec.command, spec.description));
+    }
+    lines.push(String::new());
+    lines.push("常用示例：`/workspace /Users/dev/repo` · `/worktree on` · `/mode auto_edit` · `/diff` · `/rollback 1` · `/handoff @codex_bot`".to_string());
+    lines.join("\n")
+}
+
+fn strip_leading_bot_mention<'a>(raw: &'a str, reg_bot: &BotRegistryRecord) -> &'a str {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('@') {
+        return trimmed;
+    }
+    let after_at = &trimmed[1..];
+    let split_idx = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
+    let token = &after_at[..split_idx];
+    if token.eq_ignore_ascii_case(&reg_bot.username)
+        || (!reg_bot.agent_id.trim().is_empty() && token.eq_ignore_ascii_case(&reg_bot.agent_id))
+    {
+        let rest = after_at[split_idx..].trim();
+        if !rest.is_empty() {
+            return rest;
+        }
+    }
+    trimmed
+}
+
+async fn apply_coding_config_control(
+    state: &Arc<AppState>,
+    reg_bot: &BotRegistryRecord,
+    cfg: &mut CodingAgentBotConfig,
+    chat_id: ChatId,
+    topic_raw: Option<i64>,
+    is_forum_topic: bool,
+    action: CodingControlAction,
+) -> (bool, String) {
+    let action_clone = action.clone();
+    match state
+        .coding_agent_broker
+        .send_control(
+            reg_bot,
+            cfg,
+            chat_id,
+            topic_raw,
+            is_forum_topic,
+            action,
+            crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+        )
+        .await
+    {
+        Ok(CodingHostEvent::ControlResult {
+            ok,
+            markdown_reply,
+            updated_workspace,
+            updated_use_worktree,
+            updated_model,
+            updated_permission_mode,
+            ..
+        }) => {
+            if ok {
+                if let Some(ws) = updated_workspace {
+                    cfg.workspace_path = ws;
+                }
+                if let Some(wt) = updated_use_worktree {
+                    cfg.use_worktree = wt;
+                }
+                if let Some(m) = updated_model {
+                    cfg.model_override = if m.trim().is_empty() { None } else { Some(m) };
+                }
+                if let Some(pm) = updated_permission_mode {
+                    cfg.permission_mode = pm;
+                }
+                match action_clone {
+                    CodingControlAction::SetWorkspace { path } if cfg.workspace_path.is_empty() => {
+                        cfg.workspace_path = path;
+                    }
+                    CodingControlAction::SetModel { model } if cfg.model_override.is_none() => {
+                        cfg.model_override = Some(model);
+                    }
+                    CodingControlAction::SetPermissionMode { mode } => {
+                        cfg.permission_mode = mode;
+                    }
+                    CodingControlAction::WorktreeOp { op, .. } if op == "on" => {
+                        cfg.use_worktree = true;
+                    }
+                    CodingControlAction::WorktreeOp { op, .. } if op == "off" => {
+                        cfg.use_worktree = false;
+                    }
+                    _ => {}
+                }
+                persist_coding_agent_config(state, reg_bot.bot_user_id, cfg);
+            }
+            (ok, markdown_reply)
+        }
+        Ok(_) => (false, "⚠️ 本地主机返回了非预期的响应。".to_string()),
+        Err(offline_err) => {
+            // Allow offline persistence of declarative config switches (`mode`, `model`, `worktree on|off`).
+            match action_clone {
+                CodingControlAction::SetPermissionMode { mode } => {
+                    cfg.permission_mode = mode;
+                    persist_coding_agent_config(state, reg_bot.bot_user_id, cfg);
+                    (
+                        true,
+                        format!(
+                            "✅ 权限模式已切换为 **{}** (`{}`)\n注：{}",
+                            mode.label_zh(),
+                            mode.as_str(),
+                            offline_err
+                        ),
+                    )
+                }
+                CodingControlAction::SetModel { model } => {
+                    cfg.model_override = Some(model.clone());
+                    persist_coding_agent_config(state, reg_bot.bot_user_id, cfg);
+                    (
+                        true,
+                        format!("✅ 模型已切换为 `{model}`\n注：{offline_err}"),
+                    )
+                }
+                CodingControlAction::WorktreeOp { op, .. } if op == "on" || op == "off" => {
+                    let enable = op == "on";
+                    cfg.use_worktree = enable;
+                    persist_coding_agent_config(state, reg_bot.bot_user_id, cfg);
+                    (
+                        true,
+                        format!(
+                            "✅ Worktree 隔离已设为 **{}**\n注：{}",
+                            if enable { "开启" } else { "关闭" },
+                            offline_err
+                        ),
+                    )
+                }
+                _ => (false, offline_err),
+            }
+        }
+    }
+}
+
+fn handle_coding_agent_bot_reply<'a>(
+    state: &'a Arc<AppState>,
+    chat_id: ChatId,
+    sender_id: UserId,
+    reg_bot: &'a BotRegistryRecord,
+    mut cfg: CodingAgentBotConfig,
+    text: &'a str,
+    topic_id: Option<TopicId>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+    let bot_uid = UserId(reg_bot.bot_user_id as u64);
+
+    // SECURITY INVARIANT (Owner-Only): reject non-owners unless `allow_group_members` is explicitly enabled.
+    if sender_id.0 as i64 != reg_bot.owner_user_id && !cfg.allow_group_members {
+        let _ = send_bot_chat_reply_in_topic(
+            state,
+            chat_id,
+            bot_uid,
+            CODING_AGENT_OWNER_ONLY_MSG,
+            Vec::new(),
+            topic_id,
+        );
+        return;
+    }
+
+    let chat_is_forum = state
+        .db
+        .get_chat(chat_id)
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.is_forum);
+    let topic_raw = topic_id.map(|t| t.0);
+    let is_forum_topic = topic_raw.is_some() || chat_is_forum;
+
+    let effective_text = strip_leading_bot_mention(text, reg_bot);
+    if effective_text.starts_with('/') {
+        let mut split = effective_text.splitn(2, char::is_whitespace);
+        let cmd_token = split.next().unwrap_or("");
+        let rest = split.next().unwrap_or("").trim();
+        let cmd = cmd_token
+            .trim_start_matches('/')
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match cmd.as_str() {
+            "start" => {
+                let (card, kb) = build_coding_agent_status_card_and_kb(state, reg_bot, &cfg);
+                let _ = send_bot_chat_reply_in_topic(state, chat_id, bot_uid, &card, kb, topic_id);
+                return;
+            }
+            "help" => {
+                let help = build_coding_agent_help_text(reg_bot, &cfg);
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &help,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "workspace" => {
+                if rest.is_empty() {
+                    let msg = format!(
+                        "📂 当前工作区：`{}`\n用法：`/workspace <本地项目路径>`",
+                        if cfg.workspace_path.trim().is_empty() {
+                            "未绑定"
+                        } else {
+                            cfg.workspace_path.trim()
+                        }
+                    );
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        &msg,
+                        Vec::new(),
+                        topic_id,
+                    );
+                    return;
+                }
+                let path = rest
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim()
+                    .to_string();
+                let (_, reply) = apply_coding_config_control(
+                    state,
+                    reg_bot,
+                    &mut cfg,
+                    chat_id,
+                    topic_raw,
+                    is_forum_topic,
+                    CodingControlAction::SetWorkspace { path },
+                )
+                .await;
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "worktree" => {
+                let mut parts = rest.split_whitespace();
+                let Some(sub) = parts.next() else {
+                    let msg = format!(
+                        "🌿 Worktree 隔离状态：**{}**\n用法：`/worktree <on|off|new [branch]|list|clean>`",
+                        if cfg.use_worktree { "开启" } else { "关闭" }
+                    );
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        &msg,
+                        Vec::new(),
+                        topic_id,
+                    );
+                    return;
+                };
+                let sub_lower = sub.to_ascii_lowercase();
+                let op_norm = match sub_lower.as_str() {
+                    "on" | "enable" | "true" => "on",
+                    "off" | "disable" | "false" => "off",
+                    "new" | "create" => "new",
+                    "list" | "ls" => "list",
+                    "clean" | "prune" | "remove" => "clean",
+                    _ => {
+                        let _ = send_bot_chat_reply_in_topic(
+                            state,
+                            chat_id,
+                            bot_uid,
+                            "❌ 无效参数，用法：`/worktree <on|off|new [branch]|list|clean>`",
+                            Vec::new(),
+                            topic_id,
+                        );
+                        return;
+                    }
+                };
+                let branch = parts.next().map(str::to_string);
+                let (_, reply) = apply_coding_config_control(
+                    state,
+                    reg_bot,
+                    &mut cfg,
+                    chat_id,
+                    topic_raw,
+                    is_forum_topic,
+                    CodingControlAction::WorktreeOp {
+                        op: op_norm.to_string(),
+                        branch,
+                    },
+                )
+                .await;
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "model" => {
+                if rest.is_empty() {
+                    let reply = match state
+                        .coding_agent_broker
+                        .send_control(
+                            reg_bot,
+                            &cfg,
+                            chat_id,
+                            topic_raw,
+                            is_forum_topic,
+                            CodingControlAction::ListModels,
+                            crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+                        Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+                        Err(e) => e,
+                    };
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        &reply,
+                        Vec::new(),
+                        topic_id,
+                    );
+                } else {
+                    let model = rest.to_string();
+                    let (_, reply) = apply_coding_config_control(
+                        state,
+                        reg_bot,
+                        &mut cfg,
+                        chat_id,
+                        topic_raw,
+                        is_forum_topic,
+                        CodingControlAction::SetModel { model },
+                    )
+                    .await;
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        &reply,
+                        Vec::new(),
+                        topic_id,
+                    );
+                }
+                return;
+            }
+            "mode" => {
+                if rest.is_empty() {
+                    let msg = format!(
+                        "🛡️ 当前权限模式：**{}** (`{}`)\n请选择或发送 `/mode <ask|auto_edit|full_access>`：",
+                        cfg.permission_mode.label_zh(),
+                        cfg.permission_mode.as_str()
+                    );
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        &msg,
+                        coding_mode_inline_keyboard(reg_bot.bot_user_id),
+                        topic_id,
+                    );
+                    return;
+                }
+                let Some(mode) = CodingPermissionMode::parse(rest) else {
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        "❌ 无效权限模式，可选：`ask`、`auto_edit`、`full_access`",
+                        Vec::new(),
+                        topic_id,
+                    );
+                    return;
+                };
+                let (_, reply) = apply_coding_config_control(
+                    state,
+                    reg_bot,
+                    &mut cfg,
+                    chat_id,
+                    topic_raw,
+                    is_forum_topic,
+                    CodingControlAction::SetPermissionMode { mode },
+                )
+                .await;
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "diff" => {
+                let turn_idx = if rest.is_empty() {
+                    None
+                } else if let Ok(n) = rest.parse::<u64>() {
+                    Some(n)
+                } else {
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        "❌ 回合编号格式无效，用法：`/diff [turn_idx]`",
+                        Vec::new(),
+                        topic_id,
+                    );
+                    return;
+                };
+                let reply = match state
+                    .coding_agent_broker
+                    .send_control(
+                        reg_bot,
+                        &cfg,
+                        chat_id,
+                        topic_raw,
+                        is_forum_topic,
+                        CodingControlAction::GetDiff { turn_idx },
+                        crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+                    Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+                    Err(e) => e,
+                };
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "rollback" => {
+                let turn_idx = if rest.is_empty() {
+                    None
+                } else if let Ok(n) = rest.parse::<u64>() {
+                    Some(n)
+                } else {
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        "❌ 回合编号格式无效，用法：`/rollback [turn_idx]`",
+                        Vec::new(),
+                        topic_id,
+                    );
+                    return;
+                };
+                let reply = match state
+                    .coding_agent_broker
+                    .send_control(
+                        reg_bot,
+                        &cfg,
+                        chat_id,
+                        topic_raw,
+                        is_forum_topic,
+                        CodingControlAction::RollbackCheckpoint { turn_idx },
+                        crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+                    Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+                    Err(e) => e,
+                };
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "stop" => {
+                let reply = match state
+                    .coding_agent_broker
+                    .cancel_active_turn_for_thread(
+                        sender_id,
+                        reg_bot.bot_user_id,
+                        chat_id.0,
+                        topic_raw,
+                    ) {
+                    Ok(Some(tid)) => format!("⏹️ 已向运行中的任务 `{tid}` 发送停止指令。"),
+                    Ok(None) => "ℹ️ 当前会话没有正在执行的编程任务。".to_string(),
+                    Err(e) => e,
+                };
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "new" => {
+                let reply = match state
+                    .coding_agent_broker
+                    .send_control(
+                        reg_bot,
+                        &cfg,
+                        chat_id,
+                        topic_raw,
+                        is_forum_topic,
+                        CodingControlAction::ResetSession,
+                        crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+                    Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+                    Err(e) => e,
+                };
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "status" => {
+                match state
+                    .coding_agent_broker
+                    .send_control(
+                        reg_bot,
+                        &cfg,
+                        chat_id,
+                        topic_raw,
+                        is_forum_topic,
+                        CodingControlAction::GetStatus,
+                        crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => {
+                        let _ = send_bot_chat_reply_in_topic(
+                            state,
+                            chat_id,
+                            bot_uid,
+                            &markdown_reply,
+                            Vec::new(),
+                            topic_id,
+                        );
+                    }
+                    Ok(_) => {
+                        let _ = send_bot_chat_reply_in_topic(
+                            state,
+                            chat_id,
+                            bot_uid,
+                            "⚠️ 主机返回了非预期响应。",
+                            Vec::new(),
+                            topic_id,
+                        );
+                    }
+                    Err(err) => {
+                        let (card, kb) =
+                            build_coding_agent_status_card_and_kb(state, reg_bot, &cfg);
+                        let combined = format!("{card}\n\n{err}");
+                        let _ = send_bot_chat_reply_in_topic(
+                            state, chat_id, bot_uid, &combined, kb, topic_id,
+                        );
+                    }
+                }
+                return;
+            }
+            "login" => {
+                let reply = match state
+                    .coding_agent_broker
+                    .send_control(
+                        reg_bot,
+                        &cfg,
+                        chat_id,
+                        topic_raw,
+                        is_forum_topic,
+                        CodingControlAction::CheckLogin,
+                        crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+                    Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+                    Err(e) => e,
+                };
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &reply,
+                    Vec::new(),
+                    topic_id,
+                );
+                return;
+            }
+            "handoff" => {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let target_raw = parts.next().unwrap_or("").trim();
+                let extra_note = parts.next().unwrap_or("").trim();
+                if target_raw.is_empty() {
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        "用法：`/handoff @target_bot [附言]`",
+                        Vec::new(),
+                        topic_id,
+                    );
+                    return;
+                }
+                let target_bot = match resolve_bot_record_by_key(state, target_raw) {
+                    Ok(Some(t)) => t,
+                    _ => {
+                        let _ = send_bot_chat_reply_in_topic(
+                            state,
+                            chat_id,
+                            bot_uid,
+                            &format!("❌ 未找到目标 Bot `{target_raw}`。"),
+                            Vec::new(),
+                            topic_id,
+                        );
+                        return;
+                    }
+                };
+                if target_bot.bot_user_id == reg_bot.bot_user_id {
+                    let _ = send_bot_chat_reply_in_topic(
+                        state,
+                        chat_id,
+                        bot_uid,
+                        "ℹ️ 不能将上下文交接给当前 Bot 自身。",
+                        Vec::new(),
+                        topic_id,
+                    );
+                    return;
+                }
+
+                let summary = match state
+                    .coding_agent_broker
+                    .send_control(
+                        reg_bot,
+                        &cfg,
+                        chat_id,
+                        topic_raw,
+                        is_forum_topic,
+                        CodingControlAction::BuildHandoffSummary {
+                            target_bot_username: target_bot.username.clone(),
+                        },
+                        crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(CodingHostEvent::ControlResult {
+                        ok: true,
+                        handoff_summary,
+                        markdown_reply,
+                        ..
+                    }) => handoff_summary
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(markdown_reply),
+                    Ok(CodingHostEvent::ControlResult {
+                        ok: false,
+                        markdown_reply,
+                        ..
+                    }) => {
+                        let _ = send_bot_chat_reply_in_topic(
+                            state,
+                            chat_id,
+                            bot_uid,
+                            &markdown_reply,
+                            Vec::new(),
+                            topic_id,
+                        );
+                        return;
+                    }
+                    Ok(_) => "⚠️ 主机返回了非预期的 Handoff 响应。".to_string(),
+                    Err(e) => {
+                        let _ = send_bot_chat_reply_in_topic(
+                            state, chat_id, bot_uid, &e, Vec::new(), topic_id,
+                        );
+                        return;
+                    }
+                };
+
+                if let Ok(Some(chat)) = state.db.get_chat(chat_id) {
+                    if chat.chat_type != 0 && chat.chat_type != 4 {
+                        let members = state.db.get_chat_members(chat_id).unwrap_or_default();
+                        let target_uid = UserId(target_bot.bot_user_id as u64);
+                        if !members.contains(&target_uid) {
+                            if target_bot.owner_user_id == sender_id.0 as i64
+                                || target_bot.is_official
+                            {
+                                let now_ms = chrono::Utc::now().timestamp_millis();
+                                let _ = state.db.add_chat_member(&crate::db::ChatMemberRecord {
+                                    chat_id,
+                                    user_id: target_uid,
+                                    role: "member".to_string(),
+                                    permissions_bitmask: 0,
+                                    admin_title: None,
+                                    admin_rights: 0,
+                                    banned_rights: 0,
+                                    until_date_ms: None,
+                                    joined_at_ms: now_ms,
+                                    invited_by: Some(sender_id),
+                                    updated_at_ms: now_ms,
+                                });
+                            } else {
+                                let _ = send_bot_chat_reply_in_topic(
+                                    state,
+                                    chat_id,
+                                    bot_uid,
+                                    &format!(
+                                        "⚠️ 目标 Bot `@{}` 不在当前群聊中，且你无权邀请。",
+                                        target_bot.username
+                                    ),
+                                    Vec::new(),
+                                    topic_id,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let mut handoff_msg = format!(
+                    "@{} 📋 **来自 @{} 的上下文交接**\n\n{}",
+                    target_bot.username,
+                    reg_bot.username,
+                    summary.trim()
+                );
+                if !extra_note.is_empty() {
+                    handoff_msg.push_str(&format!("\n\n**交接说明**：{extra_note}"));
+                }
+
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_uid,
+                    &handoff_msg,
+                    Vec::new(),
+                    topic_id,
+                );
+
+                // Spawn asynchronously so the source bot's floor guard releases before target acquires floor.
+                let state_bg = Arc::clone(state);
+                let from_label = reg_bot.username.clone();
+                let to_label = target_bot.username.clone();
+                let target_uid = UserId(target_bot.bot_user_id as u64);
+                tokio::spawn(async move {
+                    crate::server::dispatch_bot_handoff_to_target(
+                        &state_bg,
+                        chat_id,
+                        sender_id,
+                        &from_label,
+                        target_uid,
+                        &to_label,
+                        &handoff_msg,
+                        topic_id,
+                    )
+                    .await;
+                });
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Regular prompt (or unrecognized CLI-specific slash prompt): dispatch turn to bound local host.
+    if let Err(err_msg) = state
+        .coding_agent_broker
+        .dispatch_turn(
+            reg_bot,
+            &cfg,
+            chat_id,
+            topic_raw,
+            is_forum_topic,
+            effective_text,
+        )
+        .await
+    {
+        let _ = send_bot_chat_reply_in_topic(
+            state,
+            chat_id,
+            bot_uid,
+            &err_msg,
+            Vec::new(),
+            topic_id,
+        );
+    }
+    })
+}
+
+/// POST /api/v1/coding-agents/probe
+pub async fn coding_agents_probe(
+    auth: AuthBearer,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response {
+    let _ = state.self_weak.set(Arc::downgrade(&state));
+    let payload: Value = if body.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}))
+    };
+    let target_device_id = payload
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let timeout_ms = payload
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(
+            crate::coding_agent_broker::DEFAULT_CODING_PROBE_TIMEOUT.as_millis() as u64,
+        )
+        .clamp(500, 15_000);
+
+    match state
+        .coding_agent_broker
+        .probe_host(
+            auth.user_id,
+            target_device_id.as_deref(),
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+    {
+        Ok((device_id, providers)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "device_id": device_id,
+                "providers": providers,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "host_probe_unavailable",
+                "message": err,
+                "hosts": state.coding_agent_broker.hosts_for_user(auth.user_id.0),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn authorize_coding_callback_bot(
+    state: &Arc<AppState>,
+    _cid: ChatId,
+    caller_uid: UserId,
+    members: &[UserId],
+    bot_id: i64,
+) -> Result<(BotRegistryRecord, CodingAgentBotConfig), Response> {
+    let Some(reg_bot) = state.db.get_bot_by_user_id(bot_id).ok().flatten() else {
+        return Err(err_resp(
+            StatusCode::NOT_FOUND,
+            "bot_not_found",
+            "Coding Agent Bot not found",
+        ));
+    };
+    let Some(cfg) = reg_bot.coding_agent_config() else {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "not_coding_agent",
+            "Bot is not configured as a Coding Agent",
+        ));
+    };
+    if caller_uid.0 as i64 != reg_bot.owner_user_id && !cfg.allow_group_members {
+        return Err(err_resp(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            CODING_AGENT_OWNER_ONLY_MSG,
+        ));
+    }
+    let bot_uid = UserId(bot_id as u64);
+    if !members.contains(&bot_uid) && caller_uid.0 as i64 != reg_bot.owner_user_id {
+        return Err(err_resp(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Target bot is not a member of this chat",
+        ));
+    }
+    Ok((reg_bot, cfg))
+}
+
+async fn handle_coding_callback(
+    state: &Arc<AppState>,
+    cid: ChatId,
+    caller_uid: UserId,
+    members: &[UserId],
+    req: &ChatCallbackRequest,
+    data: &str,
+) -> Response {
+    let _ = state.self_weak.set(Arc::downgrade(state));
+    let topic_id = if req.message_id > 0 {
+        state
+            .db
+            .get_message(cid, MsgId(req.message_id))
+            .ok()
+            .flatten()
+            .and_then(|m| m.topic_id)
+    } else {
+        None
+    };
+    let topic_raw = topic_id.map(|t| t.0);
+    let is_forum_topic = topic_raw.is_some()
+        || state
+            .db
+            .get_chat(cid)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.is_forum);
+
+    if let Some(rest) = data.strip_prefix("coding:approve:") {
+        let Some((turn_id, rem)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed approval callback");
+        };
+        let Some((request_id, dec_str)) = rem.rsplit_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed approval callback");
+        };
+        let decision = match dec_str {
+            "once" => CodingApprovalDecision::AllowOnce,
+            "session" => CodingApprovalDecision::AllowSession,
+            "deny" => CodingApprovalDecision::Deny,
+            _ => {
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_decision",
+                    "Unsupported coding approval decision",
+                );
+            }
+        };
+        if let Some(meta) = state.coding_agent_broker.get_turn_meta(turn_id) {
+            if meta.chat_id != cid.0 {
+                return err_resp(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "Turn does not belong to this chat",
+                );
+            }
+            if let Err(resp) = authorize_coding_callback_bot(
+                state,
+                cid,
+                caller_uid,
+                members,
+                meta.bot_user_id,
+            ) {
+                return resp;
+            }
+        }
+        match state
+            .coding_agent_broker
+            .resolve_approval(caller_uid, turn_id, request_id, decision)
+        {
+            Ok(outcome) => {
+                let dec_label = match decision {
+                    CodingApprovalDecision::AllowOnce => "✅ 已允许本次执行",
+                    CodingApprovalDecision::AllowSession => "🔓 已允许本会话同类操作",
+                    CodingApprovalDecision::Deny => "❌ 已拒绝该操作",
+                };
+                if outcome.already_resolved {
+                    return (
+                        StatusCode::OK,
+                        Json(PeerBotActionResult {
+                            ok: true,
+                            companion_chat_id: Some(cid.0),
+                            toast: Some("该审批已处理".to_string()),
+                            inline_keyboard: Some(Vec::new()),
+                            ..Default::default()
+                        }),
+                    )
+                        .into_response();
+                }
+                let updated_text = format!(
+                    "🔐 **权限审批已处理** (`{}`)\n**操作**：{}\n**结果**：**{}**",
+                    outcome.kind, outcome.title, dec_label
+                );
+                let target_mid = if req.message_id > 0 {
+                    Some(MsgId(req.message_id))
+                } else {
+                    outcome.approval_msg_id
+                };
+                if let Some(mid) = target_mid {
+                    let _ = crate::coding_agent_broker::edit_bot_chat_message(
+                        state,
+                        cid,
+                        mid,
+                        &updated_text,
+                        Some(Vec::new()),
+                    );
+                }
+                return (
+                    StatusCode::OK,
+                    Json(PeerBotActionResult {
+                        ok: true,
+                        companion_chat_id: Some(cid.0),
+                        toast: Some(dec_label.to_string()),
+                        updated_text: Some(updated_text),
+                        inline_keyboard: Some(Vec::new()),
+                        ..Default::default()
+                    }),
+                )
+                    .into_response();
+            }
+            Err(err) if err == "FORBIDDEN" => {
+                return err_resp(StatusCode::FORBIDDEN, "forbidden", CODING_AGENT_OWNER_ONLY_MSG);
+            }
+            Err(err) => {
+                return err_resp(StatusCode::BAD_REQUEST, "approval_failed", &err);
+            }
+        }
+    }
+
+    if let Some(turn_id) = data.strip_prefix("coding:stop:") {
+        if let Some(meta) = state.coding_agent_broker.get_turn_meta(turn_id) {
+            if meta.chat_id != cid.0 {
+                return err_resp(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "Turn does not belong to this chat",
+                );
+            }
+            if let Err(resp) = authorize_coding_callback_bot(
+                state,
+                cid,
+                caller_uid,
+                members,
+                meta.bot_user_id,
+            ) {
+                return resp;
+            }
+        }
+        match state.coding_agent_broker.cancel_turn(caller_uid, turn_id) {
+            Ok(()) => {
+                if req.message_id > 0 {
+                    let _ = state.db.save_message_extras(
+                        cid,
+                        MsgId(req.message_id),
+                        Some("[]"),
+                        None,
+                    );
+                }
+                return (
+                    StatusCode::OK,
+                    Json(PeerBotActionResult {
+                        ok: true,
+                        companion_chat_id: Some(cid.0),
+                        toast: Some("⏹️ 已发送停止指令".to_string()),
+                        inline_keyboard: Some(Vec::new()),
+                        ..Default::default()
+                    }),
+                )
+                    .into_response();
+            }
+            Err(err) if err == "FORBIDDEN" => {
+                return err_resp(StatusCode::FORBIDDEN, "forbidden", CODING_AGENT_OWNER_ONLY_MSG);
+            }
+            Err(err) => {
+                return (
+                    StatusCode::OK,
+                    Json(PeerBotActionResult {
+                        ok: false,
+                        companion_chat_id: Some(cid.0),
+                        toast: Some(err),
+                        inline_keyboard: Some(Vec::new()),
+                        ..Default::default()
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(rest) = data.strip_prefix("coding:diff:") {
+        let Some((bot_id_str, turn_idx_str)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed diff callback");
+        };
+        let Ok(bot_id) = bot_id_str.parse::<i64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_id", "Invalid bot id");
+        };
+        let Ok(turn_idx) = turn_idx_str.parse::<u64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_turn_idx", "Invalid turn index");
+        };
+        let (reg_bot, cfg) = match authorize_coding_callback_bot(state, cid, caller_uid, members, bot_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let reply = match state
+            .coding_agent_broker
+            .send_control(
+                &reg_bot,
+                &cfg,
+                cid,
+                topic_raw,
+                is_forum_topic,
+                CodingControlAction::GetDiff {
+                    turn_idx: Some(turn_idx),
+                },
+                crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+            )
+            .await
+        {
+            Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+            Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+            Err(e) => e,
+        };
+        let mid = send_bot_chat_reply_in_topic(
+            state,
+            cid,
+            UserId(bot_id as u64),
+            &reply,
+            Vec::new(),
+            topic_id,
+        )
+        .map(|m| m.0)
+        .ok();
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(cid.0),
+                system_message: Some(reply),
+                reply_message_id: mid,
+                toast: Some(format!("已获取 Turn #{turn_idx} Diff")),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(rest) = data.strip_prefix("coding:rollback:") {
+        let Some((bot_id_str, turn_idx_str)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed rollback callback");
+        };
+        let Ok(bot_id) = bot_id_str.parse::<i64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_id", "Invalid bot id");
+        };
+        let Ok(turn_idx) = turn_idx_str.parse::<u64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_turn_idx", "Invalid turn index");
+        };
+        if let Err(resp) = authorize_coding_callback_bot(state, cid, caller_uid, members, bot_id) {
+            return resp;
+        }
+        let confirm_text = format!(
+            "⚠️ **确认回滚工作区到 Turn #{turn_idx} 检查点？**\n此操作将还原该轮引入的文件变更。"
+        );
+        let kb = vec![vec![
+            InlineKeyboardButton {
+                text: format!("⚠️ 确认回滚 (Turn #{turn_idx})"),
+                callback_data: Some(format!("coding:rollback_confirm:{bot_id}:{turn_idx}")),
+                url: None,
+                web_app_url: None,
+            },
+            InlineKeyboardButton {
+                text: "❎ 取消".to_string(),
+                callback_data: Some(format!("coding:rollback_cancel:{bot_id}:{turn_idx}")),
+                url: None,
+                web_app_url: None,
+            },
+        ]];
+        let mid = send_bot_chat_reply_in_topic(
+            state,
+            cid,
+            UserId(bot_id as u64),
+            &confirm_text,
+            kb.clone(),
+            topic_id,
+        )
+        .map(|m| m.0)
+        .ok();
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(cid.0),
+                system_message: Some(confirm_text),
+                reply_message_id: mid,
+                inline_keyboard: Some(kb),
+                toast: Some("请点击确认按钮以执行回滚".to_string()),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(rest) = data.strip_prefix("coding:rollback_confirm:") {
+        let Some((bot_id_str, turn_idx_str)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed rollback_confirm callback");
+        };
+        let Ok(bot_id) = bot_id_str.parse::<i64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_id", "Invalid bot id");
+        };
+        let Ok(turn_idx) = turn_idx_str.parse::<u64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_turn_idx", "Invalid turn index");
+        };
+        let (reg_bot, cfg) = match authorize_coding_callback_bot(state, cid, caller_uid, members, bot_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        if req.message_id > 0 {
+            if let Ok((Some(ikb_raw), _, _)) =
+                state.db.get_message_extras(cid, MsgId(req.message_id))
+            {
+                if ikb_raw.trim() == "[]" {
+                    return (
+                        StatusCode::OK,
+                        Json(PeerBotActionResult {
+                            ok: true,
+                            companion_chat_id: Some(cid.0),
+                            toast: Some("该回滚确认已处理".to_string()),
+                            inline_keyboard: Some(Vec::new()),
+                            ..Default::default()
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+            let _ = state
+                .db
+                .save_message_extras(cid, MsgId(req.message_id), Some("[]"), None);
+        }
+        let reply = match state
+            .coding_agent_broker
+            .send_control(
+                &reg_bot,
+                &cfg,
+                cid,
+                topic_raw,
+                is_forum_topic,
+                CodingControlAction::RollbackCheckpoint {
+                    turn_idx: Some(turn_idx),
+                },
+                crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+            )
+            .await
+        {
+            Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+            Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+            Err(e) => e,
+        };
+        if req.message_id > 0 {
+            let _ = crate::coding_agent_broker::edit_bot_chat_message(
+                state,
+                cid,
+                MsgId(req.message_id),
+                &reply,
+                Some(Vec::new()),
+            );
+        } else {
+            let _ = send_bot_chat_reply_in_topic(
+                state,
+                cid,
+                UserId(bot_id as u64),
+                &reply,
+                Vec::new(),
+                topic_id,
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(cid.0),
+                updated_text: Some(reply),
+                inline_keyboard: Some(Vec::new()),
+                toast: Some(format!("已执行 Turn #{turn_idx} 回滚")),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(rest) = data.strip_prefix("coding:rollback_cancel:") {
+        let Some((bot_id_str, _turn_idx_str)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed rollback_cancel callback");
+        };
+        let Ok(bot_id) = bot_id_str.parse::<i64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_id", "Invalid bot id");
+        };
+        if let Err(resp) = authorize_coding_callback_bot(state, cid, caller_uid, members, bot_id) {
+            return resp;
+        }
+        let text = "❎ 已取消回滚操作。".to_string();
+        if req.message_id > 0 {
+            let _ = crate::coding_agent_broker::edit_bot_chat_message(
+                state,
+                cid,
+                MsgId(req.message_id),
+                &text,
+                Some(Vec::new()),
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(cid.0),
+                updated_text: Some(text),
+                inline_keyboard: Some(Vec::new()),
+                toast: Some("已取消回滚".to_string()),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(rest) = data.strip_prefix("coding:pr:") {
+        let Some((bot_id_str, _turn_idx_str)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed pr callback");
+        };
+        let Ok(bot_id) = bot_id_str.parse::<i64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_id", "Invalid bot id");
+        };
+        let (reg_bot, cfg) = match authorize_coding_callback_bot(state, cid, caller_uid, members, bot_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let reply = match state
+            .coding_agent_broker
+            .send_control(
+                &reg_bot,
+                &cfg,
+                cid,
+                topic_raw,
+                is_forum_topic,
+                CodingControlAction::CommitAndPr {
+                    message: None,
+                    title: None,
+                },
+                crate::coding_agent_broker::DEFAULT_CODING_CONTROL_TIMEOUT,
+            )
+            .await
+        {
+            Ok(CodingHostEvent::ControlResult { markdown_reply, .. }) => markdown_reply,
+            Ok(_) => "⚠️ 主机返回了非预期响应。".to_string(),
+            Err(e) => e,
+        };
+        let mid = send_bot_chat_reply_in_topic(
+            state,
+            cid,
+            UserId(bot_id as u64),
+            &reply,
+            Vec::new(),
+            topic_id,
+        )
+        .map(|m| m.0)
+        .ok();
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(cid.0),
+                system_message: Some(reply),
+                reply_message_id: mid,
+                toast: Some("已执行 Commit & PR".to_string()),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(rest) = data.strip_prefix("coding:model:") {
+        let Some((bot_id_str, model)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed model callback");
+        };
+        let Ok(bot_id) = bot_id_str.parse::<i64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_id", "Invalid bot id");
+        };
+        let (reg_bot, mut cfg) = match authorize_coding_callback_bot(state, cid, caller_uid, members, bot_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let (_, reply) = apply_coding_config_control(
+            state,
+            &reg_bot,
+            &mut cfg,
+            cid,
+            topic_raw,
+            is_forum_topic,
+            CodingControlAction::SetModel {
+                model: model.to_string(),
+            },
+        )
+        .await;
+        if req.message_id > 0 {
+            let _ = crate::coding_agent_broker::edit_bot_chat_message(
+                state,
+                cid,
+                MsgId(req.message_id),
+                &reply,
+                Some(Vec::new()),
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(cid.0),
+                updated_text: Some(reply),
+                inline_keyboard: Some(Vec::new()),
+                toast: Some(format!("已切换模型为 {model}")),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(rest) = data.strip_prefix("coding:mode:") {
+        let Some((bot_id_str, mode_str)) = rest.split_once(':') else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_callback", "Malformed mode callback");
+        };
+        let Ok(bot_id) = bot_id_str.parse::<i64>() else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_id", "Invalid bot id");
+        };
+        let Some(mode) = CodingPermissionMode::parse(mode_str) else {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_mode", "Invalid permission mode");
+        };
+        let (reg_bot, mut cfg) = match authorize_coding_callback_bot(state, cid, caller_uid, members, bot_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let (_, reply) = apply_coding_config_control(
+            state,
+            &reg_bot,
+            &mut cfg,
+            cid,
+            topic_raw,
+            is_forum_topic,
+            CodingControlAction::SetPermissionMode { mode },
+        )
+        .await;
+        let mid = send_bot_chat_reply_in_topic(
+            state,
+            cid,
+            UserId(bot_id as u64),
+            &reply,
+            Vec::new(),
+            topic_id,
+        )
+        .map(|m| m.0)
+        .ok();
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(cid.0),
+                system_message: Some(reply),
+                reply_message_id: mid,
+                toast: Some(format!("已切换权限模式: {}", mode.label_zh())),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
+
+    err_resp(
+        StatusCode::BAD_REQUEST,
+        "unknown_coding_callback",
+        "Unsupported coding callback action",
+    )
 }
 
 // ============================================================================
@@ -3745,35 +5438,57 @@ pub async fn fabushi_bots_create(
         Err(e) => return map_telegram_err(e),
     };
 
-    let cmds = [
-        BotCommandSpec {
-            command: "start".into(),
-            description: "开始使用智能体".into(),
-        },
-        BotCommandSpec {
-            command: "help".into(),
-            description: "查看使用帮助".into(),
-        },
-        BotCommandSpec {
-            command: "new".into(),
-            description: "开启全新会话".into(),
-        },
-    ];
+    let cmds = if req.coding_agent.is_some() {
+        coding_agent_bot_commands()
+    } else {
+        vec![
+            BotCommandSpec {
+                command: "start".into(),
+                description: "开始使用智能体".into(),
+            },
+            BotCommandSpec {
+                command: "help".into(),
+                description: "查看使用帮助".into(),
+            },
+            BotCommandSpec {
+                command: "new".into(),
+                description: "开启全新会话".into(),
+            },
+        ]
+    };
     let cmds_json = serde_json::to_string(&cmds).unwrap_or_else(|_| "[]".into());
     let title = if req.title.trim().is_empty() {
-        "Fabushi Agent".to_string()
+        if let Some(ref cfg) = req.coding_agent {
+            format!("{} Coding Agent", cfg.provider_kind.display_name())
+        } else {
+            "Fabushi Agent".to_string()
+        }
     } else {
         req.title.trim().to_string()
     };
     let description = req.description.trim().to_string();
     let ai_persona = if description.is_empty() {
-        format!(
-            "你是 {} (@{})，一个拥有独立记忆与技能空间的 Fabushi Agent 智能体。",
-            display_name, username
-        )
+        if let Some(ref cfg) = req.coding_agent {
+            format!(
+                "你是 {} (@{})，运行在本地 {} 工作区的编程智能体。",
+                display_name,
+                username,
+                cfg.provider_kind.display_name()
+            )
+        } else {
+            format!(
+                "你是 {} (@{})，一个拥有独立记忆与技能空间的 Fabushi Agent 智能体。",
+                display_name, username
+            )
+        }
     } else {
         description.clone()
     };
+    let effective_pref_model = req.preferred_model.clone().or_else(|| {
+        req.coding_agent
+            .as_ref()
+            .and_then(|c| c.model_override.clone())
+    });
 
     let mut bot = match state.db.create_registered_bot(
         auth.user_id.0 as i64,
@@ -3809,12 +5524,24 @@ pub async fn fabushi_bots_create(
         req.agent_id.as_deref(),
         req.avatar_shape.as_deref(),
         req.avatar_color.as_deref(),
-        req.preferred_model.as_deref(),
+        effective_pref_model.as_deref(),
         req.thinking_level.as_deref(),
         req.approval_mode.as_deref(),
         req.toolset_preset.as_deref(),
     ) {
         bot = updated;
+    }
+
+    if let Some(mut coding_cfg) = req.coding_agent.clone() {
+        coding_cfg.workspace_path = coding_cfg.workspace_path.trim().to_string();
+        if let Ok(json_str) = serde_json::to_string(&coding_cfg) {
+            if let Ok(updated) = state
+                .db
+                .update_bot_coding_agent_json(bot.bot_user_id, &json_str)
+            {
+                bot = updated;
+            }
+        }
     }
 
     crate::routes::hermes::save_bot_persona_kv(
@@ -3899,7 +5626,7 @@ pub async fn fabushi_bot_patch(
         return resp;
     }
 
-    let updated = match state.db.update_bot_fabushi_fields(
+    let mut updated = match state.db.update_bot_fabushi_fields(
         bot.bot_user_id,
         req.display_name.as_deref(),
         req.description.as_deref(),
@@ -3916,6 +5643,35 @@ pub async fn fabushi_bot_patch(
         Ok(u) => u,
         Err(e) => return map_telegram_err(e),
     };
+
+    if let Some(mut coding_cfg) = req.coding_agent.clone() {
+        coding_cfg.workspace_path = coding_cfg.workspace_path.trim().to_string();
+        if let Ok(json_str) = serde_json::to_string(&coding_cfg) {
+            if let Ok(coding_updated) = state
+                .db
+                .update_bot_coding_agent_json(updated.bot_user_id, &json_str)
+            {
+                updated = coding_updated;
+            }
+        }
+    } else if req.preferred_model.is_some() {
+        if let Some(mut coding_cfg) = updated.coding_agent_config() {
+            coding_cfg.model_override = req
+                .preferred_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            if let Ok(json_str) = serde_json::to_string(&coding_cfg) {
+                if let Ok(coding_updated) = state
+                    .db
+                    .update_bot_coding_agent_json(updated.bot_user_id, &json_str)
+                {
+                    updated = coding_updated;
+                }
+            }
+        }
+    }
 
     let _ = ensure_fabushi_bot_hydrated(&state, updated.bot_user_id);
     let inst = state
@@ -5228,6 +6984,9 @@ pub async fn chat_callback(
     }
 
     let members = state.db.get_chat_members(cid).unwrap_or_default();
+    if data.starts_with("coding:") {
+        return handle_coding_callback(&state, cid, auth.user_id, &members, &req, data).await;
+    }
     let is_botfather_chat = data.starts_with("bf:") || members.contains(&UserId(BOTFATHER_USER_ID));
     if is_botfather_chat && data.starts_with("bf:") {
         let res = handle_botfather_callback(&state, cid, auth.user_id, data).await;

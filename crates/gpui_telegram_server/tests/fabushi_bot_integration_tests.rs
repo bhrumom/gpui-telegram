@@ -177,6 +177,7 @@ async fn unified_provisioning_across_all_entrypoints_and_official_bots() {
         thinking_level: Some("high".to_string()),
         approval_mode: Some("autonomous".to_string()),
         toolset_preset: Some("full".to_string()),
+        coding_agent: None,
     };
     let (st_a, val_a) = http_json(
         &router,
@@ -945,6 +946,7 @@ async fn botfather_newbot_and_setavatar_callbacks_persist_grok_avatar() {
         thinking_level: None,
         approval_mode: None,
         toolset_preset: None,
+        coding_agent: None,
     };
     let (st_fb, val_fb) = http_json(
         &router,
@@ -1028,6 +1030,7 @@ async fn published_companion_miniapp_bot_is_first_class_fabushi_bot_for_normal_u
         thinking_level: None,
         approval_mode: None,
         toolset_preset: None,
+        coding_agent: None,
     };
     let (st_create, val_create) = http_json(
         &router,
@@ -1254,6 +1257,7 @@ async fn hermes_fused_into_fabushi_single_runtime_and_bot_scoped_studio() {
             thinking_level: None,
             approval_mode: None,
             toolset_preset: None,
+            coding_agent: None,
         })
         .unwrap()),
     )

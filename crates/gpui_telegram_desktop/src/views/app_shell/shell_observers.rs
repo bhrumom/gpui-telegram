@@ -188,10 +188,19 @@ impl AppShell {
                             ConnectionStatus::Offline { .. } => BannerConnectionStatus::WaitingForNetwork,
                         };
                         shell.window_runtime.set_connection_status(banner, None);
+                        if !is_connected {
+                            shell.coding_host.registered_for_auth_gen = None;
+                        }
                         if is_connected && !was_connected {
                             shell.refresh_chats(cx);
                             if let Some(cid) = shell.stage.read(cx).active_chat_id {
                                 shell.load_historical_messages(cid, cx);
+                            }
+                            if shell.is_authenticated
+                                && shell.coding_host.registered_for_auth_gen
+                                    != Some(shell.session_sync.auth_generation)
+                            {
+                                shell.announce_coding_host_to_server(cx);
                             }
                         }
                         if let ConnectionStatus::Offline { ref reason } = status {
@@ -558,6 +567,7 @@ impl AppShell {
                 next_client.ws_transport.set_max_reconnect_attempts(next_client.config.max_reconnect_attempts);
                 self.client = next_client;
                 self.session_sync.ws_stream_started = false;
+                self.coding_host.registered_for_auth_gen = None;
                 self.sidebar.update(cx, |sb, _| sb.configure_for_cloud_workspace(url));
                 self.stage.update(cx, |st, _| st.configure_for_cloud_workspace(url, None));
                 self.inspector.update(cx, |insp, _| insp.configure_for_cloud_workspace(url));

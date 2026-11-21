@@ -55,7 +55,7 @@ fn upsert_fabushi_bot_summary(shell: &mut AppShell, summary: FabushiBotSummaryDt
     }
 }
 
-fn fabushi_summary_from_bot_registry(
+pub fn fabushi_summary_from_bot_registry(
     bot: &BotRegistryEntry,
     companion_chat_id: Option<i64>,
     fallback_shape: Option<&str>,
@@ -115,6 +115,7 @@ fn fabushi_summary_from_bot_registry(
         skills_count: 0,
         execution_state: "idle".to_string(),
         companion_chat_id,
+        coding_agent: bot.coding_agent.clone(),
     }
 }
 
@@ -210,10 +211,13 @@ impl AppShell {
     ) -> Entity<CreateManagedBotBoxPeers> {
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
+        let detected = self.coding_host.detected_providers.clone();
+        let device_id = self.client.device_id();
         if let Some(ref existing) = self.miniapps.create_bot_box {
             existing.update(cx, |b, _| {
                 b.set_palette(pal);
                 b.set_language(lang);
+                b.set_detected_coding_providers(detected, Some(device_id));
             });
             return existing.clone();
         }
@@ -221,6 +225,7 @@ impl AppShell {
             let mut b = CreateManagedBotBoxPeers::new();
             b.set_palette(pal);
             b.set_language(lang);
+            b.set_detected_coding_providers(detected, Some(device_id));
             b
         });
         cx.observe(
@@ -241,6 +246,7 @@ impl AppShell {
             b.open_ai_creator();
             b_cx.notify();
         });
+        self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
         self.sidebar.update(cx, |s, _| {
             s.is_account_popover_open = false;
@@ -256,6 +262,23 @@ impl AppShell {
             b.open_fabushi_creator();
             b_cx.notify();
         });
+        self.refresh_detected_coding_providers(cx);
+        self.main_menu_drawer.update(cx, |m, _| m.close());
+        self.sidebar.update(cx, |s, _| {
+            s.is_account_popover_open = false;
+            s.search_focused = false;
+        });
+        cx.notify();
+    }
+
+    /// Opens the Local Coding Agent Bot creator modal and triggers provider detection.
+    pub fn open_coding_agent_creator_modal(&mut self, cx: &mut Context<Self>) {
+        let box_ent = self.ensure_create_bot_box(cx);
+        box_ent.update(cx, |b, b_cx| {
+            b.open_coding_agent_creator();
+            b_cx.notify();
+        });
+        self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
         self.sidebar.update(cx, |s, _| {
             s.is_account_popover_open = false;
@@ -304,11 +327,16 @@ impl AppShell {
                     match res {
                         Ok(created) => {
                             shell.miniapps.create_bot_box = None;
+                            let is_coding_bot = created.bot.coding_agent.is_some();
                             upsert_fabushi_bot_summary(shell, created.bot.clone());
                             shell.window_runtime.enqueue_toast(
                                 format!(
                                     "{} @{}",
-                                    tr_str(&lang, "已创建 Fabushi 智能体", "Created Fabushi Bot"),
+                                    if is_coding_bot {
+                                        tr_str(&lang, "已创建编程智能体", "Created Coding Agent Bot")
+                                    } else {
+                                        tr_str(&lang, "已创建 Fabushi 智能体", "Created Fabushi Bot")
+                                    },
                                     created.bot.agent_id
                                 ),
                                 2800,

@@ -117,13 +117,7 @@ impl AppShell {
             return (committed, term_pre.or_else(pre));
         }
         if let Some(b) = self.miniapps.create_bot_box.as_ref().filter(|b| b.read(cx).is_visible) {
-            let r = b.read(cx);
-            let txt = if r.is_ai_mode || r.active_field == 0 {
-                &r.nl_prompt
-            } else {
-                match r.active_field { 1 => &r.bot_name, 2 => &r.bot_username, _ => &r.bot_token }
-            };
-            return (txt.clone(), pre());
+            return (b.read(cx).active_field_text().to_string(), pre());
         }
         if let Some(ov) = self.miniapps.miniapp_overlay.as_ref().filter(|w| w.read(cx).has_focused_text_input()) {
             return (ov.read(cx).active_input_text(), pre());
@@ -198,11 +192,7 @@ impl AppShell {
         }
         if let Some(box_ent) = self.miniapps.create_bot_box.as_ref().filter(|b| b.read(cx).is_visible).cloned() {
             box_ent.update(cx, |b, bcx| {
-                if b.is_ai_mode || b.active_field == 0 {
-                    b.nl_prompt.clear();
-                } else {
-                    match b.active_field { 1 => b.bot_name.clear(), 2 => b.bot_username.clear(), _ => b.bot_token.clear() }
-                }
+                b.clear_active_field();
                 bcx.notify();
             });
         } else if self.modal_container.read(cx).is_modal_active() {
@@ -552,7 +542,10 @@ impl AppShell {
             match key {
                 "tab" => {
                     self.ime.clear_preedit();
-                    box_ent.update(cx, |b, bcx| { if !b.is_ai_mode { b.active_field = (b.active_field + 1) % 4; bcx.notify(); } });
+                    box_ent.update(cx, |b, bcx| {
+                        b.cycle_active_field();
+                        bcx.notify();
+                    });
                 }
                 "backspace" => if self.ime.ime_preedit.take().is_none() { box_ent.update(cx, |b, bcx| { b.backspace(); bcx.notify(); }); },
                 "enter" => if !self.take_ime_preedit_commit(cx) { box_ent.update(cx, |b, bcx| { b.submit(); bcx.notify(); }); },

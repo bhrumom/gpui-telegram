@@ -410,6 +410,30 @@ impl ShellComputersState {
     }
 }
 
+/// Local Coding Agent Host runtime handle, probed CLI providers, and WS host registration fence.
+#[derive(Default)]
+pub struct ShellCodingHostState {
+    pub runtime: Option<Arc<gpui_telegram_coding::LocalCodingHostRuntime>>,
+    pub detected_providers: Vec<gpui_telegram_proto::DetectedCodingProvider>,
+    pub registered_for_auth_gen: Option<u64>,
+}
+
+impl ShellCodingHostState {
+    /// Creates an empty local coding host state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears detected providers and registration fence, returning any active runtime for async shutdown.
+    pub fn reset_on_logout(
+        &mut self,
+    ) -> Option<Arc<gpui_telegram_coding::LocalCodingHostRuntime>> {
+        self.detected_providers.clear();
+        self.registered_for_auth_gen = None;
+        self.runtime.take()
+    }
+}
+
 /// Returns `true` when `sidebar.selection_revision` advances with a selected dialog,
 /// preventing hover or background notifications at an unchanged revision from switching panels.
 pub fn should_switch_to_chats_on_sidebar_selection(
@@ -523,5 +547,16 @@ mod tests {
         });
         computers.reset_on_logout();
         assert!(computers.tailnet_status.is_none());
+
+        let mut coding_host = ShellCodingHostState::new();
+        coding_host.registered_for_auth_gen = Some(7);
+        coding_host.detected_providers.push(gpui_telegram_proto::DetectedCodingProvider {
+            kind: gpui_telegram_proto::CodingProviderKind::ClaudeCode,
+            installed: true,
+            ..Default::default()
+        });
+        assert!(coding_host.reset_on_logout().is_none());
+        assert!(coding_host.detected_providers.is_empty());
+        assert_eq!(coding_host.registered_for_auth_gen, None);
     }
 }

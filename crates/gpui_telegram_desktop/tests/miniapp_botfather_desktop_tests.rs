@@ -271,6 +271,7 @@ fn build_sample_bot() -> BotRegistryEntry {
         attach_peer_types: vec!["users".into(), "bots".into(), "groups".into()],
         commands: vec![],
         created_at: 1_700_000_000_000,
+        coding_agent: None,
         ..Default::default()
     }
 }
@@ -1280,6 +1281,7 @@ fn build_third_party_shop_bot() -> BotRegistryEntry {
         allows_write_to_pm: false,
         app_tos_accepted: false,
         is_blocked_by_viewer: false,
+        coding_agent: None,
         ..Default::default()
     }
 }
@@ -1676,6 +1678,7 @@ fn headless_body_bot_context_inspector_no_members_tab_and_bot_profile(cx: &mut A
             agent_id: "my-ops-bot".to_string(),
             username: "MyOpsBot".to_string(),
             display_name: "My Ops Bot".to_string(),
+            coding_agent: None,
             ..Default::default()
         }));
         let _owner_main = render_bot_profile_main(insp, TdesktopThemePalette::default(), "zh-CN", icx);
@@ -1709,6 +1712,7 @@ fn headless_body_composer_per_bot_slash_commands_isolation(cx: &mut App) {
         commands: Vec::new(),
         is_fabushi_bot: false,
         menu_button_type: "default".to_string(),
+        coding_agent: None,
         ..Default::default()
     };
 
@@ -1722,6 +1726,7 @@ fn headless_body_composer_per_bot_slash_commands_isolation(cx: &mut App) {
         menu_button_type: "web_app".to_string(),
         menu_button_text: "点单控制台".to_string(),
         menu_button_url: "gpui-miniapp://MyHermesBot/panel".to_string(),
+        coding_agent: None,
         ..Default::default()
     };
 
@@ -1739,6 +1744,7 @@ fn headless_body_composer_per_bot_slash_commands_isolation(cx: &mut App) {
             username: "MyHermesBot".to_string(),
             display_name: "My Hermes Agent".to_string(),
             companion_chat_id: Some(fabushi_cid as i64),
+            coding_agent: None,
             ..Default::default()
         }];
         s.session_sync.rich_chats_by_id.insert(

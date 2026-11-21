@@ -72,6 +72,8 @@ pub struct GatewayHub {
     signaling_hub: Arc<RwLock<Option<Arc<crate::webrtc::signaling_hub::SignalingHub>>>>,
     /// Optional WebMCP Mini App broker for RPC response & human takeover routing
     webmcp_broker: Arc<RwLock<Option<Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>>>>,
+    /// Optional Coding Agent broker for single-device local host dispatch & streaming
+    coding_agent_broker: Arc<RwLock<Option<Arc<crate::coding_agent_broker::CodingAgentBroker>>>>,
     /// Optional CrossNodeEventBus for cluster-wide stateless event fan-out
     event_bus: Arc<RwLock<Option<Arc<dyn crate::bus::CrossNodeEventBus>>>>,
     /// Ordered outbound bus publisher channel
@@ -104,6 +106,7 @@ struct WeakGatewayHub {
     search_indexer: std::sync::Weak<RwLock<Option<Arc<crate::search::tantivy_indexer::TantivyIndexer>>>>,
     signaling_hub: std::sync::Weak<RwLock<Option<Arc<crate::webrtc::signaling_hub::SignalingHub>>>>,
     webmcp_broker: std::sync::Weak<RwLock<Option<Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>>>>,
+    coding_agent_broker: std::sync::Weak<RwLock<Option<Arc<crate::coding_agent_broker::CodingAgentBroker>>>>,
     event_bus: std::sync::Weak<RwLock<Option<Arc<dyn crate::bus::CrossNodeEventBus>>>>,
     outbound_bus_tx: std::sync::Weak<RwLock<Option<mpsc::UnboundedSender<(String, crate::bus::ServerEvent)>>>>,
     bus_tasks: std::sync::Weak<RwLock<Vec<tokio::task::AbortHandle>>>,
@@ -128,6 +131,7 @@ impl WeakGatewayHub {
             search_indexer: self.search_indexer.upgrade()?,
             signaling_hub: self.signaling_hub.upgrade()?,
             webmcp_broker: self.webmcp_broker.upgrade()?,
+            coding_agent_broker: self.coding_agent_broker.upgrade()?,
             event_bus: self.event_bus.upgrade()?,
             outbound_bus_tx: self.outbound_bus_tx.upgrade()?,
             bus_tasks: self.bus_tasks.upgrade()?,
@@ -174,6 +178,7 @@ impl Default for GatewayHub {
             search_indexer: Arc::new(RwLock::new(None)),
             signaling_hub: Arc::new(RwLock::new(None)),
             webmcp_broker: Arc::new(RwLock::new(None)),
+            coding_agent_broker: Arc::new(RwLock::new(None)),
             event_bus: Arc::new(RwLock::new(None)),
             outbound_bus_tx: Arc::new(RwLock::new(None)),
             bus_tasks,
@@ -226,6 +231,13 @@ impl GatewayHub {
 
     pub fn set_webmcp_broker(&self, broker: Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>) {
         *self.webmcp_broker.write() = Some(broker);
+    }
+
+    pub fn set_coding_agent_broker(
+        &self,
+        broker: Arc<crate::coding_agent_broker::CodingAgentBroker>,
+    ) {
+        *self.coding_agent_broker.write() = Some(broker);
     }
 
     pub fn has_connected_user(&self, user_id: UserId) -> bool {
@@ -338,6 +350,9 @@ impl GatewayHub {
         let old_webmcp = self.webmcp_broker.write().take();
         drop(old_webmcp);
 
+        let old_coding = self.coding_agent_broker.write().take();
+        drop(old_coding);
+
         let old_bus = self.event_bus.write().take();
         drop(old_bus);
 
@@ -356,6 +371,7 @@ impl GatewayHub {
             search_indexer: Arc::downgrade(&self.search_indexer),
             signaling_hub: Arc::downgrade(&self.signaling_hub),
             webmcp_broker: Arc::downgrade(&self.webmcp_broker),
+            coding_agent_broker: Arc::downgrade(&self.coding_agent_broker),
             event_bus: Arc::downgrade(&self.event_bus),
             outbound_bus_tx: Arc::downgrade(&self.outbound_bus_tx),
             bus_tasks: Arc::downgrade(&self.bus_tasks),
@@ -604,6 +620,83 @@ impl GatewayHub {
             .get(&user_id)
             .map(|list| list.iter().filter(|e| !e.sender.is_closed()).count())
             .unwrap_or(0)
+    }
+
+    /// Returns true if `user_id` currently has an open socket for `session_id`.
+    pub fn has_user_session(&self, user_id: UserId, session_id: &str) -> bool {
+        self.subscribers
+            .read()
+            .get(&user_id)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| !e.sender.is_closed() && e.session_id.as_deref() == Some(session_id))
+            })
+    }
+
+    /// Sends a frame strictly to a single active socket matching `session_id`.
+    pub fn send_to_user_session(
+        &self,
+        user_id: UserId,
+        session_id: &str,
+        frame: WsServerFrame,
+    ) -> bool {
+        let mut subs = self.subscribers.write();
+        let Some(entries) = subs.get_mut(&user_id) else {
+            return false;
+        };
+        entries.retain(|e| !e.sender.is_closed());
+        if let Some(pos) = entries
+            .iter()
+            .rposition(|e| e.session_id.as_deref() == Some(session_id))
+        {
+            if entries[pos].sender.send(frame).is_ok() {
+                return true;
+            }
+            entries.remove(pos);
+        }
+        if entries.is_empty() {
+            subs.remove(&user_id);
+        }
+        false
+    }
+
+    /// Sends a frame to at most ONE active WS connection of `user_id` (preferring `preferred_session_id`),
+    /// returning `Some(delivered_session_id)` or `None` if offline. Never broadcasts to all devices.
+    pub fn send_to_single_user_connection(
+        &self,
+        user_id: UserId,
+        preferred_session_id: Option<&str>,
+        frame: WsServerFrame,
+    ) -> Option<Option<String>> {
+        let mut subs = self.subscribers.write();
+        let entries = subs.get_mut(&user_id)?;
+        entries.retain(|e| !e.sender.is_closed());
+        if entries.is_empty() {
+            subs.remove(&user_id);
+            return None;
+        }
+        if let Some(pref) = preferred_session_id {
+            if let Some(pos) = entries
+                .iter()
+                .rposition(|e| e.session_id.as_deref() == Some(pref))
+            {
+                let sid = entries[pos].session_id.clone();
+                if entries[pos].sender.send(frame.clone()).is_ok() {
+                    return Some(sid);
+                }
+                entries.remove(pos);
+            }
+        }
+        while let Some(last) = entries.pop() {
+            let sid = last.session_id.clone();
+            if last.sender.send(frame.clone()).is_ok() {
+                entries.push(last);
+                return Some(sid);
+            }
+        }
+        subs.remove(&user_id);
+        None
     }
 
     /// Total count of all active WebSocket connections across all users
@@ -925,6 +1018,17 @@ impl GatewayHub {
     pub fn handle_client_frame(
         &self,
         user_id: UserId,
+        frame: WsClientFrame,
+        reply_tx: &mpsc::UnboundedSender<WsServerFrame>,
+    ) {
+        self.handle_client_frame_with_session(user_id, None, frame, reply_tx);
+    }
+
+    /// Handle incoming client WebSocket frame with the socket's session_id context
+    pub fn handle_client_frame_with_session(
+        &self,
+        user_id: UserId,
+        session_id: Option<&str>,
         frame: WsClientFrame,
         reply_tx: &mpsc::UnboundedSender<WsServerFrame>,
     ) {
@@ -1590,6 +1694,11 @@ impl GatewayHub {
                     broker.handle_takeover_event(user_id, evt);
                 }
             }
+            WsClientFrame::CodingHostEvent(ev) => {
+                if let Some(broker) = self.coding_agent_broker.read().clone() {
+                    broker.handle_host_event(user_id, session_id, ev);
+                }
+            }
         }
     }
 }
@@ -1684,7 +1793,7 @@ pub async fn handle_ws_socket_with_session_weak(
     let (tx, mut rx) = mpsc::unbounded_channel::<WsServerFrame>();
     let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
-    hub.register_session(user_id, session_id, tx.clone());
+    hub.register_session(user_id, session_id.clone(), tx.clone());
     hub.broadcast_user_status(user_id, true);
     let sig_task = if let Some(sh) = hub.signaling_hub() {
         let (sig_tx, mut sig_rx) = mpsc::channel::<SignalingFrame>(64);
@@ -1871,7 +1980,12 @@ pub async fn handle_ws_socket_with_session_weak(
                                 if hub.is_shutdown() {
                                     break;
                                 }
-                                hub.handle_client_frame(user_id, client_frame, &tx_clone);
+                                hub.handle_client_frame_with_session(
+                                    user_id,
+                                    session_id.as_deref(),
+                                    client_frame,
+                                    &tx_clone,
+                                );
                             }
                             Err(e) => {
                                 let _ = tx_clone.send(WsServerFrame::Error {
@@ -1904,6 +2018,13 @@ pub async fn handle_ws_socket_with_session_weak(
     drop(cleanup_guard);
     if let Some(hub) = hub_weak.upgrade() {
         hub.unregister_sender(user_id, &tx);
+        if let Some(ref sid) = session_id {
+            if !hub.has_user_session(user_id, sid) {
+                if let Some(broker) = hub.coding_agent_broker.read().clone() {
+                    broker.mark_session_disconnected(user_id, sid);
+                }
+            }
+        }
         if !hub.is_shutdown() && hub.user_connection_count(user_id) == 0 {
             hub.broadcast_user_status(user_id, false);
             if let Some(sh) = hub.signaling_hub() {

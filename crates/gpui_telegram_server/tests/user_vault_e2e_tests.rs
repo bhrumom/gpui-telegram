@@ -567,6 +567,7 @@ async fn test_skip_server_bot_reply_and_archive_local_bot_reply_e2e() {
             thinking_level: None,
             approval_mode: None,
             toolset_preset: None,
+            coding_agent: None,
         })
         .send()
         .await

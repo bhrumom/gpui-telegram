@@ -79,6 +79,7 @@ pub struct AppState {
     pub user_active_talk_sessions: Arc<RwLock<HashMap<UserId, String>>>,
     pub fabushi_bots: Arc<gpui_telegram_agent::fabushi_bot::FabushiBotHost>,
     pub webmcp_broker: Arc<crate::miniapp_webmcp::MiniAppWebMcpBroker>,
+    pub coding_agent_broker: Arc<crate::coding_agent_broker::CodingAgentBroker>,
     pub self_weak: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
     pub computers: Arc<crate::routes::computers::ComputerControlService>,
     pub tailnet: Arc<crate::routes::tailnet::TailnetCoordService>,
@@ -337,6 +338,10 @@ impl AppState {
             Arc::downgrade(&gateway_hub),
             self_weak.clone(),
         ));
+        let coding_agent_broker = Arc::new(crate::coding_agent_broker::CodingAgentBroker::new(
+            Arc::downgrade(&gateway_hub),
+            self_weak.clone(),
+        ));
         let im_bridge = Arc::new(crate::hermes_im_bridge::ServerPlatformImBridge::new(
             db.clone(),
             message_pipeline.clone(),
@@ -353,6 +358,7 @@ impl AppState {
         gateway_hub.set_search_indexer(search_indexer.clone());
         gateway_hub.set_signaling_hub(signaling_hub.clone());
         gateway_hub.set_webmcp_broker(webmcp_broker.clone());
+        gateway_hub.set_coding_agent_broker(coding_agent_broker.clone());
 
         let teammate_bridge = Arc::new(ServerFabushiTeammateBridge {
             db: db.clone(),
@@ -530,6 +536,7 @@ impl AppState {
             user_active_talk_sessions: Arc::new(RwLock::new(HashMap::new())),
             fabushi_bots,
             webmcp_broker,
+            coding_agent_broker,
             self_weak,
             computers,
             tailnet,
@@ -1255,6 +1262,10 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             "/api/v1/fabushi-bots/{bot_id}",
             get(routes::bots_miniapps::fabushi_bot_get)
                 .patch(routes::bots_miniapps::fabushi_bot_patch),
+        )
+        .route(
+            "/api/v1/coding-agents/probe",
+            post(routes::bots_miniapps::coding_agents_probe),
         )
         .route(
             "/api/v1/botfather/nl-create",
@@ -3638,11 +3649,11 @@ pub(crate) fn detect_target_bots_in_chat(
     }
 
     let mut explicit_targets: Vec<UserId> = Vec::new();
-    let mut push_unique = |uid: UserId| {
-        if !explicit_targets.contains(&uid) {
-            explicit_targets.push(uid);
+    fn push_unique(targets: &mut Vec<UserId>, uid: UserId) {
+        if !targets.contains(&uid) {
+            targets.push(uid);
         }
-    };
+    }
 
     if let Some(rid) = reply_to_msg_id {
         if let Ok(Some(orig)) = state.db.get_message(chat_id, rid) {
@@ -3654,24 +3665,35 @@ pub(crate) fn detect_target_bots_in_chat(
                     .flatten()
                     .is_some_and(|u| u.is_bot)
             {
-                push_unique(orig.sender_id);
+                push_unique(&mut explicit_targets, orig.sender_id);
             }
         }
     }
 
+    let handoff_idx = text.to_ascii_lowercase().find("/handoff");
     let mentions = extract_at_mentions(text);
     for token in &mentions {
+        if let Some(h_idx) = handoff_idx {
+            // Do not prematurely invoke `/handoff @target` before the source bot executes `/handoff`.
+            if !explicit_targets.is_empty() {
+                if let Some(tok_pos) = text.find(&format!("@{token}")) {
+                    if tok_pos > h_idx {
+                        continue;
+                    }
+                }
+            }
+        }
         let lower = token.to_ascii_lowercase();
         if (lower == "all" || lower == "everyone") && !bot_members.is_empty() {
             for &buid in &bot_members {
-                push_unique(buid);
+                push_unique(&mut explicit_targets, buid);
             }
             continue;
         }
         if let Some(inst) = state.fabushi_bots.get_by_agent_id_or_username(token) {
             let buid = UserId(inst.bot_user_id as u64);
             if bot_members.is_empty() || bot_members.contains(&buid) {
-                push_unique(buid);
+                push_unique(&mut explicit_targets, buid);
                 continue;
             }
         }
@@ -3693,7 +3715,7 @@ pub(crate) fn detect_target_bots_in_chat(
                         || b.agent_id.eq_ignore_ascii_case(token)
                 });
             if matches_user || matches_reg {
-                push_unique(buid);
+                push_unique(&mut explicit_targets, buid);
             }
         }
     }
@@ -3869,6 +3891,33 @@ pub(crate) async fn maybe_trigger_bot_reply_with_reply_to(
     text: &str,
     reply_to_msg_id: Option<MsgId>,
 ) {
+    let resolved_topic = reply_to_msg_id.and_then(|rid| {
+        state
+            .db
+            .get_message(chat_id, rid)
+            .ok()
+            .flatten()
+            .and_then(|m| m.topic_id)
+    });
+    maybe_trigger_bot_reply_with_context(
+        state,
+        chat_id,
+        sender_id,
+        text,
+        reply_to_msg_id,
+        resolved_topic,
+    )
+    .await;
+}
+
+pub(crate) async fn maybe_trigger_bot_reply_with_context(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    sender_id: UserId,
+    text: &str,
+    reply_to_msg_id: Option<MsgId>,
+    topic_id: Option<TopicId>,
+) {
     let sender_is_bot = state
         .db
         .get_user(sender_id)
@@ -3887,97 +3936,168 @@ pub(crate) async fn maybe_trigger_bot_reply_with_reply_to(
     }
 
     let targets = detect_target_bots_in_chat(state, chat_id, sender_id, text, reply_to_msg_id);
-    let vk = state.agent_capability_key.verifying_key();
-    let now_ts = Utc::now().timestamp();
     for bot_user_id in targets {
-        if state
-            .db
-            .get_bot_by_user_id(bot_user_id.0 as i64)
-            .ok()
-            .flatten()
-            .is_some_and(|b| b.is_standard_bot)
-        {
-            continue;
-        }
-        let agent_key = format!("bot_{}", bot_user_id.0);
-        let tok = gpui_telegram_agent::ScopedCapabilityToken::issue(
-            &state.agent_capability_key,
-            &agent_key,
-            chat_id.0,
-            vec!["chat:write".into()],
-            120,
-        );
-        if !tok.verify_for_scope(&vk, now_ts, &agent_key, chat_id.0, "chat:write") {
-            continue;
-        }
-        let (granted, queued_cnt, hops) = {
-            let mut groups = state.multi_agent_groups.write();
-            let room = groups
-                .entry(chat_id)
-                .or_insert_with(|| GroupMultiAgentRoom::new(chat_id));
-            let Ok(hop) = room.loop_budget.record_hop(&agent_key) else {
-                continue;
-            };
-            let prio = if sender_is_bot {
-                gpui_telegram_agent::FloorPriority::TaskAssignee
-            } else {
-                gpui_telegram_agent::FloorPriority::DirectMention
-            };
-            let ok = room.floor.request_floor(&agent_key, prio);
-            (ok, room.floor.queued_count(), hop)
+        let prio = if sender_is_bot {
+            gpui_telegram_agent::FloorPriority::TaskAssignee
+        } else {
+            gpui_telegram_agent::FloorPriority::DirectMention
         };
-        if let Ok((_, pts_update)) = state.pts_engine.advance_pts(
-            chat_id,
-            0,
-            gpui_telegram_proto::sync::UpdateEvent::AgentFloorChanged {
-                chat_id,
-                current_speaker: if granted { Some(agent_key.clone()) } else { None },
-                queued_count: queued_cnt,
-                loop_hops: hops,
-            },
-        ) {
-            state.gateway_hub.broadcast_to_chat_and_members(
-                chat_id,
-                None,
-                gpui_telegram_proto::ws::WsServerFrame::PtsPush(pts_update),
-            );
-        }
-        let mut has_floor = granted;
-        if !has_floor {
-            for _ in 0..200 {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                let mut groups = state.multi_agent_groups.write();
-                if let Some(room) = groups.get_mut(&chat_id) {
-                    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
-                    room.floor.drain_expired_leases(now_ms);
-                    if room.floor.current_speaker() == Some(agent_key.as_str()) {
-                        has_floor = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !has_floor {
-            let mut groups = state.multi_agent_groups.write();
-            if let Some(room) = groups.get_mut(&chat_id) {
-                room.floor.cancel_request(&agent_key);
-            }
-            continue;
-        }
-        let _floor_guard = FloorReleaseGuard {
-            groups: Arc::clone(&state.multi_agent_groups),
-            chat_id,
-            agent_id: agent_key.clone(),
-        };
-        crate::routes::bots_miniapps::handle_ai_bot_reply(
+        dispatch_bot_turn_with_floor_and_budget(
             state,
             chat_id,
             sender_id,
             bot_user_id,
             text,
+            topic_id,
+            prio,
         )
         .await;
     }
+}
+
+pub(crate) async fn dispatch_bot_handoff_to_target(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    human_initiator: UserId,
+    from_agent_label: &str,
+    target_bot_id: UserId,
+    target_agent_label: &str,
+    handoff_text: &str,
+    topic_id: Option<TopicId>,
+) {
+    let hop_info = {
+        let mut groups = state.multi_agent_groups.write();
+        let room = groups
+            .entry(chat_id)
+            .or_insert_with(|| GroupMultiAgentRoom::new(chat_id));
+        room.loop_budget.current_hop()
+    };
+    if hop_info >= gpui_telegram_agent::DEFAULT_MAX_LOOP_HOPS {
+        return;
+    }
+    if let Ok((_, pts_update)) = state.pts_engine.advance_pts(
+        chat_id,
+        0,
+        gpui_telegram_proto::sync::UpdateEvent::AgentHandoffEvent {
+            chat_id,
+            from_agent: from_agent_label.to_string(),
+            to_agent: target_agent_label.to_string(),
+            hop: hop_info + 1,
+            max_hops: gpui_telegram_agent::DEFAULT_MAX_LOOP_HOPS,
+        },
+    ) {
+        state.gateway_hub.broadcast_to_chat_and_members(
+            chat_id,
+            None,
+            gpui_telegram_proto::ws::WsServerFrame::PtsPush(pts_update),
+        );
+    }
+    dispatch_bot_turn_with_floor_and_budget(
+        state,
+        chat_id,
+        human_initiator,
+        target_bot_id,
+        handoff_text,
+        topic_id,
+        gpui_telegram_agent::FloorPriority::TaskAssignee,
+    )
+    .await;
+}
+
+async fn dispatch_bot_turn_with_floor_and_budget(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    sender_id: UserId,
+    bot_user_id: UserId,
+    text: &str,
+    topic_id: Option<TopicId>,
+    prio: gpui_telegram_agent::FloorPriority,
+) {
+    if state
+        .db
+        .get_bot_by_user_id(bot_user_id.0 as i64)
+        .ok()
+        .flatten()
+        .is_some_and(|b| b.is_standard_bot)
+    {
+        return;
+    }
+    let vk = state.agent_capability_key.verifying_key();
+    let now_ts = Utc::now().timestamp();
+    let agent_key = format!("bot_{}", bot_user_id.0);
+    let tok = gpui_telegram_agent::ScopedCapabilityToken::issue(
+        &state.agent_capability_key,
+        &agent_key,
+        chat_id.0,
+        vec!["chat:write".into()],
+        120,
+    );
+    if !tok.verify_for_scope(&vk, now_ts, &agent_key, chat_id.0, "chat:write") {
+        return;
+    }
+    let (granted, queued_cnt, hops) = {
+        let mut groups = state.multi_agent_groups.write();
+        let room = groups
+            .entry(chat_id)
+            .or_insert_with(|| GroupMultiAgentRoom::new(chat_id));
+        let Ok(hop) = room.loop_budget.record_hop(&agent_key) else {
+            return;
+        };
+        let ok = room.floor.request_floor(&agent_key, prio);
+        (ok, room.floor.queued_count(), hop)
+    };
+    if let Ok((_, pts_update)) = state.pts_engine.advance_pts(
+        chat_id,
+        0,
+        gpui_telegram_proto::sync::UpdateEvent::AgentFloorChanged {
+            chat_id,
+            current_speaker: if granted { Some(agent_key.clone()) } else { None },
+            queued_count: queued_cnt,
+            loop_hops: hops,
+        },
+    ) {
+        state.gateway_hub.broadcast_to_chat_and_members(
+            chat_id,
+            None,
+            gpui_telegram_proto::ws::WsServerFrame::PtsPush(pts_update),
+        );
+    }
+    let mut has_floor = granted;
+    if !has_floor {
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let mut groups = state.multi_agent_groups.write();
+            if let Some(room) = groups.get_mut(&chat_id) {
+                let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+                room.floor.drain_expired_leases(now_ms);
+                if room.floor.current_speaker() == Some(agent_key.as_str()) {
+                    has_floor = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !has_floor {
+        let mut groups = state.multi_agent_groups.write();
+        if let Some(room) = groups.get_mut(&chat_id) {
+            room.floor.cancel_request(&agent_key);
+        }
+        return;
+    }
+    let _floor_guard = FloorReleaseGuard {
+        groups: Arc::clone(&state.multi_agent_groups),
+        chat_id,
+        agent_id: agent_key.clone(),
+    };
+    Box::pin(crate::routes::bots_miniapps::handle_ai_bot_reply_in_topic(
+        state,
+        chat_id,
+        sender_id,
+        bot_user_id,
+        text,
+        topic_id,
+    ))
+    .await;
 }
 
 /// Returns true if `chat_id` is in the reserved `700_000_000..750_000_000` range for per-user
@@ -5512,6 +5632,28 @@ async fn chats_agent_runs(
                 "Only bot owner or server admin can run bot config/memory/soul/skill commands",
             );
         }
+    }
+
+    if let Some(coding_bot) = state
+        .db
+        .get_bot_by_user_id(bot_user_id.0 as i64)
+        .ok()
+        .flatten()
+        .filter(|b| b.coding_agent_config().is_some())
+    {
+        let cfg = coding_bot.coding_agent_config().unwrap();
+        if auth.user_id.0 as i64 != coding_bot.owner_user_id && !cfg.allow_group_members {
+            return crate::routes::err_resp(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "🔒 该编程智能体仅限所有者操作（可在 Bot 设置中开启群成员权限）。",
+            );
+        }
+        return crate::routes::err_resp(
+            StatusCode::BAD_REQUEST,
+            "coding_agent_local_only",
+            "Coding Agent Bots execute on the bound local desktop host via chat messages",
+        );
     }
 
     let typing_guard =

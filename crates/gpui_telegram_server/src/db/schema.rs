@@ -775,6 +775,7 @@ pub const ALL_MIGRATIONS: &[&str] = &[
     MIGRATION_V35_SCOPE_ISOLATED_KEYS,
     MIGRATION_V36_USER_VAULT,
     MIGRATION_V37_SPLIT_KEY_AND_DEVICE_SYNC,
+    crate::db::schema_parity_extra::MIGRATION_V38_CODING_AGENT_BOTS,
 ];
 
 // --- Database Row Representation Models ---

@@ -449,6 +449,7 @@ mod tests {
                 display_name: title.to_string(),
                 allow_attach_menu: true,
                 attach_peer_types: vec!["private".to_string(), "group".to_string()],
+                coding_agent: None,
                 ..Default::default()
             },
             companion_chat_id: 600_000_001,

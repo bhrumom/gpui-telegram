@@ -160,6 +160,7 @@ pub enum WsClientFrame {
     },
     MiniAppWebMcpResult(crate::miniapp_contracts::MiniAppWebMcpResponse),
     MiniAppTakeoverState(crate::miniapp_contracts::MiniAppTakeoverEvent),
+    CodingHostEvent(crate::coding_agent_contracts::CodingHostEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

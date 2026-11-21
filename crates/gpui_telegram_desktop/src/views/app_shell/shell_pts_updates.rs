@@ -1225,6 +1225,9 @@ impl AppShell {
             UpdateEvent::MiniAppWebMcpCommand(cmd) => {
                 self.launch_miniapp_for_webmcp(cmd, cx);
             }
+            UpdateEvent::CodingHostCommand(cmd) => {
+                self.handle_coding_host_command(cmd, cx);
+            }
             UpdateEvent::MiniAppControlStatus {
                 bot_username,
                 short_name,

@@ -60,6 +60,20 @@ pub struct BotRegistryRecord {
     pub webhook_url: String,
     pub webhook_secret_token: String,
     pub is_standard_bot: bool,
+    pub coding_agent_json: String,
+}
+
+impl BotRegistryRecord {
+    /// Parses the optional `CodingAgentBotConfig` stored in `coding_agent_json`.
+    pub fn coding_agent_config(
+        &self,
+    ) -> Option<gpui_telegram_proto::coding_agent_contracts::CodingAgentBotConfig> {
+        let trimmed = self.coding_agent_json.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_str(trimmed).ok()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,6 +653,7 @@ fn row_to_bot(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotRegistryRecord> {
         webhook_url: row.get::<_, String>(30).unwrap_or_default(),
         webhook_secret_token: row.get::<_, String>(31).unwrap_or_default(),
         is_standard_bot: row.get::<_, i64>(32).unwrap_or(0) != 0,
+        coding_agent_json: row.get::<_, String>(33).unwrap_or_default(),
     })
 }
 
@@ -695,7 +710,7 @@ fn row_to_mini_app_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<MiniAppS
     })
 }
 
-const BOT_COLS: &str = "bot_user_id, owner_user_id, username, display_name, bot_token, description, about, ai_persona, menu_button_text, menu_button_url, is_official, is_inline, allow_attach_menu, attach_peer_types_json, commands_json, created_at, updated_at, agent_id, avatar_shape, avatar_color, preferred_model, thinking_level, approval_mode, toolset_preset, menu_button_type, has_main_app, main_app_short_name, privacy_policy_url, has_settings, can_join_groups, webhook_url, webhook_secret_token, is_standard_bot";
+const BOT_COLS: &str = "bot_user_id, owner_user_id, username, display_name, bot_token, description, about, ai_persona, menu_button_text, menu_button_url, is_official, is_inline, allow_attach_menu, attach_peer_types_json, commands_json, created_at, updated_at, agent_id, avatar_shape, avatar_color, preferred_model, thinking_level, approval_mode, toolset_preset, menu_button_type, has_main_app, main_app_short_name, privacy_policy_url, has_settings, can_join_groups, webhook_url, webhook_secret_token, is_standard_bot, coding_agent_json";
 const MINIAPP_COLS: &str = "app_id, bot_user_id, bot_username, short_name, title, description, category, icon_emoji, web_url, ui_schema_json, peer_types_json, is_published, is_attach_enabled, install_count, created_by_nl, created_at, updated_at, header_color, background_color";
 
 impl ServerDatabase {
@@ -912,8 +927,8 @@ impl ServerDatabase {
                     preferred_model, thinking_level, approval_mode, toolset_preset,
                     menu_button_type, has_main_app, main_app_short_name,
                     privacy_policy_url, has_settings, can_join_groups,
-                    webhook_url, webhook_secret_token, is_standard_bot
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, '["users","bots","groups","channels"]', ?13, ?14, ?14, ?15, ?16, ?17, '', 'medium', 'prompt', 'full', ?18, 0, '', '', 0, 1, '', '', ?19)"#,
+                    webhook_url, webhook_secret_token, is_standard_bot, coding_agent_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, '["users","bots","groups","channels"]', ?13, ?14, ?14, ?15, ?16, ?17, '', 'medium', 'prompt', 'full', ?18, 0, '', '', 0, 1, '', '', ?19, '')"#,
                 params![
                     bot_user_id,
                     owner_user_id,
@@ -1521,6 +1536,27 @@ impl ServerDatabase {
             )
             .map_db()?;
 
+            tx.query_row(
+                &format!("SELECT {BOT_COLS} FROM bots_registry WHERE bot_user_id = ?1"),
+                params![bot_user_id],
+                row_to_bot,
+            )
+            .map_db()
+        })
+    }
+
+    pub fn update_bot_coding_agent_json(
+        &self,
+        bot_user_id: i64,
+        json: &str,
+    ) -> Result<BotRegistryRecord> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.pool.with_transaction(|tx| {
+            tx.execute(
+                "UPDATE bots_registry SET coding_agent_json = ?1, updated_at = ?2 WHERE bot_user_id = ?3",
+                params![json, now_ms, bot_user_id],
+            )
+            .map_db()?;
             tx.query_row(
                 &format!("SELECT {BOT_COLS} FROM bots_registry WHERE bot_user_id = ?1"),
                 params![bot_user_id],
@@ -2621,7 +2657,7 @@ impl ServerDatabase {
                 .prepare(
                     r#"SELECT m.app_id, m.bot_user_id, m.bot_username, m.short_name, m.title, m.description, m.category, m.icon_emoji, m.web_url, m.ui_schema_json, m.peer_types_json, m.is_published, m.is_attach_enabled, m.install_count, m.created_by_nl, m.created_at, m.updated_at, m.header_color, m.background_color,
                               u.user_id, u.app_id, u.bot_user_id, u.companion_chat_id, u.allow_write_access, u.installed_at, u.last_launched_at,
-                              b.bot_user_id, b.owner_user_id, b.username, b.display_name, b.bot_token, b.description, b.about, b.ai_persona, b.menu_button_text, b.menu_button_url, b.is_official, b.is_inline, b.allow_attach_menu, b.attach_peer_types_json, b.commands_json, b.created_at, b.updated_at, b.agent_id, b.avatar_shape, b.avatar_color, b.preferred_model, b.thinking_level, b.approval_mode, b.toolset_preset, b.menu_button_type, b.has_main_app, b.main_app_short_name, b.privacy_policy_url, b.has_settings, b.can_join_groups, b.webhook_url, b.webhook_secret_token, b.is_standard_bot
+                              b.bot_user_id, b.owner_user_id, b.username, b.display_name, b.bot_token, b.description, b.about, b.ai_persona, b.menu_button_text, b.menu_button_url, b.is_official, b.is_inline, b.allow_attach_menu, b.attach_peer_types_json, b.commands_json, b.created_at, b.updated_at, b.agent_id, b.avatar_shape, b.avatar_color, b.preferred_model, b.thinking_level, b.approval_mode, b.toolset_preset, b.menu_button_type, b.has_main_app, b.main_app_short_name, b.privacy_policy_url, b.has_settings, b.can_join_groups, b.webhook_url, b.webhook_secret_token, b.is_standard_bot, b.coding_agent_json
                        FROM user_mini_apps u
                        JOIN mini_apps m ON m.app_id = u.app_id
                        JOIN bots_registry b ON b.bot_user_id = m.bot_user_id
@@ -2711,6 +2747,7 @@ impl ServerDatabase {
                         webhook_url: r.get::<_, String>(56).unwrap_or_default(),
                         webhook_secret_token: r.get::<_, String>(57).unwrap_or_default(),
                         is_standard_bot: r.get::<_, i64>(58).unwrap_or(0) != 0,
+                        coding_agent_json: r.get::<_, String>(59).unwrap_or_default(),
                     };
                     Ok((app, install, bot))
                 })

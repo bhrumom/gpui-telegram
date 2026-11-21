@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS bots_registry (
     allow_attach_menu INTEGER NOT NULL DEFAULT 0,
     attach_peer_types_json TEXT NOT NULL DEFAULT '["users","bots","groups","channels"]',
     commands_json TEXT NOT NULL DEFAULT '[]',
+    coding_agent_json TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
@@ -330,4 +331,8 @@ CREATE TABLE IF NOT EXISTS mini_app_hosted_bundles (
     html_content TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
+"#;
+
+pub const MIGRATION_V38_CODING_AGENT_BOTS: &str = r#"
+ALTER TABLE bots_registry ADD COLUMN coding_agent_json TEXT NOT NULL DEFAULT '';
 "#;

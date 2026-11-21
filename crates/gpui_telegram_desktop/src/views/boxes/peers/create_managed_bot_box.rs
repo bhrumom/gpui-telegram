@@ -20,6 +20,101 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use gpui_telegram_proto::miniapp_contracts::{
     CreateFabushiBotRequest, CLASSIC_INITIALS_AVATAR_SHAPE, GROK_AVATAR_SHAPES,
 };
+use gpui_telegram_proto::{
+    CodingAgentBotConfig, CodingPermissionMode, CodingProviderKind, DetectedCodingProvider,
+};
+
+fn parse_coding_extra_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(q) if ch == q => {
+                quote = None;
+            }
+            Some(_) => {
+                current.push(ch);
+            }
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+            }
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+fn coding_provider_avatar_preset(kind: CodingProviderKind) -> (&'static str, &'static str) {
+    match kind {
+        CodingProviderKind::ClaudeCode => ("squircle", "orange"),
+        CodingProviderKind::Codex => ("hex", "green"),
+        CodingProviderKind::OpenCode => ("blob", "cyan"),
+        CodingProviderKind::CursorCli => ("wedge", "violet"),
+        CodingProviderKind::Antigravity => ("cloud", "blue"),
+        CodingProviderKind::AcpCustom => ("pebble", "magenta"),
+    }
+}
+
+fn format_detected_provider_badge(
+    kind: CodingProviderKind,
+    detected: Option<&DetectedCodingProvider>,
+    lang: &str,
+) -> String {
+    if kind == CodingProviderKind::AcpCustom {
+        if let Some(ver) = detected
+            .and_then(|d| d.version.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return if ver.starts_with('v') || ver.starts_with('V') {
+                format!("✓ {ver}")
+            } else {
+                format!("✓ v{ver}")
+            };
+        }
+        return "Custom ACP".to_string();
+    }
+    if let Some(info) = detected.filter(|d| d.installed) {
+        if let Some(ver) = info
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if ver.starts_with('v') || ver.starts_with('V') {
+                format!("✓ {ver}")
+            } else {
+                format!("✓ v{ver}")
+            }
+        } else {
+            tr_str(lang, "✓ 已安装", "✓ Installed").to_string()
+        }
+    } else {
+        tr_str(lang, "未安装", "Not installed").to_string()
+    }
+}
 
 fn classic_preview_initials(label: &str) -> String {
     let trimmed = label.trim();
@@ -69,7 +164,17 @@ pub struct CreateManagedBotBoxPeers {
     pub is_business_bot: bool,
     pub is_submitting: bool,
     pub is_fabushi_mode: bool,
+    pub is_coding_agent_mode: bool,
     pub is_ai_mode: bool,
+    pub detected_coding_providers: Vec<DetectedCodingProvider>,
+    pub selected_coding_provider: CodingProviderKind,
+    pub coding_workspace_path: String,
+    pub coding_use_worktree: bool,
+    pub coding_permission_mode: CodingPermissionMode,
+    pub coding_executable_override: String,
+    pub coding_extra_args: String,
+    pub coding_allow_group_members: bool,
+    pub coding_bound_device_id: Option<String>,
     pub nl_prompt: String,
     pub active_field: u8,
     pub pending_submit_fabushi: Option<CreateFabushiBotRequest>,
@@ -106,7 +211,17 @@ impl CreateManagedBotBoxPeers {
             is_business_bot: true,
             is_submitting: false,
             is_fabushi_mode: false,
+            is_coding_agent_mode: false,
             is_ai_mode: true,
+            detected_coding_providers: Vec::new(),
+            selected_coding_provider: CodingProviderKind::ClaudeCode,
+            coding_workspace_path: String::new(),
+            coding_use_worktree: false,
+            coding_permission_mode: CodingPermissionMode::Ask,
+            coding_executable_override: String::new(),
+            coding_extra_args: String::new(),
+            coding_allow_group_members: false,
+            coding_bound_device_id: None,
             nl_prompt: String::new(),
             active_field: 0,
             pending_submit_fabushi: None,
@@ -138,7 +253,17 @@ impl CreateManagedBotBoxPeers {
     }
 
     pub fn is_valid(&self) -> bool {
-        if self.is_fabushi_mode {
+        if self.is_coding_agent_mode {
+            !self.bot_name.trim().is_empty()
+                && !self.coding_workspace_path.trim().is_empty()
+                && (self.bot_username.trim().is_empty()
+                    || gpui_telegram_proto::miniapp_contracts::validate_bot_username(
+                        &self.bot_username,
+                    )
+                    .is_ok())
+                && (self.selected_coding_provider != CodingProviderKind::AcpCustom
+                    || !self.coding_executable_override.trim().is_empty())
+        } else if self.is_fabushi_mode {
             !self.bot_name.trim().is_empty()
                 && (self.bot_username.trim().is_empty()
                     || gpui_telegram_proto::miniapp_contracts::validate_bot_username(
@@ -152,8 +277,47 @@ impl CreateManagedBotBoxPeers {
         }
     }
 
+    pub fn set_detected_coding_providers(
+        &mut self,
+        providers: Vec<DetectedCodingProvider>,
+        bound_device_id: Option<String>,
+    ) {
+        self.detected_coding_providers = providers;
+        if let Some(dev) = bound_device_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            if self.coding_bound_device_id.is_none() {
+                self.coding_bound_device_id = Some(dev);
+            }
+        }
+    }
+
+    pub fn select_coding_provider(&mut self, kind: CodingProviderKind) {
+        self.selected_coding_provider = kind;
+        self.bot_name = kind.display_name().to_string();
+        self.bot_username = kind.recommended_username().to_string();
+        let (shape, color) = coding_provider_avatar_preset(kind);
+        self.avatar_shape = shape.to_string();
+        self.avatar_color = color.to_string();
+    }
+
+    pub fn open_coding_agent_creator(&mut self) {
+        self.is_visible = true;
+        self.is_coding_agent_mode = true;
+        self.is_fabushi_mode = false;
+        self.is_ai_mode = false;
+        self.active_field = 10;
+        self.is_submitting = false;
+        self.status_message = None;
+        if self.bot_name.trim().is_empty() && self.bot_username.trim().is_empty() {
+            self.select_coding_provider(self.selected_coding_provider);
+        }
+    }
+
     pub fn open_fabushi_creator(&mut self) {
         self.is_visible = true;
+        self.is_coding_agent_mode = false;
         self.is_fabushi_mode = true;
         self.is_ai_mode = false;
         self.active_field = 1;
@@ -163,6 +327,7 @@ impl CreateManagedBotBoxPeers {
 
     pub fn open_ai_creator(&mut self) {
         self.is_visible = true;
+        self.is_coding_agent_mode = false;
         self.is_fabushi_mode = false;
         self.is_ai_mode = true;
         self.active_field = 0;
@@ -178,8 +343,99 @@ impl CreateManagedBotBoxPeers {
         self.language_id = lang.into();
     }
 
+    pub fn active_field_text(&self) -> &str {
+        if self.is_coding_agent_mode {
+            match self.active_field {
+                11 => &self.bot_name,
+                12 => &self.bot_username,
+                13 => &self.preferred_model,
+                14 => &self.coding_executable_override,
+                15 => &self.coding_extra_args,
+                _ => &self.coding_workspace_path,
+            }
+        } else if self.is_fabushi_mode {
+            match self.active_field {
+                2 => &self.bot_username,
+                3 => &self.description,
+                4 => &self.preferred_model,
+                _ => &self.bot_name,
+            }
+        } else if self.is_ai_mode || self.active_field == 0 {
+            &self.nl_prompt
+        } else {
+            match self.active_field {
+                1 => &self.bot_name,
+                2 => &self.bot_username,
+                _ => &self.bot_token,
+            }
+        }
+    }
+
+    pub fn clear_active_field(&mut self) {
+        if self.is_coding_agent_mode {
+            match self.active_field {
+                11 => self.bot_name.clear(),
+                12 => self.bot_username.clear(),
+                13 => self.preferred_model.clear(),
+                14 => self.coding_executable_override.clear(),
+                15 => self.coding_extra_args.clear(),
+                _ => self.coding_workspace_path.clear(),
+            }
+        } else if self.is_fabushi_mode {
+            match self.active_field {
+                2 => self.bot_username.clear(),
+                3 => self.description.clear(),
+                4 => self.preferred_model.clear(),
+                _ => self.bot_name.clear(),
+            }
+        } else if self.is_ai_mode || self.active_field == 0 {
+            self.nl_prompt.clear();
+        } else {
+            match self.active_field {
+                1 => self.bot_name.clear(),
+                2 => self.bot_username.clear(),
+                _ => self.bot_token.clear(),
+            }
+        }
+    }
+
+    pub fn cycle_active_field(&mut self) {
+        if self.is_coding_agent_mode {
+            self.active_field = match self.active_field {
+                10 => 11,
+                11 => 12,
+                12 => 13,
+                13 => 14,
+                14 => 15,
+                _ => 10,
+            };
+        } else if self.is_fabushi_mode {
+            self.active_field = match self.active_field {
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                _ => 1,
+            };
+        } else if !self.is_ai_mode {
+            self.active_field = match self.active_field {
+                1 => 2,
+                2 => 3,
+                _ => 1,
+            };
+        }
+    }
+
     pub fn push_text(&mut self, s: &str) {
-        if self.is_fabushi_mode {
+        if self.is_coding_agent_mode {
+            match self.active_field {
+                11 => self.bot_name.push_str(s),
+                12 => self.bot_username.push_str(s),
+                13 => self.preferred_model.push_str(s),
+                14 => self.coding_executable_override.push_str(s),
+                15 => self.coding_extra_args.push_str(s),
+                _ => self.coding_workspace_path.push_str(s),
+            }
+        } else if self.is_fabushi_mode {
             match self.active_field {
                 2 => self.bot_username.push_str(s),
                 3 => self.description.push_str(s),
@@ -198,7 +454,28 @@ impl CreateManagedBotBoxPeers {
     }
 
     pub fn backspace(&mut self) {
-        if self.is_fabushi_mode {
+        if self.is_coding_agent_mode {
+            match self.active_field {
+                11 => {
+                    self.bot_name.pop();
+                }
+                12 => {
+                    self.bot_username.pop();
+                }
+                13 => {
+                    self.preferred_model.pop();
+                }
+                14 => {
+                    self.coding_executable_override.pop();
+                }
+                15 => {
+                    self.coding_extra_args.pop();
+                }
+                _ => {
+                    self.coding_workspace_path.pop();
+                }
+            }
+        } else if self.is_fabushi_mode {
             match self.active_field {
                 2 => {
                     self.bot_username.pop();
@@ -231,17 +508,68 @@ impl CreateManagedBotBoxPeers {
     }
 
     pub fn submit(&mut self) {
-        if self.is_fabushi_mode {
+        let opt_str = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+        if self.is_coding_agent_mode {
+            if self.is_valid() {
+                self.status_message = None;
+                self.is_submitting = true;
+                let (av_shape, av_color) = self.effective_avatar_choice();
+                let model_override = opt_str(&self.preferred_model);
+                let bound_device_id = self
+                    .coding_bound_device_id
+                    .as_deref()
+                    .and_then(opt_str);
+                let config = CodingAgentBotConfig {
+                    provider_kind: self.selected_coding_provider,
+                    workspace_path: self.coding_workspace_path.trim().to_string(),
+                    use_worktree: self.coding_use_worktree,
+                    permission_mode: self.coding_permission_mode,
+                    executable_override: opt_str(&self.coding_executable_override),
+                    extra_args: parse_coding_extra_args(&self.coding_extra_args),
+                    bound_device_id,
+                    bound_node_id: None,
+                    model_override: model_override.clone(),
+                    allow_group_members: self.coding_allow_group_members,
+                };
+                self.pending_submit_fabushi = Some(CreateFabushiBotRequest {
+                    display_name: self.bot_name.trim().to_string(),
+                    username: opt_str(&self.bot_username),
+                    agent_id: None,
+                    description: format!(
+                        "Local {} coding agent ({})",
+                        self.selected_coding_provider.display_name(),
+                        self.coding_workspace_path.trim()
+                    ),
+                    title: String::new(),
+                    avatar_shape: av_shape,
+                    avatar_color: av_color,
+                    preferred_model: model_override,
+                    thinking_level: None,
+                    approval_mode: None,
+                    toolset_preset: None,
+                    coding_agent: Some(config),
+                });
+            } else {
+                self.status_message = Some(if self.coding_workspace_path.trim().is_empty() {
+                    "请填写本地工作区路径 (Workspace Path)".to_string()
+                } else if self.selected_coding_provider == CodingProviderKind::AcpCustom
+                    && self.coding_executable_override.trim().is_empty()
+                {
+                    "Custom ACP 需要填写可执行命令路径".to_string()
+                } else {
+                    "请检查机器人名称与 @username 格式".to_string()
+                });
+            }
+        } else if self.is_fabushi_mode {
             if self.is_valid() {
                 self.is_submitting = true;
-                let opt_str = |s: &str| {
-                    let t = s.trim();
-                    if t.is_empty() {
-                        None
-                    } else {
-                        Some(t.to_string())
-                    }
-                };
                 let (av_shape, av_color) = self.effective_avatar_choice();
                 self.pending_submit_fabushi = Some(CreateFabushiBotRequest {
                     display_name: self.bot_name.trim().to_string(),
@@ -255,6 +583,7 @@ impl CreateManagedBotBoxPeers {
                     thinking_level: Some(self.thinking_level.clone()),
                     approval_mode: Some(self.approval_mode.clone()),
                     toolset_preset: Some("full".to_string()),
+                    coding_agent: None,
                 });
             }
         } else if self.is_ai_mode {
@@ -598,6 +927,341 @@ impl CreateManagedBotBoxPeers {
                     .child(right_controls),
             )
     }
+
+    fn render_coding_agent_panel(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let provider_pills = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(5.0))
+            .children(CodingProviderKind::ALL.into_iter().enumerate().map(|(idx, kind)| {
+                let active = self.selected_coding_provider == kind;
+                let detected = self
+                    .detected_coding_providers
+                    .iter()
+                    .find(|p| p.kind == kind);
+                let installed = kind == CodingProviderKind::AcpCustom
+                    || detected.is_some_and(|d| d.installed);
+                let badge = format_detected_provider_badge(kind, detected, lang);
+                let badge_color = if active {
+                    0xFFFFFF
+                } else if installed {
+                    pal.success
+                } else {
+                    pal.text_secondary
+                };
+                div()
+                    .id(SharedString::from(format!("coding-provider-pill-{idx}")))
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(if active { pal.accent } else { pal.card_bg }))
+                    .border_1()
+                    .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.select_coding_provider(kind);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if active { 0xFFFFFF } else { pal.text_primary }))
+                            .child(kind.display_name()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(badge_color))
+                            .child(badge),
+                    )
+            }));
+
+        let exec_label = if self.selected_coding_provider == CodingProviderKind::AcpCustom {
+            tr_str(
+                lang,
+                "ACP 可执行命令路径 *",
+                "ACP Executable Path *",
+            )
+        } else {
+            tr_str(
+                lang,
+                "自定义可执行文件覆盖（可选）",
+                "Executable Override (optional)",
+            )
+        };
+        let coding_fields: [(u8, &str, &str, String); 6] = [
+            (
+                10,
+                tr_str(lang, "工作区本地目录 *", "Local Workspace Path *"),
+                tr_str(
+                    lang,
+                    "例如：/Users/dev/project",
+                    "e.g. /Users/dev/project",
+                ),
+                self.coding_workspace_path.clone(),
+            ),
+            (
+                11,
+                tr_str(lang, "智能体名称 *", "Agent Name *"),
+                tr_str(lang, "例如：Claude Code", "e.g. Claude Code"),
+                self.bot_name.clone(),
+            ),
+            (
+                12,
+                tr_str(
+                    lang,
+                    "@用户名（可选，留空自动生成）",
+                    "@username (optional, auto *_bot)",
+                ),
+                self.selected_coding_provider.recommended_username(),
+                self.bot_username.clone(),
+            ),
+            (
+                13,
+                tr_str(lang, "模型覆盖（可选）", "Model Override (optional)"),
+                tr_str(lang, "留空使用 CLI 默认模型", "Leave blank for provider default"),
+                self.preferred_model.clone(),
+            ),
+            (
+                14,
+                exec_label,
+                self.selected_coding_provider
+                    .default_binary()
+                    .unwrap_or("/path/to/acp-agent"),
+                self.coding_executable_override.clone(),
+            ),
+            (
+                15,
+                tr_str(lang, "额外 CLI 参数（可选）", "Extra CLI Args (optional)"),
+                "--verbose",
+                self.coding_extra_args.clone(),
+            ),
+        ];
+
+        let permission_pills = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(lang, "权限模式:", "Permission:")),
+            )
+            .children(
+                [
+                    CodingPermissionMode::Ask,
+                    CodingPermissionMode::AutoEdit,
+                    CodingPermissionMode::FullAccess,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(idx, mode)| {
+                    let active = self.coding_permission_mode == mode;
+                    let label = if lang.starts_with("zh") {
+                        mode.label_zh()
+                    } else {
+                        mode.label_en()
+                    };
+                    div()
+                        .id(SharedString::from(format!("coding-perm-pick-{idx}")))
+                        .cursor_pointer()
+                        .px(px(7.0))
+                        .py(px(3.0))
+                        .rounded(px(6.0))
+                        .bg(rgb(if active { pal.accent } else { pal.card_bg }))
+                        .border_1()
+                        .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
+                        .text_size(px(10.5))
+                        .font_weight(if active {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(rgb(if active { 0xFFFFFF } else { pal.text_primary }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.coding_permission_mode = mode;
+                                cx.notify();
+                            }),
+                        )
+                        .child(label)
+                }),
+            );
+
+        let toggles_row = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id("coding-worktree-toggle")
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(if self.coding_use_worktree {
+                        pal.accent
+                    } else {
+                        pal.card_bg
+                    }))
+                    .border_1()
+                    .border_color(rgb(if self.coding_use_worktree {
+                        pal.accent
+                    } else {
+                        pal.border_fg
+                    }))
+                    .text_size(px(10.5))
+                    .text_color(rgb(if self.coding_use_worktree {
+                        0xFFFFFF
+                    } else {
+                        pal.text_primary
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.coding_use_worktree = !this.coding_use_worktree;
+                            cx.notify();
+                        }),
+                    )
+                    .child(if self.coding_use_worktree {
+                        tr_str(lang, "✓ Git Worktree 隔离", "✓ Git Worktree Isolation")
+                    } else {
+                        tr_str(lang, "Git Worktree 隔离（关）", "Git Worktree Isolation (Off)")
+                    }),
+            )
+            .child(
+                div()
+                    .id("coding-group-members-toggle")
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(if self.coding_allow_group_members {
+                        pal.accent
+                    } else {
+                        pal.card_bg
+                    }))
+                    .border_1()
+                    .border_color(rgb(if self.coding_allow_group_members {
+                        pal.accent
+                    } else {
+                        pal.border_fg
+                    }))
+                    .text_size(px(10.5))
+                    .text_color(rgb(if self.coding_allow_group_members {
+                        0xFFFFFF
+                    } else {
+                        pal.text_primary
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.coding_allow_group_members = !this.coding_allow_group_members;
+                            cx.notify();
+                        }),
+                    )
+                    .child(if self.coding_allow_group_members {
+                        tr_str(lang, "✓ 允许群成员触发", "✓ Allow Group Members")
+                    } else {
+                        tr_str(lang, "仅所有者可操作", "Owner Only")
+                    }),
+            )
+            .when_some(self.coding_bound_device_id.clone(), |row, dev_id| {
+                row.child(
+                    div()
+                        .px(px(7.0))
+                        .py(px(3.0))
+                        .rounded(px(6.0))
+                        .bg(rgb(pal.input_bg))
+                        .border_1()
+                        .border_color(rgb(pal.border_fg))
+                        .text_size(px(10.0))
+                        .text_color(rgb(pal.text_secondary))
+                        .child(format!(
+                            "{}: {}",
+                            tr_str(lang, "绑定设备", "Host"),
+                            dev_id
+                        )),
+                )
+            });
+
+        div()
+            .id("create-coding-agent-scroll")
+            .max_h(px(330.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        lang,
+                        "选择本地 Coding CLI / ACP 提供方",
+                        "Select Local Coding CLI / ACP Provider",
+                    )),
+            )
+            .child(provider_pills)
+            .children(coding_fields.into_iter().map(|(fid, label, placeholder, val)| {
+                let active = self.active_field == fid;
+                div()
+                    .id(("coding-field", fid as u64))
+                    .cursor_pointer()
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(pal.input_bg))
+                    .border_1()
+                    .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.active_field = fid;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(pal.text_secondary))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(if val.is_empty() {
+                                pal.text_secondary
+                            } else {
+                                pal.text_primary
+                            }))
+                            .child(if val.is_empty() {
+                                placeholder.to_string()
+                            } else {
+                                val
+                            }),
+                    )
+            }))
+            .child(permission_pills)
+            .child(toggles_row)
+    }
 }
 
 impl Render for CreateManagedBotBoxPeers {
@@ -607,10 +1271,11 @@ impl Render for CreateManagedBotBoxPeers {
         }
         let pal = self.palette;
         let lang = self.language_id.as_str();
-        let is_fabushi = self.is_fabushi_mode;
-        let is_ai = self.is_ai_mode && !is_fabushi;
+        let is_coding = self.is_coding_agent_mode;
+        let is_fabushi = self.is_fabushi_mode && !is_coding;
+        let is_ai = self.is_ai_mode && !is_coding && !is_fabushi;
         let prompt = self.nl_prompt.clone();
-        let can_submit = if is_fabushi {
+        let can_submit = if is_coding || is_fabushi {
             self.is_valid() && !self.is_submitting
         } else if is_ai {
             !prompt.trim().is_empty() && !self.is_submitting
@@ -632,7 +1297,7 @@ impl Render for CreateManagedBotBoxPeers {
 
         div()
             .id("create-managed-bot-modal")
-            .w(self.width)
+            .w(if is_coding { px(560.0) } else { self.width })
             .min_h(self.height)
             .p(px(16.0))
             .rounded(px(14.0))
@@ -660,7 +1325,9 @@ impl Render for CreateManagedBotBoxPeers {
                                     .text_size(px(15.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(rgb(pal.text_primary))
-                                    .child(if is_fabushi {
+                                    .child(if is_coding {
+                                        tr_str(lang, "新建编程智能体 (Coding Agent)", "New Coding Agent Bot")
+                                    } else if is_fabushi {
                                         tr_str(lang, "新建 Fabushi Bot 智能体", "New Fabushi Bot Agent")
                                     } else if is_ai {
                                         tr_str(lang, "BotFather · AI 快速创建", "BotFather · AI Bot & Mini App")
@@ -687,7 +1354,7 @@ impl Render for CreateManagedBotBoxPeers {
             .child(
                 div()
                     .flex()
-                    .gap(px(6.0))
+                    .gap(px(5.0))
                     .child(
                         div()
                             .id("create-bot-tab-fabushi")
@@ -698,16 +1365,36 @@ impl Render for CreateManagedBotBoxPeers {
                             .bg(rgb(if is_fabushi { pal.accent } else { pal.card_bg }))
                             .flex()
                             .justify_center()
-                            .text_size(px(12.0))
+                            .text_size(px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_fabushi { 0xFFFFFF } else { pal.text_primary }))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.is_coding_agent_mode = false;
                                 this.is_fabushi_mode = true;
                                 this.is_ai_mode = false;
                                 this.active_field = 1;
                                 cx.notify();
                             }))
-                            .child(tr_str(lang, "✦ Fabushi 智能体", "✦ Fabushi Agent")),
+                            .child(tr_str(lang, "✦ Fabushi", "✦ Fabushi")),
+                    )
+                    .child(
+                        div()
+                            .id("create-bot-tab-coding")
+                            .cursor_pointer()
+                            .flex_1()
+                            .py(px(6.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(if is_coding { pal.accent } else { pal.card_bg }))
+                            .flex()
+                            .justify_center()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if is_coding { 0xFFFFFF } else { pal.text_primary }))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.open_coding_agent_creator();
+                                cx.notify();
+                            }))
+                            .child(tr_str(lang, "💻 编程智能体", "💻 Coding Agent")),
                     )
                     .child(
                         div()
@@ -719,10 +1406,11 @@ impl Render for CreateManagedBotBoxPeers {
                             .bg(rgb(if is_ai { pal.accent } else { pal.card_bg }))
                             .flex()
                             .justify_center()
-                            .text_size(px(12.0))
+                            .text_size(px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_ai { 0xFFFFFF } else { pal.text_primary }))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.is_coding_agent_mode = false;
                                 this.is_fabushi_mode = false;
                                 this.is_ai_mode = true;
                                 this.active_field = 0;
@@ -737,13 +1425,14 @@ impl Render for CreateManagedBotBoxPeers {
                             .flex_1()
                             .py(px(6.0))
                             .rounded(px(8.0))
-                            .bg(rgb(if !is_fabushi && !is_ai { pal.accent } else { pal.card_bg }))
+                            .bg(rgb(if !is_coding && !is_fabushi && !is_ai { pal.accent } else { pal.card_bg }))
                             .flex()
                             .justify_center()
-                            .text_size(px(12.0))
+                            .text_size(px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if !is_fabushi && !is_ai { 0xFFFFFF } else { pal.text_primary }))
+                            .text_color(rgb(if !is_coding && !is_fabushi && !is_ai { 0xFFFFFF } else { pal.text_primary }))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.is_coding_agent_mode = false;
                                 this.is_fabushi_mode = false;
                                 this.is_ai_mode = false;
                                 this.active_field = 1;
@@ -753,6 +1442,7 @@ impl Render for CreateManagedBotBoxPeers {
                     ),
             )
             .child(avatar_chooser_card)
+            .when(is_coding, |el| el.child(self.render_coding_agent_panel(pal, lang, cx)))
             .when(is_fabushi, |el| {
                 let fab_fields: [(u8, &str, &str, String); 4] = [
                     (
@@ -928,7 +1618,7 @@ impl Render for CreateManagedBotBoxPeers {
                         ),
                 )
             })
-            .when(!is_fabushi && !is_ai, |el| {
+            .when(!is_coding && !is_fabushi && !is_ai, |el| {
                 let fields: [(u8, &str, String); 3] = [
                     (1, "Bot Name", self.bot_name.clone()),
                     (2, "@username (must end with bot)", self.bot_username.clone()),
@@ -981,6 +1671,8 @@ impl Render for CreateManagedBotBoxPeers {
                     }))
                     .child(if self.is_submitting {
                         tr_str(lang, "正在创建并部署…", "Provisioning…")
+                    } else if is_coding {
+                        tr_str(lang, "💻 创建本地编程智能体", "💻 Create Coding Agent Bot")
                     } else if is_fabushi {
                         tr_str(lang, "✦ 创建独立 Fabushi 智能体", "✦ Create Isolated Fabushi Agent")
                     } else if is_ai {

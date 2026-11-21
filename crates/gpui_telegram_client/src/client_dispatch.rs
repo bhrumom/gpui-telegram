@@ -8,7 +8,7 @@ use gpui_telegram_proto::message::{MessageItem, ReactionCount};
 use gpui_telegram_proto::miniapp_contracts::{MiniAppControlMode, MiniAppWebMcpCommand};
 use gpui_telegram_proto::sync::{ChatActionEvent, TypingEvent, UpdateEvent};
 use gpui_telegram_proto::ws::WsServerFrame;
-use gpui_telegram_proto::{PollCard, TodoCard};
+use gpui_telegram_proto::{CodingHostCommand, PollCard, TodoCard};
 
 #[derive(Debug, Clone)]
 pub enum ClientDomainEvent {
@@ -107,6 +107,7 @@ pub enum ClientDomainEvent {
         status_text: String,
         active_tool: Option<String>,
     },
+    CodingHostCommand(CodingHostCommand),
     ChatAction {
         chat_id: Option<ChatId>,
         action: ChatActionEvent,
@@ -350,6 +351,9 @@ pub(crate) fn apply_update_event(
                 active_tool,
             });
         }
+        UpdateEvent::CodingHostCommand(cmd) => {
+            out_events.push(ClientDomainEvent::CodingHostCommand(cmd));
+        }
     }
 }
 
@@ -418,4 +422,35 @@ pub(crate) fn apply_ws_frame(
         }
     }
     gaps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_telegram_proto::CodingHostCommand;
+
+    #[test]
+    fn apply_update_event_maps_coding_host_command() {
+        let store = LocalStore::new();
+        let mut events = Vec::new();
+        let cmd = CodingHostCommand::ProbeProviders {
+            req_id: "probe-1".to_string(),
+            owner_user_id: 100_001,
+            target_device_id: Some("dev-mac-1".to_string()),
+        };
+
+        apply_update_event(
+            &store,
+            None,
+            Some(UserId(100_001)),
+            UpdateEvent::CodingHostCommand(cmd.clone()),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientDomainEvent::CodingHostCommand(mapped) => assert_eq!(mapped, &cmd),
+            other => panic!("expected CodingHostCommand, got {other:?}"),
+        }
+    }
 }

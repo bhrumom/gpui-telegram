@@ -1115,6 +1115,9 @@ impl AppShell {
             peer_uid == Some(fb.bot_user_id.max(0) as u64)
                 || fb.companion_chat_id == Some(chat_id as i64)
         }) {
+            if fb.coding_agent.is_some() {
+                return None;
+            }
             return Some(LocalFabushiBotTarget {
                 bot_user_id: fb.bot_user_id,
                 display_name: if fb.display_name.trim().is_empty() {
@@ -1157,6 +1160,9 @@ impl AppShell {
                     .as_deref()
                     .is_some_and(|u| !u.is_empty() && p.bot.username.eq_ignore_ascii_case(u))
         }) {
+            if prof.bot.coding_agent.is_some() {
+                return None;
+            }
             if !prof.bot.is_fabushi_bot && prof.bot.bot_user_id != OFFICIAL_DEFAULT_BOT_USER_ID {
                 return None;
             }
@@ -1192,6 +1198,22 @@ impl AppShell {
                     inline_mode_enabled: prof.bot.is_inline,
                 }),
             });
+        }
+
+        if self
+            .miniapps
+            .my_bots
+            .iter()
+            .chain(self.miniapps.attach_menu_bots.iter())
+            .any(|b| {
+                b.coding_agent.is_some()
+                    && (peer_uid == Some(b.bot_user_id.max(0) as u64)
+                        || peer_uname
+                            .as_deref()
+                            .is_some_and(|u| !u.is_empty() && b.username.eq_ignore_ascii_case(u)))
+            })
+        {
+            return None;
         }
 
         if peer_uid == Some(OFFICIAL_DEFAULT_BOT_USER_ID as u64) {

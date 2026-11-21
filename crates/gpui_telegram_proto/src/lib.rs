@@ -1,4 +1,5 @@
 pub mod cards;
+pub mod coding_agent_contracts;
 pub mod computer_contracts;
 pub mod contracts;
 pub mod e2ee;
@@ -14,6 +15,7 @@ pub use cards::{
     CardActionButton, CardActionType, GenerativeCard, GenerativeCardLayout, GenerativeComponent,
     InvoiceCard, PaymentStatus, PollAnswer, PollCard, PollOption, PriceLine, TodoCard, TodoItem,
 };
+pub use coding_agent_contracts::*;
 pub use semantic_tree::*;
 pub use computer_contracts::*;
 pub use contracts::*;

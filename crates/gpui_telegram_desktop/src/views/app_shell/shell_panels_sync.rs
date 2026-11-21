@@ -407,6 +407,11 @@ impl AppShell {
                                 } else {
                                     shell.miniapps.fabushi_bots.push(updated.clone());
                                 }
+                                for prof in shell.miniapps.bot_profiles_cache.values_mut() {
+                                    if prof.bot.bot_user_id == updated.bot_user_id {
+                                        prof.bot.coding_agent = updated.coding_agent.clone();
+                                    }
+                                }
                                 shell.sync_fabushi_bots_to_views(cx);
                                 shell.refresh_miniapps_catalog(None, cx);
                                 shell.window_runtime.enqueue_toast(

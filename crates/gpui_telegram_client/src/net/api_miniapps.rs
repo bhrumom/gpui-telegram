@@ -1015,6 +1015,7 @@ mod tests {
                                     has_main_app: true,
                                     main_app_short_name: "main".to_string(),
                                     mau_count: 500,
+                                    coding_agent: None,
                                     ..Default::default()
                                 },
                                 main_app: None,

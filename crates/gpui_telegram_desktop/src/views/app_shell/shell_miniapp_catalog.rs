@@ -634,6 +634,13 @@ impl AppShell {
             && (is_viewer_owner_fabushi
                 || bot_reg_or_prof
                     .is_some_and(|b| viewer_uid.is_some_and(|u| b.owner_user_id == u as i64)));
+        let is_coding_agent_bot = self.miniapps.fabushi_bots.iter().any(|fb| {
+            fb.coding_agent.is_some()
+                && ((bot_id > 0 && fb.bot_user_id == bot_id as i64)
+                    || (!bot_username.is_empty()
+                        && fb.username.eq_ignore_ascii_case(&bot_username))
+                    || active_chat.is_some_and(|cid| fb.companion_chat_id == Some(cid as i64)))
+        }) || bot_reg_or_prof.is_some_and(|b| b.coding_agent.is_some());
 
         // Strict menu button rule: ONLY activate when menu_button_type == "web_app" or explicit URL is set.
         let menu_type = bot_reg_or_prof
@@ -717,7 +724,7 @@ impl AppShell {
         self.composer.update(cx, |comp, c_cx| {
             comp.set_attach_mini_apps(attach_apps, peer_mask);
             comp.set_bot_slash_commands(slash_items);
-            comp.set_hermes_slash_enabled(is_viewer_owner_fabushi);
+            comp.set_hermes_slash_enabled(is_viewer_owner_fabushi && !is_coding_agent_bot);
             if has_web_app_menu {
                 let btn_url = explicit_menu_url
                     .clone()

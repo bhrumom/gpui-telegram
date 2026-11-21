@@ -323,6 +323,8 @@ pub struct BotRegistryEntry {
     pub app_tos_accepted: bool,
     #[serde(default)]
     pub is_blocked_by_viewer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<crate::coding_agent_contracts::CodingAgentBotConfig>,
 }
 
 /// Returned ONLY to the bot owner upon bot creation or token fetch/revocation.
@@ -1177,6 +1179,8 @@ pub struct CreateFabushiBotRequest {
     pub approval_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolset_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<crate::coding_agent_contracts::CodingAgentBotConfig>,
 }
 
 /// Partial update payload for a first-class Fabushi Bot (`PATCH /api/v1/fabushi-bots/{bot_id}`).
@@ -1204,6 +1208,8 @@ pub struct PatchFabushiBotRequest {
     pub notify_on_agent_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_from_sidebar: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<crate::coding_agent_contracts::CodingAgentBotConfig>,
 }
 
 /// Unified first-class Fabushi Bot summary exposed over REST and cached in Desktop UI.
@@ -1242,6 +1248,8 @@ pub struct FabushiBotSummaryDto {
     pub execution_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companion_chat_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<crate::coding_agent_contracts::CodingAgentBotConfig>,
 }
 
 /// Response returned when creating a first-class Fabushi Bot.

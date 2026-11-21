@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod auth;
 pub mod bus;
+pub mod coding_agent_broker;
 pub mod config;
 pub mod db;
 pub mod domain;

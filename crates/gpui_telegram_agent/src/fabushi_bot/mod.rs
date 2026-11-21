@@ -202,6 +202,7 @@ impl FabushiBotInstance {
             skills_count,
             execution_state: self.execution_state_label().to_string(),
             companion_chat_id,
+            coding_agent: None,
         }
     }
 }
