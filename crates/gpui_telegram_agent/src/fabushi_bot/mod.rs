@@ -311,6 +311,7 @@ pub struct FabushiBotHost {
     core_engine: Arc<HermesEngine>,
     acp_runner: RwLock<Arc<AcpRunner>>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
+    bot_browser: RwLock<Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>>>,
     teammate_handler: RwLock<Option<Arc<dyn FabushiTeammateHandler>>>,
     platform_im_bridge: RwLock<Option<Arc<dyn PlatformImBridge>>>,
     agentic_backend: RwLock<Option<Arc<dyn AgenticStateBackend>>>,
@@ -355,6 +356,7 @@ impl FabushiBotHost {
             core_engine,
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
+            bot_browser: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -392,6 +394,7 @@ impl FabushiBotHost {
             core_engine,
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
+            bot_browser: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -417,6 +420,7 @@ impl FabushiBotHost {
             core_engine,
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
+            bot_browser: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -441,6 +445,7 @@ impl FabushiBotHost {
             core_engine,
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
+            bot_browser: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -547,6 +552,33 @@ impl FabushiBotHost {
                 }
             }
         }
+    }
+
+    pub fn set_bot_browser(
+        &self,
+        orchestrator: Arc<bot_browser::orchestrator::BotBrowserOrchestrator>,
+    ) {
+        if let Ok(mut guard) = self.bot_browser.write() {
+            *guard = Some(Arc::clone(&orchestrator));
+        }
+        self.core_engine.set_bot_browser(Arc::clone(&orchestrator));
+        if let Ok(instances) = self.instances.read() {
+            for inst in instances.values() {
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_bot_browser(Arc::clone(&orchestrator));
+                }
+            }
+        }
+    }
+
+    pub fn bot_browser(
+        &self,
+    ) -> Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>> {
+        self.bot_browser
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.core_engine.bot_browser())
     }
 
     pub fn set_teammate_handler(&self, handler: Arc<dyn FabushiTeammateHandler>) {
@@ -997,6 +1029,9 @@ impl FabushiBotHost {
                 existing
                     .hermes
                     .share_user_providers_from(&self.core_engine);
+                if let Some(orch) = self.bot_browser() {
+                    existing.hermes.set_bot_browser(orch);
+                }
             }
             let prof_snap = existing.profile();
             self.register_in_core_registry(
@@ -1162,6 +1197,11 @@ impl FabushiBotHost {
                 engine.set_computer_provider(provider);
             } else if let Some(provider) = self.core_engine.computer_provider() {
                 engine.set_computer_provider(provider);
+            }
+            if let Some(orch) = self.bot_browser.read().ok().and_then(|g| g.clone()) {
+                engine.set_bot_browser(orch);
+            } else if let Some(orch) = self.core_engine.bot_browser() {
+                engine.set_bot_browser(orch);
             }
             if let Some(handler) = self.teammate_handler.read().ok().and_then(|g| g.clone()) {
                 engine.set_teammate_handler(handler);

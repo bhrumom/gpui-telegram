@@ -49,7 +49,9 @@ pub use settings_notifications_reactions::SettingsNotificationsReactionsSections
 pub use settings_notifications_type::SettingsNotificationsTypeSections;
 pub use settings_passkeys::SettingsPasskeysSections;
 pub use settings_premium::SettingsPremiumSections;
-pub use settings_privacy_security::SettingsPrivacySecuritySections;
+pub use settings_privacy_security::{
+    PendingDeviceSyncRow, SettingsPrivacySecuritySections, SettingsVaultAction, VaultCustodyStatus,
+};
 pub use settings_shortcuts::SettingsShortcutsSections;
 pub use settings_websites::SettingsWebsitesSections;
 pub use settings_chat::ChatThemePreset;

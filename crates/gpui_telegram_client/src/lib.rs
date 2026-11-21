@@ -64,6 +64,17 @@ pub use net::{
     UpsertCloudComputerRequest, UserDto, UserMeResponse, UserPrivacySettingsDto, UserProfileDto,
     VotePollHttpRequest, WalletBalanceDto, WalletTransactionDto, WsChannel, WsConnectError,
     WsTransport,
+    ApproveDeviceSyncRequest, ArchiveLocalBotReplyRequest, ArchiveLocalBotReplyResponse,
+    Argon2KdfParamsDto, AuthCustodyUpdateResponse, ChangePasswordRequest,
+    DeviceSyncActionResponse, DeviceSyncRequestBody, DeviceSyncRequestResponse,
+    DeviceSyncStatusResponse, KdfParamsQuery, KdfParamsResponse, PendingDeviceSyncItem,
+    PendingDeviceSyncListResponse, SplitKeyEmailRegisterRequest, SplitKeyLoginRequest,
+    SplitKeyRegisterRequest, UpgradeSplitKeyRequest, UpsertUserVaultItemRequest,
+    UpsertUserVaultItemResponse, UserVaultEnvelopeResponse, UserVaultItemDto,
+    UserVaultKeyEnvelopeDto, UserVaultSyncPullResponse, DEVICE_SYNC_CODE_DOMAIN_V1,
+    USER_VAULT_CATEGORY_AI_OAUTH, USER_VAULT_CATEGORY_BROWSER_COOKIE, USER_VAULT_CATEGORY_PASSWORD,
+    USER_VAULT_KDF_ALG_ARGON2ID, USER_VAULT_KDF_ALG_DEVICE_KEYCHAIN_V2,
+    USER_VAULT_KDF_ALG_SPLIT_KEY_V2,
 };
 pub use session_persistence::{
     AccountSessionRecord, ActiveDeviceSession, PersistedClientState, ProxyEndpointRecord,

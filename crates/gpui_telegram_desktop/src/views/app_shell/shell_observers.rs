@@ -539,7 +539,12 @@ impl AppShell {
     /// Dispatches events emitted by `AuthWizardView` (authentication, server URL updates, theme/locale toggles, toasts).
     pub fn handle_auth_wizard_event(&mut self, ev: &AuthWizardEvent, cx: &mut Context<Self>) {
         match ev {
-            AuthWizardEvent::Authenticated(auth) => self.apply_authenticated_session(auth.clone(), cx),
+            AuthWizardEvent::Authenticated(auth) => {
+                let vault_bootstrap = self
+                    .auth_wizard
+                    .update(cx, |w, _| w.take_pending_vault_bootstrap());
+                self.apply_authenticated_session_with_vault(auth.clone(), vault_bootstrap, cx);
+            }
             AuthWizardEvent::ServerUrlApplied(url) => {
                 let cache_dir = self.client.local_store.cache_dir().map(|p| p.to_path_buf());
                 self.client.local_store.clear_all();
@@ -992,6 +997,7 @@ impl AppShell {
             SettingsRouterEvent::ToggleLanguage => self.toggle_language_pref(cx),
             SettingsRouterEvent::Computers(ev) => self.handle_computer_settings_event(ev, cx),
             SettingsRouterEvent::AiProviders(ev) => self.handle_ai_providers_settings_event(ev, cx),
+            SettingsRouterEvent::VaultCustody(act) => self.handle_settings_vault_action(act, cx),
             SettingsRouterEvent::Navigated(sec) => {
                 if *sec != SettingsSectionType::Calls {
                     self.stop_settings_mic_test_capture(cx);
@@ -1001,6 +1007,12 @@ impl AppShell {
                     self.sync_computers_to_views(cx);
                 } else if *sec == SettingsSectionType::AiProviders {
                     self.refresh_magpie_state(cx);
+                } else if *sec == SettingsSectionType::PrivacySecurity {
+                    self.settings_router.update(cx, |r, rcx| {
+                        let _ = r.ensure_privacy(rcx);
+                    });
+                    self.sync_vault_custody_to_settings(cx);
+                    self.refresh_pending_device_sync_requests(cx);
                 }
                 cx.notify();
             }

@@ -92,6 +92,7 @@ impl TelegramClient {
             scheduled_at_ms: None,
             inline_keyboard: None,
             send_as_peer_id: None,
+            skip_server_bot_reply: false,
         };
         self.send_message_durable(req).await
     }
@@ -126,6 +127,7 @@ impl TelegramClient {
                 scheduled_at_ms: None,
                 inline_keyboard: None,
                 send_as_peer_id: None,
+                skip_server_bot_reply: false,
             };
             self.send_message_durable(dist_req).await?;
         }
@@ -144,6 +146,7 @@ impl TelegramClient {
             scheduled_at_ms: None,
             inline_keyboard: None,
             send_as_peer_id: None,
+            skip_server_bot_reply: false,
         };
         self.send_message_durable(msg_req).await
     }
@@ -170,6 +173,7 @@ impl TelegramClient {
             scheduled_at_ms: None,
             inline_keyboard: None,
             send_as_peer_id: None,
+            skip_server_bot_reply: false,
         };
         self.send_message_durable(req).await
     }

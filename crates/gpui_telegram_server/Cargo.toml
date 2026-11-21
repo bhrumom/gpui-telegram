@@ -33,6 +33,7 @@ parking_lot = { workspace = true }
 rusqlite = { workspace = true }
 tantivy = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 argon2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }

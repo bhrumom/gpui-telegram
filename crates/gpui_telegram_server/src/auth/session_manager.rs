@@ -509,6 +509,13 @@ impl SessionManager {
         self.get_user(user_id)
     }
 
+    /// Updates cached password hash for an existing in-memory user record (e.g. after Split-Key upgrade/change).
+    pub fn update_password_hash(&self, user_id: UserId, new_hash: String) {
+        if let Some(rec) = self.users.write().get_mut(&user_id) {
+            rec.password_hash = new_hash;
+        }
+    }
+
     /// Total count of active sessions
     pub fn session_count(&self) -> usize {
         self.sessions.read().len()

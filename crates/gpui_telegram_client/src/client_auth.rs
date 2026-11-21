@@ -1,23 +1,17 @@
 use crate::client::TelegramClient;
 use crate::net::{
-    AddContactHttpRequest, AddContactHttpResponse, AuthResponse, BlockedUserDto, ContactDto,
-    EmailRegisterRequest, EmailSendCodeResponse, HttpClientError, LoginRequest,
-    PhoneSendCodeRequest, PhoneSendCodeResponse, PhoneVerifyRequest, ProtoAuthResponse,
-    ProtoUpdateProfileRequest, QrPairInitResponse, QrPairPollResponse, RegisterRequest,
-    SessionDto, StatusResponse, TwoFactorSetRequest, TwoFactorStatusResponse,
-    TwoFactorVerifyRequest, UserMeResponse, UserPrivacySettingsDto, UserProfileDto,
+    AddContactHttpRequest, AddContactHttpResponse, AuthCustodyUpdateResponse, AuthResponse,
+    BlockedUserDto, ChangePasswordRequest, ContactDto, EmailRegisterRequest,
+    EmailSendCodeResponse, HttpClientError, KdfParamsResponse, LoginRequest, PhoneSendCodeRequest,
+    PhoneSendCodeResponse, PhoneVerifyRequest, ProtoAuthResponse, ProtoUpdateProfileRequest,
+    QrPairInitResponse, QrPairPollResponse, RegisterRequest, SessionDto,
+    SplitKeyEmailRegisterRequest, SplitKeyLoginRequest, SplitKeyRegisterRequest, StatusResponse,
+    TwoFactorSetRequest, TwoFactorStatusResponse, TwoFactorVerifyRequest, UpgradeSplitKeyRequest,
+    UserMeResponse, UserPrivacySettingsDto, UserProfileDto,
 };
 
-pub(crate) fn auth_from_proto(p: ProtoAuthResponse) -> AuthResponse {
-    AuthResponse {
-        user_id: p.user_id,
-        username: p.username,
-        session_id: p.session_id,
-        token: p.token,
-        first_name: p.first_name,
-        created_at: p.created_at,
-        expires_at: p.expires_at,
-    }
+pub fn auth_from_proto(p: ProtoAuthResponse) -> AuthResponse {
+    AuthResponse::from(p)
 }
 
 impl TelegramClient {
@@ -84,6 +78,56 @@ impl TelegramClient {
         let auth = self.http_client.email_register(req).await?;
         self.set_auth_session(auth.clone());
         Ok(auth)
+    }
+
+    pub async fn get_auth_kdf_params(
+        &self,
+        username_or_email: &str,
+    ) -> std::result::Result<KdfParamsResponse, HttpClientError> {
+        self.http_client.get_auth_kdf_params(username_or_email).await
+    }
+
+    pub async fn register_split_key(
+        &self,
+        req: &SplitKeyRegisterRequest,
+    ) -> std::result::Result<ProtoAuthResponse, HttpClientError> {
+        let auth = self.http_client.register_split_key(req).await?;
+        self.set_auth_session(auth_from_proto(auth.clone()));
+        Ok(auth)
+    }
+
+    pub async fn email_register_split_key(
+        &self,
+        req: &SplitKeyEmailRegisterRequest,
+    ) -> std::result::Result<ProtoAuthResponse, HttpClientError> {
+        let auth = self.http_client.email_register_split_key(req).await?;
+        self.set_auth_session(auth_from_proto(auth.clone()));
+        Ok(auth)
+    }
+
+    pub async fn login_split_key(
+        &self,
+        req: &SplitKeyLoginRequest,
+    ) -> std::result::Result<ProtoAuthResponse, HttpClientError> {
+        let auth = self.http_client.login_split_key(req).await?;
+        self.set_auth_session(auth_from_proto(auth.clone()));
+        Ok(auth)
+    }
+
+    pub async fn upgrade_split_key(
+        &self,
+        req: &UpgradeSplitKeyRequest,
+    ) -> std::result::Result<AuthCustodyUpdateResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.upgrade_split_key(&token, req).await
+    }
+
+    pub async fn change_password(
+        &self,
+        req: &ChangePasswordRequest,
+    ) -> std::result::Result<AuthCustodyUpdateResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.change_password(&token, req).await
     }
 
     pub async fn email_verify(

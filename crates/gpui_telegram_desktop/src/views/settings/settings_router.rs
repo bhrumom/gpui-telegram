@@ -16,6 +16,7 @@ use crate::views::settings::sections::{
     settings_local_passcode::AutoLockTimeout,
     settings_notifications::BadgeCountType,
     settings_notifications_reactions::ReactionsNotifySource,
+    settings_privacy_security::SettingsVaultAction,
     SettingsActiveSessionsSections, SettingsAdvancedSections, SettingsAiProvidersSections,
     SettingsBlockedPeersSections, SettingsBusinessSections, SettingsCallsSections,
     SettingsChatSections, SettingsComputersSections, SettingsCreditsSections,
@@ -29,6 +30,7 @@ use crate::views::settings::settings_power_saving::SettingsPowerSaving;
 use crate::views::settings::settings_search::SettingsSearch;
 use crate::views::settings::settings_type::SettingsSectionType;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter};
+use zeroize::Zeroize as _;
 
 /// High-level events emitted by `SettingsRouter` to `AppShell`.
 #[derive(Debug, Clone)]
@@ -143,6 +145,7 @@ pub enum SettingsRouterEvent {
         filter: String,
     },
     UpdateBusinessPrefs(Vec<String>),
+    VaultCustody(SettingsVaultAction),
     Computers(SettingsComputersEvent),
     AiProviders(SettingsAiProvidersEvent),
     SelectLanguage(&'static str),
@@ -791,7 +794,10 @@ impl SettingsRouter {
             SettingsSectionType::PrivacySecurity => self
                 .settings_privacy
                 .as_ref()
-                .is_some_and(|sp| sp.read(cx).two_factor_editing),
+                .is_some_and(|sp| {
+                    let r = sp.read(cx);
+                    r.two_factor_editing || r.recovery_key_editing
+                }),
             SettingsSectionType::Folders => self
                 .settings_folders
                 .as_ref()
@@ -827,7 +833,14 @@ impl SettingsRouter {
             SettingsSectionType::PrivacySecurity => self
                 .settings_privacy
                 .as_ref()
-                .map(|sp| sp.read(cx).two_factor_password_draft.clone())
+                .map(|sp| {
+                    let r = sp.read(cx);
+                    if r.recovery_key_editing {
+                        r.recovery_key_draft.as_str().to_string()
+                    } else {
+                        r.two_factor_password_draft.clone()
+                    }
+                })
                 .unwrap_or_default(),
             SettingsSectionType::Folders => self
                 .settings_folders
@@ -864,6 +877,19 @@ impl SettingsRouter {
             return false;
         }
         match self.settings_section {
+            SettingsSectionType::PrivacySecurity => {
+                let sp = self.ensure_privacy(cx);
+                sp.update(cx, |sp, sp_cx| {
+                    sp.recovery_key_ime_preedit = if sp.recovery_key_editing {
+                        preedit.filter(|s| !s.is_empty()).map(str::to_string)
+                    } else {
+                        None
+                    };
+                    sp_cx.notify();
+                });
+                cx.notify();
+                true
+            }
             SettingsSectionType::Computers => {
                 let sc = self.ensure_computers(cx);
                 sc.update(cx, |sc, sc_cx| sc.set_ime_preedit(preedit, sc_cx));
@@ -896,7 +922,12 @@ impl SettingsRouter {
             SettingsSectionType::PrivacySecurity => {
                 let sp = self.ensure_privacy(cx);
                 sp.update(cx, |sp, sp_cx| {
-                    sp.two_factor_password_draft.clear();
+                    if sp.recovery_key_editing {
+                        sp.recovery_key_draft.zeroize();
+                        sp.recovery_key_ime_preedit = None;
+                    } else {
+                        sp.two_factor_password_draft.clear();
+                    }
                     sp_cx.notify();
                 });
             }
@@ -948,7 +979,12 @@ impl SettingsRouter {
             SettingsSectionType::PrivacySecurity => {
                 let sp = self.ensure_privacy(cx);
                 sp.update(cx, |sp, sp_cx| {
-                    sp.two_factor_password_draft.push_str(text);
+                    if sp.recovery_key_editing {
+                        sp.recovery_key_ime_preedit = None;
+                        sp.recovery_key_draft.push_str(text);
+                    } else {
+                        sp.two_factor_password_draft.push_str(text);
+                    }
                     sp_cx.notify();
                 });
             }
@@ -1017,13 +1053,33 @@ impl SettingsRouter {
                 true
             }
             SettingsSectionType::PrivacySecurity => {
-                if !matches!(key, "backspace" | "enter") {
+                if !matches!(key, "backspace" | "enter" | "escape") {
                     return Some(false);
                 }
                 let sp = self.ensure_privacy(cx);
                 sp.update(cx, |sp, sp_cx| {
-                    if key == "backspace" {
+                    if sp.recovery_key_editing {
+                        match key {
+                            "backspace" => {
+                                sp.backspace_recovery_key_draft();
+                                sp_cx.notify();
+                            }
+                            "enter" => {
+                                let _ = sp.submit_recovery_key_draft();
+                                sp_cx.notify();
+                            }
+                            "escape" => {
+                                sp.recovery_key_editing = false;
+                                sp.recovery_key_ime_preedit = None;
+                                sp_cx.notify();
+                            }
+                            _ => {}
+                        }
+                    } else if key == "backspace" {
                         sp.two_factor_password_draft.pop();
+                        sp_cx.notify();
+                    } else if key == "escape" {
+                        sp.two_factor_editing = false;
                         sp_cx.notify();
                     } else if !sp.two_factor_password_draft.trim().is_empty() {
                         let pw = sp.two_factor_password_draft.trim().to_string();

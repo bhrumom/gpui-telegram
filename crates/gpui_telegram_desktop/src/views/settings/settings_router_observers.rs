@@ -244,12 +244,13 @@ impl SettingsRouter {
             |router: &mut SettingsRouter,
              sp: Entity<SettingsPrivacySecuritySections>,
              cx: &mut Context<SettingsRouter>| {
-                let (nav_sec, edit_cat, twofa_act, save_cfg) = sp.update(cx, |s, _| {
+                let (nav_sec, edit_cat, twofa_act, save_cfg, vault_act) = sp.update(cx, |s, _| {
                     (
                         s.pending_nav_section.take(),
                         s.pending_edit_privacy_category.take(),
                         s.pending_2fa_action.take(),
                         std::mem::take(&mut s.pending_save_settings),
+                        s.pending_vault_action.take(),
                     )
                 });
                 if let Some(sec) = nav_sec {
@@ -268,6 +269,9 @@ impl SettingsRouter {
                 }
                 if save_cfg {
                     cx.emit(SettingsRouterEvent::PushUserSettings);
+                }
+                if let Some(act) = vault_act {
+                    cx.emit(SettingsRouterEvent::VaultCustody(act));
                 }
             },
         )

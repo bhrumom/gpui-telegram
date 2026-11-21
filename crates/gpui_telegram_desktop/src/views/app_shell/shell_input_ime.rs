@@ -383,6 +383,14 @@ impl AppShell {
             return true;
         }
         if self.active_panel == ActiveWorkspacePanel::Settings {
+            if self.is_settings_input_active(cx)
+                && self
+                    .settings_router
+                    .update(cx, |sr, scx| sr.handle_non_char_key("escape", false, scx))
+                    == Some(true)
+            {
+                return true;
+            }
             self.navigate_settings_back(cx);
             return true;
         }

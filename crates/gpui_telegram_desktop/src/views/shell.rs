@@ -11,6 +11,7 @@ pub use crate::views::app_shell::shell_state::{
 pub use crate::views::app_shell::shell_truth::*;
 pub use crate::views::auth::{
     AuthWizardEvent, AuthWizardTab, AuthWizardView, LoginInputField, LoginWizardStep,
+    PendingAuthVaultBootstrap,
 };
 
 use std::path::PathBuf;
@@ -225,6 +226,10 @@ impl AppShell {
 
         shell_instance.overlays.is_passcode_locked = shell_instance.has_local_passcode_configured();
         shell_instance.wire_workspace_observers(cx);
+        cx.observe(&shell_instance.tasks_workspace, |shell, _, cx| {
+            shell.sync_discovered_subscriptions_to_local_fabushi_and_vault(cx);
+        })
+        .detach();
         shell_instance.sync_theme_and_locale_to_views(cx);
         shell_instance.hydrate_settings_from_preferences(cx);
         shell_instance.refresh_settings_truth(cx);
@@ -232,7 +237,11 @@ impl AppShell {
         if let Some(stored) = ClientConfig::load_session() {
             cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
                 let verify_res = client.http_client.get_me(&stored.token).await;
-                let _ = weak_shell.update(app, |shell, cx| match verify_res {
+                let _ = weak_shell.update(app, |shell, cx| {
+                    if shell.is_authenticated {
+                        return;
+                    }
+                    match verify_res {
                     Ok(me) => {
                         let auth = AuthResponse {
                             token: stored.token,
@@ -254,6 +263,7 @@ impl AppShell {
                             wcx.notify();
                         });
                         cx.notify();
+                    }
                     }
                 });
             })
@@ -277,6 +287,17 @@ impl AppShell {
     /// Binds an authenticated `AuthResponse`, opens WebSocket streaming, resets peer views,
     /// triggers initial server data syncs, and persists the session to disk.
     pub fn apply_authenticated_session(&mut self, auth: AuthResponse, cx: &mut Context<Self>) {
+        self.apply_authenticated_session_with_vault(auth, None, cx);
+    }
+
+    /// Binds an authenticated `AuthResponse` together with optional in-memory Split-Key /
+    /// Passwordless vault bootstrap credentials so the E2EE vault unlocks transparently.
+    pub fn apply_authenticated_session_with_vault(
+        &mut self,
+        auth: AuthResponse,
+        vault_bootstrap: Option<PendingAuthVaultBootstrap>,
+        cx: &mut Context<Self>,
+    ) {
         let srv_url = self.client.config.server_url.clone();
         self.session_sync.begin_session(
             auth.token.clone(),
@@ -334,6 +355,7 @@ impl AppShell {
         self.refresh_tasks_and_mcp(cx);
         self.refresh_hermes_commands(cx);
         self.register_current_host_and_start_relay(cx);
+        self.bootstrap_local_bot_browser_and_vault_with_auth(vault_bootstrap, cx);
 
         let _ = ClientConfig::save_session(&StoredSession {
             server_url: srv_url,
@@ -367,7 +389,12 @@ impl AppShell {
         self.last_handled_nav_dest = Some(NavDestination::Chats);
 
         self.auth_wizard.update(cx, |w, wcx| { w.reset_after_logout(srv_url.clone()); wcx.notify(); });
-        self.settings_router.update(cx, |r, rcx| r.close(rcx));
+        self.settings_router.update(cx, |r, rcx| {
+            r.close(rcx);
+            if let Some(sp) = r.settings_privacy.clone() {
+                sp.update(rcx, |sec, _| sec.clear_session_custody_state());
+            }
+        });
 
         self.client.local_store.clear_all();
         self.client.clear_session();
@@ -748,6 +775,11 @@ impl Render for AppShell {
             .when_some(
                 self.computers.pending_approvals.first().cloned(),
                 |el, pending| el.child(self.render_pending_computer_approval_banner(&pending, cx)),
+            )
+            .when(
+                self.bot_browser.first_creation_banner_open
+                    && self.bot_browser.last_recovery_key_notice.is_some(),
+                |el| el.child(self.render_vault_first_setup_notice_banner(cx)),
             )
             .when_some(current_toast, |el, toast| el.child(self.render_toast_banner(toast.text, pal, cx)))
             .into_any_element()

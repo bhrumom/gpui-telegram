@@ -42,6 +42,12 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct WsConn {
     stream: WsStream,
+    session_id: Option<String>,
+}
+
+struct ResolvedWsTarget {
+    ws_url: String,
+    needs_target_attach: bool,
 }
 
 pub struct WsCdpTransport {
@@ -83,12 +89,41 @@ impl WsCdpTransport {
         &self.endpoint
     }
 
-    async fn resolve_ws_url(&self) -> Result<String, BotBrowserError> {
+    async fn resolve_ws_target(&self) -> Result<ResolvedWsTarget, BotBrowserError> {
         if self.endpoint.starts_with("ws://") || self.endpoint.starts_with("wss://") {
-            return Ok(self.endpoint.clone());
+            let needs_target_attach = self.endpoint.ends_with("/devtools/browser");
+            return Ok(ResolvedWsTarget {
+                ws_url: self.endpoint.clone(),
+                needs_target_attach,
+            });
         }
 
         let discovery_timeout = self.command_timeout.min(Duration::from_secs(3));
+        let version_url = format!("{}/json/version", self.endpoint);
+        if let Ok(version_resp) = self
+            .http_client
+            .get(&version_url)
+            .timeout(discovery_timeout)
+            .send()
+            .await
+        {
+            if version_resp.status().is_success() {
+                if let Ok(body) = version_resp.json::<Value>().await {
+                    if let Some(ws_url) = body
+                        .as_object()
+                        .and_then(|obj| obj.get("webSocketDebuggerUrl"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        return Ok(ResolvedWsTarget {
+                            ws_url: ws_url.to_string(),
+                            needs_target_attach: ws_url.contains("/devtools/browser"),
+                        });
+                    }
+                }
+            }
+        }
+
         let list_url = format!("{}/json/list", self.endpoint);
         let list_resp = self
             .http_client
@@ -105,29 +140,10 @@ impl WsCdpTransport {
                 BotBrowserError::Io(format!("failed to parse CDP /json/list JSON: {e}"))
             })?;
             if let Some(ws_url) = extract_ws_url_from_list(&targets) {
-                return Ok(ws_url);
-            }
-        }
-
-        let version_url = format!("{}/json/version", self.endpoint);
-        let version_resp = self
-            .http_client
-            .get(&version_url)
-            .timeout(discovery_timeout)
-            .send()
-            .await
-            .map_err(|e| {
-                BotBrowserError::Io(format!(
-                    "CDP /json/version request failed at {version_url}: {e}"
-                ))
-            })?;
-
-        if version_resp.status().is_success() {
-            let body: Value = version_resp.json().await.map_err(|e| {
-                BotBrowserError::Io(format!("failed to parse CDP /json/version JSON: {e}"))
-            })?;
-            if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
-                return Ok(ws_url.to_string());
+                return Ok(ResolvedWsTarget {
+                    ws_url,
+                    needs_target_attach: false,
+                });
             }
         }
 
@@ -138,17 +154,31 @@ impl WsCdpTransport {
     }
 
     async fn connect_ws(&self) -> Result<WsConn, BotBrowserError> {
-        let ws_url = self.resolve_ws_url().await?;
-        let (stream, _) = tokio::time::timeout(self.command_timeout, connect_async(&ws_url))
-            .await
-            .map_err(|_| BotBrowserError::SidecarTimeout {
-                method: "ws_connect".to_string(),
-                timeout_ms: self.command_timeout.as_millis() as u64,
-            })?
-            .map_err(|e| {
-                BotBrowserError::Io(format!("CDP WebSocket connect failed at {ws_url}: {e}"))
-            })?;
-        Ok(WsConn { stream })
+        let resolved = self.resolve_ws_target().await?;
+        let (mut stream, _) =
+            tokio::time::timeout(self.command_timeout, connect_async(&resolved.ws_url))
+                .await
+                .map_err(|_| BotBrowserError::SidecarTimeout {
+                    method: "ws_connect".to_string(),
+                    timeout_ms: self.command_timeout.as_millis() as u64,
+                })?
+                .map_err(|e| {
+                    BotBrowserError::Io(format!(
+                        "CDP WebSocket connect failed at {}: {e}",
+                        resolved.ws_url
+                    ))
+                })?;
+
+        let session_id = if resolved.needs_target_attach {
+            Some(
+                attach_or_create_obscura_session(&mut stream, &self.next_id, self.command_timeout)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok(WsConn { stream, session_id })
     }
 }
 
@@ -164,97 +194,198 @@ fn extract_ws_url_from_list(targets: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+async fn attach_or_create_obscura_session(
+    stream: &mut WsStream,
+    next_id: &AtomicU64,
+    command_timeout: Duration,
+) -> Result<String, BotBrowserError> {
+    let targets = send_raw_cdp_on_stream(
+        stream,
+        next_id,
+        command_timeout,
+        "Target.getTargets",
+        json!({}),
+        None,
+    )
+    .await?;
+
+    let existing_target_id = targets
+        .get("targetInfos")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+                .or_else(|| arr.first())
+        })
+        .and_then(|t| t.get("targetId"))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+
+    let target_id = match existing_target_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            let created = send_raw_cdp_on_stream(
+                stream,
+                next_id,
+                command_timeout,
+                "Target.createTarget",
+                json!({ "url": "about:blank" }),
+                None,
+            )
+            .await?;
+            created
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    BotBrowserError::Cdp("Target.createTarget missing targetId".to_string())
+                })?
+        }
+    };
+
+    let attached = send_raw_cdp_on_stream(
+        stream,
+        next_id,
+        command_timeout,
+        "Target.attachToTarget",
+        json!({ "targetId": target_id, "flatten": true }),
+        None,
+    )
+    .await?;
+
+    attached
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| BotBrowserError::Cdp("Target.attachToTarget missing sessionId".to_string()))
+}
+
+async fn send_raw_cdp_on_stream(
+    stream: &mut WsStream,
+    next_id: &AtomicU64,
+    command_timeout: Duration,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+) -> Result<Value, BotBrowserError> {
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    let mut payload_obj = json!({
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    if let (Some(sid), Some(map)) = (session_id, payload_obj.as_object_mut()) {
+        if !method.starts_with("Target.") {
+            map.insert("sessionId".to_string(), Value::String(sid.to_string()));
+        }
+    }
+    let payload = payload_obj.to_string();
+
+    stream.send(Message::Text(payload)).await.map_err(|err| {
+        BotBrowserError::Io(format!("CDP WebSocket send failed for '{method}': {err}"))
+    })?;
+
+    let timeout_ms = command_timeout.as_millis() as u64;
+    let read_res = tokio::time::timeout(command_timeout, async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(txt))) => {
+                    if let Some(parsed) = parse_cdp_response_frame(txt.as_bytes(), id, method)? {
+                        return Ok(parsed);
+                    }
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    if let Some(parsed) = parse_cdp_response_frame(&bytes, id, method)? {
+                        return Ok(parsed);
+                    }
+                }
+                Some(Ok(Message::Ping(data))) => {
+                    stream.send(Message::Pong(data)).await.map_err(|e| {
+                        BotBrowserError::Io(format!("CDP WebSocket pong send failed: {e}"))
+                    })?;
+                }
+                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                Some(Ok(Message::Close(_))) => {
+                    return Err(BotBrowserError::Io(format!(
+                        "CDP WebSocket closed while waiting for '{method}'"
+                    )));
+                }
+                Some(Err(e)) => {
+                    return Err(BotBrowserError::Io(format!(
+                        "CDP WebSocket read error for '{method}': {e}"
+                    )));
+                }
+                None => {
+                    return Err(BotBrowserError::Io(format!(
+                        "CDP WebSocket EOF while waiting for '{method}'"
+                    )));
+                }
+            }
+        }
+    })
+    .await;
+
+    match read_res {
+        Ok(res) => res,
+        Err(_) => Err(BotBrowserError::SidecarTimeout {
+            method: method.to_string(),
+            timeout_ms,
+        }),
+    }
+}
+
 #[async_trait]
 impl CdpTransport for WsCdpTransport {
     async fn send_command(&self, method: &str, params: Value) -> Result<Value, BotBrowserError> {
         let mut guard = self.ws_conn.lock().await;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let payload = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        })
-        .to_string();
 
-        // Reconnect once if a previously pooled WebSocket closed while idle.
+        // Reconnect once if a previously pooled WebSocket closed while idle, or lazy-attach if
+        // a direct `/devtools/page/...` endpoint reports missing session page.
         for attempt in 0..2 {
             if guard.is_none() {
                 *guard = Some(self.connect_ws().await?);
             }
 
             let conn = guard.as_mut().expect("ws_conn just initialized");
-            match conn.stream.send(Message::Text(payload.clone())).await {
-                Ok(()) => break,
-                Err(err) => {
+            let session_id = conn.session_id.clone();
+            let res = send_raw_cdp_on_stream(
+                &mut conn.stream,
+                &self.next_id,
+                self.command_timeout,
+                method,
+                params.clone(),
+                session_id.as_deref(),
+            )
+            .await;
+
+            match res {
+                Ok(val) => return Ok(val),
+                Err(BotBrowserError::Cdp(msg))
+                    if attempt == 0 && conn.session_id.is_none() && msg.contains("No page") =>
+                {
+                    let sid = attach_or_create_obscura_session(
+                        &mut conn.stream,
+                        &self.next_id,
+                        self.command_timeout,
+                    )
+                    .await?;
+                    conn.session_id = Some(sid);
+                }
+                Err(err @ BotBrowserError::Io(_)) | Err(err @ BotBrowserError::SidecarTimeout { .. }) => {
                     *guard = None;
-                    if attempt == 1 {
-                        return Err(BotBrowserError::Io(format!(
-                            "CDP WebSocket send failed for '{method}': {err}"
-                        )));
+                    if attempt == 1 || matches!(err, BotBrowserError::SidecarTimeout { .. }) {
+                        return Err(err);
                     }
                 }
+                Err(err) => return Err(err),
             }
         }
 
-        let timeout_ms = self.command_timeout.as_millis() as u64;
-        let conn = guard
-            .as_mut()
-            .ok_or_else(|| BotBrowserError::Io("CDP WebSocket unavailable".to_string()))?;
-
-        let read_res = tokio::time::timeout(self.command_timeout, async {
-            loop {
-                match conn.stream.next().await {
-                    Some(Ok(Message::Text(txt))) => {
-                        if let Some(parsed) = parse_cdp_response_frame(txt.as_bytes(), id, method)? {
-                            return Ok(parsed);
-                        }
-                    }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        if let Some(parsed) = parse_cdp_response_frame(&bytes, id, method)? {
-                            return Ok(parsed);
-                        }
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        conn.stream.send(Message::Pong(data)).await.map_err(|e| {
-                            BotBrowserError::Io(format!("CDP WebSocket pong send failed: {e}"))
-                        })?;
-                    }
-                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
-                    Some(Ok(Message::Close(_))) => {
-                        return Err(BotBrowserError::Io(format!(
-                            "CDP WebSocket closed while waiting for '{method}'"
-                        )));
-                    }
-                    Some(Err(e)) => {
-                        return Err(BotBrowserError::Io(format!(
-                            "CDP WebSocket read error for '{method}': {e}"
-                        )));
-                    }
-                    None => {
-                        return Err(BotBrowserError::Io(format!(
-                            "CDP WebSocket EOF while waiting for '{method}'"
-                        )));
-                    }
-                }
-            }
-        })
-        .await;
-
-        match read_res {
-            Ok(Ok(val)) => Ok(val),
-            Ok(Err(err @ BotBrowserError::Io(_))) => {
-                *guard = None;
-                Err(err)
-            }
-            Ok(Err(err)) => Err(err),
-            Err(_) => {
-                *guard = None;
-                Err(BotBrowserError::SidecarTimeout {
-                    method: method.to_string(),
-                    timeout_ms,
-                })
-            }
-        }
+        Err(BotBrowserError::Io(format!(
+            "CDP WebSocket send failed after reconnect for '{method}'"
+        )))
     }
 
     async fn current_endpoint(&self) -> Result<String, BotBrowserError> {
@@ -880,7 +1011,7 @@ impl CdpBridge {
                 .get("root")
                 .and_then(|r| r.get("nodeId"))
                 .and_then(|id| id.as_i64())
-                .filter(|&id| id > 0)
+                .filter(|&id| id >= 0)
             {
                 if let Ok(queried) = self
                     .transport
@@ -931,52 +1062,22 @@ impl CdpBridge {
     }
 
     async fn clear_focused_input(&self) -> Result<(), BotBrowserError> {
-        let modifier = if cfg!(target_os = "macos") { 4 } else { 2 };
-        self.transport
+        // Clear via secret-free activeElement value reset so prefilled fields never leak or retain
+        // trailing characters when Input.insertText runs on Obscura v0.2.7.
+        let clear_expr = r#"(() => {
+  const el = document.activeElement;
+  if (el && typeof el.value === "string" && el.value.length > 0) {
+    el.value = "";
+    try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (_) {}
+    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (_) {}
+  }
+  return true;
+})()"#;
+        let _ = self
+            .transport
             .send_command(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyDown",
-                    "modifiers": modifier,
-                    "key": "a",
-                    "code": "KeyA",
-                    "windowsVirtualKeyCode": 65,
-                    "commands": ["selectAll"]
-                }),
-            )
-            .await?;
-        self.transport
-            .send_command(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyUp",
-                    "modifiers": modifier,
-                    "key": "a",
-                    "code": "KeyA",
-                    "windowsVirtualKeyCode": 65
-                }),
-            )
-            .await?;
-        self.transport
-            .send_command(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyDown",
-                    "key": "Backspace",
-                    "code": "Backspace",
-                    "windowsVirtualKeyCode": 8
-                }),
-            )
-            .await?;
-        self.transport
-            .send_command(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyUp",
-                    "key": "Backspace",
-                    "code": "Backspace",
-                    "windowsVirtualKeyCode": 8
-                }),
+                "Runtime.evaluate",
+                json!({ "expression": clear_expr, "returnByValue": true }),
             )
             .await?;
         Ok(())

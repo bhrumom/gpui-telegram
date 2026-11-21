@@ -3188,6 +3188,7 @@ struct HermesEngineInner {
     talk_coordinator: Arc<Mutex<TalkCoordinator>>,
     computer_broker: Arc<Mutex<ComputerLeaseBroker>>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
+    bot_browser: RwLock<Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>>>,
     todos: Arc<Mutex<TodoStore>>,
     agentic_store: Arc<Mutex<LocalAgenticStore>>,
     commands: SlashCommandRegistry,
@@ -3354,6 +3355,7 @@ impl HermesEngine {
             talk_coordinator: Arc::new(Mutex::new(TalkCoordinator::new())),
             computer_broker: Arc::new(Mutex::new(ComputerLeaseBroker::new())),
             computer_provider: RwLock::new(None),
+            bot_browser: RwLock::new(None),
             todos: Arc::new(Mutex::new(TodoStore::new())),
             agentic_store: Arc::new(Mutex::new(LocalAgenticStore::new())),
             commands: SlashCommandRegistry::new(),
@@ -3577,6 +3579,25 @@ impl HermesEngine {
     pub fn computer_provider(&self) -> Option<Arc<dyn ComputerCloudProvider>> {
         self.inner
             .computer_provider
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    pub fn set_bot_browser(
+        &self,
+        orchestrator: Arc<bot_browser::orchestrator::BotBrowserOrchestrator>,
+    ) {
+        if let Ok(mut guard) = self.inner.bot_browser.write() {
+            *guard = Some(orchestrator);
+        }
+    }
+
+    pub fn bot_browser(
+        &self,
+    ) -> Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>> {
+        self.inner
+            .bot_browser
             .read()
             .ok()
             .and_then(|g| g.clone())
@@ -3938,6 +3959,7 @@ impl HermesEngine {
         ctx.talk_coordinator = Arc::clone(&self.inner.talk_coordinator);
         ctx.computer_broker = Arc::clone(&self.inner.computer_broker);
         ctx.computer_provider = self.computer_provider();
+        ctx.bot_browser = self.bot_browser();
         ctx.todos = Arc::clone(&self.inner.todos);
         ctx.agentic_store = Arc::clone(&self.inner.agentic_store);
         ctx.caller_depth = caller_depth;

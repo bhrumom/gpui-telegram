@@ -18,6 +18,7 @@ pub mod sync_polls;
 pub mod tailnet;
 pub mod telegram_bot_api;
 pub mod updates;
+pub mod user_vault;
 pub mod users;
 
 use crate::db::schema::{ChatMemberRecord, ChatRecord, UserRecord};
@@ -163,6 +164,13 @@ pub fn issue_persistent_session(
         .unwrap_or_else(|| format!("user_{}", user.user_id.0));
     let account_gen = user.account_generation.max(1);
     let ttl_secs = 30 * 24 * 3600u64;
+    let auth_version = state
+        .db
+        .get_user_split_key_auth_by_id(user.user_id)
+        .ok()
+        .flatten()
+        .map(|r| r.auth_version)
+        .unwrap_or(1);
 
     if let Ok((sess_rec, token)) = state.session_store.issue_session(
         user.user_id.raw(),
@@ -184,6 +192,7 @@ pub fn issue_persistent_session(
             account_generation: Some(sess_rec.account_generation),
             created_at: Some(created_at.to_rfc3339()),
             expires_at: Some(expires_at.to_rfc3339()),
+            auth_version,
         };
     }
 
@@ -207,5 +216,6 @@ pub fn issue_persistent_session(
         account_generation: Some(account_gen),
         created_at: Some(created_at.to_rfc3339()),
         expires_at: Some(session.expires_at.to_rfc3339()),
+        auth_version,
     }
 }

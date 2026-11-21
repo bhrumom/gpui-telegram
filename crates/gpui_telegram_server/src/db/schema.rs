@@ -684,6 +684,59 @@ ALTER TABLE memory_entity_edges_v35 RENAME TO memory_entity_edges;
 CREATE INDEX IF NOT EXISTS idx_memory_entity_edges_chat ON memory_entity_edges(chat_id, src_entity);
 "#;
 
+pub const MIGRATION_V36_USER_VAULT: &str = r#"
+CREATE TABLE IF NOT EXISTS user_vault_key_envelopes (
+    user_id INTEGER PRIMARY KEY,
+    key_version INTEGER NOT NULL,
+    kdf_alg TEXT NOT NULL,
+    kdf_salt_b64 TEXT NOT NULL,
+    kdf_m_cost_kib INTEGER NOT NULL,
+    kdf_t_cost INTEGER NOT NULL,
+    kdf_p_cost INTEGER NOT NULL,
+    wrapped_root_key_b64 TEXT NOT NULL,
+    recovery_wrapped_root_key_b64 TEXT,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS user_vault_items (
+    user_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    nonce_b64 TEXT NOT NULL,
+    ciphertext_b64 TEXT NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (user_id, category, item_key)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_user_vault_items_user_rev
+    ON user_vault_items(user_id, revision);
+"#;
+
+pub const MIGRATION_V37_SPLIT_KEY_AND_DEVICE_SYNC: &str = r#"
+ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE users ADD COLUMN auth_salt_b64 TEXT;
+ALTER TABLE users ADD COLUMN auth_kdf_m_kib INTEGER;
+ALTER TABLE users ADD COLUMN auth_kdf_t_cost INTEGER;
+ALTER TABLE users ADD COLUMN auth_kdf_p_cost INTEGER;
+
+CREATE TABLE IF NOT EXISTS user_vault_device_sync_requests (
+    request_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    device_name TEXT NOT NULL,
+    device_public_key_b64 TEXT NOT NULL,
+    verification_code TEXT NOT NULL,
+    status TEXT NOT NULL,
+    approver_ephemeral_pub_b64 TEXT,
+    encrypted_root_key_b64 TEXT,
+    nonce_b64 TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_user_vault_device_sync_user_status
+    ON user_vault_device_sync_requests(user_id, status, expires_at);
+"#;
+
 pub const ALL_MIGRATIONS: &[&str] = &[
     CREATE_USERS_TABLE,
     CREATE_SESSIONS_TABLE,
@@ -720,6 +773,8 @@ pub const ALL_MIGRATIONS: &[&str] = &[
     MIGRATION_V33_E2EE_PREKEYS,
     MIGRATION_V34_AGENTIC_HERMES_STATE,
     MIGRATION_V35_SCOPE_ISOLATED_KEYS,
+    MIGRATION_V36_USER_VAULT,
+    MIGRATION_V37_SPLIT_KEY_AND_DEVICE_SYNC,
 ];
 
 // --- Database Row Representation Models ---

@@ -112,6 +112,7 @@ fn make_rich_req(chat_id: i64, text: &str, nonce: Option<u64>) -> RichSendMessag
         scheduled_at_ms: None,
         inline_keyboard: None,
         send_as_peer_id: None,
+        skip_server_bot_reply: false,
     }
 }
 

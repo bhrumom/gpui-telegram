@@ -14,10 +14,15 @@ pub mod schema;
 pub mod schema_parity;
 pub mod schema_parity_extra;
 pub mod social_store;
+pub mod user_vault_store;
 
 pub use migrations::run_migrations;
 pub use pool::SqlitePool;
 pub use schema::*;
+pub use user_vault_store::{
+    DeviceSyncApproveOutcome, DeviceSyncDenyOutcome, DeviceSyncPollOutcome,
+    UserSplitKeyAuthRecord, UserVaultUpsertOutcome,
+};
 
 use gpui_telegram_core::error::{Result, TelegramError};
 use gpui_telegram_core::types::{ChatId, MsgId, TopicId, UserId};

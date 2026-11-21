@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{Cursor, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -19,13 +19,14 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use zeroize::Zeroizing;
+use zip::write::SimpleFileOptions;
 
 use bot_browser::cdp::{
     CdpBridge, FillSubmitResult, LoginFormSelectors, ObscuraSidecarTransport, WsCdpTransport,
 };
 use bot_browser::sidecar::{
-    ArchiveKind, ObscuraBinaryManifest, ObscuraDownloader, ObscuraReleaseArtifact, ObscuraSidecar,
-    ProfileNamespace, SidecarConfig,
+    ArchiveKind, DEFAULT_OBSCURA_VERSION, ObscuraBinaryManifest, ObscuraDownloader,
+    ObscuraReleaseArtifact, ObscuraSidecar, ProfileNamespace, SidecarConfig,
 };
 use bot_browser::{
     BotBrowserError, BotBrowserEvent, DecryptedSecret, ElementRect, NormalizedClickPoint,
@@ -777,6 +778,243 @@ async fn obscura_downloader_verifies_sha256_targz_and_rejects_tampered_checksum(
     let p2 = ProfileNamespace::storage_dir_for(&data_dir, "Agent Session/1", Some(&origin));
     assert_eq!(p1, p2);
     assert!(p1.starts_with(data_dir.join("profiles")));
+
+    let _ = shutdown_tx.send(());
+}
+
+#[test]
+fn default_obscura_v027_manifest_pins_all_five_targets_with_sha256() {
+    let manifest = ObscuraBinaryManifest::default_obscura();
+    assert_eq!(DEFAULT_OBSCURA_VERSION, "0.2.7");
+    assert_eq!(manifest.version, "0.2.7");
+
+    let expected = [
+        (
+            "aarch64-macos",
+            "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.7/obscura-aarch64-macos-stealth.tar.gz",
+            "3b05ebcd4755a325be224992fad6a038d86f7e5ab483e4c781f14de06cab973f",
+            ArchiveKind::TarGz,
+        ),
+        (
+            "x86_64-macos",
+            "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.7/obscura-x86_64-macos-stealth.tar.gz",
+            "62bd094388a1f97480fd06be349299e721a3488c216c86a2fce9367310594ec3",
+            ArchiveKind::TarGz,
+        ),
+        (
+            "x86_64-linux",
+            "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.7/obscura-x86_64-linux-stealth.tar.gz",
+            "1d6514beacef9fe75671f4bf7a66d3a7bceef9bde39f8156d1ca4a701eb1e216",
+            ArchiveKind::TarGz,
+        ),
+        (
+            "aarch64-linux",
+            "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.7/obscura-aarch64-linux-stealth.tar.gz",
+            "f51167d7ae98be6c6327d3e7e015e74430e190ea6846589e3c131e10641a52b7",
+            ArchiveKind::TarGz,
+        ),
+        (
+            "x86_64-windows",
+            "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.7/obscura-x86_64-windows-stealth.zip",
+            "ffae5e71cfca0108709b57ad83ce7d6b588eff6a15a43093b0cf867dbd18c867",
+            ArchiveKind::Zip,
+        ),
+    ];
+
+    assert_eq!(manifest.artifacts.len(), expected.len());
+    for (target, url, sha, kind) in expected {
+        let art = manifest
+            .artifact_for_target(target)
+            .unwrap_or_else(|| panic!("missing manifest target {target}"));
+        assert_eq!(art.url, url);
+        assert_eq!(art.sha256, sha);
+        assert_eq!(art.sha256.len(), 64);
+        assert!(art.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(art.archive_kind, kind);
+    }
+}
+
+#[tokio::test]
+async fn obscura_downloader_extracts_zip_and_prefixed_stealth_binaries() {
+    let bin_bytes = b"#!/bin/sh\necho obscura-zip-stealth\n";
+
+    // Build a ZIP archive containing README + an obscura*-prefixed binary.
+    let mut zip_buf = Vec::new();
+    {
+        let cursor = Cursor::new(&mut zip_buf);
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("README.md", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"ignore me").unwrap();
+        writer
+            .start_file(
+                "obscura-stealth-dir/obscura-aarch64-macos-stealth",
+                SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .unwrap();
+        writer.write_all(bin_bytes).unwrap();
+        writer.finish().unwrap();
+    }
+    let zip_sha256 = hex::encode(Sha256::digest(&zip_buf));
+
+    // Also build a TarGz archive containing obscura.sha256 + ./obscura-aarch64-macos-stealth.
+    let tgz_bytes = b"#!/bin/sh\necho obscura-targz-stealth\n";
+    let mut tgz_buf = Vec::new();
+    {
+        let gz = GzEncoder::new(&mut tgz_buf, Compression::default());
+        let mut tar = Builder::new(gz);
+
+        let sha_meta = b"deadbeef  obscura\n";
+        let mut sha_hdr = Header::new_gnu();
+        sha_hdr.set_size(sha_meta.len() as u64);
+        sha_hdr.set_mode(0o644);
+        sha_hdr.set_cksum();
+        tar.append_data(&mut sha_hdr, "obscura.sha256", &sha_meta[..])
+            .unwrap();
+
+        let mut bin_hdr = Header::new_gnu();
+        bin_hdr.set_size(tgz_bytes.len() as u64);
+        bin_hdr.set_mode(0o755);
+        bin_hdr.set_cksum();
+        tar.append_data(
+            &mut bin_hdr,
+            "./obscura-aarch64-macos-stealth",
+            &tgz_bytes[..],
+        )
+        .unwrap();
+
+        let gz = tar.into_inner().unwrap();
+        gz.finish().unwrap();
+    }
+    let tgz_sha256 = hex::encode(Sha256::digest(&tgz_buf));
+
+    let routes = Arc::new(HashMap::from([
+        ("/obscura.zip".to_string(), zip_buf),
+        ("/obscura.tar.gz".to_string(), tgz_buf),
+    ]));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let routes_ref = Arc::clone(&routes);
+    let hits_ref = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                Ok((mut sock, _)) = listener.accept() => {
+                    let routes_c = Arc::clone(&routes_ref);
+                    let hits_c = Arc::clone(&hits_ref);
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        if let Some(payload) = routes_c.get(path) {
+                            hits_c.fetch_add(1, Ordering::SeqCst);
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            );
+                            let _ = sock.write_all(hdr.as_bytes()).await;
+                            let _ = sock.write_all(payload).await;
+                        } else {
+                            let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    let tmp_dir = TempDir::new().unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let target = ObscuraBinaryManifest::current_target().to_string();
+
+    // 1. Tampered ZIP checksum must fail.
+    let bad_zip_manifest = ObscuraBinaryManifest {
+        version: "0.2.7-zip-test".to_string(),
+        artifacts: vec![ObscuraReleaseArtifact {
+            target: target.clone(),
+            url: format!("http://127.0.0.1:{port}/obscura.zip"),
+            sha256: "f".repeat(64),
+            archive_kind: ArchiveKind::Zip,
+        }],
+    };
+    let bad_err = ObscuraDownloader::ensure_binary_with_overrides(
+        tmp_dir.path(),
+        &bad_zip_manifest,
+        &client,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(bad_err, BotBrowserError::SidecarChecksumMismatch { .. }));
+
+    // 2. Valid ZIP extracts obscura-*-stealth binary, caches it on second call.
+    let zip_manifest = ObscuraBinaryManifest {
+        version: "0.2.7-zip-test".to_string(),
+        artifacts: vec![ObscuraReleaseArtifact {
+            target: target.clone(),
+            url: format!("http://127.0.0.1:{port}/obscura.zip"),
+            sha256: zip_sha256,
+            archive_kind: ArchiveKind::Zip,
+        }],
+    };
+    let zip_bin = ObscuraDownloader::ensure_binary_with_overrides(
+        tmp_dir.path(),
+        &zip_manifest,
+        &client,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(&zip_bin).unwrap(), bin_bytes);
+    let hits_after_zip = hits.load(Ordering::SeqCst);
+    let zip_bin_cached = ObscuraDownloader::ensure_binary_with_overrides(
+        tmp_dir.path(),
+        &zip_manifest,
+        &client,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(zip_bin_cached, zip_bin);
+    assert_eq!(hits.load(Ordering::SeqCst), hits_after_zip);
+
+    // 3. Valid TarGz skips obscura.sha256 and extracts ./obscura-aarch64-macos-stealth.
+    let tgz_manifest = ObscuraBinaryManifest {
+        version: "0.2.7-tgz-stealth-test".to_string(),
+        artifacts: vec![ObscuraReleaseArtifact {
+            target,
+            url: format!("http://127.0.0.1:{port}/obscura.tar.gz"),
+            sha256: tgz_sha256,
+            archive_kind: ArchiveKind::TarGz,
+        }],
+    };
+    let tgz_bin = ObscuraDownloader::ensure_binary_with_overrides(
+        tmp_dir.path(),
+        &tgz_manifest,
+        &client,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(&tgz_bin).unwrap(), tgz_bytes);
 
     let _ = shutdown_tx.send(());
 }

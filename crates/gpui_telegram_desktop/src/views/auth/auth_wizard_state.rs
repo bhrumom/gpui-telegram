@@ -1,6 +1,47 @@
 //! State types, navigation enums, emitted events, and validation helpers for `AuthWizardView`.
 
+use bot_browser::e2ee_sync::{Argon2KdfParams, SplitKeyVaultKek};
 use gpui_telegram_client::AuthResponse;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+/// Strictly in-memory vault bootstrap secrets passed from `AuthWizardView` to `AppShell`
+/// upon successful sign-in or registration. Zeroized on consume/drop; never written to disk or logs.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub enum PendingAuthVaultBootstrap {
+    SplitKeyV2 {
+        split_kek: SplitKeyVaultKek,
+        #[zeroize(skip)]
+        auth_salt_b64: String,
+        #[zeroize(skip)]
+        kdf_params: Argon2KdfParams,
+        legacy_upgrade_password: Option<Zeroizing<String>>,
+        #[zeroize(skip)]
+        is_new_registration: bool,
+    },
+    PasswordlessDeviceOnly,
+}
+
+impl std::fmt::Debug for PendingAuthVaultBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SplitKeyV2 {
+                auth_salt_b64,
+                kdf_params,
+                legacy_upgrade_password,
+                is_new_registration,
+                ..
+            } => f
+                .debug_struct("SplitKeyV2")
+                .field("split_kek", &"[REDACTED]")
+                .field("auth_salt_b64", auth_salt_b64)
+                .field("kdf_params", kdf_params)
+                .field("has_legacy_upgrade", &legacy_upgrade_password.is_some())
+                .field("is_new_registration", is_new_registration)
+                .finish(),
+            Self::PasswordlessDeviceOnly => f.write_str("PasswordlessDeviceOnly"),
+        }
+    }
+}
 
 /// High-level steps of the unauthenticated Telegram Desktop onboarding & login wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

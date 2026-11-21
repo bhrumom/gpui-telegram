@@ -22,6 +22,8 @@ use crate::views::app_shell::peer_avatar_color;
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::chat_sidebar::{AddContactKind, CreationInputField, SidebarCreationModal};
 use crate::views::nav_rail::NavDestination;
+use crate::views::settings::sections::SettingsVaultAction;
+use crate::views::settings::SettingsSectionType;
 use crate::views::shell::{ActiveWorkspacePanel, AppShell};
 use crate::views::tdesktop_theme::tr_str;
 use crate::views::{CallOverlay, ComputerWorkbench, IvViewer, MainMenuCommand, MediaViewer};
@@ -1975,6 +1977,132 @@ impl AppShell {
                                 this.decide_pending_computer_approval(cmd_approve.clone(), true, cx);
                             }))
                             .child(tr_str(lang, "允许执行", "Allow")),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Renders a sleek, non-blocking floating banner on first vault creation so the user
+    /// can copy or inspect their one-time Emergency Kit without modal interruption.
+    pub fn render_vault_first_setup_notice_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id();
+
+        div()
+            .id("vault-first-setup-notice-banner")
+            .occlude()
+            .absolute()
+            .bottom(px(76.0))
+            .right(px(20.0))
+            .w(px(360.0))
+            .p(px(13.0))
+            .rounded(px(12.0))
+            .bg(rgb(pal.modal_bg))
+            .border_1()
+            .border_color(rgb(pal.accent))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(tg_icon(IconName::Lock, 15.0, pal.accent))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(pal.text_primary))
+                                    .child(tr_str(
+                                        lang,
+                                        "端到端加密保管库已自动启用",
+                                        "E2EE Vault Enabled Automatically",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("dismiss-vault-banner-btn")
+                            .cursor_pointer()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .text_xs()
+                            .text_color(rgb(pal.text_secondary))
+                            .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bot_browser.first_creation_banner_open = false;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        lang,
+                        "已为您的设备配置零知识密钥与一次性恢复密钥（绝不上传明文）。建议复制并离线备份。",
+                        "Zero-knowledge vault keys and a local-only Emergency Kit were created. Copy it for offline backup.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("open-privacy-vault-settings-btn")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(5.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(pal.hover_bg))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(pal.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bot_browser.first_creation_banner_open = false;
+                                this.active_panel = ActiveWorkspacePanel::Settings;
+                                this.settings_router.update(cx, |r, rcx| {
+                                    r.ensure_privacy(rcx);
+                                    r.navigate_to(SettingsSectionType::PrivacySecurity, true, rcx);
+                                });
+                                this.sync_vault_custody_to_settings(cx);
+                                this.refresh_pending_device_sync_requests(cx);
+                                cx.notify();
+                            }))
+                            .child(tr_str(lang, "查看详情", "Details")),
+                    )
+                    .child(
+                        div()
+                            .id("copy-vault-emergency-kit-btn")
+                            .cursor_pointer()
+                            .px(px(12.0))
+                            .py(px(5.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(pal.accent))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xFFFFFF))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.handle_settings_vault_action(
+                                    &SettingsVaultAction::CopyEmergencyKit,
+                                    cx,
+                                );
+                            }))
+                            .child(tr_str(lang, "复制恢复密钥", "Copy Kit")),
                     ),
             )
             .into_any_element()

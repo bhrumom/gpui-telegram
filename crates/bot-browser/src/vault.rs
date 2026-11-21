@@ -246,6 +246,41 @@ struct SecretPayload {
     totp_secret: Option<String>,
 }
 
+/// Decrypted credential payload for client-side E2EE sync export/import.
+/// Never serialized to AI tool responses and redacted in `Debug`.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct VaultSyncCredentialPayload {
+    pub credential_id: String,
+    pub origin: String,
+    pub account_hint: String,
+    #[zeroize(skip)]
+    pub reuse_policy: ReusePolicy,
+    pub username: String,
+    pub password: String,
+    pub totp_secret: Option<String>,
+    pub created_at_ms: i64,
+    pub last_used_at_ms: Option<i64>,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+impl std::fmt::Debug for VaultSyncCredentialPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultSyncCredentialPayload")
+            .field("credential_id", &self.credential_id)
+            .field("origin", &self.origin)
+            .field("account_hint", &self.account_hint)
+            .field("reuse_policy", &self.reuse_policy)
+            .field("username", &"[REDACTED]")
+            .field("password", &"[REDACTED]")
+            .field("has_totp", &self.totp_secret.is_some())
+            .field("created_at_ms", &self.created_at_ms)
+            .field("last_used_at_ms", &self.last_used_at_ms)
+            .field("deleted", &self.deleted)
+            .finish()
+    }
+}
+
 pub struct CredentialVault {
     conn: Mutex<Connection>,
     master_key: Zeroizing<[u8; 32]>,
@@ -304,6 +339,77 @@ impl CredentialVault {
         })
     }
 
+    fn encrypt_secret_payload(
+        &self,
+        credential_id: &str,
+        origin: &NormalizedOrigin,
+        payload: &SecretPayload,
+    ) -> Result<([u8; 12], Vec<u8>), BotBrowserError> {
+        let plaintext = Zeroizing::new(serde_json::to_vec(payload).map_err(|e| {
+            BotBrowserError::Crypto(format!("failed to serialize credential payload: {e}"))
+        })?);
+        let subkey = derive_credential_key(&self.master_key, credential_id)?;
+        let aad = build_aad(credential_id, origin.as_str());
+
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
+            BotBrowserError::Crypto(format!("failed to generate AEAD nonce: {e}"))
+        })?;
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*subkey));
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &plaintext,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|e| BotBrowserError::Crypto(format!("credential encryption failed: {e}")))?;
+        Ok((nonce_bytes, ciphertext))
+    }
+
+    fn decrypt_row_payload(
+        &self,
+        credential_id: &str,
+        canonical_origin: &str,
+        nonce_bytes: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<SecretPayload, BotBrowserError> {
+        if nonce_bytes.len() != 12 {
+            return Err(BotBrowserError::Crypto(format!(
+                "invalid stored nonce length: {} bytes",
+                nonce_bytes.len()
+            )));
+        }
+
+        let subkey = derive_credential_key(&self.master_key, credential_id)?;
+        let aad = build_aad(credential_id, canonical_origin);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*subkey));
+
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(nonce_bytes),
+                    Payload {
+                        msg: ciphertext,
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .map_err(|_| {
+                    BotBrowserError::Crypto(
+                        "AEAD authentication failed (origin binding or ciphertext tampered)"
+                            .to_string(),
+                    )
+                })?,
+        );
+        drop(subkey);
+
+        serde_json::from_slice(&plaintext).map_err(|e| {
+            BotBrowserError::Crypto(format!("failed to decode decrypted credential payload: {e}"))
+        })
+    }
+
     pub fn store_credential(
         &self,
         origin_raw: &str,
@@ -335,31 +441,9 @@ impl CredentialVault {
             password: password.to_string(),
             totp_secret: normalized_totp,
         };
-        let plaintext = Zeroizing::new(serde_json::to_vec(&payload).map_err(|e| {
-            BotBrowserError::Crypto(format!("failed to serialize credential payload: {e}"))
-        })?);
+        let (nonce_bytes, ciphertext) =
+            self.encrypt_secret_payload(&credential_id, &origin, &payload)?;
         drop(payload);
-
-        let subkey = derive_credential_key(&self.master_key, &credential_id)?;
-        let aad = build_aad(&credential_id, origin.as_str());
-
-        let mut nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
-            BotBrowserError::Crypto(format!("failed to generate AEAD nonce: {e}"))
-        })?;
-
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*subkey));
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &plaintext,
-                    aad: aad.as_bytes(),
-                },
-            )
-            .map_err(|e| BotBrowserError::Crypto(format!("credential encryption failed: {e}")))?;
-        drop(plaintext);
-        drop(subkey);
 
         let policy_str = policy_to_db_str(policy);
         let conn = self.conn.lock();
@@ -472,39 +556,12 @@ impl CredentialVault {
             }
         }
 
-        if nonce_bytes.len() != 12 {
-            return Err(BotBrowserError::Crypto(format!(
-                "invalid stored nonce length: {} bytes",
-                nonce_bytes.len()
-            )));
-        }
-
-        let subkey = derive_credential_key(&self.master_key, credential_id)?;
-        let aad = build_aad(credential_id, parsed_page_origin.as_str());
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*subkey));
-
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(
-                    Nonce::from_slice(&nonce_bytes),
-                    Payload {
-                        msg: &ciphertext,
-                        aad: aad.as_bytes(),
-                    },
-                )
-                .map_err(|_| {
-                    BotBrowserError::Crypto(
-                        "AEAD authentication failed (origin binding or ciphertext tampered)"
-                            .to_string(),
-                    )
-                })?,
-        );
-        drop(subkey);
-
-        let mut payload: SecretPayload = serde_json::from_slice(&plaintext).map_err(|e| {
-            BotBrowserError::Crypto(format!("failed to decode decrypted credential payload: {e}"))
-        })?;
-        drop(plaintext);
+        let mut payload = self.decrypt_row_payload(
+            credential_id,
+            parsed_page_origin.as_str(),
+            &nonce_bytes,
+            &ciphertext,
+        )?;
 
         let secret = DecryptedSecret {
             username: Zeroizing::new(std::mem::take(&mut payload.username)),
@@ -565,6 +622,18 @@ impl CredentialVault {
     }
 
     pub fn delete_credential(&self, credential_id: &str) -> Result<(), BotBrowserError> {
+        if !self.delete_credential_if_exists(credential_id)? {
+            return Err(BotBrowserError::CredentialNotFound(
+                credential_id.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delete_credential_if_exists(
+        &self,
+        credential_id: &str,
+    ) -> Result<bool, BotBrowserError> {
         let conn = self.conn.lock();
         let affected = conn
             .execute(
@@ -574,12 +643,292 @@ impl CredentialVault {
             .map_err(|e| {
                 BotBrowserError::Storage(format!("failed to delete credential: {e}"))
             })?;
-        if affected == 0 {
-            return Err(BotBrowserError::CredentialNotFound(
-                credential_id.to_string(),
+        Ok(affected > 0)
+    }
+
+    /// Exports one credential decrypted for client-side E2EE sync without mutating `last_used_at_ms`.
+    pub fn export_for_sync(
+        &self,
+        credential_id: &str,
+    ) -> Result<VaultSyncCredentialPayload, BotBrowserError> {
+        let row: (String, String, String, Vec<u8>, Vec<u8>, i64, Option<i64>) = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT origin, account_hint, reuse_policy, nonce, ciphertext, created_at_ms, last_used_at_ms
+                 FROM vault_credentials
+                 WHERE credential_id = ?1",
+                params![credential_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| BotBrowserError::Storage(format!("failed to load credential for sync: {e}")))?
+            .ok_or_else(|| BotBrowserError::CredentialNotFound(credential_id.to_string()))?
+        };
+
+        let (origin, account_hint, policy_raw, nonce, ciphertext, created_at_ms, last_used_at_ms) =
+            row;
+        let reuse_policy = db_str_to_policy(&policy_raw).map_err(|e| {
+            BotBrowserError::Storage(format!("invalid stored reuse_policy: {e}"))
+        })?;
+        let mut payload =
+            self.decrypt_row_payload(credential_id, &origin, &nonce, &ciphertext)?;
+
+        Ok(VaultSyncCredentialPayload {
+            credential_id: credential_id.to_string(),
+            origin,
+            account_hint,
+            reuse_policy,
+            username: std::mem::take(&mut payload.username),
+            password: std::mem::take(&mut payload.password),
+            totp_secret: payload.totp_secret.take(),
+            created_at_ms,
+            last_used_at_ms,
+            deleted: false,
+        })
+    }
+
+    /// Exports all stored credentials decrypted for client-side E2EE sync without mutating `last_used_at_ms`.
+    pub fn export_all_for_sync(&self) -> Result<Vec<VaultSyncCredentialPayload>, BotBrowserError> {
+        let rows: Vec<(String, String, String, String, Vec<u8>, Vec<u8>, i64, Option<i64>)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT credential_id, origin, account_hint, reuse_policy, nonce, ciphertext, created_at_ms, last_used_at_ms
+                     FROM vault_credentials
+                     ORDER BY created_at_ms ASC, credential_id ASC",
+                )
+                .map_err(|e| {
+                    BotBrowserError::Storage(format!("failed to prepare sync export query: {e}"))
+                })?;
+
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                })
+                .map_err(|e| {
+                    BotBrowserError::Storage(format!("failed to execute sync export query: {e}"))
+                })?;
+
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row.map_err(|e| {
+                    BotBrowserError::Storage(format!("failed to decode sync export row: {e}"))
+                })?);
+            }
+            collected
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (
+            credential_id,
+            origin,
+            account_hint,
+            policy_raw,
+            nonce,
+            ciphertext,
+            created_at_ms,
+            last_used_at_ms,
+        ) in rows
+        {
+            let reuse_policy = db_str_to_policy(&policy_raw).map_err(|e| {
+                BotBrowserError::Storage(format!("invalid stored reuse_policy: {e}"))
+            })?;
+            let mut payload =
+                self.decrypt_row_payload(&credential_id, &origin, &nonce, &ciphertext)?;
+            out.push(VaultSyncCredentialPayload {
+                credential_id,
+                origin,
+                account_hint,
+                reuse_policy,
+                username: std::mem::take(&mut payload.username),
+                password: std::mem::take(&mut payload.password),
+                totp_secret: payload.totp_secret.take(),
+                created_at_ms,
+                last_used_at_ms,
+                deleted: false,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Merges/imports a decrypted E2EE sync record by `credential_id`, re-encrypting locally
+    /// using the active `VaultRootKey` and canonical `origin` AAD binding.
+    /// Returns `Ok(true)` if the local vault state changed, or `Ok(false)` if unchanged.
+    pub fn import_from_sync(
+        &self,
+        record: &VaultSyncCredentialPayload,
+    ) -> Result<bool, BotBrowserError> {
+        let credential_id = record.credential_id.trim();
+        if credential_id.is_empty() {
+            return Err(BotBrowserError::Storage(
+                "sync credential_id cannot be empty".to_string(),
             ));
         }
-        Ok(())
+
+        if record.deleted {
+            return self.delete_credential_if_exists(credential_id);
+        }
+
+        let origin = NormalizedOrigin::parse(&record.origin)?;
+        let normalized_totp = record
+            .totp_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let has_totp = normalized_totp.is_some();
+        let resolved_hint = if record.account_hint.trim().is_empty() {
+            mask_account_hint(&record.username)
+        } else {
+            record.account_hint.trim().to_string()
+        };
+
+        let existing: Option<(String, String, String, Vec<u8>, Vec<u8>, i64, Option<i64>)> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT origin, account_hint, reuse_policy, nonce, ciphertext, created_at_ms, last_used_at_ms
+                 FROM vault_credentials
+                 WHERE credential_id = ?1",
+                params![credential_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| BotBrowserError::Storage(format!("failed to check existing credential: {e}")))?
+        };
+
+        if let Some((
+            existing_origin,
+            existing_hint,
+            existing_policy_raw,
+            existing_nonce,
+            existing_ct,
+            existing_created_at_ms,
+            existing_last_used_at_ms,
+        )) = existing
+        {
+            let existing_policy = db_str_to_policy(&existing_policy_raw).map_err(|e| {
+                BotBrowserError::Storage(format!("invalid stored reuse_policy: {e}"))
+            })?;
+            let existing_payload = self.decrypt_row_payload(
+                credential_id,
+                &existing_origin,
+                &existing_nonce,
+                &existing_ct,
+            )?;
+
+            let merged_last_used = match (existing_last_used_at_ms, record.last_used_at_ms) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+
+            let identical = existing_origin == origin.as_str()
+                && existing_hint == resolved_hint
+                && existing_policy == record.reuse_policy
+                && existing_payload.username == record.username
+                && existing_payload.password == record.password
+                && existing_payload.totp_secret == normalized_totp
+                && existing_created_at_ms == record.created_at_ms
+                && existing_last_used_at_ms == merged_last_used;
+            drop(existing_payload);
+
+            if identical {
+                return Ok(false);
+            }
+
+            let payload = SecretPayload {
+                username: record.username.clone(),
+                password: record.password.clone(),
+                totp_secret: normalized_totp,
+            };
+            let (nonce_bytes, ciphertext) =
+                self.encrypt_secret_payload(credential_id, &origin, &payload)?;
+            drop(payload);
+
+            let policy_str = policy_to_db_str(record.reuse_policy);
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE vault_credentials
+                 SET origin = ?1, account_hint = ?2, has_totp = ?3, reuse_policy = ?4,
+                     nonce = ?5, ciphertext = ?6, created_at_ms = ?7, last_used_at_ms = ?8
+                 WHERE credential_id = ?9",
+                params![
+                    origin.as_str(),
+                    resolved_hint,
+                    if has_totp { 1i64 } else { 0i64 },
+                    policy_str,
+                    nonce_bytes.as_slice(),
+                    ciphertext,
+                    record.created_at_ms,
+                    merged_last_used,
+                    credential_id,
+                ],
+            )
+            .map_err(|e| BotBrowserError::Storage(format!("failed to merge sync credential: {e}")))?;
+            return Ok(true);
+        }
+
+        let payload = SecretPayload {
+            username: record.username.clone(),
+            password: record.password.clone(),
+            totp_secret: normalized_totp,
+        };
+        let (nonce_bytes, ciphertext) =
+            self.encrypt_secret_payload(credential_id, &origin, &payload)?;
+        drop(payload);
+
+        let policy_str = policy_to_db_str(record.reuse_policy);
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO vault_credentials (
+                credential_id, origin, account_hint, has_totp, reuse_policy,
+                nonce, ciphertext, created_at_ms, last_used_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                credential_id,
+                origin.as_str(),
+                resolved_hint,
+                if has_totp { 1i64 } else { 0i64 },
+                policy_str,
+                nonce_bytes.as_slice(),
+                ciphertext,
+                record.created_at_ms,
+                record.last_used_at_ms,
+            ],
+        )
+        .map_err(|e| BotBrowserError::Storage(format!("failed to insert sync credential: {e}")))?;
+
+        Ok(true)
     }
 }
 

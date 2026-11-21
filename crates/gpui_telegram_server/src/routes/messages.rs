@@ -10,6 +10,7 @@ use axum::{body::Bytes, extract::{Path, Query, State}, http::StatusCode, respons
 use chrono::{DateTime, Utc};
 use gpui_telegram_core::types::{ChatId, MessageFlags, MsgId, PeerId, TopicId, UserId};
 use gpui_telegram_proto::message::{ForwardInfo, InlineKeyboardButton, MediaItem, MessageContent, MessageEntity, MessageItem, ReplyHeader, VoiceItem};
+use gpui_telegram_proto::user_vault::{ArchiveLocalBotReplyRequest, ArchiveLocalBotReplyResponse};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -350,30 +351,36 @@ pub async fn send_for_chat(state: &Arc<AppState>, auth_user: UserId, chat_id_raw
                 &text_preview,
                 date_ms,
             );
-            let targets = detect_target_bots_in_chat(state, chat_id, auth_user, &text_preview, reply_to);
-            let has_ai_target = targets.iter().any(|buid| {
-                !state
-                    .db
-                    .get_bot_by_user_id(buid.0 as i64)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|b| b.is_standard_bot)
-            });
-            if has_ai_target {
-                let weak_state = Arc::downgrade(state);
-                let tp = text_preview.clone();
-                tokio::spawn(async move {
-                    if let Some(state_bg) = weak_state.upgrade() {
-                        maybe_trigger_bot_reply_with_reply_to(
-                            &state_bg,
-                            chat_id,
-                            auth_user,
-                            &tp,
-                            reply_to,
-                        )
-                        .await;
-                    }
+            let skip_server_bot_reply = payload
+                .get("skip_server_bot_reply")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !skip_server_bot_reply {
+                let targets = detect_target_bots_in_chat(state, chat_id, auth_user, &text_preview, reply_to);
+                let has_ai_target = targets.iter().any(|buid| {
+                    !state
+                        .db
+                        .get_bot_by_user_id(buid.0 as i64)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|b| b.is_standard_bot)
                 });
+                if has_ai_target {
+                    let weak_state = Arc::downgrade(state);
+                    let tp = text_preview.clone();
+                    tokio::spawn(async move {
+                        if let Some(state_bg) = weak_state.upgrade() {
+                            maybe_trigger_bot_reply_with_reply_to(
+                                &state_bg,
+                                chat_id,
+                                auth_user,
+                                &tp,
+                                reply_to,
+                            )
+                            .await;
+                        }
+                    });
+                }
             }
         }
     }
@@ -403,6 +410,169 @@ pub async fn messages_send_clean(auth: AuthBearer, State(state): State<Arc<AppSt
 pub async fn chats_messages_send(auth: AuthBearer, State(state): State<Arc<AppState>>, Path(chat_id): Path<i64>, body: Bytes) -> Response {
     let payload = match parse_json_object(&body) { Ok(v) => v, Err(r) => return r };
     send_for_chat(&state, auth.user_id, chat_id, payload, StatusCode::CREATED).await
+}
+
+pub async fn archive_local_bot_reply(
+    auth: AuthBearer,
+    State(state): State<Arc<AppState>>,
+    Path(chat_id_raw): Path<i64>,
+    Json(req): Json<ArchiveLocalBotReplyRequest>,
+) -> Response {
+    if chat_id_raw <= 0 {
+        return err_resp(StatusCode::BAD_REQUEST, "invalid_chat_id", "chat_id must be a positive integer");
+    }
+    if req.bot_user_id <= 0 {
+        return err_resp(StatusCode::BAD_REQUEST, "invalid_bot_user_id", "bot_user_id must be a positive integer");
+    }
+    let trimmed_text = req.text.trim();
+    if trimmed_text.is_empty() || trimmed_text.chars().count() > 4096 {
+        return err_resp(StatusCode::BAD_REQUEST, "invalid_text", "Message text must be 1..=4096 characters");
+    }
+    if let Some(reply_id) = req.reply_to_msg_id {
+        if reply_id <= 0 {
+            return err_resp(StatusCode::BAD_REQUEST, "invalid_reply_to", "reply_to_msg_id must be > 0");
+        }
+    }
+    if let Some(nonce) = req.client_nonce {
+        if nonce == 0 || nonce > i64::MAX as u64 {
+            return err_resp(
+                StatusCode::BAD_REQUEST,
+                "invalid_nonce",
+                "client_nonce must be between 1 and i64::MAX",
+            );
+        }
+    }
+
+    let chat_id = ChatId(chat_id_raw);
+    let (chat, _, _) = match check_active_membership(&state, chat_id, auth.user_id) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+
+    if req.bot_user_id == crate::db::miniapp_store::BOTFATHER_USER_ID as i64 {
+        return err_resp(
+            StatusCode::FORBIDDEN,
+            "invalid_fabushi_bot",
+            "Cannot archive local reply as BotFather",
+        );
+    }
+
+    let is_official_default =
+        req.bot_user_id == gpui_telegram_agent::fabushi_bot::OFFICIAL_DEFAULT_BOT_USER_ID;
+    if is_official_default {
+        crate::server::ensure_default_ai_bot(&state.db);
+    }
+
+    let bot_uid = UserId(req.bot_user_id as u64);
+    let bot_user_opt = match state.db.get_user(bot_uid) {
+        Ok(u) => u,
+        Err(e) => return map_telegram_err(e),
+    };
+    if !bot_user_opt.as_ref().is_some_and(|u| u.is_bot) {
+        return err_resp(
+            StatusCode::FORBIDDEN,
+            "invalid_fabushi_bot",
+            "Target bot_user_id is not a registered bot",
+        );
+    }
+    let bot_reg = match state.db.get_bot_by_user_id(req.bot_user_id) {
+        Ok(b) => b,
+        Err(e) => return map_telegram_err(e),
+    };
+    if bot_reg.as_ref().is_some_and(|b| b.is_standard_bot) {
+        return err_resp(
+            StatusCode::FORBIDDEN,
+            "invalid_fabushi_bot",
+            "Target bot_user_id is a standard bot, not a Fabushi Bot",
+        );
+    }
+
+    let owned_by_caller = bot_reg
+        .as_ref()
+        .is_some_and(|b| b.owner_user_id == auth.user_id.0 as i64)
+        || state
+            .fabushi_bots
+            .get_by_user_id(req.bot_user_id)
+            .is_some_and(|inst| inst.settings().owner_user_id == auth.user_id.0 as i64);
+    let bot_is_member = crate::routes::hermes::is_bot_member_of_chat(&state, bot_uid.0, chat_id);
+    if !is_official_default && !owned_by_caller && !bot_is_member {
+        return err_resp(
+            StatusCode::FORBIDDEN,
+            "bot_not_authorized_in_chat",
+            "Caller is not authorized to archive a reply for this bot in this chat",
+        );
+    }
+
+    let to_peer = if chat.chat_type == 0 {
+        PeerId::User(auth.user_id)
+    } else {
+        PeerId::Chat(chat_id)
+    };
+    let mut item = MessageItem::new(
+        MsgId(0),
+        chat_id,
+        bot_uid,
+        to_peer,
+        MessageContent::plain_text(trimmed_text),
+    );
+    item.client_nonce = req.client_nonce;
+    item.flags = MessageFlags {
+        is_out: false,
+        ..Default::default()
+    };
+    if let Some(reply_id) = req.reply_to_msg_id {
+        item.reply_to = Some(ReplyHeader::new(MsgId(reply_id)));
+    }
+
+    let pts_update = match state.message_pipeline.process_incoming_message_strict(item) {
+        Ok(u) => u,
+        Err(e) => return map_telegram_err(e),
+    };
+    let msg_id = match &pts_update.event {
+        gpui_telegram_proto::sync::UpdateEvent::NewMessage(m)
+        | gpui_telegram_proto::sync::UpdateEvent::EditMessage(m) => m.id,
+        _ => MsgId(0),
+    };
+    let date_ms = state
+        .db
+        .get_message(chat_id, msg_id)
+        .ok()
+        .flatten()
+        .map(|r| r.date_ms)
+        .unwrap_or(pts_update.timestamp_ms);
+
+    if pts_update.pts_count > 0 {
+        state
+            .search_indexer
+            .index_message_nonblocking(SearchDocument::new(
+                msg_id.0.to_string(),
+                chat_id.0.to_string(),
+                bot_uid.0.to_string(),
+                date_ms,
+                trimmed_text.to_string(),
+                None,
+            ));
+        state.search_indexer.commit_nonblocking();
+        let hm_doc_id = format!("{}:{}", chat_id.0, msg_id.0);
+        state.hybrid_memory.index_message_or_file(
+            &hm_doc_id,
+            chat_id.0,
+            "message",
+            trimmed_text,
+            vec![],
+        );
+        broadcast_chat_pts(&state, chat_id, pts_update.clone());
+    }
+
+    (
+        StatusCode::OK,
+        Json(ArchiveLocalBotReplyResponse {
+            message_id: msg_id.0,
+            pts: pts_update.pts,
+            date_ms,
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

@@ -28,6 +28,9 @@ use crate::views::stage::cards::{
 impl AppShell {
     /// Appends an optimistic outgoing text message to the stage/sidebar and dispatches `send_message_rich`.
     pub fn append_outgoing_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.try_handle_local_vault_command(&text, cx) {
+            return;
+        }
         let verified_target = {
             let sb = self.sidebar.read(cx);
             let st = self.stage.read(cx);
@@ -120,6 +123,9 @@ impl AppShell {
             .chosen(active_chat_id)
             .or_else(|| self.composer.read(cx).selected_send_as_peer_id);
 
+        let fabushi_target = self.resolve_fabushi_bot_target(active_chat_id, cx);
+        let run_local_fabushi = fabushi_target.is_some() && self.can_run_local_fabushi_turn(cx);
+
         {
             let client = self.client.clone();
             let draft_token = token.clone();
@@ -140,6 +146,7 @@ impl AppShell {
                 scheduled_at_ms: None,
                 inline_keyboard: None,
                 send_as_peer_id,
+                skip_server_bot_reply: run_local_fabushi,
             };
             let sent_msg_id = msg_id;
             let http_fence = fence.clone();
@@ -211,7 +218,9 @@ impl AppShell {
             || peer_name.contains("Autonomous Agent")
             || peer_name.contains("Bot");
 
-        if is_ai_bot {
+        if let Some(target) = fabushi_target.filter(|_| run_local_fabushi) {
+            self.spawn_local_fabushi_turn(active_chat_id, target, None, text, cx);
+        } else if is_ai_bot {
             let lang = self.active_lang_id();
             let thinking_txt =
                 tr_str(lang, "AI 助手正在思考...", "Assistant is thinking...").to_string();

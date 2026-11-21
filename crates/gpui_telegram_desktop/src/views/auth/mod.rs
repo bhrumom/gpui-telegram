@@ -3,7 +3,9 @@ pub mod auth_wizard_actions;
 pub mod auth_wizard_state;
 pub mod auth_wizard_tabs_render;
 pub mod auth_wizard_view;
-pub use auth_wizard_state::{AuthWizardEvent, AuthWizardTab, LoginInputField, LoginWizardStep};
+pub use auth_wizard_state::{
+    AuthWizardEvent, AuthWizardTab, LoginInputField, LoginWizardStep, PendingAuthVaultBootstrap,
+};
 pub use auth_wizard_view::AuthWizardView;
 pub mod cable;
 pub use cable::Cable;

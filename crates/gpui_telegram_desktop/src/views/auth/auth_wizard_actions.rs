@@ -4,11 +4,20 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use bot_browser::e2ee_sync::{
+    derive_split_key, generate_split_key_salt_b64, Argon2KdfParams,
+};
 use gpui::*;
 use gpui_telegram_client::{
-    config::ClientConfig, net::http_client::EmailRegisterRequest, AuthResponse, HttpClientError,
-    LoginRequest, RegisterRequest, TelegramClient,
+    client_auth::auth_from_proto,
+    config::ClientConfig,
+    net::{
+        Argon2KdfParamsDto, SplitKeyEmailRegisterRequest, SplitKeyLoginRequest,
+        SplitKeyRegisterRequest,
+    },
+    AuthResponse, HttpClientError, LoginRequest, TelegramClient,
 };
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::components::ui::{
     delete_prev_word, pop_last_char, sanitize_paste_text, utf16_len, utf16_offset_to_utf8,
@@ -16,9 +25,33 @@ use crate::components::ui::{
 
 use super::auth_wizard_state::{
     next_login_field, validate_email_address, AuthWizardEvent, AuthWizardTab, LoginInputField,
-    LoginWizardStep,
+    LoginWizardStep, PendingAuthVaultBootstrap,
 };
 use super::auth_wizard_view::AuthWizardView;
+
+fn preferred_split_key_kdf_params() -> Argon2KdfParams {
+    if std::env::var("GPUI_OFFLINE_TEST").as_deref() == Ok("1") {
+        Argon2KdfParams::fast_for_tests()
+    } else {
+        Argon2KdfParams::default()
+    }
+}
+
+fn proto_kdf_to_bot(p: Argon2KdfParamsDto) -> Argon2KdfParams {
+    Argon2KdfParams {
+        m_cost_kib: p.m_cost_kib,
+        t_cost: p.t_cost,
+        p_cost: p.p_cost,
+    }
+}
+
+fn bot_kdf_to_proto(p: Argon2KdfParams) -> Argon2KdfParamsDto {
+    Argon2KdfParamsDto {
+        m_cost_kib: p.m_cost_kib,
+        t_cost: p.t_cost,
+        p_cost: p.p_cost,
+    }
+}
 
 impl AuthWizardView {
     fn loc(&self, zh: &str, en: &str) -> String {
@@ -38,13 +71,19 @@ impl AuthWizardView {
     fn apply_auth_result(
         &mut self,
         res: Result<AuthResponse, HttpClientError>,
+        pending_bootstrap: Option<PendingAuthVaultBootstrap>,
         err_msg: impl FnOnce(HttpClientError) -> String,
         cx: &mut Context<Self>,
     ) {
         self.is_authenticating = false;
         match res {
-            Ok(auth) => self.emit_authenticated(auth, cx),
+            Ok(auth) => {
+                self.pending_vault_bootstrap = pending_bootstrap;
+                self.emit_authenticated(auth, cx);
+            }
             Err(err) => {
+                drop(pending_bootstrap);
+                self.pending_vault_bootstrap = None;
                 self.login_error = Some(err_msg(err));
                 cx.notify();
             }
@@ -55,6 +94,7 @@ impl AuthWizardView {
         self.is_authenticated = true;
         self.is_authenticating = false;
         self.login_error = None;
+        self.password_input.zeroize();
         self.ime.clear_preedit();
         self.ime.just_committed_ime = false;
         cx.emit(AuthWizardEvent::Authenticated(auth));
@@ -66,7 +106,8 @@ impl AuthWizardView {
     }
 
     pub fn submit_login(&mut self, cx: &mut Context<Self>) {
-        let (username, password) = (self.username_input.trim().to_string(), self.password_input.clone());
+        let username = self.username_input.trim().to_string();
+        let password = Zeroizing::new(self.password_input.clone());
         if username.is_empty() || password.is_empty() {
             self.login_error = Some("Username and password cannot be empty".to_string());
             cx.notify();
@@ -74,15 +115,115 @@ impl AuthWizardView {
         }
         self.is_authenticating = true;
         self.login_error = None;
+        self.pending_vault_bootstrap = None;
         cx.notify();
 
         let client = self.client.clone();
-        let req = LoginRequest { username, password, device_name: "GPUI Desktop Client".to_string() };
         cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client.http_client.login(&req).await;
+            let (res, pending_bootstrap) = match client.http_client.get_auth_kdf_params(&username).await {
+                Ok(kdf_resp) if kdf_resp.auth_version == 2 => {
+                    let kdf_params = proto_kdf_to_bot(kdf_resp.kdf_params);
+                    let salt_b64 = kdf_resp.auth_salt_b64.clone();
+                    let pw_for_kdf = password.clone();
+                    drop(password);
+                    let derive_res = client
+                        .runtime()
+                        .spawn_blocking(move || {
+                            derive_split_key(pw_for_kdf.as_str(), &salt_b64, &kdf_params)
+                        })
+                        .await;
+                    match derive_res {
+                        Ok(Ok(bundle)) => {
+                            let req = SplitKeyLoginRequest {
+                                username,
+                                password: String::new(),
+                                device_name: "GPUI Desktop Client".to_string(),
+                                auth_verifier_b64: Some(bundle.auth_verifier_b64.as_str().to_string()),
+                            };
+                            let login_res = client
+                                .http_client
+                                .login_split_key(&req)
+                                .await
+                                .map(auth_from_proto);
+                            let boot = PendingAuthVaultBootstrap::SplitKeyV2 {
+                                split_kek: bundle.vault_kek.clone(),
+                                auth_salt_b64: bundle.auth_salt_b64.clone(),
+                                kdf_params: bundle.kdf_params,
+                                legacy_upgrade_password: None,
+                                is_new_registration: false,
+                            };
+                            (login_res, Some(boot))
+                        }
+                        Ok(Err(e)) => (
+                            Err(HttpClientError::Api {
+                                status: 400,
+                                message: format!("Split-Key derivation failed: {e}"),
+                            }),
+                            None,
+                        ),
+                        Err(e) => (
+                            Err(HttpClientError::Api {
+                                status: 500,
+                                message: format!("Split-Key derivation task failed: {e}"),
+                            }),
+                            None,
+                        ),
+                    }
+                }
+                Ok(_) => {
+                    let req = LoginRequest {
+                        username,
+                        password: password.as_str().to_string(),
+                        device_name: "GPUI Desktop Client".to_string(),
+                    };
+                    let login_res = client.http_client.login(&req).await;
+                    if login_res.is_ok() {
+                        let fresh_salt = generate_split_key_salt_b64();
+                        let upgrade_params = preferred_split_key_kdf_params();
+                        let pw_for_kdf = password.clone();
+                        let derive_res = client
+                            .runtime()
+                            .spawn_blocking(move || {
+                                derive_split_key(pw_for_kdf.as_str(), &fresh_salt, &upgrade_params)
+                            })
+                            .await;
+                        let boot = match derive_res {
+                            Ok(Ok(bundle)) => Some(PendingAuthVaultBootstrap::SplitKeyV2 {
+                                split_kek: bundle.vault_kek.clone(),
+                                auth_salt_b64: bundle.auth_salt_b64.clone(),
+                                kdf_params: bundle.kdf_params,
+                                legacy_upgrade_password: Some(password),
+                                is_new_registration: false,
+                            }),
+                            _ => {
+                                drop(password);
+                                None
+                            }
+                        };
+                        (login_res, boot)
+                    } else {
+                        drop(password);
+                        (login_res, None)
+                    }
+                }
+                Err(HttpClientError::Api { status: 404 | 405, .. }) => {
+                    let req = LoginRequest {
+                        username,
+                        password: password.as_str().to_string(),
+                        device_name: "GPUI Desktop Client".to_string(),
+                    };
+                    drop(password);
+                    (client.http_client.login(&req).await, None)
+                }
+                Err(err) => {
+                    drop(password);
+                    (Err(err), None)
+                }
+            };
             let _ = weak_wizard.update(app, |wizard, cx| {
                 wizard.apply_auth_result(
                     res,
+                    pending_bootstrap,
                     |err| match err {
                         HttpClientError::Unauthorized(_) => {
                             "Invalid username or password (401)".to_string()
@@ -98,7 +239,7 @@ impl AuthWizardView {
 
     pub fn submit_register(&mut self, cx: &mut Context<Self>) {
         let username = self.username_input.trim().to_string();
-        let password = self.password_input.clone();
+        let password = Zeroizing::new(self.password_input.clone());
         let first_name = if self.first_name_input.trim().is_empty() {
             username.clone()
         } else {
@@ -111,20 +252,68 @@ impl AuthWizardView {
         }
         self.is_authenticating = true;
         self.login_error = None;
+        self.pending_vault_bootstrap = None;
         cx.notify();
 
         let client = self.client.clone();
-        let req = RegisterRequest {
-            username: username.clone(),
-            password,
-            first_name,
-            device_name: "GPUI Desktop Client".to_string(),
-        };
         cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client.http_client.register(&req).await;
+            let salt_b64 = generate_split_key_salt_b64();
+            let kdf_params = preferred_split_key_kdf_params();
+            let derive_res = client
+                .runtime()
+                .spawn_blocking(move || {
+                    let out = derive_split_key(password.as_str(), &salt_b64, &kdf_params);
+                    drop(password);
+                    out
+                })
+                .await;
+            let (res, pending_bootstrap) = match derive_res {
+                Ok(Ok(bundle)) => {
+                    let req = SplitKeyRegisterRequest {
+                        username: username.clone(),
+                        password: None,
+                        first_name,
+                        last_name: None,
+                        device_name: "GPUI Desktop Client".to_string(),
+                        auto_welcome: false,
+                        auth_version: Some(2),
+                        auth_salt_b64: Some(bundle.auth_salt_b64.clone()),
+                        auth_verifier_b64: Some(bundle.auth_verifier_b64.as_str().to_string()),
+                        kdf_params: Some(bot_kdf_to_proto(bundle.kdf_params)),
+                    };
+                    let reg_res = client
+                        .http_client
+                        .register_split_key(&req)
+                        .await
+                        .map(auth_from_proto);
+                    let boot = PendingAuthVaultBootstrap::SplitKeyV2 {
+                        split_kek: bundle.vault_kek.clone(),
+                        auth_salt_b64: bundle.auth_salt_b64.clone(),
+                        kdf_params: bundle.kdf_params,
+                        legacy_upgrade_password: None,
+                        is_new_registration: true,
+                    };
+                    (reg_res, Some(boot))
+                }
+                Ok(Err(e)) => (
+                    Err(HttpClientError::Api {
+                        status: 400,
+                        message: format!("Split-Key derivation failed: {e}"),
+                    }),
+                    None,
+                ),
+                Err(e) => (
+                    Err(HttpClientError::Api {
+                        status: 500,
+                        message: format!("Split-Key derivation task failed: {e}"),
+                    }),
+                    None,
+                ),
+            };
             let _ = weak_wizard.update(app, |wizard, cx| {
                 wizard.apply_auth_result(
                     res,
+                    pending_bootstrap,
                     |err| match err {
                         HttpClientError::Conflict(_) => {
                             format!("Username '{}' is already registered (409)", username)
@@ -302,6 +491,8 @@ impl AuthWizardView {
                                 };
                                 if poll.is_completed() {
                                     if let Some(session) = poll.session {
+                                        wizard.pending_vault_bootstrap =
+                                            Some(PendingAuthVaultBootstrap::PasswordlessDeviceOnly);
                                         wizard.emit_authenticated(session, cx);
                                         return true;
                                     } else if let Some(token) = poll.token {
@@ -315,6 +506,8 @@ impl AuthWizardView {
                                             created_at: None,
                                             expires_at: None,
                                         };
+                                        wizard.pending_vault_bootstrap =
+                                            Some(PendingAuthVaultBootstrap::PasswordlessDeviceOnly);
                                         wizard.emit_authenticated(auth, cx);
                                         return true;
                                     }
@@ -453,7 +646,7 @@ impl AuthWizardView {
         let email = self.email_input.trim().to_string();
         let code = self.email_code_input.trim().to_string();
         let username = self.username_input.trim().to_string();
-        let password = self.password_input.clone();
+        let password = Zeroizing::new(self.password_input.clone());
         let first_name = if self.first_name_input.trim().is_empty() {
             username.clone()
         } else {
@@ -472,15 +665,69 @@ impl AuthWizardView {
         } else {
             self.is_authenticating = true;
             self.login_error = None;
+            self.pending_vault_bootstrap = None;
             cx.notify();
 
             let client = self.client.clone();
-            let req = EmailRegisterRequest { email, code, username, password, first_name };
             cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
-                let res = client.http_client.email_register(&req).await;
+                let salt_b64 = generate_split_key_salt_b64();
+                let kdf_params = preferred_split_key_kdf_params();
+                let derive_res = client
+                    .runtime()
+                    .spawn_blocking(move || {
+                        let out = derive_split_key(password.as_str(), &salt_b64, &kdf_params);
+                        drop(password);
+                        out
+                    })
+                    .await;
+                let (res, pending_bootstrap) = match derive_res {
+                    Ok(Ok(bundle)) => {
+                        let req = SplitKeyEmailRegisterRequest {
+                            email,
+                            code,
+                            username,
+                            password: None,
+                            first_name,
+                            last_name: None,
+                            device_name: "GPUI Desktop Client".to_string(),
+                            auth_version: Some(2),
+                            auth_salt_b64: Some(bundle.auth_salt_b64.clone()),
+                            auth_verifier_b64: Some(bundle.auth_verifier_b64.as_str().to_string()),
+                            kdf_params: Some(bot_kdf_to_proto(bundle.kdf_params)),
+                        };
+                        let reg_res = client
+                            .http_client
+                            .email_register_split_key(&req)
+                            .await
+                            .map(auth_from_proto);
+                        let boot = PendingAuthVaultBootstrap::SplitKeyV2 {
+                            split_kek: bundle.vault_kek.clone(),
+                            auth_salt_b64: bundle.auth_salt_b64.clone(),
+                            kdf_params: bundle.kdf_params,
+                            legacy_upgrade_password: None,
+                            is_new_registration: true,
+                        };
+                        (reg_res, Some(boot))
+                    }
+                    Ok(Err(e)) => (
+                        Err(HttpClientError::Api {
+                            status: 400,
+                            message: format!("Split-Key derivation failed: {e}"),
+                        }),
+                        None,
+                    ),
+                    Err(e) => (
+                        Err(HttpClientError::Api {
+                            status: 500,
+                            message: format!("Split-Key derivation task failed: {e}"),
+                        }),
+                        None,
+                    ),
+                };
                 let _ = weak_wizard.update(app, |wizard, cx| {
                     wizard.apply_auth_result(
                         res,
+                        pending_bootstrap,
                         |err| match err {
                             HttpClientError::Api { message, .. } => message,
                             other => other.to_string(),

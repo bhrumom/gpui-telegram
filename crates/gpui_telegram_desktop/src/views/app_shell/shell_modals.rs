@@ -182,7 +182,7 @@ impl AppShell {
                             reply_to: None, quote_text: None, topic_id: None, client_nonce: Some(client.next_client_nonce()),
                             forward_from_chat_id: Some(from_chat), forward_from_msg_id: Some(mid as i64),
                             silent: false, scheduled_at_ms: None, inline_keyboard: None,
-                            send_as_peer_id: None,
+                            send_as_peer_id: None, skip_server_bot_reply: false,
                         };
                         let _ = client.send_message_durable(req).await;
                     }

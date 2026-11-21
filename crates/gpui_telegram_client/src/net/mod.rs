@@ -5,6 +5,7 @@ pub mod api_computers;
 pub mod api_e2ee;
 pub mod api_features;
 pub mod api_miniapps;
+pub mod api_user_vault;
 pub mod hermes_client;
 pub mod http_client;
 pub mod http_helpers;
@@ -93,6 +94,19 @@ pub use hermes_client::{
     MagpieRouteTraceDto, MagpieRoutingGroupDto, MagpieRoutingGroupMemberDto,
     MagpieSaveProviderRequest, MagpieSaveProviderResponse, MagpieStateDto, MagpieSubscriptionDto,
     MagpieSubscriptionsScanResponse, OpenAiChatCompletionsRequest, OpenAiChatMessage,
+};
+pub use gpui_telegram_proto::user_vault::{
+    ApproveDeviceSyncRequest, ArchiveLocalBotReplyRequest, ArchiveLocalBotReplyResponse,
+    Argon2KdfParamsDto, AuthCustodyUpdateResponse, ChangePasswordRequest,
+    DeviceSyncActionResponse, DeviceSyncRequestBody, DeviceSyncRequestResponse,
+    DeviceSyncStatusResponse, KdfParamsQuery, KdfParamsResponse, PendingDeviceSyncItem,
+    PendingDeviceSyncListResponse, SplitKeyEmailRegisterRequest, SplitKeyLoginRequest,
+    SplitKeyRegisterRequest, UpgradeSplitKeyRequest, UpsertUserVaultItemRequest,
+    UpsertUserVaultItemResponse, UserVaultEnvelopeResponse, UserVaultItemDto,
+    UserVaultKeyEnvelopeDto, UserVaultSyncPullResponse, DEVICE_SYNC_CODE_DOMAIN_V1,
+    USER_VAULT_CATEGORY_AI_OAUTH, USER_VAULT_CATEGORY_BROWSER_COOKIE, USER_VAULT_CATEGORY_PASSWORD,
+    USER_VAULT_KDF_ALG_ARGON2ID, USER_VAULT_KDF_ALG_DEVICE_KEYCHAIN_V2,
+    USER_VAULT_KDF_ALG_SPLIT_KEY_V2,
 };
 pub use ws_channel::WsChannel;
 pub use ws_transport::{connect_ws_with_proxy, ConnectionStatus, WsConnectError, WsTransport};

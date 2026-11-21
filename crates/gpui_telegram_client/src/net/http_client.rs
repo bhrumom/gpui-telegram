@@ -199,6 +199,20 @@ pub struct AuthResponse {
     pub expires_at: Option<String>,
 }
 
+impl From<gpui_telegram_proto::contracts::AuthResponse> for AuthResponse {
+    fn from(p: gpui_telegram_proto::contracts::AuthResponse) -> Self {
+        Self {
+            user_id: p.user_id,
+            username: p.username,
+            session_id: p.session_id,
+            token: p.token,
+            first_name: p.first_name,
+            created_at: p.created_at,
+            expires_at: p.expires_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMeResponse {
     pub user_id: u64,

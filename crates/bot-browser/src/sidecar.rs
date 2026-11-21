@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use uuid::Uuid;
+use zip::ZipArchive;
 
 use crate::cdp::{CdpTransport, WsCdpTransport};
 use crate::types::{BotBrowserError, BotBrowserEvent, NormalizedOrigin};
@@ -24,13 +26,14 @@ pub const ENV_OBSCURA_BIN: &str = "BOT_BROWSER_OBSCURA_BIN";
 pub const ENV_OBSCURA_DOWNLOAD_URL: &str = "BOT_BROWSER_OBSCURA_DOWNLOAD_URL";
 pub const ENV_OBSCURA_SHA256: &str = "BOT_BROWSER_OBSCURA_SHA256";
 
-const DEFAULT_OBSCURA_VERSION: &str = "0.1.0";
+pub const DEFAULT_OBSCURA_VERSION: &str = "0.2.7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveKind {
     RawBinary,
     TarGz,
+    Zip,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,33 +65,38 @@ impl ObscuraBinaryManifest {
             artifacts: vec![
                 ObscuraReleaseArtifact {
                     target: "aarch64-macos".to_string(),
-                    url: format!("{base}/obscura-v{ver}-aarch64-macos.tar.gz"),
-                    sha256: String::new(),
+                    url: format!("{base}/obscura-aarch64-macos-stealth.tar.gz"),
+                    sha256: "3b05ebcd4755a325be224992fad6a038d86f7e5ab483e4c781f14de06cab973f"
+                        .to_string(),
                     archive_kind: ArchiveKind::TarGz,
                 },
                 ObscuraReleaseArtifact {
                     target: "x86_64-macos".to_string(),
-                    url: format!("{base}/obscura-v{ver}-x86_64-macos.tar.gz"),
-                    sha256: String::new(),
+                    url: format!("{base}/obscura-x86_64-macos-stealth.tar.gz"),
+                    sha256: "62bd094388a1f97480fd06be349299e721a3488c216c86a2fce9367310594ec3"
+                        .to_string(),
                     archive_kind: ArchiveKind::TarGz,
                 },
                 ObscuraReleaseArtifact {
                     target: "x86_64-linux".to_string(),
-                    url: format!("{base}/obscura-v{ver}-x86_64-linux.tar.gz"),
-                    sha256: String::new(),
+                    url: format!("{base}/obscura-x86_64-linux-stealth.tar.gz"),
+                    sha256: "1d6514beacef9fe75671f4bf7a66d3a7bceef9bde39f8156d1ca4a701eb1e216"
+                        .to_string(),
                     archive_kind: ArchiveKind::TarGz,
                 },
                 ObscuraReleaseArtifact {
                     target: "aarch64-linux".to_string(),
-                    url: format!("{base}/obscura-v{ver}-aarch64-linux.tar.gz"),
-                    sha256: String::new(),
+                    url: format!("{base}/obscura-aarch64-linux-stealth.tar.gz"),
+                    sha256: "f51167d7ae98be6c6327d3e7e015e74430e190ea6846589e3c131e10641a52b7"
+                        .to_string(),
                     archive_kind: ArchiveKind::TarGz,
                 },
                 ObscuraReleaseArtifact {
                     target: "x86_64-windows".to_string(),
-                    url: format!("{base}/obscura-v{ver}-x86_64-windows.exe"),
-                    sha256: String::new(),
-                    archive_kind: ArchiveKind::RawBinary,
+                    url: format!("{base}/obscura-x86_64-windows-stealth.zip"),
+                    sha256: "ffae5e71cfca0108709b57ad83ce7d6b588eff6a15a43093b0cf867dbd18c867"
+                        .to_string(),
+                    archive_kind: ArchiveKind::Zip,
                 },
             ],
         }
@@ -158,6 +166,8 @@ fn infer_archive_kind(url: &str) -> ArchiveKind {
     let without_query = lower.split(['?', '#']).next().unwrap_or(&lower);
     if without_query.ends_with(".tar.gz") || without_query.ends_with(".tgz") {
         ArchiveKind::TarGz
+    } else if without_query.ends_with(".zip") {
+        ArchiveKind::Zip
     } else {
         ArchiveKind::RawBinary
     }
@@ -260,40 +270,45 @@ impl ObscuraDownloader {
         let download_tmp_path = bin_dir.join(format!(".obscura-download-{}.tmp", Uuid::new_v4()));
         let mut download_guard = TempFileCleanup::new(download_tmp_path.clone());
 
-        let mut resp = client
-            .get(&artifact.url)
-            .send()
-            .await
-            .map_err(|e| {
+        let actual_sha256 = if let Some(sha) =
+            try_parallel_range_download(client, &artifact.url, download_guard.path()).await?
+        {
+            sha
+        } else {
+            let mut resp = client
+                .get(&artifact.url)
+                .send()
+                .await
+                .map_err(|e| {
+                    BotBrowserError::SidecarStartFailed(format!(
+                        "failed downloading Obscura from '{}': {e}",
+                        artifact.url
+                    ))
+                })?;
+
+            if !resp.status().is_success() {
+                return Err(BotBrowserError::SidecarStartFailed(format!(
+                    "Obscura download '{}' returned HTTP {}",
+                    artifact.url,
+                    resp.status()
+                )));
+            }
+
+            let mut tmp_file = fs::File::create(download_guard.path())?;
+            let mut hasher = Sha256::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| {
                 BotBrowserError::SidecarStartFailed(format!(
-                    "failed downloading Obscura from '{}': {e}",
+                    "failed reading Obscura stream from '{}': {e}",
                     artifact.url
                 ))
-            })?;
-
-        if !resp.status().is_success() {
-            return Err(BotBrowserError::SidecarStartFailed(format!(
-                "Obscura download '{}' returned HTTP {}",
-                artifact.url,
-                resp.status()
-            )));
-        }
-
-        let mut tmp_file = fs::File::create(download_guard.path())?;
-        let mut hasher = Sha256::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| {
-            BotBrowserError::SidecarStartFailed(format!(
-                "failed reading Obscura stream from '{}': {e}",
-                artifact.url
-            ))
-        })? {
-            hasher.update(&chunk);
-            tmp_file.write_all(&chunk)?;
-        }
-        tmp_file.flush()?;
-        drop(tmp_file);
-
-        let actual_sha256 = hex::encode(hasher.finalize());
+            })? {
+                hasher.update(&chunk);
+                tmp_file.write_all(&chunk)?;
+            }
+            tmp_file.flush()?;
+            drop(tmp_file);
+            hex::encode(hasher.finalize())
+        };
         if !artifact.sha256.is_empty() && actual_sha256 != artifact.sha256 {
             let _ = fs::remove_file(download_guard.path());
             download_guard.disarm();
@@ -314,6 +329,16 @@ impl ObscuraDownloader {
             }
             ArchiveKind::TarGz => {
                 let extracted_sha = extract_obscura_from_targz(
+                    download_guard.path(),
+                    staged_guard.path(),
+                    bin_name,
+                )?;
+                let _ = fs::remove_file(download_guard.path());
+                download_guard.disarm();
+                extracted_sha
+            }
+            ArchiveKind::Zip => {
+                let extracted_sha = extract_obscura_from_zip(
                     download_guard.path(),
                     staged_guard.path(),
                     bin_name,
@@ -354,7 +379,7 @@ fn verify_cached_binary(
         return Ok(true);
     }
 
-    if artifact.archive_kind == ArchiveKind::TarGz {
+    if matches!(artifact.archive_kind, ArchiveKind::TarGz | ArchiveKind::Zip) {
         if let Ok(stamp) = fs::read_to_string(stamp_path) {
             if let Some((recorded_archive, recorded_bin)) = stamp.trim().split_once(':') {
                 if recorded_archive.eq_ignore_ascii_case(&artifact.sha256)
@@ -383,55 +408,306 @@ fn sha256_file(path: &Path) -> Result<String, BotBrowserError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+const PARALLEL_DOWNLOAD_MIN_BYTES: u64 = 4 * 1024 * 1024;
+const PARALLEL_DOWNLOAD_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const PARALLEL_DOWNLOAD_CHUNKS: u64 = 16;
+
+async fn try_parallel_range_download(
+    client: &reqwest::Client,
+    url: &str,
+    dest_path: &Path,
+) -> Result<Option<String>, BotBrowserError> {
+    let Ok(head_resp) = client
+        .head(url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+    else {
+        return Ok(None);
+    };
+    if !head_resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let accepts_ranges = head_resp
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
+    let total_len = head_resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if !accepts_ranges
+        || !(PARALLEL_DOWNLOAD_MIN_BYTES..=PARALLEL_DOWNLOAD_MAX_BYTES).contains(&total_len)
+    {
+        return Ok(None);
+    }
+
+    let resolved_url = head_resp.url().as_str().to_string();
+    let file = fs::File::create(dest_path)?;
+    file.set_len(total_len)?;
+    let shared_file = Arc::new(Mutex::new(file));
+
+    let chunk_size = total_len.div_ceil(PARALLEL_DOWNLOAD_CHUNKS);
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < total_len {
+        let end = (start + chunk_size - 1).min(total_len - 1);
+        ranges.push((start, end));
+        start = end + 1;
+    }
+
+    let results: Vec<Result<(), ()>> = stream::iter(ranges)
+        .map(|(range_start, range_end)| {
+            let client = client.clone();
+            let target_url = resolved_url.clone();
+            let file_ref = Arc::clone(&shared_file);
+            async move {
+                let expected_bytes = range_end - range_start + 1;
+                for _attempt in 0..3 {
+                    let Ok(mut resp) = client
+                        .get(&target_url)
+                        .header(
+                            reqwest::header::RANGE,
+                            format!("bytes={range_start}-{range_end}"),
+                        )
+                        .send()
+                        .await
+                    else {
+                        continue;
+                    };
+                    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                        continue;
+                    }
+                    let mut offset = range_start;
+                    let mut received = 0u64;
+                    let mut stream_ok = true;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                let mut guard = file_ref.lock().await;
+                                if guard.seek(SeekFrom::Start(offset)).is_err()
+                                    || guard.write_all(&chunk).is_err()
+                                {
+                                    return Err(());
+                                }
+                                let n = chunk.len() as u64;
+                                offset += n;
+                                received += n;
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                stream_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if stream_ok && received == expected_bytes {
+                        return Ok(());
+                    }
+                }
+                Err(())
+            }
+        })
+        .buffer_unordered(PARALLEL_DOWNLOAD_CHUNKS as usize)
+        .collect()
+        .await;
+
+    if results.iter().any(Result::is_err) {
+        drop(shared_file);
+        let _ = fs::remove_file(dest_path);
+        return Ok(None);
+    }
+
+    {
+        let mut guard = shared_file.lock().await;
+        guard.flush()?;
+    }
+    drop(shared_file);
+    let sha = sha256_file(dest_path)?;
+    Ok(Some(sha))
+}
+
+fn score_obscura_archive_entry(
+    file_name: &str,
+    expected_bin_name: &str,
+    unix_mode: Option<u32>,
+) -> Option<u8> {
+    if file_name.is_empty() {
+        return None;
+    }
+    let lower = file_name.to_ascii_lowercase();
+    for ignored_ext in [
+        ".txt", ".md", ".json", ".sha256", ".sig", ".asc", ".toml", ".yaml", ".yml", ".plist",
+    ] {
+        if lower.ends_with(ignored_ext) {
+            return None;
+        }
+    }
+
+    if file_name == expected_bin_name {
+        return Some(100);
+    }
+    if file_name == "obscura" || file_name == "obscura.exe" {
+        return Some(90);
+    }
+    if lower.starts_with("obscura") {
+        let expects_exe = expected_bin_name.ends_with(".exe");
+        if expects_exe && !lower.ends_with(".exe") {
+            return None;
+        }
+        let mut score = 70u8;
+        if unix_mode.is_some_and(|m| (m & 0o111) != 0) {
+            score = score.saturating_add(10);
+        }
+        if !lower.contains('.') || lower.ends_with(".exe") {
+            score = score.saturating_add(5);
+        }
+        return Some(score);
+    }
+    None
+}
+
+fn copy_and_hash_reader<R: Read>(
+    mut reader: R,
+    dest_path: &Path,
+) -> Result<String, BotBrowserError> {
+    let mut out = fs::File::create(dest_path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+    }
+    out.flush()?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
 fn extract_obscura_from_targz(
     archive_path: &Path,
     dest_path: &Path,
     expected_bin_name: &str,
 ) -> Result<String, BotBrowserError> {
+    let best_idx: Option<usize> = {
+        let file = fs::File::open(archive_path)?;
+        let gz = GzDecoder::new(file);
+        let mut archive = Archive::new(gz);
+        let mut best: Option<(u8, usize)> = None;
+
+        for (idx, entry_res) in archive
+            .entries()
+            .map_err(|e| {
+                BotBrowserError::SidecarStartFailed(format!(
+                    "failed reading Obscura tar.gz entries: {e}"
+                ))
+            })?
+            .enumerate()
+        {
+            let entry = entry_res.map_err(|e| {
+                BotBrowserError::SidecarStartFailed(format!("corrupt Obscura tar.gz entry: {e}"))
+            })?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let path = entry.path().map_err(|e| {
+                BotBrowserError::SidecarStartFailed(format!("invalid tar entry path: {e}"))
+            })?;
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let mode = entry.header().mode().ok();
+            if let Some(score) = score_obscura_archive_entry(file_name, expected_bin_name, mode) {
+                if best.is_none_or(|(best_score, _)| score > best_score) {
+                    best = Some((score, idx));
+                }
+            }
+        }
+        best.map(|(_, idx)| idx)
+    };
+
+    let target_idx = best_idx.ok_or_else(|| {
+        BotBrowserError::SidecarStartFailed(format!(
+            "tar.gz archive did not contain '{expected_bin_name}' binary"
+        ))
+    })?;
+
     let file = fs::File::open(archive_path)?;
     let gz = GzDecoder::new(file);
     let mut archive = Archive::new(gz);
-
-    for entry_res in archive.entries().map_err(|e| {
-        BotBrowserError::SidecarStartFailed(format!("failed reading Obscura tar.gz entries: {e}"))
-    })? {
-        let mut entry = entry_res.map_err(|e| {
+    for (idx, entry_res) in archive
+        .entries()
+        .map_err(|e| {
+            BotBrowserError::SidecarStartFailed(format!(
+                "failed reading Obscura tar.gz entries: {e}"
+            ))
+        })?
+        .enumerate()
+    {
+        let entry = entry_res.map_err(|e| {
             BotBrowserError::SidecarStartFailed(format!("corrupt Obscura tar.gz entry: {e}"))
         })?;
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let path = entry.path().map_err(|e| {
-            BotBrowserError::SidecarStartFailed(format!("invalid tar entry path: {e}"))
-        })?;
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-
-        if file_name == expected_bin_name
-            || file_name == "obscura"
-            || file_name == "obscura.exe"
-        {
-            let mut out = fs::File::create(dest_path)?;
-            let mut hasher = Sha256::new();
-            let mut buf = [0u8; 32 * 1024];
-            loop {
-                let n = entry.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                out.write_all(&buf[..n])?;
-            }
-            out.flush()?;
-            return Ok(hex::encode(hasher.finalize()));
+        if idx == target_idx {
+            return copy_and_hash_reader(entry, dest_path);
         }
     }
 
     Err(BotBrowserError::SidecarStartFailed(format!(
-        "tar.gz archive did not contain '{expected_bin_name}' binary"
+        "tar.gz archive entry {target_idx} vanished during extraction"
     )))
+}
+
+fn extract_obscura_from_zip(
+    archive_path: &Path,
+    dest_path: &Path,
+    expected_bin_name: &str,
+) -> Result<String, BotBrowserError> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = ZipArchive::new(file).map_err(|e| {
+        BotBrowserError::SidecarStartFailed(format!("failed reading Obscura zip archive: {e}"))
+    })?;
+
+    let mut best: Option<(u8, usize)> = None;
+    for idx in 0..archive.len() {
+        let entry = archive.by_index(idx).map_err(|e| {
+            BotBrowserError::SidecarStartFailed(format!("corrupt Obscura zip entry: {e}"))
+        })?;
+        if !entry.is_file() {
+            continue;
+        }
+        let Some(enclosed) = entry.enclosed_name() else {
+            continue;
+        };
+        let file_name = enclosed
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let mode = entry.unix_mode();
+        if let Some(score) = score_obscura_archive_entry(file_name, expected_bin_name, mode) {
+            if best.is_none_or(|(best_score, _)| score > best_score) {
+                best = Some((score, idx));
+            }
+        }
+    }
+
+    let (_, target_idx) = best.ok_or_else(|| {
+        BotBrowserError::SidecarStartFailed(format!(
+            "zip archive did not contain '{expected_bin_name}' binary"
+        ))
+    })?;
+
+    let entry = archive.by_index(target_idx).map_err(|e| {
+        BotBrowserError::SidecarStartFailed(format!("failed opening Obscura zip entry: {e}"))
+    })?;
+    copy_and_hash_reader(entry, dest_path)
 }
 
 fn ensure_executable_permissions(path: &Path) -> Result<(), BotBrowserError> {
@@ -850,6 +1126,32 @@ impl ObscuraSidecar {
         self.shutting_down.store(true, Ordering::Release);
         let _lifecycle = self.lifecycle_lock.lock().await;
         if let Some(mut state) = self.runtime.lock().await.take() {
+            // Ask Obscura to flush session cookies/storage to `--storage-dir` before exit.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(250),
+                state.transport.send_command("Browser.close", json!({})),
+            )
+            .await;
+
+            #[cfg(unix)]
+            {
+                if let Some(pid) = state.child.id() {
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .await;
+                    if tokio::time::timeout(Duration::from_secs(2), state.child.wait())
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+
             let _ = state.child.kill().await;
             let _ = state.child.wait().await;
         }

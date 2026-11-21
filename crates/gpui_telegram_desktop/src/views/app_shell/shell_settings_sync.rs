@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gpui::{AsyncApp, Context, WeakEntity};
+use gpui::{AsyncApp, ClipboardItem, Context, WeakEntity};
 use gpui_telegram_client::net::{WalletBalanceDto, WalletTransactionDto};
 use gpui_telegram_proto::contracts::auth::UserPrivacySettingsDto;
 use gpui_telegram_proto::contracts::chats::ChatFolderDto;
@@ -17,6 +17,7 @@ use crate::views::settings::sections::settings_blocked_peers::BlockedPeerItem;
 use crate::views::settings::sections::settings_credits::StarsTransaction;
 use crate::views::settings::sections::settings_folders::ChatFolderItem;
 use crate::views::settings::sections::settings_notifications::BadgeCountType;
+use crate::views::settings::sections::SettingsVaultAction;
 use crate::views::shell::AppShell;
 
 pub(crate) fn format_ms_human(ms: i64) -> String {
@@ -663,11 +664,80 @@ impl AppShell {
                     shell.apply_magpie_state_to_views(ms, cx);
                 }
                 shell.bootstrap_local_subscriptions_on_startup(cx);
+                shell.sync_vault_custody_to_settings(cx);
+                shell.refresh_pending_device_sync_requests(cx);
 
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Dispatches a Zero-Knowledge Vault / Device Trust Ring / Credential Meta action
+    /// from Settings → Privacy & Security (or first-creation notice banner).
+    pub fn handle_settings_vault_action(
+        &mut self,
+        action: &SettingsVaultAction,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            SettingsVaultAction::RefreshVaultState => {
+                self.sync_vault_custody_to_settings(cx);
+                self.refresh_pending_device_sync_requests(cx);
+            }
+            SettingsVaultAction::CopyEmergencyKit => {
+                if let Some(ek) = self.bot_browser.last_recovery_key_notice.clone() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(ek.as_str().to_string()));
+                    self.bot_browser.first_creation_banner_open = false;
+                    self.enqueue_localized_toast(
+                        "已复制恢复密钥，请妥善离线保存",
+                        "Copied Emergency Kit — store it offline safely",
+                        2800,
+                        cx,
+                    );
+                } else {
+                    self.enqueue_localized_toast(
+                        "恢复密钥仅在首次创建保险库时本地生成展示",
+                        "Emergency Kit is only shown locally during initial vault creation",
+                        2800,
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+            SettingsVaultAction::SubmitRecoveryKey(rk) => {
+                self.unlock_vault_with_recovery_key_from_settings(rk.clone(), cx);
+            }
+            SettingsVaultAction::RequestDeviceSync => {
+                self.initiate_device_sync_request_from_settings(cx);
+            }
+            SettingsVaultAction::ApproveDeviceSync {
+                request_id,
+                device_public_key_b64,
+            } => {
+                self.approve_device_sync_request_from_settings(
+                    request_id.clone(),
+                    device_public_key_b64.clone(),
+                    cx,
+                );
+            }
+            SettingsVaultAction::DenyDeviceSync { request_id } => {
+                self.deny_device_sync_request_from_settings(request_id.clone(), cx);
+            }
+            SettingsVaultAction::ToggleCredentialAutoReuse {
+                credential_id,
+                allow_auto_reuse,
+            } => {
+                self.toggle_credential_auto_reuse_from_settings(
+                    credential_id.clone(),
+                    *allow_auto_reuse,
+                    cx,
+                );
+            }
+            SettingsVaultAction::DeleteCredential { credential_id } => {
+                self.delete_credential_from_settings(credential_id.clone(), cx);
+            }
+        }
     }
 
     /// Hydrates composer/stage/sidebar behavior and lazily syncs persisted `AppPreferences` into `SettingsRouter`.

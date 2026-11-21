@@ -993,6 +993,7 @@ impl AppShell {
                     scheduled_at_ms: None,
                     inline_keyboard: None,
                     send_as_peer_id: None,
+                    skip_server_bot_reply: false,
                 };
                 let _ = client.send_message_durable(req).await;
                 let _ = weak.update(app, |shell, cx| {

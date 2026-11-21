@@ -23,9 +23,11 @@ use bot_browser::types::{
 };
 use bot_browser::vault::{CredentialVault, MemoryMasterKeyStore};
 
+use gpui_telegram_agent::fabushi_bot::{FabushiBotHost, FabushiBotProvisionSpec};
 use gpui_telegram_agent::hermes::tools_web_media::execute_web_media_tool;
 use gpui_telegram_agent::hermes::toolsets::{
-    HermesToolContext, HermesToolExecutor, HermesToolResult, ToolsetId, all_builtin_tool_specs,
+    HermesToolContext, HermesToolExecutor, HermesToolResult, ToolsetId, ToolsetPreset,
+    all_builtin_tool_specs,
 };
 
 struct MockPage {
@@ -468,4 +470,124 @@ async fn test_hermes_browser_vault_and_assist_tools_zero_knowledge() {
     .await;
     assert!(!bare_res.success);
     assert!(!bare_res.output.to_ascii_lowercase().contains("chrome"));
+}
+
+#[tokio::test]
+async fn test_fabushi_bot_host_set_bot_browser_propagates_to_core_and_provisioned_bots() {
+    let dir = TempDir::new().unwrap();
+    let page = Arc::new(SyncMutex::new(MockPage::new(
+        "https://portal.example.com/login",
+        make_png(400, 400),
+    )));
+    let vault = Arc::new(
+        CredentialVault::open(dir.path().join("vault.db"), &MemoryMasterKeyStore::new()).unwrap(),
+    );
+    let orch = Arc::new(BotBrowserOrchestrator::with_transport_factory(
+        OrchestratorConfig::new(dir.path()),
+        vault,
+        Arc::new(MockFactory(Arc::clone(&page))),
+    ));
+
+    let host = FabushiBotHost::new_unified_ephemeral("local-hermes-v1").unwrap();
+
+    // Provision a custom bot BEFORE calling set_bot_browser
+    let pre_bot = host
+        .provision_or_sync_bot(FabushiBotProvisionSpec {
+            bot_user_id: 800_101,
+            owner_user_id: 1001,
+            username: "pre_browser_bot".to_string(),
+            display_name: "Pre Browser Bot".to_string(),
+            description: "Tests pre-existing bot propagation".to_string(),
+            title: "Agent".to_string(),
+            agent_id: None,
+            avatar_shape: None,
+            avatar_color: None,
+            preferred_model: None,
+            thinking_level: None,
+            approval_mode: None,
+            toolset_preset: Some("full".to_string()),
+            commands: Vec::new(),
+            inline_mode_enabled: false,
+        })
+        .unwrap();
+
+    // Wire BotBrowserOrchestrator onto FabushiBotHost
+    host.set_bot_browser(Arc::clone(&orch));
+
+    // Provision a custom bot AFTER calling set_bot_browser
+    let post_bot = host
+        .provision_or_sync_bot(FabushiBotProvisionSpec {
+            bot_user_id: 800_102,
+            owner_user_id: 1001,
+            username: "post_browser_bot".to_string(),
+            display_name: "Post Browser Bot".to_string(),
+            description: "Tests post-wiring bot propagation".to_string(),
+            title: "Agent".to_string(),
+            agent_id: None,
+            avatar_shape: None,
+            avatar_color: None,
+            preferred_model: None,
+            thinking_level: None,
+            approval_mode: None,
+            toolset_preset: Some("full".to_string()),
+            commands: Vec::new(),
+            inline_mode_enabled: false,
+        })
+        .unwrap();
+
+    // 1. Core engine context receives orchestrator and executes vault_list + browser_snapshot
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let core_ctx = host.core_engine().build_tool_context(
+        "fabushi_core_sess",
+        Some(10),
+        Some("777000"),
+        1,
+        Some(ToolsetPreset::Full),
+        0,
+        Arc::clone(&cancel),
+    );
+    assert!(core_ctx.bot_browser.is_some());
+    let core_vault = HermesToolExecutor::execute("vault_list", json!({}), &core_ctx).await;
+    assert!(core_vault.success, "core vault_list failed: {}", core_vault.output);
+    let core_nav = HermesToolExecutor::execute(
+        "browser_navigate",
+        json!({ "url": "https://portal.example.com/login" }),
+        &core_ctx,
+    )
+    .await;
+    assert!(core_nav.success, "core browser_navigate failed: {}", core_nav.output);
+    let core_snap = HermesToolExecutor::execute("browser_snapshot", json!({}), &core_ctx).await;
+    assert!(core_snap.success, "core browser_snapshot failed: {}", core_snap.output);
+
+    // 2. Pre-provisioned bot instance receives orchestrator
+    let pre_ctx = pre_bot.engine().build_tool_context(
+        "pre_sess",
+        Some(11),
+        Some("800101"),
+        1,
+        Some(ToolsetPreset::Full),
+        0,
+        Arc::clone(&cancel),
+    );
+    assert!(pre_ctx.bot_browser.is_some());
+    let pre_vault = HermesToolExecutor::execute("vault_list", json!({}), &pre_ctx).await;
+    assert!(pre_vault.success, "pre_bot vault_list failed: {}", pre_vault.output);
+
+    // 3. Post-provisioned bot instance automatically receives orchestrator on creation
+    let post_ctx = post_bot.engine().build_tool_context(
+        "post_sess",
+        Some(12),
+        Some("800102"),
+        1,
+        Some(ToolsetPreset::Full),
+        0,
+        cancel,
+    );
+    assert!(post_ctx.bot_browser.is_some());
+    let post_snap = HermesToolExecutor::execute("browser_snapshot", json!({}), &post_ctx).await;
+    assert!(post_snap.success, "post_bot browser_snapshot failed: {}", post_snap.output);
+    assert_eq!(
+        post_snap.structured.as_ref().unwrap()["redacted_field_count"],
+        1
+    );
 }

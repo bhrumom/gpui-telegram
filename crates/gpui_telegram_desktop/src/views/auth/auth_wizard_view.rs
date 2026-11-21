@@ -13,7 +13,9 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 
 use super::auth_wizard_state::{
     has_network_error, AuthWizardEvent, AuthWizardTab, LoginInputField, LoginWizardStep,
+    PendingAuthVaultBootstrap,
 };
+use zeroize::Zeroize as _;
 
 pub(super) struct WizardInputFieldSpec<'a> {
     pub field: LoginInputField,
@@ -60,6 +62,7 @@ pub struct AuthWizardView {
     pub phone_number: String,
     pub verification_code: String,
     pub is_authenticated: bool,
+    pub pending_vault_bootstrap: Option<PendingAuthVaultBootstrap>,
 }
 
 impl EventEmitter<AuthWizardEvent> for AuthWizardView {}
@@ -104,7 +107,13 @@ impl AuthWizardView {
             phone_number: String::new(),
             verification_code: String::new(),
             is_authenticated: false,
+            pending_vault_bootstrap: None,
         }
+    }
+
+    /// Takes and clears the strictly in-memory post-auth vault bootstrap payload.
+    pub fn take_pending_vault_bootstrap(&mut self) -> Option<PendingAuthVaultBootstrap> {
+        self.pending_vault_bootstrap.take()
     }
 
     pub fn active_lang_id(&self) -> &'static str {
@@ -132,6 +141,8 @@ impl AuthWizardView {
         }
         self.is_authenticated = false;
         self.is_authenticating = false;
+        self.password_input.zeroize();
+        self.pending_vault_bootstrap = None;
         self.login_step = LoginWizardStep::Start;
         self.verification_code.clear();
         self.login_error = None;

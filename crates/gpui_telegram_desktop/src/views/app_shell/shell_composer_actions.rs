@@ -13,6 +13,9 @@ use crate::views::shell::AppShell;
 
 impl AppShell {
     pub fn send_rich_text_options(&mut self, text: String, silent: bool, scheduled_at_ms: Option<i64>, cx: &mut Context<Self>) {
+        if self.try_handle_local_vault_command(&text, cx) {
+            return;
+        }
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() { return; }
         let Some(chat_id) = resolve_active_target_chat_id(self.stage.read(cx).active_chat_id, self.sidebar.read(cx).active_chat_id) else {
@@ -28,7 +31,7 @@ impl AppShell {
             entities: Vec::new(), reply_to: None, quote_text: None, topic_id: None,
             client_nonce: Some(self.client.next_client_nonce()), forward_from_chat_id: None,
             forward_from_msg_id: None, silent, scheduled_at_ms, inline_keyboard: None,
-            send_as_peer_id,
+            send_as_peer_id, skip_server_bot_reply: false,
         };
         let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -78,7 +81,7 @@ impl AppShell {
                         entities: Vec::new(), reply_to: None, quote_text: None, topic_id: None,
                         client_nonce: Some(client.next_client_nonce()), forward_from_chat_id: None,
                         forward_from_msg_id: None, silent: false, scheduled_at_ms: None, inline_keyboard: None,
-                        send_as_peer_id,
+                        send_as_peer_id, skip_server_bot_reply: false,
                     };
                     let _ = client.send_message_durable(req).await;
                 }

@@ -7,6 +7,11 @@ use gpui_telegram_proto::contracts::{
     TwoFactorVerifyRequest, UpdateProfileRequest as ProtoUpdateProfileRequest,
     UserPrivacySettingsDto, UserProfileDto,
 };
+use gpui_telegram_proto::user_vault::{
+    AuthCustodyUpdateResponse, ChangePasswordRequest, KdfParamsResponse,
+    SplitKeyEmailRegisterRequest, SplitKeyLoginRequest, SplitKeyRegisterRequest,
+    UpgradeSplitKeyRequest,
+};
 use reqwest::Method;
 use serde::Serialize;
 
@@ -292,5 +297,69 @@ impl HttpClient {
     ) -> Result<UserPrivacySettingsDto, HttpClientError> {
         self.request_json(Method::PUT, "/api/v1/users/me/settings", Some(token), Some(settings))
             .await
+    }
+
+    pub async fn get_auth_kdf_params(
+        &self,
+        username_or_email: &str,
+    ) -> Result<KdfParamsResponse, HttpClientError> {
+        let path = format!(
+            "/api/v1/auth/kdf-params?username={}",
+            percent_encode_rfc3986(username_or_email.trim())
+        );
+        self.request_json(Method::GET, &path, None, None::<&()>)
+            .await
+    }
+
+    pub async fn register_split_key(
+        &self,
+        req: &SplitKeyRegisterRequest,
+    ) -> Result<ProtoAuthResponse, HttpClientError> {
+        self.request_json(Method::POST, "/api/v1/auth/register", None, Some(req))
+            .await
+    }
+
+    pub async fn email_register_split_key(
+        &self,
+        req: &SplitKeyEmailRegisterRequest,
+    ) -> Result<ProtoAuthResponse, HttpClientError> {
+        self.request_json(Method::POST, "/api/v1/auth/email/register", None, Some(req))
+            .await
+    }
+
+    pub async fn login_split_key(
+        &self,
+        req: &SplitKeyLoginRequest,
+    ) -> Result<ProtoAuthResponse, HttpClientError> {
+        self.request_json(Method::POST, "/api/v1/auth/login", None, Some(req))
+            .await
+    }
+
+    pub async fn upgrade_split_key(
+        &self,
+        token: &str,
+        req: &UpgradeSplitKeyRequest,
+    ) -> Result<AuthCustodyUpdateResponse, HttpClientError> {
+        self.request_json(
+            Method::POST,
+            "/api/v1/auth/upgrade-split-key",
+            Some(token),
+            Some(req),
+        )
+        .await
+    }
+
+    pub async fn change_password(
+        &self,
+        token: &str,
+        req: &ChangePasswordRequest,
+    ) -> Result<AuthCustodyUpdateResponse, HttpClientError> {
+        self.request_json(
+            Method::POST,
+            "/api/v1/auth/change-password",
+            Some(token),
+            Some(req),
+        )
+        .await
     }
 }

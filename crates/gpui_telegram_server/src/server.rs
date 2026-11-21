@@ -89,6 +89,7 @@ pub struct AppState {
     pub push_hub: Arc<crate::push::PushGatewayHub>,
     pub session_store: Arc<crate::auth::session_store::PersistentSessionStore>,
     pub action_approval_secret: [u8; 32],
+    pub kdf_fake_salt_secret: [u8; 32],
     pub multi_agent_groups: Arc<RwLock<HashMap<ChatId, GroupMultiAgentRoom>>>,
     pub agent_capability_key: Arc<ed25519_dalek::SigningKey>,
     pub update_relay: Arc<crate::routes::updates::UpdateRelayState>,
@@ -499,6 +500,8 @@ impl AppState {
         action_approval_secret[..16].copy_from_slice(u1.as_bytes());
         action_approval_secret[16..].copy_from_slice(u2.as_bytes());
 
+        let kdf_fake_salt_secret = init_kdf_fake_salt_secret(&db);
+
         let agent_capability_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&action_approval_secret));
 
         let _shutdown_guard = Arc::new(AppShutdownGuard {
@@ -537,6 +540,7 @@ impl AppState {
             push_hub,
             session_store,
             action_approval_secret,
+            kdf_fake_salt_secret,
             multi_agent_groups: Arc::new(RwLock::new(HashMap::new())),
             agent_capability_key,
             update_relay: Arc::new(crate::routes::updates::UpdateRelayState::new()),
@@ -585,6 +589,47 @@ impl AppState {
         state.approval_gates = approval_gates;
         state
     }
+}
+
+fn init_kdf_fake_salt_secret(db: &crate::db::ServerDatabase) -> [u8; 32] {
+    if let Ok(env_val) = std::env::var("GPUI_KDF_FAKE_SALT_SECRET") {
+        let trimmed = env_val.trim();
+        if !trimmed.is_empty() {
+            let digest = Sha256::digest(trimmed.as_bytes());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&digest);
+            return out;
+        }
+    }
+    let mut candidate = [0u8; 32];
+    let u1 = Uuid::new_v4();
+    let u2 = Uuid::new_v4();
+    candidate[..16].copy_from_slice(u1.as_bytes());
+    candidate[16..].copy_from_slice(u2.as_bytes());
+    let candidate_hex: String = candidate.iter().map(|b| format!("{b:02x}")).collect();
+    let now_secs = Utc::now().timestamp();
+    if let Ok(stored_hex) =
+        db.get_or_init_server_kv("server_auth", "kdf_fake_salt_secret", &candidate_hex, now_secs)
+    {
+        if stored_hex.len() == 64 {
+            let mut parsed = [0u8; 32];
+            let mut ok = true;
+            for (i, chunk) in stored_hex.as_bytes().chunks_exact(2).enumerate() {
+                if let Ok(s) = std::str::from_utf8(chunk) {
+                    if let Ok(byte) = u8::from_str_radix(s, 16) {
+                        parsed[i] = byte;
+                        continue;
+                    }
+                }
+                ok = false;
+                break;
+            }
+            if ok {
+                return parsed;
+            }
+        }
+    }
+    candidate
 }
 
 /// Zero-cost AuthBearer extractor for authenticated routes
@@ -758,8 +803,11 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/status", get(server_status))
         .route("/api/v1/updates/latest-mac.json", get(routes::updates::updates_latest_manifest))
         .route("/api/v1/updates/assets/{tag}/{filename}", get(routes::updates::updates_download_asset))
+        .route("/api/v1/auth/kdf-params", get(routes::user_vault::auth_kdf_params))
         .route("/api/v1/auth/register", post(auth_register))
         .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/upgrade-split-key", post(routes::user_vault::auth_upgrade_split_key))
+        .route("/api/v1/auth/change-password", post(routes::user_vault::auth_change_password))
         .route("/api/v1/auth/phone/send-code", post(routes::auth_factors::phone_send_code))
         .route("/api/v1/auth/phone/verify", post(routes::auth_factors::phone_verify))
         .route("/api/v1/auth/2fa", get(routes::auth_factors::two_factor_status).post(routes::auth_factors::two_factor_set).delete(routes::auth_factors::two_factor_disable))
@@ -819,6 +867,7 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/messages/reaction", post(routes::sync_polls::messages_reaction_legacy))
         .route("/api/v1/messages/read", post(routes::sync_polls::messages_read_legacy))
         .route("/api/v1/chats/{chat_id}/messages", get(routes::messages::chats_messages_history).post(routes::messages::chats_messages_send).delete(routes::chat_extras::chat_clear_history))
+        .route("/api/v1/chats/{chat_id}/messages/archive-local-bot-reply", post(routes::messages::archive_local_bot_reply))
         .route("/api/v1/chats/{chat_id}/clear", post(routes::chat_extras::chat_clear_history))
         .route("/api/v1/chats/{chat_id}/leave", post(routes::chat_extras::chat_leave_or_delete))
         .route("/api/v1/chats/{chat_id}/ttl", post(routes::chat_extras::chat_set_ttl))
@@ -888,6 +937,42 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/e2ee/devices/{user_id}/prekeys", get(routes::e2ee::fetch_user_prekey_bundles))
         .route("/api/v1/e2ee/prekeys/{user_id}", get(routes::e2ee::fetch_user_prekey_bundles))
         .route("/api/v1/e2ee/devices/{device_id}", delete(routes::e2ee::revoke_device))
+        // --- Zero-Knowledge User Vault E2EE Sync Routes ---
+        .route(
+            "/api/v1/user-vault/envelope",
+            get(routes::user_vault::get_user_vault_envelope)
+                .put(routes::user_vault::put_user_vault_envelope),
+        )
+        .route(
+            "/api/v1/user-vault/items",
+            get(routes::user_vault::pull_user_vault_items),
+        )
+        .route(
+            "/api/v1/user-vault/items/{category}/{item_key}",
+            put(routes::user_vault::put_user_vault_item)
+                .delete(routes::user_vault::delete_user_vault_item)
+                .layer(axum::extract::DefaultBodyLimit::max(36 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/user-vault/device-sync/request",
+            post(routes::user_vault::device_sync_request),
+        )
+        .route(
+            "/api/v1/user-vault/device-sync/pending",
+            get(routes::user_vault::device_sync_pending),
+        )
+        .route(
+            "/api/v1/user-vault/device-sync/{request_id}/approve",
+            post(routes::user_vault::device_sync_approve),
+        )
+        .route(
+            "/api/v1/user-vault/device-sync/{request_id}/deny",
+            post(routes::user_vault::device_sync_deny),
+        )
+        .route(
+            "/api/v1/user-vault/device-sync/{request_id}/status",
+            get(routes::user_vault::device_sync_status),
+        )
         // --- Send-As Peers Route ---
         .route("/api/v1/chats/{chat_id}/send_as", get(routes::chat_extras::chat_send_as_list))
         // --- Stickers, GIFs, Stories, Calls, Search & Wallet ---
@@ -1244,7 +1329,8 @@ async fn server_status() -> Json<Value> {
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub username: String,
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default = "default_first_name")]
     pub first_name: String,
     pub last_name: Option<String>,
@@ -1252,6 +1338,14 @@ pub struct RegisterRequest {
     pub device_name: String,
     #[serde(default)]
     pub auto_welcome: bool,
+    #[serde(default)]
+    pub auth_version: Option<i32>,
+    #[serde(default)]
+    pub auth_salt_b64: Option<String>,
+    #[serde(default)]
+    pub auth_verifier_b64: Option<String>,
+    #[serde(default)]
+    pub kdf_params: Option<gpui_telegram_proto::user_vault::Argon2KdfParamsDto>,
 }
 
 fn default_first_name() -> String {
@@ -1260,6 +1354,92 @@ fn default_first_name() -> String {
 
 fn default_device_name() -> String {
     "GPUI Desktop".into()
+}
+
+struct ResolvedRegisterAuth {
+    secret_to_hash: String,
+    auth_version: i32,
+    auth_salt_b64: Option<String>,
+    kdf_params: Option<gpui_telegram_proto::user_vault::Argon2KdfParamsDto>,
+}
+
+fn resolve_register_auth(
+    auth_version: Option<i32>,
+    password: Option<&str>,
+    min_v1_password_chars: usize,
+    auth_salt_b64: Option<&str>,
+    auth_verifier_b64: Option<&str>,
+    kdf_params: Option<gpui_telegram_proto::user_vault::Argon2KdfParamsDto>,
+) -> Result<ResolvedRegisterAuth, Response> {
+    match auth_version {
+        None | Some(1) => {
+            let pw = password.unwrap_or("");
+            if pw.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_credentials", "message": "Password cannot be empty" })),
+                )
+                    .into_response());
+            }
+            if pw.len() < min_v1_password_chars {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_password", "message": "密码至少需要 8 位字符" })),
+                )
+                    .into_response());
+            }
+            if pw.as_bytes().len() > crate::auth::MAX_PASSWORD_BYTES {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_credentials", "message": "password must not exceed 1024 bytes" })),
+                )
+                    .into_response());
+            }
+            Ok(ResolvedRegisterAuth {
+                secret_to_hash: pw.to_string(),
+                auth_version: 1,
+                auth_salt_b64: None,
+                kdf_params: None,
+            })
+        }
+        Some(2) => {
+            let salt = auth_salt_b64
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    crate::routes::err_resp(
+                        StatusCode::BAD_REQUEST,
+                        "missing_auth_salt",
+                        "auth_salt_b64 is required when auth_version == 2",
+                    )
+                })?;
+            crate::routes::user_vault::validate_split_key_salt_b64(salt)?;
+            let verifier = auth_verifier_b64
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    crate::routes::err_resp(
+                        StatusCode::BAD_REQUEST,
+                        "missing_auth_verifier",
+                        "auth_verifier_b64 is required when auth_version == 2",
+                    )
+                })?;
+            crate::routes::user_vault::validate_split_key_verifier_b64(verifier)?;
+            let params = kdf_params.unwrap_or_default();
+            crate::routes::user_vault::validate_kdf_params(params)?;
+            Ok(ResolvedRegisterAuth {
+                secret_to_hash: verifier.to_string(),
+                auth_version: 2,
+                auth_salt_b64: Some(salt.to_string()),
+                kdf_params: Some(params),
+            })
+        }
+        Some(_) => Err(crate::routes::err_resp(
+            StatusCode::BAD_REQUEST,
+            "invalid_auth_version",
+            "auth_version must be 1 or 2",
+        )),
+    }
 }
 
 async fn auth_register(
@@ -1281,20 +1461,17 @@ async fn auth_register(
         )
             .into_response();
     }
-    if req.password.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid_credentials", "message": "Password cannot be empty" })),
-        )
-            .into_response();
-    }
-    if req.password.as_bytes().len() > crate::auth::MAX_PASSWORD_BYTES {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid_credentials", "message": "password must not exceed 1024 bytes" })),
-        )
-            .into_response();
-    }
+    let resolved_auth = match resolve_register_auth(
+        req.auth_version,
+        req.password.as_deref(),
+        1,
+        req.auth_salt_b64.as_deref(),
+        req.auth_verifier_b64.as_deref(),
+        req.kdf_params,
+    ) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
 
     // Check if user already exists in SQLite
     match state.db.get_user_by_username(username_clean) {
@@ -1318,10 +1495,10 @@ async fn auth_register(
         Ok(None) => {}
     }
 
-    // Register user in memory
+    // Register user in memory (for v2, hashes `auth_verifier_b64`, never raw password)
     match state.session_manager.register(
         username_clean,
-        &req.password,
+        &resolved_auth.secret_to_hash,
         &req.first_name,
         req.last_name.clone(),
         &req.device_name,
@@ -1355,6 +1532,21 @@ async fn auth_register(
                     Json(json!({ "error": "database_error", "message": e.to_string() })),
                 )
                     .into_response();
+            }
+            if resolved_auth.auth_version == 2 {
+                if let Err(e) = state.db.set_user_split_key_params(
+                    user.user_id,
+                    2,
+                    resolved_auth.auth_salt_b64.as_deref(),
+                    resolved_auth.kdf_params,
+                ) {
+                    tracing::error!("Failed to persist split-key metadata: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "database_error", "message": e.to_string() })),
+                    )
+                        .into_response();
+                }
             }
 
             // Issue session via PersistentSessionStore (not cached in SessionManager)
@@ -1399,6 +1591,7 @@ async fn auth_register(
                     "session_id": sess_rec.session_id,
                     "token": persistent_token,
                     "created_at": user.created_at,
+                    "auth_version": resolved_auth.auth_version,
                 })),
             )
                 .into_response()
@@ -1419,9 +1612,12 @@ async fn auth_register(
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
+    #[serde(default)]
     pub password: String,
     #[serde(default = "default_device_name")]
     pub device_name: String,
+    #[serde(default)]
+    pub auth_verifier_b64: Option<String>,
 }
 
 async fn auth_login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequest>) -> Response {
@@ -1434,11 +1630,39 @@ async fn auth_login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq
         )
             .into_response();
     }
+    if let Some(ref verifier) = req.auth_verifier_b64 {
+        if verifier.trim().as_bytes().len() > crate::auth::MAX_PASSWORD_BYTES {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_credentials", "message": "Invalid username or password" })),
+            )
+                .into_response();
+        }
+    }
 
-    // 1. Check authoritative SQLite user store first (supports multi-node login)
-    if let Ok(Some(db_user)) = state.db.get_user_by_username(&req.username) {
-        if let Some(ref hash) = db_user.password_hash {
-            if crate::auth::verify_password(&req.password, hash) {
+    // 1. Check authoritative SQLite user store first (supports username or email & multi-node login)
+    match state.db.get_user_split_key_auth_by_identifier(&req.username) {
+        Ok(Some(db_user)) => {
+            let verified = if db_user.auth_version == 2 {
+                let verifier_opt = req
+                    .auth_verifier_b64
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                match (verifier_opt, db_user.password_hash.as_deref()) {
+                    (Some(verifier), Some(hash)) => crate::auth::verify_password(verifier, hash),
+                    _ => false,
+                }
+            } else {
+                match db_user.password_hash.as_deref() {
+                    Some(hash) if !req.password.is_empty() => {
+                        crate::auth::verify_password(&req.password, hash)
+                    }
+                    _ => false,
+                }
+            };
+
+            if verified {
                 if let Ok(tfa) = state.db.get_two_factor_status(db_user.user_id) {
                     if tfa.has_password {
                         let challenge_token = format!("tfa_{}", Uuid::new_v4().simple());
@@ -1473,9 +1697,11 @@ async fn auth_login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq
                             Json(json!({
                                 "user_id": db_user.user_id.raw(),
                                 "username": username,
+                                "first_name": db_user.first_name,
                                 "session_id": sess_rec.session_id,
                                 "token": raw_token,
                                 "expires_at": expires_at,
+                                "auth_version": db_user.auth_version,
                             })),
                         )
                             .into_response();
@@ -1499,6 +1725,25 @@ async fn auth_login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq
                     .into_response();
             }
         }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "database_error", "message": e.to_string() })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+    }
+
+    if req.auth_verifier_b64.is_some() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "invalid_credentials",
+                "message": "Invalid username or password"
+            })),
+        )
+            .into_response();
     }
 
     // 2. Fallback to in-memory session manager (legacy in-memory-only unit test users)
@@ -1530,9 +1775,11 @@ async fn auth_login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq
                 Json(json!({
                     "user_id": user.user_id.raw(),
                     "username": user.username,
+                    "first_name": user.first_name,
                     "session_id": session.session_id,
                     "token": token,
                     "expires_at": session.expires_at,
+                    "auth_version": 1,
                 })),
             )
                 .into_response()
@@ -1573,12 +1820,21 @@ pub struct EmailRegisterRequest {
     pub email: String,
     pub code: String,
     pub username: String,
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default = "default_first_name")]
     pub first_name: String,
     pub last_name: Option<String>,
     #[serde(default = "default_device_name")]
     pub device_name: String,
+    #[serde(default)]
+    pub auth_version: Option<i32>,
+    #[serde(default)]
+    pub auth_salt_b64: Option<String>,
+    #[serde(default)]
+    pub auth_verifier_b64: Option<String>,
+    #[serde(default)]
+    pub kdf_params: Option<gpui_telegram_proto::user_vault::Argon2KdfParamsDto>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1780,13 +2036,17 @@ async fn auth_email_register(
         )
             .into_response();
     }
-    if req.password.len() < 8 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid_password", "message": "密码至少需要 8 位字符" })),
-        )
-            .into_response();
-    }
+    let resolved_auth = match resolve_register_auth(
+        req.auth_version,
+        req.password.as_deref(),
+        8,
+        req.auth_salt_b64.as_deref(),
+        req.auth_verifier_b64.as_deref(),
+        req.kdf_params,
+    ) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let code_clean = req.code.trim();
     if code_clean.len() != 6 || !code_clean.chars().all(|c| c.is_ascii_digit()) {
         return (
@@ -1839,7 +2099,7 @@ async fn auth_email_register(
         let payload = json!({
             "username": probe_user,
             "email": email_clean,
-            "password": req.password,
+            "password": req.password.as_deref().unwrap_or("split_key_v2_probe"),
             "verificationCode": code_clean
         });
         if let Some((status, body_text)) =
@@ -1862,12 +2122,27 @@ async fn auth_email_register(
             .into_response();
     }
 
+    if let Ok(Some(_)) = state.db.get_user_by_email(&email_clean) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "email_already_registered", "message": "该邮箱已注册，请直接登录" })),
+        )
+            .into_response();
+    }
+    if let Ok(Some(_)) = state.db.get_user_by_username(username_clean) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "user_already_exists", "message": format!("Username already registered: {}", username_clean) })),
+        )
+            .into_response();
+    }
+
     let _ = state.db.delete_email_challenge(&challenge.challenge_id);
 
     match state.session_manager.register_with_email(
         &email_clean,
         username_clean,
-        &req.password,
+        &resolved_auth.secret_to_hash,
         &req.first_name,
         req.last_name.clone(),
         &req.device_name,
@@ -1901,6 +2176,20 @@ async fn auth_email_register(
                     .into_response();
             }
             let _ = state.db.set_user_email_verified(user.user_id, &email_clean);
+            if resolved_auth.auth_version == 2 {
+                if let Err(e) = state.db.set_user_split_key_params(
+                    user.user_id,
+                    2,
+                    resolved_auth.auth_salt_b64.as_deref(),
+                    resolved_auth.kdf_params,
+                ) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "database_error", "message": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            }
 
             state.session_manager.revoke_session(&session.session_id);
             let (sess_id, persistent_token, expires_at) = match state.session_store.issue_session(
@@ -1929,6 +2218,7 @@ async fn auth_email_register(
                     "session_id": sess_id,
                     "token": persistent_token,
                     "expires_at": expires_at,
+                    "auth_version": resolved_auth.auth_version,
                 })),
             )
                 .into_response()

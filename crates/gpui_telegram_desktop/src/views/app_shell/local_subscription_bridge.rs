@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bot_browser::e2ee_sync::AiOauthVaultBundle;
 use chrono::Utc;
+use gpui_telegram_agent::fabushi_bot::FabushiBotHost;
+use gpui_telegram_agent::hermes::providers::{ApiMode, ProviderRouter, ProviderRouterState};
 use gpui_telegram_client::net::hermes_client::{MagpieSaveProviderRequest, MagpieStateDto};
 use gpui_telegram_client::TelegramClient;
 use magpie_gateway::{
@@ -29,6 +32,7 @@ use magpie_gateway::{
     CompactModelsCatalog, SubscriptionKind, VertexTokenManager, DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::views::settings::sections::settings_ai_providers::{
     SubscriptionAccountDto, SubscriptionActivateRequest, SubscriptionActivateResponse,
@@ -718,6 +722,98 @@ pub async fn refresh_legacy_provider_token_once(
         .await
         .map(|_| ())
         .map_err(|e| format!("Legacy token keep-alive update failed: {e}"))
+}
+
+/// Computes a deterministic SHA-256 fingerprint over discovered local AI subscription items.
+pub fn discovered_subscriptions_fingerprint(items: &[ClientSubscriptionSyncItem]) -> String {
+    let bytes = serde_json::to_vec(items).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    format!("{digest:x}")
+}
+
+/// Builds a client-side E2EE `AiOauthVaultBundle` containing discovered AI subscriptions and
+/// optional local `ProviderRouterState`.
+pub fn build_ai_oauth_vault_bundle(
+    items: &[ClientSubscriptionSyncItem],
+    router: Option<&ProviderRouter>,
+) -> Result<AiOauthVaultBundle, String> {
+    let subscriptions_json = serde_json::to_value(items)
+        .map_err(|e| format!("Failed serializing discovered subscriptions: {e}"))?;
+    let providers_json = match router {
+        Some(r) => serde_json::to_value(r.snapshot())
+            .map_err(|e| format!("Failed serializing provider router snapshot: {e}"))?,
+        None => serde_json::Value::Null,
+    };
+    Ok(AiOauthVaultBundle {
+        providers_json,
+        subscriptions_json,
+        updated_at_ms: Utc::now().timestamp_millis(),
+    })
+}
+
+/// Hydrates locally discovered AI OAuth / ADC subscriptions directly into the desktop's
+/// in-process `FabushiBotHost` (`core_engine` + all provisioned bot instances).
+pub fn hydrate_local_subscriptions_into_fabushi(
+    host: &FabushiBotHost,
+    items: &[ClientSubscriptionSyncItem],
+) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    let count = items.len();
+    let core = host.core_engine();
+    core.providers().ingest_client_subscriptions(items.to_vec(), true);
+    host.sync_all_providers();
+    count
+}
+
+/// Hydrates a decrypted `AiOauthVaultBundle` into the desktop's in-process `FabushiBotHost`.
+pub fn hydrate_ai_oauth_vault_bundle_into_fabushi(
+    host: &FabushiBotHost,
+    bundle: &AiOauthVaultBundle,
+) -> Result<usize, String> {
+    let mut count = 0usize;
+    let core = host.core_engine();
+    if !bundle.providers_json.is_null() {
+        if let Ok(router_state) =
+            serde_json::from_value::<ProviderRouterState>(bundle.providers_json.clone())
+        {
+            let has_non_placeholder = router_state
+                .providers
+                .values()
+                .any(|p| p.enabled && p.id != "local_hermes" && p.api_mode != ApiMode::LocalHermes)
+                || router_state.subscriptions.iter().any(|s| s.active);
+            if has_non_placeholder {
+                core.providers().sync_from_state(&router_state);
+                count = count.max(router_state.subscriptions.len().max(1));
+            }
+        }
+    }
+    if let Ok(items) =
+        serde_json::from_value::<Vec<ClientSubscriptionSyncItem>>(bundle.subscriptions_json.clone())
+    {
+        if !items.is_empty() {
+            count = hydrate_local_subscriptions_into_fabushi(host, &items);
+            return Ok(count);
+        }
+    }
+    host.sync_all_providers();
+    Ok(count)
+}
+
+/// Returns `true` when `host` has a usable non-placeholder AI provider configured locally.
+pub fn has_usable_local_fabushi_provider(host: &FabushiBotHost) -> bool {
+    let core = host.core_engine();
+    let router = core.providers();
+    if router.needs_provider_selection() {
+        return false;
+    }
+    let (active_id, active_model, active_mode) = router.active_info();
+    (active_mode != ApiMode::LocalHermes
+        && active_id != "local_hermes"
+        && !active_model.eq_ignore_ascii_case("hermes-local-v1"))
+        || router.has_configured_provider()
+        || router.has_active_subscription()
 }
 
 #[cfg(test)]

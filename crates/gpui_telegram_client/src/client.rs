@@ -21,8 +21,12 @@ use crate::net::{
     HttpClient, HttpClientError, OpenAiChatCompletionsRequest, PendingComputerCommandDto,
     RegisterLocalComputerRequest, RemoteComputerCommandRequest, RemoteComputerCommandResult,
     RemoteComputerOp, TailnetEngine, TailnetIdentity, TailnetNetMap, TailnetNodeStatus,
-    UpdateBotComputerRequest, UpdateComputerPolicyRequest, UpsertCloudComputerRequest, WsChannel,
-    WsTransport,
+    UpdateBotComputerRequest, UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
+    ApproveDeviceSyncRequest, ArchiveLocalBotReplyRequest, ArchiveLocalBotReplyResponse,
+    DeviceSyncActionResponse, DeviceSyncRequestBody, DeviceSyncRequestResponse,
+    DeviceSyncStatusResponse, PendingDeviceSyncListResponse, UpsertUserVaultItemRequest,
+    UpsertUserVaultItemResponse, UserVaultEnvelopeResponse, UserVaultKeyEnvelopeDto,
+    UserVaultSyncPullResponse, WsChannel, WsTransport,
 };
 use crate::outbox::{NetworkState, NetworkStatusListener, OutboxStore, OutboxWorker, TokenProvider};
 use crate::sync::ClientSyncCoordinator;
@@ -1317,5 +1321,108 @@ impl TelegramClient {
             .http_client
             .update_bot_computer_profile(&token, bot_id, req)
             .await?)
+    }
+
+    pub async fn get_user_vault_envelope(
+        &self,
+    ) -> std::result::Result<UserVaultEnvelopeResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.get_user_vault_envelope(&token).await
+    }
+
+    pub async fn put_user_vault_envelope(
+        &self,
+        envelope: &UserVaultKeyEnvelopeDto,
+    ) -> std::result::Result<UserVaultEnvelopeResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.put_user_vault_envelope(&token, envelope).await
+    }
+
+    pub async fn pull_user_vault_items(
+        &self,
+        since_revision: Option<i64>,
+        category: Option<&str>,
+    ) -> std::result::Result<UserVaultSyncPullResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .pull_user_vault_items(&token, since_revision, category)
+            .await
+    }
+
+    pub async fn put_user_vault_item(
+        &self,
+        category: &str,
+        item_key: &str,
+        req: &UpsertUserVaultItemRequest,
+    ) -> std::result::Result<UpsertUserVaultItemResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .put_user_vault_item(&token, category, item_key, req)
+            .await
+    }
+
+    pub async fn delete_user_vault_item(
+        &self,
+        category: &str,
+        item_key: &str,
+        expected_revision: Option<i64>,
+    ) -> std::result::Result<UpsertUserVaultItemResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .delete_user_vault_item(&token, category, item_key, expected_revision)
+            .await
+    }
+
+    pub async fn archive_local_bot_reply(
+        &self,
+        chat_id: i64,
+        req: &ArchiveLocalBotReplyRequest,
+    ) -> std::result::Result<ArchiveLocalBotReplyResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .archive_local_bot_reply(&token, chat_id, req)
+            .await
+    }
+
+    pub async fn device_sync_request(
+        &self,
+        req: &DeviceSyncRequestBody,
+    ) -> std::result::Result<DeviceSyncRequestResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.device_sync_request(&token, req).await
+    }
+
+    pub async fn device_sync_pending(
+        &self,
+    ) -> std::result::Result<PendingDeviceSyncListResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.device_sync_pending(&token).await
+    }
+
+    pub async fn device_sync_approve(
+        &self,
+        request_id: &str,
+        req: &ApproveDeviceSyncRequest,
+    ) -> std::result::Result<DeviceSyncActionResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .device_sync_approve(&token, request_id, req)
+            .await
+    }
+
+    pub async fn device_sync_deny(
+        &self,
+        request_id: &str,
+    ) -> std::result::Result<DeviceSyncActionResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.device_sync_deny(&token, request_id).await
+    }
+
+    pub async fn device_sync_status(
+        &self,
+        request_id: &str,
+    ) -> std::result::Result<DeviceSyncStatusResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client.device_sync_status(&token, request_id).await
     }
 }
