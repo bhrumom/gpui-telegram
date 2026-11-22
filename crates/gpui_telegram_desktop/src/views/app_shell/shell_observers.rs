@@ -326,7 +326,9 @@ impl AppShell {
     }
 
     fn observe_sidebar_entity(&self, cx: &mut Context<Self>) {
-        cx.observe(&self.sidebar, |shell, sb, cx| {
+        let mut prev_overlay_open = false;
+        let mut prev_search_focused = false;
+        cx.observe(&self.sidebar, move |shell, sb, cx| {
             let (
                 selected_dialog, selection_rev, story_peer, search_focused, has_creation_modal,
                 pending_contact, pending_group, search_query, search_cat, search_seq,
@@ -345,11 +347,14 @@ impl AppShell {
                 s.pending_open_bot_profile.take(), s.pending_launch_dialog_miniapp.take(),
                 s.pending_open_search_hit.take(),
             ));
+            let mut shell_dirty = false;
             if open_botfather {
                 shell.open_botfather_chat(cx);
+                shell_dirty = true;
             }
             if let Some(app_item) = install_open_app {
                 shell.install_and_launch_miniapp(app_item, cx);
+                shell_dirty = true;
             }
             if let Some(app_item) = open_app_only {
                 if app_item.is_installed {
@@ -360,9 +365,11 @@ impl AppShell {
                 } else {
                     shell.install_and_launch_miniapp(app_item, cx);
                 }
+                shell_dirty = true;
             }
             if let Some(bot_un) = open_bot_profile {
                 shell.open_bot_profile_popup(&bot_un, cx);
+                shell_dirty = true;
             }
             if let Some((cid, uri)) = launch_dialog_miniapp {
                 let _ = shell.launch_miniapp_from_uri(
@@ -371,13 +378,16 @@ impl AppShell {
                     MiniAppLaunchMode::MainMiniApp,
                     cx,
                 );
+                shell_dirty = true;
             }
             if let Some(hit) = open_search_hit {
                 shell.handle_sidebar_search_hit(hit, cx);
+                shell_dirty = true;
             }
             if collapse_rev != shell.overlays.last_sidebar_collapse_revision {
                 shell.overlays.last_sidebar_collapse_revision = collapse_rev;
                 shell.update_preferences(cx, |p| p.appearance.sidebar_collapsed = is_collapsed);
+                shell_dirty = true;
             }
             if open_menu {
                 shell.sidebar.update(cx, |s, s_cx| {
@@ -385,10 +395,14 @@ impl AppShell {
                     s.is_plus_menu_open = false;
                     s_cx.notify();
                 });
+                shell_dirty = true;
             }
-            let sb_popup = {
+            let (sb_popup, cur_overlay_open) = {
                 let s = shell.sidebar.read(cx);
-                s.is_plus_menu_open || s.is_account_popover_open || s.is_contacts_modal_open || s.active_creation_modal.is_some()
+                let overlay_open = s.is_contacts_modal_open
+                    || s.active_creation_modal.is_some()
+                    || s.is_account_popover_open;
+                (s.is_plus_menu_open || overlay_open, overlay_open)
             };
             if sb_popup && shell.stage.read(cx).more_menu_open {
                 shell.stage.update(cx, |st, st_cx| {
@@ -396,28 +410,35 @@ impl AppShell {
                     st.ttl_submenu_open = false;
                     st_cx.notify();
                 });
+                shell_dirty = true;
             }
             if open_new_channel {
                 let title = tr_str(shell.active_lang_id(), "新建频道", "New Channel");
                 shell.open_modal_dialog(title, ModalDialogKind::NewChannel, 420.0, 380.0, cx);
+                shell_dirty = true;
             }
             if let Some(action) = context_action {
                 shell.handle_sidebar_context_action(action, cx);
+                shell_dirty = true;
             }
             if search_focused || has_creation_modal {
                 shell.composer.update(cx, |c, _| c.is_input_focused = false);
             }
             if let Some(req) = pending_contact {
                 shell.dispatch_add_contact(req, cx);
+                shell_dirty = true;
             }
             if let Some(req) = pending_group {
                 shell.dispatch_create_group(req, cx);
+                shell_dirty = true;
             }
             if search_focused && search_seq > 0 && shell.session_sync.last_dispatched_search_seq != search_seq {
                 shell.dispatch_categorized_search(search_query, search_cat, search_seq, cx);
+                shell_dirty = true;
             }
             if let Some(peer) = story_peer {
                 shell.open_modal_dialog(peer.clone(), ModalDialogKind::StoriesViewer { peer_name: peer }, 420.0, 560.0, cx);
+                shell_dirty = true;
             }
             if should_switch_to_chats_on_sidebar_selection(
                 selection_rev, &mut shell.overlays.last_sidebar_selection_revision, selected_dialog.is_some(),
@@ -430,9 +451,17 @@ impl AppShell {
                     if st.active_chat_id != Some(d.id) || st.chat_title != d.peer_name {
                         shell.sync_selected_chat_inspector_and_stage(d.id, cx);
                     }
+                    shell_dirty = true;
                 }
             }
-            cx.notify();
+            if cur_overlay_open || prev_overlay_open || search_focused != prev_search_focused {
+                shell_dirty = true;
+            }
+            prev_overlay_open = cur_overlay_open;
+            prev_search_focused = search_focused;
+            if shell_dirty {
+                cx.notify();
+            }
         })
         .detach();
     }

@@ -374,10 +374,25 @@ impl AppShell {
                                 }
                                 if let Some(ref rich_list) = rich_chats {
                                     for rc in rich_list {
-                                        if rc.is_bot && rc.chat_id > 0 {
-                                            sb.bot_ids.insert(rc.chat_id as u64);
+                                        if rc.chat_id > 0 {
+                                            let cid = rc.chat_id as u64;
+                                            if rc.is_bot {
+                                                sb.bot_ids.insert(cid);
+                                            }
+                                            if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == cid) {
+                                                d.is_pinned = rc.is_pinned;
+                                                d.is_muted = rc.is_muted;
+                                            }
+                                            if rc.is_archived {
+                                                if !sb.archived_ids.contains(&cid) {
+                                                    sb.archived_ids.push(cid);
+                                                }
+                                            } else {
+                                                sb.archived_ids.retain(|&x| x != cid);
+                                            }
                                         }
                                     }
+                                    sb.recompute_folder_badges();
                                 }
                                 for d in &mut sb.dialogs {
                                     if d.avatar_initials.is_empty() || d.avatar_initials == "?" {

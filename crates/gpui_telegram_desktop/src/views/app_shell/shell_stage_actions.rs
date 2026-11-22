@@ -361,10 +361,11 @@ impl AppShell {
                         if let Some((muted, pinned)) = dlg_flags {
                             st.is_muted_chat = muted;
                             st.is_pinned_chat = pinned;
+                        } else if let Some(ref rc) = rich_meta_opt {
+                            st.is_muted_chat = rc.is_muted;
+                            st.is_pinned_chat = rc.is_pinned;
                         }
                         if let Some(ref rc) = rich_meta_opt {
-                            st.is_muted_chat = rc.is_muted || st.is_muted_chat;
-                            st.is_pinned_chat = rc.is_pinned || st.is_pinned_chat;
                             st.is_peer_blocked = rc.is_blocked;
                             st.message_ttl_seconds = rc.message_ttl_seconds;
                         }

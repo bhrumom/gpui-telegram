@@ -13,6 +13,9 @@ use crate::i18n::{tr_fmt, tr_key_or, tr_str};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use super::rich_meta::resolve_image_source;
 
+pub const APPLE_STAGE_TOP_BAR_HEIGHT: f32 = 76.0;
+pub const APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT: f32 = 52.0;
+
 #[derive(Debug, Clone)]
 pub enum TopBarUiAction {
     ToggleInspector,
@@ -79,7 +82,11 @@ pub fn render_stage_top_bar<V: 'static>(
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let is_apple = palette.is_apple_style();
-    let bar_h = px(palette.scaled_px(if is_apple { 52.0 } else { 54.0 }));
+    let bar_h = px(palette.scaled_px(if is_apple {
+        APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT
+    } else {
+        54.0
+    }));
     let bar_bg: Rgba = if is_apple {
         TdesktopThemePalette::rgba_with_alpha(
             palette.topbar_bg,
@@ -211,6 +218,7 @@ pub fn render_stage_top_bar<V: 'static>(
     let (grad_top, grad_bot) = palette.peer_avatar_gradient(pid);
     let img_src = avatar_url.and_then(|u| resolve_image_source(u, None));
     let has_chat = chat_id.is_some();
+    let is_dark = palette.mode.is_dark();
     let a_insp1 = on_action.clone();
     let a_insp2 = on_action.clone();
     let a_search = on_action.clone();
@@ -218,6 +226,27 @@ pub fn render_stage_top_bar<V: 'static>(
     let a_vcall = on_action.clone();
     let a_more = on_action.clone();
     let ttl_header_label = (message_ttl_seconds > 0).then(|| format_ttl_badge(message_ttl_seconds, lang_id));
+    let ttl_badge_el: Option<AnyElement> = ttl_header_label.map(|ttl_lbl| {
+        div()
+            .id("topbar-ttl-badge")
+            .flex_shrink_0()
+            .px(px(palette.scaled_px(6.0)))
+            .py(px(palette.scaled_px(1.5)))
+            .rounded_full()
+            .bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16))
+            .flex()
+            .items_center()
+            .gap(px(3.0))
+            .child(tg_icon(IconName::ClockSending, palette.scaled_px(11.0), palette.accent))
+            .child(
+                div()
+                    .text_size(px(palette.scaled_px(10.5)))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(palette.accent))
+                    .child(ttl_lbl),
+            )
+            .into_any_element()
+    });
     let sub_lower = subtitle.to_ascii_lowercase();
     let is_typing_or_active_bot = sub_lower.contains("typing")
         || subtitle.contains("输入")
@@ -230,235 +259,193 @@ pub fn render_stage_top_bar<V: 'static>(
         || subtitle.contains("成员")
         || subtitle.contains("订阅");
     let show_apple_subtitle = !subtitle.is_empty() && (is_typing_or_active_bot || is_online || is_group_sub);
-    let peer_hover_bg = TdesktopThemePalette::rgba_with_alpha(
-        palette.text_primary,
-        if palette.mode.is_dark() { 0.07 } else { 0.045 },
-    );
 
-    let bar = div()
-        .relative()
-        .h(bar_h)
-        .w_full()
-        .px(px(if is_apple { 16.0 } else { 14.0 }))
-        .bg(bar_bg)
-        .when(!is_apple, |el| el.border_b_1().border_color(rgb(palette.border_fg)))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(8.0))
-        .child(
+    let avatar_el: Option<AnyElement> = has_chat.then(|| {
+        let avatar_size_px = palette.scaled_px(if is_apple { 38.0 } else { 40.0 });
+        let is_typing = is_typing_or_active_bot;
+        let fab_non_classic = active_fabushi_bot
+            .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"));
+        let show_dynamic_bot_avatar =
+            fab_non_classic.is_some() || (is_bot_chat && (img_src.is_none() || is_typing));
+        let avatar_ring_col = if is_dark {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.16)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.08)
+        };
+        let avatar_shadow = vec![BoxShadow {
+            color: hsla(0.0, 0.0, 0.0, if is_dark { 0.32 } else { 0.12 }),
+            offset: point(px(0.0), px(2.0)),
+            blur_radius: px(8.0),
+            spread_radius: px(0.0),
+        }];
+
+        if show_dynamic_bot_avatar {
+            if let Some(fab) = fab_non_classic {
+                let effective_state = if !bot_activity_state.trim().is_empty()
+                    && !bot_activity_state.eq_ignore_ascii_case("idle")
+                {
+                    bot_activity_state
+                } else {
+                    fab.execution_state.as_str()
+                };
+                render_grok_bot_avatar(
+                    GrokBotAvatarProps::new(
+                        &fab.agent_id,
+                        &fab.avatar_shape,
+                        &fab.avatar_color,
+                        avatar_size_px,
+                    )
+                    .with_state(GrokPersonaState::from_activity_str(
+                        effective_state,
+                        is_typing,
+                    ))
+                    .with_follow_pointer(true)
+                    .with_surface_bg(palette.topbar_bg),
+                )
+                .into_any_element()
+            } else {
+                let seed = format!("bot_{}_{}", chat_id.unwrap_or(0), title);
+                let shape = resolve_grok_persona_shape(&seed, None);
+                let color = resolve_grok_persona_color(&seed, None);
+                let effective_state = if bot_activity_state.trim().is_empty() {
+                    "idle"
+                } else {
+                    bot_activity_state
+                };
+                render_grok_bot_avatar(
+                    GrokBotAvatarProps::new(&seed, &shape, &color, avatar_size_px)
+                        .with_state(GrokPersonaState::from_activity_str(
+                            effective_state,
+                            is_typing,
+                        ))
+                        .with_follow_pointer(true)
+                        .with_surface_bg(palette.topbar_bg),
+                )
+                .into_any_element()
+            }
+        } else if let Some(src) = img_src {
             div()
-                .id("topbar-peer-header")
+                .w(px(avatar_size_px))
+                .h(px(avatar_size_px))
+                .rounded_full()
+                .overflow_hidden()
+                .bg(rgb(grad_top))
+                .when(is_apple, |el| {
+                    el.border_1()
+                        .border_color(avatar_ring_col)
+                        .shadow(avatar_shadow.clone())
+                })
+                .flex_shrink_0()
                 .flex()
                 .items_center()
-                .gap(px(palette.scaled_px(if is_apple { 9.0 } else { 10.0 })))
-                .when(!is_apple, |el| el.flex_1())
-                .when(is_apple, |el| {
-                    el.max_w(px(360.0))
-                        .px(px(6.0))
-                        .py(px(4.0))
-                        .ml(px(-6.0))
-                        .rounded(px(10.0))
-                })
+                .justify_center()
+                .child(img(src).size_full().object_fit(ObjectFit::Cover))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(avatar_size_px))
+                .h(px(avatar_size_px))
+                .rounded_full()
                 .overflow_hidden()
-                .when(has_chat, |el| {
-                    el.cursor_pointer()
-                        .when(is_apple, |b| b.hover(move |s| s.bg(peer_hover_bg)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            a_insp1(this, TopBarUiAction::ToggleInspector, cx);
-                        }))
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgb(grad_top), 0.0),
+                    linear_color_stop(rgb(grad_bot), 1.0),
+                ))
+                .when(is_apple, |el| {
+                    el.border_1()
+                        .border_color(avatar_ring_col)
+                        .shadow(avatar_shadow)
                 })
-                .when(has_chat, |el| {
-                    let avatar_size_px = palette.scaled_px(if is_apple { 32.0 } else { 40.0 });
-                    let is_typing = is_typing_or_active_bot;
-                    let fab_non_classic = active_fabushi_bot
-                        .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"));
-                    let show_dynamic_bot_avatar =
-                        fab_non_classic.is_some() || (is_bot_chat && (img_src.is_none() || is_typing));
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(palette.scaled_px(if is_apple { 13.5 } else { 14.0 })))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(0xFFFFFF))
+                .when(avatar_url.map_or(true, |u| u.trim().is_empty()), |av| {
+                    av.child(initials.to_string())
+                })
+                .into_any_element()
+        }
+    });
 
-                    let avatar_el: AnyElement = if show_dynamic_bot_avatar {
-                        if let Some(fab) = fab_non_classic {
-                            let effective_state = if !bot_activity_state.trim().is_empty()
-                                && !bot_activity_state.eq_ignore_ascii_case("idle")
-                            {
-                                bot_activity_state
-                            } else {
-                                fab.execution_state.as_str()
-                            };
-                            render_grok_bot_avatar(
-                                GrokBotAvatarProps::new(
-                                    &fab.agent_id,
-                                    &fab.avatar_shape,
-                                    &fab.avatar_color,
-                                    avatar_size_px,
-                                )
-                                .with_state(GrokPersonaState::from_activity_str(
-                                    effective_state,
-                                    is_typing,
-                                ))
-                                .with_follow_pointer(true)
-                                .with_surface_bg(palette.topbar_bg),
-                            )
-                            .into_any_element()
-                        } else {
-                            let seed = format!("bot_{}_{}", chat_id.unwrap_or(0), title);
-                            let shape = resolve_grok_persona_shape(&seed, None);
-                            let color = resolve_grok_persona_color(&seed, None);
-                            let effective_state = if bot_activity_state.trim().is_empty() {
-                                "idle"
-                            } else {
-                                bot_activity_state
-                            };
-                            render_grok_bot_avatar(
-                                GrokBotAvatarProps::new(&seed, &shape, &color, avatar_size_px)
-                                    .with_state(GrokPersonaState::from_activity_str(
-                                        effective_state,
-                                        is_typing,
-                                    ))
-                                    .with_follow_pointer(true)
-                                    .with_surface_bg(palette.topbar_bg),
-                            )
-                            .into_any_element()
-                        }
-                    } else if let Some(src) = img_src {
-                        div()
-                            .w(px(avatar_size_px))
-                            .h(px(avatar_size_px))
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(rgb(grad_top))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(img(src).size_full().object_fit(ObjectFit::Cover))
-                            .into_any_element()
-                    } else {
-                        div()
-                            .w(px(avatar_size_px))
-                            .h(px(avatar_size_px))
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(linear_gradient(
-                                180.0,
-                                linear_color_stop(rgb(grad_top), 0.0),
-                                linear_color_stop(rgb(grad_bot), 1.0),
-                            ))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(palette.scaled_px(if is_apple { 12.5 } else { 14.0 })))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0xFFFFFF))
-                            .when(avatar_url.map_or(true, |u| u.trim().is_empty()), |av| {
-                                av.child(initials.to_string())
-                            })
-                            .into_any_element()
-                    };
-                    el.child(avatar_el)
-                })
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(if is_apple { 4.0 } else { 6.0 }))
-                                .child(
-                                    div()
-                                        .text_size(px(palette.scaled_px(14.0)))
-                                        .font_weight(if is_apple { FontWeight::BOLD } else { FontWeight::SEMIBOLD })
-                                        .text_color(rgb(palette.text_primary))
-                                        .truncate()
-                                        .child(title.to_string()),
-                                )
-                                .when(is_apple && has_chat, |row| {
-                                    row.child(tg_icon(
-                                        IconName::ChevronRight,
-                                        palette.scaled_px(11.0),
-                                        palette.text_secondary,
-                                    ))
-                                })
-                                .when_some(ttl_header_label, |row, ttl_lbl| {
-                                    row.child(
-                                        div()
-                                            .id("topbar-ttl-badge")
-                                            .px(px(palette.scaled_px(6.0)))
-                                            .py(px(palette.scaled_px(1.5)))
-                                            .rounded_full()
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(3.0))
-                                            .child(tg_icon(IconName::ClockSending, palette.scaled_px(11.0), palette.accent))
-                                            .child(
-                                                div()
-                                                    .text_size(px(palette.scaled_px(10.5)))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(palette.accent))
-                                                    .child(ttl_lbl),
-                                            ),
-                                    )
-                                }),
-                        )
-                        .when(is_apple && show_apple_subtitle, |el| {
-                            el.child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .when(is_online && !is_typing_or_active_bot, |row| {
-                                        row.child(
-                                            div()
-                                                .w(px(6.0))
-                                                .h(px(6.0))
-                                                .rounded_full()
-                                                .flex_shrink_0()
-                                                .bg(rgb(palette.online_dot_fg)),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .text_size(px(palette.scaled_px(11.5)))
-                                            .text_color(rgb(if is_typing_or_active_bot {
-                                                palette.accent
-                                            } else {
-                                                palette.text_secondary
-                                            }))
-                                            .truncate()
-                                            .child(subtitle.to_string()),
-                                    ),
-                            )
-                        })
-                        .when(!is_apple && !subtitle.is_empty(), |el| {
-                            let is_live = subtitle == "online" || subtitle.contains("typing");
-                            el.child(
-                                div()
-                                    .text_size(px(palette.scaled_px(12.0)))
-                                    .text_color(rgb(if is_live { palette.online_dot_fg } else { palette.text_secondary }))
-                                    .child(subtitle.to_string()),
-                            )
-                        }),
+    let bar = if is_apple {
+        let apple_bar_h = px(palette.scaled_px(if has_chat {
+            APPLE_STAGE_TOP_BAR_HEIGHT
+        } else {
+            APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT
+        }));
+        let apple_bar_bg = linear_gradient(
+            180.0,
+            linear_color_stop(
+                TdesktopThemePalette::rgba_with_alpha(
+                    palette.stage_bg,
+                    if is_dark { 0.90 } else { 0.92 },
                 ),
-        )
-        .when(is_apple, |el| {
-            el.child(
+                0.0,
+            ),
+            linear_color_stop(
+                TdesktopThemePalette::rgba_with_alpha(
+                    palette.stage_bg,
+                    if is_dark { 0.55 } else { 0.62 },
+                ),
+                1.0,
+            ),
+        );
+        let glass_pill_bg = if is_dark {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.88)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.88)
+        };
+        let name_pill_bg = if is_dark {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.90)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.88)
+        };
+        let name_pill_hover_bg = if is_dark {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_hover_bg, 0.96)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.98)
+        };
+        let glass_pill_border = if is_dark {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.12)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.08)
+        };
+        let pill_shadow = vec![
+            BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, if is_dark { 0.34 } else { 0.10 }),
+                offset: point(px(0.0), px(4.0)),
+                blur_radius: px(14.0),
+                spread_radius: px(0.0),
+            },
+            BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, if is_dark { 0.22 } else { 0.05 }),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(3.0),
+                spread_radius: px(0.0),
+            },
+        ];
+
+        let mut root = div()
+            .relative()
+            .h(apple_bar_h)
+            .w_full()
+            .when(has_chat, |el| el.bg(apple_bar_bg))
+            .child(
                 div()
-                    .flex_1()
-                    .h_full()
-                    .min_w(px(16.0))
+                    .absolute()
+                    .inset_0()
                     .window_control_area(WindowControlArea::Drag),
-            )
-        })
-        .when(has_chat, |el| {
+            );
+
+        if has_chat {
             let call_group = div()
                 .flex()
                 .items_center()
-                .gap(px(if is_apple { 2.0 } else { 4.0 }))
+                .gap(px(2.0))
                 .child(top_icon_btn("tb-call", IconName::PhoneCall, false, palette, cx, move |this, cx| {
                     a_acall(this, TopBarUiAction::StartCall { video: false }, cx);
                 }))
@@ -474,30 +461,227 @@ pub fn render_stage_top_bar<V: 'static>(
             let more_btn = top_icon_btn("tb-more", IconName::MoreVertical, more_menu_open, palette, cx, move |this, cx| {
                 a_more(this, TopBarUiAction::ToggleTopMoreMenu, cx);
             });
-            let actions = if is_apple {
+
+            let identity_pill = div()
+                .mt(px(palette.scaled_px(-5.0)))
+                .px(px(palette.scaled_px(10.0)))
+                .py(px(palette.scaled_px(2.5)))
+                .rounded_full()
+                .bg(name_pill_bg)
+                .hover(move |s| s.bg(name_pill_hover_bg))
+                .border_1()
+                .border_color(glass_pill_border)
+                .shadow(pill_shadow.clone())
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(4.0))
+                .max_w(px(palette.scaled_px(240.0)))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .text_size(px(palette.scaled_px(12.5)))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(palette.text_primary))
+                        .truncate()
+                        .child(title.to_string()),
+                )
+                .child(
+                    div().flex_shrink_0().flex().items_center().child(tg_icon(
+                        IconName::ChevronRight,
+                        palette.scaled_px(10.5),
+                        palette.text_secondary,
+                    )),
+                )
+                .when_some(ttl_badge_el, |row, badge| row.child(badge));
+
+            let peer_header = div()
+                .id("topbar-peer-header")
+                .occlude()
+                .cursor_pointer()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .max_w(px(palette.scaled_px(260.0)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        a_insp1(this, TopBarUiAction::ToggleInspector, cx);
+                    }),
+                )
+                .when_some(avatar_el, |col, av| col.child(av))
+                .child(identity_pill)
+                .when(show_apple_subtitle, |col| {
+                    col.child(
+                        div()
+                            .mt(px(palette.scaled_px(2.0)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(4.0))
+                            .max_w(px(palette.scaled_px(220.0)))
+                            .overflow_hidden()
+                            .when(is_online && !is_typing_or_active_bot, |row| {
+                                row.child(
+                                    div()
+                                        .w(px(5.5))
+                                        .h(px(5.5))
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .bg(rgb(palette.online_dot_fg)),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .text_size(px(palette.scaled_px(10.5)))
+                                    .text_color(rgb(if is_typing_or_active_bot {
+                                        palette.accent
+                                    } else {
+                                        palette.text_secondary
+                                    }))
+                                    .truncate()
+                                    .child(subtitle.to_string()),
+                            ),
+                    )
+                });
+
+            let right_actions_pill = div()
+                .id("topbar-right-actions-pill")
+                .absolute()
+                .top(px(palette.scaled_px(12.0)))
+                .right(px(14.0))
+                .occlude()
+                .px(px(4.0))
+                .py(px(3.0))
+                .rounded_full()
+                .bg(glass_pill_bg)
+                .border_1()
+                .border_color(glass_pill_border)
+                .shadow(pill_shadow)
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .child(call_group)
+                .child(search_btn)
+                .child(info_btn)
+                .child(more_btn);
+
+            root = root
+                .child(
+                    div()
+                        .w_full()
+                        .h_full()
+                        .px(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(peer_header),
+                )
+                .child(right_actions_pill);
+        }
+
+        root.into_any_element()
+    } else {
+        div()
+            .relative()
+            .h(bar_h)
+            .w_full()
+            .px(px(14.0))
+            .bg(bar_bg)
+            .border_b_1()
+            .border_color(rgb(palette.border_fg))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(
                 div()
+                    .id("topbar-peer-header")
                     .flex()
                     .items_center()
-                    .gap(px(3.0))
-                    .child(call_group)
-                    .child(search_btn)
-                    .child(info_btn)
-                    .child(more_btn)
-            } else {
-                div()
+                    .gap(px(palette.scaled_px(10.0)))
+                    .flex_1()
+                    .overflow_hidden()
+                    .when(has_chat, |el| {
+                        el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                            a_insp1(this, TopBarUiAction::ToggleInspector, cx);
+                        }))
+                    })
+                    .when_some(avatar_el, |el, av| el.child(av))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(palette.scaled_px(14.0)))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette.text_primary))
+                                            .truncate()
+                                            .child(title.to_string()),
+                                    )
+                                    .when_some(ttl_badge_el, |row, badge| row.child(badge)),
+                            )
+                            .when(!subtitle.is_empty(), |el| {
+                                let is_live = subtitle == "online" || subtitle.contains("typing");
+                                el.child(
+                                    div()
+                                        .text_size(px(palette.scaled_px(12.0)))
+                                        .text_color(rgb(if is_live {
+                                            palette.online_dot_fg
+                                        } else {
+                                            palette.text_secondary
+                                        }))
+                                        .child(subtitle.to_string()),
+                                )
+                            }),
+                    ),
+            )
+            .when(has_chat, |el| {
+                let call_group = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(top_icon_btn("tb-call", IconName::PhoneCall, false, palette, cx, move |this, cx| {
+                        a_acall(this, TopBarUiAction::StartCall { video: false }, cx);
+                    }))
+                    .child(top_icon_btn("tb-vcall", IconName::VideoCall, false, palette, cx, move |this, cx| {
+                        a_vcall(this, TopBarUiAction::StartCall { video: true }, cx);
+                    }));
+                let search_btn = top_icon_btn("tb-search", IconName::Search, search_open, palette, cx, move |this, cx| {
+                    a_search(this, TopBarUiAction::ToggleSearch, cx);
+                });
+                let info_btn = top_icon_btn("tb-info", IconName::SidebarPanel, is_inspector_open, palette, cx, move |this, cx| {
+                    a_insp2(this, TopBarUiAction::ToggleInspector, cx);
+                });
+                let more_btn = top_icon_btn("tb-more", IconName::MoreVertical, more_menu_open, palette, cx, move |this, cx| {
+                    a_more(this, TopBarUiAction::ToggleTopMoreMenu, cx);
+                });
+                let actions = div()
                     .flex()
                     .items_center()
                     .gap(px(4.0))
                     .child(search_btn)
                     .child(call_group)
                     .child(info_btn)
-                    .child(more_btn)
-            };
-            el.child(actions)
-        });
+                    .child(more_btn);
+                el.child(actions)
+            })
+            .into_any_element()
+    };
 
     let _ = (search_query, search_match_cursor, search_match_total, tr_fmt);
-    bar.into_any_element()
+    bar
 }
 
 pub fn render_stage_search_bar<V: 'static>(
@@ -728,7 +912,7 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
     let mut dropdown = div()
         .id("topbar-more-dropdown")
         .absolute()
-        .top(px(if is_apple { 48.0 } else { 50.0 }))
+        .top(px(if is_apple { 52.0 } else { 50.0 }))
         .right(px(12.0))
         .w(px(238.0))
         .p(px(6.0))

@@ -904,7 +904,8 @@ impl ChatSidebar {
         self.recompute_folder_badges();
     }
 
-    pub fn apply_context_action(&mut self, action: SidebarContextAction) {
+    /// Applies a sidebar context-menu action locally without queuing it back to `AppShell`.
+    pub fn apply_context_action_local(&mut self, action: SidebarContextAction) {
         match action {
             SidebarContextAction::TogglePin(id) => self.toggle_pin_dialog(id),
             SidebarContextAction::ToggleMute(id) => self.toggle_mute_dialog(id),
@@ -914,6 +915,11 @@ impl ChatSidebar {
             SidebarContextAction::DeleteChat(id) => self.delete_dialog(id),
         }
         self.context_menu = None;
+    }
+
+    /// Applies a user-triggered sidebar context-menu action locally and queues it for `AppShell`.
+    pub fn apply_context_action(&mut self, action: SidebarContextAction) {
+        self.apply_context_action_local(action);
         self.pending_context_action = Some(action);
     }
 

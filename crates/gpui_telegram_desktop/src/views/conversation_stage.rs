@@ -39,6 +39,7 @@ use crate::views::stage::stage_context_menu::ReactionOverlayMode;
 use crate::views::stage::stage_bars::{
     render_pinned_banner_46px, render_scroll_to_bottom_fab, render_stage_more_menu_overlay,
     render_stage_search_bar, render_stage_top_bar, TopBarUiAction,
+    APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT, APPLE_STAGE_TOP_BAR_HEIGHT,
 };
 use crate::views::stage::wallpaper::{
     render_empty_history_placeholder, render_empty_no_chat_pill, render_themed_wallpaper,
@@ -925,19 +926,28 @@ impl Render for ConversationStage {
             )
         };
         let pinned_info = self.pinned_banner_info();
+        let has_pinned_banner = pinned_info.is_some();
         let show_top_chrome = has_active_chat
             || total_msgs > 0
             || self.show_bot_start_bar
             || self.bot_description_card.is_some();
         let show_fabushi_bar =
             show_top_chrome && self.is_viewer_owner_fabushi_bot && self.active_fabushi_bot.is_some();
+        let apple_top_bar_h = if has_active_chat
+            && !self.select_mode_active
+            && self.selected_message_ids.is_empty()
+        {
+            self.palette.scaled_px(APPLE_STAGE_TOP_BAR_HEIGHT)
+        } else {
+            self.palette.scaled_px(APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT)
+        };
         let apple_top_inset = if !show_top_chrome {
             14.0
         } else {
-            self.palette.scaled_px(52.0)
+            apple_top_bar_h
                 + if show_fabushi_bar { 32.0 } else { 0.0 }
                 + if self.search_open { 44.0 } else { 0.0 }
-                + if pinned_info.is_some() { 46.0 } else { 0.0 }
+                + if has_pinned_banner { 46.0 } else { 0.0 }
                 + 12.0
         };
         let sticky_date_pill = if is_apple {
@@ -1534,9 +1544,20 @@ impl Render for ConversationStage {
 
         if is_apple {
             if !top_chrome_children.is_empty() {
+                let seamless_apple_header = has_active_chat
+                    && !self.select_mode_active
+                    && self.selected_message_ids.is_empty()
+                    && !show_fabushi_bar
+                    && !self.search_open
+                    && !has_pinned_banner;
+                let (feather_alpha, feather_h) = if seamless_apple_header {
+                    (if self.palette.mode.is_dark() { 0.55 } else { 0.62 }, 20.0)
+                } else {
+                    (0.90, 18.0)
+                };
                 let top_feather = linear_gradient(
                     180.0,
-                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.94), 0.0),
+                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, feather_alpha), 0.0),
                     linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.0), 1.0),
                 );
                 root = root.child(
@@ -1549,7 +1570,7 @@ impl Render for ConversationStage {
                         .flex()
                         .flex_col()
                         .children(top_chrome_children)
-                        .child(div().w_full().h(px(18.0)).bg(top_feather)),
+                        .child(div().w_full().h(px(feather_h)).bg(top_feather)),
                 );
             } else {
                 // Allow dragging the macOS window from the empty right-pane titlebar zone

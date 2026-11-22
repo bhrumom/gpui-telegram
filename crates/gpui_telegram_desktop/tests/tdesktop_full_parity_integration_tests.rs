@@ -256,3 +256,53 @@ fn test_fabushi_visual_theme_tokens_and_readability() {
         TdesktopThemeMode::Night
     );
 }
+
+#[test]
+fn test_sidebar_context_action_single_apply_and_no_rearm() {
+    use gpui::{point, px};
+    use gpui_telegram_desktop::views::chat_sidebar::{DialogDeliveryStatus, DialogItemModel};
+    use gpui_telegram_desktop::views::sidebar::dialogs_row_view::SidebarContextAction;
+
+    let mut sidebar = ChatSidebar::new();
+    sidebar.dialogs.push(DialogItemModel {
+        id: 42,
+        peer_name: "Alice".to_string(),
+        avatar_initials: "AL".to_string(),
+        avatar_color: 0x0A84FF,
+        last_message: "Hi".to_string(),
+        timestamp: "10:00".to_string(),
+        unread_count: 0,
+        is_muted: false,
+        is_pinned: false,
+        is_online: true,
+        typing_indicator: None,
+        delivery_status: DialogDeliveryStatus::Read,
+        folder: "All".to_string(),
+    });
+    sidebar.context_menu = Some((42, point(px(20.0), px(80.0))));
+
+    sidebar.apply_context_action(SidebarContextAction::TogglePin(42));
+    assert!(sidebar.dialogs[0].is_pinned);
+    assert!(sidebar.context_menu.is_none());
+
+    assert_eq!(
+        sidebar.take_pending_context_action(),
+        Some(SidebarContextAction::TogglePin(42))
+    );
+    assert_eq!(sidebar.take_pending_context_action(), None);
+    assert!(sidebar.dialogs[0].is_pinned);
+
+    sidebar.apply_context_action_local(SidebarContextAction::TogglePin(42));
+    assert!(!sidebar.dialogs[0].is_pinned);
+    assert_eq!(sidebar.take_pending_context_action(), None);
+}
+
+#[test]
+fn test_apple_stage_top_bar_height_constants() {
+    use gpui_telegram_desktop::views::stage::stage_bars::{
+        APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT, APPLE_STAGE_TOP_BAR_HEIGHT,
+    };
+
+    assert_eq!(APPLE_STAGE_TOP_BAR_HEIGHT, 76.0);
+    assert_eq!(APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT, 52.0);
+}

@@ -435,14 +435,17 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Handles pin, mute, archive, clear history, and delete context-menu actions from the sidebar.
+    /// Handles pin, mute, archive, clear history, and delete context-menu actions drained from
+    /// `ChatSidebar::pending_context_action`.
+    ///
+    /// `ChatSidebar::apply_context_action` has already applied the local state mutation before
+    /// `observe_sidebar_entity` drains `pending_context_action`, so this handler must NOT re-apply
+    /// or re-queue the action onto `self.sidebar`.
     pub fn handle_sidebar_context_action(
         &mut self,
         action: SidebarContextAction,
         cx: &mut Context<Self>,
     ) {
-        self.sidebar
-            .update(cx, |sb, _| sb.apply_context_action(action.clone()));
         let client = self.client.clone();
         match action {
             SidebarContextAction::TogglePin(id) => {
@@ -454,8 +457,14 @@ impl AppShell {
                     .find(|d| d.id == id)
                     .map(|d| d.is_pinned)
                     .unwrap_or(false);
+                if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&id) {
+                    rc.is_pinned = pinned;
+                }
                 if self.stage.read(cx).active_chat_id == Some(id) {
-                    self.stage.update(cx, |st, _| st.is_pinned_chat = pinned);
+                    self.stage.update(cx, |st, st_cx| {
+                        st.is_pinned_chat = pinned;
+                        st_cx.notify();
+                    });
                 }
                 cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
                     let _ = client.set_chat_pinned(id as i64, pinned).await;
@@ -471,8 +480,14 @@ impl AppShell {
                     .find(|d| d.id == id)
                     .map(|d| d.is_muted)
                     .unwrap_or(false);
+                if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&id) {
+                    rc.is_muted = muted;
+                }
                 if self.stage.read(cx).active_chat_id == Some(id) {
-                    self.stage.update(cx, |st, _| st.is_muted_chat = muted);
+                    self.stage.update(cx, |st, st_cx| {
+                        st.is_muted_chat = muted;
+                        st_cx.notify();
+                    });
                 }
                 cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
                     let _ = client.set_chat_muted(id as i64, muted, None).await;
@@ -481,6 +496,9 @@ impl AppShell {
             }
             SidebarContextAction::ToggleArchive(id) => {
                 let arch = self.sidebar.read(cx).archived_ids.contains(&id);
+                if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&id) {
+                    rc.is_archived = arch;
+                }
                 cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
                     let _ = client.set_chat_archived(id as i64, arch).await;
                 })
@@ -504,11 +522,12 @@ impl AppShell {
                 .detach();
             }
             SidebarContextAction::ClearHistory(id) => {
-                self.stage.update(cx, |st, _| {
+                self.stage.update(cx, |st, st_cx| {
                     st.chat_histories.insert(id, Vec::new());
                     if st.active_chat_id == Some(id) {
                         st.messages.clear();
                         st.row_height_cache.rebuild_prefix_sums(&st.messages);
+                        st_cx.notify();
                     }
                 });
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
