@@ -16,6 +16,7 @@ use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, EntryType, Header};
+use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -225,6 +226,109 @@ impl UnlockedUserVaultKey {
 
     pub fn delete_from_keychain(user_id: u64) -> Result<(), BotBrowserError> {
         Self::delete_from_keyring(user_id)
+    }
+
+    /// Persists this 256-bit root key atomically into a `0o600` (on Unix) local key file.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), BotBrowserError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
+
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let tmp_path = parent.join(format!(
+            ".{}.{}.tmp",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("user-vault-root.key"),
+            Uuid::new_v4()
+        ));
+        let encoded = Zeroizing::new(hex::encode(&*self.root_key));
+
+        let write_result: Result<(), BotBrowserError> = (|| {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&tmp_path)?;
+            file.write_all(encoded.as_bytes())?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+            }
+            fs::rename(&tmp_path, path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Loads a 256-bit root key from a local key file (`32` raw bytes or trimmed hex).
+    pub fn load_from_file(path: &Path) -> Result<Option<Self>, BotBrowserError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut raw = Zeroizing::new(Vec::new());
+        file.read_to_end(&mut raw)?;
+
+        if raw.len() == 32 {
+            let mut key = Zeroizing::new([0u8; 32]);
+            key.copy_from_slice(&raw);
+            return Ok(Some(Self { root_key: key }));
+        }
+
+        if let Ok(as_str) = std::str::from_utf8(&raw) {
+            let decoded = Zeroizing::new(hex::decode(as_str.trim()).map_err(|e| {
+                BotBrowserError::Keyring(format!("corrupt user vault file root key encoding: {e}"))
+            })?);
+            if decoded.len() == 32 {
+                let mut key = Zeroizing::new([0u8; 32]);
+                key.copy_from_slice(&decoded);
+                return Ok(Some(Self { root_key: key }));
+            }
+            return Err(BotBrowserError::Keyring(format!(
+                "unexpected user vault file root key length: {} bytes",
+                decoded.len()
+            )));
+        }
+
+        Err(BotBrowserError::Keyring(format!(
+            "invalid user vault root key file size ({} bytes) at {}",
+            raw.len(),
+            path.display()
+        )))
+    }
+
+    pub fn delete_file(path: &Path) -> Result<(), BotBrowserError> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(BotBrowserError::Io(err.to_string())),
+        }
     }
 
     pub fn seal_item(
@@ -1493,4 +1597,45 @@ fn safe_join_under(base_dir: &Path, rel: &Path) -> Result<PathBuf, BotBrowserErr
         }
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unlocked_user_vault_key_file_roundtrip_and_permissions() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key_path = tmp.path().join("nested").join("user_vault_root.key");
+
+        assert!(
+            UnlockedUserVaultKey::load_from_file(&key_path)
+                .expect("load missing")
+                .is_none()
+        );
+
+        let raw_bytes = [0x42u8; 32];
+        let key = UnlockedUserVaultKey::from_bytes(raw_bytes);
+        key.save_to_file(&key_path).expect("save key file");
+
+        let loaded = UnlockedUserVaultKey::load_from_file(&key_path)
+            .expect("load saved")
+            .expect("key present");
+        assert_eq!(loaded.as_bytes(), &raw_bytes);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        UnlockedUserVaultKey::delete_file(&key_path).expect("delete key file");
+        assert!(!key_path.exists());
+        UnlockedUserVaultKey::delete_file(&key_path).expect("idempotent delete");
+    }
 }

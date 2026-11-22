@@ -370,11 +370,27 @@ fn use_headless_file_keystore_directly() -> bool {
     std::env::var("GPUI_OFFLINE_TEST").as_deref() == Ok("1")
 }
 
+/// On macOS, default to strict `0o600` local key files instead of legacy `login.keychain-db`
+/// so dev builds, notarized upgrades, and cold launches never trigger OS Keychain password prompts.
+fn use_local_file_keystore() -> bool {
+    if use_headless_file_keystore_directly() {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var("FABUSHI_USE_MACOS_KEYCHAIN").as_deref() != Ok("1")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 fn open_default_local_vault(
     vault_db_path: &Path,
     fallback_key_path: &Path,
 ) -> Result<CredentialVault, BotBrowserError> {
-    if !use_headless_file_keystore_directly() {
+    if !use_local_file_keystore() {
         let keyring_store = SystemKeyringMasterKeyStore::default();
         match CredentialVault::open(vault_db_path, &keyring_store) {
             Ok(vault) => return Ok(vault),
@@ -384,6 +400,52 @@ fn open_default_local_vault(
     }
     let file_store = FileMasterKeyStore::new(fallback_key_path);
     CredentialVault::open(vault_db_path, &file_store)
+}
+
+fn user_vault_root_key_file_path(user_browser_dir: &Path) -> PathBuf {
+    user_browser_dir.join("user_vault_root.key")
+}
+
+fn save_device_vault_root_key(
+    user_id: u64,
+    user_browser_dir: &Path,
+    key: &UnlockedUserVaultKey,
+) -> bool {
+    if use_headless_file_keystore_directly() {
+        return false;
+    }
+    let file_path = user_vault_root_key_file_path(user_browser_dir);
+    if use_local_file_keystore() {
+        return key.save_to_file(&file_path).is_ok();
+    }
+    key.save_to_keychain(user_id).is_ok() || key.save_to_file(&file_path).is_ok()
+}
+
+fn load_device_vault_root_key(user_id: u64, user_browser_dir: &Path) -> Option<UnlockedUserVaultKey> {
+    if use_headless_file_keystore_directly() {
+        return None;
+    }
+    let file_path = user_vault_root_key_file_path(user_browser_dir);
+    if use_local_file_keystore() {
+        return UnlockedUserVaultKey::load_from_file(&file_path)
+            .ok()
+            .flatten();
+    }
+    UnlockedUserVaultKey::load_from_keychain(user_id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            UnlockedUserVaultKey::load_from_file(&file_path)
+                .ok()
+                .flatten()
+        })
+}
+
+fn delete_device_vault_root_key(user_id: u64, user_browser_dir: &Path) {
+    let _ = UnlockedUserVaultKey::delete_file(&user_vault_root_key_file_path(user_browser_dir));
+    if !use_local_file_keystore() {
+        let _ = UnlockedUserVaultKey::delete_from_keychain(user_id);
+    }
 }
 
 fn remove_sqlite_file_family(db_path: &Path) {
@@ -848,8 +910,8 @@ async fn finalize_unlocked_vault_runtime(
     let (vault, orch, host, local_subs, keychain_saved) = tokio::task::spawn_blocking(move || -> Result<_, String> {
         let saved = if already_in_keychain {
             true
-        } else if save_to_keychain && !use_headless_file_keystore_directly() {
-            key_for_open.save_to_keychain(user_id).is_ok()
+        } else if save_to_keychain {
+            save_device_vault_root_key(user_id, &user_browser_dir_owned, &key_for_open)
         } else {
             false
         };
@@ -1320,10 +1382,9 @@ impl AppShell {
                         if use_headless_file_keystore_directly() || is_new_reg {
                             None
                         } else {
+                            let dir_for_load = user_browser_dir.clone();
                             tokio::task::spawn_blocking(move || {
-                                UnlockedUserVaultKey::load_from_keychain(user_id)
-                                    .ok()
-                                    .flatten()
+                                load_device_vault_root_key(user_id, &dir_for_load)
                             })
                             .await
                             .unwrap_or(None)
@@ -1335,8 +1396,9 @@ impl AppShell {
                             .as_ref()
                             .is_ok_and(|resp| resp.envelope.is_none());
                         if server_explicitly_empty && auth_bootstrap.is_some() {
+                            let dir_for_del = user_browser_dir.clone();
                             let _ = tokio::task::spawn_blocking(move || {
-                                UnlockedUserVaultKey::delete_from_keychain(user_id)
+                                delete_device_vault_root_key(user_id, &dir_for_del);
                             })
                             .await;
                         } else {
@@ -2601,11 +2663,8 @@ impl AppShell {
                         .map_err(|e| format!("Vault crypto setup failed: {e}"))?;
                 drop(passphrase);
 
-                let keychain_saved = if !use_headless_file_keystore_directly() {
-                    unlocked_key.save_to_keychain(user_id).is_ok()
-                } else {
-                    false
-                };
+                let keychain_saved =
+                    save_device_vault_root_key(user_id, &user_browser_dir, &unlocked_key);
 
                 let vault = Arc::new(
                     open_vault_with_e2ee_key_preserving(
@@ -2859,11 +2918,8 @@ impl AppShell {
                 }
                 .map_err(|e| format!("Vault unlock failed: {e}"))?;
 
-                let keychain_saved = if !use_headless_file_keystore_directly() {
-                    unlocked.save_to_keychain(user_id).is_ok()
-                } else {
-                    false
-                };
+                let keychain_saved =
+                    save_device_vault_root_key(user_id, &user_browser_dir, &unlocked);
 
                 let vault_db_path = user_browser_dir.join("vault.db");
                 let vault = Arc::new(

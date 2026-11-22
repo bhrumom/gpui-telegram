@@ -41,7 +41,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.6.2"
+version = "1.6.3"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Teamwork GPUI Telegram Contributors"]
