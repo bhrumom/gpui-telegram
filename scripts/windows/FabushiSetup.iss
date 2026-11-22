@@ -67,30 +67,6 @@ Name: "{autodesktop}\Fabushi"; Filename: "{app}\Fabushi.exe"; Tasks: desktopicon
 Filename: "{app}\Fabushi.exe"; Description: "{cm:LaunchProgram,Fabushi}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-const
-  SMTO_ABORTIFHUNG = 2;
-  WM_SETTINGCHANGE = $001A;
-  HWND_BROADCAST = $FFFF;
-
-function SendMessageTimeout(
-  hWnd: HWND;
-  Msg: Cardinal;
-  wParam: Cardinal;
-  lParam: String;
-  fuFlags: Cardinal;
-  uTimeout: Cardinal;
-  var lpdwResult: Cardinal
-): LongInt;
-  external 'SendMessageTimeoutW@user32.dll stdcall';
-
-procedure BroadcastEnvironmentChange();
-var
-  Res: Cardinal;
-begin
-  Res := 0;
-  SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, Res);
-end;
-
 procedure GetEnvRegLocation(var RootKey: Integer; var SubKey: String);
 begin
   if IsAdminInstallMode then
@@ -139,8 +115,7 @@ begin
   if (Paths <> '') and (Paths[Length(Paths)] <> ';') then
     Paths := Paths + ';';
   Paths := Paths + PathToAdd;
-  if RegWriteExpandStringValue(RootKey, SubKey, 'Path', Paths) then
-    BroadcastEnvironmentChange();
+  RegWriteExpandStringValue(RootKey, SubKey, 'Path', Paths);
 end;
 
 procedure EnvRemovePath(PathToRemove: String);
@@ -188,8 +163,7 @@ begin
 
   if Changed then
   begin
-    if RegWriteExpandStringValue(RootKey, SubKey, 'Path', NewPaths) then
-      BroadcastEnvironmentChange();
+    RegWriteExpandStringValue(RootKey, SubKey, 'Path', NewPaths);
   end;
 end;
 

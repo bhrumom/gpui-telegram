@@ -96,9 +96,27 @@ jobs:
             echo "No Developer ID Installer identity in P12; will ship signed+notarized DMG with 1-click Install Fabushi.app."
           fi
 
+          codesign_with_retry() {
+            local attempt=1
+            local max_attempts=6
+            while true; do
+              if codesign "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::codesign failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              local delay=$((attempt * 5))
+              echo "codesign transient failure (attempt ${attempt}/${max_attempts}); retrying in ${delay}s..."
+              sleep "$delay"
+              attempt=$((attempt + 1))
+            done
+          }
+
           probe="$RUNNER_TEMP/fabushi-team-probe"
           cp /usr/bin/true "$probe"
-          codesign --force --options runtime --timestamp --sign "$identity" "$probe"
+          codesign_with_retry --force --options runtime --timestamp --sign "$identity" "$probe"
           team_id="$(codesign -dv --verbose=4 "$probe" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
           rm -f "$probe"
           test -n "$team_id"
@@ -129,12 +147,30 @@ jobs:
           APPLE_NOTARIZE: "1"
         run: |
           set -euo pipefail
+          codesign_with_retry() {
+            local attempt=1
+            local max_attempts=6
+            while true; do
+              if codesign "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::codesign failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              local delay=$((attempt * 5))
+              echo "codesign transient failure (attempt ${attempt}/${max_attempts}); retrying in ${delay}s..."
+              sleep "$delay"
+              attempt=$((attempt + 1))
+            done
+          }
+
           TAG_NAME="${{ inputs.tag_name || github.ref_name }}"
           VERSION="${TAG_NAME#v}"
           cargo build --release --bin gpui_telegram_desktop --bin gpui_telegram_server --bin fabushi --bin fabushi-remote-daemon
-          codesign --force --options runtime --timestamp --sign "$MACOS_CODESIGN_IDENTITY" target/release/gpui_telegram_server
-          codesign --force --options runtime --timestamp --sign "$MACOS_CODESIGN_IDENTITY" target/release/fabushi
-          codesign --force --options runtime --timestamp --sign "$MACOS_CODESIGN_IDENTITY" target/release/fabushi-remote-daemon
+          codesign_with_retry --force --options runtime --timestamp --sign "$MACOS_CODESIGN_IDENTITY" target/release/gpui_telegram_server
+          codesign_with_retry --force --options runtime --timestamp --sign "$MACOS_CODESIGN_IDENTITY" target/release/fabushi
+          codesign_with_retry --force --options runtime --timestamp --sign "$MACOS_CODESIGN_IDENTITY" target/release/fabushi-remote-daemon
           python3 scripts/package_release.py --version "$VERSION" --skip-clean --notarize
           sccache --show-stats || true
       - name: Verify Gatekeeper Assessment & /Applications Install Smoke Test

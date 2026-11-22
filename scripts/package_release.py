@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import json
 import shutil
 import hashlib
@@ -252,6 +253,31 @@ def generate_icns(repo_root: Path, output_icns: Path) -> bool:
         shutil.rmtree(temp_iconset, ignore_errors=True)
 
 
+def run_signing_cmd_with_retry(
+    cmd: list[str],
+    env: dict[str, str] | None = None,
+    capture_output: bool = False,
+    max_attempts: int = 6,
+) -> None:
+    """Retries Apple codesign/productbuild timestamp operations on transient TSA failures."""
+    for attempt in range(1, max_attempts + 1):
+        res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if res.returncode == 0:
+            if not capture_output:
+                if res.stdout:
+                    print(res.stdout, end="")
+                if res.stderr:
+                    print(res.stderr, end="", file=sys.stderr)
+            return
+        err_text = (res.stderr or res.stdout or "").strip()
+        if attempt == max_attempts:
+            log(f"ERROR: signing command failed after {max_attempts} attempts: {' '.join(cmd)}\n{err_text}")
+            raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
+        delay = attempt * 5
+        log(f"Signing command failed (attempt {attempt}/{max_attempts}, retrying in {delay}s): {err_text}")
+        time.sleep(delay)
+
+
 def codesign_bundle(
     app_dir: Path,
     sign_identity: str | None = None,
@@ -282,7 +308,7 @@ def codesign_bundle(
                         if entitlements and entitlements.is_file():
                             cmd.extend(["--entitlements", str(entitlements)])
                         cmd.append(str(bin_item))
-                        subprocess.run(cmd, check=True)
+                        run_signing_cmd_with_retry(cmd)
 
         bundle_cmd = [
             "codesign",
@@ -296,7 +322,7 @@ def codesign_bundle(
         if entitlements and entitlements.is_file():
             bundle_cmd.extend(["--entitlements", str(entitlements)])
         bundle_cmd.append(str(app_dir))
-        subprocess.run(bundle_cmd, check=True)
+        run_signing_cmd_with_retry(bundle_cmd)
         subprocess.run(
             ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_dir)],
             check=True,
@@ -773,7 +799,7 @@ def create_macos_dmg(
         os.chmod(dmg_path, 0o644)
 
         if sign_identity and shutil.which("codesign"):
-            subprocess.run(
+            run_signing_cmd_with_retry(
                 [
                     "codesign",
                     "--force",
@@ -781,8 +807,7 @@ def create_macos_dmg(
                     "--sign",
                     sign_identity,
                     str(dmg_path),
-                ],
-                check=True,
+                ]
             )
             log(f"Developer ID signed macOS DMG: {dmg_path.name}")
 
@@ -945,11 +970,10 @@ exit 0
             if installer_sign_identity:
                 prod_cmd.extend(["--sign", installer_sign_identity, "--timestamp"])
             prod_cmd.append(str(pkg_path))
-            subprocess.run(
+            run_signing_cmd_with_retry(
                 prod_cmd,
-                check=True,
-                capture_output=True,
                 env=pkg_env,
+                capture_output=True,
             )
         else:
             shutil.copy2(comp_pkg, pkg_path)
