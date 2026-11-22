@@ -81,28 +81,77 @@ pub fn render_search_panel<V: 'static>(
     on_peer: impl Fn(&mut V, u64, &mut Context<V>) + Clone + 'static,
     on_clear_scope: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> AnyElement {
+    let is_apple = palette.is_apple_style();
     let hover_primary = rgb(palette.text_primary);
+    let sep_color = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg)
+    };
+    let chip_idle_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.055)
+        }
+    } else {
+        rgb(palette.composer_bg)
+    };
+
     let cat_tabs: Vec<AnyElement> = TELEGRAM_SEARCH_CATEGORIES
         .iter()
         .map(|(cat_id, cat_label)| {
             let is_active = active_cat == *cat_id;
             let cid = (*cat_id).to_string();
             let cb = on_cat.clone();
-            div()
-                .cursor_pointer()
-                .relative()
-                .px(px(6.0))
-                .py(px(7.0))
-                .text_size(px(12.0))
-                .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::NORMAL })
-                .text_color(if is_active { rgb(palette.accent) } else { rgb(palette.text_secondary) })
-                .hover(move |s| if is_active { s } else { s.text_color(hover_primary) })
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
-                    cb(this, cid.clone(), cx);
-                }))
-                .child(tr_str(lang_id, *cat_label, *cat_id))
-                .when(is_active, |el| el.child(div().absolute().bottom_0().left_0().right_0().h(px(2.0)).bg(rgb(palette.accent))))
-                .into_any_element()
+            if is_apple {
+                div()
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded_full()
+                    .bg(if is_active {
+                        rgb(palette.accent)
+                    } else {
+                        chip_idle_bg
+                    })
+                    .text_size(px(11.5))
+                    .font_weight(if is_active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if is_active {
+                        rgb(0xFFFFFF)
+                    } else {
+                        rgb(palette.text_secondary)
+                    })
+                    .hover(move |s| if is_active { s } else { s.text_color(hover_primary) })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _w, cx| {
+                            cb(this, cid.clone(), cx);
+                        }),
+                    )
+                    .child(tr_str(lang_id, *cat_label, *cat_id))
+                    .into_any_element()
+            } else {
+                div()
+                    .cursor_pointer()
+                    .relative()
+                    .px(px(6.0))
+                    .py(px(7.0))
+                    .text_size(px(12.0))
+                    .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::NORMAL })
+                    .text_color(if is_active { rgb(palette.accent) } else { rgb(palette.text_secondary) })
+                    .hover(move |s| if is_active { s } else { s.text_color(hover_primary) })
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                        cb(this, cid.clone(), cx);
+                    }))
+                    .child(tr_str(lang_id, *cat_label, *cat_id))
+                    .when(is_active, |el| el.child(div().absolute().bottom_0().left_0().right_0().h(px(2.0)).bg(rgb(palette.accent))))
+                    .into_any_element()
+            }
         })
         .collect();
 
@@ -151,16 +200,22 @@ pub fn render_search_panel<V: 'static>(
             let cb = on_tag.clone();
             div()
                 .cursor_pointer()
-                .px(px(7.0))
-                .py(px(3.0))
+                .px(px(8.0))
+                .py(px(3.5))
                 .rounded_full()
-                .bg(if is_active { rgb(palette.accent) } else { rgb(palette.composer_bg) })
-                .border_1()
-                .border_color(if is_active { rgb(palette.accent) } else { rgb(palette.border_fg) })
+                .bg(if is_active { rgb(palette.accent) } else { chip_idle_bg })
+                .when(!is_apple, |el| {
+                    el.border_1().border_color(if is_active {
+                        rgb(palette.accent)
+                    } else {
+                        rgb(palette.border_fg)
+                    })
+                })
                 .flex()
                 .items_center()
                 .gap(px(4.0))
                 .text_size(px(10.5))
+                .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
                 .text_color(if is_active { rgb(palette.active_button_fg) } else { rgb(palette.text_secondary) })
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
                     cb(this, tid.clone(), cx);
@@ -174,27 +229,47 @@ pub fn render_search_panel<V: 'static>(
     div()
         .id("sidebar-categorized-search-header")
         .w_full()
-        .bg(rgb(palette.dialogs_bg))
+        .when(!is_apple, |el| el.bg(rgb(palette.dialogs_bg)))
         .border_b_1()
-        .border_color(rgb(palette.border_fg))
+        .border_color(sep_color)
         .flex()
         .flex_col()
-        .child(div().id("sidebar-search-category-tabs").w_full().px(px(6.0)).border_b_1().border_color(rgb(palette.border_fg)).flex().flex_wrap().items_center().gap(px(2.0)).children(cat_tabs))
+        .child(
+            div()
+                .id("sidebar-search-category-tabs")
+                .w_full()
+                .px(px(if is_apple { 10.0 } else { 6.0 }))
+                .py(px(if is_apple { 6.0 } else { 0.0 }))
+                .border_b_1()
+                .border_color(sep_color)
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(if is_apple { 4.0 } else { 2.0 }))
+                .children(cat_tabs),
+        )
         .when_some(search_in.peer_name.clone(), |el, scope_name| {
             el.child(
-                div().w_full().px(px(10.0)).py(px(5.0)).bg(rgb(palette.composer_bg)).flex().items_center().justify_between()
+                div()
+                    .w_full()
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .bg(if is_apple { chip_idle_bg } else { rgb(palette.composer_bg) })
+                    .flex()
+                    .items_center()
+                    .justify_between()
                     .child(div().text_size(px(11.5)).text_color(rgb(palette.accent)).child(format!("{}: {}", tr_str(lang_id, "限定对话", "In chat"), scope_name)))
                     .child(div().cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| on_clear_scope(this, cx))).child(tg_icon(IconName::Close, 12.0, palette.icon_fg))),
             )
         })
         .when(!peer_cards.is_empty(), |el| {
             el.child(
-                div().w_full().px(px(12.0)).py(px(8.0)).border_b_1().border_color(rgb(palette.border_fg)).flex().flex_col().gap(px(8.0))
-                    .child(div().text_size(px(12.0)).font_weight(FontWeight::BOLD).text_color(rgb(palette.text_secondary)).child(tr_str(lang_id, "常用联系人", "Recent")))
+                div().w_full().px(px(12.0)).py(px(8.0)).border_b_1().border_color(sep_color).flex().flex_col().gap(px(8.0))
+                    .child(div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(palette.text_secondary)).child(tr_str(lang_id, "常用联系人", "Recent")))
                     .child(div().w_full().flex().items_center().gap(px(12.0)).children(peer_cards)),
             )
         })
-        .child(div().w_full().px(px(8.0)).py(px(6.0)).flex().flex_wrap().items_center().gap(px(5.0)).children(tag_chips))
+        .child(div().w_full().px(px(10.0)).py(px(6.0)).flex().flex_wrap().items_center().gap(px(5.0)).children(tag_chips))
         .into_any_element()
 }
 
@@ -226,16 +301,30 @@ fn append_apps_catalog_group<V: 'static>(
     if items.is_empty() {
         return;
     }
-    let hover = rgb(palette.dialogs_hover_bg);
+    let is_apple = palette.is_apple_style();
+    let sep_color = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg)
+    };
+    let hover = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     out.push(
         div()
             .id(SharedString::from(format!("{id_prefix}-header")))
             .w_full()
             .px(px(12.0))
             .py(px(6.0))
-            .bg(rgb(palette.composer_bg))
+            .when(!is_apple, |el| el.bg(rgb(palette.composer_bg)))
             .border_b_1()
-            .border_color(rgb(palette.border_fg))
+            .border_color(sep_color)
             .text_size(px(11.0))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(palette.text_secondary))
@@ -273,10 +362,11 @@ fn append_apps_catalog_group<V: 'static>(
                 .w_full()
                 .px(px(10.0))
                 .py(px(9.0))
-                .bg(rgb(palette.dialogs_bg))
+                .when(is_apple, |el| el.rounded(px(10.0)))
+                .when(!is_apple, |el| el.bg(rgb(palette.dialogs_bg)))
                 .hover(move |s| s.bg(hover))
                 .border_b_1()
-                .border_color(rgb(palette.border_fg))
+                .border_color(sep_color)
                 .flex()
                 .items_center()
                 .gap(px(10.0))
@@ -352,8 +442,22 @@ pub fn render_apps_catalog_section_with_recent<V: 'static>(
     on_open_botfather: impl Fn(&mut V, &mut Context<V>) + Clone + 'static,
     on_open_bot_profile: impl Fn(&mut V, SidebarCatalogAppItem, &mut Context<V>) + Clone + 'static,
 ) -> Vec<AnyElement> {
+    let is_apple = palette.is_apple_style();
+    let sep_color = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg)
+    };
     let q_trim = query.trim().to_lowercase();
-    let hover = rgb(palette.dialogs_hover_bg);
+    let hover = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     let mut out: Vec<AnyElement> = Vec::new();
 
     let show_botfather = q_trim.is_empty()
@@ -374,10 +478,11 @@ pub fn render_apps_catalog_section_with_recent<V: 'static>(
                 .w_full()
                 .px(px(10.0))
                 .py(px(9.0))
-                .bg(rgb(palette.dialogs_bg))
+                .when(is_apple, |el| el.rounded(px(10.0)))
+                .when(!is_apple, |el| el.bg(rgb(palette.dialogs_bg)))
                 .hover(move |s| s.bg(hover))
                 .border_b_1()
-                .border_color(rgb(palette.border_fg))
+                .border_color(sep_color)
                 .flex()
                 .items_center()
                 .gap(px(10.0))
@@ -536,7 +641,21 @@ pub fn render_search_results_list<V: 'static>(
             .into_any_element()];
     }
 
-    let hover = rgb(palette.dialogs_hover_bg);
+    let is_apple = palette.is_apple_style();
+    let sep_color = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg)
+    };
+    let hover = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     results
         .into_iter()
         .map(|item| {
@@ -551,10 +670,11 @@ pub fn render_search_results_list<V: 'static>(
                 .w_full()
                 .px(px(10.0))
                 .py(px(8.0))
-                .bg(rgb(palette.dialogs_bg))
+                .when(is_apple, |el| el.rounded(px(10.0)))
+                .when(!is_apple, |el| el.bg(rgb(palette.dialogs_bg)))
                 .hover(move |s| s.bg(hover))
                 .border_b_1()
-                .border_color(rgb(palette.border_fg))
+                .border_color(sep_color)
                 .flex()
                 .items_center()
                 .gap(px(12.0))

@@ -89,16 +89,22 @@ fn banner_row<V: 'static>(
     icon: IconName, title: &str, snippet: &str, palette: &TdesktopThemePalette,
     cx: &mut Context<V>, on_close: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> AnyElement {
-    let is_fabushi = palette.mode.is_fabushi_style();
+    let is_apple = palette.is_apple_style();
     let row = div()
-        .h(px(if is_fabushi { 40.0 } else { 42.0 }))
+        .h(px(if is_apple { 38.0 } else { 42.0 }))
         .w_full()
-        .px(px(if is_fabushi { 12.0 } else { 14.0 }))
-        .bg(rgb(if is_fabushi { palette.card_bg } else { palette.compose_bg }))
-        .when(is_fabushi, |el| {
-            el.rounded(px(12.0)).border_1().border_color(rgb(palette.border_fg))
+        .px(px(if is_apple { 12.0 } else { 14.0 }))
+        .when(is_apple, |el| {
+            el.rounded(px(12.0))
+                .bg(palette.card_surface_rgba())
+                .border_1()
+                .border_color(palette.separator_rgba())
         })
-        .when(!is_fabushi, |el| el.border_b_1().border_color(rgb(palette.border_fg)))
+        .when(!is_apple, |el| {
+            el.bg(rgb(palette.compose_bg))
+                .border_b_1()
+                .border_color(rgb(palette.border_fg))
+        })
         .flex()
         .items_center()
         .justify_between()
@@ -107,25 +113,38 @@ fn banner_row<V: 'static>(
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.0))
+                .gap(px(8.0))
                 .flex_1()
                 .overflow_hidden()
-                .child(tg_icon(icon, 16.0, palette.accent))
-                .child(div().w(px(2.5)).h(px(26.0)).rounded_full().bg(rgb(palette.accent)))
+                .when(!is_apple, |el| el.child(tg_icon(icon, 16.0, palette.accent)))
+                .child(div().w(px(2.5)).h(px(22.0)).rounded_full().bg(rgb(palette.accent)))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .overflow_hidden()
-                        .child(div().text_size(px(12.0)).font_weight(FontWeight::BOLD).text_color(rgb(palette.accent)).child(title.to_string()))
-                        .child(div().text_size(px(12.0)).text_color(rgb(palette.text_secondary)).child(snippet.to_string())),
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(palette.accent))
+                                .truncate()
+                                .child(title.to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(rgb(palette.text_secondary))
+                                .truncate()
+                                .child(snippet.to_string()),
+                        ),
                 ),
         )
         .child(
             div()
                 .id("composer-banner-close")
-                .w(px(26.0))
-                .h(px(26.0))
+                .w(px(24.0))
+                .h(px(24.0))
                 .rounded_full()
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
@@ -133,13 +152,13 @@ fn banner_row<V: 'static>(
                 .items_center()
                 .justify_center()
                 .on_click(cx.listener(move |this, _, _, cx| on_close(this, cx)))
-                .child(tg_icon(IconName::Close, 14.0, palette.icon_fg)),
+                .child(tg_icon(IconName::Close, 13.0, palette.icon_fg)),
         );
 
-    if is_fabushi {
+    if is_apple {
         div()
             .w_full()
-            .px(px(12.0))
+            .px(px(16.0))
             .pt(px(4.0))
             .bg(rgb(palette.composer_bg))
             .child(row)
@@ -270,47 +289,225 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
             .into_any_element()
     };
 
-    let is_fabushi = palette.mode.is_fabushi_style();
-    let scaled_content_h = px(palette.scaled_px(f32::from(content_height)));
-    let input_border_hex = if is_fabushi {
-        if is_focused {
-            if palette.mode.is_dark() { 0x3E3E3E } else { 0xC6C6C6 }
+    let is_apple = palette.is_apple_style();
+    let raw_content_h = f32::from(content_height);
+    if is_apple {
+        let apple_capsule_h = if raw_content_h <= 44.5 {
+            36.0
         } else {
-            palette.border_fg
-        }
-    } else if is_focused {
+            (raw_content_h - 8.0).max(36.0)
+        };
+        let scaled_capsule_h = px(palette.scaled_px(apple_capsule_h));
+        let pill_bg = if palette.mode.is_dark() {
+            palette.input_bg
+        } else {
+            palette.stage_bg
+        };
+        let pill_border: Rgba = if is_focused {
+            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.72)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x808080, 0.28)
+        };
+        let attach_hover = TdesktopThemePalette::rgba_with_alpha(
+            palette.text_primary,
+            if palette.mode.is_dark() { 0.14 } else { 0.08 },
+        );
+        let accent = palette.accent;
+        let accent_hover = palette.accent_hover;
+        let right_action_el: AnyElement = if show_send {
+            div()
+                .id("cmp-send-btn")
+                .w(px(26.0))
+                .h(px(26.0))
+                .rounded_full()
+                .flex_shrink_0()
+                .bg(rgb(accent))
+                .hover(move |s| s.bg(rgb(accent_hover)))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    a_snd(this, ComposerBarAction::SendOrSave, cx);
+                }))
+                .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    a_sopt(this, ComposerBarAction::OpenSendOptions, cx);
+                }))
+                .child(tg_icon(
+                    if is_editing { IconName::SelectCheck } else { IconName::ArrowUp },
+                    14.5,
+                    0xFFFFFF,
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .id("cmp-mic-btn")
+                .w(px(26.0))
+                .h(px(26.0))
+                .rounded_full()
+                .flex_shrink_0()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    a_mic(this, ComposerBarAction::StartVoice(ev.position), cx);
+                }))
+                .child(tg_icon(IconName::Mic, 16.5, palette.text_secondary))
+                .into_any_element()
+        };
+
+        return div()
+            .w_full()
+            .px(px(16.0))
+            .pt(px(6.0))
+            .pb(px(12.0))
+            .bg(rgb(palette.composer_bg))
+            .flex()
+            .items_end()
+            .gap(px(10.0))
+            .when_some(bot_menu_view, |el, btn| {
+                el.child(div().pb(px(3.0)).flex_shrink_0().child(btn))
+            })
+            .child(
+                div()
+                    .id("cmp-attach-btn")
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .mb(px(3.0))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(rgb(palette.input_bg))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(attach_hover))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        a_att(this, ComposerBarAction::ToggleAttachments, cx);
+                    }))
+                    .text_size(px(19.0))
+                    .line_height(px(19.0))
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(rgb(palette.text_secondary))
+                    .child("+"),
+            )
+            .child(
+                div()
+                    .id("cmp-input-wrap")
+                    .flex_1()
+                    .min_h(px(palette.scaled_px(36.0)))
+                    .h(scaled_capsule_h)
+                    .pl(px(14.0))
+                    .pr(px(5.0))
+                    .py(px(5.0))
+                    .rounded(px(18.0))
+                    .bg(rgb(pill_bg))
+                    .border_1()
+                    .border_color(pill_border)
+                    .cursor_text()
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        a_foc(this, ComposerBarAction::FocusInput, cx);
+                    }))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("cmp-text-scroll")
+                            .flex_1()
+                            .when(overflow_scroll, |el| el.overflow_y_scroll().max_h(px(164.0)))
+                            .child(text_el),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.0))
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .id("cmp-fmt-toggle")
+                                    .px(px(5.0))
+                                    .py(px(2.0))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        a_fmt(this, ComposerBarAction::ToggleFormatting, cx);
+                                    }))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(if is_formatting_open {
+                                        palette.accent
+                                    } else {
+                                        palette.text_secondary
+                                    }))
+                                    .child("Aa"),
+                            )
+                            .child(
+                                div()
+                                    .id("cmp-emoji-toggle")
+                                    .w(px(26.0))
+                                    .h(px(26.0))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        a_emo(this, ComposerBarAction::ToggleEmojiPicker, cx);
+                                    }))
+                                    .child(tg_icon(
+                                        IconName::SmileEmoji,
+                                        17.0,
+                                        if is_emoji_open {
+                                            palette.accent
+                                        } else {
+                                            palette.text_secondary
+                                        },
+                                    )),
+                            )
+                            .child(right_action_el),
+                    ),
+            )
+            .into_any_element();
+    }
+
+    let scaled_content_h = px(palette.scaled_px(raw_content_h));
+    let input_border_hex = if is_focused {
         palette.accent
     } else {
         palette.border_fg
     };
-    let (send_bg, send_hover, send_icon_fg) = if is_fabushi {
-        if palette.mode.is_dark() {
-            (0xFAFAFA, 0xE5E5E5, 0x090909)
-        } else {
-            (0x141414, 0x2C2C2C, 0xFFFFFF)
-        }
-    } else {
-        (palette.accent, palette.accent_hover, 0xFFFFFF)
-    };
+    let (send_bg, send_hover, send_icon_fg) = (palette.accent, palette.accent_hover, 0xFFFFFF);
     div()
         .w_full()
         .min_h(px(palette.scaled_px(46.0)))
-        .px(px(palette.scaled_px(if is_fabushi { 12.0 } else { 10.0 })))
-        .py(px(palette.scaled_px(if is_fabushi { 8.0 } else { 6.0 })))
+        .px(px(palette.scaled_px(10.0)))
+        .py(px(palette.scaled_px(6.0)))
         .bg(rgb(palette.composer_bg))
-        .when(!is_fabushi, |el| el.border_t_1().border_color(rgb(palette.border_fg)))
+        .border_t_1()
+        .border_color(rgb(palette.border_fg))
         .flex()
         .items_end()
-        .gap(px(palette.scaled_px(if is_fabushi { 8.0 } else { 6.0 })))
+        .gap(px(palette.scaled_px(6.0)))
         .when_some(bot_menu_view, |el, btn| {
             el.child(div().pb(px(5.0)).flex_shrink_0().child(btn))
         })
         .child(
             div()
                 .id("cmp-attach-btn")
-                .w(px(palette.scaled_px(if is_fabushi { 38.0 } else { 36.0 })))
-                .h(px(palette.scaled_px(if is_fabushi { 38.0 } else { 44.0 })))
-                .when(is_fabushi, |el| el.mb(px(3.0)))
+                .w(px(palette.scaled_px(36.0)))
+                .h(px(palette.scaled_px(44.0)))
                 .rounded_full()
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
@@ -318,7 +515,7 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
                 .items_center()
                 .justify_center()
                 .on_click(cx.listener(move |this, _, _, cx| a_att(this, ComposerBarAction::ToggleAttachments, cx)))
-                .child(tg_icon(IconName::Paperclip, palette.scaled_px(if is_fabushi { 18.0 } else { 20.0 }), palette.icon_fg)),
+                .child(tg_icon(IconName::Paperclip, palette.scaled_px(20.0), palette.icon_fg)),
         )
         .child(
             div()
@@ -328,7 +525,7 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
                 .h(scaled_content_h)
                 .px(px(palette.scaled_px(12.0)))
                 .py(px(palette.scaled_px(10.0)))
-                .rounded(px(palette.scaled_px(if is_fabushi { 16.0 } else { 14.0 })))
+                .rounded(px(palette.scaled_px(14.0)))
                 .bg(rgb(palette.input_bg))
                 .border_1()
                 .border_color(rgb(input_border_hex))
@@ -385,9 +582,8 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
         .child(if show_send {
             div()
                 .id("cmp-send-btn")
-                .w(px(if is_fabushi { 38.0 } else { 44.0 }))
-                .h(px(if is_fabushi { 38.0 } else { 46.0 }))
-                .when(is_fabushi, |el| el.mb(px(3.0)))
+                .w(px(44.0))
+                .h(px(46.0))
                 .rounded_full()
                 .bg(rgb(send_bg))
                 .hover(move |s| s.bg(rgb(send_hover)))
@@ -401,14 +597,13 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
                 .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
                     a_sopt(this, ComposerBarAction::OpenSendOptions, cx);
                 }))
-                .child(tg_icon(if is_editing { IconName::SelectCheck } else { IconName::SendPlane }, if is_fabushi { 17.0 } else { 20.0 }, send_icon_fg))
+                .child(tg_icon(if is_editing { IconName::SelectCheck } else { IconName::SendPlane }, 20.0, send_icon_fg))
                 .into_any_element()
         } else {
             div()
                 .id("cmp-mic-btn")
-                .w(px(if is_fabushi { 38.0 } else { 44.0 }))
-                .h(px(if is_fabushi { 38.0 } else { 46.0 }))
-                .when(is_fabushi, |el| el.mb(px(3.0)))
+                .w(px(44.0))
+                .h(px(46.0))
                 .rounded_full()
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
@@ -418,7 +613,7 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     a_mic(this, ComposerBarAction::StartVoice(ev.position), cx);
                 }))
-                .child(tg_icon(IconName::Mic, if is_fabushi { 18.0 } else { 20.0 }, palette.icon_fg))
+                .child(tg_icon(IconName::Mic, 20.0, palette.icon_fg))
                 .into_any_element()
         })
         .into_any_element()
@@ -440,14 +635,23 @@ pub fn render_voice_recording_strip<V: 'static>(
     let a_lock = on_action.clone();
     let a_send = on_action;
 
-    div()
+    let is_apple = palette.is_apple_style();
+    let voice_row = div()
         .id("cmp-voice-bar")
         .w_full()
-        .h(px(58.0))
+        .h(px(if is_apple { 40.0 } else { 58.0 }))
         .px(px(14.0))
-        .bg(rgb(palette.composer_bg))
-        .border_t_1()
-        .border_color(rgb(palette.border_fg))
+        .when(is_apple, |el| {
+            el.rounded(px(20.0))
+                .bg(rgb(palette.input_bg))
+                .border_1()
+                .border_color(palette.separator_rgba())
+        })
+        .when(!is_apple, |el| {
+            el.bg(rgb(palette.composer_bg))
+                .border_t_1()
+                .border_color(rgb(palette.border_fg))
+        })
         .flex()
         .items_center()
         .justify_between()
@@ -460,7 +664,7 @@ pub fn render_voice_recording_strip<V: 'static>(
                 .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(rgb(palette.danger)))
                 .child(
                     div()
-                        .text_size(px(14.0))
+                        .text_size(px(13.5))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(palette.text_primary))
                         .child(format!("{:01}:{:02}.{}", mins, secs, tenths)),
@@ -476,12 +680,12 @@ pub fn render_voice_recording_strip<V: 'static>(
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.0))
+                .gap(px(8.0))
                 .child(
                     div()
                         .id("voice-cancel-btn")
                         .px(px(10.0))
-                        .py(px(6.0))
+                        .py(px(5.0))
                         .rounded(px(8.0))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
@@ -494,23 +698,23 @@ pub fn render_voice_recording_strip<V: 'static>(
                     el.child(
                         div()
                             .id("voice-lock-btn")
-                            .w(px(34.0))
-                            .h(px(34.0))
+                            .w(px(30.0))
+                            .h(px(30.0))
                             .rounded_full()
-                            .bg(rgb(palette.input_bg))
+                            .bg(rgb(palette.card_bg))
                             .cursor_pointer()
                             .flex()
                             .items_center()
                             .justify_center()
                             .on_click(cx.listener(move |this, _, _, cx| a_lock(this, ComposerBarAction::LockVoice, cx)))
-                            .child(tg_icon(IconName::Lock, 15.0, palette.accent)),
+                            .child(tg_icon(IconName::Lock, 14.0, palette.accent)),
                     )
                 })
                 .child(
                     div()
                         .id("voice-send-btn")
-                        .w(px(40.0))
-                        .h(px(40.0))
+                        .w(px(if is_apple { 30.0 } else { 40.0 }))
+                        .h(px(if is_apple { 30.0 } else { 40.0 }))
                         .rounded_full()
                         .bg(rgb(palette.accent))
                         .cursor_pointer()
@@ -518,8 +722,24 @@ pub fn render_voice_recording_strip<V: 'static>(
                         .items_center()
                         .justify_center()
                         .on_click(cx.listener(move |this, _, _, cx| a_send(this, ComposerBarAction::EndVoice, cx)))
-                        .child(tg_icon(IconName::SendPlane, 18.0, 0xFFFFFF)),
+                        .child(tg_icon(
+                            if is_apple { IconName::ArrowUp } else { IconName::SendPlane },
+                            if is_apple { 15.0 } else { 18.0 },
+                            0xFFFFFF,
+                        )),
                 ),
-        )
-        .into_any_element()
+        );
+
+    if is_apple {
+        div()
+            .w_full()
+            .px(px(16.0))
+            .pt(px(6.0))
+            .pb(px(12.0))
+            .bg(rgb(palette.composer_bg))
+            .child(voice_row)
+            .into_any_element()
+    } else {
+        voice_row.into_any_element()
+    }
 }

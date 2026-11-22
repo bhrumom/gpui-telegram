@@ -107,6 +107,86 @@ impl Default for ModalContainer {
     }
 }
 
+/// Calibrated macOS sheet backdrop scrim: crisp enough to separate modal sheets
+/// without muddying translucent vibrancy in Apple Light/Dark modes.
+pub(crate) fn macos_modal_backdrop_rgba(pal: TdesktopThemePalette) -> Rgba {
+    let alpha = if pal.mode.is_dark() { 0.48 } else { 0.28 };
+    TdesktopThemePalette::rgba_with_alpha(0x000000, alpha)
+}
+
+/// Canonical macOS floating modal card shell: `14px` corner radius, hairline translucent
+/// separator border, and two-layer ambient + contact popover shadows.
+pub(crate) fn macos_modal_card(id: &'static str, pal: TdesktopThemePalette) -> Stateful<Div> {
+    div()
+        .id(id)
+        .rounded(px(pal.scaled_px(14.0)))
+        .bg(rgb(pal.modal_bg))
+        .border_1()
+        .border_color(pal.separator_rgba())
+        .shadow(pal.popover_shadows())
+}
+
+/// Canonical macOS floating popover menu surface (`menu_bg`, `14px` radius, hairline border,
+/// and two-layer macOS popover shadows).
+pub(crate) fn macos_popover_surface(id: &'static str, pal: TdesktopThemePalette) -> Stateful<Div> {
+    div()
+        .id(id)
+        .occlude()
+        .rounded(px(pal.scaled_px(14.0)))
+        .bg(rgb(pal.menu_bg))
+        .border_1()
+        .border_color(pal.separator_rgba())
+        .shadow(pal.popover_shadows())
+}
+
+/// Crisp Apple-style primary accent pill CTA button (`#007AFF` / `#0A84FF`).
+pub(crate) fn macos_primary_pill_btn(
+    id: &'static str,
+    label: &'static str,
+    pal: TdesktopThemePalette,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(16.0))
+        .py(px(8.0))
+        .rounded(px(10.0))
+        .bg(rgb(pal.accent))
+        .hover(move |s| s.bg(rgb(pal.accent_hover)))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(13.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(pal.active_button_fg))
+        .child(label)
+}
+
+/// Subtle Apple-style secondary pill button with hairline border.
+pub(crate) fn macos_secondary_pill_btn(
+    id: &'static str,
+    label: &'static str,
+    pal: TdesktopThemePalette,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(14.0))
+        .py(px(8.0))
+        .rounded(px(10.0))
+        .bg(pal.card_surface_rgba())
+        .border_1()
+        .border_color(pal.separator_rgba())
+        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(13.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(pal.text_primary))
+        .child(label)
+}
+
 impl Render for ModalContainer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_modal_active() {
@@ -124,7 +204,7 @@ impl Render for ModalContainer {
             }
         }
 
-        render_dialog_overlay(
+        let overlay = render_dialog_overlay(
             &self.dialog,
             |this| &mut this.dialog,
             |this| {
@@ -136,6 +216,14 @@ impl Render for ModalContainer {
                 }
             },
             cx,
-        )
+        );
+
+        div()
+            .id("modal-container-overlay")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .child(overlay)
+            .into_any_element()
     }
 }

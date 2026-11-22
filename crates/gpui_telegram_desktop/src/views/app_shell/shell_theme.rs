@@ -1,4 +1,4 @@
-use gpui::{Context, Entity};
+use gpui::{Context, Entity, WindowAppearance};
 
 use crate::app::preferences::{AppPreferences, ThemeMode};
 use crate::theme::{TdesktopThemeMode, TdesktopThemePalette};
@@ -36,8 +36,21 @@ pub fn compute_shell_palette(
     (mode, palette)
 }
 
-/// Derives the desktop theme mode from persisted `AppPreferences`.
-pub fn resolve_mode_from_preferences(prefs: &AppPreferences) -> TdesktopThemeMode {
+/// Maps GPUI `WindowAppearance` (`Light`/`VibrantLight` vs `Dark`/`VibrantDark`)
+/// into the corresponding Apple Messages `TdesktopThemeMode`.
+pub fn tdesktop_mode_for_window_appearance(appearance: WindowAppearance) -> TdesktopThemeMode {
+    match appearance {
+        WindowAppearance::Light | WindowAppearance::VibrantLight => TdesktopThemeMode::Day,
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => TdesktopThemeMode::Night,
+    }
+}
+
+/// Derives the desktop theme mode from persisted `AppPreferences` plus an optional
+/// live OS `WindowAppearance` when `prefs.theme_mode == ThemeMode::System`.
+pub fn resolve_mode_from_preferences_with_appearance(
+    prefs: &AppPreferences,
+    appearance: Option<WindowAppearance>,
+) -> TdesktopThemeMode {
     let preset_mode = TdesktopThemeMode::from_name(&prefs.appearance.chat_preset);
     match prefs.theme_mode {
         ThemeMode::Light => {
@@ -47,14 +60,29 @@ pub fn resolve_mode_from_preferences(prefs: &AppPreferences) -> TdesktopThemeMod
                 TdesktopThemeMode::Day
             }
         }
-        ThemeMode::Dark | ThemeMode::System => {
+        ThemeMode::Dark => {
             if matches!(preset_mode, TdesktopThemeMode::Night | TdesktopThemeMode::Tinted) {
                 preset_mode
             } else {
                 TdesktopThemeMode::Night
             }
         }
+        ThemeMode::System => match appearance {
+            Some(app) => tdesktop_mode_for_window_appearance(app),
+            None => {
+                if matches!(preset_mode, TdesktopThemeMode::Night | TdesktopThemeMode::Tinted) {
+                    preset_mode
+                } else {
+                    TdesktopThemeMode::Night
+                }
+            }
+        },
     }
+}
+
+/// Derives the desktop theme mode from persisted `AppPreferences`.
+pub fn resolve_mode_from_preferences(prefs: &AppPreferences) -> TdesktopThemeMode {
+    resolve_mode_from_preferences_with_appearance(prefs, None)
 }
 
 /// Maps `TdesktopThemeMode` back into `AppPreferences::theme_mode`.
@@ -167,5 +195,44 @@ pub fn propagate_theme_and_locale<V: 'static>(
             o.apply_theme(palette.clone(), lang_id);
             ocx.notify();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn test_window_appearance_maps_to_apple_day_and_night() {
+        assert_eq!(
+            tdesktop_mode_for_window_appearance(WindowAppearance::Light),
+            TdesktopThemeMode::Day
+        );
+        assert_eq!(
+            tdesktop_mode_for_window_appearance(WindowAppearance::VibrantLight),
+            TdesktopThemeMode::Day
+        );
+        assert_eq!(
+            tdesktop_mode_for_window_appearance(WindowAppearance::Dark),
+            TdesktopThemeMode::Night
+        );
+        assert_eq!(
+            tdesktop_mode_for_window_appearance(WindowAppearance::VibrantDark),
+            TdesktopThemeMode::Night
+        );
+
+        let mut prefs = AppPreferences::default();
+        prefs.theme_mode = ThemeMode::System;
+        assert_eq!(
+            resolve_mode_from_preferences_with_appearance(&prefs, Some(WindowAppearance::Light)),
+            TdesktopThemeMode::Day
+        );
+        assert_eq!(
+            resolve_mode_from_preferences_with_appearance(
+                &prefs,
+                Some(WindowAppearance::VibrantDark),
+            ),
+            TdesktopThemeMode::Night
+        );
     }
 }

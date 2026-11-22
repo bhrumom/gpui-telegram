@@ -78,13 +78,23 @@ pub fn render_stage_top_bar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let bar_h = px(palette.scaled_px(54.0));
+    let is_apple = palette.is_apple_style();
+    let bar_h = px(palette.scaled_px(if is_apple { 52.0 } else { 54.0 }));
+    let bar_bg: Rgba = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(
+            palette.topbar_bg,
+            if palette.mode.is_dark() { 0.88 } else { 0.90 },
+        )
+    } else {
+        rgb(palette.topbar_bg).into()
+    };
     if select_mode_active || selected_count > 0 {
         let count_str = selected_count.to_string();
         let a_fwd = on_action.clone();
         let a_cpy = on_action.clone();
         let a_del = on_action.clone();
         let a_clr = on_action.clone();
+        let pill_r = px(if is_apple { 999.0 } else { 6.0 });
         let left_controls = if selected_count == 0 {
             div()
                 .flex()
@@ -108,7 +118,7 @@ pub fn render_stage_top_bar<V: 'static>(
                         .id("ms-fwd-btn")
                         .px(px(14.0))
                         .py(px(6.0))
-                        .rounded(px(6.0))
+                        .rounded(pill_r)
                         .bg(rgb(palette.accent))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| a_fwd(this, TopBarUiAction::ForwardSelected, cx)))
@@ -129,7 +139,7 @@ pub fn render_stage_top_bar<V: 'static>(
                         .id("ms-copy-btn")
                         .px(px(12.0))
                         .py(px(6.0))
-                        .rounded(px(6.0))
+                        .rounded(pill_r)
                         .bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| a_cpy(this, TopBarUiAction::CopySelected, cx)))
@@ -150,7 +160,7 @@ pub fn render_stage_top_bar<V: 'static>(
                         .id("ms-del-btn")
                         .px(px(12.0))
                         .py(px(6.0))
-                        .rounded(px(6.0))
+                        .rounded(pill_r)
                         .bg(TdesktopThemePalette::rgba_with_alpha(palette.danger, 0.16))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| a_del(this, TopBarUiAction::DeleteSelected, cx)))
@@ -171,24 +181,25 @@ pub fn render_stage_top_bar<V: 'static>(
             .id("stage-multiselect-bar")
             .h(bar_h)
             .w_full()
-            .px(px(14.0))
-            .bg(rgb(palette.topbar_bg))
-            .border_b_1()
-            .border_color(rgb(palette.border_fg))
+            .px(px(16.0))
+            .bg(bar_bg)
+            .when(!is_apple, |el| el.border_b_1().border_color(rgb(palette.border_fg)))
+            .when(is_apple, |el| el.border_b_1().border_color(palette.separator_rgba()))
             .flex()
             .items_center()
             .justify_between()
             .child(left_controls)
+            .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
             .child(
                 div()
                     .id("ms-cancel-btn")
-                    .px(px(10.0))
+                    .px(px(12.0))
                     .py(px(6.0))
-                    .rounded(px(6.0))
+                    .rounded(pill_r)
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
                     .on_click(cx.listener(move |this, _, _, cx| a_clr(this, TopBarUiAction::ClearSelection, cx)))
-                    .text_size(px(palette.scaled_px(12.0)))
+                    .text_size(px(palette.scaled_px(12.5)))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(palette.accent))
                     .child(tr_key_or(lang_id, "lng_cancel", "Cancel")),
@@ -197,7 +208,7 @@ pub fn render_stage_top_bar<V: 'static>(
     }
 
     let pid = chat_id.unwrap_or(0) as i64;
-    let (grad_top, _grad_bot) = palette.peer_avatar_gradient(pid);
+    let (grad_top, grad_bot) = palette.peer_avatar_gradient(pid);
     let img_src = avatar_url.and_then(|u| resolve_image_source(u, None));
     let has_chat = chat_id.is_some();
     let a_insp1 = on_action.clone();
@@ -207,39 +218,59 @@ pub fn render_stage_top_bar<V: 'static>(
     let a_vcall = on_action.clone();
     let a_more = on_action.clone();
     let ttl_header_label = (message_ttl_seconds > 0).then(|| format_ttl_badge(message_ttl_seconds, lang_id));
+    let sub_lower = subtitle.to_ascii_lowercase();
+    let is_typing_or_active_bot = sub_lower.contains("typing")
+        || subtitle.contains("输入")
+        || subtitle.contains("思考")
+        || (!bot_activity_state.trim().is_empty()
+            && !bot_activity_state.eq_ignore_ascii_case("idle"));
+    let is_online = sub_lower == "online" || subtitle == "在线";
+    let is_group_sub = sub_lower.contains("member")
+        || sub_lower.contains("subscriber")
+        || subtitle.contains("成员")
+        || subtitle.contains("订阅");
+    let show_apple_subtitle = !subtitle.is_empty() && (is_typing_or_active_bot || is_online || is_group_sub);
+    let peer_hover_bg = TdesktopThemePalette::rgba_with_alpha(
+        palette.text_primary,
+        if palette.mode.is_dark() { 0.07 } else { 0.045 },
+    );
 
     let bar = div()
         .relative()
         .h(bar_h)
         .w_full()
-        .px(px(14.0))
-        .bg(rgb(palette.topbar_bg))
-        .border_b_1()
-        .border_color(rgb(palette.border_fg))
+        .px(px(if is_apple { 16.0 } else { 14.0 }))
+        .bg(bar_bg)
+        .when(!is_apple, |el| el.border_b_1().border_color(rgb(palette.border_fg)))
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(8.0))
         .child(
             div()
                 .id("topbar-peer-header")
                 .flex()
                 .items_center()
-                .gap(px(palette.scaled_px(10.0)))
-                .flex_1()
+                .gap(px(palette.scaled_px(if is_apple { 9.0 } else { 10.0 })))
+                .when(!is_apple, |el| el.flex_1())
+                .when(is_apple, |el| {
+                    el.max_w(px(360.0))
+                        .px(px(6.0))
+                        .py(px(4.0))
+                        .ml(px(-6.0))
+                        .rounded(px(10.0))
+                })
                 .overflow_hidden()
                 .when(has_chat, |el| {
-                    el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                        a_insp1(this, TopBarUiAction::ToggleInspector, cx);
-                    }))
+                    el.cursor_pointer()
+                        .when(is_apple, |b| b.hover(move |s| s.bg(peer_hover_bg)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            a_insp1(this, TopBarUiAction::ToggleInspector, cx);
+                        }))
                 })
                 .when(has_chat, |el| {
-                    let avatar_size_px = palette.scaled_px(40.0);
-                    let sub_lower = subtitle.to_ascii_lowercase();
-                    let is_typing = sub_lower.contains("typing")
-                        || subtitle.contains("输入")
-                        || subtitle.contains("思考")
-                        || (!bot_activity_state.trim().is_empty()
-                            && !bot_activity_state.eq_ignore_ascii_case("idle"));
+                    let avatar_size_px = palette.scaled_px(if is_apple { 32.0 } else { 40.0 });
+                    let is_typing = is_typing_or_active_bot;
                     let fab_non_classic = active_fabushi_bot
                         .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"));
                     let show_dynamic_bot_avatar =
@@ -296,6 +327,7 @@ pub fn render_stage_top_bar<V: 'static>(
                             .rounded_full()
                             .overflow_hidden()
                             .bg(rgb(grad_top))
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
@@ -307,11 +339,16 @@ pub fn render_stage_top_bar<V: 'static>(
                             .h(px(avatar_size_px))
                             .rounded_full()
                             .overflow_hidden()
-                            .bg(rgb(grad_top))
+                            .bg(linear_gradient(
+                                180.0,
+                                linear_color_stop(rgb(grad_top), 0.0),
+                                linear_color_stop(rgb(grad_bot), 1.0),
+                            ))
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(palette.scaled_px(14.0)))
+                            .text_size(px(palette.scaled_px(if is_apple { 12.5 } else { 14.0 })))
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(0xFFFFFF))
                             .when(avatar_url.map_or(true, |u| u.trim().is_empty()), |av| {
@@ -330,14 +367,22 @@ pub fn render_stage_top_bar<V: 'static>(
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(6.0))
+                                .gap(px(if is_apple { 4.0 } else { 6.0 }))
                                 .child(
                                     div()
                                         .text_size(px(palette.scaled_px(14.0)))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .font_weight(if is_apple { FontWeight::BOLD } else { FontWeight::SEMIBOLD })
                                         .text_color(rgb(palette.text_primary))
+                                        .truncate()
                                         .child(title.to_string()),
                                 )
+                                .when(is_apple && has_chat, |row| {
+                                    row.child(tg_icon(
+                                        IconName::ChevronRight,
+                                        palette.scaled_px(11.0),
+                                        palette.text_secondary,
+                                    ))
+                                })
                                 .when_some(ttl_header_label, |row, ttl_lbl| {
                                     row.child(
                                         div()
@@ -360,7 +405,36 @@ pub fn render_stage_top_bar<V: 'static>(
                                     )
                                 }),
                         )
-                        .when(!subtitle.is_empty(), |el| {
+                        .when(is_apple && show_apple_subtitle, |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .when(is_online && !is_typing_or_active_bot, |row| {
+                                        row.child(
+                                            div()
+                                                .w(px(6.0))
+                                                .h(px(6.0))
+                                                .rounded_full()
+                                                .flex_shrink_0()
+                                                .bg(rgb(palette.online_dot_fg)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_size(px(palette.scaled_px(11.5)))
+                                            .text_color(rgb(if is_typing_or_active_bot {
+                                                palette.accent
+                                            } else {
+                                                palette.text_secondary
+                                            }))
+                                            .truncate()
+                                            .child(subtitle.to_string()),
+                                    ),
+                            )
+                        })
+                        .when(!is_apple && !subtitle.is_empty(), |el| {
                             let is_live = subtitle == "online" || subtitle.contains("typing");
                             el.child(
                                 div()
@@ -371,28 +445,55 @@ pub fn render_stage_top_bar<V: 'static>(
                         }),
                 ),
         )
-        .when(has_chat, |el| {
+        .when(is_apple, |el| {
             el.child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(16.0))
+                    .window_control_area(WindowControlArea::Drag),
+            )
+        })
+        .when(has_chat, |el| {
+            let call_group = div()
+                .flex()
+                .items_center()
+                .gap(px(if is_apple { 2.0 } else { 4.0 }))
+                .child(top_icon_btn("tb-call", IconName::PhoneCall, false, palette, cx, move |this, cx| {
+                    a_acall(this, TopBarUiAction::StartCall { video: false }, cx);
+                }))
+                .child(top_icon_btn("tb-vcall", IconName::VideoCall, false, palette, cx, move |this, cx| {
+                    a_vcall(this, TopBarUiAction::StartCall { video: true }, cx);
+                }));
+            let search_btn = top_icon_btn("tb-search", IconName::Search, search_open, palette, cx, move |this, cx| {
+                a_search(this, TopBarUiAction::ToggleSearch, cx);
+            });
+            let info_btn = top_icon_btn("tb-info", IconName::SidebarPanel, is_inspector_open, palette, cx, move |this, cx| {
+                a_insp2(this, TopBarUiAction::ToggleInspector, cx);
+            });
+            let more_btn = top_icon_btn("tb-more", IconName::MoreVertical, more_menu_open, palette, cx, move |this, cx| {
+                a_more(this, TopBarUiAction::ToggleTopMoreMenu, cx);
+            });
+            let actions = if is_apple {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .child(call_group)
+                    .child(search_btn)
+                    .child(info_btn)
+                    .child(more_btn)
+            } else {
                 div()
                     .flex()
                     .items_center()
                     .gap(px(4.0))
-                    .child(top_icon_btn("tb-search", IconName::Search, search_open, palette, cx, move |this, cx| {
-                        a_search(this, TopBarUiAction::ToggleSearch, cx);
-                    }))
-                    .child(top_icon_btn("tb-call", IconName::PhoneCall, false, palette, cx, move |this, cx| {
-                        a_acall(this, TopBarUiAction::StartCall { video: false }, cx);
-                    }))
-                    .child(top_icon_btn("tb-vcall", IconName::VideoCall, false, palette, cx, move |this, cx| {
-                        a_vcall(this, TopBarUiAction::StartCall { video: true }, cx);
-                    }))
-                    .child(top_icon_btn("tb-info", IconName::SidebarPanel, is_inspector_open, palette, cx, move |this, cx| {
-                        a_insp2(this, TopBarUiAction::ToggleInspector, cx);
-                    }))
-                    .child(top_icon_btn("tb-more", IconName::MoreVertical, more_menu_open, palette, cx, move |this, cx| {
-                        a_more(this, TopBarUiAction::ToggleTopMoreMenu, cx);
-                    })),
-            )
+                    .child(search_btn)
+                    .child(call_group)
+                    .child(info_btn)
+                    .child(more_btn)
+            };
+            el.child(actions)
         });
 
     let _ = (search_query, search_match_cursor, search_match_total, tr_fmt);
@@ -424,15 +525,30 @@ pub fn render_stage_search_bar<V: 'static>(
         format!("{}|", search_query)
     };
 
+    let is_apple = palette.is_apple_style();
+    let bar_bg: Rgba = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(
+            palette.topbar_bg,
+            if palette.mode.is_dark() { 0.90 } else { 0.92 },
+        )
+    } else {
+        rgb(palette.topbar_bg).into()
+    };
+    let div_col: Rgba = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg).into()
+    };
+
     div()
         .id("stage-in-chat-search-bar")
         .h(px(44.0))
         .w_full()
         .flex_shrink_0()
-        .px(px(14.0))
-        .bg(rgb(palette.topbar_bg))
+        .px(px(16.0))
+        .bg(bar_bg)
         .border_b_1()
-        .border_color(rgb(palette.border_fg))
+        .border_color(div_col)
         .flex()
         .items_center()
         .justify_between()
@@ -447,12 +563,16 @@ pub fn render_stage_search_bar<V: 'static>(
                 .child(
                     div()
                         .flex_1()
-                        .px(px(10.0))
+                        .px(px(12.0))
                         .py(px(5.0))
-                        .rounded(px(8.0))
+                        .rounded(px(if is_apple { 14.0 } else { 8.0 }))
                         .bg(rgb(palette.input_bg))
                         .border_1()
-                        .border_color(rgb(palette.accent))
+                        .border_color(if is_apple {
+                            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.72)
+                        } else {
+                            rgb(palette.accent).into()
+                        })
                         .text_size(px(13.0))
                         .text_color(if search_query.is_empty() {
                             rgb(palette.text_secondary)
@@ -593,18 +713,29 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
         (2_592_000, "1 月", "1m"),
     ];
 
-    let dropdown = div()
+    let is_apple = pal.is_apple_style();
+    let menu_bg: Rgba = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(pal.menu_bg, 0.96)
+    } else {
+        rgb(pal.menu_bg).into()
+    };
+    let menu_border: Rgba = if is_apple {
+        pal.separator_rgba()
+    } else {
+        rgb(pal.border_fg).into()
+    };
+
+    let mut dropdown = div()
         .id("topbar-more-dropdown")
         .absolute()
-        .top(px(50.0))
+        .top(px(if is_apple { 48.0 } else { 50.0 }))
         .right(px(12.0))
         .w(px(238.0))
         .p(px(6.0))
-        .rounded(px(12.0))
-        .bg(rgb(pal.menu_bg))
+        .rounded(px(if is_apple { 14.0 } else { 12.0 }))
+        .bg(menu_bg)
         .border_1()
-        .border_color(rgb(pal.border_fg))
-        .shadow_xl()
+        .border_color(menu_border)
         .occlude()
         .on_mouse_down(
             MouseButton::Left,
@@ -657,7 +788,7 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
                 .w_full()
                 .px(px(10.0))
                 .py(px(7.0))
-                .rounded(px(6.0))
+                .rounded(px(if is_apple { 8.0 } else { 6.0 }))
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(hover_bg)))
                 .on_mouse_down(
@@ -760,7 +891,7 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
             cx,
             move |this, cx| a_exp(this, TopBarUiAction::ExportChat, cx),
         ))
-        .child(div().h(px(1.0)).my(px(3.0)).bg(rgb(pal.border_fg)))
+        .child(div().h(px(1.0)).my(px(3.0)).bg(menu_border))
         .child(more_menu_item(
             "tb-menu-clear",
             IconName::Edit,
@@ -790,6 +921,11 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
             cx,
             move |this, cx| a_del(this, TopBarUiAction::DeleteOrLeaveChat, cx),
         ));
+    dropdown = if is_apple {
+        dropdown.shadow(pal.popover_shadows())
+    } else {
+        dropdown.shadow_xl()
+    };
 
     div()
         .id("topbar-more-backdrop")
@@ -850,18 +986,31 @@ fn top_icon_btn<V: 'static>(
     cx: &mut Context<V>,
     on_click: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> AnyElement {
-    let color = if active { palette.icon_active } else { palette.icon_fg };
-    let hover_bg = palette.menu_hover_bg;
+    let is_apple = palette.is_apple_style();
+    let color = if active { palette.accent } else { palette.icon_fg };
+    let hover_bg: Rgba = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(
+            palette.text_primary,
+            if palette.mode.is_dark() { 0.10 } else { 0.06 },
+        )
+    } else {
+        rgb(palette.menu_hover_bg).into()
+    };
+    let btn_sz = if is_apple { 30.0 } else { 34.0 };
+    let icon_sz = if is_apple { 16.5 } else { 18.0 };
     div()
         .id(id)
-        .w(px(34.0))
-        .h(px(34.0))
+        .w(px(btn_sz))
+        .h(px(btn_sz))
         .rounded_full()
+        .when(is_apple && active, |el| {
+            el.bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.12))
+        })
         .flex()
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .hover(move |s| s.bg(rgb(hover_bg)))
+        .hover(move |s| s.bg(hover_bg))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -869,7 +1018,7 @@ fn top_icon_btn<V: 'static>(
                 on_click(this, cx);
             }),
         )
-        .child(tg_icon(icon, 18.0, color))
+        .child(tg_icon(icon, icon_sz, color))
         .into_any_element()
 }
 
@@ -903,13 +1052,28 @@ pub fn render_pinned_banner_46px<V: 'static>(
         tr_key_or(lang_id, "lng_pinned_message", "Pinned Message").to_string()
     };
 
+    let is_apple = palette.is_apple_style();
+    let bar_bg: Rgba = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(
+            palette.topbar_bg,
+            if palette.mode.is_dark() { 0.90 } else { 0.92 },
+        )
+    } else {
+        rgb(palette.topbar_bg).into()
+    };
+    let div_col: Rgba = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg).into()
+    };
+
     div()
         .h(px(46.0))
         .w_full()
-        .px(px(14.0))
-        .bg(rgb(palette.topbar_bg))
+        .px(px(if is_apple { 16.0 } else { 14.0 }))
+        .bg(bar_bg)
         .border_b_1()
-        .border_color(rgb(palette.border_fg))
+        .border_color(div_col)
         .flex()
         .items_center()
         .justify_between()
@@ -999,25 +1163,33 @@ pub fn render_scroll_to_bottom_fab<V: 'static>(
     cx: &mut Context<V>,
     on_click: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> AnyElement {
-    div()
+    let is_apple = palette.is_apple_style();
+    let mut fab = div()
         .id("scroll-to-bottom-fab")
         .absolute()
         .bottom(px(16.0))
         .right(px(18.0))
-        .w(px(42.0))
-        .h(px(42.0))
+        .w(px(if is_apple { 36.0 } else { 42.0 }))
+        .h(px(if is_apple { 36.0 } else { 42.0 }))
         .rounded_full()
-        .bg(rgb(palette.card_bg))
+        .bg(if is_apple {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.94)
+        } else {
+            rgb(palette.card_bg).into()
+        })
         .border_1()
-        .border_color(rgb(palette.border_fg))
-        .shadow_md()
+        .border_color(if is_apple {
+            palette.separator_rgba()
+        } else {
+            rgb(palette.border_fg).into()
+        })
         .flex()
         .items_center()
         .justify_center()
         .cursor_pointer()
         .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
         .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
-        .child(tg_icon(IconName::ChevronDown, 20.0, palette.icon_fg))
+        .child(tg_icon(IconName::ChevronDown, if is_apple { 17.0 } else { 20.0 }, palette.icon_fg))
         .when(unread_count > 0, |el| {
             el.child(
                 div()
@@ -1033,6 +1205,11 @@ pub fn render_scroll_to_bottom_fab<V: 'static>(
                     .text_color(rgb(palette.unread_badge_fg))
                     .child(unread_count.to_string()),
             )
-        })
-        .into_any_element()
+        });
+    fab = if is_apple {
+        fab.shadow(palette.popover_shadows())
+    } else {
+        fab.shadow_md()
+    };
+    fab.into_any_element()
 }

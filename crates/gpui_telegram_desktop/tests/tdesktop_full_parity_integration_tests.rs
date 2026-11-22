@@ -133,39 +133,126 @@ fn test_stage_composer_sidebar_and_e2ee_call_parity() {
 
 #[test]
 fn test_fabushi_visual_theme_tokens_and_readability() {
-    let dark = TdesktopThemePalette::build(TdesktopThemeMode::Night, 0, 14, 17);
-    let tinted = TdesktopThemePalette::build(TdesktopThemeMode::Tinted, 0, 14, 17);
-    let light = TdesktopThemePalette::build(TdesktopThemeMode::Day, 0, 14, 17);
+    use gpui::AssetSource;
+    use gpui_telegram_desktop::theme::{IconName, TelegramAssetSource};
+
+    let dark = TdesktopThemePalette::build(TdesktopThemeMode::Night, 0, 14, 18);
+    let tinted = TdesktopThemePalette::build(TdesktopThemeMode::Tinted, 0, 14, 18);
+    let light = TdesktopThemePalette::build(TdesktopThemeMode::Day, 0, 14, 18);
     let classic = TdesktopThemePalette::build(TdesktopThemeMode::Classic, 0, 14, 12);
 
     assert!(dark.mode.is_fabushi_style());
     assert!(tinted.mode.is_fabushi_style());
     assert!(light.mode.is_fabushi_style());
     assert!(!classic.mode.is_fabushi_style());
+    assert!(dark.is_apple_style());
+    assert!(tinted.is_apple_style());
+    assert!(light.is_apple_style());
+    assert!(!classic.is_apple_style());
 
-    // Fabushi Dark obsidian hierarchy & accent
-    assert_eq!(dark.accent, 0x1084FE);
-    assert_eq!(dark.stage_bg, 0x070707);
-    assert_eq!(dark.dialogs_bg, 0x111111);
-    assert_eq!(dark.dialogs_active_bg, 0x2A2A2A);
-    assert_eq!(dark.msg_in_bg, 0x1A1A1A);
-    assert_eq!(dark.msg_out_bg, 0x2C2C2C);
-    assert_eq!(dark.text_primary, 0xFAFAFA);
+    // Apple Messages Dark palette & vibrant iMessage Blue outgoing tokens
+    assert_eq!(dark.accent, 0x0A84FF);
+    assert_eq!(dark.accent_hover, 0x2994FF);
+    assert_eq!(dark.window_bg, 0x1E1E1E);
+    assert_eq!(dark.stage_bg, 0x1E1E1E);
+    assert_eq!(dark.dialogs_bg, 0x1C1C1E);
+    assert_eq!(dark.dialogs_active_bg, 0x0A84FF);
+    assert_eq!(dark.msg_in_bg, 0x262629);
+    assert_eq!(dark.msg_out_bg, 0x0A84FF);
+    assert_eq!(dark.msg_out_bg_top, 0x1E8FFF);
+    assert_eq!(dark.msg_out_bg_bottom, 0x0A84FF);
+    assert_eq!(dark.msg_out_fg, 0xFFFFFF);
+    assert_eq!(dark.msg_out_secondary_fg, 0xD6EBFF);
+    assert_eq!(dark.msg_out_link_fg, 0xFFFFFF);
+    assert_eq!(dark.text_primary, 0xF5F5F7);
+    assert_eq!(dark.text_secondary, 0x98989D);
+    assert_eq!(dark.service_pill_fg, 0x8E8E93);
+    assert!((dark.sidebar_bg_rgba().a - 0.74).abs() < 0.01);
+    assert!((dark.separator_rgba().a - 0.09).abs() < 0.01);
+    assert_eq!(dark.popover_shadows().len(), 2);
 
-    // Fabushi Light paper hierarchy & non-inverted neutral selection contrast
-    assert_eq!(light.accent, 0x1084FE);
-    assert_eq!(light.stage_bg, 0xFCFCFC);
-    assert_eq!(light.dialogs_bg, 0xF7F7F7);
-    assert_eq!(light.dialogs_active_bg, 0xE4E4E4);
-    assert_ne!(light.dialogs_active_bg, light.accent);
-    assert_eq!(light.text_primary, 0x141414);
-    assert_eq!(light.service_pill_fg, 0x6E6E6E);
+    // Apple Messages Light palette & vibrant iMessage Blue outgoing tokens
+    assert_eq!(light.accent, 0x007AFF);
+    assert_eq!(light.accent_hover, 0x0062CC);
+    assert_eq!(light.window_bg, 0xFFFFFF);
+    assert_eq!(light.stage_bg, 0xFFFFFF);
+    assert_eq!(light.dialogs_bg, 0xF5F5F7);
+    assert_eq!(light.dialogs_active_bg, 0x007AFF);
+    assert_eq!(light.msg_in_bg, 0xE9E9EB);
+    assert_eq!(light.msg_out_bg, 0x007AFF);
+    assert_eq!(light.msg_out_bg_top, 0x2C95FF);
+    assert_eq!(light.msg_out_bg_bottom, 0x007AFF);
+    assert_eq!(light.msg_out_fg, 0xFFFFFF);
+    assert_eq!(light.msg_out_secondary_fg, 0xE5F2FF);
+    assert_eq!(light.msg_out_link_fg, 0xFFFFFF);
+    assert_eq!(light.text_primary, 0x1D1D1F);
+    assert_eq!(light.text_secondary, 0x86868B);
+    assert_eq!(light.service_pill_fg, 0x8E8E93);
+    assert!((light.sidebar_bg_rgba().a - 0.72).abs() < 0.01);
+    assert!((light.separator_rgba().a - 0.08).abs() < 0.01);
+    assert_eq!(light.popover_shadows().len(), 2);
 
-    // Custom accent in Fabushi Light keeps neutral active sidebar row for dark text readability
-    let light_custom = TdesktopThemePalette::build(TdesktopThemeMode::Day, 0x8544D6, 14, 17);
-    assert_ne!(light_custom.dialogs_active_bg, 0x8544D6);
+    // Custom accent in Apple Light tints outgoing gradient & active sidebar while preserving white text
+    let light_custom = TdesktopThemePalette::build(TdesktopThemeMode::Day, 0x8544D6, 14, 18);
+    assert_eq!(light_custom.dialogs_active_bg, 0x8544D6);
+    assert_eq!(light_custom.msg_out_bg, 0x8544D6);
+    assert_eq!(light_custom.msg_out_bg_bottom, 0x8544D6);
+    assert_ne!(light_custom.msg_out_bg_top, light_custom.msg_out_bg_bottom);
+    assert_eq!(light_custom.msg_out_fg, 0xFFFFFF);
 
-    // Classic mode preserves legacy Telegram green outgoing bubbles and inverted pill fg
+    // Classic mode preserves legacy Telegram green outgoing bubbles, opaque sidebar, and inverted pill fg
     assert_eq!(classic.msg_out_bg, 0xEFFDDE);
+    assert_eq!(classic.msg_out_fg, 0x000000);
     assert_eq!(classic.service_pill_fg, 0xFFFFFF);
+    assert!((classic.sidebar_bg_rgba().a - 1.0).abs() < 0.001);
+
+    // Default palette uses 18px Apple Messages bubble radius and Apple Dark accent
+    let def = TdesktopThemePalette::default();
+    assert_eq!(def.bubble_radius_px, 18);
+    assert_eq!(def.accent, 0x0A84FF);
+
+    // Canonical icon count stays 64 for harness compatibility while ArrowUp loads cleanly
+    assert_eq!(IconName::ALL.len(), 64);
+    let src = TelegramAssetSource::new();
+    let arrow = src
+        .load(IconName::ArrowUp.path())
+        .expect("load arrow_up")
+        .expect("arrow_up embedded");
+    assert!(std::str::from_utf8(arrow.as_ref()).unwrap().contains("<svg"));
+
+    // System appearance mapping follows macOS Light/Dark cleanly
+    use gpui::WindowAppearance;
+    use gpui_telegram_desktop::app::preferences::{AppPreferences, ThemeMode};
+    use gpui_telegram_desktop::views::app_shell::shell_theme::{
+        resolve_mode_from_preferences_with_appearance, tdesktop_mode_for_window_appearance,
+    };
+    assert_eq!(
+        tdesktop_mode_for_window_appearance(WindowAppearance::Light),
+        TdesktopThemeMode::Day
+    );
+    assert_eq!(
+        tdesktop_mode_for_window_appearance(WindowAppearance::VibrantLight),
+        TdesktopThemeMode::Day
+    );
+    assert_eq!(
+        tdesktop_mode_for_window_appearance(WindowAppearance::Dark),
+        TdesktopThemeMode::Night
+    );
+    assert_eq!(
+        tdesktop_mode_for_window_appearance(WindowAppearance::VibrantDark),
+        TdesktopThemeMode::Night
+    );
+    let mut sys_prefs = AppPreferences::default();
+    sys_prefs.theme_mode = ThemeMode::System;
+    assert_eq!(
+        resolve_mode_from_preferences_with_appearance(&sys_prefs, Some(WindowAppearance::Light)),
+        TdesktopThemeMode::Day
+    );
+    assert_eq!(
+        resolve_mode_from_preferences_with_appearance(
+            &sys_prefs,
+            Some(WindowAppearance::VibrantDark),
+        ),
+        TdesktopThemeMode::Night
+    );
 }

@@ -666,12 +666,13 @@ impl Render for CanonicalComposer {
             .relative()
             .w_full()
             .flex_shrink_0()
+            .bg(rgb(self.palette.composer_bg))
             .flex()
             .flex_col()
-            .when_some(ac_popup, |el, pop| el.child(div().px(px(14.0)).child(pop)))
+            .when_some(ac_popup, |el, pop| el.child(div().px(px(16.0)).child(pop)))
             .when(self.attachments_drawer.is_open, |el| {
                 el.child(
-                    div().px(px(14.0)).child(render_attachments_drawer_with_apps(
+                    div().px(px(16.0)).child(render_attachments_drawer_with_apps(
                         &self.attach_mini_apps,
                         self.current_peer_type_mask,
                         &self.palette,
@@ -683,7 +684,7 @@ impl Render for CanonicalComposer {
             })
             .when(self.is_emoji_picker_open, |el| {
                 el.child(
-                    div().px(px(14.0)).flex().justify_end().child(render_tabbed_selector_popup(
+                    div().px(px(16.0)).flex().justify_end().child(render_tabbed_selector_popup(
                         tab_idx,
                         &self.tabbed_selector.search_query,
                         self.editor.selector_search_focused,
@@ -699,7 +700,7 @@ impl Render for CanonicalComposer {
             })
             .when(self.editor.send_options_open, |el| {
                 el.child(
-                    div().px(px(14.0)).flex().justify_end().child(render_send_options_popup(
+                    div().px(px(16.0)).flex().justify_end().child(render_send_options_popup(
                         &self.palette,
                         &self.lang_id,
                         cx,
@@ -709,7 +710,7 @@ impl Render for CanonicalComposer {
             })
             .when(self.is_formatting_open, |el| {
                 el.child(
-                    div().px(px(14.0)).child(render_formatting_toolbar(
+                    div().px(px(16.0)).child(render_formatting_toolbar(
                         &self.formatting_bar,
                         &self.palette,
                         cx,
@@ -720,24 +721,29 @@ impl Render for CanonicalComposer {
             .when_some(banner, |el, b| el.child(b))
             .when_some(context_ref_strip, |el, strip| el.child(strip))
             .when_some(self.active_send_as_label().map(str::to_string), |el, label| {
+                let is_apple = self.palette.is_apple_style();
                 let bg = self.palette.input_bg;
-                let border = self.palette.border_fg;
+                let border: Rgba = if is_apple {
+                    self.palette.separator_rgba()
+                } else {
+                    rgb(self.palette.border_fg).into()
+                };
                 let fg = self.palette.text_secondary;
                 el.child(
                     div()
-                        .px(px(14.0))
+                        .px(px(16.0))
                         .pt(px(4.0))
                         .flex()
                         .items_center()
                         .child(
                             div()
                                 .id("cmp-send-as-pill")
-                                .px(px(8.0))
-                                .py(px(2.0))
-                                .rounded(px(10.0))
+                                .px(px(9.0))
+                                .py(px(2.5))
+                                .rounded_full()
                                 .bg(rgb(bg))
                                 .border_1()
-                                .border_color(rgb(border))
+                                .border_color(border)
                                 .cursor_pointer()
                                 .text_size(px(11.0))
                                 .text_color(rgb(fg))

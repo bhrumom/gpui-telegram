@@ -1,6 +1,5 @@
 //! Rendering helpers for the Alipay QR login tab and Email OTP registration tab inside `AuthWizardView`.
 
-use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::i18n::tr_str;
@@ -99,8 +98,16 @@ impl AuthWizardView {
                 return div()
                     .w(px(card_px))
                     .h(px(card_px))
-                    .rounded(px(12.0))
+                    .rounded(px(14.0))
                     .bg(rgb(0xFFFFFF))
+                    .border_1()
+                    .border_color(hsla(0.0, 0.0, 0.0, 0.08))
+                    .shadow(vec![BoxShadow {
+                        color: hsla(0.0, 0.0, 0.0, 0.08),
+                        offset: point(px(0.0), px(4.0)),
+                        blur_radius: px(12.0),
+                        spread_radius: px(0.0),
+                    }])
                     .flex()
                     .items_center()
                     .justify_center()
@@ -112,8 +119,16 @@ impl AuthWizardView {
         div()
             .w(px(200.0))
             .h(px(200.0))
-            .rounded(px(12.0))
+            .rounded(px(14.0))
             .bg(rgb(0xFFFFFF))
+            .border_1()
+            .border_color(hsla(0.0, 0.0, 0.0, 0.08))
+            .shadow(vec![BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, 0.08),
+                offset: point(px(0.0), px(4.0)),
+                blur_radius: px(12.0),
+                spread_radius: px(0.0),
+            }])
             .p(px(16.0))
             .flex()
             .flex_col()
@@ -200,16 +215,16 @@ impl AuthWizardView {
                 div()
                     .cursor_pointer()
                     .w_full()
-                    .h(px(40.0))
-                    .rounded(px(8.0))
+                    .h(px(42.0))
+                    .rounded(px(10.0))
                     .bg(rgb(0x1677FF))
                     .hover(|s| s.bg(rgb(0x0E5CD6)))
                     .flex()
                     .items_center()
                     .justify_center()
                     .gap(px(6.0))
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(13.5))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(0xFFFFFF))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -228,17 +243,18 @@ impl AuthWizardView {
                 div()
                     .cursor_pointer()
                     .w_full()
-                    .h(px(36.0))
-                    .rounded(px(8.0))
-                    .bg(rgb(pal.input_bg))
+                    .h(px(38.0))
+                    .rounded(px(10.0))
+                    .bg(pal.card_surface_rgba())
                     .border_1()
-                    .border_color(rgb(pal.border_fg))
-                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                    .border_color(pal.separator_rgba())
+                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                     .flex()
                     .items_center()
                     .justify_center()
                     .gap(px(6.0))
-                    .text_size(px(12.0))
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(pal.text_primary))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -296,9 +312,9 @@ impl AuthWizardView {
                     .child(
                         div()
                             .cursor_pointer()
-                            .px(px(12.0))
-                            .h(px(40.0))
-                            .rounded(px(8.0))
+                            .px(px(14.0))
+                            .h(px(42.0))
+                            .rounded(px(10.0))
                             .bg(if cooldown > 0 || is_sending {
                                 rgb(pal.input_bg)
                             } else {
@@ -306,9 +322,9 @@ impl AuthWizardView {
                             })
                             .border_1()
                             .border_color(if cooldown > 0 || is_sending {
-                                rgb(pal.border_fg)
+                                pal.separator_rgba()
                             } else {
-                                rgb(pal.accent)
+                                rgb(pal.accent).into()
                             })
                             .hover(move |s| {
                                 if cooldown == 0 && !is_sending {
@@ -321,7 +337,7 @@ impl AuthWizardView {
                             .items_center()
                             .justify_center()
                             .text_size(px(12.0))
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if cooldown > 0 || is_sending {
                                 rgb(pal.text_secondary)
                             } else {
@@ -415,7 +431,7 @@ impl AuthWizardView {
                     .cursor_pointer()
                     .w_full()
                     .h(px(42.0))
-                    .rounded(px(8.0))
+                    .rounded(px(10.0))
                     .bg(if is_loading {
                         rgb(pal.accent_hover)
                     } else {
@@ -426,7 +442,7 @@ impl AuthWizardView {
                     .items_center()
                     .justify_center()
                     .text_size(px(14.0))
-                    .font_weight(FontWeight::BOLD)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(pal.active_button_fg))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -471,14 +487,18 @@ impl AuthWizardView {
                         let cc_str = cc.to_string();
                         div()
                             .cursor_pointer()
-                            .px(px(10.0))
+                            .px(px(11.0))
                             .py(px(5.0))
-                            .rounded(px(6.0))
+                            .rounded(px(999.0))
                             .bg(rgb(if is_sel { pal.accent } else { pal.input_bg }))
                             .border_1()
-                            .border_color(rgb(if is_sel { pal.accent } else { pal.border_fg }))
+                            .border_color(if is_sel {
+                                rgb(pal.accent).into()
+                            } else {
+                                pal.separator_rgba()
+                            })
                             .text_size(px(12.0))
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_sel {
                                 pal.active_button_fg
                             } else {
@@ -498,11 +518,11 @@ impl AuthWizardView {
                 div()
                     .w_full()
                     .h(px(42.0))
-                    .rounded(px(8.0))
+                    .rounded(px(10.0))
                     .bg(rgb(pal.input_bg))
                     .border_1()
                     .border_color(rgb(pal.accent))
-                    .px(px(12.0))
+                    .px(px(14.0))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -545,16 +565,17 @@ impl AuthWizardView {
                             .cursor_pointer()
                             .px(px(14.0))
                             .h(px(42.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(pal.input_bg))
+                            .rounded(px(10.0))
+                            .bg(pal.card_surface_rgba())
                             .border_1()
-                            .border_color(rgb(pal.border_fg))
-                            .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                            .border_color(pal.separator_rgba())
+                            .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                             .flex()
                             .items_center()
                             .justify_center()
                             .gap(px(5.0))
                             .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(pal.text_primary))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -571,14 +592,14 @@ impl AuthWizardView {
                             .cursor_pointer()
                             .flex_1()
                             .h(px(42.0))
-                            .rounded(px(8.0))
+                            .rounded(px(10.0))
                             .bg(rgb(pal.accent))
                             .hover(move |s| s.bg(rgb(pal.accent_hover)))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(14.0))
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(pal.active_button_fg))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -621,15 +642,15 @@ impl AuthWizardView {
                     .cursor_pointer()
                     .w_full()
                     .h(px(42.0))
-                    .rounded(px(8.0))
+                    .rounded(px(10.0))
                     .bg(rgb(0x1677FF))
                     .hover(|s| s.bg(rgb(0x0E5CD6)))
                     .flex()
                     .items_center()
                     .justify_center()
                     .gap(px(6.0))
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(13.5))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(0xFFFFFF))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -687,7 +708,7 @@ impl AuthWizardView {
                     .cursor_pointer()
                     .w_full()
                     .h(px(44.0))
-                    .rounded(px(8.0))
+                    .rounded(px(10.0))
                     .bg(rgb(pal.input_bg))
                     .border_1()
                     .border_color(rgb(pal.accent))
@@ -734,14 +755,14 @@ impl AuthWizardView {
                     .cursor_pointer()
                     .w_full()
                     .h(px(44.0))
-                    .rounded(px(8.0))
+                    .rounded(px(10.0))
                     .bg(rgb(pal.accent))
                     .hover(move |s| s.bg(rgb(pal.accent_hover)))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_size(px(14.0))
-                    .font_weight(FontWeight::BOLD)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(pal.active_button_fg))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -793,11 +814,12 @@ impl AuthWizardView {
                     div()
                         .cursor_pointer()
                         .w(px(58.0))
-                        .h(px(32.0))
-                        .rounded(px(6.0))
+                        .h(px(34.0))
+                        .rounded(px(9.0))
                         .bg(rgb(pal.input_bg))
-                        .when(!for_code, |el| el.border_1().border_color(rgb(pal.border_fg)))
-                        .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                        .border_1()
+                        .border_color(pal.separator_rgba())
+                        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                         .flex()
                         .items_center()
                         .justify_center()

@@ -49,8 +49,8 @@ impl TdesktopThemeMode {
     /// Returns the default accent hex (`0xRRGGBB`) for this mode.
     pub const fn default_accent(&self) -> u32 {
         match self {
-            Self::Night | Self::Day => 0x1084FE,
-            Self::Tinted => 0x1687FF,
+            Self::Night | Self::Tinted => 0x0A84FF,
+            Self::Day => 0x007AFF,
             Self::Classic => 0x40A7E3,
         }
     }
@@ -63,12 +63,12 @@ pub struct AccentSwatch {
     pub hex: u32,
 }
 
-/// Curated accent swatches led by Fabushi Blue.
+/// Curated accent swatches led by Apple System Blue.
 pub const ACCENT_SWATCHES: &[AccentSwatch] = &[
-    AccentSwatch { name: "Fabushi Blue", hex: 0x1084FE },
+    AccentSwatch { name: "System Blue", hex: 0x007AFF },
     AccentSwatch { name: "Sky Blue", hex: 0x40A7E3 },
     AccentSwatch { name: "Teal Mint", hex: 0x3FC1B0 },
-    AccentSwatch { name: "Emerald", hex: 0x00C972 },
+    AccentSwatch { name: "Emerald", hex: 0x34C759 },
     AccentSwatch { name: "Amber Gold", hex: 0xE5A030 },
     AccentSwatch { name: "Coral Orange", hex: 0xE86C52 },
     AccentSwatch { name: "Crimson Rose", hex: 0xE16794 },
@@ -90,26 +90,26 @@ pub struct WallpaperPreset {
 pub const WALLPAPER_PRESETS: &[WallpaperPreset] = &[
     WallpaperPreset {
         id: "default_night",
-        name: "Fabushi Obsidian",
-        top_hex: 0x070707,
-        bottom_hex: 0x0A0A0A,
-        pattern_hex: 0x1A1A1A,
+        name: "Apple Dark",
+        top_hex: 0x1E1E1E,
+        bottom_hex: 0x1E1E1E,
+        pattern_hex: 0x2C2C2E,
         is_dark: true,
     },
     WallpaperPreset {
         id: "default_tinted",
-        name: "Fabushi Graphite",
-        top_hex: 0x0E1013,
-        bottom_hex: 0x13161B,
-        pattern_hex: 0x22262E,
+        name: "Apple Midnight",
+        top_hex: 0x181C22,
+        bottom_hex: 0x181C22,
+        pattern_hex: 0x242A33,
         is_dark: true,
     },
     WallpaperPreset {
         id: "default_day",
-        name: "Fabushi Paper",
-        top_hex: 0xFCFCFC,
-        bottom_hex: 0xFAFAFA,
-        pattern_hex: 0xEAEAEA,
+        name: "Apple Light",
+        top_hex: 0xFFFFFF,
+        bottom_hex: 0xFFFFFF,
+        pattern_hex: 0xE5E5EA,
         is_dark: false,
     },
     WallpaperPreset {

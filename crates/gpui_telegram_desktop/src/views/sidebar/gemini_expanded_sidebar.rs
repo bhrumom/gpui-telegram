@@ -12,9 +12,10 @@ use crate::views::sidebar::gemini_unified_sidebar::{
     UnifiedSidebarAction,
 };
 
-/// Renders the `46px` expanded sidebar top bar with collapse toggle and quick action buttons.
+/// Renders the `52px` unified sidebar titlebar with macOS traffic-light clearance,
+/// window drag area, and minimal collapse + compose icons.
 pub fn render_expanded_gemini_top_bar<V: 'static>(
-    nav: &UnifiedNavSnapshot,
+    _nav: &UnifiedNavSnapshot,
     is_plus_active: bool,
     hovered_item: Option<&'static str>,
     palette: &TdesktopThemePalette,
@@ -22,194 +23,136 @@ pub fn render_expanded_gemini_top_bar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let hover_bg = rgb(palette.dialogs_hover_bg);
-    let active_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16);
+    let is_apple = palette.is_apple_style();
+    let hover_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.06)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
+    let active_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14);
     let collapse_hovered = hovered_item == Some("collapse");
+    let compose_hovered = hovered_item == Some("compose");
     let on_collapse_hover = on_action.clone();
     let on_collapse_click = on_action.clone();
-    let on_plus_click = on_action.clone();
+    let on_compose_hover = on_action.clone();
+    let on_plus_click = on_action;
 
-    let render_top_icon_btn =
-        |id: &'static str,
-         icon: IconName,
-         is_active: bool,
-         badge: u32,
-         action: UnifiedSidebarAction| {
-            let on_btn = on_action.clone();
-            let fg = if is_active {
-                palette.accent
-            } else {
-                palette.icon_fg
-            };
-            div()
-                .id(id)
-                .relative()
-                .cursor_pointer()
-                .w(px(30.0))
-                .h(px(30.0))
-                .rounded_full()
-                .when(is_active, |el| el.bg(active_bg))
-                .hover(move |s| if is_active { s } else { s.bg(hover_bg) })
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _ev, _w, cx| {
-                        on_btn(this, action, cx);
-                    }),
-                )
-                .child(tg_icon(icon, 16.0, fg))
-                .when(badge > 0, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .top(px(2.0))
-                            .right(px(2.0))
-                            .w(px(7.0))
-                            .h(px(7.0))
-                            .rounded_full()
-                            .bg(rgb(palette.unread_badge_bg)),
-                    )
-                })
-        };
-
-    let tasks_target = if nav.active_destination == NavDestination::TaskCenter {
-        NavDestination::Chats
+    let left_clearance = if cfg!(target_os = "macos") {
+        76.0
     } else {
-        NavDestination::TaskCenter
-    };
-    let remote_target = if nav.active_destination == NavDestination::RemoteComputer {
-        NavDestination::Chats
-    } else {
-        NavDestination::RemoteComputer
-    };
-    let calls_target = if nav.active_destination == NavDestination::Calls {
-        NavDestination::Chats
-    } else {
-        NavDestination::Calls
+        12.0
     };
 
     div()
-        .h(px(46.0))
+        .h(px(52.0))
         .flex_shrink_0()
         .w_full()
-        .px(px(12.0))
+        .pl(px(left_clearance))
+        .pr(px(12.0))
+        .window_control_area(WindowControlArea::Drag)
         .flex()
         .items_center()
-        .justify_between()
-        .child(
-            div()
-                .id("sidebar-collapse-btn")
-                .relative()
-                .cursor_pointer()
-                .w(px(30.0))
-                .h(px(30.0))
-                .rounded_full()
-                .hover(move |s| s.bg(hover_bg))
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_hover(cx.listener(move |this, hovered, _w, cx| {
-                    let next = if *hovered { Some("collapse") } else { None };
-                    on_collapse_hover(this, UnifiedSidebarAction::SetHover(next), cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _ev, _w, cx| {
-                        on_collapse_click(this, UnifiedSidebarAction::ToggleCollapsed, cx);
-                    }),
-                )
-                .child(tg_icon(
-                    IconName::SidebarLeftClose,
-                    16.0,
-                    palette.icon_fg,
-                ))
-                .when(collapse_hovered, |el| {
-                    el.child(render_floating_pill_tooltip_at(
-                        tr_str(lang_id, "收起边栏", "Collapse sidebar"),
-                        38.0,
-                        2.0,
-                        palette,
-                    ))
-                }),
-        )
+        .justify_end()
+        .child(div().flex_1().h_full())
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(4.0))
-                .child(render_top_icon_btn(
-                    "top-action-tasks",
-                    IconName::Poll,
-                    nav.active_destination == NavDestination::TaskCenter,
-                    nav.tasks_unread,
-                    UnifiedSidebarAction::SelectDestination(tasks_target),
-                ))
-                .child(render_top_icon_btn(
-                    "top-action-remote",
-                    IconName::ComputerDesktop,
-                    nav.active_destination == NavDestination::RemoteComputer,
-                    0,
-                    UnifiedSidebarAction::SelectDestination(remote_target),
-                ))
-                .child(render_top_icon_btn(
-                    "top-action-contacts",
-                    IconName::ContactsUsers,
-                    false,
-                    0,
-                    UnifiedSidebarAction::OpenContacts,
-                ))
-                .child(render_top_icon_btn(
-                    "top-action-calls",
-                    IconName::PhoneCall,
-                    nav.active_destination == NavDestination::Calls,
-                    nav.calls_unread,
-                    UnifiedSidebarAction::SelectDestination(calls_target),
-                ))
                 .child(
                     div()
-                        .id("sidebar-plus-action-btn")
+                        .id("sidebar-collapse-btn")
+                        .relative()
                         .cursor_pointer()
-                        .ml(px(4.0))
-                        .w(px(30.0))
-                        .h(px(30.0))
-                        .rounded_full()
-                        .bg(if is_plus_active {
-                            active_bg
-                        } else {
-                            rgb(palette.input_bg)
-                        })
-                        .border_1()
-                        .border_color(if is_plus_active {
-                            rgb(palette.accent)
-                        } else {
-                            rgb(palette.border_fg)
-                        })
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(6.0))
                         .hover(move |s| s.bg(hover_bg))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(17.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if is_plus_active {
-                            rgb(palette.accent)
-                        } else {
-                            rgb(palette.text_primary)
-                        })
+                        .on_hover(cx.listener(move |this, hovered, _w, cx| {
+                            let next = if *hovered { Some("collapse") } else { None };
+                            on_collapse_hover(this, UnifiedSidebarAction::SetHover(next), cx);
+                        }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev, _w, cx| {
+                                cx.stop_propagation();
+                                on_collapse_click(this, UnifiedSidebarAction::ToggleCollapsed, cx);
+                            }),
+                        )
+                        .child(tg_icon(
+                            IconName::SidebarLeftClose,
+                            16.0,
+                            if collapse_hovered {
+                                palette.text_primary
+                            } else {
+                                palette.icon_fg
+                            },
+                        ))
+                        .when(collapse_hovered, |el| {
+                            el.child(render_floating_pill_tooltip_at(
+                                tr_str(lang_id, "收起边栏", "Collapse sidebar"),
+                                -28.0,
+                                32.0,
+                                palette,
+                            ))
+                        }),
+                )
+                .child(
+                    div()
+                        .id("sidebar-plus-action-btn")
+                        .relative()
+                        .cursor_pointer()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(6.0))
+                        .when(is_plus_active, |el| el.bg(active_bg))
+                        .hover(move |s| if is_plus_active { s } else { s.bg(hover_bg) })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_hover(cx.listener(move |this, hovered, _w, cx| {
+                            let next = if *hovered { Some("compose") } else { None };
+                            on_compose_hover(this, UnifiedSidebarAction::SetHover(next), cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _w, cx| {
+                                cx.stop_propagation();
                                 on_plus_click(this, UnifiedSidebarAction::TogglePlusMenu, cx);
                             }),
                         )
-                        .child("+"),
+                        .child(tg_icon(
+                            IconName::ComposePen,
+                            16.0,
+                            if is_plus_active {
+                                palette.accent
+                            } else if compose_hovered {
+                                palette.text_primary
+                            } else {
+                                palette.icon_fg
+                            },
+                        ))
+                        .when(compose_hovered && !is_plus_active, |el| {
+                            el.child(render_floating_pill_tooltip_at(
+                                tr_str(lang_id, "新建消息", "New Message"),
+                                -48.0,
+                                32.0,
+                                palette,
+                            ))
+                        }),
                 ),
         )
         .into_any_element()
 }
 
-/// Renders the inline search bar shown when searching inside the expanded sidebar.
+/// Renders the inline search bar shown inside the expanded sidebar.
 pub fn render_expanded_gemini_search_bar<V: 'static>(
     query: &str,
     is_search_focused: bool,
@@ -218,7 +161,16 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let hover_bg = rgb(palette.dialogs_hover_bg);
+    let is_apple = palette.is_apple_style();
+    let hover_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.06)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     let search_placeholder = if is_search_focused {
         tr_str(lang_id, "| 搜索", "| Search").to_string()
     } else {
@@ -236,11 +188,35 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
     let on_focus = on_action.clone();
     let on_clear = on_action;
 
+    let box_height = if is_apple { 29.0 } else { SEARCH_HEIGHT };
+    let box_radius = if is_apple { 8.0 } else { SEARCH_RADIUS };
+    let box_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.09)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x808080, 0.14)
+        }
+    } else {
+        rgb(palette.input_bg)
+    };
+    let box_border = if is_search_focused {
+        rgb(palette.accent)
+    } else if is_apple {
+        Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }
+    } else {
+        rgb(palette.border_fg)
+    };
+
     div()
         .w_full()
         .flex_shrink_0()
         .px(px(12.0))
-        .pb(px(8.0))
+        .pb(px(if is_apple { 10.0 } else { 8.0 }))
         .flex()
         .items_center()
         .gap(px(6.0))
@@ -249,8 +225,8 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
                 div()
                     .id("sidebar-search-back-btn")
                     .cursor_pointer()
-                    .w(px(30.0))
-                    .h(px(30.0))
+                    .w(px(28.0))
+                    .h(px(28.0))
                     .rounded_full()
                     .hover(move |s| s.bg(hover_bg))
                     .flex()
@@ -262,7 +238,7 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
                             on_back(this, UnifiedSidebarAction::ExitSearch, cx);
                         }),
                     )
-                    .child(tg_icon(IconName::BackArrow, 16.0, palette.icon_fg)),
+                    .child(tg_icon(IconName::BackArrow, 15.0, palette.icon_fg)),
             )
         })
         .child(
@@ -270,16 +246,13 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
                 .id("sidebar-search-box")
                 .cursor_pointer()
                 .flex_1()
-                .h(px(SEARCH_HEIGHT))
-                .bg(rgb(palette.input_bg))
+                .min_w(px(0.0))
+                .h(px(box_height))
+                .bg(box_bg)
                 .border_1()
-                .border_color(if is_search_focused {
-                    rgb(palette.accent)
-                } else {
-                    rgb(palette.border_fg)
-                })
-                .rounded(px(SEARCH_RADIUS))
-                .px(px(10.0))
+                .border_color(box_border)
+                .rounded(px(box_radius))
+                .px(px(9.0))
                 .flex()
                 .items_center()
                 .justify_between()
@@ -291,21 +264,26 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
                         .gap(px(6.0))
                         .overflow_hidden()
                         .child(tg_icon(
                             IconName::Search,
-                            14.0,
+                            13.5,
                             if is_search_focused {
                                 palette.accent
                             } else {
-                                palette.icon_fg
+                                palette.text_secondary
                             },
                         ))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
                                 .text_size(px(13.0))
                                 .text_color(if query.is_empty() {
                                     rgb(palette.text_secondary)
@@ -320,8 +298,9 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
                         div()
                             .id("sidebar-search-clear-btn")
                             .cursor_pointer()
-                            .w(px(20.0))
-                            .h(px(20.0))
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex_shrink_0()
                             .rounded_full()
                             .hover(move |s| s.bg(hover_bg))
                             .flex()
@@ -334,7 +313,7 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
                                     on_clear(this, UnifiedSidebarAction::ClearSearch, cx);
                                 }),
                             )
-                            .child(tg_icon(IconName::Close, 12.0, palette.icon_fg)),
+                            .child(tg_icon(IconName::Close, 11.0, palette.text_secondary)),
                     )
                 }),
         )
@@ -677,7 +656,8 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
         .into_any_element()
 }
 
-/// Renders the pinned `52px` expanded footer with account popover trigger and add/invite pill.
+/// Renders the streamlined `44px` expanded sidebar bottom utility dock with account trigger on the
+/// left and minimal workspace action icons (Tasks, Remote, Contacts, Calls, Settings) on the right.
 pub fn render_expanded_gemini_footer<V: 'static>(
     nav: &UnifiedNavSnapshot,
     palette: &TdesktopThemePalette,
@@ -685,7 +665,17 @@ pub fn render_expanded_gemini_footer<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let hover_bg = rgb(palette.dialogs_hover_bg);
+    let is_apple = palette.is_apple_style();
+    let hover_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.06)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
+    let active_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14);
     let avatar_grad = palette.peer_avatar_gradient(1);
     let display_name = if nav.account_name.trim().is_empty() {
         tr_str(lang_id, "我的账号", "My Account").to_string()
@@ -693,33 +683,102 @@ pub fn render_expanded_gemini_footer<V: 'static>(
         nav.account_name.clone()
     };
 
+    let render_dock_icon_btn =
+        |id: &'static str,
+         icon: IconName,
+         is_active: bool,
+         badge: u32,
+         action: UnifiedSidebarAction| {
+            let on_btn = on_action.clone();
+            let fg = if is_active {
+                palette.accent
+            } else {
+                palette.icon_fg
+            };
+            div()
+                .id(id)
+                .relative()
+                .cursor_pointer()
+                .w(px(26.0))
+                .h(px(26.0))
+                .rounded(px(6.0))
+                .when(is_active, |el| el.bg(active_bg))
+                .hover(move |s| if is_active { s } else { s.bg(hover_bg) })
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _w, cx| {
+                        on_btn(this, action, cx);
+                    }),
+                )
+                .child(tg_icon(icon, 14.5, fg))
+                .when(badge > 0, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(2.0))
+                            .right(px(2.0))
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(palette.unread_badge_bg)),
+                    )
+                })
+        };
+
+    let tasks_target = if nav.active_destination == NavDestination::TaskCenter {
+        NavDestination::Chats
+    } else {
+        NavDestination::TaskCenter
+    };
+    let remote_target = if nav.active_destination == NavDestination::RemoteComputer {
+        NavDestination::Chats
+    } else {
+        NavDestination::RemoteComputer
+    };
+    let calls_target = if nav.active_destination == NavDestination::Calls {
+        NavDestination::Chats
+    } else {
+        NavDestination::Calls
+    };
+    let settings_target = if nav.active_destination == NavDestination::Settings {
+        NavDestination::Chats
+    } else {
+        NavDestination::Settings
+    };
+
     let on_account = on_action.clone();
-    let on_invite = on_action;
 
     div()
-        .h(px(52.0))
+        .h(px(44.0))
         .flex_shrink_0()
         .w_full()
-        .px(px(12.0))
+        .px(px(10.0))
         .border_t_1()
-        .border_color(rgb(palette.border_fg))
+        .border_color(if is_apple {
+            palette.separator_rgba()
+        } else {
+            rgb(palette.border_fg)
+        })
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(8.0))
+        .gap(px(4.0))
         .child(
             div()
                 .id("sidebar-account-footer-btn")
                 .cursor_pointer()
                 .flex_1()
                 .min_w(px(0.0))
-                .px(px(6.0))
-                .py(px(5.0))
-                .rounded(px(10.0))
+                .px(px(5.0))
+                .py(px(4.0))
+                .rounded(px(8.0))
                 .hover(move |s| s.bg(hover_bg))
                 .flex()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(7.0))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _ev, _w, cx| {
@@ -729,25 +788,25 @@ pub fn render_expanded_gemini_footer<V: 'static>(
                 .child(
                     div()
                         .relative()
-                        .w(px(30.0))
-                        .h(px(30.0))
+                        .w(px(24.0))
+                        .h(px(24.0))
                         .flex_shrink_0()
                         .rounded_full()
                         .bg(rgb(avatar_grad.0))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(11.5))
+                        .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(0xFFFFFF))
                         .child(nav.account_initials.clone())
                         .child(
                             div()
                                 .absolute()
-                                .bottom_0()
-                                .right_0()
-                                .w(px(8.5))
-                                .h(px(8.5))
+                                .bottom(px(-1.0))
+                                .right(px(-1.0))
+                                .w(px(7.5))
+                                .h(px(7.5))
                                 .rounded_full()
                                 .bg(if nav.is_connected {
                                     rgb(palette.online_dot_fg)
@@ -762,43 +821,54 @@ pub fn render_expanded_gemini_footer<V: 'static>(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .overflow_hidden()
-                        .text_size(px(13.0))
+                        .truncate()
+                        .text_size(px(12.5))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(palette.text_primary))
-                        .whitespace_nowrap()
                         .child(display_name),
                 ),
         )
         .child(
             div()
-                .id("sidebar-footer-invite-btn")
-                .cursor_pointer()
-                .flex_shrink_0()
-                .h(px(30.0))
-                .px(px(10.0))
-                .rounded_full()
-                .bg(rgb(palette.input_bg))
-                .border_1()
-                .border_color(rgb(palette.border_fg))
-                .hover(move |s| s.bg(hover_bg))
                 .flex()
                 .items_center()
-                .gap(px(5.0))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _ev, _w, cx| {
-                        on_invite(this, UnifiedSidebarAction::OpenAddFriend, cx);
-                    }),
-                )
-                .child(tg_icon(IconName::GroupUsers, 14.0, palette.icon_fg))
-                .child(
-                    div()
-                        .text_size(px(12.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(palette.text_primary))
-                        .child(tr_str(lang_id, "添加", "Add")),
-                ),
+                .flex_shrink_0()
+                .gap(px(2.0))
+                .child(render_dock_icon_btn(
+                    "top-action-tasks",
+                    IconName::Poll,
+                    nav.active_destination == NavDestination::TaskCenter,
+                    nav.tasks_unread,
+                    UnifiedSidebarAction::SelectDestination(tasks_target),
+                ))
+                .child(render_dock_icon_btn(
+                    "top-action-remote",
+                    IconName::ComputerDesktop,
+                    nav.active_destination == NavDestination::RemoteComputer,
+                    0,
+                    UnifiedSidebarAction::SelectDestination(remote_target),
+                ))
+                .child(render_dock_icon_btn(
+                    "top-action-contacts",
+                    IconName::ContactsUsers,
+                    false,
+                    0,
+                    UnifiedSidebarAction::OpenContacts,
+                ))
+                .child(render_dock_icon_btn(
+                    "top-action-calls",
+                    IconName::PhoneCall,
+                    nav.active_destination == NavDestination::Calls,
+                    nav.calls_unread,
+                    UnifiedSidebarAction::SelectDestination(calls_target),
+                ))
+                .child(render_dock_icon_btn(
+                    "top-action-settings",
+                    IconName::SettingsGear,
+                    nav.active_destination == NavDestination::Settings,
+                    0,
+                    UnifiedSidebarAction::SelectDestination(settings_target),
+                )),
         )
         .into_any_element()
 }

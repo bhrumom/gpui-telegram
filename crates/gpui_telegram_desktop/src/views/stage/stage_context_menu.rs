@@ -39,6 +39,9 @@ pub enum ContextMenuAction {
 /// Canonical Telegram quick-reaction strip emojis (`history_view_reactions_strip.cpp`).
 pub const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "🔥", "🎉", "👏", "😁", "🤔"];
 
+/// Authentic macOS Apple Messages Tapback quick-reaction strip (`❤️ 👍 👎 😂 ‼️ ❓`).
+pub const APPLE_TAPBACK_REACTIONS: &[&str] = &["❤️", "👍", "👎", "😂", "‼️", "❓"];
+
 /// Extended 8-column Telegram reaction catalog (`history_view_reactions_selector.cpp: K_DEFAULT_COLUMNS = 8`).
 pub const EXTENDED_REACTIONS: &[&str] = &[
     "👍", "👎", "❤️", "🔥", "🥰", "👏", "😁", "🤔",
@@ -193,21 +196,40 @@ pub fn render_hover_reaction_overlay<V: 'static>(
     on_toggle_expand: impl Fn(&mut V, &mut Context<V>) + Clone + 'static,
     on_react: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let chosen_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.22);
+    let is_apple = palette.is_apple_style();
+    let chosen_bg = if is_apple {
+        rgb(palette.accent).into()
+    } else {
+        TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.22)
+    };
     let hover_bg = rgb(palette.menu_hover_bg);
+    let glass_bg: Rgba = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.95)
+    } else {
+        rgb(palette.menu_bg).into()
+    };
+    let border_col: Rgba = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg).into()
+    };
+    let quick_list = if is_apple {
+        APPLE_TAPBACK_REACTIONS
+    } else {
+        QUICK_REACTIONS
+    };
 
     let zone = match mode {
         ReactionOverlayMode::CornerButton => {
             let toggle_exp = on_toggle_expand.clone();
-            let btn = div()
+            let mut btn = div()
                 .id(SharedString::from(format!("rx-corner-btn-{}", msg_id)))
-                .w(px(30.0))
-                .h(px(30.0))
+                .w(px(if is_apple { 28.0 } else { 30.0 }))
+                .h(px(if is_apple { 28.0 } else { 30.0 }))
                 .rounded_full()
-                .bg(rgb(palette.menu_bg))
+                .bg(glass_bg)
                 .border_1()
-                .border_color(rgb(palette.border_fg))
-                .shadow_sm()
+                .border_color(border_col)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -221,7 +243,12 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                     }),
                 )
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                .child(tg_icon(IconName::HeartReaction, 15.0, palette.icon_fg));
+                .child(tg_icon(IconName::HeartReaction, 14.0, palette.icon_fg));
+            btn = if is_apple {
+                btn.shadow(palette.popover_shadows())
+            } else {
+                btn.shadow_sm()
+            };
 
             div()
                 .id(SharedString::from(format!("rx-hover-zone-{}", msg_id)))
@@ -245,28 +272,32 @@ pub fn render_hover_reaction_overlay<V: 'static>(
             let mut row = div()
                 .id(SharedString::from(format!("rx-strip-card-{}", msg_id)))
                 .w(px(REACTION_QUICK_STRIP_WIDTH_PX))
-                .h(px(REACTION_QUICK_STRIP_HEIGHT_PX))
-                .px(px(6.0))
+                .h(px(if is_apple { 36.0 } else { REACTION_QUICK_STRIP_HEIGHT_PX }))
+                .px(px(if is_apple { 8.0 } else { 6.0 }))
                 .rounded_full()
-                .bg(rgb(palette.menu_bg))
+                .bg(glass_bg)
                 .border_1()
-                .border_color(rgb(palette.border_fg))
-                .shadow_md()
+                .border_color(border_col)
                 .flex()
                 .items_center()
                 .justify_between()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+            row = if is_apple {
+                row.shadow(palette.popover_shadows())
+            } else {
+                row.shadow_md()
+            };
 
-            for (idx, &emoji) in QUICK_REACTIONS.iter().enumerate() {
+            for (idx, &emoji) in quick_list.iter().enumerate() {
                 let em = emoji.to_string();
                 let is_chosen = chosen_emojis.iter().any(|c| c == emoji);
                 let act = on_react.clone();
                 row = row.child(
                     div()
                         .id(SharedString::from(format!("qreact-{}-{}", msg_id, idx)))
-                        .w(px(26.0))
-                        .h(px(26.0))
+                        .w(px(if is_apple { 28.0 } else { 26.0 }))
+                        .h(px(if is_apple { 28.0 } else { 26.0 }))
                         .rounded_full()
                         .flex_shrink_0()
                         .flex()
@@ -275,10 +306,9 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                         .cursor_pointer()
                         .when(is_chosen, |el| {
                             el.bg(chosen_bg)
-                                .border_1()
-                                .border_color(rgb(palette.accent))
+                                .when(!is_apple, |b| b.border_1().border_color(rgb(palette.accent)))
                         })
-                        .hover(move |s| s.bg(hover_bg).text_size(px(17.0)))
+                        .hover(move |s| s.bg(hover_bg).text_size(px(17.5)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -286,7 +316,7 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                                 act(this, em.clone(), cx);
                             }),
                         )
-                        .text_size(px(15.0))
+                        .text_size(px(15.5))
                         .child(emoji),
                 );
             }
@@ -295,15 +325,19 @@ pub fn render_hover_reaction_overlay<V: 'static>(
             row = row.child(
                 div()
                     .id(SharedString::from(format!("qreact-expand-{}", msg_id)))
-                    .w(px(22.0))
-                    .h(px(22.0))
+                    .w(px(if is_apple { 24.0 } else { 22.0 }))
+                    .h(px(if is_apple { 24.0 } else { 22.0 }))
                     .rounded_full()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .bg(TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.35))
+                    .bg(if is_apple {
+                        TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.14)
+                    } else {
+                        TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.35)
+                    })
                     .hover(move |s| s.bg(hover_bg))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -312,7 +346,15 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                             toggle_exp(this, cx);
                         }),
                     )
-                    .child(tg_icon(IconName::ChevronDown, 12.0, palette.icon_fg)),
+                    .when(is_apple, |el| {
+                        el.text_size(px(14.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(palette.text_secondary))
+                            .child("+")
+                    })
+                    .when(!is_apple, |el| {
+                        el.child(tg_icon(IconName::ChevronDown, 12.0, palette.icon_fg))
+                    }),
             );
 
             // Outer-gutter bridge strictly outside `#bubble-{msg_id}` (`[W, W+36]` / `[-36, 0]`)
@@ -331,18 +373,19 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                     on_hover_bridge(this, *hovered, cx);
                 }));
 
+            let strip_h = if is_apple { 36.0 } else { REACTION_QUICK_STRIP_HEIGHT_PX };
             let strip_zone = div()
                 .id(SharedString::from(format!("rx-hover-zone-{}", msg_id)))
                 .absolute()
                 .w(px(REACTION_QUICK_STRIP_WIDTH_PX))
-                .h(px(REACTION_QUICK_STRIP_HEIGHT_PX + 4.0))
+                .h(px(strip_h + 4.0))
                 .when(is_outgoing, |el| el.right(px(layout.strip_side_offset)))
                 .when(!is_outgoing, |el| el.left(px(layout.strip_side_offset)))
                 .when(!layout.strip_above, |el| {
-                    el.bottom(px(-(REACTION_QUICK_STRIP_HEIGHT_PX + 4.0))).pt(px(4.0))
+                    el.bottom(px(-(strip_h + 4.0))).pt(px(4.0))
                 })
                 .when(layout.strip_above, |el| {
-                    el.top(px(-(REACTION_QUICK_STRIP_HEIGHT_PX + 4.0))).pb(px(4.0))
+                    el.top(px(-(strip_h + 4.0))).pb(px(4.0))
                 })
                 .flex()
                 .items_center()
@@ -367,7 +410,7 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                 .px(px(4.0))
                 .pb(px(4.0))
                 .border_b_1()
-                .border_color(rgb(palette.border_fg))
+                .border_color(border_col)
                 .flex()
                 .items_center()
                 .justify_between()
@@ -423,8 +466,7 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                         .cursor_pointer()
                         .when(is_chosen, |el| {
                             el.bg(chosen_bg)
-                                .border_1()
-                                .border_color(rgb(palette.accent))
+                                .when(!is_apple, |b| b.border_1().border_color(rgb(palette.accent)))
                         })
                         .hover(move |s| s.bg(hover_bg).text_size(px(18.0)))
                         .on_mouse_down(
@@ -439,22 +481,26 @@ pub fn render_hover_reaction_overlay<V: 'static>(
                 );
             }
 
-            let card = div()
+            let mut card = div()
                 .id(SharedString::from(format!("rx-selector-card-{}", msg_id)))
                 .w(px(REACTION_SELECTOR_WIDTH_PX))
                 .h(px(REACTION_SELECTOR_HEIGHT_PX))
                 .p(px(8.0))
                 .rounded(px(14.0))
-                .bg(rgb(palette.menu_bg))
+                .bg(glass_bg)
                 .border_1()
-                .border_color(rgb(palette.border_fg))
-                .shadow_lg()
+                .border_color(border_col)
                 .flex()
                 .flex_col()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .child(header)
                 .child(grid);
+            card = if is_apple {
+                card.shadow(palette.popover_shadows())
+            } else {
+                card.shadow_lg()
+            };
 
             div()
                 .id(SharedString::from(format!("rx-hover-zone-{}", msg_id)))
@@ -548,8 +594,28 @@ pub fn render_message_context_menu<V: 'static>(
     let max_y = (stage_h - est_menu_h - 8.0).max(8.0);
     let menu_x = f32::from(pos.x).clamp(8.0, max_x);
     let menu_y = f32::from(pos.y).clamp(8.0, max_y);
-    let chosen_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.22);
+    let is_apple = palette.is_apple_style();
+    let chosen_bg: Rgba = if is_apple {
+        rgb(palette.accent).into()
+    } else {
+        TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.22)
+    };
     let hover_bg = rgb(palette.menu_hover_bg);
+    let glass_bg: Rgba = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.96)
+    } else {
+        rgb(palette.menu_bg).into()
+    };
+    let border_col: Rgba = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg).into()
+    };
+    let quick_list = if is_apple {
+        APPLE_TAPBACK_REACTIONS
+    } else {
+        QUICK_REACTIONS
+    };
 
     let mut menu_box = div()
         .id("msg-context-menu-popup")
@@ -558,18 +624,22 @@ pub fn render_message_context_menu<V: 'static>(
         .top(px(menu_y))
         .w(px(menu_w))
         .p(px(6.0))
-        .rounded(px(10.0))
-        .bg(rgb(palette.menu_bg))
+        .rounded(px(if is_apple { 14.0 } else { 10.0 }))
+        .bg(glass_bg)
         .border_1()
-        .border_color(rgb(palette.border_fg))
-        .shadow_lg()
+        .border_color(border_col)
         .flex()
         .flex_col()
         .gap(px(2.0))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+    menu_box = if is_apple {
+        menu_box.shadow(palette.popover_shadows())
+    } else {
+        menu_box.shadow_lg()
+    };
 
-    // Quick-reactions top strip + expand toggle (`▾`)
+    // Quick-reactions top strip + expand toggle (`+` / `▾`)
     let mut rx_row = div()
         .flex()
         .items_center()
@@ -579,18 +649,18 @@ pub fn render_message_context_menu<V: 'static>(
         .when(!reactions_expanded, |el| {
             el.mb(px(4.0))
                 .border_b_1()
-                .border_color(rgb(palette.border_fg))
+                .border_color(border_col)
         });
 
-    for (idx, &emoji) in QUICK_REACTIONS.iter().enumerate() {
+    for (idx, &emoji) in quick_list.iter().enumerate() {
         let em = emoji.to_string();
         let is_chosen = chosen_emojis.iter().any(|c| c == emoji);
         let a = act_react.clone();
         rx_row = rx_row.child(
             div()
                 .id(SharedString::from(format!("ctx-rx-{}-{}", msg_id, idx)))
-                .w(px(26.0))
-                .h(px(26.0))
+                .w(px(if is_apple { 28.0 } else { 26.0 }))
+                .h(px(if is_apple { 28.0 } else { 26.0 }))
                 .rounded_full()
                 .flex()
                 .items_center()
@@ -598,8 +668,7 @@ pub fn render_message_context_menu<V: 'static>(
                 .cursor_pointer()
                 .when(is_chosen, |el| {
                     el.bg(chosen_bg)
-                        .border_1()
-                        .border_color(rgb(palette.accent))
+                        .when(!is_apple, |b| b.border_1().border_color(rgb(palette.accent)))
                 })
                 .hover(move |s| s.bg(hover_bg))
                 .on_mouse_down(
@@ -609,7 +678,7 @@ pub fn render_message_context_menu<V: 'static>(
                         a(this, ContextMenuAction::React(msg_id, em.clone()), cx);
                     }),
                 )
-                .text_size(px(15.0))
+                .text_size(px(15.5))
                 .child(emoji),
         );
     }
@@ -618,15 +687,19 @@ pub fn render_message_context_menu<V: 'static>(
     rx_row = rx_row.child(
         div()
             .id(SharedString::from(format!("ctx-rx-expand-{}", msg_id)))
-            .w(px(22.0))
-            .h(px(22.0))
+            .w(px(24.0))
+            .h(px(24.0))
             .rounded_full()
             .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .bg(TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.35))
+            .bg(if is_apple {
+                TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.14)
+            } else {
+                TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.35)
+            })
             .hover(move |s| s.bg(hover_bg))
             .on_mouse_down(
                 MouseButton::Left,
@@ -635,15 +708,23 @@ pub fn render_message_context_menu<V: 'static>(
                     act_toggle_exp(this, ContextMenuAction::ToggleExpandReactions, cx);
                 }),
             )
-            .child(tg_icon(
-                if reactions_expanded {
-                    IconName::Close
-                } else {
-                    IconName::ChevronDown
-                },
-                11.0,
-                palette.icon_fg,
-            )),
+            .when(is_apple && !reactions_expanded, |el| {
+                el.text_size(px(14.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(palette.text_secondary))
+                    .child("+")
+            })
+            .when(!is_apple || reactions_expanded, |el| {
+                el.child(tg_icon(
+                    if reactions_expanded {
+                        IconName::Close
+                    } else {
+                        IconName::ChevronDown
+                    },
+                    11.0,
+                    palette.icon_fg,
+                ))
+            }),
     );
 
     menu_box = menu_box.child(rx_row);
@@ -655,7 +736,7 @@ pub fn render_message_context_menu<V: 'static>(
             .pb(px(6.0))
             .mb(px(4.0))
             .border_b_1()
-            .border_color(rgb(palette.border_fg))
+            .border_color(border_col)
             .flex()
             .flex_wrap()
             .gap(px(4.0));
@@ -677,8 +758,7 @@ pub fn render_message_context_menu<V: 'static>(
                     .cursor_pointer()
                     .when(is_chosen, |el| {
                         el.bg(chosen_bg)
-                            .border_1()
-                            .border_color(rgb(palette.accent))
+                            .when(!is_apple, |b| b.border_1().border_color(rgb(palette.accent)))
                     })
                     .hover(move |s| s.bg(hover_bg).text_size(px(18.0)))
                     .on_mouse_down(
@@ -750,7 +830,7 @@ pub fn render_message_context_menu<V: 'static>(
             let a = on_action.clone();
             move |this, cx| a(this, ContextMenuAction::Select(msg_id), cx)
         }))
-        .child(div().my(px(2.0)).h(px(1.0)).w_full().bg(rgb(palette.border_fg)))
+        .child(div().my(px(2.0)).h(px(1.0)).w_full().bg(border_col))
         .child(ctx_menu_item("ctx-delete", IconName::DeleteTrash, tr_key_or(lang_id, "lng_context_delete_msg", "Delete"), true, palette, cx, {
             let a = on_action.clone();
             move |this, cx| a(this, ContextMenuAction::Delete(msg_id), cx)
@@ -783,11 +863,12 @@ fn ctx_menu_item<V: 'static>(
     let fg = if danger { palette.danger } else { palette.text_primary };
     let icon_fg = if danger { palette.danger } else { palette.icon_fg };
     let hover_bg = palette.menu_hover_bg;
+    let is_apple = palette.is_apple_style();
     div()
         .id(id)
         .px(px(10.0))
-        .py(px(6.0))
-        .rounded(px(6.0))
+        .py(px(if is_apple { 6.5 } else { 6.0 }))
+        .rounded(px(if is_apple { 8.0 } else { 6.0 }))
         .flex()
         .items_center()
         .gap(px(10.0))

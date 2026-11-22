@@ -73,6 +73,7 @@ pub fn render_autocomplete_popup<V: 'static>(
 
     let sel_idx = ac.selected_index.max(0) as usize;
     let hbg = palette.menu_hover_bg;
+    let is_apple = palette.is_apple_style();
     let mut box_el = div()
         .id("composer-autocomplete-popup")
         .w(px(340.0))
@@ -80,14 +81,26 @@ pub fn render_autocomplete_popup<V: 'static>(
         .overflow_y_scroll()
         .mb(px(6.0))
         .p(px(6.0))
-        .rounded(px(10.0))
-        .bg(rgb(palette.menu_bg))
+        .rounded(px(if is_apple { 14.0 } else { 10.0 }))
+        .bg(if is_apple {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.96)
+        } else {
+            rgb(palette.menu_bg).into()
+        })
         .border_1()
-        .border_color(rgb(palette.border_fg))
-        .shadow_lg()
+        .border_color(if is_apple {
+            palette.separator_rgba()
+        } else {
+            rgb(palette.border_fg).into()
+        })
         .flex()
         .flex_col()
         .gap(px(2.0));
+    box_el = if is_apple {
+        box_el.shadow(palette.popover_shadows())
+    } else {
+        box_el.shadow_lg()
+    };
 
     for (idx, (primary, secondary, insert)) in rows.into_iter().enumerate() {
         let act = on_action.clone();
@@ -151,19 +164,33 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
         .cloned()
         .collect();
 
+    let is_apple = palette.is_apple_style();
+    let sep_col: Rgba = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg).into()
+    };
     let mut box_el = div()
         .id("composer-attachments-popup")
         .w(px(236.0))
         .mb(px(8.0))
         .p(px(6.0))
-        .rounded(px(10.0))
-        .bg(rgb(palette.menu_bg))
+        .rounded(px(if is_apple { 14.0 } else { 10.0 }))
+        .bg(if is_apple {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.96)
+        } else {
+            rgb(palette.menu_bg).into()
+        })
         .border_1()
-        .border_color(rgb(palette.border_fg))
-        .shadow_lg()
+        .border_color(sep_col)
         .flex()
         .flex_col()
         .gap(px(2.0));
+    box_el = if is_apple {
+        box_el.shadow(palette.popover_shadows())
+    } else {
+        box_el.shadow_lg()
+    };
 
     for (idx, (kind, icon, label)) in entries.into_iter().enumerate() {
         let act = on_action.clone();
@@ -172,7 +199,7 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
                 .id(SharedString::from(format!("att-opt-{}", idx)))
                 .px(px(10.0))
                 .py(px(7.0))
-                .rounded(px(7.0))
+                .rounded(px(if is_apple { 8.0 } else { 7.0 }))
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(hbg)))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -188,7 +215,7 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
 
     if !filtered_apps.is_empty() {
         box_el = box_el
-            .child(div().w_full().h(px(1.0)).my(px(4.0)).bg(rgb(palette.border_fg)))
+            .child(div().w_full().h(px(1.0)).my(px(4.0)).bg(sep_col))
             .child(
                 div()
                     .px(px(10.0))
@@ -269,18 +296,30 @@ pub fn render_formatting_toolbar<V: 'static>(
         (TextStyleKind::Link, "Link"),
     ];
     let hbg = palette.menu_hover_bg;
+    let is_apple = palette.is_apple_style();
     let mut row = div()
         .id("composer-formatting-bar")
         .px(px(8.0))
         .py(px(5.0))
         .mb(px(6.0))
-        .rounded(px(8.0))
-        .bg(rgb(palette.card_bg))
+        .rounded(px(if is_apple { 12.0 } else { 8.0 }))
+        .bg(if is_apple {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.96)
+        } else {
+            rgb(palette.card_bg).into()
+        })
         .border_1()
-        .border_color(rgb(palette.border_fg))
+        .border_color(if is_apple {
+            palette.separator_rgba()
+        } else {
+            rgb(palette.border_fg).into()
+        })
         .flex()
         .items_center()
         .gap(px(4.0));
+    if is_apple {
+        row = row.shadow(palette.popover_shadows());
+    }
 
     for (idx, (kind, lbl)) in items.into_iter().enumerate() {
         let active = fmt.has_style(kind);
@@ -313,16 +352,24 @@ pub fn render_send_options_popup<V: 'static>(
     let a_sil = on_action.clone();
     let a_sch = on_action;
     let hbg = palette.menu_hover_bg;
-    div()
+    let is_apple = palette.is_apple_style();
+    let mut card = div()
         .id("composer-send-opts")
         .w(px(210.0))
         .p(px(6.0))
         .mb(px(6.0))
-        .rounded(px(10.0))
-        .bg(rgb(palette.menu_bg))
+        .rounded(px(if is_apple { 14.0 } else { 10.0 }))
+        .bg(if is_apple {
+            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.96)
+        } else {
+            rgb(palette.menu_bg).into()
+        })
         .border_1()
-        .border_color(rgb(palette.border_fg))
-        .shadow_lg()
+        .border_color(if is_apple {
+            palette.separator_rgba()
+        } else {
+            rgb(palette.border_fg).into()
+        })
         .flex()
         .flex_col()
         .gap(px(2.0))
@@ -331,7 +378,7 @@ pub fn render_send_options_popup<V: 'static>(
                 .id("send-silent-opt")
                 .px(px(10.0))
                 .py(px(7.0))
-                .rounded(px(7.0))
+                .rounded(px(if is_apple { 8.0 } else { 7.0 }))
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(hbg)))
                 .on_click(cx.listener(move |this, _, _, cx| a_sil(this, ComposerPopupAction::SendSilent, cx)))
@@ -346,7 +393,7 @@ pub fn render_send_options_popup<V: 'static>(
                 .id("send-schedule-opt")
                 .px(px(10.0))
                 .py(px(7.0))
-                .rounded(px(7.0))
+                .rounded(px(if is_apple { 8.0 } else { 7.0 }))
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(hbg)))
                 .on_click(cx.listener(move |this, _, _, cx| a_sch(this, ComposerPopupAction::ScheduleMessage, cx)))
@@ -355,6 +402,11 @@ pub fn render_send_options_popup<V: 'static>(
                 .gap(px(8.0))
                 .child(tg_icon(IconName::ClockSending, 15.0, palette.icon_fg))
                 .child(div().text_size(px(13.0)).text_color(rgb(palette.text_primary)).child(tr_key_or(lang_id, "lng_schedule_message", "Schedule Message"))),
-        )
-        .into_any_element()
+        );
+    card = if is_apple {
+        card.shadow(palette.popover_shadows())
+    } else {
+        card.shadow_lg()
+    };
+    card.into_any_element()
 }

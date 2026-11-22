@@ -73,16 +73,26 @@ pub fn render_tabbed_selector_popup<V: 'static>(
         _ => render_gifs_body(search_query, gifs_list, palette, lang_id, cx, on_action),
     };
 
-    div()
+    let is_apple = palette.is_apple_style();
+    let sep_col: Rgba = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg).into()
+    };
+
+    let mut popup = div()
         .id("tabbed-selector-popup")
         .w(px(346.0))
         .h(px(332.0))
         .mb(px(8.0))
-        .rounded(px(12.0))
-        .bg(rgb(palette.modal_bg))
+        .rounded(px(if is_apple { 14.0 } else { 12.0 }))
+        .bg(if is_apple {
+            TdesktopThemePalette::rgba_with_alpha(palette.modal_bg, 0.96)
+        } else {
+            rgb(palette.modal_bg).into()
+        })
         .border_1()
-        .border_color(rgb(palette.border_fg))
-        .shadow_lg()
+        .border_color(sep_col)
         .flex()
         .flex_col()
         .overflow_hidden()
@@ -91,16 +101,20 @@ pub fn render_tabbed_selector_popup<V: 'static>(
                 .px(px(10.0))
                 .py(px(8.0))
                 .border_b_1()
-                .border_color(rgb(palette.border_fg))
+                .border_color(sep_col)
                 .child(
                     div()
                         .id("sel-search-box")
                         .px(px(10.0))
                         .py(px(5.0))
-                        .rounded(px(8.0))
+                        .rounded(px(if is_apple { 14.0 } else { 8.0 }))
                         .bg(rgb(palette.input_bg))
                         .border_1()
-                        .border_color(rgb(if search_focused { palette.accent } else { palette.border_fg }))
+                        .border_color(if search_focused {
+                            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.72)
+                        } else {
+                            sep_col
+                        })
                         .cursor_text()
                         .on_click(cx.listener(move |this, _, _, cx| a_focus(this, SelectorUiAction::FocusSearch, cx)))
                         .flex()
@@ -141,7 +155,7 @@ pub fn render_tabbed_selector_popup<V: 'static>(
                 .h(px(40.0))
                 .px(px(10.0))
                 .border_t_1()
-                .border_color(rgb(palette.border_fg))
+                .border_color(sep_col)
                 .bg(rgb(palette.topbar_bg))
                 .flex()
                 .items_center()
@@ -149,8 +163,13 @@ pub fn render_tabbed_selector_popup<V: 'static>(
                 .child(tab_btn("sel-tab-emoji", IconName::SmileEmoji, "Emoji", active_tab == 0, palette, cx, move |this, cx| a_t0(this, SelectorUiAction::SwitchTab(0), cx)))
                 .child(tab_btn("sel-tab-stickers", IconName::Sticker, "Stickers", active_tab == 1, palette, cx, move |this, cx| a_t1(this, SelectorUiAction::SwitchTab(1), cx)))
                 .child(tab_btn("sel-tab-gifs", IconName::Gif, "GIFs", active_tab == 2, palette, cx, move |this, cx| a_t2(this, SelectorUiAction::SwitchTab(2), cx))),
-        )
-        .into_any_element()
+        );
+    popup = if is_apple {
+        popup.shadow(palette.popover_shadows())
+    } else {
+        popup.shadow_lg()
+    };
+    popup.into_any_element()
 }
 
 fn tab_btn<V: 'static>(

@@ -8,7 +8,8 @@ use crate::views::drawer::bot_computer_inspector::{
     render_bot_computers_subpage, render_bot_config_editor, render_bot_profile_main,
 };
 use crate::views::drawer::inspector_panels::{
-    render_members_panel, render_settings_and_stats_panel, render_shared_media_panel,
+    render_contact_profile_panel, render_members_panel, render_settings_and_stats_panel,
+    render_shared_media_panel, segmented_active_bg, segmented_pill_shadow,
 };
 use crate::views::drawer::inspector_tabs::*;
 use crate::views::drawer::statistics::info_statistics_inner_widget::ChartDataPoint;
@@ -635,8 +636,9 @@ impl Render for ContextInspector {
                         }
                     }
                 } else {
-                    InspectorTabsView::render_profile(
+                    render_contact_profile_panel(
                         &self.profile,
+                        &self.shared_media,
                         self.is_secret_chat_active,
                         self.is_contact_blocked,
                         self.copied_feedback.as_ref(),
@@ -710,26 +712,40 @@ impl Render for ContextInspector {
         };
 
         let show_tabs = subpage == InspectorSubpage::Main && (!self.profile.is_bot || has_bot_media);
+        let header_height = if pal.is_apple_style() { 52.0 } else { HEADER_HEIGHT };
+        let drawer_bg = if pal.is_apple_style() {
+            pal.stage_bg
+        } else {
+            pal.dialogs_bg
+        };
+
         let mut root = div()
             .w(px(DRAWER_WIDTH))
             .flex_shrink_0()
             .h_full()
-            .bg(rgb(pal.dialogs_bg))
+            .bg(rgb(drawer_bg))
             .border_l_1()
-            .border_color(rgb(pal.border_fg))
+            .border_color(pal.separator_rgba())
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(HEADER_HEIGHT))
+                    .h(px(header_height))
                     .flex_shrink_0()
-                    .px(px(16.0))
+                    .px(px(14.0))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(rgb(pal.border_fg))
+                    .gap(px(8.0))
+                    .when(!pal.is_apple_style(), |el| {
+                        el.border_b_1().border_color(rgb(pal.border_fg))
+                    })
                     .child(header_left)
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
                     .child(
                         div()
                             .flex()
@@ -791,21 +807,23 @@ impl Render for ContextInspector {
                                             cx.notify();
                                         }),
                                     )
-                                    .child(tg_icon(IconName::Close, 15.0, pal.icon_fg)),
+                                    .child(tg_icon(IconName::Close, 14.0, pal.icon_fg)),
                             ),
                     ),
             );
 
         if show_tabs {
-            let mut tabs_row = div()
-                .h(px(40.0))
-                .flex_shrink_0()
-                .px(px(8.0))
+            let mut seg_track = div()
+                .w_full()
+                .h(px(30.0))
+                .p(px(2.5))
+                .rounded(px(9.0))
+                .bg(rgb(pal.input_bg))
+                .border_1()
+                .border_color(pal.separator_rgba())
                 .flex()
                 .items_center()
-                .justify_around()
-                .border_b_1()
-                .border_color(rgb(pal.border_fg))
+                .gap(px(2.0))
                 .child(Self::tab_btn(
                     tr_str(lang, "资料", "Profile"),
                     InspectorTab::Profile,
@@ -814,7 +832,7 @@ impl Render for ContextInspector {
                     cx,
                 ));
             if self.profile.is_bot {
-                tabs_row = tabs_row.child(Self::tab_btn(
+                seg_track = seg_track.child(Self::tab_btn(
                     tr_str(lang, "媒体", "Media"),
                     InspectorTab::SharedMedia,
                     active_tab,
@@ -823,7 +841,7 @@ impl Render for ContextInspector {
                 ));
             } else {
                 if self.members.is_group_or_channel {
-                    tabs_row = tabs_row.child(Self::tab_btn(
+                    seg_track = seg_track.child(Self::tab_btn(
                         tr_str(lang, "成员", "Members"),
                         InspectorTab::Members,
                         active_tab,
@@ -831,7 +849,7 @@ impl Render for ContextInspector {
                         cx,
                     ));
                 }
-                tabs_row = tabs_row
+                seg_track = seg_track
                     .child(Self::tab_btn(
                         tr_str(lang, "媒体", "Media"),
                         InspectorTab::SharedMedia,
@@ -847,7 +865,13 @@ impl Render for ContextInspector {
                         cx,
                     ));
             }
-            root = root.child(tabs_row);
+            root = root.child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(14.0))
+                    .pb(px(10.0))
+                    .child(seg_track),
+            );
         }
 
         root.child(
@@ -855,7 +879,9 @@ impl Render for ContextInspector {
                 .id("inspector-tab-scroll")
                 .flex_1()
                 .min_h(px(0.0))
-                .p(px(14.0))
+                .px(px(14.0))
+                .pb(px(16.0))
+                .pt(px(4.0))
                 .overflow_y_scroll()
                 .child(body),
         )
@@ -864,13 +890,53 @@ impl Render for ContextInspector {
 }
 
 impl ContextInspector {
-    fn tab_btn(label: &str, tab: InspectorTab, active: InspectorTab, pal: TdesktopThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn tab_btn(
+        label: &str,
+        tab: InspectorTab,
+        active: InspectorTab,
+        pal: TdesktopThemePalette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let sel = tab == active;
-        div().cursor_pointer().h_full().px(px(8.0)).flex().items_center().border_b_2()
-            .border_color(if sel { rgba((pal.accent << 8) | 0xFF) } else { rgba(0x00000000) })
-            .text_size(px(12.0)).font_weight(if sel { FontWeight::BOLD } else { FontWeight::NORMAL })
-            .text_color(rgb(if sel { pal.accent } else { pal.text_secondary }))
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _e, _w, cx| { this.set_tab(tab); cx.notify(); }))
+        div()
+            .cursor_pointer()
+            .flex_1()
+            .h_full()
+            .px(px(6.0))
+            .rounded(px(7.0))
+            .when(sel, |el| {
+                el.bg(segmented_active_bg(pal))
+                    .shadow(segmented_pill_shadow(pal))
+            })
+            .when(!sel, |el| {
+                el.hover(move |s| {
+                    s.bg(TdesktopThemePalette::rgba_with_alpha(
+                        if pal.mode.is_dark() { 0xFFFFFF } else { 0x000000 },
+                        0.04,
+                    ))
+                })
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(11.5))
+            .font_weight(if sel {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::MEDIUM
+            })
+            .text_color(rgb(if sel {
+                pal.text_primary
+            } else {
+                pal.text_secondary
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _e, _w, cx| {
+                    this.set_tab(tab);
+                    cx.notify();
+                }),
+            )
             .child(label.to_string())
     }
 }

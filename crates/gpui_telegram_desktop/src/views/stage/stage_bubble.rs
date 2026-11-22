@@ -34,6 +34,12 @@ use super::stage_context_menu::{
     render_hover_reaction_overlay, ContextMenuAction, ReactionOverlayLayout, ReactionOverlayMode,
 };
 
+/// Compact minimum bubble width in Apple Messages style so short messages like "好" / "OK"
+/// hug tightly as sleek pills without altering `history_element::MSG_MIN_WIDTH` (`160.0`).
+pub const APPLE_MSG_MIN_WIDTH: f32 = 38.0;
+const APPLE_AVATAR_SIZE: f32 = 28.0;
+const APPLE_AVATAR_SKIP: f32 = 34.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BubbleGroupLayout {
     pub attached_to_prev: bool,
@@ -190,41 +196,44 @@ fn compute_definite_bubble_width(
         _ => return None,
     }
 
-    let pad_base = if palette.mode.is_fabushi_style() { 25.0 } else { 22.0 };
-    let horiz_pad = palette.scaled_px(pad_base) + 6.0;
+    let is_apple = palette.is_apple_style();
+    let pad_base = if is_apple { 26.0 } else { 22.0 };
+    let horiz_pad = palette.scaled_px(pad_base) + if is_apple { 4.0 } else { 6.0 };
     let mut needed_w = eff_min_w;
 
-    let meta_font = palette.scaled_px(10.5);
     let is_zh = lang_id.starts_with("zh");
-    let is_edited = matches!(msg.content, MessageContent::Text { is_edited: true, .. })
-        || meta.and_then(|m| m.edit_date.as_ref()).is_some();
-    let views = meta.and_then(|m| m.views_count);
-    let mut meta_w = measure_single_line_width_px(&msg.timestamp, meta_font, FontWeight::NORMAL, window)
-        + horiz_pad
-        + 6.0;
-    if is_outgoing {
-        meta_w += palette.scaled_px(18.0);
-    }
-    if is_edited {
-        let elabel = if is_zh { "已编辑" } else { "edited" };
-        meta_w += measure_single_line_width_px(elabel, meta_font, FontWeight::NORMAL, window)
-            + palette.scaled_px(5.0);
-    }
-    if let Some(vc) = views {
-        let vlabel = if is_zh {
-            format!("{} 次浏览", format_view_count(vc))
-        } else {
-            format!("{} views", format_view_count(vc))
-        };
-        meta_w += measure_single_line_width_px(&vlabel, meta_font, FontWeight::NORMAL, window)
-            + palette.scaled_px(5.0);
-    }
-    needed_w = needed_w.max(meta_w);
+    if !is_apple {
+        let meta_font = palette.scaled_px(10.5);
+        let is_edited = matches!(msg.content, MessageContent::Text { is_edited: true, .. })
+            || meta.and_then(|m| m.edit_date.as_ref()).is_some();
+        let views = meta.and_then(|m| m.views_count);
+        let mut meta_w = measure_single_line_width_px(&msg.timestamp, meta_font, FontWeight::NORMAL, window)
+            + horiz_pad
+            + 6.0;
+        if is_outgoing {
+            meta_w += palette.scaled_px(18.0);
+        }
+        if is_edited {
+            let elabel = if is_zh { "已编辑" } else { "edited" };
+            meta_w += measure_single_line_width_px(elabel, meta_font, FontWeight::NORMAL, window)
+                + palette.scaled_px(5.0);
+        }
+        if let Some(vc) = views {
+            let vlabel = if is_zh {
+                format!("{} 次浏览", format_view_count(vc))
+            } else {
+                format!("{} views", format_view_count(vc))
+            };
+            meta_w += measure_single_line_width_px(&vlabel, meta_font, FontWeight::NORMAL, window)
+                + palette.scaled_px(5.0);
+        }
+        needed_w = needed_w.max(meta_w);
 
-    if group.show_sender_name && !is_outgoing {
-        needed_w = needed_w.max(
-            measure_single_line_width_px(&msg.sender_name, 12.0, FontWeight::BOLD, window) + horiz_pad,
-        );
+        if group.show_sender_name && !is_outgoing {
+            needed_w = needed_w.max(
+                measure_single_line_width_px(&msg.sender_name, 12.0, FontWeight::BOLD, window) + horiz_pad,
+            );
+        }
     }
     if let Some(fwd) = meta.and_then(|m| m.forward_from.as_ref()) {
         let fwd_label = if is_zh {
@@ -248,7 +257,7 @@ fn compute_definite_bubble_width(
             + horiz_pad;
         needed_w = needed_w.max(reply_w);
     }
-    if !msg.reactions.is_empty() {
+    if !is_apple && !msg.reactions.is_empty() {
         let rx_w = (msg.reactions.len() as f32) * 52.0 + horiz_pad;
         needed_w = needed_w.max(rx_w);
     }
@@ -400,19 +409,87 @@ pub fn render_message_row_1to1<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, BubbleUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    render_message_row_apple(
+        msg,
+        meta,
+        active_fabushi_bot,
+        group,
+        stage_w,
+        is_selected,
+        has_any_selection,
+        false,
+        false,
+        reaction_overlay_mode,
+        reaction_overlay_layout,
+        bubble_widths_probe,
+        bubble_bounds_probe,
+        row_heights_probe,
+        highlight_alpha,
+        is_unread_anchor,
+        date_divider_label,
+        revealed_spoilers,
+        expanded_quotes,
+        copied_code_msg,
+        bot_assist,
+        palette,
+        lang_id,
+        window,
+        cx,
+        on_action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_message_row_apple<V: 'static>(
+    msg: &MessageItemModel,
+    meta: Option<&MessageRichMeta>,
+    active_fabushi_bot: Option<&FabushiBotSummaryDto>,
+    group: BubbleGroupLayout,
+    stage_w: f32,
+    is_selected: bool,
+    has_any_selection: bool,
+    is_last_outgoing: bool,
+    is_row_hovered: bool,
+    reaction_overlay_mode: Option<ReactionOverlayMode>,
+    reaction_overlay_layout: ReactionOverlayLayout,
+    bubble_widths_probe: Option<Rc<RefCell<HashMap<u64, f32>>>>,
+    bubble_bounds_probe: Option<Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>>,
+    row_heights_probe: Option<Rc<RefCell<HashMap<u64, f32>>>>,
+    highlight_alpha: f32,
+    is_unread_anchor: bool,
+    date_divider_label: Option<&str>,
+    revealed_spoilers: &HashSet<(u64, usize)>,
+    expanded_quotes: &HashSet<(u64, usize)>,
+    copied_code_msg: Option<u64>,
+    bot_assist: Option<BotAssistRenderContext<'_>>,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    window: &Window,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, BubbleUiAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
     let msg_id = msg.id;
     let is_outgoing = msg.direction == MessageDirection::Outgoing;
+    let is_apple = palette.is_apple_style();
 
     if let MessageContent::Service { text, .. } = &msg.content {
         return div()
             .id(SharedString::from(format!("svc-row-{}", msg_id)))
             .relative()
             .w_full()
-            .py(px(8.0))
+            .py(px(if is_apple { 10.0 } else { 8.0 }))
             .flex_shrink_0()
             .flex()
             .justify_center()
-            .child(
+            .child(if is_apple {
+                div()
+                    .px(px(10.0))
+                    .py(px(2.0))
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(palette.text_secondary))
+                    .child(text.clone())
+            } else {
                 div()
                     .px(px(14.0))
                     .py(px(4.0))
@@ -421,29 +498,29 @@ pub fn render_message_row_1to1<V: 'static>(
                     .text_size(px(12.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(palette.service_pill_fg))
-                    .child(text.clone()),
-            )
+                    .child(text.clone())
+            })
             .when_some(row_heights_probe, |el, probe| {
                 el.child(make_row_height_probe_canvas(msg_id, probe))
             })
             .into_any_element();
     }
 
-    let is_fabushi = palette.mode.is_fabushi_style();
-    let eff_r = if is_fabushi && palette.bubble_radius_px == 12 {
-        17.0
+    let is_apple_out = is_apple && is_outgoing;
+    let eff_r = if is_apple && matches!(palette.bubble_radius_px, 12 | 17 | 18) {
+        18.0
     } else {
         palette.bubble_radius_px as f32
     };
     let r_lg = palette.scaled_px(eff_r);
-    let r_sm = palette.scaled_px(if is_fabushi { 6.0 } else { 4.0 });
+    let r_sm = palette.scaled_px(if is_apple { 6.0 } else { 4.0 });
     let (tl, tr, br, bl) = if is_outgoing {
         (
             r_lg,
             if group.attached_to_prev { r_sm } else { r_lg },
             if group.attached_to_next {
                 r_sm
-            } else if group.show_tail && !is_fabushi {
+            } else if group.show_tail && !is_apple {
                 2.0
             } else {
                 r_lg
@@ -457,7 +534,7 @@ pub fn render_message_row_1to1<V: 'static>(
             r_lg,
             if group.attached_to_next {
                 r_sm
-            } else if group.show_tail && !is_fabushi {
+            } else if group.show_tail && !is_apple {
                 2.0
             } else {
                 r_lg
@@ -466,6 +543,24 @@ pub fn render_message_row_1to1<V: 'static>(
     };
 
     let is_local_bot_card = matches!(msg.content, MessageContent::LocalBotAssistCard(_));
+    let is_apple_fullbleed_media = is_apple
+        && !is_local_bot_card
+        && meta.map_or(true, |m| {
+            m.document.is_none() && m.contact.is_none() && m.forward_from.is_none()
+        })
+        && msg.reply_to.is_none()
+        && matches!(
+            &msg.content,
+            MessageContent::Media { .. } | MessageContent::Album { .. }
+        );
+    let is_apple_media_no_caption = is_apple_fullbleed_media
+        && match &msg.content {
+            MessageContent::Media { caption, .. } | MessageContent::Album { caption, .. } => {
+                caption.as_deref().map_or(true, |c| c.trim().is_empty())
+            }
+            _ => false,
+        };
+
     let bubble_hex = if is_local_bot_card {
         if is_selected {
             0x1E293B
@@ -480,14 +575,32 @@ pub fn render_message_row_1to1<V: 'static>(
             (false, false) => palette.msg_in_bg,
         }
     };
+    let tail_hex = if is_apple && !is_local_bot_card {
+        match (is_outgoing, is_selected) {
+            (true, true) => palette.msg_out_selected_bg,
+            (true, false) => palette.msg_out_bg_bottom,
+            (false, true) => palette.msg_in_selected_bg,
+            (false, false) => palette.msg_in_bg,
+        }
+    } else {
+        bubble_hex
+    };
 
     let body_el = render_bubble_inner_content(
         msg, meta, is_outgoing, revealed_spoilers, expanded_quotes, copied_code_msg, bot_assist, palette, lang_id, cx, on_action.clone(),
     );
 
-    let eff_min_w = palette.scaled_px(MSG_MIN_WIDTH);
+    let eff_min_w = palette.scaled_px(if is_apple {
+        APPLE_MSG_MIN_WIDTH
+    } else {
+        MSG_MIN_WIDTH
+    });
     let avatar_skip = if !is_outgoing && group.reserve_avatar_column {
-        MSG_PHOTO_SKIP
+        if is_apple {
+            APPLE_AVATAR_SKIP
+        } else {
+            MSG_PHOTO_SKIP
+        }
     } else {
         0.0
     };
@@ -523,18 +636,30 @@ pub fn render_message_row_1to1<V: 'static>(
         .when(definite_w.is_none(), |el| {
             el.min_w(px(eff_min_w)).max_w(px(eff_max_w))
         })
-        .px(px(palette.scaled_px(if is_fabushi { 12.5 } else { 11.0 })))
-        .py(px(palette.scaled_px(if is_fabushi { 8.0 } else { 7.0 })))
+        .when(is_apple_media_no_caption, |el| el.px(px(0.0)).py(px(0.0)))
+        .when(is_apple_fullbleed_media && !is_apple_media_no_caption, |el| {
+            el.px(px(0.0)).pt(px(0.0)).pb(px(palette.scaled_px(8.0)))
+        })
+        .when(!is_apple_fullbleed_media, |el| {
+            el.px(px(palette.scaled_px(if is_apple { 13.0 } else { 11.0 })))
+                .py(px(palette.scaled_px(if is_apple { 7.5 } else { 7.0 })))
+        })
         .rounded_tl(px(tl))
         .rounded_tr(px(tr))
         .rounded_br(px(br))
-        .rounded_bl(px(bl))
-        .bg(rgb(bubble_hex))
+        .rounded_bl(px(bl));
+
+    bubble = if is_apple_media_no_caption && !is_selected {
+        bubble
+    } else if is_apple && is_outgoing && !is_selected && !is_local_bot_card {
+        bubble.bg(palette.msg_out_gradient())
+    } else {
+        bubble.bg(rgb(bubble_hex))
+    };
+
+    bubble = bubble
         .when(is_local_bot_card && !is_selected && highlight_alpha <= 0.01, |el| {
             el.border_1().border_color(rgb(0x2A3140))
-        })
-        .when(is_fabushi && !is_local_bot_card && (!is_outgoing || !palette.mode.is_dark()) && !is_selected && highlight_alpha <= 0.01, |el| {
-            el.border_1().border_color(rgb(palette.border_fg))
         })
         .when(is_selected, |el| el.border_1().border_color(rgb(palette.accent)))
         .when(highlight_alpha > 0.01, |el| {
@@ -546,7 +671,7 @@ pub fn render_message_row_1to1<V: 'static>(
                 act_dbl(this, BubbleUiAction::ToggleSelect(msg_id), cx);
             } else if ev.click_count == 2 {
                 cx.stop_propagation();
-                act_dbl(this, BubbleUiAction::ToggleReaction(msg_id, "👍".to_string()), cx);
+                act_dbl(this, BubbleUiAction::ToggleReaction(msg_id, "❤️".to_string()), cx);
             }
         }))
         .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -556,7 +681,7 @@ pub fn render_message_row_1to1<V: 'static>(
             act_hover(this, BubbleUiAction::SetBubbleHover(msg_id, *hovered), cx);
         }));
 
-    if group.show_sender_name && !is_outgoing {
+    if !is_apple && group.show_sender_name && !is_outgoing {
         let name_hex = palette.peer_name_color(msg.sender_id as i64);
         bubble = bubble.child(
             div()
@@ -574,8 +699,14 @@ pub fn render_message_row_1to1<V: 'static>(
         } else {
             format!("Forwarded from {}", fwd.sender_name)
         };
-        let fwd_color = if is_fabushi { palette.text_secondary } else { palette.accent };
-        let fwd_weight = if is_fabushi { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD };
+        let fwd_color = if is_apple_out {
+            palette.msg_out_secondary_fg
+        } else if is_apple {
+            palette.text_secondary
+        } else {
+            palette.accent
+        };
+        let fwd_weight = if is_apple { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD };
         bubble = bubble.child(
             div()
                 .mb(px(palette.scaled_px(3.0)))
@@ -596,16 +727,35 @@ pub fn render_message_row_1to1<V: 'static>(
     if let Some(reply) = &msg.reply_to {
         let target_id = reply.message_id;
         let act_reply = on_action.clone();
-        let reply_bg = if is_fabushi {
+        let reply_bg = if is_apple_out {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.16)
+        } else if is_apple {
             TdesktopThemePalette::rgba_with_alpha(
                 palette.text_primary,
-                if palette.mode.is_dark() { 0.07 } else { 0.05 },
+                if palette.mode.is_dark() { 0.08 } else { 0.05 },
             )
         } else {
             TdesktopThemePalette::rgba_with_alpha(palette.reply_bar_bg, 0.30)
         };
-        let reply_bar = if is_fabushi { palette.accent } else { palette.reply_bar_fg };
-        let reply_sender_fg = if is_fabushi { palette.text_primary } else { palette.reply_bar_fg };
+        let reply_bar = if is_apple_out {
+            palette.msg_out_fg
+        } else if is_apple {
+            palette.accent
+        } else {
+            palette.reply_bar_fg
+        };
+        let reply_sender_fg = if is_apple_out {
+            palette.msg_out_fg
+        } else if is_apple {
+            palette.text_primary
+        } else {
+            palette.reply_bar_fg
+        };
+        let reply_snippet_fg = if is_apple_out {
+            palette.msg_out_secondary_fg
+        } else {
+            palette.text_secondary
+        };
         bubble = bubble.child(
             div()
                 .id(SharedString::from(format!("reply-hdr-{}", msg_id)))
@@ -616,7 +766,7 @@ pub fn render_message_row_1to1<V: 'static>(
                 .pl(px(8.0))
                 .pr(px(8.0))
                 .py(px(4.0))
-                .rounded(px(6.0))
+                .rounded(px(if is_apple { 8.0 } else { 6.0 }))
                 .bg(reply_bg)
                 .border_l_2()
                 .border_color(rgb(reply_bar))
@@ -628,7 +778,7 @@ pub fn render_message_row_1to1<V: 'static>(
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .font_weight(if is_fabushi { FontWeight::SEMIBOLD } else { FontWeight::BOLD })
+                        .font_weight(if is_apple { FontWeight::SEMIBOLD } else { FontWeight::BOLD })
                         .text_color(rgb(reply_sender_fg))
                         .truncate()
                         .child(reply.sender_name.clone()),
@@ -636,16 +786,17 @@ pub fn render_message_row_1to1<V: 'static>(
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .text_color(rgb(palette.text_secondary))
+                        .text_color(rgb(reply_snippet_fg))
                         .truncate()
                         .child(reply.snippet.clone()),
                 ),
         );
     }
 
-    bubble = bubble
-        .child(body_el)
-        .child(render_bottom_meta_strip(msg, meta, is_outgoing, palette, lang_id));
+    bubble = bubble.child(body_el);
+    if !is_apple {
+        bubble = bubble.child(render_bottom_meta_strip(msg, meta, is_outgoing, palette, lang_id));
+    }
 
     if has_any_selection {
         let act_shield = on_action.clone();
@@ -667,7 +818,7 @@ pub fn render_message_row_1to1<V: 'static>(
     }
 
     if !msg.reactions.is_empty() {
-        // Sort inline reaction pills per upstream `history_view_reactions.cpp:L177-L232`
+        // Sort reaction pills per upstream `history_view_reactions.cpp:L177-L232`
         let raw_pills: Vec<ReactionPill> = msg
             .reactions
             .iter()
@@ -686,80 +837,156 @@ pub fn render_message_row_1to1<V: 'static>(
             .collect();
         let sorted_pills = sort_reaction_pills(raw_pills);
 
-        let mut rx_bar = div().flex().flex_wrap().gap(px(4.0)).mt(px(5.0));
-        for pill in sorted_pills {
-            let em = pill.id.display_label();
-            let act_rx = on_action.clone();
-            let is_chosen = pill.chosen;
-            let is_paid = pill.paid;
-            let bg_color: Rgba = if is_paid {
-                rgba(0xFFA5002E).into()
-            } else if is_fabushi && is_chosen {
-                TdesktopThemePalette::rgba_with_alpha(
-                    palette.accent,
-                    if palette.mode.is_dark() { 0.20 } else { 0.14 },
-                )
-            } else if is_chosen {
-                rgb(palette.reaction_active_bg).into()
-            } else {
-                rgb(palette.reaction_bg).into()
-            };
-            let fg_hex = if is_chosen && !is_paid {
-                if is_fabushi {
+        if is_apple {
+            let mut tapbacks = div()
+                .absolute()
+                .top(px(-12.0))
+                .when(is_outgoing, |el| el.left(px(-10.0)))
+                .when(!is_outgoing, |el| el.right(px(-10.0)))
+                .flex()
+                .items_center()
+                .gap(px(3.0));
+            for pill in sorted_pills {
+                let em = pill.id.display_label();
+                let act_rx = on_action.clone();
+                let is_chosen = pill.chosen;
+                let is_paid = pill.paid;
+                let bg_hex = if is_paid {
+                    0xFF9F0A
+                } else if is_chosen {
                     palette.accent
+                } else if palette.mode.is_dark() {
+                    0x3A3A3C
                 } else {
+                    0xE5E5EA
+                };
+                let count_fg = if is_chosen || is_paid {
                     0xFFFFFF
-                }
-            } else if is_paid {
-                0xD97706
-            } else if is_fabushi {
-                palette.text_secondary
-            } else {
-                palette.text_primary
-            };
-            rx_bar = rx_bar.child(
-                div()
-                    .id(SharedString::from(format!("rx-pill-{}-{}", msg_id, em)))
-                    .h(px(24.0))
-                    .px(px(8.0))
-                    .rounded_full()
-                    .bg(bg_color)
-                    .when(is_chosen, |el| el.border_1().border_color(rgb(palette.accent)))
-                    .when(is_fabushi && !is_chosen && !is_paid, |el| {
-                        el.border_1().border_color(rgb(palette.border_fg))
-                    })
-                    .when(is_paid && !is_chosen, |el| el.border_1().border_color(rgb(0xFFA500)))
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            act_rx(this, BubbleUiAction::ToggleReaction(msg_id, em.clone()), cx);
+                } else {
+                    palette.text_primary
+                };
+                let show_count = pill.count > 1;
+                tapbacks = tapbacks.child(
+                    div()
+                        .id(SharedString::from(format!("rx-pill-{}-{}", msg_id, em)))
+                        .h(px(26.0))
+                        .min_w(px(26.0))
+                        .px(px(if show_count { 7.0 } else { 5.0 }))
+                        .rounded_full()
+                        .bg(rgb(bg_hex))
+                        .border_2()
+                        .border_color(rgb(palette.stage_bg))
+                        .shadow(palette.popover_shadows())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(3.0))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                act_rx(this, BubbleUiAction::ToggleReaction(msg_id, em.clone()), cx);
+                            }),
+                        )
+                        .text_size(px(12.5))
+                        .child(pill.id.display_label())
+                        .when(show_count, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(count_fg))
+                                    .child(format!("{}", pill.count)),
+                            )
                         }),
-                    )
-                    .text_size(px(12.0))
-                    .child(pill.id.display_label())
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(fg_hex))
-                            .child(format!("{}", pill.count)),
-                    ),
-            );
+                );
+            }
+            bubble = bubble.child(tapbacks);
+        } else {
+            let mut rx_bar = div().flex().flex_wrap().gap(px(4.0)).mt(px(5.0));
+            for pill in sorted_pills {
+                let em = pill.id.display_label();
+                let act_rx = on_action.clone();
+                let is_chosen = pill.chosen;
+                let is_paid = pill.paid;
+                let bg_color: Rgba = if is_paid {
+                    rgba(0xFFA5002E).into()
+                } else if is_chosen {
+                    rgb(palette.reaction_active_bg).into()
+                } else {
+                    rgb(palette.reaction_bg).into()
+                };
+                let fg_hex = if is_chosen && !is_paid {
+                    0xFFFFFF
+                } else if is_paid {
+                    0xD97706
+                } else {
+                    palette.text_primary
+                };
+                rx_bar = rx_bar.child(
+                    div()
+                        .id(SharedString::from(format!("rx-pill-{}-{}", msg_id, em)))
+                        .h(px(24.0))
+                        .px(px(8.0))
+                        .rounded_full()
+                        .bg(bg_color)
+                        .when(is_chosen, |el| el.border_1().border_color(rgb(palette.accent)))
+                        .when(is_paid && !is_chosen, |el| el.border_1().border_color(rgb(0xFFA500)))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                act_rx(this, BubbleUiAction::ToggleReaction(msg_id, em.clone()), cx);
+                            }),
+                        )
+                        .text_size(px(12.0))
+                        .child(pill.id.display_label())
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(fg_hex))
+                                .child(format!("{}", pill.count)),
+                        ),
+                );
+            }
+            bubble = bubble.child(rx_bar);
         }
-        bubble = bubble.child(rx_bar);
     }
 
-    if group.show_tail && !is_fabushi {
+    let show_apple_tail = is_apple
+        && group.show_tail
+        && !is_local_bot_card
+        && !is_apple_media_no_caption;
+    if group.show_tail && !is_apple {
         let tail_el = if is_outgoing {
             div().absolute().bottom(px(0.0)).right(px(-6.0)).child(tg_icon(IconName::BubbleTailOut, 12.0, bubble_hex))
         } else {
             div().absolute().bottom(px(0.0)).left(px(-6.0)).child(tg_icon(IconName::BubbleTailIn, 12.0, bubble_hex))
         };
         bubble = bubble.child(tail_el);
+    }
+
+    // Subtle non-shifting hover timestamp outside the bubble edge in Apple style
+    if is_apple && is_row_hovered && !has_any_selection && !msg.timestamp.is_empty() {
+        bubble = bubble.child(
+            div()
+                .id(SharedString::from(format!("hover-ts-{}", msg_id)))
+                .absolute()
+                .bottom(px(7.0))
+                .w(px(42.0))
+                .when(is_outgoing, |el| el.left(px(-82.0)).flex().justify_end())
+                .when(!is_outgoing, |el| el.right(px(-82.0)).flex().justify_start())
+                .text_size(px(10.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(palette.text_secondary))
+                .whitespace_nowrap()
+                .child(msg.timestamp.clone()),
+        );
     }
 
     if bubble_widths_probe.is_some() || bubble_bounds_probe.is_some() {
@@ -840,19 +1067,59 @@ pub fn render_message_row_1to1<V: 'static>(
         ));
     }
 
+    let bubble_element: AnyElement = if show_apple_tail {
+        let apple_tail = if is_outgoing {
+            div()
+                .absolute()
+                .bottom(px(0.0))
+                .right(px(-6.0))
+                .child(tg_icon(IconName::BubbleTailOut, 16.0, tail_hex))
+        } else {
+            div()
+                .absolute()
+                .bottom(px(0.0))
+                .left(px(-6.0))
+                .child(tg_icon(IconName::BubbleTailIn, 16.0, tail_hex))
+        };
+        div()
+            .relative()
+            .flex()
+            .flex_shrink_0()
+            .child(apple_tail)
+            .child(bubble)
+            .into_any_element()
+    } else {
+        bubble.into_any_element()
+    };
+
     let mut stack = div()
         .flex()
         .flex_col()
         .flex_shrink_0()
-        .when_some(definite_w, |el, bw| {
-            el.w(px(bw)).min_w(px(bw)).max_w(px(bw))
+        .when(!is_apple, |el| {
+            el.when_some(definite_w, |b, bw| b.w(px(bw)).min_w(px(bw)).max_w(px(bw)))
+                .when(definite_w.is_none(), |b| b.min_w(px(0.0)).max_w(px(eff_max_w)))
         })
-        .when(definite_w.is_none(), |el| {
+        .when(is_apple, |el| {
             el.min_w(px(0.0)).max_w(px(eff_max_w))
         })
         .when(is_outgoing, |el| el.items_end().ml(px(56.0)))
-        .when(!is_outgoing, |el| el.mr(px(56.0)));
-    stack = stack.child(bubble);
+        .when(!is_outgoing, |el| el.items_start().mr(px(56.0)));
+
+    if is_apple && group.show_sender_name && !is_outgoing {
+        stack = stack.child(
+            div()
+                .pl(px(12.0))
+                .mb(px(if !msg.reactions.is_empty() { 12.0 } else { 3.0 }))
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(palette.text_secondary))
+                .child(msg.sender_name.clone()),
+        );
+    }
+
+    stack = stack.child(bubble_element);
+
     if let Some(kb) = &msg.bot_keyboard {
         let a_bot = on_action.clone();
         stack = stack.child(render_inline_bot_keyboard(msg_id, kb, palette, cx, move |this, i, cx| {
@@ -860,12 +1127,79 @@ pub fn render_message_row_1to1<V: 'static>(
         }));
     }
 
+    if is_apple {
+        let is_edited = matches!(msg.content, MessageContent::Text { is_edited: true, .. })
+            || meta.and_then(|m| m.edit_date.as_ref()).is_some();
+        let show_receipt = is_outgoing && is_last_outgoing;
+        if is_edited || show_receipt {
+            let is_zh = lang_id.starts_with("zh");
+            let mut cap_row = div()
+                .mt(px(3.0))
+                .px(px(4.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .when(is_outgoing, |el| el.justify_end())
+                .when(!is_outgoing, |el| el.justify_start());
+            if is_edited {
+                cap_row = cap_row.child(
+                    div()
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(palette.text_secondary))
+                        .child(if is_zh { "已编辑" } else { "Edited" }),
+                );
+            }
+            if show_receipt {
+                let receipt_label = match msg.delivery_status {
+                    DeliveryStatus::Sending => {
+                        if is_zh { "正在发送…".to_string() } else { "Sending…".to_string() }
+                    }
+                    DeliveryStatus::Sent => {
+                        if is_zh { "已送达".to_string() } else { "Delivered".to_string() }
+                    }
+                    DeliveryStatus::Read => {
+                        if msg.timestamp.trim().is_empty() {
+                            if is_zh { "已读".to_string() } else { "Read".to_string() }
+                        } else if is_zh {
+                            format!("已读 {}", msg.timestamp)
+                        } else {
+                            format!("Read {}", msg.timestamp)
+                        }
+                    }
+                };
+                cap_row = cap_row.child(
+                    div()
+                        .id(SharedString::from(format!("delivery-receipt-{}", msg_id)))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(palette.text_secondary))
+                        .child(receipt_label),
+                );
+            }
+            stack = stack.child(cap_row);
+        }
+    }
+
+    let base_pt: f32 = if group.attached_to_prev {
+        2.0
+    } else if is_apple {
+        12.0
+    } else {
+        7.0
+    };
+    let row_pt: f32 = if is_apple && !msg.reactions.is_empty() && !group.show_sender_name {
+        base_pt.max(16.0)
+    } else {
+        base_pt
+    };
+
     let mut row = div()
         .id(SharedString::from(format!("msg-row-{}", msg_id)))
         .relative()
         .w_full()
         .px(px(16.0))
-        .pt(px(if group.attached_to_prev { 2.0 } else { 7.0 }))
+        .pt(px(row_pt))
         .flex_shrink_0()
         .flex()
         .items_end()
@@ -904,13 +1238,15 @@ pub fn render_message_row_1to1<V: 'static>(
 
     if !is_outgoing && group.reserve_avatar_column {
         let av_src = meta.and_then(|m| m.avatar_url.as_deref()).and_then(|u| resolve_image_source(u, None));
+        let av_size = if is_apple { APPLE_AVATAR_SIZE } else { MSG_PHOTO_SIZE };
+        let av_skip = if is_apple { APPLE_AVATAR_SKIP } else { MSG_PHOTO_SKIP };
         row = row.child(
-            div().w(px(MSG_PHOTO_SKIP)).flex().justify_start().when(group.show_bottom_avatar, |el| {
+            div().w(px(av_skip)).flex().justify_start().when(group.show_bottom_avatar, |el| {
                 if let Some(src) = av_src {
                     el.child(
                         div()
-                            .w(px(MSG_PHOTO_SIZE))
-                            .h(px(MSG_PHOTO_SIZE))
+                            .w(px(av_size))
+                            .h(px(av_size))
                             .rounded_full()
                             .overflow_hidden()
                             .bg(rgb(palette.peer_avatar_color(msg.sender_id as i64)))
@@ -927,7 +1263,7 @@ pub fn render_message_row_1to1<V: 'static>(
                         &fab.avatar_shape,
                         &fab.avatar_color,
                         &msg.avatar_initials,
-                        MSG_PHOTO_SIZE,
+                        av_size,
                         GrokPersonaState::from_activity_str(&fab.execution_state, false),
                         palette.stage_bg,
                         false,
@@ -935,15 +1271,15 @@ pub fn render_message_row_1to1<V: 'static>(
                 } else {
                     el.child(
                         div()
-                            .w(px(MSG_PHOTO_SIZE))
-                            .h(px(MSG_PHOTO_SIZE))
+                            .w(px(av_size))
+                            .h(px(av_size))
                             .rounded_full()
                             .overflow_hidden()
                             .bg(rgb(palette.peer_avatar_color(msg.sender_id as i64)))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(12.0))
+                            .text_size(px(if is_apple { 10.5 } else { 12.0 }))
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(0xFFFFFF))
                             .when(meta.and_then(|m| m.avatar_url.as_ref()).is_none(), |a| {
@@ -976,20 +1312,38 @@ pub fn render_message_row_1to1<V: 'static>(
         .w_full()
         .flex_shrink_0()
         .when_some(date_divider_label, |col, label| {
-            col.child(
-                div().w_full().py(px(10.0)).flex_shrink_0().flex().justify_center().child(
+            if is_apple {
+                col.child(
                     div()
-                        .px(px(12.0))
-                        .py(px(3.0))
-                        .rounded_full()
-                        .bg(palette.service_pill_rgba())
-                        .when(is_fabushi, |el| el.border_1().border_color(rgb(palette.border_fg)))
-                        .text_size(px(12.0))
-                        .font_weight(if is_fabushi { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD })
-                        .text_color(rgb(palette.service_pill_fg))
-                        .child(label.to_string()),
-                ),
-            )
+                        .w_full()
+                        .pt(px(14.0))
+                        .pb(px(6.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(palette.text_secondary))
+                                .child(label.to_string()),
+                        ),
+                )
+            } else {
+                col.child(
+                    div().w_full().py(px(10.0)).flex_shrink_0().flex().justify_center().child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(3.0))
+                            .rounded_full()
+                            .bg(palette.service_pill_rgba())
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.service_pill_fg))
+                            .child(label.to_string()),
+                    ),
+                )
+            }
         })
         .when(is_unread_anchor, |col| {
             col.child(
@@ -997,10 +1351,11 @@ pub fn render_message_row_1to1<V: 'static>(
                     div()
                         .w_full()
                         .py(px(4.0))
-                        .bg(palette.service_pill_rgba())
+                        .when(is_apple, |el| el.bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.08)))
+                        .when(!is_apple, |el| el.bg(palette.service_pill_rgba()))
                         .flex()
                         .justify_center()
-                        .text_size(px(12.0))
+                        .text_size(px(11.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(palette.accent))
                         .child(crate::i18n::tr_key_or(lang_id, "lng_unread_bar", "Unread Messages")),
@@ -1069,14 +1424,23 @@ fn render_bubble_inner_content<V: 'static>(
             if let Some(m) = meta {
                 if m.show_translation {
                     if let Some(ref tr_txt) = m.translated_text {
+                        let is_apple_out = palette.is_apple_style() && is_outgoing;
                         col = col.child(
                             div()
                                 .mt(px(4.0))
                                 .pt(px(5.0))
                                 .border_t_1()
-                                .border_color(TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.45))
+                                .border_color(if is_apple_out {
+                                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.25)
+                                } else {
+                                    TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.45)
+                                })
                                 .text_size(px(12.5))
-                                .text_color(rgb(palette.accent))
+                                .text_color(rgb(if is_apple_out {
+                                    palette.msg_out_secondary_fg
+                                } else {
+                                    palette.accent
+                                }))
                                 .child(format!("🌐 {}", tr_txt)),
                         );
                     }

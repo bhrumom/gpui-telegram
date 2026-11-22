@@ -34,6 +34,114 @@ pub fn render_folder_tabs_strip<V: 'static>(
     on_select_folder: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let icon_states = DialogsThreeStateIcon::new("folder", "folder_over", "folder_active");
+    let is_apple = palette.is_apple_style();
+
+    if is_apple {
+        let idle_bg = if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.055)
+        };
+        let idle_hover_bg = if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.13)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.095)
+        };
+        let text_hover = rgb(palette.text_primary);
+        let tabs: Vec<AnyElement> = folders
+            .iter()
+            .enumerate()
+            .map(|(idx, (folder, unread))| {
+                let is_active = folder == active_folder;
+                let _state_key = icon_states.select(is_active, false);
+                let fname = folder.clone();
+                let display_label = localize_folder_label(folder, lang_id);
+                let cb = on_select_folder.clone();
+                div()
+                    .id(("sidebar-folder-tab", idx as u64))
+                    .cursor_pointer()
+                    .h(px(palette.scaled_px(24.0)))
+                    .flex_shrink_0()
+                    .px(px(palette.scaled_px(9.0)))
+                    .rounded_full()
+                    .bg(if is_active {
+                        rgb(palette.accent)
+                    } else {
+                        idle_bg
+                    })
+                    .hover(move |s| {
+                        if is_active {
+                            s
+                        } else {
+                            s.bg(idle_hover_bg).text_color(text_hover)
+                        }
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(px(palette.scaled_px(4.0)))
+                    .text_size(px(palette.scaled_px(11.5)))
+                    .font_weight(if is_active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if is_active {
+                        rgb(0xFFFFFF)
+                    } else {
+                        rgb(palette.text_secondary)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _w, cx| {
+                            cb(this, fname.clone(), cx);
+                        }),
+                    )
+                    .child(display_label)
+                    .when(*unread > 0, |el| {
+                        el.child(
+                            div()
+                                .h(px(palette.scaled_px(15.0)))
+                                .min_w(px(palette.scaled_px(15.0)))
+                                .px(px(palette.scaled_px(4.0)))
+                                .rounded_full()
+                                .bg(if is_active {
+                                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.25)
+                                } else {
+                                    TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.18)
+                                })
+                                .text_color(if is_active {
+                                    rgb(0xFFFFFF)
+                                } else {
+                                    rgb(palette.text_secondary)
+                                })
+                                .text_size(px(palette.scaled_px(9.5)))
+                                .font_weight(FontWeight::BOLD)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(format!("{}", unread)),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        return div()
+            .h(px(palette.scaled_px(34.0)))
+            .flex_shrink_0()
+            .w_full()
+            .px(px(palette.scaled_px(12.0)))
+            .pb(px(palette.scaled_px(6.0)))
+            .flex()
+            .items_center()
+            .gap(px(palette.scaled_px(5.0)))
+            .border_b_1()
+            .border_color(palette.separator_rgba())
+            .overflow_x_hidden()
+            .children(tabs)
+            .into_any_element();
+    }
+
     let tabs: Vec<AnyElement> = folders
         .iter()
         .enumerate()
@@ -109,6 +217,16 @@ pub fn render_forum_topics_subtree<V: 'static>(
     on_select_topic: impl Fn(&mut V, u64, u64, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let forum_id = topics.forum_id;
+    let is_apple = palette.is_apple_style();
+    let hover_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     let rows: Vec<AnyElement> = topics
         .topics
         .iter()
@@ -117,9 +235,6 @@ pub fn render_forum_topics_subtree<V: 'static>(
             let tid = topic.topic_id;
             let is_sel = selected_topic == Some((forum_id, tid));
             let cb = on_select_topic.clone();
-            let is_fabushi = palette.mode.is_fabushi_style();
-            let row_bg = if is_sel { rgb(palette.dialogs_active_bg) } else { rgb(palette.dialogs_bg) };
-            let hover_bg = rgb(palette.dialogs_hover_bg);
             div()
                 .id(("sidebar-topic-row", tid))
                 .cursor_pointer()
@@ -127,8 +242,9 @@ pub fn render_forum_topics_subtree<V: 'static>(
                 .w_full()
                 .pl(px(58.0))
                 .pr(px(10.0))
-                .when(is_fabushi, |el| el.rounded(px(8.0)))
-                .bg(row_bg)
+                .when(is_apple, |el| el.rounded(px(8.0)))
+                .when(is_sel, |el| el.bg(rgb(palette.dialogs_active_bg)))
+                .when(!is_sel && !is_apple, |el| el.bg(rgb(palette.dialogs_bg)))
                 .hover(move |s| if is_sel { s } else { s.bg(hover_bg) })
                 .flex()
                 .items_center()
@@ -142,14 +258,28 @@ pub fn render_forum_topics_subtree<V: 'static>(
                         .items_center()
                         .gap(px(6.0))
                         .overflow_hidden()
-                        .child(tg_icon(IconName::FolderChat, 12.0, palette.accent))
+                        .child(tg_icon(
+                            IconName::FolderChat,
+                            12.0,
+                            if is_sel { 0xFFFFFF } else { palette.accent },
+                        ))
                         .child(
                             div()
                                 .text_size(px(12.5))
-                                .text_color(if is_sel && !is_fabushi { rgb(palette.active_button_fg) } else { rgb(palette.text_primary) })
+                                .text_color(if is_sel {
+                                    rgb(0xFFFFFF)
+                                } else {
+                                    rgb(palette.text_primary)
+                                })
                                 .child(topic.title.clone()),
                         )
-                        .when(topic.is_closed, |el| el.child(tg_icon(IconName::Lock, 11.0, palette.icon_fg))),
+                        .when(topic.is_closed, |el| {
+                            el.child(tg_icon(
+                                IconName::Lock,
+                                11.0,
+                                if is_sel { 0xFFFFFF } else { palette.icon_fg },
+                            ))
+                        }),
                 )
                 .when(topic.unread_count > 0, |el| {
                     el.child(
@@ -158,7 +288,11 @@ pub fn render_forum_topics_subtree<V: 'static>(
                             .min_w(px(16.0))
                             .px(px(4.0))
                             .rounded_full()
-                            .bg(rgb(palette.unread_badge_bg))
+                            .bg(if is_sel {
+                                TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.25)
+                            } else {
+                                rgb(palette.unread_badge_bg)
+                            })
                             .flex()
                             .items_center()
                             .justify_center()
@@ -171,7 +305,18 @@ pub fn render_forum_topics_subtree<V: 'static>(
                 .into_any_element()
         })
         .collect();
-    div().w_full().border_b_1().border_color(rgb(palette.border_fg)).flex().flex_col().children(rows).into_any_element()
+    div()
+        .w_full()
+        .border_b_1()
+        .border_color(if is_apple {
+            palette.separator_rgba()
+        } else {
+            rgb(palette.border_fg)
+        })
+        .flex()
+        .flex_col()
+        .children(rows)
+        .into_any_element()
 }
 
 pub fn render_dialog_context_menu<V: 'static>(
@@ -191,9 +336,31 @@ pub fn render_dialog_context_menu<V: 'static>(
     qa_pin.update_state(false, is_muted, is_pinned, has_unread, is_archived, true, false);
     let _ctx_pin = DialogsQuickActionContextUi::new(dialog_id, QuickDialogActionType::Pin);
 
+    let is_apple = palette.is_apple_style();
     let x = f32::from(anchor.x).clamp(8.0, 92.0);
-    let y = f32::from(anchor.y).clamp(52.0, 420.0);
-    let hover = rgb(palette.menu_hover_bg);
+    let y = f32::from(anchor.y).clamp(56.0, 420.0);
+    let hover = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.05)
+        }
+    } else {
+        rgb(palette.menu_hover_bg)
+    };
+    let menu_bg = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(
+            palette.menu_bg,
+            if palette.mode.is_dark() { 0.94 } else { 0.96 },
+        )
+    } else {
+        rgb(palette.menu_bg)
+    };
+    let menu_border = if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg)
+    };
 
     let items: [(IconName, String, SidebarContextAction, bool); 6] = [
         (IconName::Pin, if is_pinned { tr_str(lang_id, "取消置顶", "Unpin").into() } else { tr_str(lang_id, "置顶对话", "Pin").into() }, SidebarContextAction::TogglePin(dialog_id), false),
@@ -204,19 +371,28 @@ pub fn render_dialog_context_menu<V: 'static>(
         (IconName::DeleteTrash, tr_str(lang_id, "删除对话", "Delete Chat").into(), SidebarContextAction::DeleteChat(dialog_id), true),
     ];
 
-    let rows: Vec<AnyElement> = items
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (icon, label, act, danger))| {
-            let cb = on_action.clone();
-            let fg = if danger { palette.danger } else { palette.text_primary };
-            let ic = if danger { palette.danger } else { palette.icon_fg };
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(items.len() + 1);
+    for (idx, (icon, label, act, danger)) in items.into_iter().enumerate() {
+        if idx == 4 {
+            rows.push(
+                div()
+                    .h(px(1.0))
+                    .mx(px(6.0))
+                    .my(px(3.0))
+                    .bg(menu_border)
+                    .into_any_element(),
+            );
+        }
+        let cb = on_action.clone();
+        let fg = if danger { palette.danger } else { palette.text_primary };
+        let ic = if danger { palette.danger } else { palette.icon_fg };
+        rows.push(
             div()
                 .id(("sidebar-ctx-item", idx as u64))
                 .cursor_pointer()
-                .h(px(32.0))
+                .h(px(30.0))
                 .px(px(10.0))
-                .rounded(px(6.0))
+                .rounded(px(7.0))
                 .hover(move |s| s.bg(hover))
                 .flex()
                 .items_center()
@@ -227,33 +403,42 @@ pub fn render_dialog_context_menu<V: 'static>(
                 }))
                 .child(tg_icon(icon, 14.0, ic))
                 .child(div().text_size(px(12.5)).text_color(rgb(fg)).child(label))
-                .into_any_element()
-        })
-        .collect();
+                .into_any_element(),
+        );
+    }
 
     div()
         .id("sidebar-context-backdrop")
         .absolute()
         .inset_0()
+        .occlude()
         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
             on_dismiss(this, cx);
         }))
         .child(
-            div()
-                .id("sidebar-context-menu")
-                .absolute()
-                .left(px(x))
-                .top(px(y))
-                .w(px(180.0))
-                .p(px(4.0))
-                .rounded(px(8.0))
-                .bg(rgb(palette.menu_bg))
-                .border_1()
-                .border_color(rgb(palette.border_fg))
-                .shadow_md()
-                .flex()
-                .flex_col()
-                .children(rows),
+            deferred(
+                div()
+                    .id("sidebar-context-menu")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(184.0))
+                    .p(px(5.0))
+                    .rounded(px(12.0))
+                    .bg(menu_bg)
+                    .border_1()
+                    .border_color(menu_border)
+                    .shadow(palette.popover_shadows())
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .children(rows),
+            )
+            .with_priority(40),
         )
         .into_any_element()
 }

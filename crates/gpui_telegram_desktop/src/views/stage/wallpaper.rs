@@ -6,26 +6,30 @@ use crate::i18n::tr_key_or;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 
 pub fn render_themed_wallpaper(palette: &TdesktopThemePalette) -> AnyElement {
-    let gradient_bg = linear_gradient(
-        145.0,
-        linear_color_stop(rgb(palette.wallpaper_top), 0.0),
-        linear_color_stop(rgb(palette.wallpaper_bottom), 1.0),
-    );
-    let is_fabushi = palette.mode.is_fabushi_style();
+    let is_apple = palette.is_apple_style();
+    let has_custom_gradient = palette.wallpaper_top != palette.wallpaper_bottom;
     let pattern_rgba = TdesktopThemePalette::rgba_with_alpha(
         palette.wallpaper_pattern,
         if palette.mode.is_dark() { 0.14 } else { 0.10 },
     );
-
     let pattern_opacity = if palette.blur_wallpaper { 0.16 } else { 0.45 };
 
-    // Clean flat/gradient Fabushi canvas, or subtle geometric Telegram pattern motif for Classic mode
-    div()
-        .absolute()
-        .inset_0()
-        .overflow_hidden()
-        .bg(gradient_bg)
-        .when(!is_fabushi, |el| {
+    // Pure clean macOS Apple Messages stage canvas in Apple Light/Dark (respects custom gradient wallpapers if selected),
+    // or classic Telegram patterned wallpaper in Classic mode.
+    let mut canvas_div = div().absolute().inset_0().overflow_hidden();
+    if is_apple && !has_custom_gradient {
+        canvas_div = canvas_div.bg(rgb(palette.stage_bg));
+    } else {
+        let gradient_bg = linear_gradient(
+            145.0,
+            linear_color_stop(rgb(palette.wallpaper_top), 0.0),
+            linear_color_stop(rgb(palette.wallpaper_bottom), 1.0),
+        );
+        canvas_div = canvas_div.bg(gradient_bg);
+    }
+
+    canvas_div
+        .when(!is_apple, |el| {
             el.child(
                 div()
                     .absolute()
@@ -89,7 +93,41 @@ pub fn render_themed_wallpaper(palette: &TdesktopThemePalette) -> AnyElement {
 }
 
 pub fn render_empty_no_chat_pill(palette: &TdesktopThemePalette, lang_id: &str) -> AnyElement {
-    let is_fabushi = palette.mode.is_fabushi_style();
+    let is_apple = palette.is_apple_style();
+    if is_apple {
+        return div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .w(px(48.0))
+                    .h(px(48.0))
+                    .rounded_full()
+                    .bg(TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.10))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(tg_icon(IconName::FolderChat, 22.0, palette.text_secondary)),
+            )
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(palette.text_secondary))
+                    .child(tr_key_or(
+                        lang_id,
+                        "lng_chat_select_empty",
+                        "Select a chat to start messaging",
+                    )),
+            )
+            .into_any_element();
+    }
+
     div()
         .size_full()
         .relative()
@@ -104,7 +142,6 @@ pub fn render_empty_no_chat_pill(palette: &TdesktopThemePalette, lang_id: &str) 
                 .py(px(8.0))
                 .rounded_full()
                 .bg(palette.service_pill_rgba())
-                .when(is_fabushi, |el| el.border_1().border_color(rgb(palette.border_fg)))
                 .shadow_sm()
                 .text_size(px(13.0))
                 .font_weight(FontWeight::MEDIUM)
@@ -122,12 +159,46 @@ pub fn render_empty_history_placeholder(
     palette: &TdesktopThemePalette,
     lang_id: &str,
 ) -> AnyElement {
-    let is_fabushi = palette.mode.is_fabushi_style();
-    let title_fg = if is_fabushi {
-        palette.text_primary
-    } else {
-        palette.service_pill_fg
-    };
+    let is_apple = palette.is_apple_style();
+    if is_apple {
+        return div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(32.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(6.0))
+                    .max_w(px(280.0))
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text_primary))
+                            .child(tr_key_or(
+                                lang_id,
+                                "lng_empty_history_title",
+                                "No messages here yet...",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(palette.text_secondary))
+                            .child(tr_key_or(
+                                lang_id,
+                                "lng_empty_history_subtitle",
+                                "Send a message below to start the conversation.",
+                            )),
+                    ),
+            )
+            .into_any_element();
+    }
+
     div()
         .flex_1()
         .flex()
@@ -145,13 +216,12 @@ pub fn render_empty_history_placeholder(
                 .py(px(20.0))
                 .rounded(px(16.0))
                 .bg(palette.service_pill_rgba())
-                .when(is_fabushi, |el| el.border_1().border_color(rgb(palette.border_fg)))
                 .child(tg_icon(IconName::FolderChat, 38.0, palette.accent))
                 .child(
                     div()
                         .text_size(px(14.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(title_fg))
+                        .text_color(rgb(palette.service_pill_fg))
                         .child(tr_key_or(lang_id, "lng_empty_history_title", "No messages here yet...")),
                 )
                 .child(

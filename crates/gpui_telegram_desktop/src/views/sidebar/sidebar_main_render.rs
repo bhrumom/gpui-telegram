@@ -1,5 +1,7 @@
 //! Main GPUI `Render` implementation for [`ChatSidebar`].
 
+use std::collections::HashSet;
+
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
@@ -10,7 +12,8 @@ use crate::views::sidebar::dialogs_overlays::{
     render_dialog_context_menu, render_folder_tabs_strip, render_forum_topics_subtree,
 };
 use crate::views::sidebar::dialogs_renderer::{
-    render_archived_header_row, render_plus_dropdown, render_stories_strip, render_suggestion_bar,
+    render_archived_header_row, render_pinned_chats_grid, render_plus_dropdown,
+    render_stories_strip, render_suggestion_bar,
 };
 use crate::views::sidebar::dialogs_row_view::{render_dialog_row_item, SidebarDialogMeta};
 use crate::views::sidebar::gemini_unified_sidebar::{
@@ -313,8 +316,20 @@ impl Render for ChatSidebar {
                     },
                 ));
             }
-            items
+            if palette.is_apple_style() {
+                vec![div()
+                    .w_full()
+                    .px(px(palette.scaled_px(8.0)))
+                    .py(px(palette.scaled_px(4.0)))
+                    .flex()
+                    .flex_col()
+                    .children(items)
+                    .into_any_element()]
+            } else {
+                items
+            }
         } else {
+            let is_apple = palette.is_apple_style();
             let is_default_all = active_folder == "All" && query.trim().is_empty();
             let active_cf_pinned: Vec<i64> = self
                 .custom_folders
@@ -340,15 +355,63 @@ impl Render for ChatSidebar {
                     regular.push(item);
                 }
             }
+
+            let pinned_grid_items: Vec<(DialogItemModel, SidebarDialogMeta)> =
+                if is_apple && query.trim().is_empty() {
+                    pinned
+                        .iter()
+                        .filter(|d| !self.archived_ids.contains(&d.id))
+                        .take(9)
+                        .map(|d| (d.clone(), self.dialog_meta(d)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let pinned_grid_ids: HashSet<u64> =
+                pinned_grid_items.iter().map(|(d, _)| d.id).collect();
+
             let archived_with_meta: Vec<(DialogItemModel, SidebarDialogMeta)> = archived
                 .iter()
                 .map(|d| (d.clone(), self.dialog_meta(d)))
                 .collect();
             let main_with_meta: Vec<(DialogItemModel, SidebarDialogMeta)> = pinned
                 .into_iter()
+                .filter(|d| !pinned_grid_ids.contains(&d.id))
                 .chain(regular.into_iter())
                 .map(|d| (d.clone(), self.dialog_meta(&d)))
                 .collect();
+
+            let mut scroll_sections: Vec<AnyElement> = Vec::new();
+            if is_apple {
+                if let Some(pinned_grid) = render_pinned_chats_grid(
+                    &pinned_grid_items,
+                    active_id,
+                    &palette,
+                    cx,
+                    |this, did, cx| {
+                        this.context_menu = None;
+                        this.search_focused = false;
+                        this.select_dialog_from_user(did);
+                        cx.notify();
+                    },
+                    |this, did, pos, cx| {
+                        this.context_menu = Some((did, pos));
+                        cx.notify();
+                    },
+                ) {
+                    scroll_sections.push(pinned_grid);
+                }
+            }
+
+            let indented_separator = || -> AnyElement {
+                div()
+                    .ml(px(palette.scaled_px(72.0)))
+                    .mr(px(palette.scaled_px(10.0)))
+                    .h(px(1.0))
+                    .flex_shrink_0()
+                    .bg(palette.separator_rgba())
+                    .into_any_element()
+            };
 
             let mut list: Vec<AnyElement> = Vec::new();
             if let Some(arch_header) = render_archived_header_row(
@@ -363,6 +426,14 @@ impl Render for ChatSidebar {
                 },
             ) {
                 list.push(arch_header);
+                if is_apple && !self.is_archived_expanded && !main_with_meta.is_empty() {
+                    let first_sel = main_with_meta
+                        .first()
+                        .is_some_and(|(d, _)| active_id == Some(d.id));
+                    if !first_sel {
+                        list.push(indented_separator());
+                    }
+                }
             }
             if self.is_archived_expanded {
                 for (idx, (item, meta)) in archived_with_meta.iter().enumerate() {
@@ -376,6 +447,22 @@ impl Render for ChatSidebar {
                         &lang_id,
                         cx,
                     ));
+                    if is_apple {
+                        let cur_sel = active_id == Some(item.id);
+                        let next_sel = archived_with_meta
+                            .get(idx + 1)
+                            .map(|(n, _)| active_id == Some(n.id))
+                            .or_else(|| {
+                                main_with_meta
+                                    .first()
+                                    .map(|(n, _)| active_id == Some(n.id))
+                            });
+                        if let Some(is_next_sel) = next_sel {
+                            if !cur_sel && !is_next_sel {
+                                list.push(indented_separator());
+                            }
+                        }
+                    }
                 }
             }
 
@@ -405,10 +492,21 @@ impl Render for ChatSidebar {
                             },
                         ));
                     }
+                } else if is_apple {
+                    let cur_sel = active_id == Some(item.id);
+                    if let Some((next_item, _)) = main_with_meta.get(idx + 1) {
+                        let next_sel = active_id == Some(next_item.id);
+                        if !cur_sel && !next_sel {
+                            list.push(indented_separator());
+                        }
+                    }
                 }
             }
 
-            if list.is_empty() {
+            let has_any_dialog = !pinned_grid_items.is_empty()
+                || !archived_with_meta.is_empty()
+                || !main_with_meta.is_empty();
+            if !has_any_dialog {
                 list.push(
                     div()
                         .id("sidebar-empty-dialogs-state")
@@ -441,7 +539,24 @@ impl Render for ChatSidebar {
                         .into_any_element(),
                 );
             }
-            list
+
+            if !list.is_empty() {
+                if is_apple {
+                    scroll_sections.push(
+                        div()
+                            .w_full()
+                            .px(px(palette.scaled_px(8.0)))
+                            .py(px(palette.scaled_px(4.0)))
+                            .flex()
+                            .flex_col()
+                            .children(list)
+                            .into_any_element(),
+                    );
+                } else {
+                    scroll_sections.extend(list);
+                }
+            }
+            scroll_sections
         };
 
         let ctx_menu_overlay = if let Some((ctx_id, anchor)) = self.context_menu {
@@ -482,6 +597,7 @@ impl Render for ChatSidebar {
         };
 
         let _ = (contact_kind, active_field, &primary_val, &secondary_val, &tertiary_val);
+        let is_apple = palette.is_apple_style();
         let accent = rgb(palette.accent);
         let scaled_sidebar_width = palette.scaled_px(self.width).min(460.0);
         div()
@@ -490,9 +606,17 @@ impl Render for ChatSidebar {
             .flex_shrink_0()
             .h_full()
             .overflow_hidden()
-            .bg(rgb(palette.dialogs_bg))
+            .bg(if is_apple {
+                palette.sidebar_bg_rgba()
+            } else {
+                rgb(palette.dialogs_bg)
+            })
             .border_r_1()
-            .border_color(rgb(palette.border_fg))
+            .border_color(if is_apple {
+                palette.separator_rgba()
+            } else {
+                rgb(palette.border_fg)
+            })
             .flex()
             .flex_col()
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
@@ -541,9 +665,6 @@ impl Render for ChatSidebar {
                     .min_h(px(0.0))
                     .w_full()
                     .overflow_y_scroll()
-                    .when(palette.mode.is_fabushi_style(), |el| {
-                        el.px(px(palette.scaled_px(6.0))).gap(px(1.0))
-                    })
                     .flex()
                     .flex_col()
                     .children(scroll_children),

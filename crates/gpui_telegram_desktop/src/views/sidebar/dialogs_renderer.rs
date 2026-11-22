@@ -8,6 +8,7 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::chat_sidebar::{
     AddContactKind, DialogItemModel, SEARCH_HEADER_HEIGHT, SEARCH_HEIGHT, SEARCH_RADIUS,
 };
+use crate::views::sidebar::dialogs_row_view::{render_dialog_avatar, SidebarDialogMeta};
 use crate::views::sidebar::ui::dialogs_stories_list::DialogsStoriesListUi;
 use crate::views::sidebar::ui::dialogs_suggestions::DialogsSuggestionsUi;
 
@@ -170,8 +171,31 @@ pub fn render_plus_dropdown<V: 'static>(
     on_create_channel: impl Fn(&mut V, &mut Context<V>) + 'static,
     on_open_contacts: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> AnyElement {
-    let hover_bg = rgb(palette.menu_hover_bg);
     let pal = *palette;
+    let is_apple = pal.is_apple_style();
+    let hover_bg = if is_apple {
+        if pal.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.05)
+        }
+    } else {
+        rgb(pal.menu_hover_bg)
+    };
+    let menu_bg = if is_apple {
+        TdesktopThemePalette::rgba_with_alpha(
+            pal.menu_bg,
+            if pal.mode.is_dark() { 0.94 } else { 0.96 },
+        )
+    } else {
+        rgb(pal.menu_bg)
+    };
+    let menu_border = if is_apple {
+        pal.separator_rgba()
+    } else {
+        rgb(pal.border_fg)
+    };
+
     let menu_row = |id: &'static str, icon: IconName, title: String, subtitle: String| {
         div()
             .id(id)
@@ -179,7 +203,7 @@ pub fn render_plus_dropdown<V: 'static>(
             .w_full()
             .px(px(10.0))
             .py(px(7.0))
-            .rounded(px(8.0))
+            .rounded(px(7.0))
             .hover(move |s| s.bg(hover_bg))
             .flex()
             .items_center()
@@ -209,7 +233,7 @@ pub fn render_plus_dropdown<V: 'static>(
                             ),
                     ),
             )
-            .child(tg_icon(IconName::ChevronRight, 12.0, pal.icon_fg))
+            .child(tg_icon(IconName::ChevronRight, 11.5, pal.icon_fg))
     };
 
     let add_cb = on_add_contact.clone();
@@ -217,15 +241,15 @@ pub fn render_plus_dropdown<V: 'static>(
     let popup = div()
         .id("sidebar-plus-floating-menu")
         .absolute()
-        .top(px(46.0))
+        .top(px(50.0))
         .left(px(10.0))
         .right(px(10.0))
         .p(px(6.0))
         .rounded(px(12.0))
-        .bg(rgb(pal.menu_bg))
+        .bg(menu_bg)
         .border_1()
-        .border_color(rgb(pal.border_fg))
-        .shadow_xl()
+        .border_color(menu_border)
+        .shadow(pal.popover_shadows())
         .occlude()
         .on_mouse_down(
             MouseButton::Left,
@@ -296,7 +320,7 @@ pub fn render_plus_dropdown<V: 'static>(
                 }),
             ),
         )
-        .child(div().h(px(1.0)).my(px(2.0)).bg(rgb(pal.border_fg)))
+        .child(div().h(px(1.0)).mx(px(6.0)).my(px(3.0)).bg(menu_border))
         .child(
             menu_row(
                 "plus-menu-contacts-modal",
@@ -329,6 +353,205 @@ pub fn render_plus_dropdown<V: 'static>(
         .into_any_element()
 }
 
+/// Renders the macOS Apple Messages 3-column Pinned Chats avatar grid (up to 9 pinned chats)
+/// followed by a delicate translucent hairline divider.
+pub fn render_pinned_chats_grid<V: 'static>(
+    pinned_dialogs: &[(DialogItemModel, SidebarDialogMeta)],
+    active_id: Option<u64>,
+    palette: &TdesktopThemePalette,
+    cx: &mut Context<V>,
+    on_select: impl Fn(&mut V, u64, &mut Context<V>) + Clone + 'static,
+    on_context: impl Fn(&mut V, u64, Point<Pixels>, &mut Context<V>) + Clone + 'static,
+) -> Option<AnyElement> {
+    if pinned_dialogs.is_empty() {
+        return None;
+    }
+    let shown = &pinned_dialogs[..pinned_dialogs.len().min(9)];
+    let total = shown.len();
+    let avatar_size_px = palette.scaled_px(54.0);
+    let ring_size_px = palette.scaled_px(60.0);
+    let hover_bg = if palette.mode.is_dark() {
+        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
+    } else {
+        TdesktopThemePalette::rgba_with_alpha(0x000000, 0.04)
+    };
+    let badge_border = rgb(palette.dialogs_bg);
+    let online_border = palette.sidebar_bg_rgba();
+
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for chunk in shown.chunks(3) {
+        let mut cells: Vec<AnyElement> = chunk
+            .iter()
+            .map(|(item, meta)| {
+                let did = item.id;
+                let is_selected = active_id == Some(did);
+                let sel_cb = on_select.clone();
+                let ctx_cb = on_context.clone();
+                let avatar = render_dialog_avatar(
+                    item,
+                    meta,
+                    palette,
+                    avatar_size_px,
+                    palette.dialogs_bg,
+                    online_border,
+                );
+                let badge_bg = if item.is_muted {
+                    rgb(palette.muted_badge_bg)
+                } else {
+                    rgb(palette.accent)
+                };
+                let count_label = if item.unread_count > 99 {
+                    "99+".to_string()
+                } else {
+                    item.unread_count.to_string()
+                };
+
+                let mut tile = div()
+                    .id(("sidebar-pinned-tile", did))
+                    .cursor_pointer()
+                    .min_w(px(0.0))
+                    .px(px(2.0))
+                    .py(px(3.0))
+                    .rounded(px(10.0))
+                    .hover(move |s| s.bg(hover_bg))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _w, cx| {
+                            sel_cb(this, did, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                            ctx_cb(this, did, ev.position, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(ring_size_px))
+                            .h(px(ring_size_px))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(is_selected, |el| {
+                                el.border_2().border_color(rgb(palette.accent))
+                            })
+                            .child(avatar)
+                            .when(item.unread_count > 0, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(-1.0))
+                                        .right(px(-1.0))
+                                        .min_w(px(palette.scaled_px(18.0)))
+                                        .h(px(palette.scaled_px(18.0)))
+                                        .px(px(4.5))
+                                        .rounded_full()
+                                        .bg(badge_bg)
+                                        .border_2()
+                                        .border_color(badge_border)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(palette.scaled_px(10.0)))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(0xFFFFFF))
+                                        .child(count_label),
+                                )
+                            })
+                            .when(item.unread_count == 0 && meta.is_unread_marked, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(1.0))
+                                        .right(px(1.0))
+                                        .w(px(palette.scaled_px(11.0)))
+                                        .h(px(palette.scaled_px(11.0)))
+                                        .rounded_full()
+                                        .bg(badge_bg)
+                                        .border_2()
+                                        .border_color(badge_border),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .mt(px(palette.scaled_px(5.0)))
+                            .w_full()
+                            .max_w(px(palette.scaled_px(76.0)))
+                            .text_center()
+                            .truncate()
+                            .text_size(px(palette.scaled_px(11.5)))
+                            .font_weight(if is_selected {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .text_color(if is_selected {
+                                rgb(palette.accent)
+                            } else {
+                                rgb(palette.text_primary)
+                            })
+                            .child(item.peer_name.clone()),
+                    );
+
+                if total >= 3 {
+                    tile = tile.flex_1();
+                } else {
+                    tile = tile.w(px(palette.scaled_px(82.0)));
+                }
+                tile.into_any_element()
+            })
+            .collect();
+
+        if total >= 3 && cells.len() < 3 {
+            for _ in cells.len()..3 {
+                cells.push(div().flex_1().min_w(px(0.0)).into_any_element());
+            }
+        }
+
+        let row = div()
+            .w_full()
+            .flex()
+            .items_start()
+            .when(total < 3, |el| el.justify_center().gap(px(12.0)))
+            .when(total >= 3, |el| el.justify_between().gap(px(4.0)))
+            .children(cells);
+        rows.push(row.into_any_element());
+    }
+
+    Some(
+        div()
+            .id("sidebar-pinned-chats-grid")
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .py(px(palette.scaled_px(10.0)))
+                    .px(px(palette.scaled_px(12.0)))
+                    .flex()
+                    .flex_col()
+                    .gap(px(palette.scaled_px(10.0)))
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .mx(px(palette.scaled_px(12.0)))
+                    .h(px(1.0))
+                    .bg(palette.separator_rgba()),
+            )
+            .into_any_element(),
+    )
+}
+
 pub fn render_suggestion_bar<V: 'static>(
     suggestions: &DialogsSuggestionsUi,
     palette: &TdesktopThemePalette,
@@ -340,15 +563,20 @@ pub fn render_suggestion_bar<V: 'static>(
     }
     let item = suggestions.current_item.as_ref()?;
     let dismiss_cta = on_dismiss.clone();
+    let is_apple = palette.is_apple_style();
     Some(
         div()
             .h(px(37.0))
             .flex_shrink_0()
             .w_full()
-            .px(px(10.0))
-            .bg(rgb(palette.composer_bg))
+            .px(px(12.0))
+            .when(!is_apple, |el| el.bg(rgb(palette.composer_bg)))
             .border_b_1()
-            .border_color(rgb(palette.border_fg))
+            .border_color(if is_apple {
+                palette.separator_rgba()
+            } else {
+                rgb(palette.border_fg)
+            })
             .flex()
             .items_center()
             .justify_between()
@@ -370,12 +598,12 @@ pub fn render_suggestion_bar<V: 'static>(
                         el.child(
                             div()
                                 .cursor_pointer()
-                                .px(px(6.0))
+                                .px(px(7.0))
                                 .py(px(2.0))
-                                .rounded(px(4.0))
+                                .rounded_full()
                                 .bg(rgb(palette.accent))
                                 .text_size(px(11.0))
-                                .font_weight(FontWeight::BOLD)
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(palette.active_button_fg))
                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
                                     dismiss_cta(this, cx);
@@ -412,6 +640,7 @@ pub fn render_stories_strip<V: 'static>(
     if stories.elements.is_empty() {
         return None;
     }
+    let is_apple = palette.is_apple_style();
     let limit = if stories.is_expanded { stories.elements.len() } else { 3 };
     let shown: Vec<_> = stories.elements.iter().take(limit).cloned().collect();
     let story_buttons: Vec<AnyElement> = shown
@@ -455,12 +684,16 @@ pub fn render_stories_strip<V: 'static>(
             .h(px(44.0))
             .flex_shrink_0()
             .w_full()
-            .px(px(10.0))
+            .px(px(12.0))
             .flex()
             .items_center()
             .justify_between()
             .border_b_1()
-            .border_color(rgb(palette.border_fg))
+            .border_color(if is_apple {
+                palette.separator_rgba()
+            } else {
+                rgb(palette.border_fg)
+            })
             .child(
                 div()
                     .flex()
@@ -497,6 +730,7 @@ pub fn render_archived_header_row<V: 'static>(
     if archived_dialogs.is_empty() {
         return None;
     }
+    let is_apple = palette.is_apple_style();
     let preview: String = archived_dialogs
         .iter()
         .take(3)
@@ -505,6 +739,15 @@ pub fn render_archived_header_row<V: 'static>(
         .join(", ");
     let total_unread: u32 = archived_dialogs.iter().map(|d| d.unread_count).sum();
     let chev = if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight };
+    let hover = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     Some(
         div()
             .id("sidebar-archived-chats-row")
@@ -514,13 +757,13 @@ pub fn render_archived_header_row<V: 'static>(
             .w_full()
             .px(px(10.0))
             .py(px(6.0))
-            .bg(rgb(palette.dialogs_bg))
-            .hover({
-                let hover = rgb(palette.dialogs_hover_bg);
-                move |s| s.bg(hover)
+            .when(is_apple, |el| el.rounded(px(10.0)))
+            .when(!is_apple, |el| {
+                el.bg(rgb(palette.dialogs_bg))
+                    .border_b_1()
+                    .border_color(rgb(palette.border_fg))
             })
-            .border_b_1()
-            .border_color(rgb(palette.border_fg))
+            .hover(move |s| s.bg(hover))
             .flex()
             .items_center()
             .gap(px(12.0))
@@ -529,19 +772,20 @@ pub fn render_archived_header_row<V: 'static>(
             }))
             .child(
                 div()
-                    .w(px(42.0))
-                    .h(px(42.0))
+                    .w(px(40.0))
+                    .h(px(40.0))
                     .flex_shrink_0()
                     .rounded_full()
                     .bg(rgb(palette.muted_badge_bg))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(tg_icon(IconName::ArchivedChats, 20.0, 0xFFFFFF)),
+                    .child(tg_icon(IconName::ArchivedChats, 19.0, 0xFFFFFF)),
             )
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .overflow_hidden()
                     .flex()
                     .flex_col()
@@ -552,26 +796,27 @@ pub fn render_archived_header_row<V: 'static>(
                             .items_center()
                             .justify_between()
                             .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(palette.text_primary)).child(tr_str(lang_id, "已归档对话", "Archived Chats")))
-                            .child(tg_icon(chev, 13.0, palette.icon_fg)),
+                            .child(tg_icon(chev, 12.0, palette.icon_fg)),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(div().text_size(px(12.0)).text_color(rgb(palette.text_secondary)).child(preview))
+                            .gap(px(6.0))
+                            .child(div().flex_1().min_w(px(0.0)).truncate().text_size(px(12.0)).text_color(rgb(palette.text_secondary)).child(preview))
                             .when(total_unread > 0, |el| {
                                 el.child(
                                     div()
-                                        .h(px(18.0))
-                                        .min_w(px(18.0))
+                                        .h(px(17.0))
+                                        .min_w(px(17.0))
                                         .px(px(5.0))
                                         .rounded_full()
                                         .bg(rgb(palette.muted_badge_bg))
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_size(px(10.5))
+                                        .text_size(px(10.0))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(rgb(palette.unread_badge_fg))
                                         .child(format!("{}", total_unread)),

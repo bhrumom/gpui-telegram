@@ -1,7 +1,9 @@
 //! Full semantic `TdesktopThemePalette` struct and helpers.
 
 use std::collections::HashMap;
-use gpui::{rgb, Rgba};
+use gpui::{
+    hsla, linear_color_stop, linear_gradient, point, px, rgb, Background, BoxShadow, Rgba,
+};
 
 use super::palette::PaletteTokens;
 use super::palette_presets::preset_palette;
@@ -11,7 +13,8 @@ use super::palette_schemes::{
 };
 
 /// Complete semantic color, typography, bubble geometry, and peer palette derived
-/// from Telegram Desktop `.tdesktop-theme` tokens across `Night`, `Tinted`, `Day`, and `Classic`.
+/// from Apple Messages macOS & Telegram Desktop `.tdesktop-theme` tokens across
+/// `Night`, `Tinted`, `Day`, and `Classic`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TdesktopThemePalette {
     pub mode: TdesktopThemeMode,
@@ -39,6 +42,11 @@ pub struct TdesktopThemePalette {
     pub scrollbar_hover_bg: u32,
     pub msg_in_bg: u32,
     pub msg_out_bg: u32,
+    pub msg_out_bg_top: u32,
+    pub msg_out_bg_bottom: u32,
+    pub msg_out_fg: u32,
+    pub msg_out_secondary_fg: u32,
+    pub msg_out_link_fg: u32,
     pub msg_in_selected_bg: u32,
     pub msg_out_selected_bg: u32,
     pub msg_in_date_fg: u32,
@@ -147,6 +155,88 @@ impl TdesktopThemePalette {
         rgba_from_hex_alpha(hex, alpha)
     }
 
+    /// Returns `true` for Apple Messages macOS visual styles (`Night`, `Tinted`, `Day`).
+    pub const fn is_apple_style(&self) -> bool {
+        self.mode.is_fabushi_style()
+    }
+
+    /// Translucent sidebar material fill allowing macOS `NSVisualEffectView` desktop vibrancy
+    /// to shine through in Apple style while staying opaque in `Classic`.
+    pub fn sidebar_bg_rgba(&self) -> Rgba {
+        let alpha = if !self.is_apple_style() {
+            1.0
+        } else if self.mode.is_dark() {
+            0.74
+        } else {
+            0.72
+        };
+        Self::rgba_with_alpha(self.dialogs_bg, alpha)
+    }
+
+    /// Hairline translucent separator matching macOS HIG (`rgba(0,0,0,0.08)` light / `rgba(255,255,255,0.09)` dark).
+    pub fn separator_rgba(&self) -> Rgba {
+        if self.mode.is_dark() {
+            Self::rgba_with_alpha(0xFFFFFF, 0.09)
+        } else {
+            Self::rgba_with_alpha(0x000000, 0.08)
+        }
+    }
+
+    /// Grouped rounded card surface fill for Inspector drawers and macOS modal cards.
+    pub fn card_surface_rgba(&self) -> Rgba {
+        let alpha = if self.is_apple_style() { 0.94 } else { 1.0 };
+        Self::rgba_with_alpha(self.card_bg, alpha)
+    }
+
+    /// Outgoing message bubble fill: vertical 180deg Apple Messages blue sheen in Apple style,
+    /// solid legacy green fill in `Classic`.
+    pub fn msg_out_gradient(&self) -> Background {
+        if self.is_apple_style() {
+            linear_gradient(
+                180.0,
+                linear_color_stop(rgb(self.msg_out_bg_top), 0.0),
+                linear_color_stop(rgb(self.msg_out_bg_bottom), 1.0),
+            )
+        } else {
+            rgb(self.msg_out_bg).into()
+        }
+    }
+
+    /// Two-layer soft macOS ambient + contact shadow for popovers, menus, Tapbacks, and modals.
+    pub fn popover_shadows(&self) -> Vec<BoxShadow> {
+        if self.mode.is_dark() {
+            vec![
+                BoxShadow {
+                    color: hsla(0.0, 0.0, 0.0, 0.44),
+                    offset: point(px(0.0), px(10.0)),
+                    blur_radius: px(28.0),
+                    spread_radius: px(0.0),
+                },
+                BoxShadow {
+                    color: hsla(0.0, 0.0, 0.0, 0.28),
+                    offset: point(px(0.0), px(2.0)),
+                    blur_radius: px(6.0),
+                    spread_radius: px(0.0),
+                },
+            ]
+        } else {
+            vec![
+                BoxShadow {
+                    color: hsla(0.0, 0.0, 0.0, 0.14),
+                    offset: point(px(0.0), px(8.0)),
+                    blur_radius: px(24.0),
+                    spread_radius: px(0.0),
+                },
+                BoxShadow {
+                    color: hsla(0.0, 0.0, 0.0, 0.08),
+                    offset: point(px(0.0), px(2.0)),
+                    blur_radius: px(6.0),
+                    spread_radius: px(0.0),
+                },
+            ]
+        }
+    }
+
     /// Translucent service pill / date badge background matching Fabushi / Telegram Desktop stage overlays.
     pub fn service_pill_rgba(&self) -> Rgba {
         let alpha = if self.mode.is_fabushi_style() {
@@ -186,7 +276,7 @@ impl TdesktopThemePalette {
             bubble_in_bg: rgb(self.msg_in_bg),
             bubble_in_fg: rgb(self.text_primary),
             bubble_out_bg: rgb(self.msg_out_bg),
-            bubble_out_fg: rgb(self.text_primary),
+            bubble_out_fg: rgb(self.msg_out_fg),
             sidebar_bg: rgb(self.dialogs_bg),
             sidebar_active: rgb(self.dialogs_active_bg),
             sidebar_hover: rgb(self.dialogs_hover_bg),
@@ -204,6 +294,6 @@ impl TdesktopThemePalette {
 
 impl Default for TdesktopThemePalette {
     fn default() -> Self {
-        Self::build(TdesktopThemeMode::Night, 0x1084FE, 14, 17)
+        Self::build(TdesktopThemeMode::Night, 0x0A84FF, 14, 18)
     }
 }

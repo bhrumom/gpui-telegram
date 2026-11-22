@@ -29,13 +29,14 @@ pub fn render_rich_message_body<V: 'static>(
     copied_code_msg: Option<u64>,
     palette: &TdesktopThemePalette,
     lang_id: &str,
-    _is_outgoing: bool,
+    is_outgoing: bool,
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, RichTextAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let is_apple_out = palette.is_apple_style() && is_outgoing;
     let blocks = parse_rich_blocks(text, explicit_entities);
     let font_px = palette.scaled_px(palette.font_size_px as f32);
-    let body_line_h = (font_px * 1.42).round().max(font_px + 5.0);
+    let body_line_h = (font_px * 1.40).round().max(font_px + 5.0);
     let mut col = div().flex().flex_col().gap(px(3.0)).w_full().min_w(px(0.0));
 
     for (block_idx, block) in blocks.into_iter().enumerate() {
@@ -50,6 +51,7 @@ pub fn render_rich_message_body<V: 'static>(
                     None,
                     revealed_spoilers,
                     palette,
+                    is_apple_out,
                     cx,
                     on_action.clone(),
                 ));
@@ -79,22 +81,33 @@ pub fn render_rich_message_body<V: 'static>(
                             Some(FontWeight::BOLD),
                             revealed_spoilers,
                             palette,
+                            is_apple_out,
                             cx,
                             on_action.clone(),
                         )),
                 );
             }
             RichBlock::Divider => {
+                let div_bg = if is_apple_out {
+                    TdesktopThemePalette::rgba_with_alpha(palette.msg_out_fg, 0.28)
+                } else {
+                    TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.55)
+                };
                 col = col.child(
                     div()
                         .w_full()
                         .h(px(1.0))
                         .my(px(5.0))
                         .flex_shrink_0()
-                        .bg(TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.55)),
+                        .bg(div_bg),
                 );
             }
             RichBlock::ListItem { bullet, indent, segments } => {
+                let bullet_color = if is_apple_out {
+                    palette.msg_out_fg
+                } else {
+                    palette.accent
+                };
                 col = col.child(
                     div()
                         .w_full()
@@ -110,7 +123,7 @@ pub fn render_rich_message_body<V: 'static>(
                                 .text_size(px(font_px))
                                 .line_height(px(body_line_h))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(palette.accent))
+                                .text_color(rgb(bullet_color))
                                 .child(bullet),
                         )
                         .child(
@@ -123,6 +136,7 @@ pub fn render_rich_message_body<V: 'static>(
                                 None,
                                 revealed_spoilers,
                                 palette,
+                                is_apple_out,
                                 cx,
                                 on_action.clone(),
                             )),
@@ -133,26 +147,62 @@ pub fn render_rich_message_body<V: 'static>(
                 let code_copy = code.clone();
                 let act = on_action.clone();
                 let is_copied = copied_code_msg == Some(msg_id);
-                let is_fabushi = palette.mode.is_fabushi_style();
+                let is_apple = palette.is_apple_style();
                 let lang_label = if language.is_empty() {
                     "code".to_string()
                 } else {
                     language
                 };
                 let code_font = palette.scaled_px((palette.font_size_px as f32 - 1.5).max(11.5));
-                let block_bg = if is_fabushi { rgb(0x1A1D19) } else { rgb(palette.code_bg) };
-                let block_border: Rgba = if is_fabushi {
-                    rgb(0x343932)
+                let block_bg: Rgba = if is_apple_out {
+                    TdesktopThemePalette::rgba_with_alpha(0x000000, 0.24)
+                } else if is_apple {
+                    if palette.mode.is_dark() {
+                        rgb(0x161618).into()
+                    } else {
+                        rgb(0x1C1C1E).into()
+                    }
+                } else {
+                    rgb(palette.code_bg).into()
+                };
+                let block_border: Rgba = if is_apple_out {
+                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.18)
+                } else if is_apple {
+                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.10)
                 } else {
                     TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.55)
                 };
-                let hdr_bg: Rgba = if is_fabushi {
-                    rgb(0x222621)
+                let hdr_bg: Rgba = if is_apple_out {
+                    TdesktopThemePalette::rgba_with_alpha(0x000000, 0.16)
+                } else if is_apple {
+                    rgb(0x262629).into()
                 } else {
                     TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.35)
                 };
-                let hdr_fg = if is_fabushi { rgb(0x9CA39A) } else { rgb(palette.text_secondary) };
-                let code_text_fg = if is_fabushi { rgb(0xD9DED4) } else { rgb(palette.code_fg) };
+                let hdr_fg = if is_apple_out {
+                    rgb(palette.msg_out_secondary_fg)
+                } else if is_apple {
+                    rgb(0x98989D)
+                } else {
+                    rgb(palette.text_secondary)
+                };
+                let code_text_fg = if is_apple_out {
+                    rgb(palette.msg_out_fg)
+                } else if is_apple {
+                    rgb(0xF2F2F7)
+                } else {
+                    rgb(palette.code_fg)
+                };
+                let copy_fg = if is_apple_out {
+                    palette.msg_out_fg
+                } else {
+                    palette.accent
+                };
+                let copy_hover = if is_apple_out {
+                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.18)
+                } else {
+                    TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.18)
+                };
                 col = col.child(
                     div()
                         .flex()
@@ -160,7 +210,7 @@ pub fn render_rich_message_body<V: 'static>(
                         .w_full()
                         .min_w(px(0.0))
                         .my(px(3.0))
-                        .rounded(px(if is_fabushi { 10.0 } else { 8.0 }))
+                        .rounded(px(if is_apple { 10.0 } else { 8.0 }))
                         .bg(block_bg)
                         .border_1()
                         .border_color(block_border)
@@ -190,17 +240,17 @@ pub fn render_rich_message_body<V: 'static>(
                                         .py(px(2.0))
                                         .rounded(px(4.0))
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.18)))
+                                        .hover(move |s| s.bg(copy_hover))
                                         .on_click(cx.listener(move |this, _ev, _window, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(code_copy.clone()));
                                             act(this, RichTextAction::CopyCode(code_copy.clone()), cx);
                                         }))
-                                        .child(tg_icon(IconName::Copy, 12.0, palette.accent))
+                                        .child(tg_icon(IconName::Copy, 12.0, copy_fg))
                                         .child(
                                             div()
                                                 .text_size(px(11.0))
                                                 .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(palette.accent))
+                                                .text_color(rgb(copy_fg))
                                                 .child(if is_copied {
                                                     tr_key_or(lang_id, "lng_copied", "Copied")
                                                 } else {
@@ -246,19 +296,27 @@ pub fn render_rich_message_body<V: 'static>(
                             None,
                             revealed_spoilers,
                             palette,
+                            is_apple_out,
                             cx,
                             on_action.clone(),
                         ));
                     }
                 }
                 let act = on_action.clone();
-                let quote_bg = if palette.mode.is_fabushi_style() {
+                let quote_bg = if is_apple_out {
+                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.16)
+                } else if palette.is_apple_style() {
                     TdesktopThemePalette::rgba_with_alpha(
                         palette.text_primary,
-                        if palette.mode.is_dark() { 0.06 } else { 0.045 },
+                        if palette.mode.is_dark() { 0.08 } else { 0.05 },
                     )
                 } else {
                     TdesktopThemePalette::rgba_with_alpha(palette.reply_bar_bg, 0.25)
+                };
+                let quote_bar_fg = if is_apple_out {
+                    palette.msg_out_fg
+                } else {
+                    palette.reply_bar_fg
                 };
                 col = col.child(
                     div()
@@ -273,10 +331,10 @@ pub fn render_rich_message_body<V: 'static>(
                         .my(px(palette.scaled_px(3.0)))
                         .px(px(palette.scaled_px(10.0)))
                         .py(px(palette.scaled_px(6.0)))
-                        .rounded(px(palette.scaled_px(6.0)))
+                        .rounded(px(palette.scaled_px(8.0)))
                         .bg(quote_bg)
                         .border_l_2()
-                        .border_color(rgb(palette.reply_bar_fg))
+                        .border_color(rgb(quote_bar_fg))
                         .when(can_collapse, |el| {
                             el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
                                 act(this, RichTextAction::ToggleBlockquote(msg_id, block_id), cx);
@@ -288,7 +346,7 @@ pub fn render_rich_message_body<V: 'static>(
                                 div().pl(px(6.0)).pt(px(2.0)).flex_shrink_0().child(tg_icon(
                                     if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight },
                                     13.0,
-                                    palette.reply_bar_fg,
+                                    quote_bar_fg,
                                 )),
                             )
                         }),
@@ -377,6 +435,7 @@ pub fn split_wrappable_inline_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_inline_segments<V: 'static>(
     msg_id: u64,
     block_key: usize,
@@ -386,12 +445,24 @@ fn render_inline_segments<V: 'static>(
     default_weight: Option<FontWeight>,
     revealed_spoilers: &HashSet<(u64, usize)>,
     palette: &TdesktopThemePalette,
+    is_apple_out: bool,
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, RichTextAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     if segs.is_empty() {
         return div().w_full().h(px(6.0)).flex_shrink_0().into_any_element();
     }
+
+    let base_fg_hex = if is_apple_out {
+        palette.msg_out_fg
+    } else {
+        palette.text_primary
+    };
+    let link_fg_hex = if is_apple_out {
+        palette.msg_out_link_fg
+    } else {
+        palette.text_link
+    };
 
     let mut full_text = String::new();
     let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
@@ -462,19 +533,37 @@ fn render_inline_segments<V: 'static>(
             if f.spoiler {
                 let sid = seg.spoiler_id.unwrap_or(seg_idx);
                 let revealed = revealed_spoilers.contains(&(msg_id, sid));
-                hs.background_color = Some(Hsla::from(if revealed {
+                hs.background_color = Some(Hsla::from(if is_apple_out {
+                    TdesktopThemePalette::rgba_with_alpha(
+                        0xFFFFFF,
+                        if revealed { 0.22 } else { 0.34 },
+                    )
+                } else if revealed {
                     TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14)
                 } else {
                     TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.42)
                 }));
-                hs.color = Some(Hsla::from(if revealed {
+                hs.color = Some(Hsla::from(if is_apple_out {
+                    rgb(if revealed {
+                        palette.msg_out_fg
+                    } else {
+                        palette.msg_out_secondary_fg
+                    })
+                } else if revealed {
                     rgb(palette.text_primary)
                 } else {
                     rgb(palette.text_secondary)
                 }));
             } else if f.code {
-                hs.color = Some(Hsla::from(rgb(palette.code_fg)));
-                hs.background_color = Some(Hsla::from(rgb(palette.code_bg)));
+                if is_apple_out {
+                    hs.color = Some(Hsla::from(rgb(palette.msg_out_fg)));
+                    hs.background_color = Some(Hsla::from(
+                        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.18),
+                    ));
+                } else {
+                    hs.color = Some(Hsla::from(rgb(palette.code_fg)));
+                    hs.background_color = Some(Hsla::from(rgb(palette.code_bg)));
+                }
                 if f.bold || default_weight.is_none() {
                     hs.font_weight = Some(if f.bold {
                         FontWeight::BOLD
@@ -485,13 +574,13 @@ fn render_inline_segments<V: 'static>(
                 if f.link_url.is_some() || f.underline {
                     hs.underline = Some(UnderlineStyle {
                         thickness: px(1.0),
-                        color: Some(Hsla::from(rgb(palette.text_link))),
+                        color: Some(Hsla::from(rgb(link_fg_hex))),
                         wavy: false,
                     });
                 }
             } else {
                 if is_link {
-                    hs.color = Some(Hsla::from(rgb(palette.text_link)));
+                    hs.color = Some(Hsla::from(rgb(link_fg_hex)));
                 }
                 if f.bold {
                     hs.font_weight = Some(FontWeight::BOLD);
@@ -499,13 +588,13 @@ fn render_inline_segments<V: 'static>(
                 if f.italic {
                     hs.font_style = Some(FontStyle::Italic);
                 }
-                if f.underline || f.link_url.is_some() {
+                if f.underline || f.link_url.is_some() || (is_apple_out && is_link) {
                     hs.underline = Some(UnderlineStyle {
                         thickness: px(1.0),
                         color: Some(Hsla::from(rgb(if is_link {
-                            palette.text_link
+                            link_fg_hex
                         } else {
-                            palette.text_primary
+                            base_fg_hex
                         }))),
                         wavy: false,
                     });
@@ -513,7 +602,7 @@ fn render_inline_segments<V: 'static>(
                 if f.strike {
                     hs.strikethrough = Some(StrikethroughStyle {
                         thickness: px(1.0),
-                        color: Some(Hsla::from(rgb(palette.text_primary))),
+                        color: Some(Hsla::from(rgb(base_fg_hex))),
                     });
                 }
             }
@@ -536,7 +625,7 @@ fn render_inline_segments<V: 'static>(
         .min_w(px(0.0))
         .text_size(px(font_px))
         .line_height(px(line_height_px))
-        .text_color(rgb(palette.text_primary))
+        .text_color(rgb(base_fg_hex))
         .when_some(default_weight, |el, w| el.font_weight(w));
 
     if clickable_ranges.is_empty() {

@@ -108,6 +108,7 @@ pub(super) fn render_floating_pill_tooltip_at(
     top_px: f32,
     palette: &TdesktopThemePalette,
 ) -> Deferred {
+    let is_apple = palette.is_apple_style();
     let (pill_bg, pill_fg) = if palette.mode.is_dark() {
         (rgb(0xF1F3F4), rgb(0x1F1F1F))
     } else {
@@ -123,7 +124,8 @@ pub(super) fn render_floating_pill_tooltip_at(
             .py(px(6.0))
             .rounded_full()
             .bg(pill_bg)
-            .shadow_md()
+            .when(is_apple, |el| el.shadow(palette.popover_shadows()))
+            .when(!is_apple, |el| el.shadow_md())
             .whitespace_nowrap()
             .text_size(px(12.0))
             .font_weight(FontWeight::MEDIUM)
@@ -146,9 +148,18 @@ fn render_collapsed_icon_btn<V: 'static>(
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
     click_action: UnifiedSidebarAction,
 ) -> AnyElement {
+    let is_apple = palette.is_apple_style();
     let is_hovered = hovered_item == Some(hover_key);
-    let active_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.20);
-    let hover_bg = rgb(palette.dialogs_hover_bg);
+    let active_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16);
+    let hover_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.06)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     let icon_color = if is_active {
         palette.accent
     } else if is_hovered {
@@ -220,10 +231,19 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let is_apple = palette.is_apple_style();
     let toggle_hovered = hovered_item == Some("toggle");
     let compose_hovered = hovered_item == Some("compose");
     let account_hovered = hovered_item == Some("account");
-    let hover_bg = rgb(palette.dialogs_hover_bg);
+    let hover_bg = if is_apple {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.06)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg)
+    };
     let active_ring = rgb(palette.accent);
     let avatar_grad = palette.peer_avatar_gradient(1);
 
@@ -240,28 +260,47 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
         .w(px(palette.scaled_px(COLLAPSED_WIDTH).min(96.0)))
         .flex_shrink_0()
         .h_full()
-        .bg(rgb(palette.dialogs_bg))
+        .bg(if is_apple {
+            palette.sidebar_bg_rgba()
+        } else {
+            rgb(palette.dialogs_bg)
+        })
         .border_r_1()
-        .border_color(rgb(palette.border_fg))
+        .border_color(if is_apple {
+            palette.separator_rgba()
+        } else {
+            rgb(palette.border_fg)
+        })
         .flex()
         .flex_col()
         .items_center()
         .justify_between()
-        .py(px(10.0))
+        .when(!cfg!(target_os = "macos"), |el| el.pt(px(10.0)))
+        .pb(px(10.0))
         .child(
             div()
+                .w_full()
                 .flex()
                 .flex_col()
                 .items_center()
                 .flex_shrink_0()
                 .gap(px(6.0))
+                .when(cfg!(target_os = "macos"), |el| {
+                    el.child(
+                        div()
+                            .w_full()
+                            .h(px(52.0))
+                            .flex_shrink_0()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
+                })
                 .child(
                     div()
                         .id("sidebar-expand-btn")
                         .relative()
                         .w(px(36.0))
                         .h(px(36.0))
-                        .rounded_full()
+                        .rounded(px(if is_apple { 8.0 } else { 18.0 }))
                         .cursor_pointer()
                         .when(toggle_hovered, |el| el.bg(hover_bg))
                         .hover(move |s| s.bg(hover_bg))
@@ -275,6 +314,7 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev, _w, cx| {
+                                cx.stop_propagation();
                                 on_toggle_click(this, UnifiedSidebarAction::ToggleCollapsed, cx);
                             }),
                         )
@@ -300,19 +340,18 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                         .relative()
                         .w(px(36.0))
                         .h(px(36.0))
-                        .rounded_full()
+                        .rounded(px(if is_apple { 8.0 } else { 18.0 }))
                         .cursor_pointer()
-                        .bg(rgb(palette.input_bg))
-                        .border_1()
-                        .border_color(rgb(palette.border_fg))
+                        .when(!is_apple, |el| {
+                            el.bg(rgb(palette.input_bg))
+                                .border_1()
+                                .border_color(rgb(palette.border_fg))
+                        })
                         .when(compose_hovered, |el| el.bg(hover_bg))
                         .hover(move |s| s.bg(hover_bg))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(18.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(palette.text_primary))
                         .on_hover(cx.listener(move |this, hovered, _w, cx| {
                             let next = if *hovered { Some("compose") } else { None };
                             on_compose_hover(this, UnifiedSidebarAction::SetHover(next), cx);
@@ -320,10 +359,19 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev, _w, cx| {
+                                cx.stop_propagation();
                                 on_compose_click(this, UnifiedSidebarAction::TogglePlusMenu, cx);
                             }),
                         )
-                        .child("+")
+                        .child(tg_icon(
+                            IconName::ComposePen,
+                            17.0,
+                            if compose_hovered {
+                                palette.text_primary
+                            } else {
+                                palette.icon_fg
+                            },
+                        ))
                         .when(compose_hovered, |el| {
                             el.child(render_floating_pill_tooltip(
                                 tr_str(lang_id, "发起新对话", "New Chat"),
@@ -349,7 +397,11 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                         .w(px(24.0))
                         .h(px(1.0))
                         .my(px(2.0))
-                        .bg(rgb(palette.border_fg)),
+                        .bg(if is_apple {
+                            palette.separator_rgba()
+                        } else {
+                            rgb(palette.border_fg)
+                        }),
                 ),
         )
         .child(

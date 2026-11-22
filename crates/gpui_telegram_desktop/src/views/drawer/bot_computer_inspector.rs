@@ -107,16 +107,19 @@ fn bot_action_pill(
         .id(id)
         .cursor_pointer()
         .flex_1()
-        .py(px(8.0))
-        .rounded(px(10.0))
-        .bg(rgb(pal.card_bg))
+        .min_w(px(0.0))
+        .py(px(10.0))
+        .px(px(4.0))
+        .rounded(px(12.0))
+        .bg(pal.card_surface_rgba())
         .border_1()
-        .border_color(rgb(pal.border_fg))
+        .border_color(pal.separator_rgba())
         .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(4.0))
+        .justify_center()
+        .gap(px(5.0))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -124,12 +127,13 @@ fn bot_action_pill(
                 cx.notify();
             }),
         )
-        .child(tg_icon(icon, 16.0, pal.accent))
+        .child(tg_icon(icon, 17.0, pal.accent))
         .child(
             div()
                 .text_size(px(11.0))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(pal.text_link))
+                .text_color(rgb(pal.accent))
+                .truncate()
                 .child(label.to_string()),
         )
 }
@@ -143,14 +147,20 @@ fn bot_menu_row(
     on_tap: impl Fn(&mut ContextInspector, &mut Context<ContextInspector>) + 'static,
     cx: &mut Context<ContextInspector>,
 ) -> Stateful<Div> {
+    let is_danger = fg_color == pal.danger;
     div()
         .id(id)
         .cursor_pointer()
         .w_full()
-        .px(px(10.0))
-        .py(px(8.0))
-        .rounded(px(8.0))
-        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+        .px(px(12.0))
+        .py(px(10.0))
+        .hover(move |s| {
+            if is_danger {
+                s.bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.10))
+            } else {
+                s.bg(rgb(pal.dialogs_hover_bg))
+            }
+        })
         .flex()
         .items_center()
         .gap(px(10.0))
@@ -164,11 +174,18 @@ fn bot_menu_row(
         .child(tg_icon(icon, 15.0, fg_color))
         .child(
             div()
-                .text_size(px(12.5))
+                .text_size(px(13.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(fg_color))
                 .child(label.to_string()),
         )
+}
+
+fn bot_card_hairline(pal: TdesktopThemePalette) -> Div {
+    div()
+        .mx(px(12.0))
+        .h(px(1.0))
+        .bg(pal.separator_rgba())
 }
 
 pub fn render_bot_profile_main(
@@ -207,15 +224,29 @@ pub fn render_bot_profile_main(
         }
     };
 
+    let avatar_px = if pal.is_apple_style() { 74.0 } else { 80.0 };
+    let avatar_shadow = vec![BoxShadow {
+        color: hsla(0.0, 0.0, 0.0, if pal.mode.is_dark() { 0.36 } else { 0.14 }),
+        offset: point(px(0.0), px(4.0)),
+        blur_radius: px(12.0),
+        spread_radius: px(0.0),
+    }];
+
     let avatar = if let Some(ref path) = model.avatar_path {
         div()
-            .w(px(80.0))
-            .h(px(80.0))
+            .w(px(avatar_px))
+            .h(px(avatar_px))
             .rounded_full()
             .overflow_hidden()
             .border_1()
-            .border_color(rgb(pal.border_fg))
-            .child(img(path.clone()).w(px(80.0)).h(px(80.0)).object_fit(ObjectFit::Cover))
+            .border_color(pal.separator_rgba())
+            .shadow(avatar_shadow)
+            .child(
+                img(path.clone())
+                    .w(px(avatar_px))
+                    .h(px(avatar_px))
+                    .object_fit(ObjectFit::Cover),
+            )
             .into_any_element()
     } else if is_owner_fabushi {
         if let Some(ref fab) = inspector.active_fabushi_bot {
@@ -230,17 +261,22 @@ pub fn render_bot_profile_main(
                     &fab.avatar_shape,
                     &fab.avatar_color,
                     &fallback_initials,
-                    80.0,
+                    avatar_px,
                     state,
-                    pal.window_bg,
+                    pal.stage_bg,
                     false,
                 )
             } else {
                 render_grok_bot_avatar(
-                    GrokBotAvatarProps::new(&fab.agent_id, &fab.avatar_shape, &fab.avatar_color, 80.0)
-                        .with_state(state)
-                        .with_follow_pointer(true)
-                        .with_surface_bg(pal.window_bg),
+                    GrokBotAvatarProps::new(
+                        &fab.agent_id,
+                        &fab.avatar_shape,
+                        &fab.avatar_color,
+                        avatar_px,
+                    )
+                    .with_state(state)
+                    .with_follow_pointer(true)
+                    .with_surface_bg(pal.stage_bg),
                 )
             };
             div()
@@ -260,14 +296,17 @@ pub fn render_bot_profile_main(
         }
     } else {
         div()
-            .w(px(80.0))
-            .h(px(80.0))
+            .w(px(avatar_px))
+            .h(px(avatar_px))
             .rounded_full()
             .bg(rgb(avatar_color))
+            .border_1()
+            .border_color(pal.separator_rgba())
+            .shadow(avatar_shadow)
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(26.0))
+            .text_size(px(25.0))
             .font_weight(FontWeight::BOLD)
             .text_color(rgb(0xFFFFFF))
             .child(fallback_initials)
@@ -315,19 +354,19 @@ pub fn render_bot_profile_main(
     let copied_prefix = tr_str(lang, "已复制", "Copied").to_string();
     let copied_link_prefix = tr_str(lang, "已复制", "Copied").to_string();
 
-    let mut action_rows = div()
+    let mut info_action_rows = div()
         .w_full()
-        .p(px(6.0))
         .rounded(px(12.0))
-        .bg(rgb(pal.card_bg))
+        .bg(pal.card_surface_rgba())
         .border_1()
-        .border_color(rgb(pal.border_fg))
+        .border_color(pal.separator_rgba())
+        .overflow_hidden()
         .flex()
-        .flex_col()
-        .gap(px(2.0));
+        .flex_col();
 
+    let mut has_prev_info_row = false;
     if model.bot_can_join_groups {
-        action_rows = action_rows.child(bot_menu_row(
+        info_action_rows = info_action_rows.child(bot_menu_row(
             "bot-profile-add-to-group",
             IconName::GroupUsers,
             tr_str(lang, "添加到群组", "Add to Group or Channel"),
@@ -338,9 +377,13 @@ pub fn render_bot_profile_main(
             },
             cx,
         ));
+        has_prev_info_row = true;
     }
     if has_help_cmd {
-        action_rows = action_rows.child(bot_menu_row(
+        if has_prev_info_row {
+            info_action_rows = info_action_rows.child(bot_card_hairline(pal));
+        }
+        info_action_rows = info_action_rows.child(bot_menu_row(
             "bot-profile-help",
             IconName::FolderBots,
             tr_str(lang, "机器人帮助", "Bot Help"),
@@ -351,9 +394,13 @@ pub fn render_bot_profile_main(
             },
             cx,
         ));
+        has_prev_info_row = true;
     }
     if has_settings_row {
-        action_rows = action_rows.child(bot_menu_row(
+        if has_prev_info_row {
+            info_action_rows = info_action_rows.child(bot_card_hairline(pal));
+        }
+        info_action_rows = info_action_rows.child(bot_menu_row(
             "bot-profile-settings",
             IconName::SettingsGear,
             tr_str(lang, "机器人设置", "Bot Settings"),
@@ -364,22 +411,34 @@ pub fn render_bot_profile_main(
             },
             cx,
         ));
+        has_prev_info_row = true;
     }
     let priv_for_row = privacy_url.clone();
-    action_rows = action_rows
-        .child(bot_menu_row(
-            "bot-profile-privacy",
-            IconName::Lock,
-            tr_str(lang, "机器人隐私政策", "Privacy Policy"),
-            pal.text_primary,
-            pal,
-            move |this, _| {
-                this.pending_action =
-                    Some(InspectorAction::OpenBotPrivacyPolicy(priv_for_row.clone()));
-            },
-            cx,
-        ))
-        .child(div().w_full().h(px(1.0)).my(px(2.0)).bg(rgb(pal.border_fg)))
+    if has_prev_info_row {
+        info_action_rows = info_action_rows.child(bot_card_hairline(pal));
+    }
+    info_action_rows = info_action_rows.child(bot_menu_row(
+        "bot-profile-privacy",
+        IconName::Lock,
+        tr_str(lang, "机器人隐私政策", "Privacy Policy"),
+        pal.text_primary,
+        pal,
+        move |this, _| {
+            this.pending_action =
+                Some(InspectorAction::OpenBotPrivacyPolicy(priv_for_row.clone()));
+        },
+        cx,
+    ));
+
+    let destructive_action_card = div()
+        .w_full()
+        .rounded(px(12.0))
+        .bg(pal.card_surface_rgba())
+        .border_1()
+        .border_color(pal.separator_rgba())
+        .overflow_hidden()
+        .flex()
+        .flex_col()
         .child(bot_menu_row(
             "bot-profile-report",
             IconName::DeleteTrash,
@@ -391,6 +450,7 @@ pub fn render_bot_profile_main(
             },
             cx,
         ))
+        .child(bot_card_hairline(pal))
         .child(bot_menu_row(
             "bot-profile-block-toggle",
             IconName::Close,
@@ -426,17 +486,19 @@ pub fn render_bot_profile_main(
                 .flex_col()
                 .items_center()
                 .gap(px(6.0))
-                .py(px(6.0))
+                .pt(px(4.0))
+                .pb(px(4.0))
                 .child(avatar)
                 .child(
                     div()
+                        .pt(px(4.0))
                         .flex()
                         .items_center()
                         .justify_center()
                         .gap(px(5.0))
                         .child(
                             div()
-                                .text_size(px(16.0))
+                                .text_size(px(18.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(pal.text_primary))
                                 .child(model.name.clone()),
@@ -503,14 +565,14 @@ pub fn render_bot_profile_main(
         .when(!model.bio.trim().is_empty() || !display_username.is_empty(), |col| {
             let mut info_card = div()
                 .w_full()
-                .p(px(10.0))
+                .p(px(12.0))
                 .rounded(px(12.0))
-                .bg(rgb(pal.card_bg))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(8.0));
+                .gap(px(10.0));
 
             if !model.bio.trim().is_empty() {
                 info_card = info_card.child(
@@ -520,15 +582,16 @@ pub fn render_bot_profile_main(
                         .gap(px(2.0))
                         .child(
                             div()
-                                .text_size(px(12.5))
-                                .text_color(rgb(pal.text_primary))
-                                .child(model.bio.clone()),
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(pal.text_secondary))
+                                .child(tr_str(lang, "简介", "Info")),
                         )
                         .child(
                             div()
-                                .text_size(px(11.0))
-                                .text_color(rgb(pal.text_secondary))
-                                .child(tr_str(lang, "简介", "Info")),
+                                .text_size(px(13.0))
+                                .text_color(rgb(pal.text_primary))
+                                .child(model.bio.clone()),
                         ),
                 );
             }
@@ -537,7 +600,7 @@ pub fn render_bot_profile_main(
                 let cp = display_username.clone();
                 let cp_feedback = display_username.clone();
                 if !model.bio.trim().is_empty() {
-                    info_card = info_card.child(div().w_full().h(px(1.0)).bg(rgb(pal.border_fg)));
+                    info_card = info_card.child(div().w_full().h(px(1.0)).bg(pal.separator_rgba()));
                 }
                 info_card = info_card.child(
                     div()
@@ -688,8 +751,9 @@ pub fn render_bot_profile_main(
                     ),
             )
         })
-        .child(action_rows)
+        .child(info_action_rows)
         .when_some(owner_section, |col, owner| col.child(owner))
+        .child(destructive_action_card)
         .into_any_element()
 }
 
@@ -699,8 +763,15 @@ fn copied_feedback_banner(
 ) -> Option<AnyElement> {
     inspector.copied_feedback.as_ref().map(|hint| {
         div()
-            .px(px(6.0))
-            .text_size(px(11.0))
+            .w_full()
+            .px(px(12.0))
+            .py(px(7.0))
+            .rounded(px(10.0))
+            .bg(TdesktopThemePalette::rgba_with_alpha(pal.success, 0.12))
+            .border_1()
+            .border_color(TdesktopThemePalette::rgba_with_alpha(pal.success, 0.28))
+            .text_size(px(11.5))
+            .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(pal.success))
             .child(hint.clone())
             .into_any_element()
@@ -1003,13 +1074,13 @@ fn render_owner_fabushi_and_computer_cards(
                 div()
                     .w_full()
                     .p(px(12.0))
-                    .rounded(px(14.0))
-                    .bg(rgb(pal.card_bg))
+                    .rounded(px(12.0))
+                    .bg(pal.card_surface_rgba())
                     .border_1()
-                    .border_color(rgb(pal.border_fg))
+                    .border_color(pal.separator_rgba())
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(px(10.0))
                     .child(
                         div()
                             .flex()
@@ -1091,10 +1162,10 @@ fn render_owner_fabushi_and_computer_cards(
             div()
                 .w_full()
                 .p(px(12.0))
-                .rounded(px(14.0))
-                .bg(rgb(pal.card_bg))
+                .rounded(px(12.0))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
                 .gap(px(10.0))
@@ -1211,13 +1282,13 @@ fn render_owner_fabushi_and_computer_cards(
             div()
                 .w_full()
                 .p(px(12.0))
-                .rounded(px(14.0))
-                .bg(rgb(pal.card_bg))
+                .rounded(px(12.0))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .flex()
@@ -1362,7 +1433,7 @@ fn render_miniature_desktop_card(
         .overflow_hidden()
         .bg(rgb(0xEFF3F8))
         .border_1()
-        .border_color(rgb(pal.border_fg))
+        .border_color(pal.separator_rgba())
         .hover(|s| s.border_color(rgb(pal.accent)))
         .flex()
         .flex_col()
@@ -1534,9 +1605,9 @@ pub fn render_bot_computers_subpage(
             div()
                 .p(px(12.0))
                 .rounded(px(12.0))
-                .bg(rgb(pal.card_bg))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .text_size(px(12.0))
                 .text_color(rgb(pal.text_secondary))
                 .child(tr_str(
@@ -1604,14 +1675,14 @@ pub fn render_bot_computers_subpage(
             div()
                 .w_full()
                 .p(px(18.0))
-                .rounded(px(14.0))
-                .bg(rgb(pal.card_bg))
+                .rounded(px(12.0))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .w(px(40.0))
@@ -1709,14 +1780,18 @@ fn render_computer_item_card(
 
     div()
         .w_full()
-        .p(px(10.0))
+        .p(px(12.0))
         .rounded(px(12.0))
-        .bg(rgb(pal.card_bg))
+        .bg(pal.card_surface_rgba())
         .border_1()
-        .border_color(rgb(if is_bound { pal.accent } else { pal.border_fg }))
+        .border_color(if is_bound {
+            rgb(pal.accent).into()
+        } else {
+            pal.separator_rgba()
+        })
         .flex()
         .flex_col()
-        .gap(px(8.0))
+        .gap(px(10.0))
         .child(
             div()
                 .flex()
@@ -1992,14 +2067,14 @@ pub fn render_bot_config_editor(
         .gap(px(12.0))
         .child(
             div()
-                .p(px(10.0))
+                .p(px(12.0))
                 .rounded(px(12.0))
-                .bg(rgb(pal.card_bg))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -2011,14 +2086,14 @@ pub fn render_bot_config_editor(
         )
         .child(
             div()
-                .p(px(10.0))
+                .p(px(12.0))
                 .rounded(px(12.0))
-                .bg(rgb(pal.card_bg))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -2032,16 +2107,16 @@ pub fn render_bot_config_editor(
                         .cursor_text()
                         .min_h(px(74.0))
                         .p(px(8.0))
-                        .rounded(px(8.0))
+                        .rounded(px(10.0))
                         .bg(rgb(pal.input_bg))
                         .border_1()
-                        .border_color(rgb(
+                        .border_color(
                             if inspector.bot_config_focus == BotConfigFocusField::Persona {
-                                pal.accent
+                                rgb(pal.accent).into()
                             } else {
-                                pal.border_fg
+                                pal.separator_rgba()
                             },
-                        ))
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -2067,14 +2142,14 @@ pub fn render_bot_config_editor(
         )
         .child(
             div()
-                .p(px(10.0))
+                .p(px(12.0))
                 .rounded(px(12.0))
-                .bg(rgb(pal.card_bg))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -2087,18 +2162,18 @@ pub fn render_bot_config_editor(
                         .id("bot-model-input-box")
                         .cursor_text()
                         .min_h(px(34.0))
-                        .px(px(8.0))
+                        .px(px(10.0))
                         .py(px(6.0))
-                        .rounded(px(8.0))
+                        .rounded(px(10.0))
                         .bg(rgb(pal.input_bg))
                         .border_1()
-                        .border_color(rgb(
+                        .border_color(
                             if inspector.bot_config_focus == BotConfigFocusField::Model {
-                                pal.accent
+                                rgb(pal.accent).into()
                             } else {
-                                pal.border_fg
+                                pal.separator_rgba()
                             },
-                        ))
+                        )
                         .flex()
                         .items_center()
                         .on_mouse_down(
@@ -2146,14 +2221,14 @@ pub fn render_bot_config_editor(
         )
         .child(
             div()
-                .p(px(10.0))
+                .p(px(12.0))
                 .rounded(px(12.0))
-                .bg(rgb(pal.card_bg))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -2177,7 +2252,11 @@ pub fn render_bot_config_editor(
                                     rgb(pal.input_bg).into()
                                 })
                                 .border_1()
-                                .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
+                                .border_color(if active {
+                                    rgb(pal.accent).into()
+                                } else {
+                                    pal.separator_rgba()
+                                })
                                 .text_size(px(11.0))
                                 .font_weight(if active {
                                     FontWeight::SEMIBOLD
@@ -2203,14 +2282,14 @@ pub fn render_bot_config_editor(
         )
         .child(
             div()
-                .p(px(10.0))
+                .p(px(12.0))
                 .rounded(px(12.0))
-                .bg(rgb(pal.card_bg))
+                .bg(pal.card_surface_rgba())
                 .border_1()
-                .border_color(rgb(pal.border_fg))
+                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(6.0))
+                .gap(px(8.0))
                 .child(bot_toggle_row(
                     "bot-toggle-cross-device",
                     tr_str(lang, "允许跨设备协同控制", "Allow Cross-Device Control"),
@@ -2297,6 +2376,7 @@ fn bot_toggle_row(
     pal: TdesktopThemePalette,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let track_bg = if enabled { pal.success } else { pal.input_bg };
     div()
         .id(id)
         .cursor_pointer()
@@ -2307,24 +2387,40 @@ fn bot_toggle_row(
         .on_mouse_down(MouseButton::Left, on_click)
         .child(
             div()
-                .text_size(px(11.5))
+                .text_size(px(12.0))
                 .text_color(rgb(pal.text_primary))
                 .child(label.to_string()),
         )
         .child(
             div()
                 .w(px(34.0))
-                .h(px(18.0))
+                .h(px(20.0))
                 .rounded_full()
-                .bg(rgb(if enabled { pal.accent } else { pal.input_bg }))
+                .bg(rgb(track_bg))
                 .border_1()
-                .border_color(rgb(if enabled { pal.accent } else { pal.border_fg }))
+                .border_color(if enabled {
+                    rgb(track_bg).into()
+                } else {
+                    pal.separator_rgba()
+                })
                 .px(px(2.0))
                 .flex()
                 .items_center()
                 .justify_end()
                 .when(!enabled, |el| el.justify_start())
-                .child(div().w(px(12.0)).h(px(12.0)).rounded_full().bg(rgb(0xFFFFFF))),
+                .child(
+                    div()
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .rounded_full()
+                        .bg(rgb(0xFFFFFF))
+                        .shadow(vec![BoxShadow {
+                            color: hsla(0.0, 0.0, 0.0, 0.22),
+                            offset: point(px(0.0), px(1.0)),
+                            blur_radius: px(2.0),
+                            spread_radius: px(0.0),
+                        }]),
+                ),
         )
 }
 
@@ -2407,13 +2503,13 @@ fn render_coding_agent_inspector_card(
         .id("coding-agent-inspector-card")
         .w_full()
         .p(px(12.0))
-        .rounded(px(14.0))
-        .bg(rgb(pal.card_bg))
+        .rounded(px(12.0))
+        .bg(pal.card_surface_rgba())
         .border_1()
-        .border_color(rgb(pal.border_fg))
+        .border_color(pal.separator_rgba())
         .flex()
         .flex_col()
-        .gap(px(8.0))
+        .gap(px(10.0))
         .child(
             div()
                 .flex()
@@ -2477,18 +2573,18 @@ fn render_coding_agent_inspector_card(
                 .id("coding-insp-workspace-box")
                 .cursor_text()
                 .min_h(px(32.0))
-                .px(px(8.0))
+                .px(px(10.0))
                 .py(px(6.0))
-                .rounded(px(8.0))
+                .rounded(px(10.0))
                 .bg(rgb(pal.input_bg))
                 .border_1()
-                .border_color(rgb(
+                .border_color(
                     if inspector.bot_config_focus == BotConfigFocusField::CodingWorkspace {
-                        pal.accent
+                        rgb(pal.accent).into()
                     } else {
-                        pal.border_fg
+                        pal.separator_rgba()
                     },
-                ))
+                )
                 .flex()
                 .items_center()
                 .on_mouse_down(
@@ -2549,18 +2645,18 @@ fn render_coding_agent_inspector_card(
                 .id("coding-insp-model-box")
                 .cursor_text()
                 .min_h(px(32.0))
-                .px(px(8.0))
+                .px(px(10.0))
                 .py(px(6.0))
-                .rounded(px(8.0))
+                .rounded(px(10.0))
                 .bg(rgb(pal.input_bg))
                 .border_1()
-                .border_color(rgb(
+                .border_color(
                     if inspector.bot_config_focus == BotConfigFocusField::CodingModel {
-                        pal.accent
+                        rgb(pal.accent).into()
                     } else {
-                        pal.border_fg
+                        pal.separator_rgba()
                     },
-                ))
+                )
                 .flex()
                 .items_center()
                 .on_mouse_down(

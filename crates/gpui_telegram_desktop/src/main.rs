@@ -47,17 +47,33 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
         let app_client = client.clone();
 
+        let titlebar = if cfg!(target_os = "macos") {
+            Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(16.0), px(18.0))),
+            })
+        } else {
+            Some(TitlebarOptions {
+                title: Some(SharedString::from(if cfg!(target_os = "windows") {
+                    "Fabushi"
+                } else {
+                    ""
+                })),
+                ..Default::default()
+            })
+        };
+        let window_background = if cfg!(target_os = "macos") {
+            WindowBackgroundAppearance::Blurred
+        } else {
+            WindowBackgroundAppearance::Opaque
+        };
+
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from(if cfg!(target_os = "windows") {
-                        "Fabushi"
-                    } else {
-                        ""
-                    })),
-                    ..Default::default()
-                }),
+                titlebar,
+                window_background,
                 focus: true,
                 show: true,
                 window_min_size: Some(size(px(800.0), px(560.0))),

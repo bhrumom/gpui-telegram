@@ -18,9 +18,14 @@ use crate::views::app_shell::shell_panels::{render_empty_panel_notice, render_pa
 use crate::views::app_shell::shell_truth::{
     derive_initials, format_authoritative_timestamp, peer_subtitle_for_dialog,
 };
+use crate::views::app_shell::modal_container::{
+    macos_modal_backdrop_rgba, macos_modal_card, macos_popover_surface, macos_primary_pill_btn,
+    macos_secondary_pill_btn,
+};
 use crate::views::app_shell::peer_avatar_color;
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::chat_sidebar::{AddContactKind, CreationInputField, SidebarCreationModal};
+use crate::views::drawer::inspector_panels::{segmented_active_bg, segmented_pill_shadow};
 use crate::views::nav_rail::NavDestination;
 use crate::views::settings::sections::SettingsVaultAction;
 use crate::views::settings::SettingsSectionType;
@@ -32,19 +37,13 @@ fn fullscreen_occluded_layer(child: impl IntoElement) -> AnyElement {
     div().absolute().top_0().left_0().size_full().occlude().child(child).into_any_element()
 }
 
-fn modal_backdrop_shell(id: &'static str, bg_rgba: u32) -> Stateful<Div> {
-    div().id(id).absolute().top_0().left_0().size_full().occlude().bg(rgba(bg_rgba)).flex().items_center().justify_center()
+fn modal_backdrop_shell(id: &'static str, bg_color: Rgba) -> Stateful<Div> {
+    div().id(id).absolute().top_0().left_0().size_full().occlude().bg(bg_color).flex().items_center().justify_center()
 }
 
-fn modal_text_action_btn(id: &'static str, label: &'static str, pal: TdesktopThemePalette) -> Stateful<Div> {
-    div().id(id).cursor_pointer().px(px(10.0)).py(px(6.0)).rounded(px(6.0))
-        .hover(move |s| s.bg(rgb(pal.hover_bg)))
-        .text_size(px(13.5)).font_weight(FontWeight::BOLD).text_color(rgb(pal.accent)).child(label)
-}
-
-fn talk_pill(bg: u32, border: Option<u32>, fg: u32, label: &'static str) -> Div {
-    let base = div().cursor_pointer().px(px(12.0)).py(px(6.0)).rounded(px(8.0)).bg(rgb(bg)).text_size(px(12.5)).text_color(rgb(fg)).child(label);
-    if let Some(b) = border { base.border_1().border_color(rgb(b)) } else { base.font_weight(FontWeight::SEMIBOLD) }
+fn talk_pill(bg: u32, border: Option<Rgba>, fg: u32, label: &'static str) -> Div {
+    let base = div().cursor_pointer().px(px(13.0)).py(px(6.5)).rounded(px(999.0)).bg(rgb(bg)).text_size(px(12.5)).text_color(rgb(fg)).child(label);
+    if let Some(b) = border { base.border_1().border_color(b) } else { base.font_weight(FontWeight::SEMIBOLD) }
 }
 
 fn format_live_miniapp_telemetry(
@@ -108,12 +107,15 @@ impl AppShell {
     ) -> AnyElement {
         let w = pal.scaled_px(width_px).min(1080.0);
         let h = pal.scaled_px(height_px).min(820.0);
-        modal_backdrop_shell(backdrop_id, 0x00000088)
+        modal_backdrop_shell(backdrop_id, macos_modal_backdrop_rgba(pal))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_workspace_modal_to_chats(cx)))
             .child(
-                div().id(box_id).w(px(w)).h(px(h)).rounded(px(pal.scaled_px(14.0)))
-                    .bg(rgb(pal.modal_bg)).border_1().border_color(rgb(pal.border_fg))
-                    .shadow_lg().flex().flex_col().overflow_hidden()
+                macos_modal_card(box_id, pal)
+                    .w(px(w))
+                    .h(px(h))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(body),
             )
@@ -122,10 +124,13 @@ impl AppShell {
 
     /// Renders the centered, responsive `ComputerWorkbench` overlay layer.
     pub fn render_remote_computer_overlay(&self, overlay: Entity<ComputerWorkbench>) -> AnyElement {
-        modal_backdrop_shell("computer-workbench-backdrop", 0x000000A6)
-            .p(px(20.0))
-            .child(overlay)
-            .into_any_element()
+        modal_backdrop_shell(
+            "computer-workbench-backdrop",
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.56),
+        )
+        .p(px(20.0))
+        .child(overlay)
+        .into_any_element()
     }
 
     /// Renders the Talk Mode / WebRTC call overlay plus AI voice controls when active.
@@ -135,14 +140,15 @@ impl AppShell {
         let talk_lang = self.active_lang_id();
         let talk_pal = self.theme_state.palette;
 
-        div().absolute().top_0().left_0().size_full().occlude().bg(rgba(0x00000088))
+        div().absolute().top_0().left_0().size_full().occlude().bg(macos_modal_backdrop_rgba(talk_pal))
             .flex().flex_col().items_center().justify_center().gap(px(12.0))
             .child(overlay)
             .when(is_ai_talk, |wrap| {
                 let ptt_lbl = if is_rec { tr_str(talk_lang, "停止并发送语音", "Stop & Send Voice") } else { tr_str(talk_lang, "按住/点击说话", "Push to Talk") };
                 wrap.child(
                     div().flex().items_center().gap(px(10.0)).px(px(16.0)).py(px(10.0)).rounded(px(14.0))
-                        .bg(rgb(talk_pal.card_bg)).border_1().border_color(rgb(talk_pal.border_fg))
+                        .bg(rgb(talk_pal.modal_bg)).border_1().border_color(talk_pal.separator_rgba())
+                        .shadow(talk_pal.popover_shadows())
                         .child(
                             talk_pill(if is_rec { talk_pal.danger } else { talk_pal.accent }, None, 0xFFFFFF, ptt_lbl)
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
@@ -151,7 +157,7 @@ impl AppShell {
                                 })),
                         )
                         .child(
-                            talk_pill(talk_pal.input_bg, Some(talk_pal.border_fg), talk_pal.text_primary, tr_str(talk_lang, "发送对话回合", "Send Voice Turn"))
+                            talk_pill(talk_pal.input_bg, Some(talk_pal.separator_rgba()), talk_pal.text_primary, tr_str(talk_lang, "发送对话回合", "Send Voice Turn"))
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                     let draft = this.composer.read(cx).text().trim().to_string();
                                     let prompt = if !draft.is_empty() {
@@ -164,7 +170,7 @@ impl AppShell {
                                 })),
                         )
                         .child(
-                            talk_pill(talk_pal.input_bg, Some(talk_pal.danger), talk_pal.danger, tr_str(talk_lang, "打断播报 (<60ms)", "Barge-In (<60ms)"))
+                            talk_pill(talk_pal.input_bg, Some(TdesktopThemePalette::rgba_with_alpha(talk_pal.danger, 0.50)), talk_pal.danger, tr_str(talk_lang, "打断播报 (<60ms)", "Barge-In (<60ms)"))
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.interrupt_ai_talk_barge_in(cx))),
                         ),
                 )
@@ -412,11 +418,15 @@ impl AppShell {
                     .w(px(if is_live_pip { 340.0 } else { 300.0 }))
                     .px(px(12.0))
                     .py(px(10.0))
-                    .rounded(px(16.0))
+                    .rounded(px(14.0))
                     .bg(rgb(pal.modal_bg))
                     .border_1()
-                    .border_color(rgb(badge_color))
-                    .shadow_lg()
+                    .border_color(if is_takeover || is_waiting || is_live_pip {
+                        TdesktopThemePalette::rgba_with_alpha(badge_color, 0.55)
+                    } else {
+                        pal.separator_rgba()
+                    })
+                    .shadow(pal.popover_shadows())
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -755,7 +765,7 @@ impl AppShell {
         }
         if let Some(box_ent) = self.miniapps.create_bot_box.clone().filter(|b| b.read(cx).is_visible) {
             layers.push(
-                modal_backdrop_shell("create-managed-bot-backdrop", 0x00000099)
+                modal_backdrop_shell("create-managed-bot-backdrop", macos_modal_backdrop_rgba(pal))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.miniapps.create_bot_box = None; cx.notify(); }))
                     .child(div().on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation())).child(box_ent))
                     .into_any_element(),
@@ -777,7 +787,7 @@ impl AppShell {
                 if i.is_empty() { "BT".to_string() } else { i }
             };
             layers.push(
-                modal_backdrop_shell("miniapp-launch-confirm-backdrop", 0x00000088)
+                modal_backdrop_shell("miniapp-launch-confirm-backdrop", macos_modal_backdrop_rgba(pal))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -786,15 +796,9 @@ impl AppShell {
                         }),
                     )
                     .child(
-                        div()
-                            .id("miniapp-launch-confirm-modal")
-                            .w(px(360.0))
+                        macos_modal_card("miniapp-launch-confirm-modal", pal)
+                            .w(px(368.0))
                             .p(px(22.0))
-                            .rounded(px(16.0))
-                            .bg(rgb(pal.modal_bg))
-                            .border_1()
-                            .border_color(rgb(pal.border_fg))
-                            .shadow_lg()
                             .flex()
                             .flex_col()
                             .gap(px(14.0))
@@ -810,6 +814,8 @@ impl AppShell {
                                             .h(px(48.0))
                                             .rounded_full()
                                             .bg(rgb(avatar_col))
+                                            .border_1()
+                                            .border_color(pal.separator_rgba())
                                             .flex()
                                             .items_center()
                                             .justify_center()
@@ -846,11 +852,13 @@ impl AppShell {
                                 div()
                                     .id("miniapp-confirm-more-info-btn")
                                     .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(8.0))
-                                    .rounded(px(8.0))
-                                    .bg(rgb(pal.card_bg))
-                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                    .px(px(12.0))
+                                    .py(px(9.0))
+                                    .rounded(px(10.0))
+                                    .bg(pal.card_surface_rgba())
+                                    .border_1()
+                                    .border_color(pal.separator_rgba())
+                                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                                     .flex()
                                     .items_center()
                                     .justify_between()
@@ -869,7 +877,7 @@ impl AppShell {
                                         "本机器人的更多信息",
                                         "More information about this bot",
                                     ))
-                                    .child(">"),
+                                    .child(tg_icon(IconName::ChevronRight, 13.0, pal.accent)),
                             )
                             .child(
                                 div()
@@ -910,48 +918,35 @@ impl AppShell {
                                     .mt(px(4.0))
                                     .flex()
                                     .justify_end()
-                                    .gap(px(10.0))
+                                    .gap(px(8.0))
                                     .child(
-                                        div()
-                                            .id("miniapp-confirm-cancel-btn")
-                                            .cursor_pointer()
-                                            .px(px(14.0))
-                                            .py(px(8.0))
-                                            .rounded(px(8.0))
-                                            .hover(move |s| s.bg(rgb(pal.hover_bg)))
-                                            .text_size(px(13.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(pal.text_secondary))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.miniapps.pending_miniapp_confirm = None;
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child(tr_str(lang, "取消", "Cancel")),
+                                        macos_secondary_pill_btn(
+                                            "miniapp-confirm-cancel-btn",
+                                            tr_str(lang, "取消", "Cancel"),
+                                            pal,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.miniapps.pending_miniapp_confirm = None;
+                                                cx.notify();
+                                            }),
+                                        ),
                                     )
                                     .child(
-                                        div()
-                                            .id("miniapp-confirm-open-btn")
-                                            .cursor_pointer()
-                                            .px(px(16.0))
-                                            .py(px(8.0))
-                                            .rounded(px(8.0))
-                                            .bg(rgb(pal.accent))
-                                            .hover(move |s| s.bg(rgb(pal.accent_hover)))
-                                            .text_size(px(13.5))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(0xFFFFFF))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.confirm_pending_miniapp_launch(cx);
-                                                }),
-                                            )
-                                            .child(tr_str(lang, "打开应用", "Launch")),
+                                        macos_primary_pill_btn(
+                                            "miniapp-confirm-open-btn",
+                                            tr_str(lang, "打开应用", "Launch"),
+                                            pal,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.confirm_pending_miniapp_launch(cx);
+                                            }),
+                                        ),
                                     ),
                             ),
                     )
@@ -960,7 +955,7 @@ impl AppShell {
         }
         if let Some(box_ent) = self.miniapps.bot_profile_box.clone().filter(|b| b.read(cx).is_visible) {
             layers.push(
-                modal_backdrop_shell("bot-profile-box-backdrop", 0x00000088)
+                modal_backdrop_shell("bot-profile-box-backdrop", macos_modal_backdrop_rgba(pal))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -984,7 +979,7 @@ impl AppShell {
         }
         if self.miniapps.miniapp_tos_modal_open {
             layers.push(
-                modal_backdrop_shell("miniapp-tos-modal-backdrop", 0x00000099)
+                modal_backdrop_shell("miniapp-tos-modal-backdrop", macos_modal_backdrop_rgba(pal))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -993,15 +988,9 @@ impl AppShell {
                         }),
                     )
                     .child(
-                        div()
-                            .id("miniapp-tos-modal")
-                            .w(px(390.0))
+                        macos_modal_card("miniapp-tos-modal", pal)
+                            .w(px(396.0))
                             .p(px(22.0))
-                            .rounded(px(16.0))
-                            .bg(rgb(pal.modal_bg))
-                            .border_1()
-                            .border_color(rgb(pal.border_fg))
-                            .shadow_lg()
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
@@ -1033,25 +1022,19 @@ impl AppShell {
                                     .flex()
                                     .justify_end()
                                     .child(
-                                        div()
-                                            .id("miniapp-tos-close-btn")
-                                            .cursor_pointer()
-                                            .px(px(16.0))
-                                            .py(px(7.0))
-                                            .rounded(px(8.0))
-                                            .bg(rgb(pal.accent))
-                                            .text_size(px(13.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xFFFFFF))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.miniapps.miniapp_tos_modal_open = false;
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child(tr_str(lang, "我知道了", "OK")),
+                                        macos_primary_pill_btn(
+                                            "miniapp-tos-close-btn",
+                                            tr_str(lang, "我知道了", "OK"),
+                                            pal,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.miniapps.miniapp_tos_modal_open = false;
+                                                cx.notify();
+                                            }),
+                                        ),
                                     ),
                             ),
                     )
@@ -1091,32 +1074,54 @@ impl AppShell {
             }
         }
 
-        modal_backdrop_shell("telegram-contacts-modal-backdrop", 0x00000088)
+        modal_backdrop_shell("telegram-contacts-modal-backdrop", macos_modal_backdrop_rgba(pal))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.sidebar.update(cx, |sb, scx| { sb.close_contacts_modal(); scx.notify(); });
                 cx.notify();
             }))
             .child(
-                div().id("telegram-contacts-modal-box").w(px(pal.scaled_px(360.0).min(640.0))).h(px(pal.scaled_px(480.0).min(760.0))).rounded(px(pal.scaled_px(12.0)))
-                    .bg(rgb(pal.modal_bg)).border_1().border_color(rgb(pal.border_fg))
-                    .shadow_lg().flex().flex_col().overflow_hidden()
+                macos_modal_card("telegram-contacts-modal-box", pal)
+                    .w(px(pal.scaled_px(372.0).min(640.0)))
+                    .h(px(pal.scaled_px(492.0).min(760.0)))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        div().w_full().px(px(pal.scaled_px(20.0))).py(px(pal.scaled_px(14.0))).flex().items_center().justify_between()
+                        div().w_full().px(px(pal.scaled_px(20.0))).pt(px(pal.scaled_px(16.0))).pb(px(pal.scaled_px(10.0))).flex().items_center().justify_between()
                             .child(div().text_size(px(pal.scaled_px(16.0))).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(tr_str(lang, "联系人", "Contacts")))
                             .child(div().text_size(px(pal.scaled_px(12.0))).text_color(rgb(pal.text_secondary)).child(format!("{} {}", rows.len(), tr_str(lang, "位联系人", "contacts")))),
                     )
                     .child(
-                        div().w_full().px(px(pal.scaled_px(16.0))).py(px(pal.scaled_px(8.0))).border_b_1().border_color(rgb(pal.border_fg)).flex().items_center().gap(px(pal.scaled_px(8.0)))
-                            .child(tg_icon(IconName::Search, pal.scaled_px(14.0), pal.icon_fg))
+                        div()
+                            .w_full()
+                            .px(px(pal.scaled_px(16.0)))
+                            .pb(px(pal.scaled_px(10.0)))
+                            .border_b_1()
+                            .border_color(pal.separator_rgba())
                             .child(
-                                div().text_size(px(pal.scaled_px(13.5)))
-                                    .text_color(rgb(if contact_q.is_empty() { pal.text_secondary } else { pal.text_primary }))
-                                    .child(if contact_q.is_empty() { tr_str(lang, "搜索", "Search").to_string() } else { contact_q }),
+                                div()
+                                    .w_full()
+                                    .px(px(pal.scaled_px(10.0)))
+                                    .py(px(pal.scaled_px(7.0)))
+                                    .rounded(px(pal.scaled_px(9.0)))
+                                    .bg(rgb(pal.input_bg))
+                                    .border_1()
+                                    .border_color(pal.separator_rgba())
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(pal.scaled_px(8.0)))
+                                    .child(tg_icon(IconName::Search, pal.scaled_px(14.0), pal.icon_fg))
+                                    .child(
+                                        div()
+                                            .text_size(px(pal.scaled_px(13.0)))
+                                            .text_color(rgb(if contact_q.is_empty() { pal.text_secondary } else { pal.text_primary }))
+                                            .child(if contact_q.is_empty() { tr_str(lang, "搜索", "Search").to_string() } else { contact_q }),
+                                    ),
                             ),
                     )
                     .child(
-                        div().id("contacts-modal-scroll").flex_1().w_full().overflow_y_scroll().flex().flex_col()
+                        div().id("contacts-modal-scroll").flex_1().w_full().py(px(6.0)).overflow_y_scroll().flex().flex_col().gap(px(2.0))
                             .when(rows.is_empty(), |body| {
                                 body.items_center().justify_center().child(
                                     div().text_size(px(pal.scaled_px(13.5))).text_color(rgb(pal.text_secondary)).child(tr_str(lang, "未找到相关联系人", "No matching contacts")),
@@ -1125,8 +1130,8 @@ impl AppShell {
                             .when(!rows.is_empty(), |body| {
                                 body.children(rows.into_iter().map(|(uid, cid_opt, initials, name, sub, col)| {
                                     let click_name = name.clone();
-                                    div().cursor_pointer().w_full().px(px(pal.scaled_px(16.0))).py(px(pal.scaled_px(10.0)))
-                                        .hover(move |s| s.bg(rgb(pal.hover_bg))).flex().items_center().gap(px(pal.scaled_px(12.0)))
+                                    div().cursor_pointer().mx(px(pal.scaled_px(8.0))).px(px(pal.scaled_px(10.0))).py(px(pal.scaled_px(9.0))).rounded(px(pal.scaled_px(10.0)))
+                                        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg))).flex().items_center().gap(px(pal.scaled_px(12.0)))
                                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                                             this.sidebar.update(cx, |sb, scx| {
                                                 sb.close_contacts_modal();
@@ -1150,21 +1155,21 @@ impl AppShell {
                                             cx.notify();
                                         }))
                                         .child(
-                                            div().w(px(pal.scaled_px(40.0))).h(px(pal.scaled_px(40.0))).rounded_full().bg(rgb(col)).flex().items_center().justify_center()
-                                                .text_size(px(pal.scaled_px(14.0))).font_weight(FontWeight::BOLD).text_color(rgb(pal.active_button_fg)).child(initials),
+                                            div().w(px(pal.scaled_px(38.0))).h(px(pal.scaled_px(38.0))).rounded_full().bg(rgb(col)).flex().items_center().justify_center()
+                                                .text_size(px(pal.scaled_px(13.5))).font_weight(FontWeight::BOLD).text_color(rgb(pal.active_button_fg)).child(initials),
                                         )
                                         .child(
-                                            div().flex().flex_col()
-                                                .child(div().text_size(px(pal.scaled_px(14.0))).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(name))
-                                                .when(!sub.is_empty(), |el| el.child(div().text_size(px(pal.scaled_px(12.0))).text_color(rgb(pal.accent)).child(sub))),
+                                            div().flex().flex_col().gap(px(1.0))
+                                                .child(div().text_size(px(pal.scaled_px(13.5))).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(name))
+                                                .when(!sub.is_empty(), |el| el.child(div().text_size(px(pal.scaled_px(11.5))).text_color(rgb(pal.text_secondary)).child(sub))),
                                         )
                                 }))
                             }),
                     )
                     .child(
-                        div().w_full().px(px(16.0)).py(px(12.0)).border_t_1().border_color(rgb(pal.border_fg)).flex().items_center().justify_between()
+                        div().w_full().px(px(16.0)).py(px(12.0)).border_t_1().border_color(pal.separator_rgba()).flex().items_center().justify_between()
                             .child(
-                                modal_text_action_btn("contacts-modal-add-btn", tr_str(lang, "添加联系人", "Add Contact"), pal)
+                                macos_primary_pill_btn("contacts-modal-add-btn", tr_str(lang, "添加联系人", "Add Contact"), pal)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.sidebar.update(cx, |sb, scx| { sb.close_contacts_modal(); scx.notify(); });
                                         let l = this.active_lang_id();
@@ -1172,7 +1177,7 @@ impl AppShell {
                                     })),
                             )
                             .child(
-                                modal_text_action_btn("contacts-modal-close-btn", tr_str(lang, "关闭", "Close"), pal)
+                                macos_secondary_pill_btn("contacts-modal-close-btn", tr_str(lang, "关闭", "Close"), pal)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.sidebar.update(cx, |sb, scx| { sb.close_contacts_modal(); scx.notify(); });
                                         cx.notify();
@@ -1229,11 +1234,11 @@ impl AppShell {
             let shown = if value.is_empty() {
                 if focused { "|".to_string() } else { placeholder.to_string() }
             } else if focused { format!("{value}|") } else { value.to_string() };
-            div().w_full().flex().flex_col().gap(px(pal.scaled_px(4.0)))
+            div().w_full().flex().flex_col().gap(px(pal.scaled_px(5.0)))
                 .child(div().text_size(px(pal.scaled_px(12.0))).font_weight(FontWeight::MEDIUM).text_color(rgb(if focused { pal.accent } else { pal.text_secondary })).child(label.to_string()))
                 .child(
-                    div().w_full().px(px(pal.scaled_px(12.0))).py(px(pal.scaled_px(9.0))).rounded(px(pal.scaled_px(8.0))).bg(rgb(pal.input_bg))
-                        .border_1().border_color(rgb(if focused { pal.accent } else { pal.border_fg })).cursor_text()
+                    div().w_full().px(px(pal.scaled_px(12.0))).py(px(pal.scaled_px(9.5))).rounded(px(pal.scaled_px(10.0))).bg(rgb(pal.input_bg))
+                        .border_1().border_color(if focused { rgb(pal.accent).into() } else { pal.separator_rgba() }).cursor_text()
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                             this.sidebar.update(cx, |sb, scx| { sb.active_creation_field = field; scx.notify(); });
                             cx.notify();
@@ -1244,14 +1249,27 @@ impl AppShell {
         };
 
         let make_kind_tab = |selected: bool, label: &'static str, kind: AddContactKind, cx: &mut Context<Self>| -> AnyElement {
-            div().flex_1().py(px(pal.scaled_px(6.0))).rounded(px(pal.scaled_px(6.0))).bg(rgb(if selected { pal.accent } else { pal.input_bg }))
-                .text_size(px(pal.scaled_px(12.5))).font_weight(FontWeight::SEMIBOLD).text_color(rgb(if selected { pal.active_button_fg } else { pal.text_primary }))
-                .flex().items_center().justify_center().cursor_pointer()
+            div()
+                .flex_1()
+                .py(px(pal.scaled_px(6.0)))
+                .rounded(px(pal.scaled_px(7.0)))
+                .when(selected, |el| {
+                    el.bg(segmented_active_bg(pal))
+                        .shadow(segmented_pill_shadow(pal))
+                })
+                .text_size(px(pal.scaled_px(12.5)))
+                .font_weight(if selected { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                .text_color(rgb(if selected { pal.text_primary } else { pal.text_secondary }))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                     this.sidebar.update(cx, |sb, scx| { sb.contact_kind = kind; scx.notify(); });
                     cx.notify();
                 }))
-                .child(label).into_any_element()
+                .child(label)
+                .into_any_element()
         };
 
         let box_1 = make_field(CreationInputField::PrimaryName, lbl_1, &primary_val, ph_1, cx);
@@ -1389,11 +1407,11 @@ impl AppShell {
             Some(
                 div()
                     .w_full()
-                    .p(px(pal.scaled_px(10.0)))
-                    .rounded(px(pal.scaled_px(10.0)))
-                    .bg(rgb(pal.card_bg))
+                    .p(px(pal.scaled_px(12.0)))
+                    .rounded(px(pal.scaled_px(12.0)))
+                    .bg(pal.card_surface_rgba())
                     .border_1()
-                    .border_color(rgb(pal.border_fg))
+                    .border_color(pal.separator_rgba())
                     .flex()
                     .flex_col()
                     .gap(px(pal.scaled_px(8.0)))
@@ -1476,20 +1494,25 @@ impl AppShell {
 
         let modal_w = if show_bot_avatar_chooser { 436.0 } else { 410.0 };
 
-        modal_backdrop_shell("telegram-creation-modal-backdrop", 0x00000088)
+        modal_backdrop_shell("telegram-creation-modal-backdrop", macos_modal_backdrop_rgba(pal))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
                 cx.notify();
             }))
             .child(
-                div().id("telegram-creation-modal-box").w(px(pal.scaled_px(modal_w).min(720.0))).rounded(px(pal.scaled_px(14.0))).bg(rgb(pal.modal_bg))
-                    .border_1().border_color(rgb(pal.border_fg)).shadow_lg().p(px(pal.scaled_px(22.0))).flex().flex_col().gap(px(pal.scaled_px(12.0)))
+                macos_modal_card("telegram-creation-modal-box", pal)
+                    .w(px(pal.scaled_px(modal_w).min(720.0)))
+                    .p(px(pal.scaled_px(22.0)))
+                    .flex()
+                    .flex_col()
+                    .gap(px(pal.scaled_px(12.0)))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div().flex().items_center().justify_between()
                             .child(div().text_size(px(pal.scaled_px(17.0))).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(title))
                             .child(
-                                div().cursor_pointer().p(px(pal.scaled_px(4.0))).rounded_full().hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                div().cursor_pointer().w(px(pal.scaled_px(28.0))).h(px(pal.scaled_px(28.0))).rounded_full().hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+                                    .flex().items_center().justify_center()
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
                                         cx.notify();
@@ -1499,7 +1522,7 @@ impl AppShell {
                     )
                     .when(modal_kind == SidebarCreationModal::AddContact, |el| {
                         el.child(
-                            div().w_full().p(px(3.0)).rounded(px(8.0)).bg(rgb(pal.input_bg)).flex().gap(px(4.0))
+                            div().w_full().p(px(2.5)).rounded(px(9.0)).bg(rgb(pal.input_bg)).border_1().border_color(pal.separator_rgba()).flex().gap(px(2.0))
                                 .child(make_kind_tab(!is_bot, tr_str(lang, "好友联系人", "Contact"), AddContactKind::Friend, cx))
                                 .child(make_kind_tab(is_bot, tr_str(lang, "AI 智能体", "AI Bot"), AddContactKind::AiBot, cx)),
                         )
@@ -1507,18 +1530,16 @@ impl AppShell {
                     .when_some(bot_avatar_chooser, |el, card| el.child(card))
                     .child(box_1).child(box_2).child(box_3)
                     .child(
-                        div().pt(px(4.0)).flex().justify_end().gap(px(10.0))
+                        div().pt(px(4.0)).flex().justify_end().gap(px(8.0))
                             .child(
-                                modal_text_action_btn("creation-modal-cancel-btn", tr_str(lang, "取消", "Cancel"), pal)
-                                    .px(px(14.0)).py(px(7.0)).rounded(px(8.0)).font_weight(FontWeight::SEMIBOLD)
+                                macos_secondary_pill_btn("creation-modal-cancel-btn", tr_str(lang, "取消", "Cancel"), pal)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
                                         cx.notify();
                                     })),
                             )
                             .child(
-                                div().id("creation-modal-submit-btn").cursor_pointer().px(px(16.0)).py(px(7.0)).rounded(px(8.0))
-                                    .bg(rgb(pal.accent)).text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.active_button_fg))
+                                macos_primary_pill_btn("creation-modal-submit-btn", submit_lbl, pal)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         let created = this.sidebar.update(cx, |sb, scx| {
                                             let res = sb.submit_creation_modal();
@@ -1535,8 +1556,7 @@ impl AppShell {
                                             this.window_runtime.enqueue_toast(msg, 2600);
                                         }
                                         cx.notify();
-                                    }))
-                                    .child(submit_lbl),
+                                    })),
                             ),
                     ),
             )
@@ -1591,8 +1611,8 @@ impl AppShell {
                             let redial_name = peer_name.clone();
                             let is_vid = call.is_video;
 
-                            div().cursor_pointer().w_full().px(px(16.0)).py(px(12.0)).rounded(px(10.0))
-                                .bg(rgb(pal.card_bg)).border_1().border_color(rgb(pal.border_fg)).hover(move |s| s.bg(rgb(pal.hover_bg)))
+                            div().cursor_pointer().w_full().px(px(14.0)).py(px(12.0)).rounded(px(12.0))
+                                .bg(pal.card_surface_rgba()).border_1().border_color(pal.separator_rgba()).hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                                 .flex().items_center().justify_between()
                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.start_webrtc_call(peer_id, redial_name.clone(), is_vid, cx)))
                                 .child(
@@ -1655,16 +1675,20 @@ impl AppShell {
         let is_collapsed = self.sidebar.read(cx).is_collapsed;
 
         let menu_row = |id: &'static str, icon: IconName, label: &'static str, fg_color: u32, is_danger: bool, action: fn(&mut AppShell, &mut Context<AppShell>)| -> AnyElement {
-            let row_hover = if is_danger { rgba(0xE539351F) } else { rgb(pal.hover_bg) };
-            div().id(id).cursor_pointer().w_full().h(px(36.0)).px(px(10.0)).rounded(px(9.0)).hover(move |s| s.bg(row_hover))
+            let row_hover = if is_danger {
+                TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.12)
+            } else {
+                rgb(pal.menu_hover_bg)
+            };
+            div().id(id).cursor_pointer().w_full().h(px(34.0)).px(px(10.0)).rounded(px(8.0)).hover(move |s| s.bg(row_hover))
                 .flex().items_center().gap(px(10.0))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.sidebar.update(cx, |s, scx| { s.is_account_popover_open = false; scx.notify(); });
                     action(this, cx);
                 }))
-                .child(tg_icon(icon, 16.0, fg_color))
-                .child(div().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).text_color(rgb(fg_color)).child(label))
+                .child(tg_icon(icon, 15.0, fg_color))
+                .child(div().text_size(px(13.0)).font_weight(FontWeight::MEDIUM).text_color(rgb(fg_color)).child(label))
                 .into_any_element()
         };
 
@@ -1676,10 +1700,15 @@ impl AppShell {
                 cx.notify();
             }))
             .child(
-                div().id("account-popover-card").occlude().absolute().left(px(pal.scaled_px(10.0)))
+                macos_popover_surface("account-popover-card", pal)
+                    .absolute()
+                    .left(px(pal.scaled_px(10.0)))
                     .bottom(if is_collapsed { px(pal.scaled_px(52.0)) } else { px(pal.scaled_px(58.0)) })
-                    .w(px(pal.scaled_px(236.0))).p(px(pal.scaled_px(6.0))).rounded(px(pal.scaled_px(14.0))).bg(rgb(pal.dialogs_bg))
-                    .border_1().border_color(rgb(pal.border_fg)).shadow_lg().flex().flex_col().gap(px(2.0))
+                    .w(px(pal.scaled_px(240.0)))
+                    .p(px(pal.scaled_px(6.0)))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(menu_row("account-popover-profile", IconName::ContactsUsers, tr_str(lang, "个人资料", "Profile"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::MyProfile, cx)))
                     .child(menu_row("account-popover-saved", IconName::SavedMessages, tr_str(lang, "收藏夹", "Saved"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::SavedMessages, cx)))
@@ -1701,7 +1730,7 @@ impl AppShell {
                             },
                         ))
                     })
-                    .child(div().w_full().h(px(1.0)).my(px(4.0)).bg(rgb(pal.border_fg)))
+                    .child(div().mx(px(8.0)).h(px(1.0)).my(px(4.0)).bg(pal.separator_rgba()))
                     .child(menu_row(
                         "account-popover-theme",
                         if is_dark { IconName::SunDay } else { IconName::NightMoon },
@@ -1726,37 +1755,43 @@ impl AppShell {
             format!("{}|", "•".repeat(pin_len))
         };
         let err_opt = self.overlays.passcode_unlock_error.clone();
+        let lock_canvas_bg = if pal.is_apple_style() && !pal.mode.is_dark() {
+            pal.dialogs_bg
+        } else {
+            pal.window_bg
+        };
 
         div()
             .id("telegram-passcode-lock-overlay")
             .absolute()
             .inset_0()
             .occlude()
-            .bg(rgb(pal.window_bg))
+            .bg(rgb(lock_canvas_bg))
             .flex()
             .items_center()
             .justify_center()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
-                div()
-                    .id("telegram-passcode-lock-card")
-                    .w(px(pal.scaled_px(360.0)))
-                    .p(px(pal.scaled_px(28.0)))
+                macos_modal_card("telegram-passcode-lock-card", pal)
+                    .w(px(pal.scaled_px(372.0)))
+                    .p(px(pal.scaled_px(30.0)))
                     .rounded(px(pal.scaled_px(16.0)))
-                    .bg(rgb(pal.modal_bg))
-                    .border_1()
-                    .border_color(rgb(pal.border_fg))
-                    .shadow_lg()
                     .flex()
                     .flex_col()
                     .items_center()
                     .gap(px(pal.scaled_px(14.0)))
                     .child(
                         div()
-                            .w(px(pal.scaled_px(56.0)))
-                            .h(px(pal.scaled_px(56.0)))
-                            .rounded_full()
+                            .w(px(pal.scaled_px(60.0)))
+                            .h(px(pal.scaled_px(60.0)))
+                            .rounded(px(pal.scaled_px(16.0)))
                             .bg(rgb(pal.accent))
+                            .shadow(vec![BoxShadow {
+                                color: TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.30).into(),
+                                offset: point(px(0.0), px(6.0)),
+                                blur_radius: px(16.0),
+                                spread_radius: px(0.0),
+                            }])
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1777,6 +1812,7 @@ impl AppShell {
                         div()
                             .text_size(px(pal.scaled_px(12.5)))
                             .text_color(rgb(pal.text_secondary))
+                            .text_center()
                             .child(tr_str(
                                 lang,
                                 "请输入您的本地锁定密码以解锁对话",
@@ -1822,9 +1858,10 @@ impl AppShell {
                             .id("passcode-lock-submit-btn")
                             .cursor_pointer()
                             .w_full()
-                            .py(px(pal.scaled_px(10.0)))
+                            .py(px(pal.scaled_px(10.5)))
                             .rounded(px(pal.scaled_px(10.0)))
                             .bg(rgb(pal.accent))
+                            .hover(move |s| s.bg(rgb(pal.accent_hover)))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1919,22 +1956,16 @@ impl AppShell {
             format!("{} requests execution on {}:", caller, pending.node_id)
         };
 
-        div()
-            .id("pending-computer-approval-banner")
+        macos_modal_card("pending-computer-approval-banner", pal)
             .occlude()
             .absolute()
-            .top(px(54.0))
+            .top(px(58.0))
             .right(px(20.0))
-            .w(px(390.0))
+            .w(px(392.0))
             .p(px(14.0))
-            .rounded(px(12.0))
-            .bg(rgb(pal.modal_bg))
-            .border_1()
-            .border_color(rgb(pal.accent))
-            .shadow_lg()
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(px(10.0))
             .child(
                 div()
                     .flex()
@@ -1960,11 +1991,11 @@ impl AppShell {
                 div()
                     .w_full()
                     .px(px(10.0))
-                    .py(px(7.0))
-                    .rounded(px(8.0))
+                    .py(px(8.0))
+                    .rounded(px(10.0))
                     .bg(rgb(pal.input_bg))
                     .border_1()
-                    .border_color(rgb(pal.border_fg))
+                    .border_color(pal.separator_rgba())
                     .text_xs()
                     .text_color(rgb(pal.text_primary))
                     .child(op_summary),
@@ -1981,11 +2012,14 @@ impl AppShell {
                             .cursor_pointer()
                             .px(px(12.0))
                             .py(px(6.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(pal.hover_bg))
+                            .rounded(px(9.0))
+                            .bg(pal.card_surface_rgba())
+                            .border_1()
+                            .border_color(pal.separator_rgba())
+                            .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(pal.text_secondary))
+                            .text_color(rgb(pal.text_primary))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.decide_pending_computer_approval(cmd_deny.clone(), false, cx);
                             }))
@@ -1997,8 +2031,9 @@ impl AppShell {
                             .cursor_pointer()
                             .px(px(14.0))
                             .py(px(6.0))
-                            .rounded(px(8.0))
+                            .rounded(px(9.0))
                             .bg(rgb(pal.accent))
+                            .hover(move |s| s.bg(rgb(pal.accent_hover)))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(0xFFFFFF))
@@ -2017,22 +2052,16 @@ impl AppShell {
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id();
 
-        div()
-            .id("vault-first-setup-notice-banner")
+        macos_modal_card("vault-first-setup-notice-banner", pal)
             .occlude()
             .absolute()
             .bottom(px(76.0))
             .right(px(20.0))
-            .w(px(360.0))
-            .p(px(13.0))
-            .rounded(px(12.0))
-            .bg(rgb(pal.modal_bg))
-            .border_1()
-            .border_color(rgb(pal.accent))
-            .shadow_lg()
+            .w(px(368.0))
+            .p(px(14.0))
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(px(9.0))
             .child(
                 div()
                     .flex()
@@ -2061,12 +2090,15 @@ impl AppShell {
                         div()
                             .id("dismiss-vault-banner-btn")
                             .cursor_pointer()
-                            .px(px(6.0))
-                            .py(px(2.0))
-                            .rounded(px(6.0))
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .text_xs()
                             .text_color(rgb(pal.text_secondary))
-                            .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                            .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.bot_browser.first_creation_banner_open = false;
                                 cx.notify();
@@ -2094,10 +2126,13 @@ impl AppShell {
                         div()
                             .id("open-privacy-vault-settings-btn")
                             .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(5.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(pal.hover_bg))
+                            .px(px(11.0))
+                            .py(px(6.0))
+                            .rounded(px(9.0))
+                            .bg(pal.card_surface_rgba())
+                            .border_1()
+                            .border_color(pal.separator_rgba())
+                            .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(pal.text_primary))
@@ -2118,10 +2153,11 @@ impl AppShell {
                         div()
                             .id("copy-vault-emergency-kit-btn")
                             .cursor_pointer()
-                            .px(px(12.0))
-                            .py(px(5.0))
-                            .rounded(px(8.0))
+                            .px(px(13.0))
+                            .py(px(6.0))
+                            .rounded(px(9.0))
                             .bg(rgb(pal.accent))
+                            .hover(move |s| s.bg(rgb(pal.accent_hover)))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(0xFFFFFF))

@@ -22,13 +22,14 @@ use gpui::*;
 use gpui_telegram_client::storage::Localstorage;
 use gpui_telegram_client::{AuthResponse, ClientConfig, StoredSession, TelegramClient};
 
-use crate::app::{preferences::AppPreferences, TelegramApp};
+use crate::app::{preferences::{AppPreferences, ThemeMode}, TelegramApp};
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
 use crate::theme::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::app_shell::{
     build_account_record, compute_shell_palette,
     local_subscription_bridge::ShellMagpieLocalState,
+    shell_theme::tdesktop_mode_for_window_appearance,
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
     ShellBotBrowserState, ShellPanelState,
 };
@@ -117,6 +118,7 @@ pub struct AppShell {
     pub magpie_local: ShellMagpieLocalState,
     pub bot_browser: ShellBotBrowserState,
     pub theme_state: ShellThemeVisualState,
+    pub last_window_appearance: Option<WindowAppearance>,
 }
 
 impl AppShell {
@@ -226,6 +228,7 @@ impl AppShell {
             magpie_local: ShellMagpieLocalState::new(),
             bot_browser: ShellBotBrowserState::new(),
             theme_state: init_theme_state,
+            last_window_appearance: None,
         };
 
         shell_instance.overlays.is_passcode_locked = shell_instance.has_local_passcode_configured();
@@ -685,17 +688,38 @@ impl AppShell {
     }
 
     fn render_toast_banner(&self, text: String, pal: TdesktopThemePalette, cx: &mut Context<Self>) -> Stateful<Div> {
-        div()
-            .id("window-toast-banner").cursor_pointer()
-            .absolute().bottom(px(pal.scaled_px(28.0))).right(px(pal.scaled_px(28.0)))
-            .px(px(pal.scaled_px(16.0))).py(px(pal.scaled_px(9.0))).rounded(px(pal.scaled_px(16.0)))
-            .bg(rgb(pal.card_bg)).border_1().border_color(rgb(pal.border_fg)).shadow_lg()
-            .text_size(px(pal.scaled_px(12.5))).text_color(rgb(pal.text_primary))
+        let is_apple = pal.is_apple_style();
+        let mut toast = div()
+            .id("window-toast-banner")
+            .cursor_pointer()
+            .absolute()
+            .bottom(px(pal.scaled_px(28.0)))
+            .right(px(pal.scaled_px(28.0)))
+            .px(px(pal.scaled_px(16.0)))
+            .py(px(pal.scaled_px(if is_apple { 8.0 } else { 9.0 })))
+            .border_1()
+            .shadow(pal.popover_shadows())
+            .text_size(px(pal.scaled_px(12.5)))
+            .font_weight(if is_apple { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+            .text_color(rgb(pal.text_primary))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.window_runtime.controller.dismiss_current_toast();
                 cx.notify();
-            }))
-            .child(text)
+            }));
+
+        toast = if is_apple {
+            toast
+                .rounded_full()
+                .bg(TdesktopThemePalette::rgba_with_alpha(pal.menu_bg, 0.94))
+                .border_color(pal.separator_rgba())
+        } else {
+            toast
+                .rounded(px(pal.scaled_px(16.0)))
+                .bg(rgb(pal.card_bg))
+                .border_color(rgb(pal.border_fg))
+        };
+
+        toast.child(text)
     }
 }
 
@@ -703,6 +727,18 @@ impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let scale_factor = (self.preferences.interface_scale_pct.clamp(50, 300) as f32) / 100.0;
         window.set_rem_size(px(16.0 * scale_factor));
+
+        let current_appearance = window.appearance();
+        if self.last_window_appearance != Some(current_appearance) {
+            self.last_window_appearance = Some(current_appearance);
+        }
+        if self.preferences.theme_mode == ThemeMode::System {
+            let target_mode = tdesktop_mode_for_window_appearance(current_appearance);
+            if self.theme_state.theme_mode != target_mode {
+                self.theme_state.theme_mode = target_mode;
+                self.sync_theme_and_locale_to_views(cx);
+            }
+        }
 
         if self.is_authenticated && !self.focus_handle.is_focused(window) {
             self.focus_handle.focus(window);
@@ -719,13 +755,28 @@ impl Render for AppShell {
         let update_banner = self.render_in_app_update_banner(cx);
 
         if !self.is_authenticated {
+            let login_bg = if pal.is_apple_style() && !pal.mode.is_dark() {
+                pal.dialogs_bg
+            } else {
+                pal.window_bg
+            };
             return div()
                 .id("app-shell-login-root")
                 .size_full()
-                .bg(rgb(pal.window_bg))
+                .bg(rgb(login_bg))
                 .flex()
                 .flex_col()
                 .relative()
+                .when(cfg!(target_os = "macos"), |el| {
+                    el.child(
+                        div()
+                            .id("login-titlebar-drag-strip")
+                            .w_full()
+                            .h(px(44.0))
+                            .flex_shrink_0()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
+                })
                 .when_some(update_banner, |el, banner| el.child(banner))
                 .child(
                     div()
@@ -755,6 +806,7 @@ impl Render for AppShell {
             let sb = self.sidebar.read(cx);
             (sb.is_contacts_modal_open, sb.active_creation_modal, sb.is_account_popover_open)
         };
+        let use_vibrant_root = pal.is_apple_style() && cfg!(target_os = "macos");
 
         div()
             .id("app-shell-authenticated-root")
@@ -762,7 +814,8 @@ impl Render for AppShell {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_window_key_down(event, window, cx);
             }))
-            .relative().size_full().flex().flex_col().bg(rgb(pal.window_bg))
+            .relative().size_full().flex().flex_col()
+            .when(!use_vibrant_root, |el| el.bg(rgb(pal.window_bg)))
             .child(ime_canvas)
             .when(show_conn_banner, |el| {
                 el.child(
@@ -777,6 +830,7 @@ impl Render for AppShell {
                     .child(self.sidebar.clone())
                     .child(
                         div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
+                            .bg(rgb(pal.stage_bg))
                             .child(self.stage.clone()).child(self.composer.clone()).into_any_element(),
                     )
                     .child(self.inspector.clone()),

@@ -25,11 +25,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 
-use crate::theme::TdesktopThemePalette;
+use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::stage::history_drag_area::HistoryDragArea;
-use crate::views::stage::history_view_highlight_manager::HistoryViewHighlightManager;
+use crate::views::stage::history_view_highlight_manager::{
+    ChatPaintHighlight, HistoryViewHighlightManager,
+};
 use crate::views::stage::pinned_bar::PinnedTracker;
 use crate::views::stage::rich_meta::MessageRichMeta;
+use crate::views::stage::stage_bubble::{
+    render_message_row_apple, BotAssistRenderContext, BubbleGroupLayout,
+};
 use crate::views::stage::stage_context_menu::ReactionOverlayMode;
 use crate::views::stage::stage_bars::{
     render_pinned_banner_46px, render_scroll_to_bottom_fab, render_stage_more_menu_overlay,
@@ -714,6 +719,134 @@ impl ConversationStage {
             self.scroll_to_bottom();
         }
     }
+    fn build_visible_message_rows_apple(
+        &self,
+        start_idx: usize,
+        end_idx: usize,
+        is_group_chat: bool,
+        stage_w: f32,
+        highlight_paint: Option<(u64, ChatPaintHighlight)>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let total_msgs = self.messages.len();
+        let selected_set: HashSet<u64> = self.selected_message_ids.iter().copied().collect();
+        let has_any_selection = self.select_mode_active || !selected_set.is_empty();
+        let mut message_rows =
+            Vec::with_capacity(if total_msgs == 0 { 0 } else { end_idx - start_idx + 1 });
+        if total_msgs == 0 {
+            return message_rows;
+        }
+        let last_outgoing_id = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.direction == MessageDirection::Outgoing
+                    && !matches!(m.content, MessageContent::Service { .. })
+            })
+            .map(|m| m.id);
+
+        for idx in start_idx..=end_idx.min(total_msgs.saturating_sub(1)) {
+            let msg = &self.messages[idx];
+            let (attached_prev, attached_next) = compute_attachment(&self.messages, idx);
+            let is_outgoing = msg.direction == MessageDirection::Outgoing;
+            let group = BubbleGroupLayout {
+                attached_to_prev: attached_prev,
+                attached_to_next: attached_next,
+                show_sender_name: !is_outgoing && !attached_prev && is_group_chat,
+                show_bottom_avatar: !is_outgoing && !attached_next,
+                show_tail: !attached_next,
+                reserve_avatar_column: !is_outgoing && is_group_chat,
+            };
+            let meta = self.message_meta.get(&msg.id);
+            let prev_date = if idx > 0 {
+                self.message_meta
+                    .get(&self.messages[idx - 1].id)
+                    .and_then(|m| m.date_group_label.as_deref())
+            } else {
+                None
+            };
+            let cur_date = meta.and_then(|m| m.date_group_label.as_deref());
+            let date_divider = match (prev_date, cur_date) {
+                (Some(p), Some(c)) if p != c => Some(c),
+                (None, Some(c)) if idx == 0 => Some(c),
+                _ => None,
+            };
+            let hl_alpha = highlight_paint
+                .as_ref()
+                .and_then(|(hid, p)| if *hid == msg.id { Some(p.opacity) } else { None })
+                .unwrap_or(0.0);
+
+            let (is_within_viewport, reaction_overlay_layout) =
+                self.compute_reaction_overlay_layout(idx, msg, group.reserve_avatar_column);
+            let overlay_mode = if is_within_viewport {
+                self.reaction_overlay_mode(msg.id)
+            } else {
+                None
+            };
+            let is_last_outgoing = last_outgoing_id == Some(msg.id);
+            let is_row_hovered =
+                self.hovered_message_id == Some(msg.id) || self.hovered_gutter_id == Some(msg.id);
+
+            message_rows.push(render_message_row_apple(
+                msg,
+                meta,
+                self.active_fabushi_bot.as_ref(),
+                group,
+                stage_w,
+                selected_set.contains(&msg.id),
+                has_any_selection,
+                is_last_outgoing,
+                is_row_hovered,
+                overlay_mode,
+                reaction_overlay_layout,
+                Some(self.bubble_widths_probe.clone()),
+                Some(self.bubble_bounds_probe.clone()),
+                Some(self.row_heights_probe.clone()),
+                hl_alpha,
+                self.unread_anchor_msg_id == Some(msg.id),
+                date_divider,
+                &self.revealed_spoilers,
+                &self.expanded_quotes,
+                self.copied_code_msg,
+                Some(BotAssistRenderContext {
+                    login_drafts: &self.bot_assist_login_drafts,
+                    click_drafts: &self.bot_assist_click_drafts,
+                    active_field: self.active_bot_card_field.as_ref(),
+                    ime_preedit: self.bot_assist_ime_preedit.as_deref(),
+                }),
+                &self.palette,
+                &self.lang_id,
+                window,
+                cx,
+                |this, action, cx| this.handle_bubble_action(action, cx),
+            ));
+        }
+        message_rows
+    }
+
+    fn render_apple_sticky_date(&self, date_lbl: String, top_px: f32) -> AnyElement {
+        div()
+            .absolute()
+            .top(px(top_px))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .px(px(10.0))
+                    .py(px(2.0))
+                    .rounded_full()
+                    .bg(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.86))
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(self.palette.text_secondary))
+                    .child(date_lbl),
+            )
+            .into_any_element()
+    }
 }
 
 impl Default for ConversationStage {
@@ -768,12 +901,58 @@ impl Render for ConversationStage {
             || self.chat_subtitle == "group"
             || self.messages.iter().filter(|m| m.direction == MessageDirection::Incoming).map(|m| m.sender_id).collect::<HashSet<_>>().len() > 1;
         let can_block_peer = !is_group_chat && !self.is_saved_messages;
+        let is_apple = self.palette.is_apple_style();
         let stage_w = self.effective_stage_width();
-        let message_rows = self.build_visible_message_rows(start_idx, end_idx, is_group_chat, stage_w, highlight_paint, window, cx);
-        let sticky_date_pill = self.sticky_date_label(start_idx).map(|lbl| self.render_sticky_date_pill(lbl));
+        let message_rows = if is_apple {
+            self.build_visible_message_rows_apple(
+                start_idx,
+                end_idx,
+                is_group_chat,
+                stage_w,
+                highlight_paint,
+                window,
+                cx,
+            )
+        } else {
+            self.build_visible_message_rows(
+                start_idx,
+                end_idx,
+                is_group_chat,
+                stage_w,
+                highlight_paint,
+                window,
+                cx,
+            )
+        };
+        let pinned_info = self.pinned_banner_info();
+        let show_top_chrome = has_active_chat
+            || total_msgs > 0
+            || self.show_bot_start_bar
+            || self.bot_description_card.is_some();
+        let show_fabushi_bar =
+            show_top_chrome && self.is_viewer_owner_fabushi_bot && self.active_fabushi_bot.is_some();
+        let apple_top_inset = if !show_top_chrome {
+            14.0
+        } else {
+            self.palette.scaled_px(52.0)
+                + if show_fabushi_bar { 32.0 } else { 0.0 }
+                + if self.search_open { 44.0 } else { 0.0 }
+                + if pinned_info.is_some() { 46.0 } else { 0.0 }
+                + 12.0
+        };
+        let sticky_date_pill = if is_apple {
+            if raw_scroll_top > 24.0 {
+                self.sticky_date_label(start_idx)
+                    .map(|lbl| self.render_apple_sticky_date(lbl, apple_top_inset - 4.0))
+            } else {
+                None
+            }
+        } else {
+            self.sticky_date_label(start_idx)
+                .map(|lbl| self.render_sticky_date_pill(lbl))
+        };
         let toast_pill = self.toast_banner.clone().map(|toast| self.render_toast_banner_pill(toast, cx));
         let drag_overlay = self.drag_area.is_active().then(|| self.render_drag_area_overlay());
-        let pinned_info = self.pinned_banner_info();
         let show_scroll_fab = has_active_chat && total_msgs > 0 && (!self.is_at_bottom() || self.unread_incoming_count > 0);
         let accent_hex = self.palette.accent;
 
@@ -815,7 +994,7 @@ impl Render for ConversationStage {
             .min_h(px(0.0))
             .w_full()
             .overflow_hidden()
-            .bg(rgb(self.palette.history_bg))
+            .bg(rgb(if is_apple { self.palette.stage_bg } else { self.palette.history_bg }))
             .flex()
             .flex_col()
             .child(
@@ -830,12 +1009,9 @@ impl Render for ConversationStage {
                 .size_full(),
             );
 
-        if has_active_chat
-            || total_msgs > 0
-            || self.show_bot_start_bar
-            || self.bot_description_card.is_some()
-        {
-            root = root.child(render_stage_top_bar(
+        let mut top_chrome_children: Vec<AnyElement> = Vec::new();
+        if show_top_chrome {
+            top_chrome_children.push(render_stage_top_bar(
                 self.active_chat_id,
                 &self.chat_title,
                 &self.chat_subtitle,
@@ -920,19 +1096,29 @@ impl Render for ConversationStage {
                     } else {
                         crate::i18n::tr_str(&self.lang_id, "智能体面板", "Inspector")
                     };
-                    root = root.child(
+                    let bar_bg: Rgba = if is_apple {
+                        TdesktopThemePalette::rgba_with_alpha(self.palette.topbar_bg, 0.90)
+                    } else {
+                        rgb(self.palette.top_bar_bg).into()
+                    };
+                    let sep_col: Rgba = if is_apple {
+                        self.palette.separator_rgba()
+                    } else {
+                        rgb(self.palette.border_fg).into()
+                    };
+                    top_chrome_children.push(
                         div()
                             .id("stage-fabushi-session-bar")
                             .w_full()
                             .h(px(32.0))
-                            .px(px(14.0))
+                            .px(px(if is_apple { 16.0 } else { 14.0 }))
                             .flex()
                             .items_center()
                             .justify_between()
                             .gap(px(8.0))
-                            .bg(rgb(self.palette.top_bar_bg))
+                            .bg(bar_bg)
                             .border_b_1()
-                            .border_color(rgb(self.palette.border_fg))
+                            .border_color(sep_col)
                             .child(left)
                             .child(
                                 div()
@@ -946,10 +1132,10 @@ impl Render for ConversationStage {
                                             .cursor_pointer()
                                             .px(px(8.0))
                                             .py(px(2.0))
-                                            .rounded(px(6.0))
+                                            .rounded(px(if is_apple { 999.0 } else { 6.0 }))
                                             .bg(rgb(self.palette.input_bg))
                                             .border_1()
-                                            .border_color(rgb(self.palette.border_fg))
+                                            .border_color(sep_col)
                                             .text_size(px(11.0))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(rgb(self.palette.text_primary))
@@ -968,7 +1154,7 @@ impl Render for ConversationStage {
                                             .cursor_pointer()
                                             .px(px(8.0))
                                             .py(px(2.0))
-                                            .rounded(px(6.0))
+                                            .rounded(px(if is_apple { 999.0 } else { 6.0 }))
                                             .bg(TdesktopThemePalette::rgba_with_alpha(self.palette.accent, 0.14))
                                             .text_size(px(11.0))
                                             .font_weight(FontWeight::SEMIBOLD)
@@ -981,12 +1167,13 @@ impl Render for ConversationStage {
                                             )
                                             .child(insp_label),
                                     ),
-                            ),
+                            )
+                            .into_any_element(),
                     );
                 }
             }
             if self.search_open {
-                root = root.child(render_stage_search_bar(
+                top_chrome_children.push(render_stage_search_bar(
                     &self.search_query,
                     self.search_match_cursor,
                     self.search_match_ids.len(),
@@ -999,7 +1186,7 @@ impl Render for ConversationStage {
         }
 
         if let Some((snippet, sender, thumb, count, active_idx)) = pinned_info {
-            root = root.child(render_pinned_banner_46px(
+            top_chrome_children.push(render_pinned_banner_46px(
                 &snippet,
                 &sender,
                 thumb.as_deref(),
@@ -1012,8 +1199,18 @@ impl Render for ConversationStage {
             ));
         }
 
+        if !is_apple {
+            for child in top_chrome_children.drain(..) {
+                root = root.child(child);
+            }
+        }
+
         let bot_desc_card = self.bot_description_card.as_ref().map(|desc| {
-            let card_bg = TdesktopThemePalette::rgba_with_alpha(self.palette.card_bg, 0.96);
+            let card_bg = if is_apple {
+                self.palette.card_surface_rgba()
+            } else {
+                TdesktopThemePalette::rgba_with_alpha(self.palette.card_bg, 0.96)
+            };
             let body_text = if desc.trim().is_empty() {
                 crate::i18n::tr_str(
                     &self.lang_id,
@@ -1024,45 +1221,52 @@ impl Render for ConversationStage {
             } else {
                 desc.clone()
             };
+            let mut card = div()
+                .w(px(340.0))
+                .max_w(px(380.0))
+                .px(px(18.0))
+                .py(px(14.0))
+                .rounded(px(14.0))
+                .bg(card_bg)
+                .border_1()
+                .border_color(if is_apple {
+                    self.palette.separator_rgba()
+                } else {
+                    rgb(self.palette.border_fg).into()
+                })
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(self.palette.text_primary))
+                        .child(crate::i18n::tr_str(
+                            &self.lang_id,
+                            "它能做什么？",
+                            "What can this bot do?",
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .line_height(relative(1.45))
+                        .text_color(rgb(self.palette.text_primary))
+                        .child(body_text),
+                );
+            card = if is_apple {
+                card.shadow(self.palette.popover_shadows())
+            } else {
+                card.shadow_sm()
+            };
             div()
                 .id("stage-bot-description-card")
                 .w_full()
                 .my(px(16.0))
                 .flex()
                 .justify_center()
-                .child(
-                    div()
-                        .w(px(340.0))
-                        .max_w(px(380.0))
-                        .px(px(18.0))
-                        .py(px(14.0))
-                        .rounded(px(14.0))
-                        .bg(card_bg)
-                        .border_1()
-                        .border_color(rgb(self.palette.border_fg))
-                        .shadow_sm()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(self.palette.text_primary))
-                                .child(crate::i18n::tr_str(
-                                    &self.lang_id,
-                                    "它能做什么？",
-                                    "What can this bot do?",
-                                )),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .line_height(relative(1.45))
-                                .text_color(rgb(self.palette.text_primary))
-                                .child(body_text),
-                        ),
-                )
+                .child(card)
                 .into_any_element()
         });
 
@@ -1090,8 +1294,8 @@ impl Render for ConversationStage {
                     .relative()
                     .size_full()
                     .px(px(12.0))
-                    .pt(px(14.0))
-                    .pb(px(46.0))
+                    .pt(px(if is_apple { apple_top_inset } else { 14.0 }))
+                    .pb(px(if is_apple { 28.0 } else { 46.0 }))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .on_mouse_down(
@@ -1121,33 +1325,6 @@ impl Render for ConversationStage {
                             && !self.bot_activity_state.is_empty()
                             && !self.bot_activity_state.eq_ignore_ascii_case("idle"),
                         |el| {
-                            let (agent_seed, shape, color) = self
-                                .active_fabushi_bot
-                                .as_ref()
-                                .map(|fab| {
-                                    (
-                                        fab.agent_id.clone(),
-                                        fab.avatar_shape.clone(),
-                                        fab.avatar_color.clone(),
-                                    )
-                                })
-                                .unwrap_or_else(|| {
-                                    let seed = format!(
-                                        "bot_{}_{}",
-                                        self.active_chat_id.unwrap_or(0),
-                                        self.chat_title
-                                    );
-                                    (
-                                        seed.clone(),
-                                        gpui_telegram_proto::miniapp_contracts::resolve_grok_persona_shape(&seed, None),
-                                        gpui_telegram_proto::miniapp_contracts::resolve_grok_persona_color(&seed, None),
-                                    )
-                                });
-                            let persona_state =
-                                crate::components::grok_bot_avatar::GrokPersonaState::from_activity_str(
-                                    &self.bot_activity_state,
-                                    true,
-                                );
                             let status_label = match self.bot_activity_state.as_str() {
                                 "tool" => self
                                     .bot_activity_detail
@@ -1163,46 +1340,186 @@ impl Render for ConversationStage {
                                     .clone()
                                     .unwrap_or_else(|| "正在深度思考...".to_string()),
                             };
-                            el.child(
-                                div()
-                                    .id("stage-bot-thinking-indicator")
-                                    .px(px(14.0))
-                                    .py(px(8.0))
-                                    .mx(px(10.0))
-                                    .my(px(4.0))
-                                    .rounded(px(14.0))
-                                    .bg(rgb(self.palette.card_bg))
-                                    .border_1()
-                                    .border_color(rgb(self.palette.border_fg))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(10.0))
-                                    .child(
-                                        crate::components::grok_bot_avatar::render_grok_bot_avatar(
-                                            crate::components::grok_bot_avatar::GrokBotAvatarProps::new(
-                                                &agent_seed,
-                                                &shape,
-                                                &color,
-                                                30.0,
+                            if is_apple {
+                                // Authentic Apple Messages incoming gray bubble with tail + 3 breathing dots
+                                let phase = ((stage_now_ms() / 320) % 3) as usize;
+                                let dot_alpha = |idx: usize| -> f32 {
+                                    match (idx + 3 - phase) % 3 {
+                                        0 => 0.92,
+                                        1 => 0.58,
+                                        _ => 0.34,
+                                    }
+                                };
+                                let dot_hex = self.palette.text_secondary;
+                                let show_detail = self.bot_activity_detail.is_some()
+                                    || self.bot_activity_state == "tool";
+                                el.child(
+                                    div()
+                                        .id("stage-bot-thinking-indicator")
+                                        .w_full()
+                                        .px(px(16.0))
+                                        .pt(px(10.0))
+                                        .pb(px(4.0))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .flex_col()
+                                        .items_start()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .relative()
+                                                .flex()
+                                                .flex_shrink_0()
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .bottom(px(0.0))
+                                                        .left(px(-6.0))
+                                                        .child(tg_icon(
+                                                            IconName::BubbleTailIn,
+                                                            16.0,
+                                                            self.palette.msg_in_bg,
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .relative()
+                                                        .px(px(14.0))
+                                                        .py(px(11.0))
+                                                        .rounded(px(18.0))
+                                                        .bg(rgb(self.palette.msg_in_bg))
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(5.0))
+                                                        .child(
+                                                            div()
+                                                                .w(px(7.5))
+                                                                .h(px(7.5))
+                                                                .rounded_full()
+                                                                .bg(TdesktopThemePalette::rgba_with_alpha(
+                                                                    dot_hex,
+                                                                    dot_alpha(0),
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(px(7.5))
+                                                                .h(px(7.5))
+                                                                .rounded_full()
+                                                                .bg(TdesktopThemePalette::rgba_with_alpha(
+                                                                    dot_hex,
+                                                                    dot_alpha(1),
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(px(7.5))
+                                                                .h(px(7.5))
+                                                                .rounded_full()
+                                                                .bg(TdesktopThemePalette::rgba_with_alpha(
+                                                                    dot_hex,
+                                                                    dot_alpha(2),
+                                                                )),
+                                                        ),
+                                                ),
+                                        )
+                                        .when(show_detail, |col| {
+                                            col.child(
+                                                div()
+                                                    .pl(px(6.0))
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(self.palette.text_secondary))
+                                                    .child(status_label),
                                             )
-                                            .with_state(persona_state)
-                                            .with_surface_bg(self.palette.card_bg),
+                                        }),
+                                )
+                            } else {
+                                let (agent_seed, shape, color) = self
+                                    .active_fabushi_bot
+                                    .as_ref()
+                                    .map(|fab| {
+                                        (
+                                            fab.agent_id.clone(),
+                                            fab.avatar_shape.clone(),
+                                            fab.avatar_color.clone(),
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        let seed = format!(
+                                            "bot_{}_{}",
+                                            self.active_chat_id.unwrap_or(0),
+                                            self.chat_title
+                                        );
+                                        (
+                                            seed.clone(),
+                                            gpui_telegram_proto::miniapp_contracts::resolve_grok_persona_shape(&seed, None),
+                                            gpui_telegram_proto::miniapp_contracts::resolve_grok_persona_color(&seed, None),
+                                        )
+                                    });
+                                let persona_state =
+                                    crate::components::grok_bot_avatar::GrokPersonaState::from_activity_str(
+                                        &self.bot_activity_state,
+                                        true,
+                                    );
+                                el.child(
+                                    div()
+                                        .id("stage-bot-thinking-indicator")
+                                        .px(px(14.0))
+                                        .py(px(8.0))
+                                        .mx(px(10.0))
+                                        .my(px(4.0))
+                                        .rounded(px(14.0))
+                                        .bg(rgb(self.palette.card_bg))
+                                        .border_1()
+                                        .border_color(rgb(self.palette.border_fg))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .child(
+                                            crate::components::grok_bot_avatar::render_grok_bot_avatar(
+                                                crate::components::grok_bot_avatar::GrokBotAvatarProps::new(
+                                                    &agent_seed,
+                                                    &shape,
+                                                    &color,
+                                                    30.0,
+                                                )
+                                                .with_state(persona_state)
+                                                .with_surface_bg(self.palette.card_bg),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(self.palette.text_secondary))
+                                                .child(status_label),
                                         ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.5))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(self.palette.text_secondary))
-                                            .child(status_label),
-                                    ),
-                            )
+                                )
+                            }
                         },
                     )
                     .when(bottom_spacer_height > 0.0, |el| {
                         el.child(div().id("stage-bottom-spacer").w_full().h(px(bottom_spacer_height)).flex_shrink_0())
                     }),
             )
+            .when(is_apple, |el| {
+                // Soft bottom feather gradient blending transcript seamlessly into the floating capsule composer
+                let bottom_feather = linear_gradient(
+                    180.0,
+                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.0), 0.0),
+                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.90), 1.0),
+                );
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(14.0))
+                        .bg(bottom_feather),
+                )
+            })
             .when_some(sticky_date_pill, |el, pill| el.child(pill))
             .when_some(toast_pill, |el, pill| el.child(pill))
             .when(show_scroll_fab, |el| {
@@ -1215,6 +1532,39 @@ impl Render for ConversationStage {
 
         root = root.child(transcript);
 
+        if is_apple {
+            if !top_chrome_children.is_empty() {
+                let top_feather = linear_gradient(
+                    180.0,
+                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.94), 0.0),
+                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.0), 1.0),
+                );
+                root = root.child(
+                    div()
+                        .id("stage-floating-top-chrome")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .flex_col()
+                        .children(top_chrome_children)
+                        .child(div().w_full().h(px(18.0)).bg(top_feather)),
+                );
+            } else {
+                // Allow dragging the macOS window from the empty right-pane titlebar zone
+                root = root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(52.0))
+                        .window_control_area(WindowControlArea::Drag),
+                );
+            }
+        }
+
         if self.show_bot_start_bar {
             let pal = self.palette;
             let lang = self.lang_id.as_str();
@@ -1222,12 +1572,11 @@ impl Render for ConversationStage {
                 div()
                     .id("stage-bot-start-bar")
                     .w_full()
-                    .h(px(48.0))
+                    .h(px(52.0))
                     .flex_shrink_0()
                     .px(px(16.0))
                     .bg(rgb(pal.composer_bg))
-                    .border_t_1()
-                    .border_color(rgb(pal.border_fg))
+                    .when(!is_apple, |el| el.border_t_1().border_color(rgb(pal.border_fg)))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1236,8 +1585,8 @@ impl Render for ConversationStage {
                             .id("stage-bot-start-btn")
                             .cursor_pointer()
                             .w_full()
-                            .h(px(34.0))
-                            .rounded(px(8.0))
+                            .h(px(36.0))
+                            .rounded(px(if is_apple { 18.0 } else { 8.0 }))
                             .bg(rgb(pal.accent))
                             .hover(move |s| s.bg(rgb(pal.accent_hover)))
                             .flex()
