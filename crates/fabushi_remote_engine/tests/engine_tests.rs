@@ -200,7 +200,7 @@ async fn test_pty_mux_lifecycle_persistence_exec_env_and_nested_loop_prevention(
         .exec_command("dev-shell", "echo fabushi_pty_ok", 10_000)
         .await
         .expect("exec echo");
-    assert!(!res1.timed_out);
+    assert!(!res1.timed_out, "exec echo timed out: {:?}", res1.output);
     assert_eq!(res1.exit_code, 0);
     assert!(
         res1.output.contains("fabushi_pty_ok"),

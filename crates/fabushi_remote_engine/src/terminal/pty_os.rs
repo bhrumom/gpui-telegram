@@ -393,6 +393,7 @@ mod win_impl {
     const INVALID_HANDLE_VALUE: HANDLE = (-1isize) as HANDLE;
     const EXTENDED_STARTUPINFO_PRESENT: DWORD = 0x0008_0000;
     const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x0000_0400;
+    const STARTF_USESTDHANDLES: DWORD = 0x0000_0100;
     const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 
     #[repr(C)]
@@ -662,7 +663,8 @@ mod win_impl {
             unsafe {
                 InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size);
             }
-            let mut attr_buf = vec![0u8; attr_size.max(64)];
+            let mut attr_buf =
+                vec![0usize; attr_size.div_ceil(std::mem::size_of::<usize>()).max(8)];
             let attr_ptr = attr_buf.as_mut_ptr() as *mut c_void;
             unsafe {
                 if InitializeProcThreadAttributeList(attr_ptr, 1, 0, &mut attr_size) == 0 {
@@ -697,6 +699,10 @@ mod win_impl {
 
             let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
             si.startup_info.cb = std::mem::size_of::<STARTUPINFOEXW>() as DWORD;
+            si.startup_info.dw_flags = STARTF_USESTDHANDLES;
+            si.startup_info.h_std_input = INVALID_HANDLE_VALUE;
+            si.startup_info.h_std_output = INVALID_HANDLE_VALUE;
+            si.startup_info.h_std_error = INVALID_HANDLE_VALUE;
             si.lp_attribute_list = attr_ptr;
 
             let cmd_target = if shell.trim().is_empty() {
