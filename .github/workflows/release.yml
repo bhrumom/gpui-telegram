@@ -347,7 +347,7 @@ jobs:
           path: |
             dist/Fabushi-*-windows-x86_64-setup.exe
             dist/Fabushi-*-windows-x86_64.zip
-            dist/fabushi-*-windows-x86_64.exe
+            dist/fabushi-v[0-9]*-windows-x86_64.exe
             dist/fabushi-remote-daemon-*-windows-x86_64.exe
             dist/gpui_telegram_server-*-windows-x86_64.exe
             dist/latest-windows.json
@@ -360,16 +360,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
           TAG_NAME="${{ inputs.tag_name || github.ref_name }}"
+          VERSION="${TAG_NAME#v}"
           gh release view "$TAG_NAME" >/dev/null 2>&1 || gh release create "$TAG_NAME" --title "Fabushi ${TAG_NAME}" --generate-notes
           assets=(
-            dist/Fabushi-*-windows-x86_64-setup.exe
-            dist/Fabushi-*-windows-x86_64.zip
-            dist/fabushi-*-windows-x86_64.exe
-            dist/fabushi-remote-daemon-*-windows-x86_64.exe
-            dist/gpui_telegram_server-*-windows-x86_64.exe
-            dist/latest-windows.json
-            dist/SHA256SUMS-windows.txt
+            "dist/Fabushi-${VERSION}-windows-x86_64-setup.exe"
+            "dist/Fabushi-${VERSION}-windows-x86_64.zip"
+            "dist/fabushi-${TAG_NAME}-windows-x86_64.exe"
+            "dist/fabushi-remote-daemon-${TAG_NAME}-windows-x86_64.exe"
+            "dist/gpui_telegram_server-${TAG_NAME}-windows-x86_64.exe"
+            "dist/latest-windows.json"
+            "dist/SHA256SUMS-windows.txt"
           )
-          gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+            gh release upload "$TAG_NAME" "$asset" --clobber
+          done
