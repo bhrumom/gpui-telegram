@@ -103,19 +103,64 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
     var existing = window.__GPUI_WEBMCP__ || {};
     var toolsMap = existing._tools || {};
     var stateProvider = typeof existing._stateProvider === 'function' ? existing._stateProvider : null;
+    var pageErrors = Array.isArray(existing._pageErrors) ? existing._pageErrors : [];
+    function pushPageError(msg) {
+      var clean = String(msg || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+      if (!clean) return;
+      if (pageErrors.length && pageErrors[pageErrors.length - 1] === clean) return;
+      pageErrors.push(clean);
+      if (pageErrors.length > 5) pageErrors.shift();
+    }
+    if (!window.__gpuiWebMcpErrorListenersInstalled) {
+      window.__gpuiWebMcpErrorListenersInstalled = true;
+      window.addEventListener('error', function(ev) {
+        try {
+          var m = (ev && ev.message) || (ev && ev.error && ev.error.message) || 'Page script error';
+          pushPageError(m);
+        } catch (_) {}
+      });
+      window.addEventListener('unhandledrejection', function(ev) {
+        try {
+          var r = ev && ev.reason;
+          var m = (r && r.message) ? r.message : String(r || 'Unhandled promise rejection');
+          pushPageError(m);
+        } catch (_) {}
+      });
+    }
+    function readVisibleToast() {
+      try {
+        var sels = ['#toast', '[role="alert"]', '.toast', '.error-banner'];
+        for (var i = 0; i < sels.length; i++) {
+          var el = document.querySelector(sels[i]);
+          if (!el) continue;
+          var cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0')) continue;
+          var txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+          if (txt) return txt;
+        }
+      } catch (_) {}
+      return '';
+    }
+    function enrichSummaryWithDiagnostics(summary) {
+      var out = (summary && typeof summary === 'object') ? Object.assign({}, summary) : {};
+      var toast = readVisibleToast();
+      if (toast && !out.visible_toast) out.visible_toast = toast;
+      if (pageErrors.length && !out.page_errors) out.page_errors = pageErrors.slice();
+      return out;
+    }
     function readStateSummary() {
       try {
         if (typeof stateProvider === 'function') {
           var provided = stateProvider();
-          if (provided && typeof provided === 'object') return provided;
+          if (provided && typeof provided === 'object') return enrichSummaryWithDiagnostics(provided);
         }
-        if (window.STATE && typeof window.STATE === 'object') return window.STATE;
+        if (window.STATE && typeof window.STATE === 'object') return enrichSummaryWithDiagnostics(window.STATE);
       } catch (_) {}
-      return {
+      return enrichSummaryWithDiagnostics({
         kind: 'external_webview',
         title: document.title || '',
         url: String(window.location && window.location.href || '')
-      };
+      });
     }
     function inspectPage() {
       var controls = [];
@@ -134,7 +179,11 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
           });
         }
       } catch (_) {}
-      return { title: document.title || '', controls: controls, state_summary: readStateSummary() };
+      var res = { title: document.title || '', controls: controls, state_summary: readStateSummary() };
+      var toast = readVisibleToast();
+      if (toast) res.visible_toast = toast;
+      if (pageErrors.length) res.page_errors = pageErrors.slice();
+      return res;
     }
     function builtins() {
       return {
@@ -268,6 +317,7 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
     window.__GPUI_WEBMCP__ = {
       _tools: toolsMap,
       _stateProvider: stateProvider,
+      _pageErrors: pageErrors,
       discover: listDescriptors,
       readState: readStateSummary,
       invoke: function(requestId, operation, toolName, args) {

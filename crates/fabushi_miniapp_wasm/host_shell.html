@@ -60,7 +60,7 @@
   const hud = document.getElementById('hud'), tabsEl = document.getElementById('tabs'), sheetEl = document.getElementById('sheet'), toastEl = document.getElementById('toast'), filePicker = document.getElementById('file-picker');
   const enc = new TextEncoder(), dec = new TextDecoder(), imgs = {};
   ['earth_texture.jpg', 'home_world_lightfield.webp', 'zen_room_backdrop_2d.webp'].forEach(n => { const im = new Image(); im.src = '/api/v1/fabushi-miniapp/assets/' + n; imgs[n] = im; });
-  let wasm = null, lastVm = null, lastUiRev = -1, lastSheetKey = '', lastTab = '', editRec = null, composing = false;
+  let wasm = null, lastVm = null, bootError = null, lastUiRev = -1, lastSheetKey = '', lastTab = '', editRec = null, composing = false;
 
   const h = (tag, props, ...kids) => {
     const el = document.createElement(tag);
@@ -138,7 +138,12 @@
   const segPill = (mode, can3d, cmdType, isZen) => h('div', { class: 'seg' + (isZen ? ' zen-seg' : '') }, ['two_d', 'three_d'].map(m => h('button', { class: mode === m ? 'on' : '', 'data-mode': m, text: (m === 'three_d' && !can3d ? '🔒 ' : '') + (m === 'two_d' ? '2D' : '3D'), onClick: () => dispatch({ type: cmdType, mode: m }) })));
 
   const snapshotSummary = () => {
-    if (!lastVm) return null;
+    if (!lastVm) {
+      if (bootError) {
+        return { ok: false, boot_error: bootError, status_text: 'WASM 加载失败: ' + bootError };
+      }
+      return null;
+    }
     let status_text = '';
     if (lastVm.is_transferring) {
       status_text = `发送中: 《${lastVm.current_sending_scripture || '经典'}》 → ${lastVm.current_sending_country || 'ALL'} · 已传 ${lastVm.global_data_sent_formatted || '0 B'}`;
@@ -318,12 +323,14 @@
   function registerFabushiWebMcpTools() {
     if (!navigator.modelContext || typeof navigator.modelContext.registerTool !== 'function') return;
     const ensureReady = async () => {
+      if (bootError) throw new Error('全球法布施 WASM 加载失败: ' + bootError);
       if (!wasm || !lastVm) {
         await Promise.race([
           bootReadyPromise,
           new Promise(r => setTimeout(r, 8000)),
         ]);
       }
+      if (bootError) throw new Error('全球法布施 WASM 加载失败: ' + bootError);
       if (!wasm || !lastVm) throw new Error('全球法布施 WASM 运行时尚未初始化完成');
       return lastVm;
     };
@@ -454,7 +461,11 @@
   registerFabushiWebMcpTools();
 
   async function boot() {
-    const resp = await fetch('/api/v1/fabushi-miniapp/app.wasm'), mod = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
+    const resp = await fetch('/api/v1/fabushi-miniapp/app.wasm');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} (${resp.url || '/api/v1/fabushi-miniapp/app.wasm'})`);
+    const buf = await resp.arrayBuffer();
+    if (!buf || buf.byteLength < 8) throw new Error(`WASM 响应无效 (${buf ? buf.byteLength : 0} bytes)`);
+    const mod = await WebAssembly.instantiate(buf, {});
     wasm = mod.instance.exports;
     const tab = new URLSearchParams(window.location.search).get('tab');
     let res = readResult(wasm.fabushi_wasm_init(Date.now(), -new Date().getTimezoneOffset(), canvas.clientWidth || 420, canvas.clientHeight || 780));
@@ -465,7 +476,15 @@
     const frame = now => { if (now - lastTick >= 33) { const dt = now - lastTick; lastTick = now; applyResult(readResult(wasm.fabushi_wasm_tick(dt, Date.now(), canvas.clientWidth || 420, canvas.clientHeight || 780))); } requestAnimationFrame(frame); };
     requestAnimationFrame(frame);
   }
-  boot().catch(err => { resolveBootReady(); toastEl.textContent = 'WASM 加载失败: ' + err; toastEl.style.display = 'block'; });
+  boot().catch(err => {
+    bootError = err && err.message ? err.message : String(err);
+    resolveBootReady();
+    toastEl.textContent = 'WASM 加载失败: ' + bootError;
+    toastEl.style.display = 'block';
+    if (navigator.modelContext && typeof navigator.modelContext.reportStatus === 'function') {
+      navigator.modelContext.reportStatus(snapshotSummary());
+    }
+  });
 })();
 </script>
 </body>

@@ -1809,6 +1809,9 @@ pub async fn handle_botfather_message(
                     !is_standard,
                 ) {
                     Ok(app) => {
+                        if is_external_miniapp_url(&app.web_url, &app.bot_username, &app.short_name) {
+                            let _ = state.db.delete_mini_app_hosted_bundle(&app.app_id);
+                        }
                         let _ = state.db.clear_botfather_session(uid);
                         let menu_note = if is_standard {
                             "该小程序已设为该机器人的 Main Mini App；如需额外开启底部 Menu Button，可发送 `/setmenubutton` 或调用 `setChatMenuButton` API。"
@@ -2810,7 +2813,7 @@ pub async fn handle_ai_bot_reply_in_topic(
     if !apps.is_empty() {
         let mut app_lines = vec![
             "## Companion Mini Apps (WebMCP Live Control)".to_string(),
-            "此机器人绑定了真实可交互的小程序。当用户请求查询小程序实时状态或操作小程序功能时，必须主动调用 `webmcp_discover` 发现当前小程序暴露的工具，再调用 `webmcp_call_tool` 执行真实操作并基于工具返回结果作答，严禁凭空编造数据或假称“Hermes-local-v1”；若需要用户手动登录、验证码或人工确认，请调用 `miniapp_request_takeover` 暂停等待用户结束接管后继续。当用户询问你是什么模型时，请如实回答你在 Fabushi Agent 运行时上所连接的真实 Active Model。".to_string(),
+            "此机器人绑定了真实可交互的小程序。当用户请求查询小程序实时状态或操作小程序功能时，必须主动调用 `webmcp_discover` 发现当前小程序暴露的工具，再调用 `webmcp_call_tool` 执行真实操作并基于工具返回结果作答，严禁凭空编造数据或假称“Hermes-local-v1”。如果 `webmcp_call_tool` 返回错误（如工具未注册、执行失败）或 `state_summary` / `page_error` / `boot_error` 报告页面加载或 WASM 异常，必须如实向用户说明操作失败并引用具体错误信息，**绝对禁止**声称操作已发送/已成功或编造实时状态；若需要用户手动登录、验证码或人工确认，请调用 `miniapp_request_takeover` 暂停等待用户结束接管后继续。当用户询问你是什么模型时，请如实回答你在 Fabushi Agent 运行时上所连接的真实 Active Model。".to_string(),
         ];
         for app in &apps {
             app_lines.push(format!(
@@ -2820,10 +2823,14 @@ pub async fn handle_ai_bot_reply_in_topic(
         }
         extra_context_sections.push(app_lines.join("\n"));
     }
-    if latest_state_val.is_some() || !cloud_kv.is_empty() {
+    let inject_schema_state = latest_state_val.is_some()
+        && apps.iter().any(|a| app_uses_schema_state_patch(state, a));
+    if inject_schema_state || !cloud_kv.is_empty() {
         let mut ctx_note = vec!["## Live Companion Mini App State".to_string()];
-        if let Some(ref st) = latest_state_val {
-            ctx_note.push(format!("- [User Live Mini App State]: {st}"));
+        if inject_schema_state {
+            if let Some(ref st) = latest_state_val {
+                ctx_note.push(format!("- [User Live Mini App State]: {st}"));
+            }
         }
         if !cloud_kv.is_empty() {
             if let Ok(kv_str) = serde_json::to_string(&cloud_kv) {
@@ -5777,6 +5784,9 @@ pub async fn miniapps_create(
         false,
     ) {
         Ok(app) => {
+            if is_external_miniapp_url(&app.web_url, &app.bot_username, &app.short_name) {
+                let _ = state.db.delete_mini_app_hosted_bundle(&app.app_id);
+            }
             let entry = miniapp_record_to_entry(&state, &app, auth.user_id.0 as i64, None);
             (StatusCode::CREATED, Json(entry)).into_response()
         }
@@ -6456,6 +6466,7 @@ pub async fn miniapps_action(
             (None, None, None)
         };
         let copilot_persona = allow_bot_persona.then(|| bot.ai_persona.clone());
+        let use_schema_patch = app_uses_schema_state_patch(&state, &app);
         let (enriched_sp, effective_model) =
             crate::routes::hermes::build_enriched_bot_turn_context(
                 &state,
@@ -6470,7 +6481,7 @@ pub async fn miniapps_action(
                     bot_model,
                 ),
                 &[],
-                true,
+                use_schema_patch,
             );
         let session_id_opt = crate::routes::hermes::resolve_and_apply_bot_session_policy(
             &state,
@@ -6836,6 +6847,25 @@ pub async fn miniapps_storage_delete(
     }
 }
 
+pub(crate) fn is_external_miniapp_url(web_url: &str, bot_username: &str, short_name: &str) -> bool {
+    let trimmed = web_url.trim();
+    let self_suffix = format!("/miniapps/{}/{}", bot_username, short_name);
+    (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+        && !trimmed.ends_with(&self_suffix)
+}
+
+pub(crate) fn app_uses_schema_state_patch(state: &AppState, app: &MiniAppRecord) -> bool {
+    if is_external_miniapp_url(&app.web_url, &app.bot_username, &app.short_name) {
+        return false;
+    }
+    state
+        .db
+        .get_mini_app_hosted_bundle(&app.app_id)
+        .ok()
+        .flatten()
+        .is_none()
+}
+
 /// GET /miniapps/{bot_username}/{short_name}
 pub async fn serve_miniapp_html(
     State(state): State<Arc<AppState>>,
@@ -6851,56 +6881,8 @@ pub async fn serve_miniapp_html(
     };
     let init_data = params.get("init_data").cloned().unwrap_or_default();
 
-    let hosted_bundle = state
-        .db
-        .get_mini_app_hosted_bundle(&app.app_id)
-        .ok()
-        .flatten();
-    if let Some(bundle_html) = hosted_bundle {
-        let init_escaped = serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into());
-        let has_tg_sdk = bundle_html.contains("/js/telegram-web-app.js");
-        let inject_init = format!(
-            r#"<script>window.__TG_INIT_DATA__ = {}; window.__TG_BOT_ID__ = {};</script>"#,
-            init_escaped, bot.bot_user_id
-        );
-        let inject_full = if has_tg_sdk {
-            inject_init.clone()
-        } else {
-            format!(r#"{inject_init}<script src="/js/telegram-web-app.js"></script>"#)
-        };
-        let final_html = if has_tg_sdk {
-            if let Some(idx) = bundle_html.find("<script src=\"/js/telegram-web-app.js\"") {
-                let mut s = String::with_capacity(bundle_html.len() + inject_init.len() + 1);
-                s.push_str(&bundle_html[..idx]);
-                s.push_str(&inject_init);
-                s.push_str(&bundle_html[idx..]);
-                s
-            } else if let Some(idx) = bundle_html.find("</head>") {
-                let mut s = String::with_capacity(bundle_html.len() + inject_init.len() + 1);
-                s.push_str(&bundle_html[..idx]);
-                s.push_str(&inject_init);
-                s.push_str(&bundle_html[idx..]);
-                s
-            } else {
-                format!("{}\n{}", inject_init, bundle_html)
-            }
-        } else if let Some(idx) = bundle_html.find("</head>") {
-            let mut s = String::with_capacity(bundle_html.len() + inject_full.len() + 1);
-            s.push_str(&bundle_html[..idx]);
-            s.push_str(&inject_full);
-            s.push_str(&bundle_html[idx..]);
-            s
-        } else {
-            format!("{}\n{}", inject_full, bundle_html)
-        };
-        return (StatusCode::OK, Html(final_html)).into_response();
-    }
-
     let trimmed_url = app.web_url.trim();
-    let self_suffix = format!("/miniapps/{}/{}", bot.username, app.short_name);
-    if (trimmed_url.starts_with("http://") || trimmed_url.starts_with("https://"))
-        && !trimmed_url.ends_with(&self_suffix)
-    {
+    if is_external_miniapp_url(trimmed_url, &bot.username, &app.short_name) {
         let sep = if trimmed_url.contains('#') { "&" } else { "#" };
         let iframe_src = if init_data.is_empty() {
             trimmed_url.to_string()
@@ -6958,6 +6940,51 @@ pub async fn serve_miniapp_html(
             iframe_src = html_escape(&iframe_src),
         );
         return (StatusCode::OK, Html(html)).into_response();
+    }
+
+    let hosted_bundle = state
+        .db
+        .get_mini_app_hosted_bundle(&app.app_id)
+        .ok()
+        .flatten();
+    if let Some(bundle_html) = hosted_bundle {
+        let init_escaped = serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into());
+        let has_tg_sdk = bundle_html.contains("/js/telegram-web-app.js");
+        let inject_init = format!(
+            r#"<script>window.__TG_INIT_DATA__ = {}; window.__TG_BOT_ID__ = {};</script>"#,
+            init_escaped, bot.bot_user_id
+        );
+        let inject_full = if has_tg_sdk {
+            inject_init.clone()
+        } else {
+            format!(r#"{inject_init}<script src="/js/telegram-web-app.js"></script>"#)
+        };
+        let final_html = if has_tg_sdk {
+            if let Some(idx) = bundle_html.find("<script src=\"/js/telegram-web-app.js\"") {
+                let mut s = String::with_capacity(bundle_html.len() + inject_init.len() + 1);
+                s.push_str(&bundle_html[..idx]);
+                s.push_str(&inject_init);
+                s.push_str(&bundle_html[idx..]);
+                s
+            } else if let Some(idx) = bundle_html.find("</head>") {
+                let mut s = String::with_capacity(bundle_html.len() + inject_init.len() + 1);
+                s.push_str(&bundle_html[..idx]);
+                s.push_str(&inject_init);
+                s.push_str(&bundle_html[idx..]);
+                s
+            } else {
+                format!("{}\n{}", inject_init, bundle_html)
+            }
+        } else if let Some(idx) = bundle_html.find("</head>") {
+            let mut s = String::with_capacity(bundle_html.len() + inject_full.len() + 1);
+            s.push_str(&bundle_html[..idx]);
+            s.push_str(&inject_full);
+            s.push_str(&bundle_html[idx..]);
+            s
+        } else {
+            format!("{}\n{}", inject_full, bundle_html)
+        };
+        return (StatusCode::OK, Html(final_html)).into_response();
     }
 
     let schema: MiniAppUiSchema =

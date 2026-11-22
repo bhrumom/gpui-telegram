@@ -6488,9 +6488,10 @@ fn sha256_hex(input: &str) -> String {
 fn build_non_fatal_tool_error_envelope(tool_name: &str, err_msg: &str) -> String {
     json!({
         "ok": false,
+        "action_executed": false,
         "tool": tool_name,
         "error": err_msg,
-        "hint": "Fix the arguments or choose another approach and continue."
+        "hint": "This tool call FAILED and did NOT perform the requested action. Do NOT claim the action succeeded or fabricate live status. Fix the arguments or try a verified alternative tool; if still unable to execute, honestly report the failure and exact error message to the user."
     })
     .to_string()
 }

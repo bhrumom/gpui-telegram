@@ -74,6 +74,16 @@ jobs:
           cargo build --release -p fabushi_miniapp --features server --bin fabushi_miniapp_server --bin publish_fabushi_miniapp
           ls -lh target/release/gpui_telegram_server target/release/fabushi_miniapp_server target/release/publish_fabushi_miniapp
 
+      - name: Upload Compiled Backend & Mini App Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-linux-x86_64
+          path: |
+            target/release/gpui_telegram_server
+            target/release/fabushi_miniapp_server
+            target/release/publish_fabushi_miniapp
+          retention-days: 7
+
       - name: Configure SSH Credentials from GitHub Secrets
         env:
           SSH_KEY: ${{ secrets.BACKEND_SSH_PRIVATE_KEY }}

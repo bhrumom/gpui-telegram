@@ -1524,3 +1524,119 @@ async fn serve_miniapp_html_serves_latest_published_bundle_and_external_url_with
         "external miniapp must render generic iframe wrapper with tgWebAppData hash: {html_ext}"
     );
 }
+
+#[tokio::test]
+async fn republishing_hosted_app_with_external_url_clears_stale_bundle_and_serves_iframe() {
+    let (_dir, state, router) = boot_temp_server("miniapp_republish_clears_bundle");
+    let (_uid, token) = register_user(&router, "miniapp_republisher").await;
+
+    let (st_bot, bot_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/bots",
+        Some(&token),
+        Some(json!({
+            "display_name": "Republish App Bot",
+            "username": "repub_app_bot",
+            "description": "Republish Test Bot",
+            "about": "Republish Test",
+            "allow_attach_menu": true,
+            "attach_peer_types": ["users", "bots", "groups"]
+        })),
+    )
+    .await;
+    assert_eq!(st_bot, StatusCode::CREATED, "create @repub_app_bot: {bot_val}");
+    let bot_token = bot_val["bot_token"].as_str().expect("bot_token").to_string();
+
+    let (st_pub1, pub_val1) = http_json(
+        &router,
+        "POST",
+        &format!("/bot{bot_token}/publishMiniApp"),
+        None,
+        Some(json!({
+            "short_name": "hosted",
+            "title": "Hosted v1",
+            "description": "Initial hosted bundle",
+            "category": "tools",
+            "icon_emoji": "🧩",
+            "web_url": "/miniapps/repub_app_bot/hosted",
+            "is_main_app": true,
+            "html_bundle": "<html><head></head><body>OLD_STALE_BUNDLE</body></html>"
+        })),
+    )
+    .await;
+    assert_eq!(st_pub1, StatusCode::OK, "publish v1: {pub_val1}");
+    let app_id = pub_val1["result"]["app_id"]
+        .as_str()
+        .expect("app_id")
+        .to_string();
+    assert!(
+        state
+            .db
+            .get_mini_app_hosted_bundle(&app_id)
+            .expect("get bundle")
+            .is_some(),
+        "hosted bundle must be stored after v1 publish"
+    );
+
+    let (st_pub2, pub_val2) = http_json(
+        &router,
+        "POST",
+        &format!("/bot{bot_token}/publishMiniApp"),
+        None,
+        Some(json!({
+            "short_name": "hosted",
+            "title": "External v2",
+            "description": "Migrated external URL app",
+            "category": "tools",
+            "icon_emoji": "🌐",
+            "web_url": "https://external-v2.example/app",
+            "is_main_app": true
+        })),
+    )
+    .await;
+    assert_eq!(st_pub2, StatusCode::OK, "re-publish v2 external: {pub_val2}");
+    assert!(
+        state
+            .db
+            .get_mini_app_hosted_bundle(&app_id)
+            .expect("get bundle after external republish")
+            .is_none(),
+        "stale hosted bundle must be deleted when re-published with external web_url"
+    );
+
+    let req2 = Request::builder()
+        .method("GET")
+        .uri("/miniapps/repub_app_bot/hosted?init_data=v2_init")
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = router.clone().oneshot(req2).await.expect("GET v2 miniapp html");
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let html2 = String::from_utf8(to_bytes(resp2.into_body(), usize::MAX).await.unwrap().to_vec())
+        .expect("utf8 html2");
+    assert!(
+        !html2.contains("OLD_STALE_BUNDLE")
+            && html2.contains("https://external-v2.example/app#tgWebAppData=v2_init"),
+        "republished external app must serve external iframe instead of stale bundle: {html2}"
+    );
+
+    // Even if a stale hosted bundle row exists alongside an external web_url, external URL wins.
+    state
+        .db
+        .upsert_mini_app_hosted_bundle(&app_id, "<html><body>MANUAL_STALE_BUNDLE</body></html>")
+        .expect("insert stale bundle row");
+    let req3 = Request::builder()
+        .method("GET")
+        .uri("/miniapps/repub_app_bot/hosted?init_data=v3_init")
+        .body(Body::empty())
+        .unwrap();
+    let resp3 = router.clone().oneshot(req3).await.expect("GET v3 miniapp html");
+    assert_eq!(resp3.status(), StatusCode::OK);
+    let html3 = String::from_utf8(to_bytes(resp3.into_body(), usize::MAX).await.unwrap().to_vec())
+        .expect("utf8 html3");
+    assert!(
+        !html3.contains("MANUAL_STALE_BUNDLE")
+            && html3.contains("https://external-v2.example/app#tgWebAppData=v3_init"),
+        "external web_url must take precedence over any stale hosted bundle row: {html3}"
+    );
+}

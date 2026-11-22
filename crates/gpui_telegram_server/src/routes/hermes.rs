@@ -1118,7 +1118,7 @@ pub(crate) fn build_enriched_bot_turn_context(
         prompt_blocks.push(
             "## Directives\n\
              - Execute multi-step requests iteratively using your available Fabushi Bot & WebMCP tools (`webmcp_list_miniapps`, `webmcp_discover`, `webmcp_call_tool`, `miniapp_request_takeover`, `computer_list`, `computer_status`, `computer_lease_acquire`, `computer_exec`, `computer_file`, `terminal`, `read_file`, `write_file`, `search_files`, `skill_list`, `skill_view`, `skill_manage`, `memory`) until the task is genuinely verified.\n\
-             - When controlling a companion Mini App (any attached or registered Mini App), call `webmcp_discover` first if needed and use `webmcp_call_tool` to inspect state or trigger real actions; use `miniapp_request_takeover` if manual user interaction is needed.\n\
+             - When controlling a companion Mini App (any attached or registered Mini App), call `webmcp_discover` first if needed and use `webmcp_call_tool` to inspect state or trigger real actions; use `miniapp_request_takeover` if manual user interaction is needed. If `webmcp_call_tool` fails, reports an unregistered tool, or `webmcp_discover`/`state_summary` reports a `page_error`, `boot_error`, or WASM failure, you MUST NOT claim the action succeeded or fabricate live transfer/runtime status—truthfully report the exact error to the user.\n\
              - Base all answers strictly on verified tool outputs and live state; never fabricate results or suppress tool/provider failures.\n\
              - Never claim to be \"Hermes-local-v1\" or invent a local model when backed by a configured provider/model.\n\
              - Never disclose raw SSH passwords, private keys, API keys, or tokens.\n\
@@ -1319,7 +1319,35 @@ fn is_sensitive_arg_key(key: &str) -> bool {
 }
 
 fn format_tool_args_preview(arguments: &Value) -> String {
+    format_tool_args_preview_inner(arguments, true)
+}
+
+fn format_tool_args_preview_inner(arguments: &Value, expand_tool_name: bool) -> String {
     if let Some(obj) = arguments.as_object() {
+        if expand_tool_name {
+            if let Some(tool_name) = obj
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(sub_args) = obj.get("arguments").filter(|v| !v.is_null()) {
+                    let is_empty = match sub_args {
+                        Value::Object(m) => m.is_empty(),
+                        Value::Array(a) => a.is_empty(),
+                        Value::String(s) => s.trim().is_empty(),
+                        _ => false,
+                    };
+                    if !is_empty {
+                        let compact_sub_args = format_tool_args_preview_inner(sub_args, false);
+                        if !compact_sub_args.is_empty() {
+                            return truncate_chars(&format!("{tool_name} {compact_sub_args}"), 80);
+                        }
+                    }
+                }
+                return truncate_chars(tool_name, 72);
+            }
+        }
         for preferred in ["command", "path", "node_id", "query", "action", "name", "url"] {
             if let Some(v) = obj.get(preferred).and_then(|x| x.as_str()) {
                 let single_line = v.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1621,7 +1649,17 @@ impl StreamConsumerState {
             .iter()
             .filter(|s| s.status != StepStatus::Running)
             .count();
-        let mut lines = vec![format!("🔧 **执行步骤 ({done}/{total})**")];
+        let failed = self
+            .tool_steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Err)
+            .count();
+        let header = if failed > 0 {
+            format!("🔧 **执行步骤 ({done}/{total} · {failed} 步失败)**")
+        } else {
+            format!("🔧 **执行步骤 ({done}/{total})**")
+        };
+        let mut lines = vec![header];
         let max_display = 8;
         let start_idx = if total > max_display {
             lines.push(format!("…已折叠前 {} 步", total - max_display + 1));
@@ -1767,14 +1805,22 @@ fn flush_streamed_bot_message(
     if is_final && !params.companion_apps.is_empty() {
         let patches = extract_state_patches(consumer.raw_answer_text());
         if !patches.is_empty() {
-            crate::routes::bots_miniapps::apply_miniapp_state_patches_for_bot_user(
-                state,
-                params.sender_id.0 as i64,
-                params.bot_user_id.0 as i64,
-                params.chat_id.0,
-                &params.companion_apps,
-                &patches,
-            );
+            let schema_apps: Vec<MiniAppRecord> = params
+                .companion_apps
+                .iter()
+                .filter(|app| crate::routes::bots_miniapps::app_uses_schema_state_patch(state, app))
+                .cloned()
+                .collect();
+            if !schema_apps.is_empty() {
+                crate::routes::bots_miniapps::apply_miniapp_state_patches_for_bot_user(
+                    state,
+                    params.sender_id.0 as i64,
+                    params.bot_user_id.0 as i64,
+                    params.chat_id.0,
+                    &schema_apps,
+                    &patches,
+                );
+            }
         }
     }
 
@@ -1914,6 +1960,10 @@ pub(crate) async fn execute_bot_turn_streamed(
             .filter(|m| !m.trim().is_empty())
     });
 
+    let include_state_patch_hint = params
+        .companion_apps
+        .iter()
+        .any(|app| crate::routes::bots_miniapps::app_uses_schema_state_patch(state, app));
     let (enriched_sp, effective_model) = build_enriched_bot_turn_context(
         state,
         params.sender_id.0,
@@ -1923,7 +1973,7 @@ pub(crate) async fn execute_bot_turn_streamed(
         params.explicit_model.clone(),
         fallback_bot_model,
         &params.extra_context_sections,
-        !params.companion_apps.is_empty(),
+        include_state_patch_hint,
     );
 
     let session_id_opt = resolve_and_apply_bot_session_policy(
@@ -7248,5 +7298,183 @@ mod tests {
 
         gw_srv.abort();
         mock_srv.abort();
+    }
+
+    #[test]
+    fn test_format_tool_args_preview_prefers_webmcp_tool_name() {
+        let no_sub = json!({
+            "bot_username": "fabushi_bot",
+            "chat_id": 601440062,
+            "tool_name": "get_state",
+            "arguments": {}
+        });
+        assert_eq!(format_tool_args_preview(&no_sub), "get_state");
+
+        let with_sub = json!({
+            "bot_username": "fabushi_bot",
+            "chat_id": 601440062,
+            "tool_name": "fabushi_send_dharma",
+            "arguments": { "sutra": "金刚经", "looping": false }
+        });
+        let preview = format_tool_args_preview(&with_sub);
+        assert!(preview.starts_with("fabushi_send_dharma "), "got {preview}");
+        assert!(preview.contains("金刚经"), "got {preview}");
+    }
+
+    #[test]
+    fn test_stream_consumer_render_counts_failed_steps() {
+        let mut sc_ok = StreamConsumerState::new();
+        sc_ok.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "ok1".into(),
+            tool_name: "webmcp_discover".into(),
+            arguments: json!({"bot_username": "fabushi_bot"}),
+        });
+        sc_ok.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "ok1".into(),
+            tool_name: "webmcp_discover".into(),
+            success: true,
+            output: "ok".into(),
+            duration_ms: 15,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        let md_ok = sc_ok.render(true, None);
+        assert!(md_ok.contains("🔧 **执行步骤 (1/1)**"), "got {md_ok}");
+        assert!(!md_ok.contains("步失败"), "got {md_ok}");
+
+        let mut sc_fail = StreamConsumerState::new();
+        sc_fail.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "c1".into(),
+            tool_name: "webmcp_discover".into(),
+            arguments: json!({"bot_username": "fabushi_bot"}),
+        });
+        sc_fail.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "c1".into(),
+            tool_name: "webmcp_discover".into(),
+            success: true,
+            output: "ok".into(),
+            duration_ms: 10,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        sc_fail.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "c2".into(),
+            tool_name: "webmcp_call_tool".into(),
+            arguments: json!({"tool_name": "fabushi_send_dharma", "arguments": {"sutra": "金刚经"}}),
+        });
+        sc_fail.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "c2".into(),
+            tool_name: "webmcp_call_tool".into(),
+            success: false,
+            output: "Error: 未注册的 WebMCP 工具: fabushi_send_dharma".into(),
+            duration_ms: 20,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        let md_fail = sc_fail.render(true, None);
+        assert!(md_fail.contains("🔧 **执行步骤 (2/2 · 1 步失败)**"), "got {md_fail}");
+    }
+
+    #[test]
+    fn test_app_uses_schema_state_patch_gates_external_and_hosted_apps() {
+        let (_dir, state) = test_state("schema_patch_gate");
+        let bot = state
+            .db
+            .create_registered_bot(
+                1001,
+                "patch_gate_bot",
+                "Patch Gate Bot",
+                "desc",
+                "about",
+                "persona",
+                "",
+                "",
+                "[]",
+                false,
+                true,
+            )
+            .expect("register bot");
+
+        let schema_app = state
+            .db
+            .create_or_upsert_mini_app_with_options(
+                bot.bot_user_id,
+                "patch_gate_bot",
+                "schema_app",
+                "Schema App",
+                "desc",
+                "tools",
+                "🧩",
+                None,
+                "{}",
+                true,
+                true,
+                false,
+                "",
+                "",
+                None,
+                false,
+            )
+            .expect("schema app");
+        assert!(crate::routes::bots_miniapps::app_uses_schema_state_patch(
+            &state,
+            &schema_app
+        ));
+
+        let hosted_app = state
+            .db
+            .create_or_upsert_mini_app_with_options(
+                bot.bot_user_id,
+                "patch_gate_bot",
+                "hosted_app",
+                "Hosted App",
+                "desc",
+                "tools",
+                "🧩",
+                None,
+                "{}",
+                true,
+                true,
+                false,
+                "",
+                "",
+                None,
+                false,
+            )
+            .expect("hosted app");
+        state
+            .db
+            .upsert_mini_app_hosted_bundle(&hosted_app.app_id, "<html><body>app</body></html>")
+            .expect("upsert hosted bundle");
+        assert!(!crate::routes::bots_miniapps::app_uses_schema_state_patch(
+            &state,
+            &hosted_app
+        ));
+
+        let ext_app = state
+            .db
+            .create_or_upsert_mini_app_with_options(
+                bot.bot_user_id,
+                "patch_gate_bot",
+                "ext_app",
+                "External App",
+                "desc",
+                "tools",
+                "🌐",
+                Some("https://external.example/miniapp"),
+                "{}",
+                true,
+                true,
+                false,
+                "",
+                "",
+                None,
+                false,
+            )
+            .expect("external app");
+        assert!(!crate::routes::bots_miniapps::app_uses_schema_state_patch(
+            &state,
+            &ext_app
+        ));
     }
 }

@@ -3269,6 +3269,18 @@ impl ServerDatabase {
         })
     }
 
+    pub fn delete_mini_app_hosted_bundle(&self, app_id: &str) -> Result<bool> {
+        self.pool.with_conn(|conn| {
+            let rows = conn
+                .execute(
+                    "DELETE FROM mini_app_hosted_bundles WHERE app_id = ?1",
+                    params![app_id],
+                )
+                .map_db()?;
+            Ok(rows > 0)
+        })
+    }
+
     pub fn enqueue_bot_api_update(
         &self,
         bot_user_id: i64,

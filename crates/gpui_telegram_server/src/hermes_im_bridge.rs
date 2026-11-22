@@ -26,6 +26,51 @@ use serde_json::{json, Value};
 use std::sync::{Arc, OnceLock, Weak};
 use uuid::Uuid;
 
+fn extract_webmcp_page_error(summary: Option<&Value>) -> Option<String> {
+    let obj = summary?.as_object()?;
+    if let Some(boot_err) = obj
+        .get("boot_error")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(boot_err.to_string());
+    }
+    if let Some(arr) = obj.get("page_errors").and_then(|v| v.as_array()) {
+        let msgs: Vec<&str> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+            .collect();
+        if !msgs.is_empty() {
+            return Some(msgs.join("; "));
+        }
+    }
+    if let Some(toast) = obj
+        .get("visible_toast")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let lower = toast.to_ascii_lowercase();
+        const INDICATORS: [&str; 10] = [
+            "失败",
+            "error",
+            "exception",
+            "compileerror",
+            "wasm",
+            "404",
+            "500",
+            "无法",
+            "崩溃",
+            "failed",
+        ];
+        if INDICATORS.iter().any(|ind| lower.contains(ind)) {
+            return Some(toast.to_string());
+        }
+    }
+    None
+}
+
 pub struct ServerPlatformImBridge {
     db: Arc<ServerDatabase>,
     pipeline: Arc<MessagePipeline>,
@@ -1436,7 +1481,8 @@ impl PlatformImBridge for ServerPlatformImBridge {
                             if !resp.ok {
                                 return Err(resp.error.unwrap_or_else(|| "WebMCP discover failed".into()));
                             }
-                            return Ok(json!({
+                            let page_error = extract_webmcp_page_error(resp.state_summary.as_ref());
+                            let mut payload = json!({
                                 "success": true,
                                 "mode": "live_webmcp",
                                 "bot_username": app.bot_username,
@@ -1444,7 +1490,19 @@ impl PlatformImBridge for ServerPlatformImBridge {
                                 "app_title": app.title,
                                 "tools": resp.tools,
                                 "state_summary": resp.state_summary,
-                            }));
+                            });
+                            if let Some(err) = page_error {
+                                if let Some(obj) = payload.as_object_mut() {
+                                    obj.insert(
+                                        "warning".to_string(),
+                                        json!(format!(
+                                            "Mini App page reported an error: {err}. Do NOT claim Mini App actions succeeded; report this exact error to the user."
+                                        )),
+                                    );
+                                    obj.insert("page_error".to_string(), json!(err));
+                                }
+                            }
+                            return Ok(payload);
                         }
                     }
                     let catalog = Self::headless_webmcp_catalog(&app);
@@ -1497,13 +1555,17 @@ impl PlatformImBridge for ServerPlatformImBridge {
                             .dispatch_to_client(caller_uid, cmd, DEFAULT_WEBMCP_RPC_TIMEOUT)
                             .await?
                         {
+                            let page_error = extract_webmcp_page_error(resp.state_summary.as_ref());
                             if !resp.ok {
-                                return Err(
-                                    resp.error
-                                        .unwrap_or_else(|| format!("WebMCP tool '{tool}' failed")),
-                                );
+                                let mut err_msg = resp
+                                    .error
+                                    .unwrap_or_else(|| format!("WebMCP tool '{tool}' failed"));
+                                if let Some(page_err) = page_error {
+                                    err_msg.push_str(&format!("（小程序页面异常: {page_err}）"));
+                                }
+                                return Err(err_msg);
                             }
-                            return Ok(json!({
+                            let mut payload = json!({
                                 "success": true,
                                 "mode": "live_webmcp",
                                 "bot_username": app.bot_username,
@@ -1511,8 +1573,37 @@ impl PlatformImBridge for ServerPlatformImBridge {
                                 "tool_name": tool,
                                 "result": resp.result,
                                 "state_summary": resp.state_summary,
-                            }));
+                            });
+                            if let Some(err) = page_error {
+                                if let Some(obj) = payload.as_object_mut() {
+                                    obj.insert(
+                                        "warning".to_string(),
+                                        json!(format!(
+                                            "Mini App page reported an error: {err}. Do NOT claim Mini App actions succeeded; report this exact error to the user."
+                                        )),
+                                    );
+                                    obj.insert("page_error".to_string(), json!(err));
+                                }
+                            }
+                            return Ok(payload);
                         }
+                    }
+
+                    const HEADLESS_SUPPORTED_TOOLS: [&str; 9] = [
+                        "get_state",
+                        "page_inspect",
+                        "page_fill",
+                        "page_press_main_button",
+                        "page_press_secondary_button",
+                        "widget_event",
+                        "main_button_click",
+                        "secondary_button_click",
+                        "send_data",
+                    ];
+                    if !HEADLESS_SUPPORTED_TOOLS.contains(&tool) {
+                        return Err(format!(
+                            "未注册的 WebMCP 工具: {tool}（当前没有已连接的桌面小程序 WebView，无法执行页面专属工具）"
+                        ));
                     }
 
                     let fallback_res = self.execute_headless_webmcp_tool(
@@ -2215,5 +2306,54 @@ mod tests {
         assert!(state_res.success);
         let state_v: Value = serde_json::from_str(&state_res.output).unwrap();
         assert_eq!(state_v["result"]["state"]["item_name"], "Matcha Latte");
+
+        let unregistered = HermesToolExecutor::execute(
+            "webmcp_call_tool",
+            json!({
+                "tool_name": "fabushi_send_dharma",
+                "arguments": { "sutra": "金刚经" }
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(
+            !unregistered.success,
+            "headless fallback must reject unregistered custom tool: {:?}",
+            unregistered.output
+        );
+        let unreg_err = unregistered.error.as_deref().unwrap_or("");
+        assert!(
+            unreg_err.contains("未注册的 WebMCP 工具: fabushi_send_dharma"),
+            "unexpected unregistered tool error: {unreg_err}"
+        );
+    }
+
+    #[test]
+    fn extract_webmcp_page_error_detects_boot_page_and_toast_errors() {
+        assert_eq!(extract_webmcp_page_error(None), None);
+        assert_eq!(extract_webmcp_page_error(Some(&json!({}))), None);
+
+        let boot = json!({ "boot_error": "HTTP 404 (/api/v1/fabushi-miniapp/app.wasm)" });
+        assert_eq!(
+            extract_webmcp_page_error(Some(&boot)).as_deref(),
+            Some("HTTP 404 (/api/v1/fabushi-miniapp/app.wasm)")
+        );
+
+        let page_errs = json!({ "page_errors": ["TypeError: x is not a function", "WASM trap"] });
+        assert_eq!(
+            extract_webmcp_page_error(Some(&page_errs)).as_deref(),
+            Some("TypeError: x is not a function; WASM trap")
+        );
+
+        let err_toast = json!({
+            "visible_toast": "WASM 加载失败: CompileError: WebAssembly.Module doesn't parse at byte 0: expected a module of at least 8 bytes"
+        });
+        assert_eq!(
+            extract_webmcp_page_error(Some(&err_toast)).as_deref(),
+            Some("WASM 加载失败: CompileError: WebAssembly.Module doesn't parse at byte 0: expected a module of at least 8 bytes")
+        );
+
+        let normal_toast = json!({ "visible_toast": "已保存" });
+        assert_eq!(extract_webmcp_page_error(Some(&normal_toast)), None);
     }
 }
