@@ -66,6 +66,18 @@ impl AppShell {
             && self.stage.read(cx).active_bot_card_field.is_some()
     }
 
+    /// Returns `true` when Apple Messages inline Compose mode (`收件人:`) should receive keyboard & IME input.
+    pub fn is_apple_compose_input_active(&self, cx: &App) -> bool {
+        let sb = self.sidebar.read(cx);
+        self.active_panel == ActiveWorkspacePanel::Chats
+            && self.theme_state.palette.is_apple_style()
+            && sb.is_plus_menu_open
+            && !sb.search_focused
+            && !sb.is_contacts_modal_open
+            && sb.active_creation_modal.is_none()
+            && !self.composer.read(cx).is_input_focused
+    }
+
     fn set_composer_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
         self.composer.update(cx, |c, c_cx| {
             c.is_input_focused = focused;
@@ -80,6 +92,7 @@ impl AppShell {
             || sb.search_focused
             || sb.active_creation_modal.is_some()
             || sb.is_contacts_modal_open
+            || self.is_apple_compose_input_active(cx)
             || self.modal_container.read(cx).is_modal_active()
             || self.miniapps.create_bot_box.as_ref().is_some_and(|b| b.read(cx).is_visible)
             || self.miniapps.miniapp_overlay.as_ref().is_some_and(|w| w.read(cx).has_focused_text_input())
@@ -160,6 +173,7 @@ impl AppShell {
             );
         }
         if self.is_studio_input_active(cx) { return (String::new(), pre()); }
+        if self.is_apple_compose_input_active(cx) { return (sb.compose_recipient_query.clone(), pre()); }
         if sb.search_focused { return (sb.search_query.clone(), pre()); }
         if self.stage.read(cx).search_open { return (self.stage.read(cx).search_query.clone(), pre()); }
         let c = self.composer.read(cx);
@@ -201,6 +215,8 @@ impl AppShell {
             self.sidebar.update(cx, |sb, scx| { sb.contacts_search_query.clear(); scx.notify(); });
         } else if self.sidebar.read(cx).active_creation_modal.is_some() {
             self.sidebar.update(cx, |sb, scx| { sb.clear_creation_text(); scx.notify(); });
+        } else if self.is_apple_compose_input_active(cx) {
+            self.sidebar.update(cx, |sb, scx| { sb.compose_recipient_query.clear(); scx.notify(); });
         } else if self.is_settings_input_active(cx) {
             self.settings_router.update(cx, |sr, scx| { sr.clear_active_input(scx); });
         } else if self.is_inspector_bot_input_active(cx) {
@@ -254,6 +270,11 @@ impl AppShell {
             self.sidebar.update(cx, |sb, scx| { sb.contacts_search_query.push_str(&clean); scx.notify(); });
         } else if self.sidebar.read(cx).active_creation_modal.is_some() {
             self.sidebar.update(cx, |sb, scx| { sb.push_creation_text(&clean); scx.notify(); });
+        } else if self.is_apple_compose_input_active(cx) {
+            self.sidebar.update(cx, |sb, scx| {
+                sb.compose_recipient_query.push_str(&clean);
+                scx.notify();
+            });
         } else if self.is_settings_input_active(cx) {
             self.settings_router.update(cx, |sr, scx| { sr.push_input_text(&clean, scx); });
         } else if self.is_inspector_bot_input_active(cx) {
@@ -590,6 +611,40 @@ impl AppShell {
             }
             cx.notify();
             return true;
+        }
+        if self.is_apple_compose_input_active(cx) {
+            match key {
+                "backspace" => {
+                    if self.ime.ime_preedit.take().is_none() {
+                        self.sidebar.update(cx, |sb, scx| {
+                            backspace_string(&mut sb.compose_recipient_query, is_alt);
+                            scx.notify();
+                        });
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "enter" => {
+                    if self.take_ime_preedit_commit(cx) || self.ime.take_just_committed() {
+                        return true;
+                    }
+                    let recipients = self.collect_apple_compose_recipients(cx);
+                    if let Some(first) = recipients.into_iter().next() {
+                        self.open_apple_compose_recipient(first, cx);
+                    } else if !self.sidebar.read(cx).compose_recipient_query.trim().is_empty() {
+                        self.open_add_friend_from_compose_query(cx);
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "tab" => {
+                    self.ime.clear_preedit();
+                    self.set_composer_focused(true, cx);
+                    cx.notify();
+                    return true;
+                }
+                _ => {}
+            }
         }
         if self.is_settings_input_active(cx) {
             if key == "backspace" && self.ime.ime_preedit.take().is_some() {
@@ -949,6 +1004,15 @@ impl EntityInputHandler for AppShell {
             let caret_x = cx_mid - px(140.0) + px((char_count as f32 * 8.0).min(280.0));
             let caret_y = if !self.is_authenticated { cy_mid + px(10.0) } else { cy_mid - px(24.0) };
             return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(20.0))));
+        }
+        if self.is_apple_compose_input_active(cx) {
+            let sb_width = self.sidebar.read(cx).effective_width();
+            let caret_x = element_bounds.origin.x
+                + px(sb_width + 78.0 + (char_count as f32 * 8.0).min(300.0));
+            return Some(Bounds::new(
+                point(caret_x, element_bounds.origin.y + px(18.0)),
+                size(px(2.0), px(18.0)),
+            ));
         }
         if self.stage.read(cx).search_open {
             let caret_x = element_bounds.origin.x + px(360.0) + px((char_count as f32 * 8.0).min(280.0));

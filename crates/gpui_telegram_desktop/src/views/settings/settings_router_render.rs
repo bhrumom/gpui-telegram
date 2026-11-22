@@ -4,11 +4,12 @@
 use super::settings_router::SettingsRouter;
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName};
+use crate::views::app_shell::modal_container::{macos_modal_backdrop_rgba, macos_modal_card};
 use crate::views::settings::settings_type::SettingsSectionType;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, rgb, rgba, AnyElement, Context, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    div, px, rgb, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window,
 };
 
 impl SettingsRouter {
@@ -263,7 +264,7 @@ impl SettingsRouter {
                     .py(px(pal.scaled_px(12.0)))
                     .bg(rgb(pal.topbar_bg))
                     .border_b_1()
-                    .border_color(rgb(pal.border_fg))
+                    .border_color(pal.separator_rgba())
                     .child(
                         div()
                             .flex()
@@ -277,7 +278,7 @@ impl SettingsRouter {
                                     .gap(px(pal.scaled_px(6.0)))
                                     .px(px(pal.scaled_px(12.0)))
                                     .py(px(pal.scaled_px(6.0)))
-                                    .rounded(px(pal.scaled_px(6.0)))
+                                    .rounded_full()
                                     .bg(if is_root {
                                         rgb(pal.accent)
                                     } else {
@@ -401,15 +402,15 @@ impl SettingsRouter {
                             .child(
                                 div()
                                     .cursor_pointer()
-                                    .px(px(pal.scaled_px(10.0)))
+                                    .px(px(pal.scaled_px(11.0)))
                                     .py(px(pal.scaled_px(6.0)))
-                                    .rounded(px(pal.scaled_px(6.0)))
+                                    .rounded_full()
                                     .bg(rgb(pal.input_bg))
                                     .hover(move |s| s.bg(rgb(pal.hover_bg)))
                                     .flex()
                                     .items_center()
                                     .gap(px(pal.scaled_px(5.0)))
-                                    .text_size(px(pal.scaled_px(13.0)))
+                                    .text_size(px(pal.scaled_px(12.5)))
                                     .text_color(rgb(pal.text_primary))
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -427,17 +428,17 @@ impl SettingsRouter {
                             .child(
                                 div()
                                     .cursor_pointer()
-                                    .px(px(pal.scaled_px(10.0)))
+                                    .px(px(pal.scaled_px(11.0)))
                                     .py(px(pal.scaled_px(6.0)))
-                                    .rounded(px(pal.scaled_px(6.0)))
+                                    .rounded_full()
                                     .bg(rgb(pal.input_bg))
                                     .hover(move |s| s.bg(rgb(pal.hover_bg)))
                                     .flex()
                                     .items_center()
                                     .gap(px(pal.scaled_px(5.0)))
-                                    .text_size(px(pal.scaled_px(13.0)))
+                                    .text_size(px(pal.scaled_px(12.5)))
                                     .text_color(rgb(pal.accent))
-                                    .font_weight(FontWeight::BOLD)
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -449,26 +450,23 @@ impl SettingsRouter {
                             )
                             .child(
                                 div()
+                                    .id("settings-modal-close-btn")
                                     .cursor_pointer()
-                                    .px(px(pal.scaled_px(10.0)))
-                                    .py(px(pal.scaled_px(6.0)))
-                                    .rounded(px(pal.scaled_px(6.0)))
+                                    .w(px(pal.scaled_px(28.0)))
+                                    .h(px(pal.scaled_px(28.0)))
+                                    .rounded_full()
                                     .bg(rgb(pal.input_bg))
-                                    .hover(move |s| s.bg(rgb(pal.danger)))
+                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
                                     .flex()
                                     .items_center()
-                                    .gap(px(pal.scaled_px(5.0)))
-                                    .text_size(px(pal.scaled_px(13.0)))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(pal.text_primary))
+                                    .justify_center()
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             this.close(cx);
                                         }),
                                     )
-                                    .child(tg_icon(IconName::Close, pal.scaled_px(13.0), pal.icon_fg))
-                                    .child(tr_str(lang, "关闭", "Close")),
+                                    .child(tg_icon(IconName::Close, pal.scaled_px(13.0), pal.icon_fg)),
                             ),
                     ),
             )
@@ -494,7 +492,7 @@ impl Render for SettingsRouter {
             .left_0()
             .size_full()
             .occlude()
-            .bg(rgba(0x00000088))
+            .bg(macos_modal_backdrop_rgba(pal))
             .flex()
             .items_center()
             .justify_center()
@@ -505,15 +503,9 @@ impl Render for SettingsRouter {
                 }),
             )
             .child(
-                div()
-                    .id("telegram-settings-modal-box")
+                macos_modal_card("telegram-settings-modal-box", pal)
                     .w(px(box_w))
                     .h(px(box_h))
-                    .rounded(px(pal.scaled_px(14.0)))
-                    .bg(rgb(pal.modal_bg))
-                    .border_1()
-                    .border_color(rgb(pal.border_fg))
-                    .shadow_lg()
                     .flex()
                     .flex_col()
                     .overflow_hidden()

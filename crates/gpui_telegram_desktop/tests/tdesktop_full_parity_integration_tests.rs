@@ -150,12 +150,13 @@ fn test_fabushi_visual_theme_tokens_and_readability() {
     assert!(light.is_apple_style());
     assert!(!classic.is_apple_style());
 
-    // Apple Messages Dark palette & vibrant iMessage Blue outgoing tokens
+    // Apple Messages Dark palette & unified sidebar/stage luminance
     assert_eq!(dark.accent, 0x0A84FF);
     assert_eq!(dark.accent_hover, 0x2994FF);
     assert_eq!(dark.window_bg, 0x1E1E1E);
     assert_eq!(dark.stage_bg, 0x1E1E1E);
-    assert_eq!(dark.dialogs_bg, 0x1C1C1E);
+    assert_eq!(dark.dialogs_bg, 0x1E1E1E);
+    assert_eq!(dark.dialogs_bg, dark.stage_bg);
     assert_eq!(dark.dialogs_active_bg, 0x0A84FF);
     assert_eq!(dark.msg_in_bg, 0x262629);
     assert_eq!(dark.msg_out_bg, 0x0A84FF);
@@ -167,16 +168,17 @@ fn test_fabushi_visual_theme_tokens_and_readability() {
     assert_eq!(dark.text_primary, 0xF5F5F7);
     assert_eq!(dark.text_secondary, 0x98989D);
     assert_eq!(dark.service_pill_fg, 0x8E8E93);
-    assert!((dark.sidebar_bg_rgba().a - 0.74).abs() < 0.01);
-    assert!((dark.separator_rgba().a - 0.09).abs() < 0.01);
+    assert!((dark.sidebar_bg_rgba().a - 1.0).abs() < 0.001);
+    assert!((dark.separator_rgba().a - 0.08).abs() < 0.01);
     assert_eq!(dark.popover_shadows().len(), 2);
 
-    // Apple Messages Light palette & vibrant iMessage Blue outgoing tokens
+    // Apple Messages Light palette & unified sidebar/stage luminance
     assert_eq!(light.accent, 0x007AFF);
     assert_eq!(light.accent_hover, 0x0062CC);
     assert_eq!(light.window_bg, 0xFFFFFF);
     assert_eq!(light.stage_bg, 0xFFFFFF);
-    assert_eq!(light.dialogs_bg, 0xF5F5F7);
+    assert_eq!(light.dialogs_bg, 0xFFFFFF);
+    assert_eq!(light.dialogs_bg, light.stage_bg);
     assert_eq!(light.dialogs_active_bg, 0x007AFF);
     assert_eq!(light.msg_in_bg, 0xE9E9EB);
     assert_eq!(light.msg_out_bg, 0x007AFF);
@@ -188,8 +190,8 @@ fn test_fabushi_visual_theme_tokens_and_readability() {
     assert_eq!(light.text_primary, 0x1D1D1F);
     assert_eq!(light.text_secondary, 0x86868B);
     assert_eq!(light.service_pill_fg, 0x8E8E93);
-    assert!((light.sidebar_bg_rgba().a - 0.72).abs() < 0.01);
-    assert!((light.separator_rgba().a - 0.08).abs() < 0.01);
+    assert!((light.sidebar_bg_rgba().a - 1.0).abs() < 0.001);
+    assert!((light.separator_rgba().a - 0.07).abs() < 0.01);
     assert_eq!(light.popover_shadows().len(), 2);
 
     // Custom accent in Apple Light tints outgoing gradient & active sidebar while preserving white text
@@ -305,4 +307,57 @@ fn test_apple_stage_top_bar_height_constants() {
 
     assert_eq!(APPLE_STAGE_TOP_BAR_HEIGHT, 76.0);
     assert_eq!(APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT, 52.0);
+}
+
+#[test]
+fn test_apple_compose_mode_and_inspector_muse_sections() {
+    use gpui_telegram_desktop::views::chat_sidebar::{DialogDeliveryStatus, DialogItemModel};
+
+    let mut sb = ChatSidebar::new();
+    sb.dialogs.push(DialogItemModel {
+        id: 101,
+        peer_name: "Alice".to_string(),
+        avatar_initials: "AL".to_string(),
+        avatar_color: 0x0A84FF,
+        last_message: "Hey".to_string(),
+        timestamp: "10:00".to_string(),
+        unread_count: 0,
+        is_muted: false,
+        is_pinned: false,
+        is_online: true,
+        typing_indicator: None,
+        delivery_status: DialogDeliveryStatus::Read,
+        folder: "All".to_string(),
+    });
+    assert!(!sb.is_plus_menu_open);
+    assert!(sb.compose_recipient_query.is_empty());
+
+    sb.toggle_plus_menu();
+    assert!(sb.is_plus_menu_open);
+    sb.compose_recipient_query = "Ali".to_string();
+
+    sb.select_dialog_from_user(101);
+    assert_eq!(sb.active_chat_id, Some(101));
+    assert!(!sb.is_plus_menu_open);
+    assert!(sb.compose_recipient_query.is_empty());
+
+    sb.toggle_plus_menu();
+    sb.compose_recipient_query = "Bob".to_string();
+    sb.exit_compose_mode();
+    assert!(!sb.is_plus_menu_open);
+    assert!(sb.compose_recipient_query.is_empty());
+
+    let mut inspector = ContextInspector::new();
+    assert!(!inspector.avatar_editor_open);
+    assert!(!inspector.is_section_collapsed("overview"));
+    inspector.toggle_section("overview");
+    assert!(inspector.is_section_collapsed("overview"));
+    inspector.toggle_section("overview");
+    assert!(!inspector.is_section_collapsed("overview"));
+
+    inspector.toggle_section("actions");
+    inspector.avatar_editor_open = true;
+    inspector.clear_peer();
+    assert!(!inspector.avatar_editor_open);
+    assert!(!inspector.is_section_collapsed("actions"));
 }

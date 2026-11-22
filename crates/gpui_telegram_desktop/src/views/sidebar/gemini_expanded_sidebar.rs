@@ -426,7 +426,7 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
     let on_plus = on_action.clone();
     let on_more = on_action.clone();
 
-    let primary_items: [(&'static str, NavDestination, IconName, &'static str, &'static str, u32); 4] = [
+    let primary_items: [(&'static str, NavDestination, IconName, &'static str, &'static str, u32); 3] = [
         (
             "sidebar-nav-chats",
             NavDestination::Chats,
@@ -434,14 +434,6 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
             "全部会话",
             "All Chats",
             nav.chats_unread,
-        ),
-        (
-            "sidebar-nav-calls",
-            NavDestination::Calls,
-            IconName::PhoneCall,
-            "通话",
-            "Calls",
-            nav.calls_unread,
         ),
         (
             "sidebar-nav-tasks",
@@ -738,11 +730,6 @@ pub fn render_expanded_gemini_footer<V: 'static>(
     } else {
         NavDestination::RemoteComputer
     };
-    let calls_target = if nav.active_destination == NavDestination::Calls {
-        NavDestination::Chats
-    } else {
-        NavDestination::Calls
-    };
     let settings_target = if nav.active_destination == NavDestination::Settings {
         NavDestination::Chats
     } else {
@@ -854,13 +841,6 @@ pub fn render_expanded_gemini_footer<V: 'static>(
                     false,
                     0,
                     UnifiedSidebarAction::OpenContacts,
-                ))
-                .child(render_dock_icon_btn(
-                    "top-action-calls",
-                    IconName::PhoneCall,
-                    nav.active_destination == NavDestination::Calls,
-                    nav.calls_unread,
-                    UnifiedSidebarAction::SelectDestination(calls_target),
                 ))
                 .child(render_dock_icon_btn(
                     "top-action-settings",

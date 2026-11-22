@@ -637,6 +637,31 @@ impl Render for CanonicalComposer {
             SelectorTabKind::Gifs => 2,
         };
 
+        let is_apple = self.palette.is_apple_style();
+        let wrap_center = |child: AnyElement, align_end: bool| -> AnyElement {
+            if is_apple {
+                div()
+                    .w_full()
+                    .px(px(20.0))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(740.0))
+                            .when(align_end, |el| el.flex().justify_end())
+                            .child(child),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .px(px(16.0))
+                    .when(align_end, |el| el.flex().justify_end())
+                    .child(child)
+                    .into_any_element()
+            }
+        };
+
         div()
             .id("canonical-composer-root")
             .track_focus(&focus)
@@ -669,22 +694,23 @@ impl Render for CanonicalComposer {
             .bg(rgb(self.palette.composer_bg))
             .flex()
             .flex_col()
-            .when_some(ac_popup, |el, pop| el.child(div().px(px(16.0)).child(pop)))
+            .when_some(ac_popup, |el, pop| el.child(wrap_center(pop, false)))
             .when(self.attachments_drawer.is_open, |el| {
-                el.child(
-                    div().px(px(16.0)).child(render_attachments_drawer_with_apps(
+                el.child(wrap_center(
+                    render_attachments_drawer_with_apps(
                         &self.attach_mini_apps,
                         self.current_peer_type_mask,
                         &self.palette,
                         &self.lang_id,
                         cx,
                         |this, act, cx| this.handle_popup_action(act, cx),
-                    )),
-                )
+                    ),
+                    false,
+                ))
             })
             .when(self.is_emoji_picker_open, |el| {
-                el.child(
-                    div().px(px(16.0)).flex().justify_end().child(render_tabbed_selector_popup(
+                el.child(wrap_center(
+                    render_tabbed_selector_popup(
                         tab_idx,
                         &self.tabbed_selector.search_query,
                         self.editor.selector_search_focused,
@@ -695,33 +721,35 @@ impl Render for CanonicalComposer {
                         &self.lang_id,
                         cx,
                         |this, act, cx| this.handle_selector_action(act, cx),
-                    )),
-                )
+                    ),
+                    true,
+                ))
             })
             .when(self.editor.send_options_open, |el| {
-                el.child(
-                    div().px(px(16.0)).flex().justify_end().child(render_send_options_popup(
+                el.child(wrap_center(
+                    render_send_options_popup(
                         &self.palette,
                         &self.lang_id,
                         cx,
                         |this, act, cx| this.handle_popup_action(act, cx),
-                    )),
-                )
+                    ),
+                    true,
+                ))
             })
             .when(self.is_formatting_open, |el| {
-                el.child(
-                    div().px(px(16.0)).child(render_formatting_toolbar(
+                el.child(wrap_center(
+                    render_formatting_toolbar(
                         &self.formatting_bar,
                         &self.palette,
                         cx,
                         |this, act, cx| this.handle_popup_action(act, cx),
-                    )),
-                )
+                    ),
+                    false,
+                ))
             })
             .when_some(banner, |el, b| el.child(b))
-            .when_some(context_ref_strip, |el, strip| el.child(strip))
+            .when_some(context_ref_strip, |el, strip| el.child(wrap_center(strip, false)))
             .when_some(self.active_send_as_label().map(str::to_string), |el, label| {
-                let is_apple = self.palette.is_apple_style();
                 let bg = self.palette.input_bg;
                 let border: Rgba = if is_apple {
                     self.palette.separator_rgba()
@@ -729,9 +757,8 @@ impl Render for CanonicalComposer {
                     rgb(self.palette.border_fg).into()
                 };
                 let fg = self.palette.text_secondary;
-                el.child(
+                el.child(wrap_center(
                     div()
-                        .px(px(16.0))
                         .pt(px(4.0))
                         .flex()
                         .items_center()
@@ -751,8 +778,10 @@ impl Render for CanonicalComposer {
                                     this.handle_bar_action(ComposerBarAction::CycleSendAs, cx);
                                 }))
                                 .child(format!("Send as: {label}")),
-                        ),
-                )
+                        )
+                        .into_any_element(),
+                    false,
+                ))
             })
             .child(if is_recording {
                 render_voice_recording_strip(&self.voice_gesture, &self.palette, &self.lang_id, cx, |this, act, cx| {

@@ -328,6 +328,8 @@ impl AppShell {
     fn observe_sidebar_entity(&self, cx: &mut Context<Self>) {
         let mut prev_overlay_open = false;
         let mut prev_search_focused = false;
+        let mut prev_compose_open = false;
+        let mut prev_compose_query = String::new();
         cx.observe(&self.sidebar, move |shell, sb, cx| {
             let (
                 selected_dialog, selection_rev, story_peer, search_focused, has_creation_modal,
@@ -393,16 +395,22 @@ impl AppShell {
                 shell.sidebar.update(cx, |s, s_cx| {
                     s.is_account_popover_open = !s.is_account_popover_open;
                     s.is_plus_menu_open = false;
+                    s.compose_recipient_query.clear();
                     s_cx.notify();
                 });
                 shell_dirty = true;
             }
-            let (sb_popup, cur_overlay_open) = {
+            let (sb_popup, cur_overlay_open, cur_compose_open, cur_compose_query) = {
                 let s = shell.sidebar.read(cx);
                 let overlay_open = s.is_contacts_modal_open
                     || s.active_creation_modal.is_some()
                     || s.is_account_popover_open;
-                (s.is_plus_menu_open || overlay_open, overlay_open)
+                (
+                    s.is_plus_menu_open || overlay_open,
+                    overlay_open,
+                    s.is_plus_menu_open,
+                    s.compose_recipient_query.clone(),
+                )
             };
             if sb_popup && shell.stage.read(cx).more_menu_open {
                 shell.stage.update(cx, |st, st_cx| {
@@ -454,11 +462,24 @@ impl AppShell {
                     shell_dirty = true;
                 }
             }
-            if cur_overlay_open || prev_overlay_open || search_focused != prev_search_focused {
+            if !prev_compose_open
+                && cur_compose_open
+                && shell.theme_state.palette.is_apple_style()
+            {
+                shell.composer.update(cx, |c, _| c.is_input_focused = false);
+            }
+            if cur_overlay_open
+                || prev_overlay_open
+                || search_focused != prev_search_focused
+                || cur_compose_open != prev_compose_open
+                || cur_compose_query != prev_compose_query
+            {
                 shell_dirty = true;
             }
             prev_overlay_open = cur_overlay_open;
             prev_search_focused = search_focused;
+            prev_compose_open = cur_compose_open;
+            prev_compose_query = cur_compose_query;
             if shell_dirty {
                 cx.notify();
             }

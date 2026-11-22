@@ -191,8 +191,6 @@ impl InspectorTabsView {
         lang: &str,
         cx: &mut Context<ContextInspector>,
     ) -> AnyElement {
-        let peer_name = model.name.clone();
-        let peer_for_vid = model.name.clone();
         let avatar_color = if model.avatar_color != 0 { model.avatar_color } else { pal.accent };
 
         let fallback_initials = {
@@ -238,12 +236,6 @@ impl InspectorTabsView {
                     .child(if model.name.is_empty() { tr_str(lang, "未选择对话", "No chat selected").to_string() } else { model.name.clone() }))
                 .child(div().text_size(px(12.0)).text_color(rgb(pal.text_secondary)).child(model.status.clone())))
             .child(div().flex().items_center().justify_around().gap(px(6.0))
-                .child(Self::action_pill(IconName::PhoneCall, tr_str(lang, "语音", "Call"), pal, move |this| {
-                    this.pending_action = Some(InspectorAction::StartVoiceCall(peer_name.clone()));
-                }, cx))
-                .child(Self::action_pill(IconName::VideoCall, tr_str(lang, "视频", "Video"), pal, move |this| {
-                    this.pending_action = Some(InspectorAction::StartVideoCall(peer_for_vid.clone()));
-                }, cx))
                 .child(Self::action_pill(IconName::Mute, tr_str(lang, "静音", "Mute"), pal, move |this| {
                     this.profile.is_notifications_enabled = !this.profile.is_notifications_enabled;
                     this.pending_action = Some(InspectorAction::ToggleNotifications(this.profile.is_notifications_enabled));

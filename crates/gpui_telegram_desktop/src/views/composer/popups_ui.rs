@@ -147,11 +147,11 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
     on_action: impl Fn(&mut V, ComposerPopupAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let entries = [
-        (AttachmentKind::PhotoOrVideo, IconName::Camera, tr_key_or(lang_id, "lng_attach_photo_video", "Photo or Video")),
-        (AttachmentKind::DocumentOrFile, IconName::FileDoc, tr_key_or(lang_id, "lng_attach_file", "File")),
-        (AttachmentKind::CreatePoll, IconName::Poll, tr_key_or(lang_id, "lng_polls_create", "Poll")),
-        (AttachmentKind::SendLocation, IconName::LocationPin, tr_key_or(lang_id, "lng_attach_location", "Location")),
-        (AttachmentKind::ShareContact, IconName::ContactsUsers, tr_key_or(lang_id, "lng_attach_contact", "Contact")),
+        (AttachmentKind::PhotoOrVideo, IconName::Camera, 0x0A84FFu32, tr_key_or(lang_id, "lng_attach_photo_video", "Photo or Video")),
+        (AttachmentKind::DocumentOrFile, IconName::FileDoc, 0x5E5CE6u32, tr_key_or(lang_id, "lng_attach_file", "File")),
+        (AttachmentKind::CreatePoll, IconName::Poll, 0xFF9F0Au32, tr_key_or(lang_id, "lng_polls_create", "Poll")),
+        (AttachmentKind::SendLocation, IconName::LocationPin, 0x30D158u32, tr_key_or(lang_id, "lng_attach_location", "Location")),
+        (AttachmentKind::ShareContact, IconName::ContactsUsers, 0x64D2FFu32, tr_key_or(lang_id, "lng_attach_contact", "Contact")),
     ];
     let hbg = palette.menu_hover_bg;
     let filtered_apps: Vec<ComposerAttachMiniApp> = attach_apps
@@ -172,10 +172,10 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
     };
     let mut box_el = div()
         .id("composer-attachments-popup")
-        .w(px(236.0))
+        .w(px(if is_apple { 248.0 } else { 236.0 }))
         .mb(px(8.0))
         .p(px(6.0))
-        .rounded(px(if is_apple { 14.0 } else { 10.0 }))
+        .rounded(px(if is_apple { 16.0 } else { 10.0 }))
         .bg(if is_apple {
             TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.96)
         } else {
@@ -192,14 +192,13 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
         box_el.shadow_lg()
     };
 
-    for (idx, (kind, icon, label)) in entries.into_iter().enumerate() {
+    for (idx, (kind, icon, badge_col, label)) in entries.into_iter().enumerate() {
         let act = on_action.clone();
         box_el = box_el.child(
             div()
                 .id(SharedString::from(format!("att-opt-{}", idx)))
-                .px(px(10.0))
-                .py(px(7.0))
-                .rounded(px(if is_apple { 8.0 } else { 7.0 }))
+                .when(is_apple, |el| el.h(px(38.0)).px(px(8.0)).rounded(px(10.0)))
+                .when(!is_apple, |el| el.px(px(10.0)).py(px(7.0)).rounded(px(7.0)))
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(hbg)))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -208,8 +207,27 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
                 .flex()
                 .items_center()
                 .gap(px(10.0))
-                .child(tg_icon(icon, 16.0, palette.accent))
-                .child(div().text_size(px(13.0)).text_color(rgb(palette.text_primary)).child(label.to_string())),
+                .child(if is_apple {
+                    div()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded_full()
+                        .bg(TdesktopThemePalette::rgba_with_alpha(badge_col, 0.16))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(tg_icon(icon, 14.5, badge_col))
+                        .into_any_element()
+                } else {
+                    tg_icon(icon, 16.0, palette.accent).into_any_element()
+                })
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .when(is_apple, |el| el.font_weight(FontWeight::MEDIUM))
+                        .text_color(rgb(palette.text_primary))
+                        .child(label.to_string()),
+                ),
         );
     }
 

@@ -20,9 +20,9 @@ pub fn settings_card(pal: TdesktopThemePalette) -> Div {
     div()
         .w_full()
         .rounded(px(pal.scaled_px(12.0)))
-        .bg(rgb(pal.card_bg))
+        .bg(pal.card_surface_rgba())
         .border_1()
-        .border_color(rgb(pal.border_fg))
+        .border_color(pal.separator_rgba())
         .p(px(pal.scaled_px(14.0)))
         .flex()
         .flex_col()
@@ -138,21 +138,33 @@ pub fn settings_toggle_row<V: 'static>(
         )
         .child(
             div()
-                .w(px(pal.scaled_px(36.0)))
+                .w(px(pal.scaled_px(34.0)))
                 .h(px(pal.scaled_px(20.0)))
                 .rounded_full()
-                .bg(rgb(if active { pal.accent } else { pal.muted_badge_bg }))
-                .p(px(pal.scaled_px(2.0)))
+                .bg(rgb(if active { pal.success } else { pal.input_bg }))
+                .border_1()
+                .border_color(if active {
+                    rgb(pal.success).into()
+                } else {
+                    pal.separator_rgba()
+                })
+                .px(px(pal.scaled_px(2.0)))
                 .flex()
                 .items_center()
                 .when(active, |el| el.justify_end())
                 .when(!active, |el| el.justify_start())
                 .child(
                     div()
-                        .w(px(pal.scaled_px(16.0)))
-                        .h(px(pal.scaled_px(16.0)))
+                        .w(px(pal.scaled_px(14.0)))
+                        .h(px(pal.scaled_px(14.0)))
                         .rounded_full()
-                        .bg(rgb(pal.active_button_fg)),
+                        .bg(rgb(0xFFFFFF))
+                        .shadow(vec![BoxShadow {
+                            color: hsla(0.0, 0.0, 0.0, 0.22),
+                            offset: point(px(0.0), px(1.0)),
+                            blur_radius: px(2.0),
+                            spread_radius: px(0.0),
+                        }]),
                 ),
         )
         .into_any_element()

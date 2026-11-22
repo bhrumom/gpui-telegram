@@ -365,6 +365,7 @@ impl ChatSidebar {
 
     fn reset_creation_inputs(&mut self, modal: SidebarCreationModal) {
         self.is_plus_menu_open = false;
+        self.compose_recipient_query.clear();
         self.is_account_popover_open = false;
         self.search_focused = false;
         self.active_creation_modal = Some(modal);
@@ -391,6 +392,7 @@ impl ChatSidebar {
     pub fn close_creation_modal(&mut self) {
         self.active_creation_modal = None;
         self.is_plus_menu_open = false;
+        self.compose_recipient_query.clear();
         self.creation_primary_input.clear();
         self.creation_secondary_input.clear();
         self.creation_tertiary_input.clear();

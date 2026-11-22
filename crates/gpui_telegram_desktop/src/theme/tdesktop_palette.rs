@@ -160,25 +160,18 @@ impl TdesktopThemePalette {
         self.mode.is_fabushi_style()
     }
 
-    /// Translucent sidebar material fill allowing macOS `NSVisualEffectView` desktop vibrancy
-    /// to shine through in Apple style while staying opaque in `Classic`.
+    /// Unified solid sidebar fill so sidebar, chat canvas, and right inspector drawer share one
+    /// consistent surface luminance separated by crisp macOS hairlines.
     pub fn sidebar_bg_rgba(&self) -> Rgba {
-        let alpha = if !self.is_apple_style() {
-            1.0
-        } else if self.mode.is_dark() {
-            0.74
-        } else {
-            0.72
-        };
-        Self::rgba_with_alpha(self.dialogs_bg, alpha)
+        Self::rgba_with_alpha(self.dialogs_bg, 1.0)
     }
 
-    /// Hairline translucent separator matching macOS HIG (`rgba(0,0,0,0.08)` light / `rgba(255,255,255,0.09)` dark).
+    /// Hairline translucent separator matching macOS HIG (`rgba(0,0,0,0.07)` light / `rgba(255,255,255,0.08)` dark).
     pub fn separator_rgba(&self) -> Rgba {
         if self.mode.is_dark() {
-            Self::rgba_with_alpha(0xFFFFFF, 0.09)
+            Self::rgba_with_alpha(0xFFFFFF, 0.08)
         } else {
-            Self::rgba_with_alpha(0x000000, 0.08)
+            Self::rgba_with_alpha(0x000000, 0.07)
         }
     }
 

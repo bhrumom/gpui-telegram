@@ -162,7 +162,6 @@ impl Render for SettingsMainSections {
             (IconName::FolderAll, tr_str(lang, "聊天分组", "Folders"), SettingsSectionType::Folders, ""),
             (IconName::SettingsGear, tr_str(lang, "高级设置", "Advanced"), SettingsSectionType::Advanced, ""),
             (IconName::ComputerDesktop, tr_str(lang, "电脑", "Computers"), SettingsSectionType::Computers, ""),
-            (IconName::PhoneCall, tr_str(lang, "音视频通话", "Speakers and Camera"), SettingsSectionType::Calls, ""),
             (IconName::ComputerDesktop, tr_str(lang, "键盘快捷键", "Keyboard Shortcuts"), SettingsSectionType::Shortcuts, ""),
             (IconName::BotRobot, tr_str(lang, "商业功能", "Business"), SettingsSectionType::Business, ""),
             (IconName::PremiumStar, tr_str(lang, "高级会员", "Premium"), SettingsSectionType::Premium, ""),

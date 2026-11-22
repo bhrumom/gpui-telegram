@@ -1,11 +1,19 @@
 //! ContextInspectorDrawer 320px Right Drawer (`SPEC-02-GPUI-COMPONENT-HIERARCHY` § 2.5).
 
+use std::collections::HashSet;
+
+use crate::components::grok_bot_avatar::{
+    render_grok_bot_avatar, render_grok_persona_avatar, trigger_grok_avatar_spin,
+    GrokBotAvatarProps, GrokPersonaState,
+};
 use crate::components::ui::{TextInputController, delete_prev_word, pop_last_char};
 use crate::i18n::tr_str;
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::TdesktopThemePalette;
 use crate::views::drawer::bot_computer_inspector::{
+    render_bot_agent_and_computer_tab, render_bot_avatar_editor_popover,
     render_bot_computers_subpage, render_bot_config_editor, render_bot_profile_main,
+    render_bot_settings_tab,
 };
 use crate::views::drawer::inspector_panels::{
     render_contact_profile_panel, render_members_panel, render_settings_and_stats_panel,
@@ -15,6 +23,7 @@ use crate::views::drawer::inspector_tabs::*;
 use crate::views::drawer::statistics::info_statistics_inner_widget::ChartDataPoint;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::miniapp_contracts::CLASSIC_INITIALS_AVATAR_SHAPE;
 use gpui_telegram_proto::{BotComputerProfileDto, ComputerNodeDto, ComputerRunPolicy};
 
 pub const DRAWER_WIDTH: f32 = 320.0;
@@ -63,6 +72,8 @@ pub struct ContextInspector {
     pub coding_draft_model_override: String,
     pub coding_workspace_input: Option<Entity<TextInputController>>,
     pub coding_model_input: Option<Entity<TextInputController>>,
+    pub collapsed_sections: HashSet<&'static str>,
+    pub avatar_editor_open: bool,
 }
 
 impl ContextInspector {
@@ -106,6 +117,8 @@ impl ContextInspector {
             coding_draft_model_override: String::new(),
             coding_workspace_input: None,
             coding_model_input: None,
+            collapsed_sections: HashSet::new(),
+            avatar_editor_open: false,
         }
     }
 
@@ -201,6 +214,18 @@ impl ContextInspector {
         self.coding_draft_permission_mode = gpui_telegram_proto::CodingPermissionMode::Ask;
         self.coding_draft_allow_group_members = false;
         self.coding_draft_model_override.clear();
+        self.collapsed_sections.clear();
+        self.avatar_editor_open = false;
+    }
+
+    pub fn is_section_collapsed(&self, key: &'static str) -> bool {
+        self.collapsed_sections.contains(key)
+    }
+
+    pub fn toggle_section(&mut self, key: &'static str) {
+        if !self.collapsed_sections.remove(key) {
+            self.collapsed_sections.insert(key);
+        }
     }
 
     pub fn clear_peer(&mut self) { self.is_open = false; self.active_tab = InspectorTab::Profile; self.clear_peer_facts(); }
@@ -419,7 +444,7 @@ impl ContextInspector {
 
     pub fn is_bot_input_active(&self) -> bool {
         self.is_open
-            && self.active_tab == InspectorTab::Profile
+            && matches!(self.active_tab, InspectorTab::Profile | InspectorTab::Members)
             && self.profile.is_bot
             && ((self.subpage == InspectorSubpage::BotConfigEditor
                 && matches!(
@@ -588,31 +613,24 @@ impl Render for ContextInspector {
             return div().w(px(0.0)).h_full().overflow_hidden().into_any_element();
         }
         let pal = self.palette;
-        if !self.members.is_group_or_channel && self.active_tab == InspectorTab::Members {
+        if !self.profile.is_bot && !self.members.is_group_or_channel && self.active_tab == InspectorTab::Members {
             self.active_tab = InspectorTab::Profile;
         }
-        let has_bot_media = self.shared_media.media_count > 0
-            || !self.shared_media.files.is_empty()
-            || !self.shared_media.links.is_empty();
-        if self.profile.is_bot {
-            if matches!(self.active_tab, InspectorTab::Members | InspectorTab::Settings)
-                || (self.active_tab == InspectorTab::SharedMedia && !has_bot_media)
-            {
-                self.active_tab = InspectorTab::Profile;
-            }
-        }
         let active_tab = self.active_tab;
-        let is_bot_profile_tab = active_tab == InspectorTab::Profile && self.profile.is_bot;
         let allow_owner_subpages =
             self.profile.is_viewer_owner && self.active_fabushi_bot.is_some();
-        let subpage = if is_bot_profile_tab && allow_owner_subpages {
+        let subpage = if self.profile.is_bot
+            && allow_owner_subpages
+            && matches!(active_tab, InspectorTab::Profile | InspectorTab::Members)
+        {
             self.subpage
         } else {
             InspectorSubpage::Main
         };
-        if is_bot_profile_tab
+        if self.profile.is_bot
             && (subpage == InspectorSubpage::BotConfigEditor
                 || (subpage == InspectorSubpage::Main
+                    && active_tab == InspectorTab::Members
                     && self
                         .active_fabushi_bot
                         .as_ref()
@@ -639,6 +657,7 @@ impl Render for ContextInspector {
                     render_contact_profile_panel(
                         &self.profile,
                         &self.shared_media,
+                        &self.collapsed_sections,
                         self.is_secret_chat_active,
                         self.is_contact_blocked,
                         self.copied_feedback.as_ref(),
@@ -648,36 +667,79 @@ impl Render for ContextInspector {
                     )
                 }
             }
-            InspectorTab::Members => render_members_panel(&self.members, pal, lang, cx),
+            InspectorTab::Members => {
+                if self.profile.is_bot {
+                    match subpage {
+                        InspectorSubpage::Main => {
+                            render_bot_agent_and_computer_tab(self, pal, lang, cx)
+                        }
+                        InspectorSubpage::ComputersList => {
+                            render_bot_computers_subpage(self, pal, lang, cx)
+                        }
+                        InspectorSubpage::BotConfigEditor => {
+                            render_bot_config_editor(self, pal, lang, cx)
+                        }
+                    }
+                } else {
+                    render_members_panel(&self.members, pal, lang, cx)
+                }
+            }
             InspectorTab::SharedMedia => render_shared_media_panel(&self.shared_media, pal, lang, cx),
-            InspectorTab::Settings => render_settings_and_stats_panel(&self.settings, self.channel_boost_level, self.channel_boosts_current, self.channel_boosts_target, &self.channel_stats, pal, lang, cx),
-        };
-        let title = if self.profile.is_bot {
-            tr_str(lang, "机器人信息", "Bot Info")
-        } else {
-            match active_tab {
-                InspectorTab::Profile => tr_str(lang, "个人资料", "Profile"),
-                InspectorTab::Members => tr_str(lang, "成员列表", "Members"),
-                InspectorTab::SharedMedia => tr_str(lang, "共享内容", "Shared"),
-                InspectorTab::Settings => tr_str(lang, "更多设置", "Settings"),
+            InspectorTab::Settings => {
+                if self.profile.is_bot {
+                    render_bot_settings_tab(self, pal, lang, cx)
+                } else {
+                    render_settings_and_stats_panel(
+                        &self.settings,
+                        self.channel_boost_level,
+                        self.channel_boosts_current,
+                        self.channel_boosts_target,
+                        &self.channel_stats,
+                        pal,
+                        lang,
+                        cx,
+                    )
+                }
             }
         };
 
-        let header_left = if subpage != InspectorSubpage::Main {
+        let is_dark = pal.mode.is_dark();
+        let header_height = if subpage == InspectorSubpage::Main {
+            44.0
+        } else {
+            48.0
+        };
+        let drawer_bg = if pal.is_apple_style() {
+            pal.stage_bg
+        } else {
+            pal.dialogs_bg
+        };
+
+        let header = if subpage != InspectorSubpage::Main {
             let sub_label = match subpage {
                 InspectorSubpage::ComputersList => tr_str(lang, "电脑", "Computers"),
                 InspectorSubpage::BotConfigEditor => tr_str(lang, "AI Bot 配置", "Bot Config"),
                 InspectorSubpage::Main => "",
             };
             div()
+                .h(px(header_height))
+                .flex_shrink_0()
+                .px(px(14.0))
                 .flex()
                 .items_center()
-                .gap(px(4.0))
+                .gap(px(8.0))
                 .child(
                     div()
                         .id("inspector-breadcrumb-root")
                         .cursor_pointer()
-                        .text_size(px(14.5))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded_full()
+                        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .text_size(px(12.5))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(pal.text_secondary))
                         .hover(|s| s.text_color(rgb(pal.text_primary)))
@@ -691,32 +753,38 @@ impl Render for ContextInspector {
                                 cx.notify();
                             }),
                         )
-                        .child(tr_str(lang, "机器人信息", "Bot Info").to_string()),
+                        .child(tg_icon(IconName::BackArrow, 13.0, pal.text_secondary))
+                        .child(tr_str(lang, "返回", "Back")),
                 )
-                .child(tg_icon(IconName::ChevronRight, 13.0, pal.text_secondary))
                 .child(
                     div()
-                        .text_size(px(14.5))
+                        .text_size(px(14.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(pal.text_primary))
                         .child(sub_label.to_string()),
                 )
-                .into_any_element()
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .window_control_area(WindowControlArea::Drag),
+                )
+                .child(Self::close_icon_btn(pal, cx))
         } else {
             div()
-                .text_size(px(15.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(pal.text_primary))
-                .child(title.to_string())
-                .into_any_element()
-        };
-
-        let show_tabs = subpage == InspectorSubpage::Main && (!self.profile.is_bot || has_bot_media);
-        let header_height = if pal.is_apple_style() { 52.0 } else { HEADER_HEIGHT };
-        let drawer_bg = if pal.is_apple_style() {
-            pal.stage_bg
-        } else {
-            pal.dialogs_bg
+                .h(px(header_height))
+                .flex_shrink_0()
+                .px(px(14.0))
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .window_control_area(WindowControlArea::Drag),
+                )
+                .child(Self::close_icon_btn(pal, cx))
         };
 
         let mut root = div()
@@ -728,121 +796,274 @@ impl Render for ContextInspector {
             .border_color(pal.separator_rgba())
             .flex()
             .flex_col()
-            .child(
+            .child(header);
+
+        if subpage == InspectorSubpage::Main {
+            let model = &self.profile;
+            let is_owner_fabushi = model.is_viewer_owner && self.active_fabushi_bot.is_some();
+            let can_edit_hero = is_owner_fabushi || !model.is_bot;
+            let is_verified = model.is_verified
+                || model
+                    .username
+                    .trim()
+                    .trim_start_matches('@')
+                    .eq_ignore_ascii_case("BotFather");
+            let avatar_px = 84.0;
+            let avatar_color = if model.avatar_color != 0 {
+                model.avatar_color
+            } else {
+                pal.accent
+            };
+            let fallback_initials = {
+                let trimmed = model.avatar_initials.trim();
+                if !trimmed.is_empty() && trimmed != "?" {
+                    trimmed.to_string()
+                } else {
+                    let derived = crate::views::app_shell::shell_truth::derive_initials(&model.name);
+                    if derived.is_empty() {
+                        if model.is_bot { "BOT".to_string() } else { "?".to_string() }
+                    } else {
+                        derived
+                    }
+                }
+            };
+            let avatar_shadow = vec![BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, if is_dark { 0.34 } else { 0.12 }),
+                offset: point(px(0.0), px(4.0)),
+                blur_radius: px(14.0),
+                spread_radius: px(0.0),
+            }];
+            let core_avatar = if let Some(ref path) = model.avatar_path {
                 div()
-                    .h(px(header_height))
-                    .flex_shrink_0()
-                    .px(px(14.0))
+                    .w(px(avatar_px))
+                    .h(px(avatar_px))
+                    .rounded_full()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(pal.separator_rgba())
+                    .shadow(avatar_shadow)
+                    .child(
+                        img(path.clone())
+                            .w(px(avatar_px))
+                            .h(px(avatar_px))
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .into_any_element()
+            } else if is_owner_fabushi {
+                if let Some(ref fab) = self.active_fabushi_bot {
+                    let spin_id = fab.agent_id.clone();
+                    let state = GrokPersonaState::from_activity_str(&fab.execution_state, false);
+                    let avatar_el = if fab
+                        .avatar_shape
+                        .eq_ignore_ascii_case(CLASSIC_INITIALS_AVATAR_SHAPE)
+                    {
+                        render_grok_persona_avatar(
+                            &fab.agent_id,
+                            &fab.avatar_shape,
+                            &fab.avatar_color,
+                            &fallback_initials,
+                            avatar_px,
+                            state,
+                            drawer_bg,
+                            false,
+                        )
+                    } else {
+                        render_grok_bot_avatar(
+                            GrokBotAvatarProps::new(
+                                &fab.agent_id,
+                                &fab.avatar_shape,
+                                &fab.avatar_color,
+                                avatar_px,
+                            )
+                            .with_state(state)
+                            .with_follow_pointer(true)
+                            .with_surface_bg(drawer_bg),
+                        )
+                    };
+                    div()
+                        .id("bot-inspector-grok-avatar")
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_this, _, _, cx| {
+                                trigger_grok_avatar_spin(&spin_id);
+                                cx.notify();
+                            }),
+                        )
+                        .child(avatar_el)
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            } else {
+                div()
+                    .w(px(avatar_px))
+                    .h(px(avatar_px))
+                    .rounded_full()
+                    .bg(rgb(avatar_color))
+                    .border_1()
+                    .border_color(pal.separator_rgba())
+                    .shadow(avatar_shadow)
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .when(!pal.is_apple_style(), |el| {
-                        el.border_b_1().border_color(rgb(pal.border_fg))
-                    })
-                    .child(header_left)
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .window_control_area(WindowControlArea::Drag),
+                    .justify_center()
+                    .text_size(px(26.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xFFFFFF))
+                    .child(fallback_initials)
+                    .into_any_element()
+            };
+
+            let status_trimmed = model.status.trim();
+            let clean_handle = model.username.trim();
+            let (show_green_dot, status_label) = if model.is_bot {
+                (true, tr_str(lang, "已连接", "Connected").to_string())
+            } else if status_trimmed.eq_ignore_ascii_case("online") || status_trimmed == "在线" {
+                (true, tr_str(lang, "在线", "Online").to_string())
+            } else if !status_trimmed.is_empty() {
+                (false, status_trimmed.to_string())
+            } else {
+                (false, clean_handle.to_string())
+            };
+
+            let edit_badge = can_edit_hero.then(|| {
+                div()
+                    .id("inspector-hero-edit-btn")
+                    .cursor_pointer()
+                    .absolute()
+                    .bottom(px(0.0))
+                    .right(px(0.0))
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .rounded_full()
+                    .bg(rgb(pal.modal_bg))
+                    .border_1()
+                    .border_color(pal.separator_rgba())
+                    .shadow(segmented_pill_shadow(pal))
+                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if is_owner_fabushi {
+                                this.avatar_editor_open = !this.avatar_editor_open;
+                            } else {
+                                this.pending_action = Some(InspectorAction::OpenEditPeer);
+                            }
+                            cx.notify();
+                        }),
                     )
-                    .child(
+                    .child(tg_icon(
+                        IconName::Edit,
+                        12.0,
+                        if self.avatar_editor_open { pal.accent } else { pal.icon_fg },
+                    ))
+            });
+
+            let hero = div()
+                .flex_shrink_0()
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pb(px(6.0))
+                .child(
+                    div()
+                        .relative()
+                        .w(px(avatar_px))
+                        .h(px(avatar_px))
+                        .child(core_avatar)
+                        .when_some(edit_badge, |wrap, badge| wrap.child(badge)),
+                )
+                .child(
+                    div()
+                        .pt(px(10.0))
+                        .px(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .text_size(px(17.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(pal.text_primary))
+                                .text_center()
+                                .child(if model.name.is_empty() {
+                                    tr_str(lang, "未选择对话", "No chat selected").to_string()
+                                } else {
+                                    model.name.clone()
+                                }),
+                        )
+                        .when(is_verified, |row| {
+                            row.child(tg_icon(IconName::Verified, 15.0, pal.accent))
+                        }),
+                )
+                .when(!status_label.is_empty(), |col| {
+                    col.child(
                         div()
+                            .pt(px(2.0))
                             .flex()
                             .items_center()
-                            .gap(px(4.0))
-                            .when(!self.profile.is_bot || allow_owner_subpages, |row| {
+                            .justify_center()
+                            .gap(px(5.0))
+                            .when(show_green_dot, |row| {
                                 row.child(
                                     div()
-                                        .id("inspector-header-more")
-                                        .cursor_pointer()
-                                        .w(px(28.0))
-                                        .h(px(28.0))
+                                        .w(px(8.0))
+                                        .h(px(8.0))
                                         .rounded_full()
-                                        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                if this.profile.is_bot
-                                                    && this.profile.is_viewer_owner
-                                                    && this.active_fabushi_bot.is_some()
-                                                {
-                                                    if this.subpage == InspectorSubpage::Main {
-                                                        this.subpage =
-                                                            InspectorSubpage::ComputersList;
-                                                        this.pending_action = Some(
-                                                            InspectorAction::OpenBotComputersSubpage,
-                                                        );
-                                                    } else {
-                                                        this.subpage = InspectorSubpage::Main;
-                                                        this.bot_config_focus =
-                                                            BotConfigFocusField::None;
-                                                    }
-                                                    cx.notify();
-                                                }
-                                            }),
-                                        )
-                                        .child(tg_icon(IconName::MoreVertical, 15.0, pal.icon_fg)),
+                                        .bg(rgb(pal.online_dot_fg)),
                                 )
                             })
                             .child(
                                 div()
-                                    .id("inspector-header-close")
-                                    .cursor_pointer()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .rounded_full()
-                                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _e, _w, cx| {
-                                            this.bot_config_focus = BotConfigFocusField::None;
-                                            this.close();
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tg_icon(IconName::Close, 14.0, pal.icon_fg)),
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child(status_label),
                             ),
-                    ),
-            );
+                    )
+                })
+                .when(self.avatar_editor_open && is_owner_fabushi, |col| {
+                    col.child(render_bot_avatar_editor_popover(self, pal, lang, cx))
+                });
 
-        if show_tabs {
+            let track_bg = TdesktopThemePalette::rgba_with_alpha(
+                if is_dark { 0xFFFFFF } else { 0x000000 },
+                if is_dark { 0.06 } else { 0.045 },
+            );
             let mut seg_track = div()
                 .w_full()
-                .h(px(30.0))
-                .p(px(2.5))
-                .rounded(px(9.0))
-                .bg(rgb(pal.input_bg))
-                .border_1()
-                .border_color(pal.separator_rgba())
+                .h(px(34.0))
+                .p(px(3.0))
+                .rounded_full()
+                .bg(track_bg)
                 .flex()
                 .items_center()
-                .gap(px(2.0))
-                .child(Self::tab_btn(
-                    tr_str(lang, "资料", "Profile"),
+                .gap(px(2.0));
+
+            if self.profile.is_bot {
+                seg_track = seg_track
+                    .child(Self::icon_tab_btn("inspector-tab-profile", IconName::FolderAll, InspectorTab::Profile, active_tab, pal, cx))
+                    .child(Self::icon_tab_btn("inspector-tab-agent", IconName::BotRobot, InspectorTab::Members, active_tab, pal, cx))
+                    .child(Self::icon_tab_btn("inspector-tab-media", IconName::Camera, InspectorTab::SharedMedia, active_tab, pal, cx))
+                    .child(Self::icon_tab_btn("inspector-tab-settings", IconName::SettingsGear, InspectorTab::Settings, active_tab, pal, cx));
+            } else {
+                seg_track = seg_track.child(Self::icon_tab_btn(
+                    "inspector-tab-profile",
+                    IconName::ContactsUsers,
                     InspectorTab::Profile,
                     active_tab,
                     pal,
                     cx,
                 ));
-            if self.profile.is_bot {
-                seg_track = seg_track.child(Self::tab_btn(
-                    tr_str(lang, "媒体", "Media"),
-                    InspectorTab::SharedMedia,
-                    active_tab,
-                    pal,
-                    cx,
-                ));
-            } else {
                 if self.members.is_group_or_channel {
-                    seg_track = seg_track.child(Self::tab_btn(
-                        tr_str(lang, "成员", "Members"),
+                    seg_track = seg_track.child(Self::icon_tab_btn(
+                        "inspector-tab-members",
+                        IconName::GroupUsers,
                         InspectorTab::Members,
                         active_tab,
                         pal,
@@ -850,28 +1071,34 @@ impl Render for ContextInspector {
                     ));
                 }
                 seg_track = seg_track
-                    .child(Self::tab_btn(
-                        tr_str(lang, "媒体", "Media"),
+                    .child(Self::icon_tab_btn(
+                        "inspector-tab-media",
+                        IconName::Camera,
                         InspectorTab::SharedMedia,
                         active_tab,
                         pal,
                         cx,
                     ))
-                    .child(Self::tab_btn(
-                        tr_str(lang, "设置", "Settings"),
+                    .child(Self::icon_tab_btn(
+                        "inspector-tab-settings",
+                        IconName::SettingsGear,
                         InspectorTab::Settings,
                         active_tab,
                         pal,
                         cx,
                     ));
             }
-            root = root.child(
-                div()
-                    .flex_shrink_0()
-                    .px(px(14.0))
-                    .pb(px(10.0))
-                    .child(seg_track),
-            );
+
+            root = root
+                .child(hero)
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(14.0))
+                        .pt(px(8.0))
+                        .pb(px(10.0))
+                        .child(seg_track),
+                );
         }
 
         root.child(
@@ -879,8 +1106,8 @@ impl Render for ContextInspector {
                 .id("inspector-tab-scroll")
                 .flex_1()
                 .min_h(px(0.0))
-                .px(px(14.0))
-                .pb(px(16.0))
+                .px(px(12.0))
+                .pb(px(18.0))
                 .pt(px(4.0))
                 .overflow_y_scroll()
                 .child(body),
@@ -890,8 +1117,34 @@ impl Render for ContextInspector {
 }
 
 impl ContextInspector {
-    fn tab_btn(
-        label: &str,
+    fn close_icon_btn(pal: TdesktopThemePalette, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("inspector-header-close")
+            .occlude()
+            .cursor_pointer()
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded_full()
+            .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, _w, cx| {
+                    cx.stop_propagation();
+                    this.bot_config_focus = BotConfigFocusField::None;
+                    this.avatar_editor_open = false;
+                    this.close();
+                    cx.notify();
+                }),
+            )
+            .child(tg_icon(IconName::Close, 14.0, pal.icon_fg))
+    }
+
+    fn icon_tab_btn(
+        id: &'static str,
+        icon: IconName,
         tab: InspectorTab,
         active: InspectorTab,
         pal: TdesktopThemePalette,
@@ -899,11 +1152,11 @@ impl ContextInspector {
     ) -> impl IntoElement {
         let sel = tab == active;
         div()
+            .id(id)
             .cursor_pointer()
             .flex_1()
             .h_full()
-            .px(px(6.0))
-            .rounded(px(7.0))
+            .rounded_full()
             .when(sel, |el| {
                 el.bg(segmented_active_bg(pal))
                     .shadow(segmented_pill_shadow(pal))
@@ -919,17 +1172,6 @@ impl ContextInspector {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(11.5))
-            .font_weight(if sel {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::MEDIUM
-            })
-            .text_color(rgb(if sel {
-                pal.text_primary
-            } else {
-                pal.text_secondary
-            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _e, _w, cx| {
@@ -937,6 +1179,14 @@ impl ContextInspector {
                     cx.notify();
                 }),
             )
-            .child(label.to_string())
+            .child(tg_icon(
+                icon,
+                15.0,
+                if sel {
+                    pal.text_primary
+                } else {
+                    pal.text_secondary
+                },
+            ))
     }
 }

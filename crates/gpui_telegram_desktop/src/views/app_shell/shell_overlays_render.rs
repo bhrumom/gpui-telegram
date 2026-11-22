@@ -1713,7 +1713,6 @@ impl AppShell {
                     .child(menu_row("account-popover-profile", IconName::ContactsUsers, tr_str(lang, "个人资料", "Profile"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::MyProfile, cx)))
                     .child(menu_row("account-popover-saved", IconName::SavedMessages, tr_str(lang, "收藏夹", "Saved"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::SavedMessages, cx)))
                     .child(menu_row("account-popover-connectors", IconName::TerminalMcp, tr_str(lang, "连接器", "Connectors"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::McpTools, cx)))
-                    .child(menu_row("account-popover-voice", IconName::Mic, tr_str(lang, "语音对话", "Voice Chat"), pal.text_primary, false, |this, cx| this.activate_nav_destination(NavDestination::TalkMode, cx)))
                     .child(menu_row("account-popover-fabushi", IconName::BotRobot, tr_str(lang, "新建智能体 · Fabushi Bot", "New Fabushi Bot"), pal.accent, false, |this, cx| this.open_fabushi_creator_modal(cx)))
                     .child(menu_row("account-popover-botfather", IconName::BotRobot, tr_str(lang, "BotFather · 创建机器人/小程序", "BotFather · Create Bot/App"), pal.accent, false, |this, cx| this.open_botfather_chat(cx)))
                     .child(menu_row("account-popover-miniapps", IconName::FolderBots, tr_str(lang, "小程序中心", "Mini Apps Center"), pal.text_primary, false, |this, cx| this.open_miniapps_center(cx)))
@@ -2168,6 +2167,672 @@ impl AppShell {
                                 );
                             }))
                             .child(tr_str(lang, "复制恢复密钥", "Copy Kit")),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AppleComposeRecipient {
+    pub user_id: u64,
+    pub chat_id: Option<u64>,
+    pub initials: String,
+    pub name: String,
+    pub subtitle: String,
+    pub avatar_color: u32,
+}
+
+impl AppShell {
+    pub(crate) fn collect_apple_compose_recipients(&self, cx: &App) -> Vec<AppleComposeRecipient> {
+        let sb_ref = self.sidebar.read(cx);
+        let q_lower = sb_ref.compose_recipient_query.trim().to_lowercase();
+        let mut rows: Vec<AppleComposeRecipient> = Vec::new();
+
+        for c in &self.session_sync.contacts_list {
+            let full = format!("{} {}", c.first_name, c.last_name.as_deref().unwrap_or(""))
+                .trim()
+                .to_string();
+            let name = if full.is_empty() {
+                c.username
+                    .clone()
+                    .unwrap_or_else(|| format!("User {}", c.user_id))
+            } else {
+                full
+            };
+            let sub = c
+                .username
+                .as_deref()
+                .map(|u| format!("@{u}"))
+                .or_else(|| c.phone.clone())
+                .unwrap_or_default();
+            if q_lower.is_empty()
+                || name.to_lowercase().contains(&q_lower)
+                || sub.to_lowercase().contains(&q_lower)
+            {
+                let resolved_chat = c.chat_id.map(|id| id as u64).or_else(|| {
+                    sb_ref
+                        .dialogs
+                        .iter()
+                        .find(|d| d.id == c.user_id || d.peer_name == name)
+                        .map(|d| d.id)
+                });
+                rows.push(AppleComposeRecipient {
+                    user_id: c.user_id,
+                    chat_id: resolved_chat,
+                    initials: derive_initials(&name),
+                    name,
+                    subtitle: sub,
+                    avatar_color: peer_avatar_color(c.user_id),
+                });
+            }
+        }
+        for d in &sb_ref.dialogs {
+            if !d.peer_name.contains("Telegram Official Bot")
+                && !rows
+                    .iter()
+                    .any(|r| r.chat_id == Some(d.id) || r.name == d.peer_name)
+                && (q_lower.is_empty()
+                    || d.peer_name.to_lowercase().contains(&q_lower)
+                    || d.last_message.to_lowercase().contains(&q_lower))
+            {
+                rows.push(AppleComposeRecipient {
+                    user_id: d.id,
+                    chat_id: Some(d.id),
+                    initials: d.avatar_initials.clone(),
+                    name: d.peer_name.clone(),
+                    subtitle: peer_subtitle_for_dialog(d),
+                    avatar_color: d.avatar_color,
+                });
+            }
+        }
+        rows
+    }
+
+    pub(crate) fn open_apple_compose_recipient(
+        &mut self,
+        rec: AppleComposeRecipient,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime.clear_preedit();
+        self.sidebar.update(cx, |sb, scx| {
+            sb.exit_compose_mode();
+            if let Some(cid) = rec.chat_id {
+                sb.select_dialog_from_user(cid);
+            }
+            scx.notify();
+        });
+        self.composer.update(cx, |c, ccx| {
+            c.is_input_focused = true;
+            ccx.notify();
+        });
+        if let Some(cid) = rec.chat_id {
+            self.sync_selected_chat_inspector_and_stage(cid, cx);
+        } else {
+            let req = CreateChatRequest {
+                title: rec.name,
+                chat_type: Some(serde_json::json!(0)),
+                peer_user_id: Some(rec.user_id),
+                ..Default::default()
+            };
+            let client = self.client.clone();
+            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                if let Ok(created) = client.create_chat(&req).await {
+                    let _ = weak.update(app, |s, cx| {
+                        s.sidebar.update(cx, |sb, _| {
+                            sb.select_dialog_from_user(created.chat_id as u64);
+                        });
+                        s.refresh_chats(cx);
+                    });
+                }
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_add_friend_from_compose_query(&mut self, cx: &mut Context<Self>) {
+        self.ime.clear_preedit();
+        let raw_q = self.sidebar.read(cx).compose_recipient_query.trim().to_string();
+        self.sidebar.update(cx, |sb, scx| {
+            sb.open_add_contact_modal(AddContactKind::Friend);
+            if !raw_q.is_empty() {
+                if raw_q.starts_with('@') {
+                    sb.creation_secondary_input = raw_q.trim_start_matches('@').to_string();
+                } else {
+                    sb.creation_primary_input = raw_q;
+                }
+            }
+            scx.notify();
+        });
+        cx.notify();
+    }
+
+    pub fn render_apple_compose_stage(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.theme_state.palette.clone();
+        let lang = self.active_lang_id();
+        let query = self.sidebar.read(cx).compose_recipient_query.clone();
+        let compose_focused = self.is_apple_compose_input_active(cx);
+        let preedit = if compose_focused {
+            self.ime.ime_preedit.clone()
+        } else {
+            None
+        };
+        let recipients = self.collect_apple_compose_recipients(cx);
+        let quick_pill = |id: &'static str,
+                          icon: IconName,
+                          tint: u32,
+                          label: &'static str| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .h(px(pal.scaled_px(34.0)))
+                .px(px(pal.scaled_px(12.0)))
+                .rounded_full()
+                .bg(pal.card_surface_rgba())
+                .border_1()
+                .border_color(pal.separator_rgba())
+                .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+                .flex()
+                .items_center()
+                .gap(px(pal.scaled_px(8.0)))
+                .child(
+                    div()
+                        .w(px(pal.scaled_px(22.0)))
+                        .h(px(pal.scaled_px(22.0)))
+                        .rounded_full()
+                        .bg(TdesktopThemePalette::rgba_with_alpha(tint, 0.16))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(tg_icon(icon, pal.scaled_px(12.5), tint)),
+                )
+                .child(
+                    div()
+                        .text_size(px(pal.scaled_px(12.5)))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(pal.text_primary))
+                        .child(label),
+                )
+        };
+
+        div()
+            .id("apple-compose-stage")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .bg(rgb(pal.stage_bg))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .w_full()
+                    .h(px(pal.scaled_px(56.0)))
+                    .px(px(pal.scaled_px(16.0)))
+                    .border_b_1()
+                    .border_color(pal.separator_rgba())
+                    .window_control_area(WindowControlArea::Drag)
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("apple-compose-to-bar")
+                            .occlude()
+                            .cursor_text()
+                            .w_full()
+                            .h(px(pal.scaled_px(34.0)))
+                            .px(px(pal.scaled_px(14.0)))
+                            .rounded_full()
+                            .bg(rgb(pal.input_bg))
+                            .border_1()
+                            .border_color(if compose_focused {
+                                TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.55)
+                            } else {
+                                pal.separator_rgba()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.sidebar.update(cx, |sb, scx| {
+                                        sb.search_focused = false;
+                                        scx.notify();
+                                    });
+                                    this.composer.update(cx, |c, ccx| {
+                                        c.is_input_focused = false;
+                                        ccx.notify();
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(pal.scaled_px(13.0)))
+                                            .text_color(rgb(pal.text_secondary))
+                                            .child(tr_str(lang, "收件人:", "To:")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .items_center()
+                                            .overflow_hidden()
+                                            .when(!query.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_size(px(pal.scaled_px(13.0)))
+                                                        .text_color(rgb(pal.text_primary))
+                                                        .child(query.clone()),
+                                                )
+                                            })
+                                            .when_some(preedit.clone(), |el, p| {
+                                                el.child(
+                                                    div()
+                                                        .border_b_1()
+                                                        .border_color(rgb(pal.accent))
+                                                        .text_size(px(pal.scaled_px(13.0)))
+                                                        .text_color(rgb(pal.text_primary))
+                                                        .child(p),
+                                                )
+                                            })
+                                            .when(compose_focused, |el| {
+                                                el.child(
+                                                    div()
+                                                        .w(px(1.5))
+                                                        .h(px(pal.scaled_px(15.0)))
+                                                        .rounded_full()
+                                                        .flex_shrink_0()
+                                                        .bg(rgb(pal.accent)),
+                                                )
+                                            })
+                                            .when(query.is_empty() && preedit.is_none(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .ml(px(2.0))
+                                                        .truncate()
+                                                        .text_size(px(pal.scaled_px(13.0)))
+                                                        .text_color(
+                                                            TdesktopThemePalette::rgba_with_alpha(
+                                                                pal.text_secondary,
+                                                                0.72,
+                                                            ),
+                                                        )
+                                                        .child(tr_str(
+                                                            lang,
+                                                            "输入姓名、用户名或选择联系人",
+                                                            "Type a name, @username, or pick a contact",
+                                                        )),
+                                                )
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("apple-compose-add-recipient-btn")
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .w(px(pal.scaled_px(24.0)))
+                                    .h(px(pal.scaled_px(24.0)))
+                                    .rounded_full()
+                                    .flex_shrink_0()
+                                    .bg(pal.card_surface_rgba())
+                                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(pal.scaled_px(15.0)))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(pal.text_primary))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.ime.clear_preedit();
+                                            this.sidebar.update(cx, |sb, scx| {
+                                                sb.open_contacts_modal();
+                                                scx.notify();
+                                            });
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("+"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(pal.scaled_px(740.0)))
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .px(px(pal.scaled_px(20.0)))
+                                    .pt(px(pal.scaled_px(16.0)))
+                                    .pb(px(pal.scaled_px(10.0)))
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(pal.scaled_px(8.0)))
+                                    .child(
+                                        quick_pill(
+                                            "apple-compose-pill-friend",
+                                            IconName::ContactsUsers,
+                                            0x0A84FF,
+                                            tr_str(lang, "添加好友", "Add Friend"),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.ime.clear_preedit();
+                                                this.sidebar.update(cx, |sb, scx| {
+                                                    sb.open_add_contact_modal(
+                                                        AddContactKind::Friend,
+                                                    );
+                                                    scx.notify();
+                                                });
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        quick_pill(
+                                            "apple-compose-pill-bot",
+                                            IconName::BotRobot,
+                                            0x5E5CE6,
+                                            tr_str(lang, "创建 AI Bot", "New AI Bot"),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.ime.clear_preedit();
+                                                this.sidebar.update(cx, |sb, scx| {
+                                                    sb.open_add_contact_modal(
+                                                        AddContactKind::AiBot,
+                                                    );
+                                                    scx.notify();
+                                                });
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        quick_pill(
+                                            "apple-compose-pill-group",
+                                            IconName::GroupUsers,
+                                            0x30D158,
+                                            tr_str(lang, "新建群组", "New Group"),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.ime.clear_preedit();
+                                                this.sidebar.update(cx, |sb, scx| {
+                                                    sb.open_create_group_modal();
+                                                    scx.notify();
+                                                });
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        quick_pill(
+                                            "apple-compose-pill-channel",
+                                            IconName::ChannelMegaphone,
+                                            0xFF9F0A,
+                                            tr_str(lang, "新建频道", "New Channel"),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.ime.clear_preedit();
+                                                this.sidebar.update(cx, |sb, scx| {
+                                                    sb.exit_compose_mode();
+                                                    scx.notify();
+                                                });
+                                                let title = tr_str(
+                                                    this.active_lang_id(),
+                                                    "新建频道",
+                                                    "New Channel",
+                                                );
+                                                this.open_modal_dialog(
+                                                    title,
+                                                    ModalDialogKind::NewChannel,
+                                                    420.0,
+                                                    380.0,
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px(px(pal.scaled_px(24.0)))
+                                    .pt(px(pal.scaled_px(6.0)))
+                                    .pb(px(pal.scaled_px(6.0)))
+                                    .text_size(px(pal.scaled_px(11.5)))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child(tr_str(lang, "建议的联系人", "Suggestions")),
+                            )
+                            .child(
+                                div()
+                                    .id("apple-compose-recipients-scroll")
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .w_full()
+                                    .px(px(pal.scaled_px(14.0)))
+                                    .pb(px(pal.scaled_px(16.0)))
+                                    .overflow_y_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .when(recipients.is_empty(), |col| {
+                                        if !query.trim().is_empty() {
+                                            col.child(
+                                                div()
+                                                    .id("apple-compose-add-query-friend")
+                                                    .cursor_pointer()
+                                                    .mx(px(pal.scaled_px(6.0)))
+                                                    .px(px(pal.scaled_px(12.0)))
+                                                    .py(px(pal.scaled_px(10.0)))
+                                                    .rounded(px(pal.scaled_px(12.0)))
+                                                    .bg(pal.card_surface_rgba())
+                                                    .border_1()
+                                                    .border_color(pal.separator_rgba())
+                                                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(pal.scaled_px(12.0)))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.open_add_friend_from_compose_query(
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(pal.scaled_px(36.0)))
+                                                            .h(px(pal.scaled_px(36.0)))
+                                                            .rounded_full()
+                                                            .bg(
+                                                                TdesktopThemePalette::rgba_with_alpha(
+                                                                    pal.accent, 0.16,
+                                                                ),
+                                                            )
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(tg_icon(
+                                                                IconName::ContactsUsers,
+                                                                pal.scaled_px(17.0),
+                                                                pal.accent,
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap(px(1.0))
+                                                            .child(
+                                                                div()
+                                                                    .truncate()
+                                                                    .text_size(px(pal.scaled_px(
+                                                                        13.5,
+                                                                    )))
+                                                                    .font_weight(
+                                                                        FontWeight::SEMIBOLD,
+                                                                    )
+                                                                    .text_color(rgb(pal.text_primary))
+                                                                    .child(format!(
+                                                                        "{} \"{}\"",
+                                                                        tr_str(
+                                                                            lang,
+                                                                            "添加联系人",
+                                                                            "Add contact",
+                                                                        ),
+                                                                        query.trim()
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .truncate()
+                                                                    .text_size(px(pal.scaled_px(
+                                                                        11.5,
+                                                                    )))
+                                                                    .text_color(rgb(
+                                                                        pal.text_secondary,
+                                                                    ))
+                                                                    .child(tr_str(
+                                                                        lang,
+                                                                        "通过手机号或 @用户名发起对话",
+                                                                        "Start a chat by phone or @username",
+                                                                    )),
+                                                            ),
+                                                    ),
+                                            )
+                                        } else {
+                                            col.items_center().justify_center().pt(px(28.0)).child(
+                                                div()
+                                                    .text_size(px(pal.scaled_px(13.0)))
+                                                    .text_color(rgb(pal.text_secondary))
+                                                    .child(tr_str(
+                                                        lang,
+                                                        "暂无建议的联系人",
+                                                        "No suggested contacts yet",
+                                                    )),
+                                            )
+                                        }
+                                    })
+                                    .when(!recipients.is_empty(), |col| {
+                                        col.children(recipients.into_iter().enumerate().map(
+                                            |(idx, rec)| {
+                                                let rec_click = rec.clone();
+                                                div()
+                                                    .id(("apple-compose-rec-row", idx))
+                                                    .cursor_pointer()
+                                                    .px(px(pal.scaled_px(10.0)))
+                                                    .py(px(pal.scaled_px(8.0)))
+                                                    .rounded(px(pal.scaled_px(10.0)))
+                                                    .hover(move |s| {
+                                                        s.bg(rgb(pal.dialogs_hover_bg))
+                                                    })
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(pal.scaled_px(12.0)))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.open_apple_compose_recipient(
+                                                                rec_click.clone(),
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(pal.scaled_px(36.0)))
+                                                            .h(px(pal.scaled_px(36.0)))
+                                                            .rounded_full()
+                                                            .flex_shrink_0()
+                                                            .bg(rgb(rec.avatar_color))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .text_size(px(pal.scaled_px(13.0)))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(rgb(pal.active_button_fg))
+                                                            .child(rec.initials),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap(px(1.0))
+                                                            .child(
+                                                                div()
+                                                                    .truncate()
+                                                                    .text_size(px(pal.scaled_px(
+                                                                        13.5,
+                                                                    )))
+                                                                    .font_weight(
+                                                                        FontWeight::SEMIBOLD,
+                                                                    )
+                                                                    .text_color(rgb(pal.text_primary))
+                                                                    .child(rec.name),
+                                                            )
+                                                            .when(!rec.subtitle.is_empty(), |el| {
+                                                                el.child(
+                                                                    div()
+                                                                        .truncate()
+                                                                        .text_size(px(
+                                                                            pal.scaled_px(11.5),
+                                                                        ))
+                                                                        .text_color(rgb(
+                                                                            pal.text_secondary,
+                                                                        ))
+                                                                        .child(rec.subtitle),
+                                                                )
+                                                            }),
+                                                    )
+                                            },
+                                        ))
+                                    }),
+                            ),
                     ),
             )
             .into_any_element()

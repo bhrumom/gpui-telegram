@@ -693,8 +693,8 @@ impl AppShell {
             .id("window-toast-banner")
             .cursor_pointer()
             .absolute()
-            .bottom(px(pal.scaled_px(28.0)))
-            .right(px(pal.scaled_px(28.0)))
+            .bottom(px(pal.scaled_px(86.0)))
+            .right(px(pal.scaled_px(20.0)))
             .px(px(pal.scaled_px(16.0)))
             .py(px(pal.scaled_px(if is_apple { 8.0 } else { 9.0 })))
             .border_1()
@@ -802,11 +802,15 @@ impl Render for AppShell {
 
         let show_conn_banner = self.window_runtime.connecting_widget.is_visible;
         let conn_banner_text = self.window_runtime.connecting_widget.status_text();
-        let (contacts_open, creation_modal, account_popover_open) = {
+        let (contacts_open, creation_modal, account_popover_open, is_apple_compose_mode) = {
             let sb = self.sidebar.read(cx);
-            (sb.is_contacts_modal_open, sb.active_creation_modal, sb.is_account_popover_open)
+            (
+                sb.is_contacts_modal_open,
+                sb.active_creation_modal,
+                sb.is_account_popover_open,
+                pal.is_apple_style() && sb.is_plus_menu_open,
+            )
         };
-        let use_vibrant_root = pal.is_apple_style() && cfg!(target_os = "macos");
 
         div()
             .id("app-shell-authenticated-root")
@@ -815,7 +819,7 @@ impl Render for AppShell {
                 this.handle_window_key_down(event, window, cx);
             }))
             .relative().size_full().flex().flex_col()
-            .when(!use_vibrant_root, |el| el.bg(rgb(pal.window_bg)))
+            .bg(rgb(pal.window_bg))
             .child(ime_canvas)
             .when(show_conn_banner, |el| {
                 el.child(
@@ -831,9 +835,15 @@ impl Render for AppShell {
                     .child(
                         div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
                             .bg(rgb(pal.stage_bg))
-                            .child(self.stage.clone()).child(self.composer.clone()).into_any_element(),
+                            .child(if is_apple_compose_mode {
+                                self.render_apple_compose_stage(cx)
+                            } else {
+                                self.stage.clone().into_any_element()
+                            })
+                            .child(self.composer.clone())
+                            .into_any_element(),
                     )
-                    .child(self.inspector.clone()),
+                    .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone())),
             )
             .when_some(self.rtc_talk.talk_mode_overlay.clone(), |el, ov| el.child(self.render_talk_mode_overlay(ov, cx)))
             .when_some(self.overlays.media_viewer_overlay.clone(), |el, ov| el.child(self.render_media_viewer_overlay(ov)))

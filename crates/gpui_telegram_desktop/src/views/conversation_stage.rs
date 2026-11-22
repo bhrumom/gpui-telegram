@@ -931,8 +931,6 @@ impl Render for ConversationStage {
             || total_msgs > 0
             || self.show_bot_start_bar
             || self.bot_description_card.is_some();
-        let show_fabushi_bar =
-            show_top_chrome && self.is_viewer_owner_fabushi_bot && self.active_fabushi_bot.is_some();
         let apple_top_bar_h = if has_active_chat
             && !self.select_mode_active
             && self.selected_message_ids.is_empty()
@@ -945,7 +943,6 @@ impl Render for ConversationStage {
             14.0
         } else {
             apple_top_bar_h
-                + if show_fabushi_bar { 32.0 } else { 0.0 }
                 + if self.search_open { 44.0 } else { 0.0 }
                 + if has_pinned_banner { 46.0 } else { 0.0 }
                 + 12.0
@@ -1044,144 +1041,6 @@ impl Render for ConversationStage {
                 cx,
                 |this, action, cx| this.handle_topbar_action(action, cx),
             ));
-            if self.is_viewer_owner_fabushi_bot {
-                if let Some(fab_bot) = self.active_fabushi_bot.clone() {
-                    let fab_color = crate::components::avatar::parse_fabushi_hex_color(&fab_bot.avatar_color)
-                        .unwrap_or(self.palette.accent);
-                    let fab_meta = format!(
-                        "isolated · {} · {}",
-                        fab_bot.thinking_level, fab_bot.approval_mode
-                    );
-                    let fab_model = fab_bot.preferred_model.trim().to_string();
-                    let mut left = div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .child(crate::components::grok_bot_avatar::render_grok_persona_avatar(
-                            &fab_bot.agent_id,
-                            &fab_bot.avatar_shape,
-                            &fab_bot.avatar_color,
-                            &fab_bot.display_name,
-                            18.0,
-                            crate::components::grok_bot_avatar::GrokPersonaState::from_activity_str(
-                                &fab_bot.execution_state,
-                                false,
-                            ),
-                            self.palette.card_bg,
-                            false,
-                        ))
-                        .child(
-                            div()
-                                .px(px(6.0))
-                                .py(px(1.0))
-                                .rounded(px(999.0))
-                                .bg(TdesktopThemePalette::rgba_with_alpha(fab_color, 0.14))
-                                .text_size(px(10.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(fab_color))
-                                .child(format!("@{}", fab_bot.agent_id)),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(rgb(self.palette.text_secondary))
-                                .child(fab_meta),
-                        );
-                    if !fab_model.is_empty() {
-                        left = left.child(
-                            div()
-                                .px(px(6.0))
-                                .py(px(1.0))
-                                .rounded(px(6.0))
-                                .bg(rgb(self.palette.input_bg))
-                                .text_size(px(10.5))
-                                .text_color(rgb(self.palette.text_primary))
-                                .child(fab_model),
-                        );
-                    }
-                    let insp_label = if self.is_inspector_open {
-                        crate::i18n::tr_str(&self.lang_id, "收起面板", "Hide Inspector")
-                    } else {
-                        crate::i18n::tr_str(&self.lang_id, "智能体面板", "Inspector")
-                    };
-                    let bar_bg: Rgba = if is_apple {
-                        TdesktopThemePalette::rgba_with_alpha(self.palette.topbar_bg, 0.90)
-                    } else {
-                        rgb(self.palette.top_bar_bg).into()
-                    };
-                    let sep_col: Rgba = if is_apple {
-                        self.palette.separator_rgba()
-                    } else {
-                        rgb(self.palette.border_fg).into()
-                    };
-                    top_chrome_children.push(
-                        div()
-                            .id("stage-fabushi-session-bar")
-                            .w_full()
-                            .h(px(32.0))
-                            .px(px(if is_apple { 16.0 } else { 14.0 }))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .bg(bar_bg)
-                            .border_b_1()
-                            .border_color(sep_col)
-                            .child(left)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .flex_shrink_0()
-                                    .child(
-                                        div()
-                                            .id("stage-fabushi-reset-session")
-                                            .cursor_pointer()
-                                            .px(px(8.0))
-                                            .py(px(2.0))
-                                            .rounded(px(if is_apple { 999.0 } else { 6.0 }))
-                                            .bg(rgb(self.palette.input_bg))
-                                            .border_1()
-                                            .border_color(sep_col)
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(self.palette.text_primary))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.pending_bot_action = Some("hermes:/new".to_string());
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child("/new"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("stage-fabushi-open-inspector")
-                                            .cursor_pointer()
-                                            .px(px(8.0))
-                                            .py(px(2.0))
-                                            .rounded(px(if is_apple { 999.0 } else { 6.0 }))
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(self.palette.accent, 0.14))
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(self.palette.accent))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.handle_topbar_action(TopBarUiAction::ToggleInspector, cx);
-                                                }),
-                                            )
-                                            .child(insp_label),
-                                    ),
-                            )
-                            .into_any_element(),
-                    );
-                }
-            }
             if self.search_open {
                 top_chrome_children.push(render_stage_search_bar(
                     &self.search_query,
@@ -1547,7 +1406,6 @@ impl Render for ConversationStage {
                 let seamless_apple_header = has_active_chat
                     && !self.select_mode_active
                     && self.selected_message_ids.is_empty()
-                    && !show_fabushi_bar
                     && !self.search_open
                     && !has_pinned_banner;
                 let (feather_alpha, feather_h) = if seamless_apple_header {

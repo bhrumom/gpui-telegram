@@ -77,6 +77,9 @@ impl Render for ChatSidebar {
         let query = self.search_query.clone();
         let is_search_focused = self.search_focused;
         let is_plus_open = self.is_plus_menu_open;
+        let is_apple_compose = palette.is_apple_style() && is_plus_open;
+        let compose_query = self.compose_recipient_query.clone();
+        let row_active_id = if is_apple_compose { None } else { active_id };
         let creation_modal = self.active_creation_modal;
         let contact_kind = self.contact_kind;
         let active_field = self.active_creation_field;
@@ -148,7 +151,7 @@ impl Render for ChatSidebar {
             |this, action, cx| this.handle_unified_action(action, cx),
         );
 
-        let plus_dropdown = if is_plus_open {
+        let plus_dropdown = if is_plus_open && !palette.is_apple_style() {
             Some(render_plus_dropdown(
                 &palette,
                 &lang_id,
@@ -382,10 +385,114 @@ impl Render for ChatSidebar {
                 .collect();
 
             let mut scroll_sections: Vec<AnyElement> = Vec::new();
+            if is_apple_compose {
+                scroll_sections.push(
+                    div()
+                        .w_full()
+                        .px(px(palette.scaled_px(8.0)))
+                        .pt(px(palette.scaled_px(4.0)))
+                        .child(
+                            div()
+                                .id("sidebar-compose-draft-row")
+                                .cursor_pointer()
+                                .h(px(palette.scaled_px(64.0)))
+                                .w_full()
+                                .pl(px(palette.scaled_px(18.0)))
+                                .pr(px(palette.scaled_px(10.0)))
+                                .py(px(palette.scaled_px(8.0)))
+                                .rounded(px(palette.scaled_px(10.0)))
+                                .bg(rgb(palette.dialogs_active_bg))
+                                .flex()
+                                .items_center()
+                                .gap(px(palette.scaled_px(10.0)))
+                                .child(
+                                    div()
+                                        .w(px(palette.scaled_px(44.0)))
+                                        .h(px(palette.scaled_px(44.0)))
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .bg(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.22))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(tg_icon(
+                                            IconName::ContactsUsers,
+                                            palette.scaled_px(20.0),
+                                            0xFFFFFF,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .flex_col()
+                                        .justify_center()
+                                        .gap(px(palette.scaled_px(2.0)))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(palette.scaled_px(13.5)))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(0xFFFFFF))
+                                                .child(tr_str(&lang_id, "新信息", "New Message")),
+                                        )
+                                        .when(!compose_query.trim().is_empty(), |col| {
+                                            col.child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(palette.scaled_px(12.0)))
+                                                    .text_color(
+                                                        TdesktopThemePalette::rgba_with_alpha(
+                                                            0xFFFFFF, 0.85,
+                                                        ),
+                                                    )
+                                                    .child(format!(
+                                                        "{}{}",
+                                                        tr_str(&lang_id, "至: ", "To: "),
+                                                        compose_query.trim()
+                                                    )),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("sidebar-compose-draft-close")
+                                        .cursor_pointer()
+                                        .w(px(palette.scaled_px(22.0)))
+                                        .h(px(palette.scaled_px(22.0)))
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .hover(|s| {
+                                            s.bg(TdesktopThemePalette::rgba_with_alpha(
+                                                0xFFFFFF, 0.20,
+                                            ))
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev, _w, cx| {
+                                                cx.stop_propagation();
+                                                this.exit_compose_mode();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tg_icon(
+                                            IconName::Close,
+                                            palette.scaled_px(11.0),
+                                            0xFFFFFF,
+                                        )),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
             if is_apple {
                 if let Some(pinned_grid) = render_pinned_chats_grid(
                     &pinned_grid_items,
-                    active_id,
+                    row_active_id,
                     &palette,
                     cx,
                     |this, did, cx| {
@@ -429,7 +536,7 @@ impl Render for ChatSidebar {
                 if is_apple && !self.is_archived_expanded && !main_with_meta.is_empty() {
                     let first_sel = main_with_meta
                         .first()
-                        .is_some_and(|(d, _)| active_id == Some(d.id));
+                        .is_some_and(|(d, _)| row_active_id == Some(d.id));
                     if !first_sel {
                         list.push(indented_separator());
                     }
@@ -440,7 +547,7 @@ impl Render for ChatSidebar {
                     list.push(render_sidebar_dialog_row(
                         item,
                         idx,
-                        active_id,
+                        row_active_id,
                         is_narrow,
                         meta,
                         &palette,
@@ -448,14 +555,14 @@ impl Render for ChatSidebar {
                         cx,
                     ));
                     if is_apple {
-                        let cur_sel = active_id == Some(item.id);
+                        let cur_sel = row_active_id == Some(item.id);
                         let next_sel = archived_with_meta
                             .get(idx + 1)
-                            .map(|(n, _)| active_id == Some(n.id))
+                            .map(|(n, _)| row_active_id == Some(n.id))
                             .or_else(|| {
                                 main_with_meta
                                     .first()
-                                    .map(|(n, _)| active_id == Some(n.id))
+                                    .map(|(n, _)| row_active_id == Some(n.id))
                             });
                         if let Some(is_next_sel) = next_sel {
                             if !cur_sel && !is_next_sel {
@@ -471,7 +578,7 @@ impl Render for ChatSidebar {
                 list.push(render_sidebar_dialog_row(
                     item,
                     idx,
-                    active_id,
+                    row_active_id,
                     is_narrow,
                     meta,
                     &palette,
@@ -493,9 +600,9 @@ impl Render for ChatSidebar {
                         ));
                     }
                 } else if is_apple {
-                    let cur_sel = active_id == Some(item.id);
+                    let cur_sel = row_active_id == Some(item.id);
                     if let Some((next_item, _)) = main_with_meta.get(idx + 1) {
-                        let next_sel = active_id == Some(next_item.id);
+                        let next_sel = row_active_id == Some(next_item.id);
                         if !cur_sel && !next_sel {
                             list.push(indented_separator());
                         }

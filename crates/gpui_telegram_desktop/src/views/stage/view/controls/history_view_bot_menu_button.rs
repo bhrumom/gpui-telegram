@@ -3,6 +3,7 @@
 //! Upstream header: `tdesktop/Telegram/SourceFiles/history/view/controls/history_view_bot_menu_button.h`
 
 use gpui::*;
+use crate::theme::TdesktopThemePalette;
 
 /// Authentic bot menu button model and GPUI component
 pub struct HistoryViewBotMenuButtonViewControls {
@@ -88,7 +89,10 @@ impl Render for HistoryViewBotMenuButtonViewControls {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_small = self.is_small;
         let text = self.text.clone();
-        let active_bg = if self.is_active { self.accent_color } else { 0x242f3d };
+        let accent = if self.accent_color != 0 { self.accent_color } else { 0x0A84FF };
+        let soft_bg = TdesktopThemePalette::rgba_with_alpha(accent, 0.14);
+        let soft_hover = TdesktopThemePalette::rgba_with_alpha(accent, 0.22);
+        let soft_border = TdesktopThemePalette::rgba_with_alpha(accent, 0.24);
         let bid = self.bot_id;
         let buser = self.bot_username.clone();
         let btitle = self.text.clone();
@@ -97,7 +101,7 @@ impl Render for HistoryViewBotMenuButtonViewControls {
         let mut inner = div()
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(4.0))
             .child("☰");
 
         if !is_small {
@@ -111,15 +115,18 @@ impl Render for HistoryViewBotMenuButtonViewControls {
             .flex()
             .items_center()
             .justify_center()
-            .h(px(34.0))
-            .px(px(12.0))
+            .h(px(28.0))
+            .px(px(10.0))
             .rounded_full()
-            .bg(rgb(active_bg))
-            .text_xs()
+            .bg(soft_bg)
+            .border_1()
+            .border_color(soft_border)
+            .text_size(px(11.5))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(0xffffff))
-            .hover(|s| s.bg(rgb(0x2b8be0)))
+            .text_color(rgb(accent))
+            .hover(move |s| s.bg(soft_hover))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                cx.stop_propagation();
                 if !burl.trim().is_empty() || !buser.trim().is_empty() {
                     this.pending_launch = Some((bid, buser.clone(), btitle.clone(), burl.clone()));
                     cx.notify();

@@ -208,6 +208,7 @@ pub struct ChatSidebar {
 
     // `+` button next to search box & Add Contact (Create AI Bot / Add Friend) / Create Group / Contacts modal state
     pub is_plus_menu_open: bool,
+    pub compose_recipient_query: String,
     pub is_contacts_modal_open: bool,
     pub contacts_search_query: String,
     pub active_creation_modal: Option<SidebarCreationModal>,
@@ -301,6 +302,7 @@ impl ChatSidebar {
             search_focused: false,
             story_clicked_peer: None,
             is_plus_menu_open: false,
+            compose_recipient_query: String::new(),
             is_contacts_modal_open: false,
             contacts_search_query: String::new(),
             active_creation_modal: None,
@@ -429,6 +431,7 @@ impl ChatSidebar {
         self.search_focused = false;
         self.story_clicked_peer = None;
         self.is_plus_menu_open = false;
+        self.compose_recipient_query.clear();
         self.is_account_popover_open = false;
         self.hovered_rail_dialog_id = None;
         self.is_contacts_modal_open = false;
@@ -471,6 +474,7 @@ impl ChatSidebar {
 
     pub fn open_contacts_modal(&mut self) {
         self.is_plus_menu_open = false;
+        self.compose_recipient_query.clear();
         self.is_account_popover_open = false;
         self.search_focused = false;
         self.is_contacts_modal_open = true;
@@ -493,6 +497,7 @@ impl ChatSidebar {
         self.expand_from_user_if_collapsed();
         self.search_focused = true;
         self.is_plus_menu_open = false;
+        self.compose_recipient_query.clear();
         self.is_account_popover_open = false;
         self.search_request_seq = self.search_request_seq.wrapping_add(1);
     }
@@ -543,6 +548,7 @@ impl ChatSidebar {
 
     pub fn toggle_plus_menu(&mut self) {
         self.is_account_popover_open = false;
+        self.compose_recipient_query.clear();
         if self.is_collapsed {
             self.expand_from_user_if_collapsed();
             self.is_plus_menu_open = true;
@@ -553,6 +559,11 @@ impl ChatSidebar {
         if self.is_plus_menu_open {
             self.search_focused = false;
         }
+    }
+
+    pub fn exit_compose_mode(&mut self) {
+        self.is_plus_menu_open = false;
+        self.compose_recipient_query.clear();
     }
 
     pub fn select_folder(&mut self, folder: impl Into<String>) {
@@ -571,6 +582,7 @@ impl ChatSidebar {
     pub fn select_dialog_from_user(&mut self, id: u64) {
         self.select_dialog(id);
         if self.active_chat_id == Some(id) {
+            self.exit_compose_mode();
             self.selection_revision = self.selection_revision.wrapping_add(1);
         }
     }
@@ -730,10 +742,16 @@ mod tests {
         sb.toggle_collapsed_from_user();
         assert!(sb.is_collapsed);
         assert_eq!(sb.collapse_state_revision, 4);
+        sb.compose_recipient_query = "Alice".to_string();
         sb.toggle_plus_menu();
         assert!(!sb.is_collapsed);
         assert!(sb.is_plus_menu_open);
+        assert!(sb.compose_recipient_query.is_empty());
         assert_eq!(sb.collapse_state_revision, 5);
+        sb.compose_recipient_query = "Bob".to_string();
+        sb.exit_compose_mode();
+        assert!(!sb.is_plus_menu_open);
+        assert!(sb.compose_recipient_query.is_empty());
     }
 
     #[std::prelude::v1::test]

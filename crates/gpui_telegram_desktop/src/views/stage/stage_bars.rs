@@ -222,8 +222,6 @@ pub fn render_stage_top_bar<V: 'static>(
     let a_insp1 = on_action.clone();
     let a_insp2 = on_action.clone();
     let a_search = on_action.clone();
-    let a_acall = on_action.clone();
-    let a_vcall = on_action.clone();
     let a_more = on_action.clone();
     let ttl_header_label = (message_ttl_seconds > 0).then(|| format_ttl_badge(message_ttl_seconds, lang_id));
     let ttl_badge_el: Option<AnyElement> = ttl_header_label.map(|ttl_lbl| {
@@ -261,7 +259,7 @@ pub fn render_stage_top_bar<V: 'static>(
     let show_apple_subtitle = !subtitle.is_empty() && (is_typing_or_active_bot || is_online || is_group_sub);
 
     let avatar_el: Option<AnyElement> = has_chat.then(|| {
-        let avatar_size_px = palette.scaled_px(if is_apple { 38.0 } else { 40.0 });
+        let avatar_size_px = palette.scaled_px(40.0);
         let is_typing = is_typing_or_active_bot;
         let fab_non_classic = active_fabushi_bot
             .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"));
@@ -442,16 +440,6 @@ pub fn render_stage_top_bar<V: 'static>(
             );
 
         if has_chat {
-            let call_group = div()
-                .flex()
-                .items_center()
-                .gap(px(2.0))
-                .child(top_icon_btn("tb-call", IconName::PhoneCall, false, palette, cx, move |this, cx| {
-                    a_acall(this, TopBarUiAction::StartCall { video: false }, cx);
-                }))
-                .child(top_icon_btn("tb-vcall", IconName::VideoCall, false, palette, cx, move |this, cx| {
-                    a_vcall(this, TopBarUiAction::StartCall { video: true }, cx);
-                }));
             let search_btn = top_icon_btn("tb-search", IconName::Search, search_open, palette, cx, move |this, cx| {
                 a_search(this, TopBarUiAction::ToggleSearch, cx);
             });
@@ -463,7 +451,7 @@ pub fn render_stage_top_bar<V: 'static>(
             });
 
             let identity_pill = div()
-                .mt(px(palette.scaled_px(-5.0)))
+                .mt(px(palette.scaled_px(-4.0)))
                 .px(px(palette.scaled_px(10.0)))
                 .py(px(palette.scaled_px(2.5)))
                 .rounded_full()
@@ -565,7 +553,6 @@ pub fn render_stage_top_bar<V: 'static>(
                 .flex()
                 .items_center()
                 .gap(px(2.0))
-                .child(call_group)
                 .child(search_btn)
                 .child(info_btn)
                 .child(more_btn);
@@ -648,16 +635,6 @@ pub fn render_stage_top_bar<V: 'static>(
                     ),
             )
             .when(has_chat, |el| {
-                let call_group = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(top_icon_btn("tb-call", IconName::PhoneCall, false, palette, cx, move |this, cx| {
-                        a_acall(this, TopBarUiAction::StartCall { video: false }, cx);
-                    }))
-                    .child(top_icon_btn("tb-vcall", IconName::VideoCall, false, palette, cx, move |this, cx| {
-                        a_vcall(this, TopBarUiAction::StartCall { video: true }, cx);
-                    }));
                 let search_btn = top_icon_btn("tb-search", IconName::Search, search_open, palette, cx, move |this, cx| {
                     a_search(this, TopBarUiAction::ToggleSearch, cx);
                 });
@@ -672,7 +649,6 @@ pub fn render_stage_top_bar<V: 'static>(
                     .items_center()
                     .gap(px(4.0))
                     .child(search_btn)
-                    .child(call_group)
                     .child(info_btn)
                     .child(more_btn);
                 el.child(actions)
@@ -680,7 +656,7 @@ pub fn render_stage_top_bar<V: 'static>(
             .into_any_element()
     };
 
-    let _ = (search_query, search_match_cursor, search_match_total, tr_fmt);
+    let _ = (search_query, search_match_cursor, search_match_total, tr_fmt, TopBarUiAction::StartCall { video: false });
     bar
 }
 

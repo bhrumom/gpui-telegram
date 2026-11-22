@@ -39,7 +39,7 @@ pub(crate) fn segmented_pill_shadow(pal: TdesktopThemePalette) -> Vec<BoxShadow>
     }
 }
 
-fn grouped_card(pal: TdesktopThemePalette) -> Div {
+pub(crate) fn grouped_card(pal: TdesktopThemePalette) -> Div {
     div()
         .w_full()
         .rounded(px(12.0))
@@ -49,59 +49,151 @@ fn grouped_card(pal: TdesktopThemePalette) -> Div {
         .overflow_hidden()
 }
 
-fn card_hairline(pal: TdesktopThemePalette) -> Div {
+pub(crate) fn card_hairline(pal: TdesktopThemePalette) -> Div {
     div()
         .mx(px(12.0))
         .h(px(1.0))
         .bg(pal.separator_rgba())
 }
 
-fn apple_quick_action_tile(
+/// Borderless Muse-style collapsible section header (`13px` medium/semibold title + right chevron).
+pub(crate) fn muse_collapsible_header(
     id: &'static str,
-    icon: IconName,
-    icon_color: u32,
-    label: &str,
-    label_color: u32,
+    section_key: &'static str,
+    title: &str,
+    collapsed: bool,
     pal: TdesktopThemePalette,
-    on_tap: impl Fn(&mut ContextInspector) + 'static,
     cx: &mut Context<ContextInspector>,
 ) -> Stateful<Div> {
     div()
         .id(id)
         .cursor_pointer()
-        .flex_1()
-        .min_w(px(0.0))
-        .py(px(10.0))
-        .px(px(4.0))
-        .rounded(px(12.0))
-        .bg(pal.card_surface_rgba())
-        .border_1()
-        .border_color(pal.separator_rgba())
+        .w_full()
+        .px(px(6.0))
+        .py(px(6.0))
+        .rounded(px(8.0))
         .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
         .flex()
-        .flex_col()
         .items_center()
-        .justify_center()
-        .gap(px(5.0))
+        .justify_between()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _e, _w, cx| {
-                on_tap(this);
+            cx.listener(move |this, _, _, cx| {
+                this.toggle_section(section_key);
                 cx.notify();
             }),
         )
-        .child(tg_icon(icon, 17.0, icon_color))
         .child(
             div()
-                .text_size(px(11.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(label_color))
-                .truncate()
-                .child(label.to_string()),
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(pal.text_primary))
+                .child(title.to_string()),
         )
+        .child(tg_icon(
+            if collapsed {
+                IconName::ChevronRight
+            } else {
+                IconName::ChevronDown
+            },
+            12.0,
+            pal.text_secondary,
+        ))
 }
 
-fn apple_switch_pill(enabled: bool, pal: TdesktopThemePalette) -> Div {
+/// Clean borderless Muse-style list item with a `30px` circular hairline icon badge on the left,
+/// primary title (`13px`) + optional muted subtitle (`11.5px`), and optional trailing accessory.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn muse_icon_row(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    icon_color: u32,
+    title: impl Into<String>,
+    subtitle: Option<String>,
+    title_color: Option<u32>,
+    trailing: Option<AnyElement>,
+    pal: TdesktopThemePalette,
+    on_tap: impl Fn(&mut ContextInspector, &mut Context<ContextInspector>) + 'static,
+    cx: &mut Context<ContextInspector>,
+) -> Stateful<Div> {
+    let fg = title_color.unwrap_or(pal.text_primary);
+    let badge_bg = TdesktopThemePalette::rgba_with_alpha(
+        icon_color,
+        if pal.mode.is_dark() { 0.14 } else { 0.08 },
+    );
+    let badge_border = TdesktopThemePalette::rgba_with_alpha(
+        icon_color,
+        if pal.mode.is_dark() { 0.24 } else { 0.14 },
+    );
+    div()
+        .id(id)
+        .cursor_pointer()
+        .w_full()
+        .px(px(6.0))
+        .py(px(7.0))
+        .rounded(px(10.0))
+        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.0))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                on_tap(this, cx);
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .w(px(30.0))
+                        .h(px(30.0))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(badge_bg)
+                        .border_1()
+                        .border_color(badge_border)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(tg_icon(icon, 14.0, icon_color)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.5))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(fg))
+                                .truncate()
+                                .child(title.into()),
+                        )
+                        .when_some(subtitle, |col, sub| {
+                            col.child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child(sub),
+                            )
+                        }),
+                ),
+        )
+        .when_some(trailing, |row, acc| row.child(acc))
+}
+
+pub(crate) fn apple_switch_pill(enabled: bool, pal: TdesktopThemePalette) -> Div {
     let track_bg = if enabled { pal.success } else { pal.input_bg };
     div()
         .w(px(34.0))
@@ -209,13 +301,14 @@ fn render_media_thumb_tile(
         })
 }
 
-/// Renders the flagship Apple Messages Contact Info profile panel:
-/// centered 74px hero avatar, 4-tile quick action strip, grouped contact facts card,
-/// optional 3-column shared media preview card, privacy toggle, and red destructive card.
+/// Renders the Muse-inspired Contact Info profile panel (Hero & segmented bar live in `ContextInspector::render`):
+/// collapsible contact facts rows with circular hairline badges, optional 3-column shared media preview,
+/// notifications & privacy switches, and clean destructive row.
 #[allow(clippy::too_many_arguments)]
 pub fn render_contact_profile_panel(
     model: &ProfileTabModel,
     shared_media: &SharedMediaTabModel,
+    collapsed_sections: &std::collections::HashSet<&'static str>,
     is_secret_chat_active: bool,
     is_contact_blocked: bool,
     copied_feedback: Option<&String>,
@@ -223,451 +316,235 @@ pub fn render_contact_profile_panel(
     lang: &str,
     cx: &mut Context<ContextInspector>,
 ) -> AnyElement {
-    let peer_name = model.name.clone();
-    let peer_for_vid = model.name.clone();
-    let avatar_color = if model.avatar_color != 0 {
-        model.avatar_color
-    } else {
-        pal.accent
-    };
-    let avatar_px = if pal.is_apple_style() { 74.0 } else { 80.0 };
-
-    let fallback_initials = {
-        let trimmed_init = model.avatar_initials.trim();
-        if !trimmed_init.is_empty() && trimmed_init != "?" {
-            trimmed_init.to_string()
-        } else {
-            let derived = crate::views::app_shell::shell_truth::derive_initials(&model.name);
-            if derived.is_empty() {
-                "?".to_string()
-            } else {
-                derived
-            }
-        }
-    };
-
-    let avatar_shadow = vec![BoxShadow {
-        color: hsla(0.0, 0.0, 0.0, if pal.mode.is_dark() { 0.36 } else { 0.14 }),
-        offset: point(px(0.0), px(4.0)),
-        blur_radius: px(12.0),
-        spread_radius: px(0.0),
-    }];
-
-    let avatar = if let Some(ref path) = model.avatar_path {
-        div()
-            .w(px(avatar_px))
-            .h(px(avatar_px))
-            .rounded_full()
-            .overflow_hidden()
-            .border_1()
-            .border_color(pal.separator_rgba())
-            .shadow(avatar_shadow)
-            .child(
-                img(path.clone())
-                    .w(px(avatar_px))
-                    .h(px(avatar_px))
-                    .object_fit(ObjectFit::Cover),
-            )
-            .into_any_element()
-    } else {
-        div()
-            .w(px(avatar_px))
-            .h(px(avatar_px))
-            .rounded_full()
-            .bg(rgb(avatar_color))
-            .border_1()
-            .border_color(pal.separator_rgba())
-            .shadow(avatar_shadow)
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(25.0))
-            .font_weight(FontWeight::BOLD)
-            .text_color(rgb(pal.active_button_fg))
-            .child(fallback_initials)
-            .into_any_element()
-    };
-
-    let status_trimmed = model.status.trim();
-    let is_online = status_trimmed.eq_ignore_ascii_case("online") || status_trimmed == "在线";
-    let clean_handle = model.username.trim();
-    let subtitle_text = if !status_trimmed.is_empty() && !clean_handle.is_empty() {
-        format!("{clean_handle} · {status_trimmed}")
-    } else if !status_trimmed.is_empty() {
-        status_trimmed.to_string()
-    } else {
-        clean_handle.to_string()
-    };
-
-    let mut rows: Vec<(String, String, bool)> = Vec::new();
+    let mut rows: Vec<(IconName, u32, String, String)> = Vec::new();
     if !model.phone.is_empty() {
         rows.push((
-            tr_str(lang, "手机号", "Mobile").into(),
+            IconName::PhoneCall,
+            pal.accent,
             model.phone.clone(),
-            true,
+            tr_str(lang, "手机号 · 点击复制", "Mobile · Click to copy").into(),
         ));
     }
     if !model.username.is_empty() {
         rows.push((
-            tr_str(lang, "用户名", "Username").into(),
+            IconName::ContactsUsers,
+            pal.accent,
             model.username.clone(),
-            true,
+            tr_str(lang, "用户名 · 点击复制", "Username · Click to copy").into(),
         ));
     }
     if !model.bio.is_empty() {
         rows.push((
-            tr_str(lang, "简介", "Bio").into(),
+            IconName::FolderAll,
+            pal.text_secondary,
             model.bio.clone(),
-            false,
+            tr_str(lang, "简介", "Bio").into(),
         ));
     }
     for (label, val) in &model.facts {
-        rows.push((label.clone(), val.clone(), false));
+        rows.push((IconName::FileDoc, pal.text_secondary, val.clone(), label.clone()));
     }
 
-    let mute_icon_color = if model.is_notifications_enabled {
-        pal.accent
-    } else {
-        pal.text_secondary
-    };
-    let mute_label = if model.is_notifications_enabled {
-        tr_str(lang, "静音", "Mute")
-    } else {
-        tr_str(lang, "已静音", "Unmute")
-    };
+    let info_collapsed = collapsed_sections.contains("contact-sec-info");
+    let media_collapsed = collapsed_sections.contains("contact-sec-media");
+    let privacy_collapsed = collapsed_sections.contains("contact-sec-privacy");
 
-    let facts_card = if rows.is_empty() {
-        None
-    } else {
-        let mut card = grouped_card(pal).flex().flex_col();
-        let last_idx = rows.len().saturating_sub(1);
-        for (idx, (label, val, is_link)) in rows.into_iter().enumerate() {
-            let cp = val.clone();
-            let copied_prefix = tr_str(lang, "已复制", "Copied").to_string();
-            card = card.child(
-                div()
-                    .cursor_pointer()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(10.0))
-                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _e, _w, cx| {
-                            this.copied_feedback = Some(format!("{copied_prefix}: {cp}"));
-                            this.pending_action = Some(InspectorAction::CopyText(cp.clone()));
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(pal.text_secondary))
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .text_color(rgb(if is_link {
-                                        pal.text_link
-                                    } else {
-                                        pal.text_primary
-                                    }))
-                                    .child(val),
-                            ),
-                    )
-                    .child(tg_icon(IconName::Copy, 13.0, pal.text_secondary)),
-            );
-            if idx < last_idx {
-                card = card.child(card_hairline(pal));
+    let info_section = (!rows.is_empty()).then(|| {
+        let mut sec = div().w_full().flex().flex_col().gap(px(2.0)).child(
+            muse_collapsible_header(
+                "contact-sec-info-hdr",
+                "contact-sec-info",
+                tr_str(lang, "联系信息", "Contact Info"),
+                info_collapsed,
+                pal,
+                cx,
+            ),
+        );
+        if !info_collapsed {
+            for (idx, (icon, col, val, subtitle)) in rows.into_iter().enumerate() {
+                let cp = val.clone();
+                let copied_prefix = tr_str(lang, "已复制", "Copied").to_string();
+                sec = sec.child(muse_icon_row(
+                    SharedString::from(format!("contact-info-row-{idx}")),
+                    icon,
+                    col,
+                    val,
+                    Some(subtitle),
+                    None,
+                    Some(tg_icon(IconName::Copy, 12.5, pal.text_secondary).into_any_element()),
+                    pal,
+                    move |this, _| {
+                        this.copied_feedback = Some(format!("{copied_prefix}: {cp}"));
+                        this.pending_action = Some(InspectorAction::CopyText(cp.clone()));
+                    },
+                    cx,
+                ));
             }
         }
-        Some(card)
-    };
+        sec
+    });
 
-    let media_preview_card = if shared_media.media_items.is_empty() {
-        None
-    } else {
-        Some(
-            grouped_card(pal)
-                .p(px(12.0))
-                .flex()
-                .flex_col()
-                .gap(px(10.0))
+    let media_section = (!shared_media.media_items.is_empty()).then(|| {
+        let mut sec = div().w_full().flex().flex_col().gap(px(6.0)).child(
+            muse_collapsible_header(
+                "contact-sec-media-hdr",
+                "contact-sec-media",
+                tr_str(lang, "照片与媒体", "Photos & Media"),
+                media_collapsed,
+                pal,
+                cx,
+            ),
+        );
+        if !media_collapsed {
+            sec = sec
                 .child(
                     div()
+                        .px(px(6.0))
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(pal.text_primary))
-                                .child(tr_str(lang, "照片与媒体", "Photos & Media")),
-                        )
-                        .child(
-                            div()
-                                .id("inspector-media-see-all")
-                                .cursor_pointer()
-                                .text_size(px(11.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(pal.accent))
-                                .hover(|s| s.underline())
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _e, _w, cx| {
-                                        this.set_tab(InspectorTab::SharedMedia);
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(tr_str(lang, "查看全部", "See All")),
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .children(
+                            shared_media
+                                .media_items
+                                .iter()
+                                .take(6)
+                                .map(|item| render_media_thumb_tile(item, 88.0, pal, cx)),
                         ),
                 )
                 .child(
-                    div().flex().flex_wrap().gap(px(6.0)).children(
-                        shared_media
-                            .media_items
-                            .iter()
-                            .take(6)
-                            .map(|item| render_media_thumb_tile(item, 84.0, pal, cx)),
-                    ),
+                    div()
+                        .id("inspector-media-see-all")
+                        .cursor_pointer()
+                        .py(px(4.0))
+                        .flex()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(pal.text_secondary))
+                        .hover(|s| s.text_color(rgb(pal.text_primary)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _e, _w, cx| {
+                                this.set_tab(InspectorTab::SharedMedia);
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "查看所有照片与媒体", "See all shared media")),
+                );
+        }
+        sec
+    });
+
+    let mut privacy_sec = div().w_full().flex().flex_col().gap(px(2.0)).child(
+        muse_collapsible_header(
+            "contact-sec-privacy-hdr",
+            "contact-sec-privacy",
+            tr_str(lang, "通知与隐私", "Notifications & Privacy"),
+            privacy_collapsed,
+            pal,
+            cx,
+        ),
+    );
+    if !privacy_collapsed {
+        let mute_on = model.is_notifications_enabled;
+        privacy_sec = privacy_sec
+            .child(muse_icon_row(
+                "inspector-quick-mute",
+                if mute_on { IconName::Speaker } else { IconName::Mute },
+                if mute_on { pal.accent } else { pal.text_secondary },
+                tr_str(lang, "消息通知", "Notifications"),
+                Some(
+                    if mute_on {
+                        tr_str(lang, "已开启声音与横幅提醒", "Alerts enabled")
+                    } else {
+                        tr_str(lang, "已静音通知", "Muted")
+                    }
+                    .to_string(),
                 ),
-        )
-    };
+                None,
+                Some(apple_switch_pill(mute_on, pal).into_any_element()),
+                pal,
+                |this, _| {
+                    this.profile.is_notifications_enabled = !this.profile.is_notifications_enabled;
+                    this.pending_action = Some(InspectorAction::ToggleNotifications(
+                        this.profile.is_notifications_enabled,
+                    ));
+                },
+                cx,
+            ))
+            .child(muse_icon_row(
+                "inspector-secret-chat-toggle",
+                IconName::Lock,
+                if is_secret_chat_active { pal.success } else { pal.accent },
+                if is_secret_chat_active {
+                    tr_str(lang, "端到端加密已开启", "Secret Chat Active")
+                } else {
+                    tr_str(lang, "开启加密聊天", "Start Secret Chat")
+                },
+                None,
+                None,
+                Some(apple_switch_pill(is_secret_chat_active, pal).into_any_element()),
+                pal,
+                |this, _| {
+                    this.is_secret_chat_active = !this.is_secret_chat_active;
+                },
+                cx,
+            ))
+            .child(muse_icon_row(
+                "inspector-edit-peer-row",
+                IconName::Edit,
+                pal.icon_fg,
+                tr_str(lang, "编辑联系人信息", "Edit Contact Info"),
+                None,
+                None,
+                Some(tg_icon(IconName::ChevronRight, 12.0, pal.text_secondary).into_any_element()),
+                pal,
+                |this, _| {
+                    this.pending_action = Some(InspectorAction::OpenEditPeer);
+                },
+                cx,
+            ))
+            .child(muse_icon_row(
+                "inspector-block-contact-row",
+                IconName::Close,
+                pal.danger,
+                if is_contact_blocked {
+                    tr_str(lang, "取消屏蔽联系人", "Unblock Contact")
+                } else {
+                    tr_str(lang, "屏蔽此联系人", "Block Contact")
+                },
+                None,
+                Some(pal.danger),
+                None,
+                pal,
+                |this, _| {
+                    this.is_contact_blocked = !this.is_contact_blocked;
+                },
+                cx,
+            ));
+    }
 
     div()
         .flex()
         .flex_col()
-        .gap(px(12.0))
-        // Hero Profile Section
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .pt(px(4.0))
-                .pb(px(4.0))
-                .gap(px(6.0))
-                .child(avatar)
-                .child(
-                    div()
-                        .pt(px(4.0))
-                        .text_size(px(18.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.text_primary))
-                        .text_center()
-                        .child(if model.name.is_empty() {
-                            tr_str(lang, "未选择对话", "No chat selected").to_string()
-                        } else {
-                            model.name.clone()
-                        }),
-                )
-                .when(!subtitle_text.is_empty(), |col| {
-                    col.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(5.0))
-                            .when(is_online, |row| {
-                                row.child(
-                                    div()
-                                        .w(px(7.0))
-                                        .h(px(7.0))
-                                        .rounded_full()
-                                        .bg(rgb(pal.online_dot_fg)),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(pal.text_secondary))
-                                    .child(subtitle_text),
-                            ),
-                    )
-                }),
-        )
-        // 4-Tile Apple Quick Action Strip
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(apple_quick_action_tile(
-                    "inspector-quick-audio",
-                    IconName::PhoneCall,
-                    pal.accent,
-                    tr_str(lang, "语音", "Audio"),
-                    pal.accent,
-                    pal,
-                    move |this| {
-                        this.pending_action =
-                            Some(InspectorAction::StartVoiceCall(peer_name.clone()));
-                    },
-                    cx,
-                ))
-                .child(apple_quick_action_tile(
-                    "inspector-quick-video",
-                    IconName::VideoCall,
-                    pal.accent,
-                    tr_str(lang, "视频", "Video"),
-                    pal.accent,
-                    pal,
-                    move |this| {
-                        this.pending_action =
-                            Some(InspectorAction::StartVideoCall(peer_for_vid.clone()));
-                    },
-                    cx,
-                ))
-                .child(apple_quick_action_tile(
-                    "inspector-quick-mute",
-                    IconName::Mute,
-                    mute_icon_color,
-                    mute_label,
-                    mute_icon_color,
-                    pal,
-                    |this| {
-                        this.profile.is_notifications_enabled =
-                            !this.profile.is_notifications_enabled;
-                        this.pending_action = Some(InspectorAction::ToggleNotifications(
-                            this.profile.is_notifications_enabled,
-                        ));
-                    },
-                    cx,
-                ))
-                .child(apple_quick_action_tile(
-                    "inspector-quick-info",
-                    IconName::Edit,
-                    pal.accent,
-                    tr_str(lang, "信息", "Info"),
-                    pal.accent,
-                    pal,
-                    |this| {
-                        this.pending_action = Some(InspectorAction::OpenEditPeer);
-                    },
-                    cx,
-                )),
-        )
-        // Bio & Contact Facts Grouped Card
-        .when_some(facts_card, |col, card| col.child(card))
+        .gap(px(14.0))
         .when_some(copied_feedback.cloned(), |col, hint| {
             col.child(
                 div()
                     .w_full()
-                    .px(px(12.0))
-                    .py(px(7.0))
-                    .rounded(px(10.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(9.0))
                     .bg(TdesktopThemePalette::rgba_with_alpha(pal.success, 0.12))
-                    .border_1()
-                    .border_color(TdesktopThemePalette::rgba_with_alpha(pal.success, 0.28))
                     .text_size(px(11.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(pal.success))
                     .child(hint),
             )
         })
-        // Shared Media 3-Column Preview Card
-        .when_some(media_preview_card, |col, card| col.child(card))
-        // Privacy & Secret Chat Card
-        .child(
-            grouped_card(pal).child(
-                div()
-                    .id("inspector-secret-chat-toggle")
-                    .cursor_pointer()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(11.0))
-                    .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _e, _w, cx| {
-                            this.is_secret_chat_active = !this.is_secret_chat_active;
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(9.0))
-                            .child(tg_icon(
-                                IconName::Lock,
-                                15.0,
-                                if is_secret_chat_active {
-                                    pal.success
-                                } else {
-                                    pal.accent
-                                },
-                            ))
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(pal.text_primary))
-                                    .child(if is_secret_chat_active {
-                                        tr_str(lang, "端到端加密已开启", "Secret Chat Active")
-                                    } else {
-                                        tr_str(lang, "开启加密聊天", "Start Secret Chat")
-                                    }),
-                            ),
-                    )
-                    .child(apple_switch_pill(is_secret_chat_active, pal)),
-            ),
-        )
-        // Cleanly Separated Red Destructive Action Card
-        .child(
-            grouped_card(pal).child(
-                div()
-                    .id("inspector-block-contact-row")
-                    .cursor_pointer()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(11.0))
-                    .hover(move |s| {
-                        s.bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.10))
-                    })
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _e, _w, cx| {
-                            this.is_contact_blocked = !this.is_contact_blocked;
-                            cx.notify();
-                        }),
-                    )
-                    .child(tg_icon(IconName::Close, 15.0, pal.danger))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(pal.danger))
-                            .child(if is_contact_blocked {
-                                tr_str(lang, "取消屏蔽联系人", "Unblock Contact")
-                            } else {
-                                tr_str(lang, "屏蔽此联系人", "Block Contact")
-                            }),
-                    ),
-            ),
-        )
+        .when_some(info_section, |col, sec| col.child(sec))
+        .when_some(media_section, |col, sec| col.child(sec))
+        .child(privacy_sec)
         .into_any_element()
 }
 
