@@ -320,9 +320,20 @@ impl SessionPersistenceBridge {
 
     fn resolve_storage_path() -> PathBuf {
         if let Ok(custom) = std::env::var("GPUI_TELEGRAM_STATE_PATH") {
-            return PathBuf::from(custom);
+            let trimmed = custom.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
         }
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = std::env::var("HOME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("USERPROFILE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+        {
             return PathBuf::from(home).join(".gpui_telegram_session_v1.json");
         }
         std::env::temp_dir().join("gpui_telegram_session_v1.json")

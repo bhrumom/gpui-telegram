@@ -561,32 +561,25 @@ impl PtyMuxServer {
         let handle = self
             .find_handle(name_or_id)
             .ok_or_else(|| RemoteEngineError::NotFound(format!("session '{name_or_id}' not found")))?;
-        let (session_id, mut rx) = {
+        let (session_id, shell, mut rx) = {
             let h = handle.read();
             if !h.info.alive {
                 return Err(RemoteEngineError::Other(format!(
                     "terminal session '{name_or_id}' is not alive"
                 )));
             }
-            (h.info.session_id.clone(), h.output_tx.subscribe())
+            (
+                h.info.session_id.clone(),
+                h.info.shell.clone(),
+                h.output_tx.subscribe(),
+            )
         };
 
-        let token = uuid::Uuid::new_v4().simple().to_string();
+        let full_token = uuid::Uuid::new_v4().simple().to_string();
+        let token = &full_token[..16];
         let sentinel_prefix = format!("__FABUSHI_EXEC_{token}__:");
-
-        #[cfg(windows)]
-        let script = {
-            format!(
-                "{command}\r\n$__fb_ec = if ($?) {{ 0 }} else {{ if ($LASTEXITCODE -ne $null) {{ $LASTEXITCODE }} else {{ 1 }} }}; Write-Output (\"__FABUSHI_\" + \"EXEC_{token}__:\" + $__fb_ec)\r\n"
-            )
-        };
-        #[cfg(not(windows))]
-        let script = {
-            // Split sentinel literal across single-quoted chunks so PTY ECHO never matches sentinel_prefix!
-            format!(
-                "{command}\n__fb_ec=$?; printf '\\n__FABUSHI_''EXEC_%s__:%d\\n' '{token}' \"$__fb_ec\"\n"
-            )
-        };
+        const SENTINEL_SUFFIX: &str = "__FB_END__";
+        let script = build_exec_script(&shell, cfg!(windows), command, token);
 
         self.write_input(name_or_id, script.as_bytes())?;
 
@@ -605,14 +598,16 @@ impl PtyMuxServer {
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(chunk)) => {
                     collected.push_str(&String::from_utf8_lossy(&chunk));
-                    let normalized = collected.replace('\r', "");
+                    let normalized = normalize_pty_output(&collected);
                     if let Some(pos) = normalized.find(&sentinel_prefix) {
                         let after = &normalized[pos + sentinel_prefix.len()..];
-                        if let Some(nl_pos) = after.find('\n') {
-                            let code_str = after[..nl_pos].trim();
+                        if let Some(end_pos) =
+                            after.find(SENTINEL_SUFFIX).or_else(|| after.find('\n'))
+                        {
+                            let code_str = after[..end_pos].trim();
                             exit_code = code_str.parse::<i32>().unwrap_or(0);
                             let before = &normalized[..pos];
-                            let cleaned = strip_exec_wrapper_echo(before, command);
+                            let cleaned = strip_exec_wrapper_echo(before, command, token);
                             return Ok(TerminalExecResultDto {
                                 session_id,
                                 exit_code,
@@ -631,7 +626,8 @@ impl PtyMuxServer {
             }
         }
 
-        let cleaned = strip_exec_wrapper_echo(&collected.replace('\r', ""), command);
+        let normalized = normalize_pty_output(&collected);
+        let cleaned = strip_exec_wrapper_echo(&normalized, command, token);
         Ok(TerminalExecResultDto {
             session_id,
             exit_code,
@@ -648,15 +644,266 @@ impl PtyMuxServer {
     }
 }
 
-fn strip_exec_wrapper_echo(raw: &str, command: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecShellKind {
+    PosixSh,
+    WindowsCmd,
+    WindowsPowerShell,
+}
+
+fn detect_exec_shell_kind(shell: &str, is_windows: bool) -> ExecShellKind {
+    let first = shell.split_whitespace().next().unwrap_or("");
+    let cleaned = first.trim_matches(|c| c == '"' || c == '\'');
+    let base = cleaned
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    match stem {
+        "powershell" | "pwsh" => ExecShellKind::WindowsPowerShell,
+        "cmd" => ExecShellKind::WindowsCmd,
+        "sh" | "bash" | "zsh" | "dash" | "fish" | "ash" => ExecShellKind::PosixSh,
+        _ if is_windows => ExecShellKind::WindowsCmd,
+        _ => ExecShellKind::PosixSh,
+    }
+}
+
+fn build_exec_script(shell: &str, is_windows: bool, command: &str, token: &str) -> String {
+    match detect_exec_shell_kind(shell, is_windows) {
+        ExecShellKind::WindowsCmd => {
+            let normalized_cmd = command.replace("\r\n", "\r").replace('\n', "\r");
+            // Reset stale ERRORLEVEL with `ver >nul` and split sentinel with `^` so PTY echo never matches sentinel_prefix.
+            format!(
+                "ver >nul\r{normalized_cmd}\recho __FABUSHI_^EXEC_{token}__:%ERRORLEVEL%__FB_END__\r"
+            )
+        }
+        ExecShellKind::WindowsPowerShell => {
+            let normalized_cmd = command.replace("\r\n", "\r").replace('\n', "\r");
+            format!(
+                "$global:LASTEXITCODE = 0\r{normalized_cmd}\r$__fb_ok = $?; $__fb_ec = if ($__fb_ok) {{ if ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }} }} else {{ if ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }} }}; Write-Output (\"__FABUSHI_\" + \"EXEC_{token}__:\" + $__fb_ec + \"__FB_END__\")\r"
+            )
+        }
+        ExecShellKind::PosixSh => {
+            // Split sentinel literal across single-quoted chunks so PTY ECHO never matches sentinel_prefix.
+            format!(
+                "{command}\n__fb_ec=$?; printf '\\n__FABUSHI_''EXEC_%s__:%d__FB_END__\\n' '{token}' \"$__fb_ec\"\n"
+            )
+        }
+    }
+}
+
+/// Normalizes VT100/ANSI screen-diff output (such as Windows ConPTY CSI cursor positioning and
+/// cursor-forward spaces) into plain UTF-8 text with standard `\n` line breaks.
+pub fn normalize_pty_output(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut cur_row: u32 = 1;
+    let mut cur_col: u32 = 1;
+    let mut has_output = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            0x00 => {
+                i += 1;
+            }
+            b'\r' => {
+                cur_col = 1;
+                i += 1;
+            }
+            0x08 => {
+                cur_col = cur_col.saturating_sub(1).max(1);
+                i += 1;
+            }
+            b'\n' => {
+                out.push('\n');
+                cur_row = cur_row.saturating_add(1);
+                cur_col = 1;
+                i += 1;
+            }
+            b'\t' => {
+                out.push('\t');
+                cur_col = ((cur_col.saturating_sub(1)) / 8 + 1) * 8 + 1;
+                has_output = true;
+                i += 1;
+            }
+            0x1B => {
+                i += 1;
+                if i >= bytes.len() {
+                    break;
+                }
+                match bytes[i] {
+                    // OSC sequence: ESC ] ... (BEL | ST)
+                    b']' => {
+                        i += 1;
+                        while i < bytes.len() {
+                            if bytes[i] == 0x07 {
+                                i += 1;
+                                break;
+                            }
+                            if bytes[i] == 0x1B && bytes.get(i + 1) == Some(&b'\\') {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    // DCS / APC / PM / SOS strings terminated by ST (ESC \)
+                    b'P' | b'_' | b'^' | b'X' => {
+                        i += 1;
+                        while i < bytes.len() {
+                            if bytes[i] == 0x1B && bytes.get(i + 1) == Some(&b'\\') {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    // CSI sequence: ESC [ <params/intermediates> <final 0x40..=0x7E>
+                    b'[' => {
+                        i += 1;
+                        let param_start = i;
+                        while i < bytes.len() && (0x20..=0x3F).contains(&bytes[i]) {
+                            i += 1;
+                        }
+                        let param_end = i;
+                        if i >= bytes.len() {
+                            break;
+                        }
+                        let final_byte = bytes[i];
+                        i += 1;
+
+                        let param_bytes = &bytes[param_start..param_end];
+                        let is_standard = param_bytes
+                            .iter()
+                            .all(|&c| c.is_ascii_digit() || c == b';');
+                        if is_standard {
+                            let param_str = std::str::from_utf8(param_bytes).unwrap_or("");
+                            let mut parts = param_str.split(';').map(|s| {
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    s.parse::<u32>().ok()
+                                }
+                            });
+                            let p0 = parts.next().and_then(|o| o);
+                            let p1 = parts.next().and_then(|o| o);
+
+                            match final_byte {
+                                b'H' | b'f' => {
+                                    let row = p0.unwrap_or(1).max(1);
+                                    let col = p1.unwrap_or(1).max(1);
+                                    if row != cur_row {
+                                        if has_output && !out.ends_with('\n') {
+                                            out.push('\n');
+                                        }
+                                        cur_row = row;
+                                        cur_col = col;
+                                    } else {
+                                        if col > cur_col {
+                                            let spaces = (col - cur_col).min(16);
+                                            for _ in 0..spaces {
+                                                out.push(' ');
+                                            }
+                                            has_output = true;
+                                        }
+                                        cur_col = col;
+                                    }
+                                }
+                                b'G' => {
+                                    let col = p0.unwrap_or(1).max(1);
+                                    if col > cur_col {
+                                        let spaces = (col - cur_col).min(16);
+                                        for _ in 0..spaces {
+                                            out.push(' ');
+                                        }
+                                        has_output = true;
+                                    }
+                                    cur_col = col;
+                                }
+                                b'C' => {
+                                    let n = p0.unwrap_or(1).max(1).min(16);
+                                    for _ in 0..n {
+                                        out.push(' ');
+                                    }
+                                    cur_col = cur_col.saturating_add(n);
+                                    has_output = true;
+                                }
+                                b'B' | b'E' => {
+                                    let n = p0.unwrap_or(1).max(1);
+                                    if has_output && !out.ends_with('\n') {
+                                        out.push('\n');
+                                    }
+                                    cur_row = cur_row.saturating_add(n);
+                                    if final_byte == b'E' {
+                                        cur_col = 1;
+                                    }
+                                }
+                                b'd' => {
+                                    let row = p0.unwrap_or(1).max(1);
+                                    if row != cur_row && has_output && !out.ends_with('\n') {
+                                        out.push('\n');
+                                    }
+                                    cur_row = row;
+                                }
+                                b'J' => {
+                                    if has_output && !out.ends_with('\n') {
+                                        out.push('\n');
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // Charset selection sequences: ESC ( X / ESC ) X / ESC * X / ESC + X
+                    b'(' | b')' | b'*' | b'+' => {
+                        i = (i + 2).min(bytes.len());
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            0x01..=0x1F | 0x7F => {
+                i += 1;
+            }
+            _ => {
+                if let Some(ch) = raw[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                    cur_col = cur_col.saturating_add(1);
+                    has_output = true;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn strip_exec_wrapper_echo(raw: &str, command: &str, token: &str) -> String {
     let cmd_first_line = command.lines().next().unwrap_or("").trim();
     let lines: Vec<&str> = raw
         .lines()
         .filter(|line| {
             let t = line.trim();
-            !t.contains("__fb_ec=$?")
+            !t.contains("__fb_ec=")
+                && !t.contains("$__fb_ok")
+                && !t.contains("$__fb_ec")
+                && !t.contains("$global:LASTEXITCODE = 0")
+                && !t.contains("if ($LASTEXITCODE) { $LASTEXITCODE }")
                 && !t.contains("__FABUSHI_")
-                && (cmd_first_line.is_empty() || t != cmd_first_line)
+                && !t.contains("__FB_END__")
+                && (token.is_empty() || !t.contains(token))
+                && !t.contains("ver >nul")
+                && (cmd_first_line.is_empty()
+                    || (t != cmd_first_line
+                        && !t.ends_with(&format!(">{cmd_first_line}"))
+                        && !t.ends_with(&format!("> {cmd_first_line}"))))
         })
         .collect();
     lines.join("\n").trim().to_string()

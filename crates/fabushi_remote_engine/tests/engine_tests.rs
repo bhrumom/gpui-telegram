@@ -15,8 +15,8 @@ use fabushi_remote_engine::terminal::client_tty::{
     run_local_tty_attach, DetachEscapeParser, EscapeAction, TtyAttachOptions,
 };
 use fabushi_remote_engine::terminal::{
-    detect_osc52_sequences, handle_terminal_ipc_method, Osc52StreamScanner, PtyMuxServer,
-    FABUSHI_IN_MUX_ENV,
+    detect_osc52_sequences, handle_terminal_ipc_method, normalize_pty_output, Osc52StreamScanner,
+    PtyMuxServer, FABUSHI_IN_MUX_ENV,
 };
 use fabushi_remote_engine::RemoteEngineError;
 use gpui_telegram_proto::remote_control_contracts::{
@@ -51,10 +51,25 @@ impl LocalIpcHandler for TestIpcHandler {
     }
 }
 
+fn test_ipc_endpoint(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        tmp.path().join(format!("{name}.sock"))
+    }
+    #[cfg(windows)]
+    {
+        let _ = tmp;
+        std::path::PathBuf::from(format!(
+            r"\\.\pipe\fabushi-test-{}-{name}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+}
+
 #[tokio::test]
 async fn test_ipc_roundtrip_permissions_and_uid_check() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let sock = tmp.path().join("ipc.sock");
+    let sock = test_ipc_endpoint(&tmp, "ipc");
     let mux = Arc::new(PtyMuxServer::new());
     let server = LocalIpcServer::bind(sock.clone(), Arc::new(TestIpcHandler { mux }))
         .await
@@ -182,7 +197,7 @@ async fn test_pty_mux_lifecycle_persistence_exec_env_and_nested_loop_prevention(
 
     // Execute commands in the unattached persistent PTY
     let res1 = mux
-        .exec_command("dev-shell", "echo fabushi_pty_ok", 5_000)
+        .exec_command("dev-shell", "echo fabushi_pty_ok", 10_000)
         .await
         .expect("exec echo");
     assert!(!res1.timed_out);
@@ -196,7 +211,7 @@ async fn test_pty_mux_lifecycle_persistence_exec_env_and_nested_loop_prevention(
     #[cfg(unix)]
     {
         let res_fail = mux
-            .exec_command("dev-shell", "false", 5_000)
+            .exec_command("dev-shell", "false", 10_000)
             .await
             .expect("exec false");
         assert!(!res_fail.timed_out);
@@ -206,7 +221,7 @@ async fn test_pty_mux_lifecycle_persistence_exec_env_and_nested_loop_prevention(
             .exec_command(
                 "dev-shell",
                 "echo MUX=$FABUSHI_IN_MUX TMUX_SET=${TMUX:-none}",
-                5_000,
+                10_000,
             )
             .await
             .expect("exec env");
@@ -215,9 +230,40 @@ async fn test_pty_mux_lifecycle_persistence_exec_env_and_nested_loop_prevention(
         assert!(res_env.output.contains("TMUX_SET=none"));
     }
 
+    #[cfg(windows)]
+    {
+        let res_fail = mux
+            .exec_command("dev-shell", "cmd /c exit 7", 10_000)
+            .await
+            .expect("exec non-zero");
+        assert!(
+            !res_fail.timed_out,
+            "cmd non-zero exec timed out: {:?}",
+            res_fail.output
+        );
+        assert_eq!(res_fail.exit_code, 7);
+
+        // Subsequent command must observe ERRORLEVEL reset back to 0 and FABUSHI_IN_MUX=1.
+        let res_env = mux
+            .exec_command("dev-shell", "echo MUX=%FABUSHI_IN_MUX%", 10_000)
+            .await
+            .expect("exec env after error");
+        assert!(
+            !res_env.timed_out,
+            "cmd env exec timed out: {:?}",
+            res_env.output
+        );
+        assert_eq!(res_env.exit_code, 0);
+        assert!(
+            res_env.output.contains("MUX=1"),
+            "unexpected env output: {:?}",
+            res_env.output
+        );
+    }
+
     // Nested FABUSHI_IN_MUX=1 protection
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let sock = tmp.path().join("mux.sock");
+    let sock = test_ipc_endpoint(&tmp, "mux");
     let server = LocalIpcServer::bind(sock.clone(), Arc::new(TestIpcHandler { mux: Arc::clone(&mux) }))
         .await
         .expect("bind");
@@ -490,4 +536,76 @@ fn test_clipboard_loop_prevention_and_wol_and_headless_subsystems() {
     assert!(PowerManager::execute_power_action(&PowerActionKind::Lock)
         .unwrap()
         .contains("headless"));
+}
+
+#[test]
+fn test_normalize_pty_output_conpty_vt100_sequences() {
+    let raw = concat!(
+        "\x1b]0;cmd.exe\x07",
+        "\x1b[2J\x1b[m\x1b[H",
+        "\x1b[2;1HC:\\Users\\Admin>whoami\x1b[1Cand\x1b[1Chost",
+        "\x1b[3;1H\x1b[32m0cadhjae-vmejbe\\administrator\x1b[0m",
+        "\x1b[4;1H__FABUSHI_EXEC_0123456789abcdef__:0__FB_END__",
+        "\x1b[?25h"
+    );
+    let norm = normalize_pty_output(raw);
+    let lines: Vec<&str> = norm.lines().collect();
+    assert_eq!(lines[0], "C:\\Users\\Admin>whoami and host");
+    assert_eq!(lines[1], "0cadhjae-vmejbe\\administrator");
+    assert_eq!(lines[2], "__FABUSHI_EXEC_0123456789abcdef__:0__FB_END__");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn test_windows_powershell_pty_exec() {
+    let mux = Arc::new(PtyMuxServer::new());
+    let created = mux
+        .new_session(Some("ps-ci"), Some("powershell.exe"), 120, 30, None)
+        .expect("spawn powershell ConPTY");
+    assert!(created.alive);
+
+    let res1 = mux
+        .exec_command("ps-ci", "Write-Output fabushi_ps_ok", 20_000)
+        .await
+        .expect("exec ps Write-Output");
+    assert!(
+        !res1.timed_out,
+        "powershell Write-Output timed out: {:?}",
+        res1.output
+    );
+    assert_eq!(res1.exit_code, 0);
+    assert!(
+        res1.output.contains("fabushi_ps_ok"),
+        "unexpected ps output: {:?}",
+        res1.output
+    );
+
+    let res_err = mux
+        .exec_command("ps-ci", "cmd /c exit 7", 15_000)
+        .await
+        .expect("exec ps non-zero");
+    assert!(
+        !res_err.timed_out,
+        "powershell non-zero exec timed out: {:?}",
+        res_err.output
+    );
+    assert_eq!(res_err.exit_code, 7);
+
+    let res_rec = mux
+        .exec_command("ps-ci", "Write-Output after_err_ok", 15_000)
+        .await
+        .expect("exec ps recovery");
+    assert!(
+        !res_rec.timed_out,
+        "powershell recovery timed out: {:?}",
+        res_rec.output
+    );
+    assert_eq!(res_rec.exit_code, 0);
+    assert!(
+        res_rec.output.contains("after_err_ok"),
+        "unexpected ps recovery output: {:?}",
+        res_rec.output
+    );
+
+    assert!(mux.kill_session("ps-ci").expect("kill ps session"));
 }

@@ -394,7 +394,6 @@ mod win_impl {
     const EXTENDED_STARTUPINFO_PRESENT: DWORD = 0x0008_0000;
     const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x0000_0400;
     const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
-    const HANDLE_FLAG_INHERIT: DWORD = 0x0000_0001;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -404,6 +403,7 @@ mod win_impl {
     }
 
     #[repr(C)]
+    #[allow(dead_code)]
     struct SECURITY_ATTRIBUTES {
         n_length: DWORD,
         lp_security_descriptor: *mut c_void,
@@ -454,7 +454,6 @@ mod win_impl {
             lp_pipe_attributes: *const SECURITY_ATTRIBUTES,
             n_size: DWORD,
         ) -> BOOL;
-        fn SetHandleInformation(h_object: HANDLE, dw_mask: DWORD, dw_flags: DWORD) -> BOOL;
         fn CreatePseudoConsole(
             size: COORD,
             h_input: HANDLE,
@@ -514,8 +513,8 @@ mod win_impl {
 
     pub struct WinPty {
         hpcon: Mutex<usize>,
-        in_write: Mutex<usize>,
-        h_process: Mutex<usize>,
+        in_write: Arc<Mutex<usize>>,
+        h_process: Arc<Mutex<usize>>,
         alive: Arc<AtomicBool>,
     }
 
@@ -530,7 +529,7 @@ mod win_impl {
     }
 
     fn build_utf16_env_block() -> Vec<u16> {
-        let mut block: Vec<u16> = Vec::new();
+        let mut entries: Vec<(String, String)> = Vec::new();
         for (k, v) in std::env::vars() {
             if k.eq_ignore_ascii_case("TMUX")
                 || k.eq_ignore_ascii_case("TMUX_PANE")
@@ -538,16 +537,81 @@ mod win_impl {
             {
                 continue;
             }
+            entries.push((k, v));
+        }
+        entries.push((
+            crate::terminal::FABUSHI_IN_MUX_ENV.to_string(),
+            "1".to_string(),
+        ));
+        entries.sort_by(|a, b| a.0.to_ascii_uppercase().cmp(&b.0.to_ascii_uppercase()));
+
+        let mut block: Vec<u16> = Vec::new();
+        for (k, v) in entries {
             block.extend(std::ffi::OsStr::new(&format!("{k}={v}")).encode_wide());
             block.push(0);
         }
-        block.extend(
-            std::ffi::OsStr::new(&format!("{}=1", crate::terminal::FABUSHI_IN_MUX_ENV))
-                .encode_wide(),
-        );
-        block.push(0);
         block.push(0);
         block
+    }
+
+    fn write_handle_all(in_write: &Mutex<usize>, data: &[u8]) -> EngineResult<()> {
+        let guard = in_write.lock();
+        let h = *guard as HANDLE;
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return Err(RemoteEngineError::Other("ConPTY input closed".into()));
+        }
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let mut written: DWORD = 0;
+            let remaining = &data[offset..];
+            let chunk_len = remaining.len().min(DWORD::MAX as usize) as DWORD;
+            let ok = unsafe {
+                WriteFile(
+                    h,
+                    remaining.as_ptr(),
+                    chunk_len,
+                    &mut written,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(RemoteEngineError::Io(std::io::Error::last_os_error()));
+            }
+            if written == 0 {
+                return Err(RemoteEngineError::Other(
+                    "ConPTY WriteFile wrote 0 bytes".into(),
+                ));
+            }
+            offset += written as usize;
+        }
+        Ok(())
+    }
+
+    /// Detects ConPTY Device Status Report cursor position queries (`ESC [ 6 n` / `ESC [ ? 6 n`)
+    /// across chunk boundaries and responds immediately so conhost / PSReadLine never stalls.
+    fn scan_and_reply_dsr(tail: &mut Vec<u8>, chunk: &[u8], in_write: &Mutex<usize>) {
+        let mut scan = Vec::with_capacity(tail.len() + chunk.len());
+        scan.extend_from_slice(tail);
+        scan.extend_from_slice(chunk);
+
+        let mut idx = 0usize;
+        let mut last_match_end = 0usize;
+        while idx < scan.len() {
+            if scan[idx..].starts_with(b"\x1b[6n") {
+                let _ = write_handle_all(in_write, b"\x1b[1;1R");
+                idx += 4;
+                last_match_end = idx;
+            } else if scan[idx..].starts_with(b"\x1b[?6n") {
+                let _ = write_handle_all(in_write, b"\x1b[?1;1R");
+                idx += 5;
+                last_match_end = idx;
+            } else {
+                idx += 1;
+            }
+        }
+        let keep_from = last_match_end.max(scan.len().saturating_sub(4));
+        tail.clear();
+        tail.extend_from_slice(&scan[keep_from..]);
     }
 
     impl WinPty {
@@ -564,19 +628,16 @@ mod win_impl {
             let mut in_write: HANDLE = ptr::null_mut();
             let mut out_read: HANDLE = ptr::null_mut();
             let mut out_write: HANDLE = ptr::null_mut();
-            let sa = SECURITY_ATTRIBUTES {
-                n_length: std::mem::size_of::<SECURITY_ATTRIBUTES>() as DWORD,
-                lp_security_descriptor: ptr::null_mut(),
-                b_inherit_handle: 1,
-            };
             unsafe {
-                if CreatePipe(&mut in_read, &mut in_write, &sa, 0) == 0
-                    || CreatePipe(&mut out_read, &mut out_write, &sa, 0) == 0
-                {
+                if CreatePipe(&mut in_read, &mut in_write, ptr::null(), 0) == 0 {
                     return Err(RemoteEngineError::Io(std::io::Error::last_os_error()));
                 }
-                SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0);
-                SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
+                if CreatePipe(&mut out_read, &mut out_write, ptr::null(), 0) == 0 {
+                    let err = std::io::Error::last_os_error();
+                    CloseHandle(in_read);
+                    CloseHandle(in_write);
+                    return Err(RemoteEngineError::Io(err));
+                }
             }
 
             let mut hpcon: HPCON = ptr::null_mut();
@@ -585,12 +646,10 @@ mod win_impl {
                 y: rows.max(4) as i16,
             };
             let hr = unsafe { CreatePseudoConsole(size, in_read, out_write, 0, &mut hpcon) };
-            unsafe {
-                CloseHandle(in_read);
-                CloseHandle(out_write);
-            }
             if hr != 0 || hpcon.is_null() {
                 unsafe {
+                    CloseHandle(in_read);
+                    CloseHandle(out_write);
                     CloseHandle(in_write);
                     CloseHandle(out_read);
                 }
@@ -607,10 +666,13 @@ mod win_impl {
             let attr_ptr = attr_buf.as_mut_ptr() as *mut c_void;
             unsafe {
                 if InitializeProcThreadAttributeList(attr_ptr, 1, 0, &mut attr_size) == 0 {
+                    let err = std::io::Error::last_os_error();
                     ClosePseudoConsole(hpcon);
+                    CloseHandle(in_read);
+                    CloseHandle(out_write);
                     CloseHandle(in_write);
                     CloseHandle(out_read);
-                    return Err(RemoteEngineError::Io(std::io::Error::last_os_error()));
+                    return Err(RemoteEngineError::Io(err));
                 }
                 if UpdateProcThreadAttribute(
                     attr_ptr,
@@ -622,11 +684,14 @@ mod win_impl {
                     ptr::null_mut(),
                 ) == 0
                 {
+                    let err = std::io::Error::last_os_error();
                     DeleteProcThreadAttributeList(attr_ptr);
                     ClosePseudoConsole(hpcon);
+                    CloseHandle(in_read);
+                    CloseHandle(out_write);
                     CloseHandle(in_write);
                     CloseHandle(out_read);
-                    return Err(RemoteEngineError::Io(std::io::Error::last_os_error()));
+                    return Err(RemoteEngineError::Io(err));
                 }
             }
 
@@ -635,7 +700,7 @@ mod win_impl {
             si.lp_attribute_list = attr_ptr;
 
             let cmd_target = if shell.trim().is_empty() {
-                "powershell.exe"
+                "cmd.exe"
             } else {
                 shell.trim()
             };
@@ -663,6 +728,9 @@ mod win_impl {
             };
             unsafe {
                 DeleteProcThreadAttributeList(attr_ptr);
+                // Child-side ConPTY pipe ends are closed after CreateProcessW per Microsoft ConPTY lifecycle guidance.
+                CloseHandle(in_read);
+                CloseHandle(out_write);
             }
             if ok == 0 {
                 let err = std::io::Error::last_os_error();
@@ -677,15 +745,19 @@ mod win_impl {
                 CloseHandle(pi.h_thread);
             }
 
+            let in_write_arc = Arc::new(Mutex::new(in_write as usize));
+            let h_process_arc = Arc::new(Mutex::new(pi.h_process as usize));
+
             let out_read_usize = out_read as usize;
-            let h_proc_usize = pi.h_process as usize;
+            let in_write_reader = Arc::clone(&in_write_arc);
+            let h_process_reader = Arc::clone(&h_process_arc);
             let alive_reader = Arc::clone(&alive);
             std::thread::Builder::new()
                 .name("fabushi-conpty-read".into())
                 .spawn(move || {
                     let out_h = out_read_usize as HANDLE;
-                    let proc_h = h_proc_usize as HANDLE;
                     let mut buf = [0u8; 8192];
+                    let mut dsr_tail: Vec<u8> = Vec::with_capacity(8);
                     loop {
                         let mut read_bytes: DWORD = 0;
                         let ok = unsafe {
@@ -700,46 +772,42 @@ mod win_impl {
                         if ok == 0 || read_bytes == 0 {
                             break;
                         }
-                        on_output(&buf[..read_bytes as usize]);
+                        let chunk = &buf[..read_bytes as usize];
+                        scan_and_reply_dsr(&mut dsr_tail, chunk, &in_write_reader);
+                        on_output(chunk);
                     }
                     unsafe {
                         CloseHandle(out_h);
-                        WaitForSingleObject(proc_h, 2_000);
                     }
-                    let mut code: DWORD = 0;
-                    let got = unsafe { GetExitCodeProcess(proc_h, &mut code) };
+                    let exit_code = {
+                        let guard = h_process_reader.lock();
+                        let proc_h = *guard as HANDLE;
+                        if proc_h.is_null() {
+                            None
+                        } else {
+                            unsafe {
+                                WaitForSingleObject(proc_h, 500);
+                            }
+                            let mut code: DWORD = 0;
+                            let got = unsafe { GetExitCodeProcess(proc_h, &mut code) };
+                            if got != 0 { Some(code as i32) } else { None }
+                        }
+                    };
                     alive_reader.store(false, Ordering::SeqCst);
-                    on_exit(if got != 0 { Some(code as i32) } else { None });
+                    on_exit(exit_code);
                 })
                 .map_err(RemoteEngineError::Io)?;
 
             Ok(Self {
                 hpcon: Mutex::new(hpcon as usize),
-                in_write: Mutex::new(in_write as usize),
-                h_process: Mutex::new(pi.h_process as usize),
+                in_write: in_write_arc,
+                h_process: h_process_arc,
                 alive,
             })
         }
 
         pub fn write_all(&self, data: &[u8]) -> EngineResult<()> {
-            let h = *self.in_write.lock() as HANDLE;
-            if h.is_null() || h == INVALID_HANDLE_VALUE {
-                return Err(RemoteEngineError::Other("ConPTY input closed".into()));
-            }
-            let mut written: DWORD = 0;
-            let ok = unsafe {
-                WriteFile(
-                    h,
-                    data.as_ptr(),
-                    data.len() as DWORD,
-                    &mut written,
-                    ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(RemoteEngineError::Io(std::io::Error::last_os_error()));
-            }
-            Ok(())
+            write_handle_all(&self.in_write, data)
         }
 
         pub fn resize(&self, cols: u16, rows: u16) -> EngineResult<()> {
@@ -760,31 +828,37 @@ mod win_impl {
         }
 
         pub fn kill(&self) -> EngineResult<()> {
-            let mut hp = self.hpcon.lock();
-            if *hp != 0 {
-                unsafe {
-                    ClosePseudoConsole(*hp as HPCON);
-                }
-                *hp = 0;
-            }
-            let mut iw = self.in_write.lock();
-            if *iw != 0 {
-                unsafe {
-                    CloseHandle(*iw as HANDLE);
-                }
-                *iw = 0;
-            }
-            let mut proc_h = self.h_process.lock();
-            if *proc_h != 0 {
-                if self.alive.load(Ordering::SeqCst) {
-                    unsafe {
-                        TerminateProcess(*proc_h as HANDLE, 1);
+            {
+                let mut proc_h = self.h_process.lock();
+                if *proc_h != 0 {
+                    if self.alive.load(Ordering::SeqCst) {
+                        unsafe {
+                            TerminateProcess(*proc_h as HANDLE, 1);
+                        }
                     }
+                    unsafe {
+                        CloseHandle(*proc_h as HANDLE);
+                    }
+                    *proc_h = 0;
                 }
-                unsafe {
-                    CloseHandle(*proc_h as HANDLE);
+            }
+            {
+                let mut hp = self.hpcon.lock();
+                if *hp != 0 {
+                    unsafe {
+                        ClosePseudoConsole(*hp as HPCON);
+                    }
+                    *hp = 0;
                 }
-                *proc_h = 0;
+            }
+            {
+                let mut iw = self.in_write.lock();
+                if *iw != 0 {
+                    unsafe {
+                        CloseHandle(*iw as HANDLE);
+                    }
+                    *iw = 0;
+                }
             }
             Ok(())
         }

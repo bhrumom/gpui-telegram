@@ -217,6 +217,17 @@ impl ClientConfig {
         }
     }
 
+    fn resolve_home_dir() -> Option<String> {
+        env::var("HOME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                env::var("USERPROFILE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+    }
+
     fn resolve_app_dir(config_dir: Option<&str>, home: Option<&str>) -> PathBuf {
         if let Some(dir) = config_dir.map(str::trim).filter(|s| !s.is_empty()) {
             return PathBuf::from(dir);
@@ -229,10 +240,10 @@ impl ClientConfig {
         PathBuf::from(".config").join("gpui_telegram")
     }
 
-    /// Returns base application configuration directory (`GPUI_TELEGRAM_CONFIG_DIR`, or `$HOME/.config/gpui_telegram`).
+    /// Returns base application configuration directory (`GPUI_TELEGRAM_CONFIG_DIR`, `$HOME/.config/gpui_telegram`, or `%USERPROFILE%/.config/gpui_telegram`).
     pub fn get_app_dir() -> PathBuf {
         let config_dir = env::var("GPUI_TELEGRAM_CONFIG_DIR").ok();
-        let home = env::var("HOME").ok();
+        let home = Self::resolve_home_dir();
         Self::resolve_app_dir(config_dir.as_deref(), home.as_deref())
     }
 
@@ -332,11 +343,14 @@ impl ClientConfig {
 
     /// Returns path to secondary XDG Data Home session persistence file (~/.local/share/gpui_telegram/session.json).
     pub fn get_xdg_data_session_path() -> PathBuf {
-        if let Ok(data_home) = env::var("XDG_DATA_HOME") {
-            PathBuf::from(data_home)
-                .join("gpui_telegram")
-                .join("session.json")
-        } else if let Ok(home) = env::var("HOME") {
+        if let Ok(data_home) = env::var("XDG_DATA_HOME").map(|s| s.trim().to_string()) {
+            if !data_home.is_empty() {
+                return PathBuf::from(data_home)
+                    .join("gpui_telegram")
+                    .join("session.json");
+            }
+        }
+        if let Some(home) = Self::resolve_home_dir() {
             PathBuf::from(home)
                 .join(".local")
                 .join("share")
@@ -474,24 +488,35 @@ mod tests {
         assert_eq!(cfg.config_source, ConfigSource::DefaultFallback);
     }
 
-    #[test]
-    fn test_app_dir_gpui_telegram_config_dir_override() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        struct EnvGuard {
-            key: &'static str,
-            prev: Option<String>,
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                prev: env::var(key).ok(),
+            }
         }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.prev {
-                        Some(val) => env::set_var(self.key, val),
-                        None => env::remove_var(self.key),
-                    }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(val) => env::set_var(self.key, val),
+                    None => env::remove_var(self.key),
                 }
             }
         }
+    }
 
+    #[test]
+    fn test_app_dir_gpui_telegram_config_dir_override() {
         // Pure helper precedence and trimming checks
         assert_eq!(
             ClientConfig::resolve_app_dir(Some("  /custom/gpui-cfg  "), Some("/Users/alice")),
@@ -507,11 +532,8 @@ mod tests {
         );
 
         // Live environment variable override check on ClientConfig::get_app_dir()
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvGuard {
-            key: "GPUI_TELEGRAM_CONFIG_DIR",
-            prev: env::var("GPUI_TELEGRAM_CONFIG_DIR").ok(),
-        };
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::capture("GPUI_TELEGRAM_CONFIG_DIR");
 
         let override_dir = env::temp_dir().join(format!(
             "gpui_telegram_config_override_{}",
@@ -532,7 +554,41 @@ mod tests {
         unsafe {
             env::set_var("GPUI_TELEGRAM_CONFIG_DIR", "   ");
         }
-        let expected_fallback = ClientConfig::resolve_app_dir(None, env::var("HOME").ok().as_deref());
+        let expected_fallback =
+            ClientConfig::resolve_app_dir(None, ClientConfig::resolve_home_dir().as_deref());
         assert_eq!(ClientConfig::get_app_dir(), expected_fallback);
+    }
+
+    #[test]
+    fn test_app_dir_falls_back_to_userprofile_when_home_unset() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g_cfg = EnvGuard::capture("GPUI_TELEGRAM_CONFIG_DIR");
+        let _g_home = EnvGuard::capture("HOME");
+        let _g_up = EnvGuard::capture("USERPROFILE");
+        let _g_xdg = EnvGuard::capture("XDG_DATA_HOME");
+
+        let fake_profile = env::temp_dir().join(format!(
+            "fabushi_win_userprofile_{}",
+            std::process::id()
+        ));
+        unsafe {
+            env::remove_var("GPUI_TELEGRAM_CONFIG_DIR");
+            env::remove_var("HOME");
+            env::remove_var("XDG_DATA_HOME");
+            env::set_var("USERPROFILE", &fake_profile);
+        }
+
+        assert_eq!(
+            ClientConfig::get_app_dir(),
+            fake_profile.join(".config").join("gpui_telegram")
+        );
+        assert_eq!(
+            ClientConfig::get_xdg_data_session_path(),
+            fake_profile
+                .join(".local")
+                .join("share")
+                .join("gpui_telegram")
+                .join("session.json")
+        );
     }
 }

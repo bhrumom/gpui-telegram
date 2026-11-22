@@ -1099,19 +1099,46 @@ async fn execute_local_computer_op_inner(
                 },
                 "exec" => {
                     let cmd_str = command.as_deref().unwrap_or("");
-                    match engine
-                        .pty_mux
-                        .exec_command(target, cmd_str, timeout_ms.unwrap_or(15_000))
-                        .await
-                    {
-                        Ok(exec_res) => {
-                            result.ok = !exec_res.timed_out && exec_res.exit_code == 0;
-                            result.exit_code = exec_res.exit_code;
-                            result.stdout = serde_json::to_string(&exec_res).unwrap_or_default();
+                    let needs_spawn = match engine.pty_mux.get_session(target) {
+                        Some(dto) if !dto.alive && session_name.is_none() => {
+                            let _ = engine.pty_mux.kill_session(target);
+                            true
                         }
-                        Err(err) => {
-                            result.exit_code = 1;
-                            result.stderr = err.to_string();
+                        None => true,
+                        Some(_) => false,
+                    };
+                    let init_res = if needs_spawn {
+                        engine
+                            .pty_mux
+                            .new_session(
+                                Some(target),
+                                shell.as_deref(),
+                                cols.unwrap_or(100),
+                                rows.unwrap_or(28),
+                                None,
+                            )
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(err) = init_res {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    } else {
+                        match engine
+                            .pty_mux
+                            .exec_command(target, cmd_str, timeout_ms.unwrap_or(15_000))
+                            .await
+                        {
+                            Ok(exec_res) => {
+                                result.ok = !exec_res.timed_out && exec_res.exit_code == 0;
+                                result.exit_code = exec_res.exit_code;
+                                result.stdout = serde_json::to_string(&exec_res).unwrap_or_default();
+                            }
+                            Err(err) => {
+                                result.exit_code = 1;
+                                result.stderr = err.to_string();
+                            }
                         }
                     }
                 }
