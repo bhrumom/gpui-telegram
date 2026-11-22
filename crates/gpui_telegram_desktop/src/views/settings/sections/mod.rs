@@ -35,7 +35,9 @@ pub use settings_business::SettingsBusinessSections;
 pub use settings_calls::SettingsCallsSections;
 pub use settings_chat::SettingsChatSections;
 pub use settings_computers::{
-    CloudFormField, SettingsComputersEvent, SettingsComputersPage, SettingsComputersSections,
+    AssistInputField, CloudFormField, McpClientPreset, SettingsComputersEvent,
+    SettingsComputersPage, SettingsComputersSections, SettingsComputersTab,
+    build_mcp_client_config_json, format_assist_id_display, is_valid_custom_assist_code,
 };
 pub use settings_credits::SettingsCreditsSections;
 pub use settings_folders::SettingsFoldersSections;

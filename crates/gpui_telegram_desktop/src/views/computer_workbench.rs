@@ -1,7 +1,13 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::remote_control_contracts::{
+    ColorSubsampling, DisplayInfoDto, FileConflictPolicy, FileTransferDirection,
+    FileTransferStatus, FileTransferTaskDto, PowerActionKind, RemoteStreamSettingsDto,
+    StreamCodec, StreamQuality,
+};
 use gpui_telegram_proto::{
     ComputerNodeDto, ComputerNodeKind, ComputerRunPolicy, TailnetPeerLiveState, TailnetRelayMode,
 };
@@ -10,6 +16,7 @@ use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
+use crate::views::remote_terminal_view::{RemoteTerminalAction, RemoteTerminalView};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +46,33 @@ pub struct TerminalLogEntry {
     pub cwd: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseControlMode {
+    #[default]
+    Absolute,
+    GameRelative,
+    CursorLock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkbenchHudPopover {
+    Quality,
+    Displays,
+    Hotkeys,
+    Audio,
+    Power,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkbenchHotkeyPreset {
+    CtrlAltDel,
+    AppSwitcher,
+    SpotlightOrStart,
+    Copy,
+    Paste,
+    CloseWindow,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkbenchCommand {
     RefreshScreen,
@@ -47,6 +81,28 @@ pub enum WorkbenchCommand {
     RunShell { command: String, cwd: Option<String> },
     ListFiles { path: String },
     ReadRemoteFile { path: String },
+    SetStreamSettings(RemoteStreamSettingsDto),
+    ListDisplays,
+    SwitchDisplay { display_index: u32 },
+    ToggleVirtualDisplay {
+        enabled: bool,
+        width: u32,
+        height: u32,
+    },
+    TogglePrivacyScreen {
+        enabled: bool,
+        message: Option<String>,
+    },
+    SendRelativeMouseDelta { dx: i32, dy: i32 },
+    SendHotkey { key: String, modifiers: Vec<String> },
+    PowerAction(PowerActionKind),
+    TakeScreenshot,
+    FileTransferAction {
+        transfer_id: String,
+        action: String,
+        conflict_policy: FileConflictPolicy,
+    },
+    TerminalAction(RemoteTerminalAction),
 }
 
 /// Decodes an inline `data:image/<fmt>;base64,...` frame URL into a cached GPUI `Image`.
@@ -221,6 +277,7 @@ pub struct ComputerWorkbench {
     pub run_policy: ComputerRunPolicy,
     pub active_tab: WorkbenchTab,
     pub terminal_input: Option<Entity<TextInputController>>,
+    pub terminal_view: Option<Entity<RemoteTerminalView>>,
     pub terminal_draft: String,
     pub terminal_focused: bool,
     pub terminal_history: Vec<TerminalLogEntry>,
@@ -229,9 +286,20 @@ pub struct ComputerWorkbench {
     pub file_preview: Option<(String, String)>,
     pub status_banner: Option<String>,
     pub pending_command: Option<WorkbenchCommand>,
+    pub pending_commands: VecDeque<WorkbenchCommand>,
     pub tailnet_peer: Option<TailnetPeerLiveState>,
     pub needs_screen_permission_guide: bool,
     pub needs_accessibility_permission_guide: bool,
+    pub hud_expanded: bool,
+    pub hud_active_popover: Option<WorkbenchHudPopover>,
+    pub stream_settings: RemoteStreamSettingsDto,
+    pub mouse_mode: MouseControlMode,
+    pub virtual_display_enabled: bool,
+    pub displays: Vec<DisplayInfoDto>,
+    pub file_transfers: Vec<FileTransferTaskDto>,
+    pub file_conflict_policy: FileConflictPolicy,
+    pub file_drawer_open: bool,
+    pub wol_mac_address: String,
     cached_frame_src: Option<String>,
     cached_frame_image: Option<Arc<gpui::Image>>,
     viewport_bounds: Arc<std::sync::Mutex<Option<Bounds<Pixels>>>>,
@@ -264,6 +332,7 @@ impl ComputerWorkbench {
             run_policy: ComputerRunPolicy::AskEveryTime,
             active_tab: WorkbenchTab::DesktopScreen,
             terminal_input: None,
+            terminal_view: None,
             terminal_draft: String::new(),
             terminal_focused: false,
             terminal_history: Vec::new(),
@@ -272,9 +341,29 @@ impl ComputerWorkbench {
             file_preview: None,
             status_banner: None,
             pending_command: None,
+            pending_commands: VecDeque::new(),
             tailnet_peer: None,
             needs_screen_permission_guide: false,
             needs_accessibility_permission_guide: false,
+            hud_expanded: true,
+            hud_active_popover: None,
+            stream_settings: RemoteStreamSettingsDto::default(),
+            mouse_mode: MouseControlMode::Absolute,
+            virtual_display_enabled: false,
+            displays: vec![DisplayInfoDto {
+                display_id: 0,
+                name: "Primary Display".to_string(),
+                width: 1920,
+                height: 1080,
+                scale_factor_x100: 100,
+                is_primary: true,
+                is_virtual: false,
+                refresh_hz: 60,
+            }],
+            file_transfers: Vec::new(),
+            file_conflict_policy: FileConflictPolicy::Overwrite,
+            file_drawer_open: false,
+            wol_mac_address: String::new(),
             cached_frame_src: None,
             cached_frame_image: None,
             viewport_bounds: Arc::new(std::sync::Mutex::new(None)),
@@ -297,6 +386,23 @@ impl ComputerWorkbench {
     pub fn ensure_terminal_input(&mut self, cx: &mut Context<Self>) {
         if self.terminal_input.is_none() {
             self.terminal_input = Some(cx.new(|_| TextInputController::new()));
+        }
+    }
+
+    pub fn ensure_terminal_view(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_view.is_none() {
+            let pal = self.palette;
+            let lang = self.language_id.clone();
+            let entity = cx.new(|_| RemoteTerminalView::new(pal, &lang));
+            cx.observe(&entity, |this, term, cx| {
+                let acts = term.update(cx, |t, _| t.take_actions());
+                for act in acts {
+                    this.enqueue_command(WorkbenchCommand::TerminalAction(act));
+                }
+                cx.notify();
+            })
+            .detach();
+            self.terminal_view = Some(entity);
         }
     }
 
@@ -395,6 +501,19 @@ impl ComputerWorkbench {
     pub fn take_command(&mut self) -> Option<WorkbenchCommand> {
         self.pending_command.take()
     }
+    pub fn enqueue_command(&mut self, cmd: WorkbenchCommand) {
+        if let Some(prev) = self.pending_command.take() {
+            self.pending_commands.push_back(prev);
+        }
+        self.pending_command = Some(cmd);
+    }
+    pub fn take_commands(&mut self) -> Vec<WorkbenchCommand> {
+        let mut out: Vec<WorkbenchCommand> = self.pending_commands.drain(..).collect();
+        if let Some(last) = self.pending_command.take() {
+            out.push(last);
+        }
+        out
+    }
     pub fn toggle_mouse_capture(&mut self) {
         self.is_mouse_captured = !self.is_mouse_captured;
     }
@@ -406,6 +525,226 @@ impl ComputerWorkbench {
     }
     pub fn toggle_quality(&mut self) {
         self.is_quality_hd = !self.is_quality_hd;
+        self.stream_settings.quality = if self.is_quality_hd {
+            StreamQuality::Hd
+        } else {
+            StreamQuality::Smooth
+        };
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn toggle_hud_expanded(&mut self) {
+        self.hud_expanded = !self.hud_expanded;
+        if !self.hud_expanded {
+            self.hud_active_popover = None;
+        }
+    }
+    pub fn set_stream_fps(&mut self, fps: u32) {
+        self.stream_settings.target_fps = fps;
+        self.device.fps = fps;
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn set_stream_quality(&mut self, quality: StreamQuality) {
+        self.stream_settings.quality = quality;
+        self.is_quality_hd = matches!(
+            quality,
+            StreamQuality::Hd | StreamQuality::Ultra4K | StreamQuality::Original
+        );
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn set_stream_codec(&mut self, codec: StreamCodec) {
+        self.stream_settings.codec = codec;
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn toggle_truecolor_444(&mut self) {
+        self.stream_settings.color_mode = match self.stream_settings.color_mode {
+            ColorSubsampling::Yuv420 => ColorSubsampling::TrueColor444,
+            ColorSubsampling::TrueColor444 => ColorSubsampling::Yuv420,
+        };
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn toggle_hdr(&mut self) {
+        self.stream_settings.hdr = !self.stream_settings.hdr;
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn set_mouse_mode(&mut self, mode: MouseControlMode) {
+        self.mouse_mode = mode;
+        self.stream_settings.relative_mouse =
+            matches!(mode, MouseControlMode::GameRelative | MouseControlMode::CursorLock);
+        self.stream_settings.lock_cursor_in_window = matches!(mode, MouseControlMode::CursorLock);
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn toggle_macos_key_remap(&mut self) {
+        self.stream_settings.macos_hotkey_mapping = !self.stream_settings.macos_hotkey_mapping;
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn toggle_audio_enabled(&mut self) {
+        self.stream_settings.audio_enabled = !self.stream_settings.audio_enabled;
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn toggle_mute_remote_speaker(&mut self) {
+        self.stream_settings.mute_remote_speaker = !self.stream_settings.mute_remote_speaker;
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn toggle_mic_passthrough(&mut self) {
+        self.stream_settings.mic_passthrough = !self.stream_settings.mic_passthrough;
+        self.enqueue_command(WorkbenchCommand::SetStreamSettings(
+            self.stream_settings.clone(),
+        ));
+    }
+    pub fn set_displays(&mut self, displays: Vec<DisplayInfoDto>) {
+        if !displays.is_empty() {
+            self.displays = displays;
+        }
+    }
+    pub fn switch_display(&mut self, display_index: u32) {
+        self.stream_settings.display_index = display_index;
+        self.hud_active_popover = None;
+        self.enqueue_command(WorkbenchCommand::SwitchDisplay { display_index });
+    }
+    pub fn toggle_virtual_display(&mut self) {
+        self.virtual_display_enabled = !self.virtual_display_enabled;
+        let enabled = self.virtual_display_enabled;
+        self.enqueue_command(WorkbenchCommand::ToggleVirtualDisplay {
+            enabled,
+            width: 1920,
+            height: 1080,
+        });
+    }
+    pub fn toggle_privacy_screen(&mut self) {
+        self.stream_settings.privacy_screen = !self.stream_settings.privacy_screen;
+        let enabled = self.stream_settings.privacy_screen;
+        self.enqueue_command(WorkbenchCommand::TogglePrivacyScreen {
+            enabled,
+            message: if enabled {
+                Some("Remote session privacy screen active".to_string())
+            } else {
+                None
+            },
+        });
+    }
+    pub fn trigger_hotkey(&mut self, preset: WorkbenchHotkeyPreset) {
+        let remap_to_meta = self.stream_settings.macos_hotkey_mapping
+            && self.device.os_name.to_ascii_lowercase().contains("mac");
+        let (key, modifiers): (&str, Vec<String>) = match preset {
+            WorkbenchHotkeyPreset::CtrlAltDel => (
+                "Delete",
+                vec!["Control".to_string(), "Alt".to_string()],
+            ),
+            WorkbenchHotkeyPreset::AppSwitcher => (
+                "Tab",
+                vec![if remap_to_meta { "Meta" } else { "Alt" }.to_string()],
+            ),
+            WorkbenchHotkeyPreset::SpotlightOrStart => (
+                if remap_to_meta { "Space" } else { "Meta" },
+                if remap_to_meta {
+                    vec!["Meta".to_string()]
+                } else {
+                    vec![]
+                },
+            ),
+            WorkbenchHotkeyPreset::Copy => (
+                "c",
+                vec![if remap_to_meta { "Meta" } else { "Control" }.to_string()],
+            ),
+            WorkbenchHotkeyPreset::Paste => (
+                "v",
+                vec![if remap_to_meta { "Meta" } else { "Control" }.to_string()],
+            ),
+            WorkbenchHotkeyPreset::CloseWindow => (
+                if remap_to_meta { "w" } else { "F4" },
+                vec![if remap_to_meta { "Meta" } else { "Alt" }.to_string()],
+            ),
+        };
+        self.hud_active_popover = None;
+        self.enqueue_command(WorkbenchCommand::SendHotkey {
+            key: key.to_string(),
+            modifiers,
+        });
+    }
+    pub fn trigger_power_action(&mut self, action: PowerActionKind) {
+        self.hud_active_popover = None;
+        self.enqueue_command(WorkbenchCommand::PowerAction(action));
+    }
+    pub fn trigger_wake_on_lan(&mut self) {
+        let mac = if self.wol_mac_address.trim().is_empty() {
+            "FF:FF:FF:FF:FF:FF".to_string()
+        } else {
+            self.wol_mac_address.trim().to_string()
+        };
+        self.trigger_power_action(PowerActionKind::WakeOnLan {
+            mac_address: mac,
+            broadcast_ip: None,
+        });
+    }
+    pub fn trigger_screenshot(&mut self) {
+        self.enqueue_command(WorkbenchCommand::TakeScreenshot);
+    }
+    pub fn set_file_conflict_policy(&mut self, policy: FileConflictPolicy) {
+        self.file_conflict_policy = policy;
+        for task in &mut self.file_transfers {
+            if matches!(task.status, FileTransferStatus::Queued | FileTransferStatus::Paused) {
+                task.conflict_policy = policy;
+            }
+        }
+    }
+    pub fn upsert_file_transfer(&mut self, task: FileTransferTaskDto) {
+        if let Some(existing) = self
+            .file_transfers
+            .iter_mut()
+            .find(|t| t.transfer_id == task.transfer_id)
+        {
+            *existing = task;
+        } else {
+            self.file_transfers.push(task);
+        }
+    }
+    pub fn resume_file_transfer(&mut self, transfer_id: &str) {
+        if let Some(t) = self
+            .file_transfers
+            .iter_mut()
+            .find(|t| t.transfer_id == transfer_id)
+        {
+            t.status = FileTransferStatus::Running;
+        }
+        self.enqueue_command(WorkbenchCommand::FileTransferAction {
+            transfer_id: transfer_id.to_string(),
+            action: "resume".to_string(),
+            conflict_policy: self.file_conflict_policy,
+        });
+    }
+    pub fn pause_file_transfer(&mut self, transfer_id: &str) {
+        if let Some(t) = self
+            .file_transfers
+            .iter_mut()
+            .find(|t| t.transfer_id == transfer_id)
+        {
+            t.status = FileTransferStatus::Paused;
+        }
+        self.enqueue_command(WorkbenchCommand::FileTransferAction {
+            transfer_id: transfer_id.to_string(),
+            action: "pause".to_string(),
+            conflict_policy: self.file_conflict_policy,
+        });
     }
 
     pub fn push_terminal_output(
@@ -459,6 +798,37 @@ impl ComputerWorkbench {
         self.active_tab == WorkbenchTab::RemoteTerminal && self.terminal_focused
     }
 
+    pub fn is_interactive_pty_focused(&self, cx: &App) -> bool {
+        self.active_tab == WorkbenchTab::RemoteTerminal
+            && self
+                .terminal_view
+                .as_ref()
+                .is_some_and(|t| {
+                    let view = t.read(cx);
+                    view.is_focused || view.renaming_tab_index.is_some()
+                })
+    }
+
+    pub fn feed_pty_output(
+        &mut self,
+        session_id: Option<&str>,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(term) = self.terminal_view.as_ref() {
+            term.update(cx, |t, tcx| {
+                let target_id = session_id
+                    .map(|s| s.to_string())
+                    .or_else(|| t.active_tab().map(|tab| tab.session_id.clone()));
+                if let Some(id) = target_id {
+                    t.feed_session_output(&id, bytes);
+                }
+                tcx.notify();
+            });
+            cx.notify();
+        }
+    }
+
     pub fn terminal_text_and_preedit(&self, cx: &App) -> (String, Option<String>) {
         if let Some(ctrl) = self.terminal_input.as_ref() {
             return ctrl.read(cx).text_and_preedit(self.terminal_draft.clone());
@@ -471,15 +841,65 @@ impl ComputerWorkbench {
         if let Some(ctrl) = self.terminal_input.as_ref() {
             ctrl.update(cx, |c, _| c.clear_preedit());
         }
+        if let Some(term) = self.terminal_view.as_ref() {
+            term.update(cx, |t, tcx| {
+                t.ime_preedit = None;
+                tcx.notify();
+            });
+        }
         cx.notify();
     }
 
     pub fn push_terminal_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.is_interactive_pty_focused(cx) {
+            if let Some(term) = self.terminal_view.as_ref() {
+                let handled = term.update(cx, |t, tcx| {
+                    let ok = t.push_committed_text(text);
+                    if ok {
+                        tcx.notify();
+                    }
+                    ok
+                });
+                if handled {
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if let Some(ctrl) = self.terminal_input.as_ref() {
             ctrl.update(cx, |c, _| c.clear_preedit());
         }
         self.terminal_draft.push_str(text);
         cx.notify();
+    }
+
+    pub fn handle_terminal_key_stroke(
+        &mut self,
+        key: &str,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        platform: bool,
+        key_char: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_interactive_pty_focused(cx) {
+            return false;
+        }
+        if let Some(term) = self.terminal_view.as_ref() {
+            let handled = term.update(cx, |t, tcx| {
+                let ok = t.handle_key_stroke(key, shift, ctrl, alt, platform, key_char);
+                if ok {
+                    tcx.notify();
+                }
+                ok
+            });
+            if handled {
+                cx.notify();
+            }
+            return handled;
+        }
+        false
     }
 
     pub fn handle_terminal_non_char_key(
@@ -490,6 +910,11 @@ impl ComputerWorkbench {
     ) -> bool {
         if !self.is_terminal_input_active() {
             return false;
+        }
+        if self.is_interactive_pty_focused(cx)
+            && self.handle_terminal_key_stroke(key, false, false, is_alt, false, None, cx)
+        {
+            return true;
         }
         match key {
             "backspace" | "delete" => {
@@ -518,6 +943,20 @@ impl ComputerWorkbench {
         new_text: &str,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        if self.is_interactive_pty_focused(cx) {
+            if let Some(term) = self.terminal_view.as_ref() {
+                term.update(cx, |t, tcx| {
+                    t.ime_preedit = if new_text.is_empty() {
+                        None
+                    } else {
+                        Some(new_text.to_string())
+                    };
+                    tcx.notify();
+                });
+                cx.notify();
+                return None;
+            }
+        }
         self.ensure_terminal_input(cx);
         let commit = self
             .terminal_input
@@ -528,6 +967,936 @@ impl ComputerWorkbench {
         }
         cx.notify();
         commit
+    }
+
+    fn hud_chip(
+        id: &'static str,
+        label: impl Into<SharedString>,
+        active: bool,
+        accent_hex: u32,
+        pal: &TdesktopThemePalette,
+        on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px(px(7.0))
+            .py(px(3.5))
+            .rounded(px(6.0))
+            .bg(if active {
+                TdesktopThemePalette::rgba_with_alpha(accent_hex, 0.24)
+            } else {
+                rgba(0xFFFFFF12)
+            })
+            .hover(|s| s.bg(rgba(0xFFFFFF24)))
+            .border_1()
+            .border_color(if active {
+                rgb(accent_hex).into()
+            } else {
+                rgba(0xFFFFFF22)
+            })
+            .text_size(px(11.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(if active { 0xFFFFFF } else { pal.text_primary }))
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                cx.stop_propagation();
+                on_click(ev, window, cx);
+            })
+            .child(label.into())
+    }
+
+    fn render_floating_hud(
+        &self,
+        pal: &TdesktopThemePalette,
+        lang: &str,
+        dev: &HostDeviceSpec,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_zh = lang.starts_with("zh");
+        let is_p2p = self
+            .tailnet_peer
+            .as_ref()
+            .is_some_and(|p| p.relay_mode == TailnetRelayMode::DirectUdp);
+        let relay_badge = match self.tailnet_peer.as_ref().map(|p| p.relay_mode) {
+            Some(TailnetRelayMode::DirectUdp) => {
+                if is_zh { "P2P直连" } else { "P2P" }
+            }
+            Some(TailnetRelayMode::DerpRelay) => {
+                if is_zh { "DERP中继" } else { "DERP" }
+            }
+            Some(TailnetRelayMode::HttpFallback) => "HTTP",
+            Some(TailnetRelayMode::Offline) | None => {
+                if self.is_connected { "Live" } else { "Offline" }
+            }
+        };
+        let stats_text = format!(
+            "{} · {}ms · {}FPS",
+            relay_badge, dev.latency_ms, self.stream_settings.target_fps
+        );
+        let pill_color = if is_p2p { 0x22C55E } else { pal.accent };
+
+        if !self.hud_expanded {
+            return div()
+                .id("wb-hud-collapsed-pill")
+                .px(px(10.0))
+                .py(px(5.0))
+                .rounded(px(999.0))
+                .bg(rgba(0x0F172AE0))
+                .border_1()
+                .border_color(rgba(0xFFFFFF26))
+                .shadow_lg()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .w(px(7.0))
+                        .h(px(7.0))
+                        .rounded(px(999.0))
+                        .bg(rgb(pill_color)),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xF8FAFC))
+                        .child(stats_text),
+                )
+                .child(Self::hud_chip(
+                    "wb-hud-expand-btn",
+                    tr_str(lang, "展开工具栏", "HUD"),
+                    true,
+                    pal.accent,
+                    pal,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_hud_expanded();
+                        cx.notify();
+                    }),
+                ))
+                .into_any_element();
+        }
+
+        let mouse_label = match self.mouse_mode {
+            MouseControlMode::Absolute => tr_str(lang, "绝对鼠标", "Abs"),
+            MouseControlMode::GameRelative => tr_str(lang, "游戏相对", "Rel"),
+            MouseControlMode::CursorLock => tr_str(lang, "锁定光标", "Lock"),
+        };
+        let next_mouse_mode = match self.mouse_mode {
+            MouseControlMode::Absolute => MouseControlMode::GameRelative,
+            MouseControlMode::GameRelative => MouseControlMode::CursorLock,
+            MouseControlMode::CursorLock => MouseControlMode::Absolute,
+        };
+        let quality_label = format!(
+            "{} {}fps{}",
+            match self.stream_settings.quality {
+                StreamQuality::Ultra4K | StreamQuality::Original => "4K",
+                StreamQuality::Hd => "HD",
+                StreamQuality::Smooth => "Smooth",
+                StreamQuality::Auto => "Auto",
+            },
+            self.stream_settings.target_fps,
+            if self.stream_settings.color_mode == ColorSubsampling::TrueColor444 {
+                " 4:4:4"
+            } else {
+                ""
+            }
+        );
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(6.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .id("wb-hud-expanded-bar")
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(12.0))
+                    .bg(rgba(0x0F172AE6))
+                    .border_1()
+                    .border_color(rgba(0xFFFFFF28))
+                    .shadow_xl()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.5))
+                            .rounded(px(999.0))
+                            .bg(TdesktopThemePalette::rgba_with_alpha(pill_color, 0.20))
+                            .border_1()
+                            .border_color(rgb(pill_color))
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0xFFFFFF))
+                            .child(stats_text),
+                    )
+                    .child(Self::hud_chip(
+                        "wb-hud-quality-btn",
+                        quality_label,
+                        self.hud_active_popover == Some(WorkbenchHudPopover::Quality),
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.hud_active_popover =
+                                if this.hud_active_popover == Some(WorkbenchHudPopover::Quality) {
+                                    None
+                                } else {
+                                    Some(WorkbenchHudPopover::Quality)
+                                };
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-display-btn",
+                        format!("{} #{}", tr_str(lang, "屏幕", "Disp"), self.stream_settings.display_index),
+                        self.hud_active_popover == Some(WorkbenchHudPopover::Displays),
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.enqueue_command(WorkbenchCommand::ListDisplays);
+                            this.hud_active_popover =
+                                if this.hud_active_popover == Some(WorkbenchHudPopover::Displays) {
+                                    None
+                                } else {
+                                    Some(WorkbenchHudPopover::Displays)
+                                };
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-virtual-disp-btn",
+                        tr_str(lang, "虚拟屏", "VirtDisp"),
+                        self.virtual_display_enabled,
+                        0x8B5CF6,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_virtual_display();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-privacy-btn",
+                        tr_str(lang, "隐私屏", "Privacy"),
+                        self.stream_settings.privacy_screen,
+                        0x14B8A6,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_privacy_screen();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-mouse-mode-btn",
+                        mouse_label,
+                        self.mouse_mode != MouseControlMode::Absolute,
+                        0xF59E0B,
+                        pal,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_mouse_mode(next_mouse_mode);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-hotkeys-btn",
+                        tr_str(lang, "快捷键", "Hotkeys"),
+                        self.hud_active_popover == Some(WorkbenchHudPopover::Hotkeys),
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.hud_active_popover =
+                                if this.hud_active_popover == Some(WorkbenchHudPopover::Hotkeys) {
+                                    None
+                                } else {
+                                    Some(WorkbenchHudPopover::Hotkeys)
+                                };
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-audio-btn",
+                        if self.stream_settings.audio_enabled {
+                            tr_str(lang, "音频开", "Audio On")
+                        } else {
+                            tr_str(lang, "音频关", "Audio Off")
+                        },
+                        self.hud_active_popover == Some(WorkbenchHudPopover::Audio)
+                            || self.stream_settings.audio_enabled,
+                        0x22C55E,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.hud_active_popover =
+                                if this.hud_active_popover == Some(WorkbenchHudPopover::Audio) {
+                                    None
+                                } else {
+                                    Some(WorkbenchHudPopover::Audio)
+                                };
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-files-btn",
+                        format!("{} ({})", tr_str(lang, "传输", "Files"), self.file_transfers.len()),
+                        self.file_drawer_open,
+                        0x38BDF8,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.file_drawer_open = !this.file_drawer_open;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-power-btn",
+                        tr_str(lang, "电源", "Power"),
+                        self.hud_active_popover == Some(WorkbenchHudPopover::Power),
+                        pal.danger,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.hud_active_popover =
+                                if this.hud_active_popover == Some(WorkbenchHudPopover::Power) {
+                                    None
+                                } else {
+                                    Some(WorkbenchHudPopover::Power)
+                                };
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-screenshot-btn",
+                        tr_str(lang, "截屏", "Snap"),
+                        false,
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.trigger_screenshot();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-hud-collapse-btn",
+                        tr_str(lang, "收起", "Hide"),
+                        false,
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_hud_expanded();
+                            cx.notify();
+                        }),
+                    )),
+            );
+
+        if let Some(popover) = self.hud_active_popover {
+            col = col.child(self.render_hud_popover(popover, pal, lang, cx));
+        }
+        col.into_any_element()
+    }
+
+    fn render_hud_popover(
+        &self,
+        popover: WorkbenchHudPopover,
+        pal: &TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut box_el = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .rounded(px(10.0))
+            .bg(rgba(0x0F172AF2))
+            .border_1()
+            .border_color(rgba(0xFFFFFF2A))
+            .shadow_xl()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        match popover {
+            WorkbenchHudPopover::Quality => {
+                box_el = box_el
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x94A3B8))
+                                    .child(tr_str(lang, "帧率:", "FPS:")),
+                            )
+                            .children([30u32, 60, 120, 144].into_iter().map(|fps| {
+                                let id: &'static str = match fps {
+                                    30 => "wb-fps-30",
+                                    60 => "wb-fps-60",
+                                    120 => "wb-fps-120",
+                                    _ => "wb-fps-144",
+                                };
+                                Self::hud_chip(
+                                    id,
+                                    format!("{fps}fps"),
+                                    self.stream_settings.target_fps == fps,
+                                    pal.accent,
+                                    pal,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.set_stream_fps(fps);
+                                        cx.notify();
+                                    }),
+                                )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x94A3B8))
+                                    .child(tr_str(lang, "画质:", "Quality:")),
+                            )
+                            .child(Self::hud_chip(
+                                "wb-qual-auto",
+                                "Auto",
+                                self.stream_settings.quality == StreamQuality::Auto,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_stream_quality(StreamQuality::Auto);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-qual-hd",
+                                "HD 1080P",
+                                self.stream_settings.quality == StreamQuality::Hd,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_stream_quality(StreamQuality::Hd);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-qual-4k",
+                                "4K Ultra",
+                                self.stream_settings.quality == StreamQuality::Ultra4K,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_stream_quality(StreamQuality::Ultra4K);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-qual-444",
+                                "TrueColor 4:4:4",
+                                self.stream_settings.color_mode == ColorSubsampling::TrueColor444,
+                                0x8B5CF6,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_truecolor_444();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-qual-hdr",
+                                "HDR",
+                                self.stream_settings.hdr,
+                                0xF59E0B,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_hdr();
+                                    cx.notify();
+                                }),
+                            )),
+                    );
+            }
+            WorkbenchHudPopover::Displays => {
+                box_el = box_el.child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xE2E8F0))
+                        .child(tr_str(lang, "切换远程显示器", "Switch Remote Display")),
+                );
+                for (i, d) in self.displays.iter().enumerate() {
+                    let did = d.display_id;
+                    let label = format!(
+                        "#{} {} ({}x{} @ {}Hz{})",
+                        did,
+                        d.name,
+                        d.width,
+                        d.height,
+                        d.refresh_hz,
+                        if d.is_virtual { " · Virtual" } else { "" }
+                    );
+                    let id: &'static str = match i {
+                        0 => "wb-disp-0",
+                        1 => "wb-disp-1",
+                        2 => "wb-disp-2",
+                        _ => "wb-disp-n",
+                    };
+                    box_el = box_el.child(Self::hud_chip(
+                        id,
+                        label,
+                        self.stream_settings.display_index == did,
+                        pal.accent,
+                        pal,
+                        cx.listener(move |this, _, _, cx| {
+                            this.switch_display(did);
+                            cx.notify();
+                        }),
+                    ));
+                }
+            }
+            WorkbenchHudPopover::Hotkeys => {
+                box_el = box_el
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xE2E8F0))
+                                    .child(tr_str(lang, "组合键与按键映射", "Hotkeys & Key Remap")),
+                            )
+                            .child(Self::hud_chip(
+                                "wb-hotkey-remap-toggle",
+                                tr_str(lang, "macOS ⇄ Win 映射", "macOS ⇄ Win Remap"),
+                                self.stream_settings.macos_hotkey_mapping,
+                                0x14B8A6,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_macos_key_remap();
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(5.0))
+                            .child(Self::hud_chip(
+                                "wb-hk-cad",
+                                "Ctrl+Alt+Del",
+                                false,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_hotkey(WorkbenchHotkeyPreset::CtrlAltDel);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-hk-switch",
+                                "Cmd/Alt+Tab",
+                                false,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_hotkey(WorkbenchHotkeyPreset::AppSwitcher);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-hk-spot",
+                                "Cmd+Space / Win",
+                                false,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_hotkey(WorkbenchHotkeyPreset::SpotlightOrStart);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-hk-copy",
+                                tr_str(lang, "复制", "Copy"),
+                                false,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_hotkey(WorkbenchHotkeyPreset::Copy);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-hk-paste",
+                                tr_str(lang, "粘贴", "Paste"),
+                                false,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_hotkey(WorkbenchHotkeyPreset::Paste);
+                                    cx.notify();
+                                }),
+                            )),
+                    );
+            }
+            WorkbenchHudPopover::Audio => {
+                box_el = box_el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(Self::hud_chip(
+                            "wb-audio-stream-toggle",
+                            tr_str(lang, "同步远程音频", "Remote Audio"),
+                            self.stream_settings.audio_enabled,
+                            0x22C55E,
+                            pal,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_audio_enabled();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(Self::hud_chip(
+                            "wb-audio-mute-host-toggle",
+                            tr_str(lang, "静音被控端扬声器", "Mute Host Speaker"),
+                            self.stream_settings.mute_remote_speaker,
+                            0xF59E0B,
+                            pal,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_mute_remote_speaker();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(Self::hud_chip(
+                            "wb-audio-mic-toggle",
+                            tr_str(lang, "麦克风透传", "Mic Passthrough"),
+                            self.stream_settings.mic_passthrough,
+                            0x38BDF8,
+                            pal,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_mic_passthrough();
+                                cx.notify();
+                            }),
+                        )),
+                );
+            }
+            WorkbenchHudPopover::Power => {
+                box_el = box_el
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xE2E8F0))
+                            .child(tr_str(lang, "远程电源与唤醒控制", "Remote Power & WOL")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(6.0))
+                            .child(Self::hud_chip(
+                                "wb-pwr-lock",
+                                tr_str(lang, "锁屏", "Lock"),
+                                false,
+                                pal.accent,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_power_action(PowerActionKind::Lock);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-pwr-sleep",
+                                tr_str(lang, "休眠", "Sleep"),
+                                false,
+                                0xF59E0B,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_power_action(PowerActionKind::Sleep);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-pwr-reboot",
+                                tr_str(lang, "重启", "Reboot"),
+                                false,
+                                pal.danger,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_power_action(PowerActionKind::Reboot);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-pwr-shutdown",
+                                tr_str(lang, "关机", "Shutdown"),
+                                false,
+                                pal.danger,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_power_action(PowerActionKind::Shutdown);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Self::hud_chip(
+                                "wb-pwr-wol",
+                                tr_str(lang, "WOL 网络唤醒", "Wake-on-LAN"),
+                                false,
+                                0x22C55E,
+                                pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_wake_on_lan();
+                                    cx.notify();
+                                }),
+                            )),
+                    );
+            }
+        }
+        box_el.into_any_element()
+    }
+
+    fn render_file_transfer_drawer(
+        &self,
+        pal: &TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut list = div().flex().flex_col().gap(px(6.0));
+        if self.file_transfers.is_empty() {
+            list = list.child(
+                div()
+                    .py(px(16.0))
+                    .text_xs()
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        lang,
+                        "暂无文件传输任务，可从「远程终端与文件」页上传或下载文件（支持断点续传）",
+                        "No active transfers. Supports chunked resumable upload/download.",
+                    )),
+            );
+        } else {
+            for (idx, t) in self.file_transfers.iter().enumerate() {
+                let pct = if t.total_bytes == 0 {
+                    100u64
+                } else {
+                    (t.transferred_bytes.saturating_mul(100) / t.total_bytes).min(100)
+                };
+                let tid_resume = t.transfer_id.clone();
+                let tid_pause = t.transfer_id.clone();
+                let dir_tag = match t.direction {
+                    FileTransferDirection::Upload => "↑ UP",
+                    FileTransferDirection::Download => "↓ DOWN",
+                };
+                let is_paused = matches!(
+                    t.status,
+                    FileTransferStatus::Paused | FileTransferStatus::Failed
+                );
+                let toggle_id = SharedString::from(format!("wb-xfer-toggle-{idx}"));
+                list = list.child(
+                    div()
+                        .p(px(8.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(pal.window_bg))
+                        .border_1()
+                        .border_color(rgb(pal.border_fg))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.text_primary))
+                                        .truncate()
+                                        .child(format!("{dir_tag} {}", t.remote_path)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(pal.accent))
+                                        .child(format!("{pct}%")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(4.0))
+                                .rounded(px(2.0))
+                                .bg(rgb(pal.input_bg))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(pct as f32 / 100.0))
+                                        .rounded(px(2.0))
+                                        .bg(rgb(pal.accent)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(pal.text_secondary))
+                                        .child(format!(
+                                            "{}/{} bytes · {:?}",
+                                            t.transferred_bytes, t.total_bytes, t.status
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id(toggle_id)
+                                        .cursor_pointer()
+                                        .px(px(7.0))
+                                        .py(px(2.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(pal.hover_bg))
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(pal.text_primary))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                if is_paused {
+                                                    this.resume_file_transfer(&tid_resume);
+                                                } else {
+                                                    this.pause_file_transfer(&tid_pause);
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if is_paused {
+                                            tr_str(lang, "续传", "Resume")
+                                        } else {
+                                            tr_str(lang, "暂停", "Pause")
+                                        }),
+                                ),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .id("wb-file-transfer-drawer")
+            .w(px(310.0))
+            .max_h(px(360.0))
+            .rounded(px(12.0))
+            .bg(rgb(pal.card_bg))
+            .border_1()
+            .border_color(rgb(pal.border_fg))
+            .shadow_xl()
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(pal.text_primary))
+                            .child(tr_str(lang, "文件传输队列", "File Transfers")),
+                    )
+                    .child(
+                        div()
+                            .id("wb-file-drawer-close")
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(pal.text_secondary))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.file_drawer_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(pal.text_secondary))
+                            .child(tr_str(lang, "冲突策略:", "Conflict:")),
+                    )
+                    .child(Self::hud_chip(
+                        "wb-conflict-overwrite",
+                        tr_str(lang, "覆盖", "Overwrite"),
+                        self.file_conflict_policy == FileConflictPolicy::Overwrite,
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_file_conflict_policy(FileConflictPolicy::Overwrite);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-conflict-rename",
+                        tr_str(lang, "重命名", "Rename"),
+                        self.file_conflict_policy == FileConflictPolicy::Rename,
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_file_conflict_policy(FileConflictPolicy::Rename);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(Self::hud_chip(
+                        "wb-conflict-skip",
+                        tr_str(lang, "跳过", "Skip"),
+                        self.file_conflict_policy == FileConflictPolicy::Skip,
+                        pal.accent,
+                        pal,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_file_conflict_policy(FileConflictPolicy::Skip);
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .id("wb-file-drawer-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+            .into_any_element()
     }
 
     fn toggle_chip(label: &str, active: bool, pal: &TdesktopThemePalette) -> Div {
@@ -723,6 +2092,50 @@ impl ComputerWorkbench {
                     )
                     .child(preview)
                     .child(bounds_tracker)
+                    .child(
+                        div()
+                            .id("wb-hud-top-overlay")
+                            .absolute()
+                            .top(px(10.0))
+                            .left(px(12.0))
+                            .right(px(12.0))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(self.render_floating_hud(pal, lang, dev, cx)),
+                    )
+                    .when(self.file_drawer_open, |vp| {
+                        vp.child(
+                            div()
+                                .absolute()
+                                .top(px(56.0))
+                                .right(px(12.0))
+                                .child(self.render_file_transfer_drawer(pal, lang, cx)),
+                        )
+                    })
+                    .when(self.stream_settings.privacy_screen, |vp| {
+                        vp.child(
+                            div()
+                                .id("wb-privacy-badge")
+                                .absolute()
+                                .bottom(px(12.0))
+                                .left(px(12.0))
+                                .px(px(10.0))
+                                .py(px(5.0))
+                                .rounded(px(999.0))
+                                .bg(rgba(0x0F766EE0))
+                                .border_1()
+                                .border_color(rgb(0x14B8A6))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0xFFFFFF))
+                                .child(tr_str(
+                                    lang,
+                                    "被控端隐私屏已启用（对方屏幕已隐藏）",
+                                    "Host privacy screen active",
+                                )),
+                        )
+                    })
                     .when(
                         self.needs_screen_permission_guide
                             || self.needs_accessibility_permission_guide,
@@ -1275,13 +2688,25 @@ impl ComputerWorkbench {
                             ),
                     )
                     .child(
-                        div()
-                            .id("wb-term-history")
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .overflow_y_scroll()
-                            .p(px(12.0))
-                            .child(logs_col),
+                        if let Some(term) = self.terminal_view.as_ref() {
+                            div()
+                                .id("wb-pty-view-host")
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .child(term.clone())
+                                .into_any_element()
+                        } else {
+                            div()
+                                .id("wb-term-history")
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .overflow_y_scroll()
+                                .p(px(12.0))
+                                .child(logs_col)
+                                .into_any_element()
+                        },
                     )
                     .child(
                         div()
@@ -1315,6 +2740,9 @@ impl ComputerWorkbench {
                                         cx.listener(|this, _, _, cx| {
                                             this.ensure_terminal_input(cx);
                                             this.terminal_focused = true;
+                                            if let Some(term) = this.terminal_view.as_ref() {
+                                                term.update(cx, |t, _| t.is_focused = false);
+                                            }
                                             cx.notify();
                                         }),
                                     )
@@ -1489,6 +2917,7 @@ impl Default for ComputerWorkbench {
 impl Render for ComputerWorkbench {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_terminal_input(cx);
+        self.ensure_terminal_view(cx);
         let pal = self.palette;
         let lang = self.language_id.clone();
         let dev = self.device.clone();
@@ -1633,6 +3062,9 @@ impl Render for ComputerWorkbench {
                                 cx.listener(|this, _, _, cx| {
                                     this.active_tab = WorkbenchTab::DesktopScreen;
                                     this.terminal_focused = false;
+                                    if let Some(term) = this.terminal_view.as_ref() {
+                                        term.update(cx, |t, _| t.is_focused = false);
+                                    }
                                     cx.notify();
                                 }),
                             ))
@@ -1644,6 +3076,10 @@ impl Render for ComputerWorkbench {
                                 cx.listener(|this, _, _, cx| {
                                     this.active_tab = WorkbenchTab::RemoteTerminal;
                                     this.terminal_focused = true;
+                                    this.ensure_terminal_view(cx);
+                                    if let Some(term) = this.terminal_view.as_ref() {
+                                        term.update(cx, |t, _| t.is_focused = true);
+                                    }
                                     cx.notify();
                                 }),
                             ))

@@ -1880,6 +1880,35 @@ impl AppShell {
             RemoteComputerOp::GuiInput { action, x, y, text, key } => {
                 format!("GUI {action} ({x:?}, {y:?}) text={text:?} key={key:?}")
             }
+            RemoteComputerOp::MouseAction { action, x, y, dx, dy, button, .. } => {
+                format!("Mouse {action} pos=({x:?}, {y:?}) delta=({dx:?}, {dy:?}) btn={button:?}")
+            }
+            RemoteComputerOp::KeyboardAction { action, key, text, modifiers } => {
+                format!("Key {action} key={key:?} mods={modifiers:?} text={text:?}")
+            }
+            RemoteComputerOp::ClipboardGet => tr_str(lang, "读取剪贴板", "Read clipboard").to_string(),
+            RemoteComputerOp::ClipboardSet { text, mime_type, .. } => {
+                let len = text.as_ref().map(|t| t.len()).unwrap_or(0);
+                format!("ClipboardSet ({len} chars, mime={mime_type:?})")
+            }
+            RemoteComputerOp::PowerAction { action } => format!("Power {action:?}"),
+            RemoteComputerOp::DisplayList => tr_str(lang, "枚举显示器", "List displays").to_string(),
+            RemoteComputerOp::DisplaySwitch { display_index } => format!("Switch display #{display_index}"),
+            RemoteComputerOp::PrivacyScreenToggle { enabled, .. } => {
+                format!("Privacy screen {}", if *enabled { "ON" } else { "OFF" })
+            }
+            RemoteComputerOp::TerminalOp { op, session_name, command, .. } => {
+                format!("Terminal {op} session={session_name:?} cmd={command:?}")
+            }
+            RemoteComputerOp::AccessibilityTree { max_depth } => {
+                format!("AccessibilityTree (max_depth={max_depth:?})")
+            }
+            RemoteComputerOp::SemanticAction { element_id, action, .. } => {
+                format!("Semantic {action} on {element_id}")
+            }
+            RemoteComputerOp::FileChunkOp { op, transfer_id, path, offset, .. } => {
+                format!("FileChunk {op} {path} id={transfer_id} offset={offset}")
+            }
             RemoteComputerOp::TestConnection => tr_str(lang, "测试连接", "Test connection").to_string(),
         };
         let cmd_approve = pending.command_id.clone();

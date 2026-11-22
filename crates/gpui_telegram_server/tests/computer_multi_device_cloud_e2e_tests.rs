@@ -336,6 +336,16 @@ async fn aux_agent_exec_handler(
             res.exit_code = 0;
             res.stdout = format!("gui_input ok: {action}");
         }
+        other => {
+            let op_name = serde_json::to_value(&other)
+                .ok()
+                .and_then(|v| v.get("op").and_then(|s| s.as_str()).map(String::from))
+                .unwrap_or_else(|| "remote_op".to_string());
+            st.recorded_ops.lock().unwrap().push(op_name.clone());
+            res.ok = true;
+            res.exit_code = 0;
+            res.stdout = format!("{op_name} ok");
+        }
     }
 
     res.duration_ms = started.elapsed().as_millis() as u64;

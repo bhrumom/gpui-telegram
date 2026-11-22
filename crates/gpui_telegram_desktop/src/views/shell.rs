@@ -6,7 +6,7 @@
 pub use crate::views::app_shell::shell_state::{
     reconcile_stage_message_list, should_switch_to_chats_on_sidebar_selection,
     ShellCodingHostState, ShellComputersState, ShellMiniAppState, ShellOverlayState,
-    ShellRtcTalkState, ShellSessionSyncState, ShellThemeVisualState,
+    ShellRemoteHostRuntime, ShellRtcTalkState, ShellSessionSyncState, ShellThemeVisualState,
 };
 pub use crate::views::app_shell::shell_truth::*;
 pub use crate::views::auth::{
@@ -112,6 +112,7 @@ pub struct AppShell {
     pub rtc_talk: ShellRtcTalkState,
     pub overlays: ShellOverlayState,
     pub computers: ShellComputersState,
+    pub remote_host: ShellRemoteHostRuntime,
     pub coding_host: ShellCodingHostState,
     pub magpie_local: ShellMagpieLocalState,
     pub bot_browser: ShellBotBrowserState,
@@ -220,6 +221,7 @@ impl AppShell {
             rtc_talk: ShellRtcTalkState::new(),
             overlays: ShellOverlayState::new(),
             computers: ShellComputersState::new(),
+            remote_host: ShellRemoteHostRuntime::new(),
             coding_host: ShellCodingHostState::new(),
             magpie_local: ShellMagpieLocalState::new(),
             bot_browser: ShellBotBrowserState::new(),
@@ -235,6 +237,7 @@ impl AppShell {
         shell_instance.sync_theme_and_locale_to_views(cx);
         shell_instance.hydrate_settings_from_preferences(cx);
         shell_instance.refresh_settings_truth(cx);
+        shell_instance.ensure_remote_host_runtime_bootstrapped(cx);
 
         if let Some(stored) = ClientConfig::load_session() {
             cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -398,6 +401,7 @@ impl AppShell {
         self.overlays.clear_overlays();
         self.miniapps.reset();
         self.computers.reset_on_logout();
+        self.sync_remote_tray_status(cx);
         if let Some(coding_rt) = self.coding_host.reset_on_logout() {
             client.runtime().spawn(async move {
                 coding_rt.shutdown().await;

@@ -123,8 +123,8 @@ async fn test_cli_subcommand_export() {
     registry.register_typed(SendMessageAction).unwrap();
     registry.register_typed(DeleteMessageAction).unwrap();
 
-    let cli_export = CliExporter::export_cli_schema(&registry, "gpui-tg-cli", "1.0.0");
-    assert_eq!(cli_export.program_name, "gpui-tg-cli");
+    let cli_export = CliExporter::export_cli_schema(&registry, "fabushi", "1.0.0");
+    assert_eq!(cli_export.program_name, "fabushi");
     assert_eq!(cli_export.subcommands.len(), 2);
 
     let send_sub = cli_export.subcommands.iter().find(|s| s.name == "send_message").unwrap();
@@ -253,7 +253,7 @@ async fn test_schema_consistency_across_quad_export() {
     let openapi = OpenApiExporter::export_spec(&registry, "Test", "1.0.0", "http://localhost");
     let hermes = HermesToolExporter::export_tools(&registry);
     let mcp = McpExporter::export_tools_list(&registry);
-    let cli = CliExporter::export_cli_schema(&registry, "gpui-tg-cli", "1.0.0");
+    let cli = CliExporter::export_cli_schema(&registry, "fabushi", "1.0.0");
 
     // 1. OpenAPI documents 422 and 400 and matches Hermes/MCP schemas
     let send_op = &openapi["paths"]["/api/v1/actions/send_message"]["post"];
@@ -356,4 +356,61 @@ async fn test_high_risk_action_requires_approval_in_registry() {
         .await
         .unwrap();
     assert_eq!(ok["deleted_count"], 2);
+}
+
+#[tokio::test]
+async fn test_full_app_action_bus_quad_export() {
+    let registry = ActionRegistry::new();
+    register_full_app_actions(&registry).unwrap();
+
+    let count = registry.count();
+    assert!(count >= 30, "expected full-app action catalog, got {count}");
+
+    let openapi = OpenApiExporter::export_spec(&registry, "Fabushi Action Bus", "1.4.0", "http://localhost");
+    let hermes = HermesToolExporter::export_tools(&registry);
+    let mcp = McpExporter::export_tools_list(&registry);
+    let cli = CliExporter::export_cli_schema(&registry, "fabushi", "1.4.0");
+
+    assert_eq!(cli.program_name, "fabushi");
+    assert_eq!(cli.subcommands.len(), count);
+    assert_eq!(hermes.len(), count);
+    assert_eq!(mcp.tools.len(), count);
+    assert_eq!(openapi["paths"].as_object().unwrap().len(), count);
+
+    let categories: std::collections::HashSet<&str> = cli
+        .subcommands
+        .iter()
+        .map(|s| s.category.as_str())
+        .collect();
+    for expected in [
+        "messaging",
+        "dialogs",
+        "chat",
+        "media",
+        "search",
+        "user",
+        "call",
+        "miniapp",
+        "admin",
+        "system",
+        "device",
+        "remote",
+        "terminal",
+        "assist",
+        "cloud_pc",
+        "bot",
+        "task",
+        "vault",
+        "mcp",
+    ] {
+        assert!(
+            categories.contains(expected),
+            "Missing category '{expected}' in full-app quad export"
+        );
+    }
+
+    assert!(cli.subcommands.iter().any(|s| s.kebab_name == "device-list"));
+    assert!(cli.subcommands.iter().any(|s| s.kebab_name == "remote-capture-screen"));
+    assert!(cli.subcommands.iter().any(|s| s.kebab_name == "terminal-exec"));
+    assert!(cli.subcommands.iter().any(|s| s.kebab_name == "mcp-status"));
 }

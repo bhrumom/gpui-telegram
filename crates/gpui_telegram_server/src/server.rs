@@ -94,6 +94,9 @@ pub struct AppState {
     pub multi_agent_groups: Arc<RwLock<HashMap<ChatId, GroupMultiAgentRoom>>>,
     pub agent_capability_key: Arc<ed25519_dalek::SigningKey>,
     pub update_relay: Arc<crate::routes::updates::UpdateRelayState>,
+    pub mcp_oauth_state: Arc<crate::routes::mcp_oauth::McpOAuthRuntimeState>,
+    pub remote_sessions: Arc<crate::routes::remote_assist::RemoteSessionRegistry>,
+    pub mcp_sessions: Arc<crate::routes::official_mcp::McpSessionRegistry>,
 }
 
 impl Default for AppState {
@@ -551,6 +554,9 @@ impl AppState {
             multi_agent_groups: Arc::new(RwLock::new(HashMap::new())),
             agent_capability_key,
             update_relay: Arc::new(crate::routes::updates::UpdateRelayState::new()),
+            mcp_oauth_state: Arc::new(crate::routes::mcp_oauth::McpOAuthRuntimeState::new()),
+            remote_sessions: Arc::new(crate::routes::remote_assist::RemoteSessionRegistry::new()),
+            mcp_sessions: Arc::new(crate::routes::official_mcp::McpSessionRegistry::new()),
         }
     }
 
@@ -1293,6 +1299,87 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             get(routes::telegram_bot_api::telegram_bot_api_dispatch)
                 .post(routes::telegram_bot_api::telegram_bot_api_dispatch),
         )
+        // --- Official MCP OAuth 2.1 Discovery, Endpoint & Remote Assist ---
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(routes::mcp_oauth::oauth_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(routes::mcp_oauth::oauth_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(routes::mcp_oauth::oauth_authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/openid-configuration",
+            get(routes::mcp_oauth::oauth_authorization_server_metadata),
+        )
+        .route("/oauth/register", post(routes::mcp_oauth::oauth_register))
+        .route("/oauth/authorize", get(routes::mcp_oauth::oauth_authorize_get))
+        .route(
+            "/oauth/authorize/login",
+            post(routes::mcp_oauth::oauth_authorize_login),
+        )
+        .route(
+            "/oauth/authorize/qr-poll",
+            get(routes::mcp_oauth::oauth_authorize_qr_poll),
+        )
+        .route(
+            "/oauth/authorize/approve",
+            post(routes::mcp_oauth::oauth_authorize_approve),
+        )
+        .route("/oauth/token", post(routes::mcp_oauth::oauth_token))
+        .route("/oauth/revoke", post(routes::mcp_oauth::oauth_revoke))
+        .route("/api/v1/mcp/grants", get(routes::mcp_oauth::mcp_grants_list))
+        .route(
+            "/api/v1/mcp/grants/{family_id}",
+            axum::routing::delete(routes::mcp_oauth::mcp_grant_revoke),
+        )
+        .route("/api/v1/mcp/audit", get(routes::mcp_oauth::mcp_audit_list))
+        .route(
+            "/mcp",
+            post(routes::official_mcp::mcp_post)
+                .get(routes::official_mcp::mcp_get_sse)
+                .delete(routes::official_mcp::mcp_delete),
+        )
+        .route(
+            "/api/v1/remote/assist/info",
+            get(routes::remote_assist::assist_info),
+        )
+        .route(
+            "/api/v1/remote/assist/reset-code",
+            post(routes::remote_assist::assist_reset_code),
+        )
+        .route(
+            "/api/v1/remote/assist/set-code",
+            post(routes::remote_assist::assist_set_code),
+        )
+        .route(
+            "/api/v1/remote/assist/allow",
+            post(routes::remote_assist::assist_allow),
+        )
+        .route(
+            "/api/v1/remote/assist/start",
+            post(routes::remote_assist::assist_start),
+        )
+        .route(
+            "/api/v1/remote/sessions",
+            get(routes::remote_assist::remote_sessions_list),
+        )
+        .route(
+            "/api/v1/remote/sessions/disconnect",
+            post(routes::remote_assist::remote_sessions_disconnect),
+        )
+        .route(
+            "/api/v1/remote/sessions/disconnect-all",
+            post(routes::remote_assist::remote_sessions_disconnect_all),
+        )
+        .route(
+            "/api/v1/remote/webrtc/signal",
+            post(routes::remote_assist::remote_webrtc_signal),
+        )
         // --- WebSocket Upgrade Route ---
         .route("/api/v1/ws", get(ws_upgrade_handler))
         // --- Tower Middleware Stack ---
@@ -1307,7 +1394,13 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
                 ),
             ),
         )
-        .layer(CorsLayer::permissive())
+        .layer(
+            CorsLayer::permissive().expose_headers([
+                axum::http::HeaderName::from_static("mcp-protocol-version"),
+                axum::http::HeaderName::from_static("mcp-session-id"),
+                axum::http::header::WWW_AUTHENTICATE,
+            ]),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -1332,7 +1425,8 @@ async fn server_status() -> Json<Value> {
             "stickers", "gifs", "stories", "calls_webrtc", "tantivy_search",
             "statistics", "export", "wallet_stars", "acp_durable",
             "hermes_agent", "hermes_gateway", "openai_compat", "acp_json_rpc",
-            "auto_update_relay"
+            "auto_update_relay", "official_mcp_oauth21", "remote_control",
+            "remote_assist"
         ]
     }))
 }

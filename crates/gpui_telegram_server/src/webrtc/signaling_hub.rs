@@ -14,12 +14,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
-/// WebRTC Call Signaling Hub managing 1-on-1 calls, SFU conference rooms,
-/// peer routing, and ephemeral STUN/TURN credential generation.
+/// Identifies a specific signaling endpoint by `(UserId, device_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DevicePeer {
+    pub user_id: UserId,
+    pub device_id: String,
+}
+
+/// WebRTC Call Signaling Hub managing 1-on-1 calls, same-account multi-device routing,
+/// SFU conference rooms, peer routing, and ephemeral STUN/TURN credential generation.
 #[derive(Debug, Default, Clone)]
 pub struct SignalingHub {
     sessions: Arc<RwLock<HashMap<String, ServerCallSession>>>,
     user_channels: Arc<RwLock<HashMap<UserId, mpsc::Sender<SignalingFrame>>>>,
+    device_channels: Arc<RwLock<HashMap<(UserId, String), mpsc::Sender<SignalingFrame>>>>,
+    device_routes: Arc<RwLock<HashMap<String, (DevicePeer, DevicePeer)>>>,
     sfu_bridge: Arc<RwLock<SfuBridge>>,
     active_calls: Arc<RwLock<HashMap<String, Vec<SignalingFrame>>>>,
 }
@@ -40,9 +49,242 @@ impl SignalingHub {
         self.user_channels.write().remove(&user_id);
     }
 
+    /// Registers a device-addressed client channel so multiple devices on the same
+    /// user account can route WebRTC signaling independently.
+    pub fn register_device_client(
+        &self,
+        user_id: UserId,
+        device_id: impl Into<String>,
+        tx: mpsc::Sender<SignalingFrame>,
+    ) {
+        let dev = device_id.into().trim().to_string();
+        if dev.is_empty() {
+            self.register_client(user_id, tx);
+            return;
+        }
+        self.device_channels.write().insert((user_id, dev), tx);
+    }
+
+    /// Unregisters a device-addressed client channel upon disconnect.
+    pub fn unregister_device_client(&self, user_id: UserId, device_id: &str) {
+        let dev = device_id.trim().to_string();
+        if !dev.is_empty() {
+            self.device_channels.write().remove(&(user_id, dev));
+        }
+    }
+
     /// Returns whether a user is currently connected to the signaling gateway.
     pub fn is_client_online(&self, user_id: UserId) -> bool {
         self.user_channels.read().contains_key(&user_id)
+            || self
+                .device_channels
+                .read()
+                .keys()
+                .any(|(uid, _)| *uid == user_id)
+    }
+
+    /// Returns whether a specific `(user_id, device_id)` endpoint is connected.
+    pub fn is_device_online(&self, user_id: UserId, device_id: &str) -> bool {
+        let dev = device_id.trim();
+        !dev.is_empty()
+            && self
+                .device_channels
+                .read()
+                .contains_key(&(user_id, dev.to_string()))
+    }
+
+    /// Lists all online device IDs registered for `user_id`.
+    pub fn online_devices_for_user(&self, user_id: UserId) -> Vec<String> {
+        self.device_channels
+            .read()
+            .keys()
+            .filter_map(|(uid, dev)| if *uid == user_id { Some(dev.clone()) } else { None })
+            .collect()
+    }
+
+    /// Returns the `(caller_peer, callee_peer)` device endpoints for a device-routed call.
+    pub fn get_device_route(&self, call_id: &str) -> Option<(DevicePeer, DevicePeer)> {
+        self.device_routes.read().get(call_id).cloned()
+    }
+
+    /// Dispatches a device-addressed signaling frame supporting same-account multi-device WebRTC.
+    pub async fn dispatch_device_frame(
+        &self,
+        sender_user: UserId,
+        sender_device_id: &str,
+        target_device_id: Option<&str>,
+        frame: SignalingFrame,
+    ) -> Result<()> {
+        let sender_dev = sender_device_id.trim().to_string();
+        if sender_dev.is_empty() {
+            return Err(TelegramError::Validation(
+                "sender_device_id is required for device signaling".into(),
+            ));
+        }
+        let sender_peer = DevicePeer {
+            user_id: sender_user,
+            device_id: sender_dev.clone(),
+        };
+
+        match frame {
+            SignalingFrame::Invite {
+                ref call_id,
+                from_user,
+                to_user,
+                is_video,
+            } => {
+                if from_user != sender_user {
+                    return Err(TelegramError::PermissionDenied(
+                        "Sender ID mismatch on invite".into(),
+                    ));
+                }
+                let target_dev = target_device_id
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        TelegramError::Validation(
+                            "target_device_id is required for device-addressed invite".into(),
+                        )
+                    })?;
+
+                if from_user == to_user && sender_dev == target_dev {
+                    return Err(TelegramError::Validation(
+                        "Cannot establish WebRTC signaling to the same device".into(),
+                    ));
+                }
+
+                let target_peer = DevicePeer {
+                    user_id: to_user,
+                    device_id: target_dev,
+                };
+                let session = ServerCallSession::new(call_id.clone(), from_user, to_user, is_video);
+                self.sessions.write().insert(call_id.clone(), session);
+                self.device_routes
+                    .write()
+                    .insert(call_id.clone(), (sender_peer, target_peer.clone()));
+                self.record_signal(call_id, frame.clone());
+                self.relay_to_device(&target_peer, frame).await?;
+            }
+            SignalingFrame::Ringing { ref call_id } => {
+                let target = {
+                    let (caller_peer, callee_peer) =
+                        self.device_routes.read().get(call_id).cloned().ok_or_else(|| {
+                            TelegramError::NotFound(format!("Call session {call_id} not found"))
+                        })?;
+                    if callee_peer != sender_peer {
+                        return Err(TelegramError::PermissionDenied(
+                            "Only target callee device can acknowledge ringing".into(),
+                        ));
+                    }
+                    let mut sessions = self.sessions.write();
+                    let session = sessions.get_mut(call_id).ok_or_else(|| {
+                        TelegramError::NotFound(format!("Call session {call_id} not found"))
+                    })?;
+                    session.transition_to(CallState::Ringing)?;
+                    caller_peer
+                };
+                self.record_signal(call_id, frame.clone());
+                self.relay_to_device(&target, frame).await?;
+            }
+            SignalingFrame::Accept { ref call_id } => {
+                let target = {
+                    let (caller_peer, callee_peer) =
+                        self.device_routes.read().get(call_id).cloned().ok_or_else(|| {
+                            TelegramError::NotFound(format!("Call session {call_id} not found"))
+                        })?;
+                    if callee_peer != sender_peer {
+                        return Err(TelegramError::PermissionDenied(
+                            "Only target callee device can accept call".into(),
+                        ));
+                    }
+                    let mut sessions = self.sessions.write();
+                    let session = sessions.get_mut(call_id).ok_or_else(|| {
+                        TelegramError::NotFound(format!("Call session {call_id} not found"))
+                    })?;
+                    session.transition_to(CallState::Connecting)?;
+                    caller_peer
+                };
+                self.record_signal(call_id, frame.clone());
+                self.relay_to_device(&target, frame).await?;
+            }
+            SignalingFrame::Offer {
+                ref call_id,
+                ref sdp,
+            } => {
+                let target = {
+                    let (caller_peer, callee_peer) =
+                        self.device_routes.read().get(call_id).cloned().ok_or_else(|| {
+                            TelegramError::NotFound(format!("Call session {call_id} not found"))
+                        })?;
+                    let other = counterpart_device(&caller_peer, &callee_peer, &sender_peer)?;
+                    let mut sessions = self.sessions.write();
+                    let session = sessions.get_mut(call_id).ok_or_else(|| {
+                        TelegramError::NotFound(format!("Call session {call_id} not found"))
+                    })?;
+                    session.sdp_offer = Some(sdp.clone());
+                    other
+                };
+                self.record_signal(call_id, frame.clone());
+                self.relay_to_device(&target, frame).await?;
+            }
+            SignalingFrame::Answer {
+                ref call_id,
+                ref sdp,
+            } => {
+                let target = {
+                    let (caller_peer, callee_peer) =
+                        self.device_routes.read().get(call_id).cloned().ok_or_else(|| {
+                            TelegramError::NotFound(format!("Call session {call_id} not found"))
+                        })?;
+                    let other = counterpart_device(&caller_peer, &callee_peer, &sender_peer)?;
+                    let mut sessions = self.sessions.write();
+                    let session = sessions.get_mut(call_id).ok_or_else(|| {
+                        TelegramError::NotFound(format!("Call session {call_id} not found"))
+                    })?;
+                    session.sdp_answer = Some(sdp.clone());
+                    session.transition_to(CallState::Connected)?;
+                    other
+                };
+                self.record_signal(call_id, frame.clone());
+                self.relay_to_device(&target, frame).await?;
+            }
+            SignalingFrame::IceCandidate { ref call_id, .. } => {
+                let target = {
+                    let (caller_peer, callee_peer) =
+                        self.device_routes.read().get(call_id).cloned().ok_or_else(|| {
+                            TelegramError::NotFound(format!("Call session {call_id} not found"))
+                        })?;
+                    counterpart_device(&caller_peer, &callee_peer, &sender_peer)?
+                };
+                self.record_signal(call_id, frame.clone());
+                self.relay_to_device(&target, frame).await?;
+            }
+            SignalingFrame::Hangup {
+                ref call_id,
+                ref reason,
+            } => {
+                let target = {
+                    let route_opt = self.device_routes.read().get(call_id).cloned();
+                    if let Some((caller_peer, callee_peer)) = route_opt {
+                        let other = counterpart_device(&caller_peer, &callee_peer, &sender_peer)?;
+                        let mut sessions = self.sessions.write();
+                        if let Some(session) = sessions.get_mut(call_id) {
+                            let _ = session.transition_to(CallState::Ended);
+                            session.end_reason = Some(reason.clone());
+                        }
+                        Some(other)
+                    } else {
+                        None
+                    }
+                };
+                self.record_signal(call_id, frame.clone());
+                if let Some(peer) = target {
+                    let _ = self.relay_to_device(&peer, frame).await;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Dispatches an incoming signaling frame, advances Call FSM, and relays to the counterpart peer.
@@ -266,7 +508,15 @@ impl SignalingHub {
 
     /// Relays a frame directly to a connected client channel.
     async fn relay_to_user(&self, target_user: UserId, frame: SignalingFrame) -> Result<()> {
-        let tx = { self.user_channels.read().get(&target_user).cloned() };
+        let tx = {
+            self.user_channels.read().get(&target_user).cloned().or_else(|| {
+                self.device_channels
+                    .read()
+                    .iter()
+                    .find(|((uid, _), _)| *uid == target_user)
+                    .map(|(_, sender)| sender.clone())
+            })
+        };
         if let Some(sender) = tx {
             sender
                 .send(frame)
@@ -276,6 +526,45 @@ impl SignalingHub {
         } else {
             Err(TelegramError::NotFound(format!("User {target_user} is offline")))
         }
+    }
+
+    /// Relays a frame strictly to a specific `(UserId, device_id)` endpoint.
+    async fn relay_to_device(&self, target: &DevicePeer, frame: SignalingFrame) -> Result<()> {
+        let tx = {
+            self.device_channels
+                .read()
+                .get(&(target.user_id, target.device_id.clone()))
+                .cloned()
+        };
+        if let Some(sender) = tx {
+            sender
+                .send(frame)
+                .await
+                .map_err(|_| TelegramError::Internal("Device signaling channel disconnected".into()))?;
+            Ok(())
+        } else {
+            Err(TelegramError::NotFound(format!(
+                "Device ({}, {}) is offline",
+                target.user_id, target.device_id
+            )))
+        }
+    }
+}
+
+fn counterpart_device(
+    caller: &DevicePeer,
+    callee: &DevicePeer,
+    sender: &DevicePeer,
+) -> Result<DevicePeer> {
+    if sender == caller {
+        Ok(callee.clone())
+    } else if sender == callee {
+        Ok(caller.clone())
+    } else {
+        Err(TelegramError::PermissionDenied(format!(
+            "Device ({}, {}) is not a participant in this signaling session",
+            sender.user_id, sender.device_id
+        )))
     }
 }
 

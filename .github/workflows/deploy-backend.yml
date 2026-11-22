@@ -11,6 +11,8 @@ on:
       - "crates/gpui_telegram_webrtc/**"
       - "crates/gpui_telegram_agent/**"
       - "crates/gpui_telegram_server/**"
+      - "crates/fabushi_remote_engine/**"
+      - "crates/fabushi_remote_daemon/**"
       - "crates/fabushi_miniapp/**"
       - "crates/fabushi_miniapp_wasm/**"
       - "crates/magpie_gateway/**"
@@ -214,6 +216,10 @@ jobs:
             if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
               echo "Backend health check passed on attempt \${i}"
               curl -fsS http://127.0.0.1:8080/api/v1/status
+              echo ""
+              curl -fsS http://127.0.0.1:8080/.well-known/oauth-protected-resource
+              echo ""
+              curl -fsS http://127.0.0.1:8080/.well-known/oauth-authorization-server
               echo ""
               exit 0
             fi

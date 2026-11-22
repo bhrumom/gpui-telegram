@@ -1,29 +1,68 @@
 use crate::net::http_client::{HttpClient, HttpClientError};
 use crate::net::http_helpers::percent_encode_rfc3986;
+use base64::Engine as _;
+use fabushi_remote_engine::accessibility::AccessibilityEngine;
+use fabushi_remote_engine::audio::AudioPipeline;
+use fabushi_remote_engine::capture::{CaptureFormat, ScreenCaptureEngine};
+use fabushi_remote_engine::clipboard::ClipboardSyncEngine;
+use fabushi_remote_engine::control_lease::RemoteControlHub;
+use fabushi_remote_engine::display_privacy::DisplayPrivacyManager;
+use fabushi_remote_engine::file_transfer::DEFAULT_CHUNK_SIZE;
+use fabushi_remote_engine::input::{KeyboardActionParams, MouseActionParams, NativeInputEngine};
+use fabushi_remote_engine::power::PowerManager;
+use fabushi_remote_engine::terminal::PtyMuxServer;
 use gpui_telegram_proto::computer_contracts::{
     ApproveComputerCommandRequest, BotComputerProfileDto, ComputerListResponse, ComputerNodeDto,
     PendingComputerCommandDto, RegisterLocalComputerRequest, RemoteComputerCommandRequest,
     RemoteComputerCommandResult, RemoteComputerOp, UpdateBotComputerRequest,
     UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
 };
+use gpui_telegram_proto::remote_control_contracts::{
+    AccessibilityNodeDto, AssistAllowRequest, AssistSetCodeRequest, AssistStartRequest,
+    AssistStartResponse, ClipboardPayloadDto, DisplayInfoDto, McpOAuthGrantsResponse,
+    RemoteAssistConfigDto, RemoteSessionDisconnectRequest, RemoteSessionsResponse,
+};
 use gpui_telegram_proto::tailnet_contracts::{
     TailnetNetMap, TailnetRegisterRequest, TailnetStunResponse,
 };
 use reqwest::Method;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_LOCAL_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 20_000;
-static CAPTURE_TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
-struct TempFileGuard(PathBuf);
+/// Shared local remote-control engine instances powered by `fabushi_remote_engine`.
+pub struct LocalRemoteEngine {
+    pub hub: Arc<RemoteControlHub>,
+    pub pty_mux: Arc<PtyMuxServer>,
+    pub capture: Arc<ScreenCaptureEngine>,
+    pub input: Arc<NativeInputEngine>,
+    pub clipboard: Arc<ClipboardSyncEngine>,
+    pub display_privacy: Arc<DisplayPrivacyManager>,
+    pub accessibility: Arc<AccessibilityEngine>,
+    pub audio: Arc<AudioPipeline>,
+}
 
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// Returns the process-wide `LocalRemoteEngine` singleton shared across `gpui_telegram_client`
+/// and `gpui_telegram_desktop` IPC / UI runtime.
+pub fn shared_remote_engine() -> &'static LocalRemoteEngine {
+    static ENGINE: OnceLock<LocalRemoteEngine> = OnceLock::new();
+    ENGINE.get_or_init(|| LocalRemoteEngine {
+        hub: RemoteControlHub::shared(),
+        pty_mux: Arc::new(PtyMuxServer::new()),
+        capture: Arc::new(ScreenCaptureEngine::new()),
+        input: Arc::new(NativeInputEngine::new()),
+        clipboard: Arc::new(ClipboardSyncEngine::new(format!(
+            "host-{}",
+            std::process::id()
+        ))),
+        display_privacy: Arc::new(DisplayPrivacyManager::new()),
+        accessibility: Arc::new(AccessibilityEngine),
+        audio: Arc::new(AudioPipeline::new()),
+    })
 }
 
 fn sanitize_hostname_candidate(raw: &str) -> Option<String> {
@@ -450,231 +489,61 @@ fn generate_fallback_screen_png_bytes(width: u32, height: u32) -> Vec<u8> {
     png
 }
 
-async fn capture_screen_png_data_url(force_fallback: bool) -> (String, &'static str) {
-    let seq = CAPTURE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = std::env::temp_dir().join(format!(
-        "gpui-telegram-capture-{}-{}.png",
-        std::process::id(),
-        seq
-    ));
-    let guard = TempFileGuard(tmp_path.clone());
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 
-    #[cfg(target_os = "macos")]
+fn is_headless_or_unit_test() -> bool {
+    cfg!(test)
+        || std::env::var_os("GPUI_OFFLINE_TEST").is_some()
+        || fabushi_remote_engine::is_headless_test_env()
+}
+
+fn headless_clipboard_slot() -> &'static parking_lot::RwLock<ClipboardPayloadDto> {
+    static CLIP: OnceLock<parking_lot::RwLock<ClipboardPayloadDto>> = OnceLock::new();
+    CLIP.get_or_init(|| {
+        parking_lot::RwLock::new(ClipboardPayloadDto {
+            mime_type: "text/plain".to_string(),
+            text: Some(String::new()),
+            image_b64: None,
+            origin_id: "headless-init".to_string(),
+            seq: 1,
+        })
+    })
+}
+
+async fn capture_screen_png_data_url(force_fallback: bool) -> (String, &'static str) {
     if !force_fallback
+        && !is_headless_or_unit_test()
         && std::env::var_os("GPUI_SKIP_NATIVE_SCREENCAPTURE").is_none()
-        && std::env::var_os("GPUI_OFFLINE_TEST").is_none()
     {
-        let mut cmd = tokio::process::Command::new("screencapture");
-        cmd.arg("-x").arg(&guard.0).kill_on_drop(true);
-        if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(2), cmd.output()).await {
-            if output.status.success() {
-                if let Ok(bytes) = tokio::fs::read(&guard.0).await {
-                    if bytes.len() > 8 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                        let b64 = encode_base64(&bytes);
-                        drop(guard);
-                        return (format!("data:image/png;base64,{}", b64), "screencapture");
-                    }
-                }
+        let engine = shared_remote_engine();
+        let display_idx = engine.display_privacy.active_display_index();
+        if let Ok(frame) = engine.capture.capture_screen(display_idx, CaptureFormat::Png) {
+            if frame.data.len() > 8
+                && (frame.data.starts_with(b"\x89PNG\r\n\x1a\n")
+                    || frame.data.starts_with(b"\xff\xd8\xff"))
+            {
+                return (frame.to_data_url(), "fabushi_remote_engine");
             }
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
-    let _ = force_fallback;
-
-    drop(guard);
     let png_bytes = generate_fallback_screen_png_bytes(160, 90);
     let b64 = encode_base64(&png_bytes);
     (format!("data:image/png;base64,{}", b64), "fallback_png")
 }
 
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct CgPointFfi {
-    x: f64,
-    y: f64,
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn AXIsProcessTrusted() -> bool;
-    fn CGWarpMouseCursorPosition(new_cursor_position: CgPointFfi) -> i32;
-    fn CGEventCreateMouseEvent(
-        source: *const std::ffi::c_void,
-        mouse_type: u32,
-        mouse_cursor_position: CgPointFfi,
-        mouse_button: u32,
-    ) -> *mut std::ffi::c_void;
-    fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
-    fn CFRelease(cf: *const std::ffi::c_void);
-}
-
-#[cfg(target_os = "macos")]
-fn post_macos_left_click(px: i32, py: i32) -> Result<&'static str, String> {
-    const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
-    const K_CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
-    const K_CG_EVENT_MOUSE_MOVED: u32 = 5;
-    const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
-    const K_CG_HID_EVENT_TAP: u32 = 0;
-
-    unsafe {
-        if !AXIsProcessTrusted() {
-            return Err(
-                "macOS 辅助功能权限未授予：请在「系统设置 → 隐私与安全性 → 辅助功能」中允许 Fabushi 后重试"
-                    .to_string(),
-            );
-        }
-        let pt = CgPointFfi {
-            x: px as f64,
-            y: py as f64,
-        };
-        let _ = CGWarpMouseCursorPosition(pt);
-        let moved = CGEventCreateMouseEvent(
-            std::ptr::null(),
-            K_CG_EVENT_MOUSE_MOVED,
-            pt,
-            K_CG_MOUSE_BUTTON_LEFT,
-        );
-        if !moved.is_null() {
-            CGEventPost(K_CG_HID_EVENT_TAP, moved);
-            CFRelease(moved);
-        }
-        let down = CGEventCreateMouseEvent(
-            std::ptr::null(),
-            K_CG_EVENT_LEFT_MOUSE_DOWN,
-            pt,
-            K_CG_MOUSE_BUTTON_LEFT,
-        );
-        let up = CGEventCreateMouseEvent(
-            std::ptr::null(),
-            K_CG_EVENT_LEFT_MOUSE_UP,
-            pt,
-            K_CG_MOUSE_BUTTON_LEFT,
-        );
-        if down.is_null() || up.is_null() {
-            if !down.is_null() {
-                CFRelease(down);
-            }
-            if !up.is_null() {
-                CFRelease(up);
-            }
-            return Err("CoreGraphics failed to construct mouse click event".to_string());
-        }
-        CGEventPost(K_CG_HID_EVENT_TAP, down);
-        std::thread::sleep(Duration::from_millis(18));
-        CGEventPost(K_CG_HID_EVENT_TAP, up);
-        CFRelease(down);
-        CFRelease(up);
-        Ok("macos_coregraphics")
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn try_macos_gui_input(
-    action: &str,
-    x: Option<i32>,
-    y: Option<i32>,
-    text: Option<&str>,
-    key: Option<&str>,
-) -> Result<Option<&'static str>, String> {
-    if cfg!(test) || std::env::var_os("GPUI_OFFLINE_TEST").is_some() {
-        return Ok(None);
-    }
-
-    let action_lc = action.trim().to_ascii_lowercase();
-    if action_lc == "click" {
-        let Some((px, py)) = x.zip(y) else {
-            return Err("Missing x/y coordinates for click".to_string());
-        };
-        return post_macos_left_click(px, py).map(Some);
-    }
-
-    let mut cmd = tokio::process::Command::new("osascript");
-    match action_lc.as_str() {
-        "type" => {
-            let Some(txt) = text.filter(|s| !s.is_empty()) else {
-                return Ok(None);
-            };
-            cmd.args([
-                "-e",
-                "on run argv",
-                "-e",
-                "tell application \"System Events\" to keystroke (item 1 of argv)",
-                "-e",
-                "end run",
-                "--",
-                txt,
-            ]);
-        }
-        "key" => {
-            let Some(k) = key.map(str::trim).filter(|s| !s.is_empty()) else {
-                return Ok(None);
-            };
-            let key_code = match k.to_ascii_lowercase().as_str() {
-                "enter" | "return" => Some(36u16),
-                "tab" => Some(48),
-                "escape" | "esc" => Some(53),
-                "space" => Some(49),
-                "backspace" | "delete" => Some(51),
-                "up" => Some(126),
-                "down" => Some(125),
-                "left" => Some(123),
-                "right" => Some(124),
-                _ => None,
-            };
-            if let Some(code) = key_code {
-                cmd.args([
-                    "-e",
-                    &format!("tell application \"System Events\" to key code {code}"),
-                ]);
-            } else if k.chars().count() == 1 {
-                cmd.args([
-                    "-e",
-                    "on run argv",
-                    "-e",
-                    "tell application \"System Events\" to keystroke (item 1 of argv)",
-                    "-e",
-                    "end run",
-                    "--",
-                    k,
-                ]);
-            } else {
-                return Ok(None);
-            }
-        }
-        _ => return Ok(None),
-    }
-
-    cmd.kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(2), cmd.output()).await {
-        Ok(Ok(output)) if output.status.success() => Ok(Some("macos_gui")),
-        Ok(Ok(output)) => {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if err.is_empty() {
-                Err("macOS 辅助功能权限未授予或系统事件被拦截".to_string())
-            } else {
-                Err(err)
-            }
-        }
-        _ => Err("macOS GUI input timed out".to_string()),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn try_macos_gui_input(
-    _action: &str,
-    _x: Option<i32>,
-    _y: Option<i32>,
-    _text: Option<&str>,
-    _key: Option<&str>,
-) -> Result<Option<&'static str>, String> {
-    Ok(None)
-}
-
-/// Executes a `RemoteComputerOp` directly on the local host machine.
+/// Executes a `RemoteComputerOp` directly on the local host machine via `fabushi_remote_engine`.
 pub async fn execute_local_computer_op(
     node_id: &str,
     command_id: &str,
@@ -691,6 +560,7 @@ async fn execute_local_computer_op_inner(
 ) -> RemoteComputerCommandResult {
     let started = Instant::now();
     let executed_by = format!("local-host:{}", detect_local_hostname());
+    let engine = shared_remote_engine();
 
     let mut result = RemoteComputerCommandResult {
         command_id: command_id.to_string(),
@@ -830,15 +700,41 @@ async fn execute_local_computer_op_inner(
             text,
             key,
         } => {
-            match try_macos_gui_input(
-                action,
-                *x,
-                *y,
-                text.as_deref(),
-                key.as_deref(),
-            )
-            .await
-            {
+            let action_lc = action.trim().to_ascii_lowercase();
+            let engine_res = if is_headless_or_unit_test() {
+                Ok(None)
+            } else if matches!(
+                action_lc.as_str(),
+                "click" | "move" | "double_click" | "right_click" | "down" | "up" | "scroll"
+            ) {
+                engine
+                    .input
+                    .execute_mouse_action(&MouseActionParams {
+                        action: action_lc.clone(),
+                        x: *x,
+                        y: *y,
+                        dx: None,
+                        dy: None,
+                        button: Some("left".to_string()),
+                        clicks: Some(1),
+                        scroll_x: None,
+                        scroll_y: None,
+                        relative: false,
+                    })
+                    .map(|_| Some("fabushi_remote_engine"))
+            } else {
+                engine
+                    .input
+                    .execute_keyboard_action(&KeyboardActionParams {
+                        action: action_lc.clone(),
+                        text: text.clone(),
+                        key: key.clone(),
+                        modifiers: Vec::new(),
+                    })
+                    .map(|_| Some("fabushi_remote_engine"))
+            };
+
+            match engine_res {
                 Ok(Some(driver)) => {
                     result.ok = true;
                     result.exit_code = 0;
@@ -864,13 +760,564 @@ async fn execute_local_computer_op_inner(
                         key
                     );
                 }
-                Err(err_msg) => {
+                Err(err) => {
                     result.ok = false;
                     result.exit_code = 1;
-                    result.stderr = err_msg;
+                    result.stderr = err.to_string();
                 }
             }
         }
+        RemoteComputerOp::MouseAction {
+            action,
+            x,
+            y,
+            dx,
+            dy,
+            button,
+            clicks,
+            scroll_x,
+            scroll_y,
+            relative,
+        } => {
+            if is_headless_or_unit_test() {
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = format!(
+                    "mouse_action acknowledged (headless): action={} x={:?} y={:?} relative={}",
+                    action, x, y, relative
+                );
+            } else if let Err(err) = engine.input.set_relative_mouse(*relative) {
+                result.exit_code = 1;
+                result.stderr = err.to_string();
+            } else if let Err(err) = engine.input.execute_mouse_action(&MouseActionParams {
+                action: action.clone(),
+                x: *x,
+                y: *y,
+                dx: *dx,
+                dy: *dy,
+                button: button.clone(),
+                clicks: *clicks,
+                scroll_x: *scroll_x,
+                scroll_y: *scroll_y,
+                relative: *relative,
+            }) {
+                result.exit_code = 1;
+                result.stderr = err.to_string();
+            } else {
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = format!(
+                    "mouse_action acknowledged: action={} x={:?} y={:?} relative={}",
+                    action, x, y, relative
+                );
+            }
+        }
+        RemoteComputerOp::KeyboardAction {
+            action,
+            text,
+            key,
+            modifiers,
+        } => {
+            if is_headless_or_unit_test() {
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = format!(
+                    "keyboard_action acknowledged (headless): action={} key={:?} modifiers={:?}",
+                    action, key, modifiers
+                );
+            } else {
+                match engine.input.execute_keyboard_action(&KeyboardActionParams {
+                    action: action.clone(),
+                    text: text.clone(),
+                    key: key.clone(),
+                    modifiers: modifiers.clone(),
+                }) {
+                    Ok(()) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = format!(
+                            "keyboard_action acknowledged: action={} key={:?} modifiers={:?}",
+                            action, key, modifiers
+                        );
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+        }
+        RemoteComputerOp::ClipboardGet => {
+            if is_headless_or_unit_test() {
+                let payload = headless_clipboard_slot().read().clone();
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = serde_json::to_string(&payload).unwrap_or_default();
+            } else {
+                match engine.clipboard.get_local() {
+                    Ok(payload) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = serde_json::to_string(&payload).unwrap_or_default();
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+        }
+        RemoteComputerOp::ClipboardSet {
+            text,
+            image_b64,
+            mime_type,
+        } => {
+            let payload = ClipboardPayloadDto {
+                mime_type: mime_type
+                    .clone()
+                    .unwrap_or_else(|| "text/plain".to_string()),
+                text: text.clone(),
+                image_b64: image_b64.clone(),
+                origin_id: format!("remote-op:{}", command_id),
+                seq: chrono::Utc::now().timestamp_millis().max(1) as u64,
+            };
+            if is_headless_or_unit_test() {
+                *headless_clipboard_slot().write() = payload;
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = serde_json::json!({ "applied": true }).to_string();
+            } else {
+                match engine.clipboard.apply_remote(&payload) {
+                    Ok(applied) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = serde_json::json!({ "applied": applied }).to_string();
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+        }
+        RemoteComputerOp::PowerAction { action } => {
+            if is_headless_or_unit_test() {
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = format!("headless power action acknowledged: {:?}", action);
+            } else {
+                match PowerManager::execute_power_action(action) {
+                    Ok(msg) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = msg;
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+        }
+        RemoteComputerOp::DisplayList => {
+            if is_headless_or_unit_test() {
+                let mut displays = vec![DisplayInfoDto {
+                    display_id: 0,
+                    name: "Headless Virtual Display".to_string(),
+                    width: 1920,
+                    height: 1080,
+                    scale_factor_x100: 100,
+                    is_primary: true,
+                    is_virtual: false,
+                    refresh_hz: 60,
+                }];
+                displays.extend(engine.display_privacy.virtual_displays());
+                result.ok = true;
+                result.exit_code = 0;
+                result.entries = displays
+                    .iter()
+                    .map(|d| format!("{}:{} ({}x{})", d.display_id, d.name, d.width, d.height))
+                    .collect();
+                result.stdout = serde_json::to_string(&displays).unwrap_or_default();
+            } else {
+                match engine.capture.list_displays() {
+                    Ok(mut displays) => {
+                        displays.extend(engine.display_privacy.virtual_displays());
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.entries = displays
+                            .iter()
+                            .map(|d| format!("{}:{} ({}x{})", d.display_id, d.name, d.width, d.height))
+                            .collect();
+                        result.stdout = serde_json::to_string(&displays).unwrap_or_default();
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+        }
+        RemoteComputerOp::DisplaySwitch { display_index } => {
+            match engine.display_privacy.switch_display(*display_index) {
+                Ok(idx) => {
+                    result.ok = true;
+                    result.exit_code = 0;
+                    result.stdout = format!("Switched active display to {idx}");
+                }
+                Err(err) => {
+                    result.exit_code = 1;
+                    result.stderr = err.to_string();
+                }
+            }
+        }
+        RemoteComputerOp::PrivacyScreenToggle { enabled, message } => {
+            match engine
+                .display_privacy
+                .set_privacy_screen(*enabled, message.clone())
+            {
+                Ok(state) => {
+                    result.ok = true;
+                    result.exit_code = 0;
+                    result.stdout = format!("Privacy screen enabled={state}");
+                }
+                Err(err) => {
+                    result.exit_code = 1;
+                    result.stderr = err.to_string();
+                }
+            }
+        }
+        RemoteComputerOp::TerminalOp {
+            op: sub_op,
+            session_name,
+            shell,
+            input,
+            command,
+            cols,
+            rows,
+            timeout_ms,
+            new_name,
+        } => {
+            let target = session_name.as_deref().unwrap_or("default");
+            match sub_op.as_str() {
+                "ls" => {
+                    let list = engine.pty_mux.list_sessions();
+                    result.ok = true;
+                    result.exit_code = 0;
+                    result.entries = list.iter().map(|s| s.name.clone()).collect();
+                    result.stdout = serde_json::to_string(&list).unwrap_or_default();
+                }
+                "has" => {
+                    let exists = engine.pty_mux.has_session(target);
+                    result.ok = exists;
+                    result.exit_code = if exists { 0 } else { 1 };
+                    result.stdout = serde_json::json!({ "exists": exists }).to_string();
+                }
+                "new" => match engine.pty_mux.new_session(
+                    session_name.as_deref(),
+                    shell.as_deref(),
+                    cols.unwrap_or(100),
+                    rows.unwrap_or(28),
+                    None,
+                ) {
+                    Ok(dto) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = serde_json::to_string(&dto).unwrap_or_default();
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                },
+                "kill" => match engine.pty_mux.kill_session(target) {
+                    Ok(killed) => {
+                        result.ok = killed;
+                        result.exit_code = if killed { 0 } else { 1 };
+                        result.stdout = serde_json::json!({ "killed": killed }).to_string();
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                },
+                "rename" => {
+                    let next = new_name.as_deref().unwrap_or("");
+                    match engine.pty_mux.rename_session(target, next) {
+                        Ok(dto) => {
+                            result.ok = true;
+                            result.exit_code = 0;
+                            result.stdout = serde_json::to_string(&dto).unwrap_or_default();
+                        }
+                        Err(err) => {
+                            result.exit_code = 1;
+                            result.stderr = err.to_string();
+                        }
+                    }
+                }
+                "resize" => match engine.pty_mux.resize_session(
+                    target,
+                    cols.unwrap_or(100),
+                    rows.unwrap_or(28),
+                    true,
+                    false,
+                ) {
+                    Ok(()) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = "resized".to_string();
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                },
+                "write" | "send" => {
+                    let data = input.as_deref().unwrap_or("");
+                    match engine.pty_mux.write_input(target, data.as_bytes()) {
+                        Ok(()) => {
+                            result.ok = true;
+                            result.exit_code = 0;
+                            result.stdout = format!("wrote {} bytes", data.len());
+                        }
+                        Err(err) => {
+                            result.exit_code = 1;
+                            result.stderr = err.to_string();
+                        }
+                    }
+                }
+                "read" => match engine.pty_mux.read_scrollback(target, Some(400)) {
+                    Ok(txt) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = txt;
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                },
+                "exec" => {
+                    let cmd_str = command.as_deref().unwrap_or("");
+                    match engine
+                        .pty_mux
+                        .exec_command(target, cmd_str, timeout_ms.unwrap_or(15_000))
+                        .await
+                    {
+                        Ok(exec_res) => {
+                            result.ok = !exec_res.timed_out && exec_res.exit_code == 0;
+                            result.exit_code = exec_res.exit_code;
+                            result.stdout = serde_json::to_string(&exec_res).unwrap_or_default();
+                        }
+                        Err(err) => {
+                            result.exit_code = 1;
+                            result.stderr = err.to_string();
+                        }
+                    }
+                }
+                other => {
+                    result.exit_code = 1;
+                    result.stderr = format!("Unsupported terminal_op '{other}'");
+                }
+            }
+        }
+        RemoteComputerOp::AccessibilityTree { max_depth } => {
+            if is_headless_or_unit_test() {
+                let tree = AccessibilityNodeDto {
+                    element_id: "root-0".to_string(),
+                    role: "AXApplication".to_string(),
+                    name: Some("Fabushi Desktop".to_string()),
+                    value: None,
+                    bounds: Some([0, 0, 1440, 900]),
+                    actions: vec!["AXRaise".to_string()],
+                    children: vec![AccessibilityNodeDto {
+                        element_id: "win-1".to_string(),
+                        role: "AXWindow".to_string(),
+                        name: Some("Main".to_string()),
+                        value: None,
+                        bounds: Some([0, 0, 1280, 820]),
+                        actions: vec!["AXPress".to_string()],
+                        children: Vec::new(),
+                    }],
+                };
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = serde_json::to_string(&tree).unwrap_or_default();
+            } else {
+                match engine.accessibility.capture_tree(*max_depth) {
+                    Ok(tree) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = serde_json::to_string(&tree).unwrap_or_default();
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+        }
+        RemoteComputerOp::SemanticAction {
+            element_id,
+            action,
+            value,
+        } => {
+            if is_headless_or_unit_test() {
+                result.ok = true;
+                result.exit_code = 0;
+                result.stdout = format!("semantic_action {action} on {element_id} (headless)");
+            } else {
+                match engine
+                    .accessibility
+                    .perform_semantic_action(element_id, action, value.as_deref())
+                {
+                    Ok(()) => {
+                        result.ok = true;
+                        result.exit_code = 0;
+                        result.stdout = format!("semantic_action {action} on {element_id}");
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+        }
+        RemoteComputerOp::FileChunkOp {
+            op: chunk_op,
+            transfer_id,
+            path,
+            offset,
+            data_b64,
+            sha256,
+            total_size: _,
+        } => match chunk_op.as_str() {
+            "read_chunk" => {
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                match tokio::fs::File::open(path).await {
+                    Ok(mut file) => {
+                        let meta_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                        if let Err(err) = file.seek(std::io::SeekFrom::Start(*offset)).await {
+                            result.exit_code = 1;
+                            result.stderr = err.to_string();
+                        } else {
+                            let mut buf = vec![0u8; DEFAULT_CHUNK_SIZE];
+                            match file.read(&mut buf).await {
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    let digest = hex_sha256(&buf);
+                                    let b64 =
+                                        base64::engine::general_purpose::STANDARD.encode(&buf);
+                                    result.ok = true;
+                                    result.exit_code = 0;
+                                    result.stdout = serde_json::json!({
+                                        "transfer_id": transfer_id,
+                                        "path": path,
+                                        "offset": offset,
+                                        "size": n,
+                                        "total_size": meta_len,
+                                        "sha256": digest,
+                                        "data_b64": b64,
+                                    })
+                                    .to_string();
+                                }
+                                Err(err) => {
+                                    result.exit_code = 1;
+                                    result.stderr = err.to_string();
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = err.to_string();
+                    }
+                }
+            }
+            "write_chunk" | "append" | "resume" => {
+                use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+                let b64 = data_b64.as_deref().unwrap_or("");
+                match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                    Ok(bytes) => {
+                        let actual_sha = hex_sha256(&bytes);
+                        if let Some(expected) = sha256.as_deref().filter(|s| !s.is_empty()) {
+                            if !actual_sha.eq_ignore_ascii_case(expected) {
+                                result.exit_code = 1;
+                                result.stderr = format!(
+                                    "SHA-256 mismatch at offset {offset}: expected {expected}, got {actual_sha}"
+                                );
+                                result.duration_ms = started.elapsed().as_millis() as u64;
+                                return result;
+                            }
+                        }
+                        if let Some(parent) = Path::new(path).parent() {
+                            if !parent.as_os_str().is_empty() {
+                                let _ = tokio::fs::create_dir_all(parent).await;
+                            }
+                        }
+                        match tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .read(true)
+                            .open(path)
+                            .await
+                        {
+                            Ok(mut file) => {
+                                if let Err(err) = file.seek(std::io::SeekFrom::Start(*offset)).await
+                                {
+                                    result.exit_code = 1;
+                                    result.stderr = err.to_string();
+                                } else if let Err(err) = file.write_all(&bytes).await {
+                                    result.exit_code = 1;
+                                    result.stderr = err.to_string();
+                                } else {
+                                    let _ = file.flush().await;
+                                    result.ok = true;
+                                    result.exit_code = 0;
+                                    result.stdout = serde_json::json!({
+                                        "transfer_id": transfer_id,
+                                        "path": path,
+                                        "offset": offset,
+                                        "bytes_written": bytes.len(),
+                                        "sha256": actual_sha,
+                                    })
+                                    .to_string();
+                                }
+                            }
+                            Err(err) => {
+                                result.exit_code = 1;
+                                result.stderr = err.to_string();
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        result.exit_code = 1;
+                        result.stderr = format!("Invalid chunk base64: {err}");
+                    }
+                }
+            }
+            "stat" => match tokio::fs::metadata(path).await {
+                Ok(meta) => {
+                    result.ok = true;
+                    result.exit_code = 0;
+                    result.stdout = serde_json::json!({
+                        "transfer_id": transfer_id,
+                        "path": path,
+                        "total_size": meta.len(),
+                        "is_file": meta.is_file(),
+                    })
+                    .to_string();
+                }
+                Err(err) => {
+                    result.exit_code = 1;
+                    result.stderr = err.to_string();
+                }
+            },
+            other => {
+                result.exit_code = 1;
+                result.stderr = format!("Unsupported file chunk_op '{other}'");
+            }
+        },
         RemoteComputerOp::TestConnection => {
             let (ip, os, _res) = detect_local_host_info();
             result.ok = true;
@@ -1088,6 +1535,144 @@ impl HttpClient {
             processed.push(cmd);
         }
         Ok(processed)
+    }
+
+    pub async fn get_remote_assist_info(
+        &self,
+        token: &str,
+    ) -> Result<RemoteAssistConfigDto, HttpClientError> {
+        self.request_json(
+            Method::GET,
+            "/api/v1/remote/assist/info",
+            Some(token),
+            None::<&()>,
+        )
+        .await
+    }
+
+    pub async fn reset_remote_assist_code(
+        &self,
+        token: &str,
+    ) -> Result<RemoteAssistConfigDto, HttpClientError> {
+        self.request_json(
+            Method::POST,
+            "/api/v1/remote/assist/reset-code",
+            Some(token),
+            Some(&serde_json::json!({})),
+        )
+        .await
+    }
+
+    pub async fn set_remote_assist_code(
+        &self,
+        token: &str,
+        code: &str,
+    ) -> Result<RemoteAssistConfigDto, HttpClientError> {
+        let req = AssistSetCodeRequest {
+            code: code.to_string(),
+        };
+        self.request_json(
+            Method::POST,
+            "/api/v1/remote/assist/set-code",
+            Some(token),
+            Some(&req),
+        )
+        .await
+    }
+
+    pub async fn set_remote_assist_allow(
+        &self,
+        token: &str,
+        allow_assist: bool,
+    ) -> Result<RemoteAssistConfigDto, HttpClientError> {
+        let req = AssistAllowRequest { allow_assist };
+        self.request_json(
+            Method::POST,
+            "/api/v1/remote/assist/allow",
+            Some(token),
+            Some(&req),
+        )
+        .await
+    }
+
+    pub async fn start_remote_assist(
+        &self,
+        token: &str,
+        req: &AssistStartRequest,
+    ) -> Result<AssistStartResponse, HttpClientError> {
+        self.request_json(
+            Method::POST,
+            "/api/v1/remote/assist/start",
+            Some(token),
+            Some(req),
+        )
+        .await
+    }
+
+    pub async fn list_remote_sessions(
+        &self,
+        token: &str,
+    ) -> Result<RemoteSessionsResponse, HttpClientError> {
+        self.request_json(
+            Method::GET,
+            "/api/v1/remote/sessions",
+            Some(token),
+            None::<&()>,
+        )
+        .await
+    }
+
+    pub async fn disconnect_remote_session(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<(), HttpClientError> {
+        let req = RemoteSessionDisconnectRequest {
+            session_id: session_id.to_string(),
+        };
+        self.request_empty(
+            Method::POST,
+            "/api/v1/remote/sessions/disconnect",
+            Some(token),
+            Some(&req),
+        )
+        .await
+    }
+
+    pub async fn disconnect_all_remote_sessions(
+        &self,
+        token: &str,
+    ) -> Result<serde_json::Value, HttpClientError> {
+        self.request_json(
+            Method::POST,
+            "/api/v1/remote/sessions/disconnect-all",
+            Some(token),
+            Some(&serde_json::json!({})),
+        )
+        .await
+    }
+
+    pub async fn list_mcp_grants(
+        &self,
+        token: &str,
+    ) -> Result<McpOAuthGrantsResponse, HttpClientError> {
+        self.request_json(
+            Method::GET,
+            "/api/v1/mcp/grants",
+            Some(token),
+            None::<&()>,
+        )
+        .await
+    }
+
+    pub async fn revoke_mcp_grant(
+        &self,
+        token: &str,
+        family_id: &str,
+    ) -> Result<(), HttpClientError> {
+        let path = format!("/api/v1/mcp/grants/{}", percent_encode_rfc3986(family_id));
+        self.request_empty(Method::DELETE, &path, Some(token), None::<&()>)
+            .await
     }
 }
 
@@ -1494,5 +2079,352 @@ mod tests {
         assert!(!primary_ip.starts_with("169.254."));
         assert!(!os_name.is_empty());
         assert!(!res.is_empty());
+    }
+
+    #[test]
+    fn test_extended_remote_ops_and_remote_control_http_endpoints() {
+        use gpui_telegram_proto::remote_control_contracts::{
+            AssistCodeMode, McpOAuthGrantSummaryDto, PowerActionKind, RemoteControlMode,
+            RemoteControllerKind, RemoteSessionDto,
+        };
+        use gpui_telegram_proto::tailnet_contracts::TailnetRelayMode;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let chunk_file = tmp.path().join("chunked.bin");
+        let chunk_path = chunk_file.to_string_lossy().to_string();
+
+        rt.block_on(async {
+            // Mouse + Keyboard + Display + Privacy + Clipboard + Accessibility + Power
+            let m = execute_local_computer_op(
+                "local:1:d",
+                "op-m",
+                &RemoteComputerOp::MouseAction {
+                    action: "move".into(),
+                    x: Some(100),
+                    y: Some(200),
+                    dx: None,
+                    dy: None,
+                    button: None,
+                    clicks: None,
+                    scroll_x: None,
+                    scroll_y: None,
+                    relative: false,
+                },
+            )
+            .await;
+            assert!(m.ok);
+
+            let k = execute_local_computer_op(
+                "local:1:d",
+                "op-k",
+                &RemoteComputerOp::KeyboardAction {
+                    action: "hotkey".into(),
+                    text: None,
+                    key: Some("c".into()),
+                    modifiers: vec!["ctrl".into()],
+                },
+            )
+            .await;
+            assert!(k.ok);
+
+            let cs = execute_local_computer_op(
+                "local:1:d",
+                "op-cs",
+                &RemoteComputerOp::ClipboardSet {
+                    text: Some("fabushi-clip".into()),
+                    image_b64: None,
+                    mime_type: Some("text/plain".into()),
+                },
+            )
+            .await;
+            assert!(cs.ok);
+            let cg = execute_local_computer_op("local:1:d", "op-cg", &RemoteComputerOp::ClipboardGet)
+                .await;
+            assert!(cg.ok);
+            assert!(cg.stdout.contains("fabushi-clip"));
+
+            let dl = execute_local_computer_op("local:1:d", "op-dl", &RemoteComputerOp::DisplayList)
+                .await;
+            assert!(dl.ok);
+            assert!(!dl.entries.is_empty());
+
+            let ds = execute_local_computer_op(
+                "local:1:d",
+                "op-ds",
+                &RemoteComputerOp::DisplaySwitch { display_index: 0 },
+            )
+            .await;
+            assert!(ds.ok);
+
+            let pv = execute_local_computer_op(
+                "local:1:d",
+                "op-pv",
+                &RemoteComputerOp::PrivacyScreenToggle {
+                    enabled: true,
+                    message: Some("Locked".into()),
+                },
+            )
+            .await;
+            assert!(pv.ok);
+
+            let ax = execute_local_computer_op(
+                "local:1:d",
+                "op-ax",
+                &RemoteComputerOp::AccessibilityTree { max_depth: Some(2) },
+            )
+            .await;
+            assert!(ax.ok);
+            assert!(ax.stdout.contains("AXApplication"));
+
+            let pw = execute_local_computer_op(
+                "local:1:d",
+                "op-pw",
+                &RemoteComputerOp::PowerAction {
+                    action: PowerActionKind::Lock,
+                },
+            )
+            .await;
+            assert!(pw.ok);
+
+            // TerminalOp lifecycle
+            let t_new = execute_local_computer_op(
+                "local:1:d",
+                "op-tn",
+                &RemoteComputerOp::TerminalOp {
+                    op: "new".into(),
+                    session_name: Some("api-term-test".into()),
+                    shell: Some("sh".into()),
+                    input: None,
+                    command: None,
+                    cols: Some(80),
+                    rows: Some(24),
+                    timeout_ms: None,
+                    new_name: None,
+                },
+            )
+            .await;
+            assert!(t_new.ok);
+
+            let t_has = execute_local_computer_op(
+                "local:1:d",
+                "op-th",
+                &RemoteComputerOp::TerminalOp {
+                    op: "has".into(),
+                    session_name: Some("api-term-test".into()),
+                    shell: None,
+                    input: None,
+                    command: None,
+                    cols: None,
+                    rows: None,
+                    timeout_ms: None,
+                    new_name: None,
+                },
+            )
+            .await;
+            assert!(t_has.ok);
+            assert_eq!(t_has.exit_code, 0);
+
+            let t_kill = execute_local_computer_op(
+                "local:1:d",
+                "op-tk",
+                &RemoteComputerOp::TerminalOp {
+                    op: "kill".into(),
+                    session_name: Some("api-term-test".into()),
+                    shell: None,
+                    input: None,
+                    command: None,
+                    cols: None,
+                    rows: None,
+                    timeout_ms: None,
+                    new_name: None,
+                },
+            )
+            .await;
+            assert!(t_kill.ok);
+
+            // FileChunkOp write + read + SHA-256 mismatch rejection
+            let raw_payload = b"hello-fabushi-chunk";
+            let good_sha = hex_sha256(raw_payload);
+            let b64_payload = base64::engine::general_purpose::STANDARD.encode(raw_payload);
+
+            let bad_write = execute_local_computer_op(
+                "local:1:d",
+                "op-fw-bad",
+                &RemoteComputerOp::FileChunkOp {
+                    op: "write_chunk".into(),
+                    transfer_id: "tx-1".into(),
+                    path: chunk_path.clone(),
+                    offset: 0,
+                    data_b64: Some(b64_payload.clone()),
+                    sha256: Some("0000".into()),
+                    total_size: Some(raw_payload.len() as u64),
+                },
+            )
+            .await;
+            assert!(!bad_write.ok);
+            assert!(bad_write.stderr.contains("SHA-256 mismatch"));
+
+            let good_write = execute_local_computer_op(
+                "local:1:d",
+                "op-fw-ok",
+                &RemoteComputerOp::FileChunkOp {
+                    op: "write_chunk".into(),
+                    transfer_id: "tx-1".into(),
+                    path: chunk_path.clone(),
+                    offset: 0,
+                    data_b64: Some(b64_payload),
+                    sha256: Some(good_sha.clone()),
+                    total_size: Some(raw_payload.len() as u64),
+                },
+            )
+            .await;
+            assert!(good_write.ok);
+
+            let read_back = execute_local_computer_op(
+                "local:1:d",
+                "op-fr",
+                &RemoteComputerOp::FileChunkOp {
+                    op: "read_chunk".into(),
+                    transfer_id: "tx-1".into(),
+                    path: chunk_path,
+                    offset: 0,
+                    data_b64: None,
+                    sha256: None,
+                    total_size: None,
+                },
+            )
+            .await;
+            assert!(read_back.ok);
+            assert!(read_back.stdout.contains(&good_sha));
+        });
+
+        // Verify new HttpClient endpoints (/api/v1/remote/assist/*, /api/v1/remote/sessions/*, /api/v1/mcp/grants*)
+        let seen_paths = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let seen_srv = Arc::clone(&seen_paths);
+        let addr = rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let headers_str = String::from_utf8_lossy(&buf[..n]);
+                    let first = headers_str.lines().next().unwrap_or("");
+                    let mut parts = first.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    seen_srv.lock().push((method.clone(), path.clone()));
+
+                    let body = match (method.as_str(), path.as_str()) {
+                        ("GET", "/api/v1/remote/assist/info")
+                        | ("POST", "/api/v1/remote/assist/reset-code")
+                        | ("POST", "/api/v1/remote/assist/set-code")
+                        | ("POST", "/api/v1/remote/assist/allow") => serde_json::to_vec(
+                            &RemoteAssistConfigDto {
+                                assist_id: "482910375".into(),
+                                allow_assist: true,
+                                code_mode: AssistCodeMode::Custom,
+                                current_code: Some("Abc12345".into()),
+                                expires_at_ms: None,
+                            },
+                        )
+                        .unwrap(),
+                        ("POST", "/api/v1/remote/assist/start") => serde_json::to_vec(
+                            &AssistStartResponse {
+                                session_id: "sess-1".into(),
+                                target_node_id: "local:2:dev".into(),
+                                target_device_id: "dev".into(),
+                                temp_relay_token: "rtok".into(),
+                                requires_host_confirm: false,
+                                expires_at_ms: None,
+                            },
+                        )
+                        .unwrap(),
+                        ("GET", "/api/v1/remote/sessions") => serde_json::to_vec(
+                            &RemoteSessionsResponse {
+                                sessions: vec![RemoteSessionDto {
+                                    session_id: "sess-1".into(),
+                                    controller_kind: RemoteControllerKind::AiMcp,
+                                    controller_name: "Antigravity".into(),
+                                    controller_platform: "macos".into(),
+                                    controller_id: "cli-1".into(),
+                                    target_node_id: "local:1:d".into(),
+                                    target_device_id: "d".into(),
+                                    mode: RemoteControlMode::AiControl,
+                                    started_at_ms: 1000,
+                                    last_activity_ms: 2000,
+                                    active_tool: Some("capture_screen".into()),
+                                    relay_mode: TailnetRelayMode::DirectUdp,
+                                    rtt_ms: Some(9),
+                                    fps: Some(60),
+                                }],
+                            },
+                        )
+                        .unwrap(),
+                        ("GET", "/api/v1/mcp/grants") => serde_json::to_vec(
+                            &McpOAuthGrantsResponse {
+                                grants: vec![McpOAuthGrantSummaryDto {
+                                    family_id: "fam-1".into(),
+                                    client_id: "cid-1".into(),
+                                    client_name: "Antigravity".into(),
+                                    scopes: vec!["devices:read".into()],
+                                    allowed_node_ids: vec![],
+                                    created_at_ms: 1000,
+                                    last_used_ms: Some(2000),
+                                    expires_at_ms: 9000,
+                                }],
+                            },
+                        )
+                        .unwrap(),
+                        _ => br#"{"ok":true}"#.to_vec(),
+                    };
+
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                }
+            });
+            addr
+        });
+
+        let mut cfg = ClientConfig::default();
+        cfg.server_url = format!("http://{addr}");
+        let client = TelegramClient::new(cfg);
+        client.set_token(Some("tok".into()));
+
+        let assist = client.get_remote_assist_info().unwrap();
+        assert_eq!(assist.assist_id, "482910375");
+        let _ = client.reset_remote_assist_code().unwrap();
+        let _ = client.set_remote_assist_code("Abc12345").unwrap();
+        let _ = client.set_remote_assist_allow(true).unwrap();
+        let start = client
+            .start_remote_assist(&AssistStartRequest {
+                assist_id: "482910375".into(),
+                access_code: "Abc12345".into(),
+                mode: RemoteControlMode::Desktop,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(start.session_id, "sess-1");
+
+        let sessions = client.list_remote_sessions().unwrap();
+        assert_eq!(sessions.sessions.len(), 1);
+        client.disconnect_remote_session("sess-1").unwrap();
+        let _ = client.disconnect_all_remote_sessions().unwrap();
+
+        let grants = client.list_mcp_grants().unwrap();
+        assert_eq!(grants.grants.len(), 1);
+        client.revoke_mcp_grant("fam-1").unwrap();
+
+        let recorded = seen_paths.lock();
+        assert_eq!(recorded.len(), 10);
+        assert_eq!(recorded[9], ("DELETE".into(), "/api/v1/mcp/grants/fam-1".into()));
     }
 }

@@ -1,5 +1,6 @@
 //! Module definitions for `crates/gpui_telegram_desktop/src/app`
 
+pub mod cli_installer;
 pub mod main;
 pub mod main_account;
 pub mod main_app_config;

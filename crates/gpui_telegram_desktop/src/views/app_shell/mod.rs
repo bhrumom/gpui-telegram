@@ -1,5 +1,6 @@
 //! Module definitions for `crates/gpui_telegram_desktop/src/views/app_shell`
 
+pub mod desktop_ipc_host;
 pub mod gift_resale_filter;
 pub mod local_subscription_bridge;
 pub mod main_window;

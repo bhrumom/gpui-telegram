@@ -292,6 +292,45 @@ impl AppShell {
         }
     }
 
+    fn try_route_interactive_pty_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_authenticated {
+            return false;
+        }
+        let Some(ov) = self
+            .overlays
+            .computer_overlay
+            .as_ref()
+            .filter(|ov| ov.read(cx).is_interactive_pty_focused(cx))
+            .cloned()
+        else {
+            return false;
+        };
+        let m = event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        // Forward Control combinations (Ctrl+C, Ctrl+D, etc.), Cmd+C selection copy,
+        // and non-printable navigation/control keys to RemoteTerminalView.
+        let is_ctrl_combo = m.control && !m.platform;
+        let is_cmd_copy = m.platform && key.eq_ignore_ascii_case("c");
+        if is_ctrl_combo || is_cmd_copy {
+            return ov.update(cx, |wb, wcx| {
+                wb.handle_terminal_key_stroke(
+                    key,
+                    m.shift,
+                    m.control,
+                    m.alt,
+                    m.platform,
+                    event.keystroke.key_char.as_deref(),
+                    wcx,
+                )
+            });
+        }
+        false
+    }
+
     /// Handles window-level key down events without swallowing printable IME character input.
     pub fn handle_window_key_down(
         &mut self,
@@ -299,6 +338,10 @@ impl AppShell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.try_route_interactive_pty_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let key = event.keystroke.key.as_str();
 
         // 1. Handle Cmd / Ctrl shortcuts (Theme, Language, Navigation, Modals, Search, Paste)
@@ -325,6 +368,9 @@ impl AppShell {
 
     /// Dispatches a synthetic or view-local `KeyDownEvent` (used by tests and fallback key handlers).
     pub fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.try_route_interactive_pty_key(event, cx) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
 
         if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {

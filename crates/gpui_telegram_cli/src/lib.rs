@@ -1,30 +1,29 @@
 pub mod approval;
 pub mod cli_parser;
+pub mod envelope;
 pub mod error;
 pub mod help;
 pub mod http_client;
+pub mod ipc_client;
+pub mod mcp_config;
 pub mod registry;
+pub mod session_store;
+pub mod unified_commands;
+pub mod unified_parser;
 
 use crate::approval::{prompt_local_approval, resolve_remote_gate_decision, ApprovalDecisionPrompt};
 use crate::cli_parser::{parse_args, CliCommand, ExportFormat, GlobalOptions, OutputFormat};
+use crate::envelope::{format_json, ok_envelope, CliOutcome};
 use crate::error::CliError;
 use crate::help::{format_actions_table, format_topic_help};
 use crate::http_client::{ActionHttpClient, ActionHttpOutcome};
 use crate::registry::{build_default_registry, default_cli_schema, resolve_action, PROGRAM_NAME};
+use crate::unified_commands::execute_unified;
 use gpui_telegram_core::action_bus::{
     ActionContext, ActionError, ActionRegistry, CliExporter, CliSchemaExport, HermesToolExporter,
     McpExporter, OpenApiExporter,
 };
 use serde_json::{json, Value};
-
-fn format_json(val: &Value, pretty: bool) -> Result<String, CliError> {
-    if pretty {
-        serde_json::to_string_pretty(val)
-    } else {
-        serde_json::to_string(val)
-    }
-    .map_err(|e| CliError::Execution(format!("Failed to serialize JSON output: {e}")))
-}
 
 fn map_action_error(err: ActionError) -> CliError {
     match err {
@@ -32,22 +31,26 @@ fn map_action_error(err: ActionError) -> CliError {
         ActionError::InvalidInput(m) => CliError::Validation(m),
         ActionError::Unauthorized(m) => CliError::Unauthorized(m),
         ActionError::Forbidden(m) => CliError::Forbidden(m),
-        ActionError::ExecutionFailed(m) | ActionError::Serialization(m) | ActionError::RateLimited(m) => {
-            CliError::Execution(m)
-        }
+        ActionError::ExecutionFailed(m)
+        | ActionError::Serialization(m)
+        | ActionError::RateLimited(m) => CliError::Execution(m),
     }
 }
 
-pub async fn run_cli_from_env() -> Result<String, CliError> {
+pub async fn run_cli_from_env() -> Result<CliOutcome, CliError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    run_cli_with_args(&args).await
+    run_cli_with_args_outcome(&args).await
 }
 
 pub async fn run_cli_with_args(args: &[String]) -> Result<String, CliError> {
+    run_cli_with_args_outcome(args).await.map(|o| o.stdout)
+}
+
+pub async fn run_cli_with_args_outcome(args: &[String]) -> Result<CliOutcome, CliError> {
     let registry = build_default_registry();
     let schema = default_cli_schema(&registry);
     let parsed = parse_args(args, &registry, &schema, None)?;
-    execute_command(parsed.options, parsed.command, &registry, &schema).await
+    execute_command_outcome(parsed.options, parsed.command, &registry, &schema).await
 }
 
 pub async fn execute_command(
@@ -56,16 +59,42 @@ pub async fn execute_command(
     registry: &ActionRegistry,
     schema: &CliSchemaExport,
 ) -> Result<String, CliError> {
+    execute_command_outcome(opts, command, registry, schema)
+        .await
+        .map(|o| o.stdout)
+}
+
+pub async fn execute_command_outcome(
+    opts: GlobalOptions,
+    command: CliCommand,
+    registry: &ActionRegistry,
+    schema: &CliSchemaExport,
+) -> Result<CliOutcome, CliError> {
     match command {
         CliCommand::Help { topic } => {
-            format_topic_help(schema, topic.as_deref()).ok_or_else(|| {
+            let text = format_topic_help(schema, topic.as_deref()).ok_or_else(|| {
                 CliError::UnknownCommand(format!(
                     "Unknown help topic '{}'",
                     topic.unwrap_or_default()
                 ))
-            })
+            })?;
+            Ok(CliOutcome::ok(text))
         }
-        CliCommand::Version => Ok(format!("{} {}", schema.program_name, schema.version)),
+        CliCommand::Version { envelope } => {
+            if envelope && opts.output_format != Some(OutputFormat::Text) {
+                let payload = ok_envelope(json!({
+                    "program": schema.program_name,
+                    "version": schema.version,
+                }));
+                Ok(CliOutcome::ok(format_json(&payload, opts.pretty)?))
+            } else {
+                Ok(CliOutcome::ok(format!(
+                    "{} {}",
+                    schema.program_name, schema.version
+                )))
+            }
+        }
+        CliCommand::Unified(unified) => execute_unified(&opts, unified).await,
         CliCommand::ExportSchema { format } => {
             let val = match format {
                 ExportFormat::Cli => {
@@ -80,7 +109,7 @@ pub async fn execute_command(
                 }
                 ExportFormat::OpenApi => OpenApiExporter::export_spec(
                     registry,
-                    "GPUI Telegram Action Bus",
+                    "Fabushi Platform Action Bus",
                     env!("CARGO_PKG_VERSION"),
                     &opts.server_url,
                 ),
@@ -97,7 +126,7 @@ pub async fn execute_command(
                     })?
                 }
             };
-            format_json(&val, opts.pretty)
+            Ok(CliOutcome::ok(format_json(&val, opts.pretty)?))
         }
         CliCommand::List { category, remote } => {
             let use_remote = remote || (!opts.local && opts.server_explicit);
@@ -127,14 +156,17 @@ pub async fn execute_command(
             };
 
             if let Some(ref cat) = category {
-                items.retain(|item| item.get("category").and_then(|v| v.as_str()) == Some(cat.as_str()));
+                items.retain(|item| {
+                    item.get("category").and_then(|v| v.as_str()) == Some(cat.as_str())
+                });
             }
 
             let out_fmt = opts.output_format.unwrap_or(OutputFormat::Text);
-            match out_fmt {
-                OutputFormat::Json => format_json(&json!({ "actions": items }), opts.pretty),
-                OutputFormat::Text => Ok(format_actions_table(&items)),
-            }
+            let s = match out_fmt {
+                OutputFormat::Json => format_json(&json!({ "actions": items }), opts.pretty)?,
+                OutputFormat::Text => format_actions_table(&items),
+            };
+            Ok(CliOutcome::ok(s))
         }
         CliCommand::Schema { action, remote } => {
             let use_remote = remote || (!opts.local && opts.server_explicit);
@@ -142,10 +174,10 @@ pub async fn execute_command(
                 .map(|sub| sub.name.clone())
                 .unwrap_or_else(|| action.replace('-', "_"));
 
-            if use_remote {
+            let s = if use_remote {
                 let client = ActionHttpClient::new(&opts.server_url)?;
                 let body = client.get_action_schema(&canonical_name).await?;
-                format_json(&body, opts.pretty)
+                format_json(&body, opts.pretty)?
             } else {
                 let act = registry.get(&canonical_name).ok_or_else(|| {
                     CliError::UnknownCommand(format!("Action '{action}' not found"))
@@ -160,8 +192,9 @@ pub async fn execute_command(
                     "input_schema": act.input_schema(),
                     "output_schema": act.output_schema(),
                 });
-                format_json(&payload, opts.pretty)
-            }
+                format_json(&payload, opts.pretty)?
+            };
+            Ok(CliOutcome::ok(s))
         }
         CliCommand::Approve {
             gate_id,
@@ -170,14 +203,14 @@ pub async fn execute_command(
         } => {
             let token = opts.token.as_deref().ok_or_else(|| {
                 CliError::Unauthorized(
-                    "Bearer token is required for 'approve' (--token or GPUI_TELEGRAM_TOKEN)".into(),
+                    "Bearer token is required for 'approve' (--token or FABUSHI_TOKEN/GPUI_TELEGRAM_TOKEN)".into(),
                 )
             })?;
             let client = ActionHttpClient::new(&opts.server_url)?;
             let resp = client
                 .approve_gate(&gate_id, token, &decision, reason.as_deref())
                 .await?;
-            format_json(&resp, opts.pretty)
+            Ok(CliOutcome::ok(format_json(&resp, opts.pretty)?))
         }
         CliCommand::ExecuteAction { action_name, input } => {
             let spec = resolve_action(schema, &action_name).ok_or_else(|| {
@@ -200,7 +233,7 @@ pub async fn execute_command(
                     .execute(&action_name, ctx, input)
                     .await
                     .map_err(map_action_error)?;
-                return format_json(&result, opts.pretty);
+                return Ok(CliOutcome::ok(format_json(&result, opts.pretty)?));
             }
 
             let client = ActionHttpClient::new(&opts.server_url)?;
@@ -214,7 +247,7 @@ pub async fn execute_command(
                 .await?;
 
             match outcome {
-                ActionHttpOutcome::Executed(val) => format_json(&val, opts.pretty),
+                ActionHttpOutcome::Executed(val) => Ok(CliOutcome::ok(format_json(&val, opts.pretty)?)),
                 ActionHttpOutcome::ApprovalRequired {
                     gate_id,
                     expires_at_ms,
@@ -264,7 +297,9 @@ pub async fn execute_command(
                                 )
                                 .await?
                             {
-                                ActionHttpOutcome::Executed(val) => format_json(&val, opts.pretty),
+                                ActionHttpOutcome::Executed(val) => {
+                                    Ok(CliOutcome::ok(format_json(&val, opts.pretty)?))
+                                }
                                 ActionHttpOutcome::ApprovalRequired {
                                     gate_id: new_gid,
                                     expires_at_ms: new_exp,
@@ -305,6 +340,7 @@ pub async fn execute_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unified_parser::{LtermOp, McpOp, TargetSelector, UnifiedCommand};
 
     #[test]
     fn test_parse_negative_chat_id_and_json_stdin() {
@@ -377,5 +413,59 @@ mod tests {
         .collect();
         let err2 = parse_args(&unknown_json_field, &registry, &schema, None).unwrap_err();
         assert_eq!(err2.exit_code(), 2);
+    }
+
+    #[test]
+    fn test_parse_unified_commands_with_fuzzy_match_and_mux() {
+        let registry = build_default_registry();
+        let schema = default_cli_schema(&registry);
+
+        let args1: Vec<String> = vec!["screen", "capture", "--m", "studio", "--out", "/tmp/a.png"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let p1 = parse_args(&args1, &registry, &schema, None).unwrap();
+        assert!(matches!(
+            p1.command,
+            CliCommand::Unified(UnifiedCommand::ScreenCapture {
+                target: TargetSelector::Match(ref m),
+                out_path: Some(ref p),
+                ..
+            }) if m == "studio" && p == "/tmp/a.png"
+        ));
+
+        let args2: Vec<String> = vec!["lterm", "has", "dev-shell"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let p2 = parse_args(&args2, &registry, &schema, None).unwrap();
+        assert!(matches!(
+            p2.command,
+            CliCommand::Unified(UnifiedCommand::Lterm {
+                op: LtermOp::Has { ref name }
+            }) if name == "dev-shell"
+        ));
+
+        let args3: Vec<String> = vec![
+            "mcp",
+            "config",
+            "--client",
+            "claude",
+            "--url",
+            "https://mcp.ombhrum.com",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let p3 = parse_args(&args3, &registry, &schema, None).unwrap();
+        assert!(matches!(
+            p3.command,
+            CliCommand::Unified(UnifiedCommand::Mcp {
+                op: McpOp::Config {
+                    client: crate::mcp_config::McpClientTarget::Claude,
+                    url: Some(ref u)
+                }
+            }) if u == "https://mcp.ombhrum.com"
+        ));
     }
 }

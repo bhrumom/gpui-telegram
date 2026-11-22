@@ -3,12 +3,13 @@
 Automated Windows release packager for Fabushi (GPUI Telegram Desktop Client).
 
 Produces in dist/:
-1. Fabushi-{version}-windows-x86_64.zip        (portable archive with Fabushi.exe, gpui-tg-cli.exe, gpui_telegram_server.exe)
-2. Fabushi-{version}-windows-x86_64-setup.exe  (1-click Inno Setup installer)
-3. gpui-tg-cli-v{version}-windows-x86_64.exe   (standalone Action Bus CLI)
-4. gpui_telegram_server-v{version}-windows-x86_64.exe (standalone server binary)
-5. latest-windows.json                         (auto-updater manifest for Windows)
-6. SHA256SUMS-windows.txt                      (SHA-256 checksums for all Windows artifacts)
+1. Fabushi-{version}-windows-x86_64.zip              (portable archive with Fabushi.exe, bin/fabushi.exe, bin/fabushi-remote-daemon.exe, gpui_telegram_server.exe)
+2. Fabushi-{version}-windows-x86_64-setup.exe        (1-click Inno Setup installer with PATH registration)
+3. fabushi-v{version}-windows-x86_64.exe             (standalone unified Fabushi CLI)
+4. fabushi-remote-daemon-v{version}-windows-x86_64.exe (standalone remote daemon)
+5. gpui_telegram_server-v{version}-windows-x86_64.exe (standalone server binary)
+6. latest-windows.json                               (auto-updater manifest for Windows)
+7. SHA256SUMS-windows.txt                            (SHA-256 checksums for all Windows artifacts)
 """
 
 from __future__ import annotations
@@ -93,7 +94,8 @@ def main() -> int:
 
     desktop_exe = target_dir / "gpui_telegram_desktop.exe"
     server_exe = target_dir / "gpui_telegram_server.exe"
-    cli_exe = target_dir / "gpui-tg-cli.exe"
+    cli_exe = target_dir / "fabushi.exe"
+    daemon_exe = target_dir / "fabushi-remote-daemon.exe"
 
     if not desktop_exe.is_file():
         raise FileNotFoundError(f"Missing built desktop binary: {desktop_exe}")
@@ -102,6 +104,8 @@ def main() -> int:
     if stage_dir.exists():
         shutil.rmtree(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
+    bin_stage_dir = stage_dir / "bin"
+    bin_stage_dir.mkdir(parents=True, exist_ok=True)
 
     fabushi_exe = stage_dir / "Fabushi.exe"
     shutil.copy2(desktop_exe, fabushi_exe)
@@ -109,8 +113,13 @@ def main() -> int:
 
     staged_files = [fabushi_exe]
     if cli_exe.is_file():
-        dst = stage_dir / "gpui-tg-cli.exe"
+        dst = bin_stage_dir / "fabushi.exe"
         shutil.copy2(cli_exe, dst)
+        staged_files.append(dst)
+        log(f"Staged {dst}")
+    if daemon_exe.is_file():
+        dst = bin_stage_dir / "fabushi-remote-daemon.exe"
+        shutil.copy2(daemon_exe, dst)
         staged_files.append(dst)
         log(f"Staged {dst}")
     if server_exe.is_file():
@@ -124,6 +133,7 @@ def main() -> int:
         f"Fabushi Desktop {tag_name} (Windows {arch})\r\n"
         f"=========================================\r\n\r\n"
         f"- Double-click Fabushi.exe to launch Fabushi Desktop.\r\n"
+        f"- Run bin\\fabushi.exe --help for the unified Fabushi CLI.\r\n"
         f"- Releases & updates: https://github.com/{GITHUB_REPO}/releases\r\n",
         encoding="utf-8",
     )
@@ -136,17 +146,22 @@ def main() -> int:
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for fpath in staged_files:
-            zf.write(fpath, arcname=f"Fabushi/{fpath.name}")
+            rel_arc = fpath.relative_to(stage_dir).as_posix()
+            zf.write(fpath, arcname=f"Fabushi/{rel_arc}")
     zip_sha = sha256_file(zip_path)
     zip_size = zip_path.stat().st_size
     log(f"Created portable ZIP: {zip_path} ({zip_size:,} bytes, sha256={zip_sha[:12]}...)")
 
-    # 2. Standalone CLI & server binaries for release upload
+    # 2. Standalone CLI, daemon & server binaries for release upload
     artifacts: list[Path] = [zip_path]
     if cli_exe.is_file():
-        cli_out = dist_dir / f"gpui-tg-cli-{tag_name}-windows-{arch}.exe"
+        cli_out = dist_dir / f"fabushi-{tag_name}-windows-{arch}.exe"
         shutil.copy2(cli_exe, cli_out)
         artifacts.append(cli_out)
+    if daemon_exe.is_file():
+        daemon_out = dist_dir / f"fabushi-remote-daemon-{tag_name}-windows-{arch}.exe"
+        shutil.copy2(daemon_exe, daemon_out)
+        artifacts.append(daemon_out)
     if server_exe.is_file():
         srv_out = dist_dir / f"gpui_telegram_server-{tag_name}-windows-{arch}.exe"
         shutil.copy2(server_exe, srv_out)

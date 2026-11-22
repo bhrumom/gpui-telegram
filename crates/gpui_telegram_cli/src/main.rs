@@ -9,13 +9,16 @@ async fn main() {
         .try_init();
 
     match run_cli_from_env().await {
-        Ok(output) => {
-            if !output.is_empty() {
-                if output.ends_with('\n') {
-                    print!("{output}");
+        Ok(outcome) => {
+            if !outcome.stdout.is_empty() {
+                if outcome.stdout.ends_with('\n') {
+                    print!("{}", outcome.stdout);
                 } else {
-                    println!("{output}");
+                    println!("{}", outcome.stdout);
                 }
+            }
+            if outcome.exit_code != 0 {
+                std::process::exit(outcome.exit_code);
             }
         }
         Err(err) => {

@@ -265,23 +265,24 @@ def codesign_bundle(
         return
 
     if sign_identity:
-        macos_dir = app_dir / "Contents" / "MacOS"
-        if macos_dir.is_dir():
-            for bin_item in sorted(macos_dir.iterdir()):
-                if bin_item.is_file() and os.access(bin_item, os.X_OK):
-                    cmd = [
-                        "codesign",
-                        "--force",
-                        "--options",
-                        "runtime",
-                        "--timestamp",
-                        "--sign",
-                        sign_identity,
-                    ]
-                    if entitlements and entitlements.is_file():
-                        cmd.extend(["--entitlements", str(entitlements)])
-                    cmd.append(str(bin_item))
-                    subprocess.run(cmd, check=True)
+        for subdir in ("MacOS", "Helpers"):
+            bin_dir = app_dir / "Contents" / subdir
+            if bin_dir.is_dir():
+                for bin_item in sorted(bin_dir.iterdir()):
+                    if bin_item.is_file() and os.access(bin_item, os.X_OK):
+                        cmd = [
+                            "codesign",
+                            "--force",
+                            "--options",
+                            "runtime",
+                            "--timestamp",
+                            "--sign",
+                            sign_identity,
+                        ]
+                        if entitlements and entitlements.is_file():
+                            cmd.extend(["--entitlements", str(entitlements)])
+                        cmd.append(str(bin_item))
+                        subprocess.run(cmd, check=True)
 
         bundle_cmd = [
             "codesign",
@@ -303,6 +304,15 @@ def codesign_bundle(
         log(f"Developer ID signed & verified {app_dir.name} ({sign_identity})")
     else:
         try:
+            helpers_dir = app_dir / "Contents" / "Helpers"
+            if helpers_dir.is_dir():
+                for helper_item in sorted(helpers_dir.iterdir()):
+                    if helper_item.is_file() and os.access(helper_item, os.X_OK):
+                        subprocess.run(
+                            ["codesign", "--force", "--sign", "-", str(helper_item)],
+                            check=True,
+                            capture_output=True,
+                        )
             subprocess.run(
                 ["codesign", "--force", "--deep", "--sign", "-", str(app_dir)],
                 check=True,
@@ -414,22 +424,33 @@ def build_macos_app_bundle(
     version: str,
     sign_identity: str | None = None,
     entitlements: Path | None = None,
+    helper_bins: list[Path] | None = None,
 ) -> Path:
     app_dir = dist_dir / f"{app_name}.app"
     contents_dir = app_dir / "Contents"
     macos_dir = contents_dir / "MacOS"
+    helpers_dir = contents_dir / "Helpers"
     resources_dir = contents_dir / "Resources"
 
     if app_dir.exists():
         shutil.rmtree(app_dir)
 
     macos_dir.mkdir(parents=True, exist_ok=True)
+    helpers_dir.mkdir(parents=True, exist_ok=True)
     resources_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Copy executable binary
+    # 1. Copy primary executable binary
     dest_bin = macos_dir / binary_name
     shutil.copy2(source_bin, dest_bin)
     os.chmod(dest_bin, 0o755)
+
+    # 1b. Copy CLI & daemon helper binaries into Contents/Helpers/
+    for helper_bin in helper_bins or []:
+        if helper_bin.is_file():
+            dest_helper = helpers_dir / helper_bin.name
+            shutil.copy2(helper_bin, dest_helper)
+            os.chmod(dest_helper, 0o755)
+            log(f"Bundled helper binary: {dest_helper} ({dest_helper.stat().st_size} bytes)")
 
     # 2. Write Info.plist
     info_plist = contents_dir / "Info.plist"
@@ -523,6 +544,18 @@ def build_macos_app_bundle(
             ignore=shutil.ignore_patterns(".DS_Store", "._*", "AppIcon.icns", "AppIcon-512.png"),
         )
         log(f"Bundled desktop assets into {dest_assets}")
+
+    # 4c. Bundle launchd plists into Contents/Resources/
+    for plist_name in (
+        "com.ombhrum.fabushi.agent.plist",
+        "com.ombhrum.fabushi.daemon.plist",
+    ):
+        plist_src = repo_root / "scripts" / "macos" / plist_name
+        if plist_src.is_file():
+            plist_dst = resources_dir / plist_name
+            shutil.copy2(plist_src, plist_dst)
+            os.chmod(plist_dst, 0o644)
+            log(f"Bundled launchd plist into {plist_dst}")
 
     # 5. Sign app bundle (Developer ID hardened runtime if configured, else ad-hoc)
     codesign_bundle(app_dir, sign_identity=sign_identity, entitlements=entitlements)
@@ -763,6 +796,7 @@ def create_macos_dmg(
 
 
 def create_macos_pkg(
+    repo_root: Path,
     dist_dir: Path,
     app_dir: Path,
     app_name: str,
@@ -797,7 +831,29 @@ def create_macos_pkg(
         else:
             shutil.copytree(app_dir, staged_app, symlinks=True)
 
-        # Post-install script: register in LaunchServices & open Fabushi for the active GUI user
+        # Stage launchd LaunchAgents and LaunchDaemons plists
+        launch_agents_dir = pkg_root / "Library" / "LaunchAgents"
+        launch_daemons_dir = pkg_root / "Library" / "LaunchDaemons"
+        launch_agents_dir.mkdir(parents=True, exist_ok=True)
+        launch_daemons_dir.mkdir(parents=True, exist_ok=True)
+
+        agent_plist_src = repo_root / "scripts" / "macos" / "com.ombhrum.fabushi.agent.plist"
+        if not agent_plist_src.is_file():
+            agent_plist_src = app_dir / "Contents" / "Resources" / "com.ombhrum.fabushi.agent.plist"
+        if agent_plist_src.is_file():
+            agent_plist_dst = launch_agents_dir / "com.ombhrum.fabushi.agent.plist"
+            shutil.copy2(agent_plist_src, agent_plist_dst)
+            os.chmod(agent_plist_dst, 0o644)
+
+        daemon_plist_src = repo_root / "scripts" / "macos" / "com.ombhrum.fabushi.daemon.plist"
+        if not daemon_plist_src.is_file():
+            daemon_plist_src = app_dir / "Contents" / "Resources" / "com.ombhrum.fabushi.daemon.plist"
+        if daemon_plist_src.is_file():
+            daemon_plist_dst = launch_daemons_dir / "com.ombhrum.fabushi.daemon.plist"
+            shutil.copy2(daemon_plist_src, daemon_plist_dst)
+            os.chmod(daemon_plist_dst, 0o644)
+
+        # Post-install script: register CLI symlink, launchd daemon/agent, LaunchServices & open Fabushi
         scripts_dir = work_dir / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         postinstall = scripts_dir / "postinstall"
@@ -809,8 +865,33 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Framewo
 if [ -x "$LSREGISTER" ]; then
   "$LSREGISTER" -f "$APP_PATH" || true
 fi
+
+if [ -x "$APP_PATH/Contents/Helpers/fabushi" ]; then
+  mkdir -p /usr/local/bin && ln -sf "/Applications/{app_name}.app/Contents/Helpers/fabushi" /usr/local/bin/fabushi
+fi
+
+DAEMON_PLIST="/Library/LaunchDaemons/com.ombhrum.fabushi.daemon.plist"
+if [ -f "$DAEMON_PLIST" ]; then
+  chown root:wheel "$DAEMON_PLIST" || true
+  chmod 644 "$DAEMON_PLIST" || true
+  launchctl bootout system/com.ombhrum.fabushi.daemon >/dev/null 2>&1 || true
+  launchctl bootstrap system "$DAEMON_PLIST" || true
+  launchctl kickstart -k system/com.ombhrum.fabushi.daemon >/dev/null 2>&1 || true
+fi
+
 CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+AGENT_PLIST="/Library/LaunchAgents/com.ombhrum.fabushi.agent.plist"
+if [ -f "$AGENT_PLIST" ]; then
+  chown root:wheel "$AGENT_PLIST" || true
+  chmod 644 "$AGENT_PLIST" || true
+fi
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
+  CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+  if [ -n "$CONSOLE_UID" ] && [ -f "$AGENT_PLIST" ]; then
+    launchctl bootout "gui/$CONSOLE_UID/com.ombhrum.fabushi.agent" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT_PLIST" || true
+    launchctl kickstart -k "gui/$CONSOLE_UID/com.ombhrum.fabushi.agent" >/dev/null 2>&1 || true
+  fi
   sudo -u "$CONSOLE_USER" /usr/bin/open -a "$APP_PATH" || true
 fi
 exit 0
@@ -960,8 +1041,8 @@ The {app_name} desktop client connects directly to the production cloud infrastr
 - `{app_name}-{version}-macos-{arch}.dmg`: Drag-and-drop macOS disk image containing `{app_name}.app` and `/Applications` shortcut.
 - `{app_name}-{version}-macos-{arch}.zip`: Self-contained app bundle archive used by the in-app one-click updater.
 - `latest-mac.json`: Auto-updater release manifest pointing to `https://github.com/{GITHUB_REPO}/releases`.
-- `{app_name}.app/`: Standalone macOS Application Bundle (`com.ombhrum.fabushi`).
-- `bin/gpui_telegram_desktop`: Standalone executable binary for CLI diagnostics.
+- `{app_name}.app/`: Standalone macOS Application Bundle (`com.ombhrum.fabushi`) with bundled `Contents/Helpers/fabushi` & `Contents/Helpers/fabushi-remote-daemon`.
+- `bin/gpui_telegram_desktop`, `bin/fabushi`, `bin/fabushi-remote-daemon`: Standalone executable binaries.
 - `SHA256SUMS`: Cryptographic digests for all deliverables.
 """
     with open(notes_path, "w", encoding="utf-8") as f:
@@ -1012,9 +1093,11 @@ def generate_sha256sums(dist_dir: Path) -> Path:
     lines = []
 
     entries = []
-    bin_file = dist_dir / "bin" / "gpui_telegram_desktop"
-    if bin_file.exists():
-        entries.append(bin_file)
+    bin_dir = dist_dir / "bin"
+    if bin_dir.is_dir():
+        for bin_item in sorted(bin_dir.iterdir()):
+            if bin_item.is_file() and not bin_item.name.startswith("."):
+                entries.append(bin_item)
 
     for item in sorted(dist_dir.iterdir()):
         if item.is_file() and item.name != "SHA256SUMS" and not item.name.startswith("."):
@@ -1073,6 +1156,27 @@ def install_to_applications(app_dir: Path, app_name: str):
         subprocess.run(["mdimport", str(target_app)], check=False, capture_output=True)
         log("Triggered Spotlight metadata indexing via mdimport.")
 
+    bundled_cli = target_app / "Contents" / "Helpers" / "fabushi"
+    if bundled_cli.is_file():
+        linked = False
+        sys_cli = Path("/usr/local/bin/fabushi")
+        try:
+            sys_cli.parent.mkdir(parents=True, exist_ok=True)
+            if sys_cli.is_symlink() or sys_cli.exists():
+                sys_cli.unlink()
+            os.symlink(bundled_cli, sys_cli)
+            log(f"Linked unified CLI: {sys_cli} -> {bundled_cli}")
+            linked = True
+        except OSError as e:
+            log(f"Could not symlink {sys_cli} ({e}); falling back to ~/.local/bin/fabushi")
+        if not linked:
+            user_cli = Path.home() / ".local" / "bin" / "fabushi"
+            user_cli.parent.mkdir(parents=True, exist_ok=True)
+            if user_cli.is_symlink() or user_cli.exists():
+                user_cli.unlink()
+            os.symlink(bundled_cli, user_cli)
+            log(f"Linked unified CLI: {user_cli} -> {bundled_cli}")
+
 
 def main():
     args = parse_args()
@@ -1111,11 +1215,30 @@ def main():
 
     log(f"Verified release binary: {release_bin} ({release_bin.stat().st_size} bytes)")
 
+    # Step 2b: Resolve unified CLI (`fabushi`) & remote daemon (`fabushi-remote-daemon`) helpers
+    helper_bins: list[Path] = []
+    for helper_name in ("fabushi", "fabushi-remote-daemon"):
+        helper_path = target_dir / "release" / helper_name
+        if not helper_path.exists() and args.build_if_missing:
+            log(f"Helper {helper_path} not found. Invoking 'cargo build --release --bin {helper_name}'...")
+            subprocess.run(
+                ["cargo", "build", "--release", "--bin", helper_name],
+                cwd=str(repo_root),
+                check=True,
+            )
+        if helper_path.is_file():
+            helper_bins.append(helper_path)
+            log(f"Verified helper binary: {helper_path} ({helper_path.stat().st_size} bytes)")
+        else:
+            log(f"WARNING: Helper binary not found at {helper_path}; skipping bundle copy.")
+
     # Step 3: Prepare dist directory
     dist_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 4: Package standalone binary
+    # Step 4: Package standalone binaries
     package_standalone_bin(dist_dir, release_bin, args.binary_name)
+    for helper_bin in helper_bins:
+        package_standalone_bin(dist_dir, helper_bin, helper_bin.name)
 
     # Step 5: Package primary Fabushi.app + native Install Fabushi.app wizard
     entitlements_path = (
@@ -1136,6 +1259,7 @@ def main():
         version=version,
         sign_identity=args.sign_identity,
         entitlements=entitlements_path,
+        helper_bins=helper_bins,
     )
     installer_app = build_macos_installer_app(
         repo_root=repo_root,
@@ -1185,6 +1309,7 @@ def main():
         notarize=args.notarize,
     )
     pkg_path = create_macos_pkg(
+        repo_root,
         dist_dir,
         app_dir,
         args.app_name,

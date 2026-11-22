@@ -14,6 +14,9 @@ use gpui_telegram_media::{AudioPlaybackEngine, VoiceRecorder};
 use gpui_telegram_proto::computer_contracts::{
     BotComputerProfileDto, ComputerNodeDto, PendingComputerCommandDto,
 };
+use gpui_telegram_proto::remote_control_contracts::{
+    McpOAuthGrantSummaryDto, RemoteAssistConfigDto, RemoteSessionDto,
+};
 use gpui_telegram_proto::contracts::auth::ContactDto;
 use gpui_telegram_proto::miniapp_contracts::{
     BotPublicProfileDto, BotRegistryEntry, FabushiBotSummaryDto, MiniAppEntry, MiniAppLaunchMode,
@@ -382,7 +385,8 @@ impl ShellThemeVisualState {
     }
 }
 
-/// Multi-device & cloud computer registry, Bot computer profiles, and pending approval queue.
+/// Multi-device & cloud computer registry, Bot computer profiles, pending approval queue,
+/// remote assist configuration, active control sessions, MCP grants, and CLI status.
 #[derive(Debug, Clone, Default)]
 pub struct ShellComputersState {
     pub computers: Vec<ComputerNodeDto>,
@@ -392,6 +396,11 @@ pub struct ShellComputersState {
     pub relay_loop_started: bool,
     pub relay_generation: u64,
     pub tailnet_status: Option<gpui_telegram_proto::TailnetNodeStatus>,
+    pub assist_config: Option<RemoteAssistConfigDto>,
+    pub active_sessions: Vec<RemoteSessionDto>,
+    pub mcp_grants: Vec<McpOAuthGrantSummaryDto>,
+    pub mcp_endpoint_url: Option<String>,
+    pub cli_status: Option<crate::app::cli_installer::CliInstallStatus>,
 }
 
 impl ShellComputersState {
@@ -407,6 +416,28 @@ impl ShellComputersState {
         self.relay_loop_started = false;
         self.relay_generation = self.relay_generation.wrapping_add(1);
         self.tailnet_status = None;
+        self.assist_config = None;
+        self.active_sessions.clear();
+        self.mcp_grants.clear();
+    }
+}
+
+/// Live local IPC host, system tray icons, and controlled-status floating window handles.
+#[derive(Default)]
+pub struct ShellRemoteHostRuntime {
+    pub ipc_server: Option<fabushi_remote_engine::ipc::LocalIpcServer>,
+    pub ipc_handler: Option<Arc<crate::views::app_shell::desktop_ipc_host::DesktopLocalIpcHandler>>,
+    pub tray_mac: crate::platform::mac::tray_mac::TrayMacMac,
+    pub tray_win: crate::platform::win::tray_win::TrayWinWin,
+    pub controlled_window:
+        Option<gpui::WindowHandle<crate::views::remote_controlled_window::RemoteControlledWindow>>,
+    pub services_bootstrapped: bool,
+    pub hub_events_started: bool,
+}
+
+impl ShellRemoteHostRuntime {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 

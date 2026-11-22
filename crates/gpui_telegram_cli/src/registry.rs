@@ -1,19 +1,15 @@
 use gpui_telegram_core::action_bus::{
-    ActionCategory, ActionRegistry, CliExporter, CliSchemaExport, CliSubcommandSpec,
-    DeleteMessageAction, GetChatHistoryAction, ListDialogsAction, PlatformAction,
-    SendMessageAction,
+    register_full_app_actions, ActionCategory, ActionRegistry, CliExporter, CliSchemaExport,
+    CliSubcommandSpec, PlatformAction,
 };
 use serde_json::Value;
 
-pub const PROGRAM_NAME: &str = "gpui-tg-cli";
+pub const PROGRAM_NAME: &str = "fabushi";
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:18080";
 
 pub fn build_default_registry() -> ActionRegistry {
     let registry = ActionRegistry::new();
-    let _ = registry.register_typed(SendMessageAction);
-    let _ = registry.register_typed(GetChatHistoryAction);
-    let _ = registry.register_typed(ListDialogsAction);
-    let _ = registry.register_typed(DeleteMessageAction);
+    let _ = register_full_app_actions(&registry);
     registry
 }
 

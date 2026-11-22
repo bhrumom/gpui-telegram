@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "bot-browser"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2115,7 +2115,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_magpie_gateway"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "e2e_suite"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2483,6 +2483,54 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "fabushi_remote_daemon"
+version = "1.5.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fabushi_remote_engine",
+ "gpui_telegram_core",
+ "gpui_telegram_proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "fabushi_remote_engine"
+version = "1.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "core-foundation 0.10.0",
+ "core-foundation-sys",
+ "core-graphics 0.25.0",
+ "enigo",
+ "foreign-types",
+ "futures",
+ "gpui_telegram_core",
+ "gpui_telegram_proto",
+ "image",
+ "libc",
+ "objc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+ "xcap",
 ]
 
 [[package]]
@@ -3297,7 +3345,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_agent"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3333,11 +3381,15 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_cli"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "chrono",
+ "fabushi_remote_engine",
  "gpui_telegram_core",
+ "gpui_telegram_proto",
  "gpui_telegram_server",
  "reqwest",
  "serde",
@@ -3348,11 +3400,12 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "gpui_telegram_client"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "aes",
  "argon2",
@@ -3362,6 +3415,7 @@ dependencies = [
  "cipher",
  "ed25519-dalek",
  "fabushi-messaging-core",
+ "fabushi_remote_engine",
  "futures",
  "getrandom 0.2.17",
  "gpui_telegram_core",
@@ -3394,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_coding"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3413,7 +3467,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_core"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "aes",
  "cbc",
@@ -3435,11 +3489,13 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_desktop"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
+ "base64 0.22.1",
  "bot-browser",
  "chrono",
  "fabushi-messaging-core",
+ "fabushi_remote_engine",
  "futures",
  "gpui",
  "gpui_telegram_agent",
@@ -3470,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_media"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "chrono",
  "fabushi-messaging-core",
@@ -3486,7 +3542,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_proto"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3502,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_server"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3514,6 +3570,7 @@ dependencies = [
  "ed25519-dalek",
  "fabushi-messaging-core",
  "futures",
+ "getrandom 0.2.17",
  "gpui_telegram_agent",
  "gpui_telegram_client",
  "gpui_telegram_core",
@@ -3542,6 +3599,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "x25519-dalek",
  "zeroize",
@@ -3549,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_test_harness"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3579,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_webrtc"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4651,7 +4709,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "magpie_gateway"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

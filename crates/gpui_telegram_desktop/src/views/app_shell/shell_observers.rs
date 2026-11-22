@@ -1014,6 +1014,7 @@ impl AppShell {
                 }
                 if *sec == SettingsSectionType::Computers {
                     self.refresh_computers(cx);
+                    self.refresh_remote_assist_and_grants(cx);
                     self.sync_computers_to_views(cx);
                 } else if *sec == SettingsSectionType::AiProviders {
                     self.refresh_magpie_state(cx);

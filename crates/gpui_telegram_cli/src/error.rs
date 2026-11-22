@@ -1,3 +1,4 @@
+use crate::envelope::{err_envelope, now_timestamp};
 use serde_json::{json, Value};
 
 #[derive(Debug, thiserror::Error)]
@@ -33,40 +34,41 @@ pub enum CliError {
 
     #[error("Execution error: {0}")]
     Execution(String),
+
+    #[error("Check error: {0}")]
+    CheckError(String),
 }
 
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Usage(_) | Self::UnknownCommand(_) | Self::Validation(_) => 2,
+            Self::Usage(_)
+            | Self::UnknownCommand(_)
+            | Self::Validation(_)
+            | Self::CheckError(_) => 2,
             Self::Unauthorized(_) => 3,
             Self::ApprovalRequired { .. } | Self::Forbidden(_) => 4,
             Self::Http(_) | Self::ServerError { .. } | Self::Execution(_) => 1,
         }
     }
 
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Usage(_) => "usage_error",
+            Self::UnknownCommand(_) => "unknown_command",
+            Self::Validation(_) => "validation_error",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::ApprovalRequired { .. } => "approval_required",
+            Self::Forbidden(_) => "forbidden",
+            Self::Http(_) => "http_error",
+            Self::ServerError { .. } => "server_error",
+            Self::Execution(_) => "execution_error",
+            Self::CheckError(_) => "check_error",
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         match self {
-            Self::Usage(msg) => json!({
-                "success": false,
-                "error": "usage_error",
-                "message": msg,
-            }),
-            Self::UnknownCommand(msg) => json!({
-                "success": false,
-                "error": "unknown_command",
-                "message": msg,
-            }),
-            Self::Validation(msg) => json!({
-                "success": false,
-                "error": "validation_error",
-                "message": msg,
-            }),
-            Self::Unauthorized(msg) => json!({
-                "success": false,
-                "error": "unauthorized",
-                "message": msg,
-            }),
             Self::ApprovalRequired {
                 action,
                 gate_id,
@@ -74,34 +76,42 @@ impl CliError {
                 message,
             } => json!({
                 "success": false,
+                "data": Value::Null,
                 "error": "Approval required",
+                "error_detail": {
+                    "code": "approval_required",
+                    "message": message,
+                },
                 "action": action,
                 "gate_id": gate_id,
                 "expires_at_ms": expires_at_ms,
                 "message": message,
+                "timestamp": now_timestamp(),
             }),
-            Self::Forbidden(msg) => json!({
-                "success": false,
-                "error": "forbidden",
-                "message": msg,
-            }),
-            Self::Http(msg) => json!({
-                "success": false,
-                "error": "http_error",
-                "message": msg,
-            }),
-            Self::ServerError { status, body } => json!({
-                "success": false,
-                "status": status,
-                "error": body.get("error").cloned().unwrap_or_else(|| json!("server_error")),
-                "message": body.get("message").cloned().unwrap_or_else(|| json!(format!("Server returned status {status}"))),
-                "body": body,
-            }),
-            Self::Execution(msg) => json!({
-                "success": false,
-                "error": "execution_error",
-                "message": msg,
-            }),
+            Self::ServerError { status, body } => {
+                let code = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("server_error");
+                let message = body
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("Server returned status {status}"));
+                json!({
+                    "success": false,
+                    "data": Value::Null,
+                    "status": status,
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "status": status,
+                        "body": body,
+                    },
+                    "timestamp": now_timestamp(),
+                })
+            }
+            other => err_envelope(other.code(), &other.to_string()),
         }
     }
 }

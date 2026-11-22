@@ -10,7 +10,7 @@ final class InstallerWindowController: NSWindowController {
     private var isInstalling = false
 
     private let appVersion: String = {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.4.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.5.0"
     }()
 
     init() {
@@ -150,9 +150,93 @@ final class InstallerWindowController: NSWindowController {
     private func copyWithAdminPrivileges(sourcePath: String, targetPath: String) -> (Int32, String) {
         let escapedSrc = sourcePath.replacingOccurrences(of: "'", with: "'\\''")
         let escapedDst = targetPath.replacingOccurrences(of: "'", with: "'\\''")
-        let shellCmd = "rm -rf '\(escapedDst)' && /usr/bin/ditto '\(escapedSrc)' '\(escapedDst)' && xattr -dr com.apple.quarantine '\(escapedDst)' 2>/dev/null || true"
+        let cliPath = "\(targetPath)/Contents/Helpers/fabushi"
+        let escapedCli = cliPath.replacingOccurrences(of: "'", with: "'\\''")
+        let shellCmd = "rm -rf '\(escapedDst)' && /usr/bin/ditto '\(escapedSrc)' '\(escapedDst)' && (xattr -dr com.apple.quarantine '\(escapedDst)' 2>/dev/null || true) && ([ ! -x '\(escapedCli)' ] || (mkdir -p /usr/local/bin && ln -sf '\(escapedCli)' /usr/local/bin/fabushi))"
         let appleScript = "do shell script \"\(shellCmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
         return runProcess("/usr/bin/osascript", ["-e", appleScript])
+    }
+
+    private func ensureSymlink(at linkURL: URL, targetPath: String) -> Bool {
+        let fm = FileManager.default
+        let dirURL = linkURL.deletingLastPathComponent()
+        do {
+            try fm.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
+            if (try? fm.attributesOfItem(atPath: linkURL.path)) != nil {
+                try fm.removeItem(at: linkURL)
+            }
+            try fm.createSymbolicLink(atPath: linkURL.path, withDestinationPath: targetPath)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    private func installCliSymlink(targetApp: URL) -> String? {
+        let fm = FileManager.default
+        let cliBinary = targetApp.appendingPathComponent("Contents/Helpers/fabushi")
+        guard fm.fileExists(atPath: cliBinary.path) else {
+            return nil
+        }
+
+        let systemBinDir = URL(fileURLWithPath: "/usr/local/bin")
+        let systemCliLink = systemBinDir.appendingPathComponent("fabushi")
+
+        if let existingDest = try? fm.destinationOfSymbolicLink(atPath: systemCliLink.path),
+           existingDest == cliBinary.path {
+            return systemCliLink.path
+        }
+
+        let canWriteSystemBin = fm.isWritableFile(atPath: systemBinDir.path)
+            || (!fm.fileExists(atPath: systemBinDir.path) && fm.isWritableFile(atPath: "/usr/local"))
+        if canWriteSystemBin && ensureSymlink(at: systemCliLink, targetPath: cliBinary.path) {
+            return systemCliLink.path
+        }
+
+        let escapedCli = cliBinary.path.replacingOccurrences(of: "'", with: "'\\''")
+        let shellCmd = "mkdir -p /usr/local/bin && ln -sf '\(escapedCli)' /usr/local/bin/fabushi"
+        let appleScript = "do shell script \"\(shellCmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
+        let (code, _) = runProcess("/usr/bin/osascript", ["-e", appleScript])
+        if code == 0 {
+            return systemCliLink.path
+        }
+
+        let userLocalLink = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/fabushi")
+        if ensureSymlink(at: userLocalLink, targetPath: cliBinary.path) {
+            return userLocalLink.path
+        }
+        return nil
+    }
+
+    private func deployUserLaunchAgent(targetApp: URL) {
+        let fm = FileManager.default
+        let srcPlist = targetApp.appendingPathComponent("Contents/Resources/com.ombhrum.fabushi.agent.plist")
+        guard fm.fileExists(atPath: srcPlist.path) else {
+            return
+        }
+
+        let launchAgentsDir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
+        let destPlist = launchAgentsDir.appendingPathComponent("com.ombhrum.fabushi.agent.plist")
+        do {
+            try fm.createDirectory(at: launchAgentsDir, withIntermediateDirectories: true, attributes: nil)
+            if fm.fileExists(atPath: destPlist.path) {
+                try fm.removeItem(at: destPlist)
+            }
+            try fm.copyItem(at: srcPlist, to: destPlist)
+            try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: destPlist.path)
+        } catch {
+            return
+        }
+
+        let daemonBinary = targetApp.appendingPathComponent("Contents/Helpers/fabushi-remote-daemon")
+        if fm.fileExists(atPath: daemonBinary.path) {
+            let uid = getuid()
+            _ = runProcess("/bin/launchctl", ["bootout", "gui/\(uid)/com.ombhrum.fabushi.agent"])
+            _ = runProcess("/bin/launchctl", ["bootstrap", "gui/\(uid)", destPlist.path])
+            _ = runProcess("/bin/launchctl", ["kickstart", "-k", "gui/\(uid)/com.ombhrum.fabushi.agent"])
+        }
     }
 
     private func performInstall(launchAfter: Bool) {
@@ -213,6 +297,10 @@ final class InstallerWindowController: NSWindowController {
             _ = runProcess(lsregister, ["-f", targetApp.path])
         }
         _ = runProcess("/usr/bin/mdimport", [targetApp.path])
+
+        updateProgress(85, message: "正在安装 fabushi CLI 工具并注册后台服务...")
+        _ = installCliSymlink(targetApp: targetApp)
+        deployUserLaunchAgent(targetApp: targetApp)
 
         updateProgress(92, message: launchAfter ? "安装成功！正在启动 Fabushi..." : "安装成功！已安装至 /Applications/Fabushi.app")
 

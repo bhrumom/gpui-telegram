@@ -10,14 +10,19 @@ use crate::media::opus_codec::{
 };
 use crate::signaling::SignalingFrame;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -107,6 +112,32 @@ pub type AudioFrameCallback = Arc<dyn Fn(&[i16], u32, u16) + Send + Sync>;
 pub type VideoFrameCallback = Arc<dyn Fn(&VideoFrameData) + Send + Sync>;
 pub type IceCandidateCallback = Arc<dyn Fn(SignalingFrame) + Send + Sync>;
 pub type StateChangeCallback = Arc<dyn Fn(PeerConnectionState) + Send + Sync>;
+pub type DataChannelMessageCallback = Arc<dyn Fn(&str, &[u8], bool) + Send + Sync>;
+pub type DataChannelOpenCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Reliability profile for an `RTCDataChannel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataChannelReliability {
+    /// Ordered and reliable delivery (control RPC, terminal, clipboard, file chunks).
+    ReliableOrdered,
+    /// Unordered, zero-retransmit delivery (low-latency mouse deltas and raw frame packets).
+    UnreliableUnordered,
+}
+
+/// Payload delivered over a `MockLoopback` or `RTCDataChannel` pipe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataChannelPayload {
+    pub label: String,
+    pub is_string: bool,
+    pub data: Vec<u8>,
+}
+
+/// Standard DataChannel label for reliable control/input/terminal/clipboard JSON frames.
+pub const CONTROL_DATA_CHANNEL_LABEL: &str = "control";
+/// Standard DataChannel label for unreliable low-latency pointer deltas.
+pub const INPUT_FAST_DATA_CHANNEL_LABEL: &str = "input-fast";
+/// Standard DataChannel label for low-latency remote desktop video frame chunks.
+pub const MEDIA_FRAME_DATA_CHANNEL_LABEL: &str = "media-frame";
 
 fn encode_live_video_payload(frame: &VideoFrameData) -> Vec<u8> {
     let mut out = Vec::with_capacity(24 + frame.data.len());
@@ -155,18 +186,26 @@ pub struct WebRtcPeerTransport {
     on_video: Arc<parking_lot::RwLock<Option<VideoFrameCallback>>>,
     on_ice_candidate: Arc<parking_lot::RwLock<Option<IceCandidateCallback>>>,
     on_state_change: Arc<parking_lot::RwLock<Option<StateChangeCallback>>>,
+    on_data_channel_message: Arc<parking_lot::RwLock<Option<DataChannelMessageCallback>>>,
+    on_data_channel_open: Arc<parking_lot::RwLock<Option<DataChannelOpenCallback>>>,
 
     // MockLoopback decoupled senders & receivers
     loopback_audio_tx: Arc<parking_lot::RwLock<Option<mpsc::Sender<RtpPacket>>>>,
     loopback_video_tx: Arc<parking_lot::RwLock<Option<mpsc::Sender<VideoFrameData>>>>,
+    loopback_dc_tx: Arc<parking_lot::RwLock<Option<mpsc::Sender<DataChannelPayload>>>>,
     loopback_audio_rx: Arc<Mutex<Option<mpsc::Receiver<RtpPacket>>>>,
     loopback_video_rx: Arc<Mutex<Option<mpsc::Receiver<VideoFrameData>>>>,
+    loopback_dc_rx: Arc<Mutex<Option<mpsc::Receiver<DataChannelPayload>>>>,
     loopback_rx_handle: Arc<parking_lot::Mutex<Option<tokio::task::AbortHandle>>>,
+    loopback_open_channels: Arc<parking_lot::RwLock<HashSet<String>>>,
 
-    // Live WebRTC instance and local media tracks
+    // Live WebRTC instance, local media tracks, and DataChannels
     peer_connection: Option<Arc<RTCPeerConnection>>,
     live_audio_track: Option<Arc<TrackLocalStaticRTP>>,
     live_video_track: Option<Arc<TrackLocalStaticSample>>,
+    data_channels: Arc<parking_lot::RwLock<HashMap<String, Arc<RTCDataChannel>>>>,
+    data_channel_reliability: Arc<parking_lot::RwLock<HashMap<String, DataChannelReliability>>>,
+    dc_open_notify: Arc<Notify>,
 }
 
 impl WebRtcPeerTransport {
@@ -186,14 +225,22 @@ impl WebRtcPeerTransport {
             on_video: Arc::new(parking_lot::RwLock::new(None)),
             on_ice_candidate: Arc::new(parking_lot::RwLock::new(None)),
             on_state_change: Arc::new(parking_lot::RwLock::new(None)),
+            on_data_channel_message: Arc::new(parking_lot::RwLock::new(None)),
+            on_data_channel_open: Arc::new(parking_lot::RwLock::new(None)),
             loopback_audio_tx: Arc::new(parking_lot::RwLock::new(None)),
             loopback_video_tx: Arc::new(parking_lot::RwLock::new(None)),
+            loopback_dc_tx: Arc::new(parking_lot::RwLock::new(None)),
             loopback_audio_rx: Arc::new(Mutex::new(None)),
             loopback_video_rx: Arc::new(Mutex::new(None)),
+            loopback_dc_rx: Arc::new(Mutex::new(None)),
             loopback_rx_handle: Arc::new(parking_lot::Mutex::new(None)),
+            loopback_open_channels: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             peer_connection: None,
             live_audio_track: None,
             live_video_track: None,
+            data_channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            data_channel_reliability: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            dc_open_notify: Arc::new(Notify::new()),
         };
 
         if mode == TransportMode::Live {
@@ -441,10 +488,132 @@ impl WebRtcPeerTransport {
             })
         }));
 
+        // Wire incoming remote RTCDataChannel events (reliable control + unreliable input/frame channels)
+        let dc_map = Arc::clone(&self.data_channels);
+        let dc_rel = Arc::clone(&self.data_channel_reliability);
+        let on_dc_msg = Arc::clone(&self.on_data_channel_message);
+        let on_dc_open = Arc::clone(&self.on_data_channel_open);
+        let dc_notify = Arc::clone(&self.dc_open_notify);
+        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let dc_map = Arc::clone(&dc_map);
+            let dc_rel = Arc::clone(&dc_rel);
+            let on_dc_msg = Arc::clone(&on_dc_msg);
+            let on_dc_open = Arc::clone(&on_dc_open);
+            let dc_notify = Arc::clone(&dc_notify);
+            Box::pin(async move {
+                let rel = if dc.ordered() {
+                    DataChannelReliability::ReliableOrdered
+                } else {
+                    DataChannelReliability::UnreliableUnordered
+                };
+                Self::wire_live_data_channel(
+                    dc,
+                    rel,
+                    dc_map,
+                    dc_rel,
+                    on_dc_msg,
+                    on_dc_open,
+                    dc_notify,
+                );
+            })
+        }));
+
         self.peer_connection = Some(pc);
         self.set_state(PeerConnectionState::New);
 
         Ok(())
+    }
+
+    fn wire_live_data_channel(
+        dc: Arc<RTCDataChannel>,
+        reliability: DataChannelReliability,
+        channels_map: Arc<parking_lot::RwLock<HashMap<String, Arc<RTCDataChannel>>>>,
+        reliability_map: Arc<parking_lot::RwLock<HashMap<String, DataChannelReliability>>>,
+        on_msg: Arc<parking_lot::RwLock<Option<DataChannelMessageCallback>>>,
+        on_open: Arc<parking_lot::RwLock<Option<DataChannelOpenCallback>>>,
+        open_notify: Arc<Notify>,
+    ) {
+        let label = dc.label().to_string();
+        channels_map.write().insert(label.clone(), Arc::clone(&dc));
+        reliability_map.write().insert(label.clone(), reliability);
+
+        let open_label = label.clone();
+        let on_open_cb = Arc::clone(&on_open);
+        let open_notify_cb = Arc::clone(&open_notify);
+        dc.on_open(Box::new(move || {
+            let lbl = open_label.clone();
+            let cb_arc = Arc::clone(&on_open_cb);
+            let notify = Arc::clone(&open_notify_cb);
+            Box::pin(async move {
+                notify.notify_waiters();
+                if let Some(cb) = cb_arc.read().clone() {
+                    cb(&lbl);
+                }
+            })
+        }));
+
+        let msg_label = label.clone();
+        let on_msg_cb = Arc::clone(&on_msg);
+        dc.on_message(Box::new(move |msg: DataChannelMessage| {
+            let lbl = msg_label.clone();
+            let cb_arc = Arc::clone(&on_msg_cb);
+            Box::pin(async move {
+                if let Some(cb) = cb_arc.read().clone() {
+                    cb(&lbl, &msg.data, msg.is_string);
+                }
+            })
+        }));
+
+        let close_label = label;
+        let channels_close = Arc::clone(&channels_map);
+        dc.on_close(Box::new(move || {
+            let lbl = close_label.clone();
+            let map = Arc::clone(&channels_close);
+            Box::pin(async move {
+                map.write().remove(&lbl);
+            })
+        }));
+    }
+
+    fn build_loopback_half(
+        cfg: PeerTransportConfig,
+        ssrc: u32,
+        audio_tx: mpsc::Sender<RtpPacket>,
+        video_tx: mpsc::Sender<VideoFrameData>,
+        dc_tx: mpsc::Sender<DataChannelPayload>,
+        audio_rx: mpsc::Receiver<RtpPacket>,
+        video_rx: mpsc::Receiver<VideoFrameData>,
+        dc_rx: mpsc::Receiver<DataChannelPayload>,
+    ) -> Self {
+        let channels = cfg.audio_channels;
+        Self {
+            config: cfg,
+            mode: TransportMode::MockLoopback,
+            state: Arc::new(parking_lot::RwLock::new(PeerConnectionState::Connected)),
+            packetizer: Arc::new(parking_lot::Mutex::new(OpusPacketizer::new(channels, ssrc))),
+            depacketizer: Arc::new(parking_lot::Mutex::new(OpusDepacketizer::new(channels))),
+            ai_media_tap: Arc::new(parking_lot::RwLock::new(None)),
+            on_audio: Arc::new(parking_lot::RwLock::new(None)),
+            on_video: Arc::new(parking_lot::RwLock::new(None)),
+            on_ice_candidate: Arc::new(parking_lot::RwLock::new(None)),
+            on_state_change: Arc::new(parking_lot::RwLock::new(None)),
+            on_data_channel_message: Arc::new(parking_lot::RwLock::new(None)),
+            on_data_channel_open: Arc::new(parking_lot::RwLock::new(None)),
+            loopback_audio_tx: Arc::new(parking_lot::RwLock::new(Some(audio_tx))),
+            loopback_video_tx: Arc::new(parking_lot::RwLock::new(Some(video_tx))),
+            loopback_dc_tx: Arc::new(parking_lot::RwLock::new(Some(dc_tx))),
+            loopback_audio_rx: Arc::new(Mutex::new(Some(audio_rx))),
+            loopback_video_rx: Arc::new(Mutex::new(Some(video_rx))),
+            loopback_dc_rx: Arc::new(Mutex::new(Some(dc_rx))),
+            loopback_rx_handle: Arc::new(parking_lot::Mutex::new(None)),
+            loopback_open_channels: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            peer_connection: None,
+            live_audio_track: None,
+            live_video_track: None,
+            data_channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            data_channel_reliability: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            dc_open_notify: Arc::new(Notify::new()),
+        }
     }
 
     /// Creates a connected pair of transports in MockLoopback mode for headless CI testing
@@ -454,61 +623,32 @@ impl WebRtcPeerTransport {
 
         let (a_audio_tx, a_audio_rx) = mpsc::channel::<RtpPacket>(LOOPBACK_CHANNEL_CAPACITY);
         let (a_video_tx, a_video_rx) = mpsc::channel::<VideoFrameData>(LOOPBACK_CHANNEL_CAPACITY);
+        let (a_dc_tx, a_dc_rx) = mpsc::channel::<DataChannelPayload>(LOOPBACK_CHANNEL_CAPACITY);
 
         let (b_audio_tx, b_audio_rx) = mpsc::channel::<RtpPacket>(LOOPBACK_CHANNEL_CAPACITY);
         let (b_video_tx, b_video_rx) = mpsc::channel::<VideoFrameData>(LOOPBACK_CHANNEL_CAPACITY);
+        let (b_dc_tx, b_dc_rx) = mpsc::channel::<DataChannelPayload>(LOOPBACK_CHANNEL_CAPACITY);
 
-        let transport_a = Self {
-            config: cfg.clone(),
-            mode: TransportMode::MockLoopback,
-            state: Arc::new(parking_lot::RwLock::new(PeerConnectionState::Connected)),
-            packetizer: Arc::new(parking_lot::Mutex::new(OpusPacketizer::new(
-                cfg.audio_channels,
-                0x11111111,
-            ))),
-            depacketizer: Arc::new(parking_lot::Mutex::new(OpusDepacketizer::new(
-                cfg.audio_channels,
-            ))),
-            ai_media_tap: Arc::new(parking_lot::RwLock::new(None)),
-            on_audio: Arc::new(parking_lot::RwLock::new(None)),
-            on_video: Arc::new(parking_lot::RwLock::new(None)),
-            on_ice_candidate: Arc::new(parking_lot::RwLock::new(None)),
-            on_state_change: Arc::new(parking_lot::RwLock::new(None)),
-            loopback_audio_tx: Arc::new(parking_lot::RwLock::new(Some(b_audio_tx))),
-            loopback_video_tx: Arc::new(parking_lot::RwLock::new(Some(b_video_tx))),
-            loopback_audio_rx: Arc::new(Mutex::new(Some(a_audio_rx))),
-            loopback_video_rx: Arc::new(Mutex::new(Some(a_video_rx))),
-            loopback_rx_handle: Arc::new(parking_lot::Mutex::new(None)),
-            peer_connection: None,
-            live_audio_track: None,
-            live_video_track: None,
-        };
-
-        let transport_b = Self {
-            config: cfg.clone(),
-            mode: TransportMode::MockLoopback,
-            state: Arc::new(parking_lot::RwLock::new(PeerConnectionState::Connected)),
-            packetizer: Arc::new(parking_lot::Mutex::new(OpusPacketizer::new(
-                cfg.audio_channels,
-                0x22222222,
-            ))),
-            depacketizer: Arc::new(parking_lot::Mutex::new(OpusDepacketizer::new(
-                cfg.audio_channels,
-            ))),
-            ai_media_tap: Arc::new(parking_lot::RwLock::new(None)),
-            on_audio: Arc::new(parking_lot::RwLock::new(None)),
-            on_video: Arc::new(parking_lot::RwLock::new(None)),
-            on_ice_candidate: Arc::new(parking_lot::RwLock::new(None)),
-            on_state_change: Arc::new(parking_lot::RwLock::new(None)),
-            loopback_audio_tx: Arc::new(parking_lot::RwLock::new(Some(a_audio_tx))),
-            loopback_video_tx: Arc::new(parking_lot::RwLock::new(Some(a_video_tx))),
-            loopback_audio_rx: Arc::new(Mutex::new(Some(b_audio_rx))),
-            loopback_video_rx: Arc::new(Mutex::new(Some(b_video_rx))),
-            loopback_rx_handle: Arc::new(parking_lot::Mutex::new(None)),
-            peer_connection: None,
-            live_audio_track: None,
-            live_video_track: None,
-        };
+        let transport_a = Self::build_loopback_half(
+            cfg.clone(),
+            0x11111111,
+            b_audio_tx,
+            b_video_tx,
+            b_dc_tx,
+            a_audio_rx,
+            a_video_rx,
+            a_dc_rx,
+        );
+        let transport_b = Self::build_loopback_half(
+            cfg,
+            0x22222222,
+            a_audio_tx,
+            a_video_tx,
+            a_dc_tx,
+            b_audio_rx,
+            b_video_rx,
+            b_dc_rx,
+        );
 
         (transport_a, transport_b)
     }
@@ -528,19 +668,22 @@ impl WebRtcPeerTransport {
     /// Spawns a background loopback receiver task on this transport (safe with concurrent sends)
     pub async fn spawn_loopback_receiver(this: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
         let (audio_rx_opt, video_rx_opt) = this.take_loopback_receivers().await;
-        if audio_rx_opt.is_none() && video_rx_opt.is_none() {
+        let dc_rx_opt = this.loopback_dc_rx.lock().await.take();
+        if audio_rx_opt.is_none() && video_rx_opt.is_none() && dc_rx_opt.is_none() {
             return None;
         }
         let depacketizer = Arc::clone(&this.depacketizer);
         let ai_tap = Arc::clone(&this.ai_media_tap);
         let on_audio = Arc::clone(&this.on_audio);
         let on_video = Arc::clone(&this.on_video);
+        let on_dc = Arc::clone(&this.on_data_channel_message);
         let sample_rate = this.config.audio_sample_rate;
         let channels = this.config.audio_channels;
 
         let handle = tokio::spawn(async move {
             let mut audio_rx = audio_rx_opt;
             let mut video_rx = video_rx_opt;
+            let mut dc_rx = dc_rx_opt;
             loop {
                 tokio::select! {
                     Some(rtp) = async {
@@ -570,6 +713,16 @@ impl WebRtcPeerTransport {
                     } => {
                         if let Some(cb) = on_video.read().clone() {
                             cb(&frame);
+                        }
+                    }
+                    Some(dc_msg) = async {
+                        match dc_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(cb) = on_dc.read().clone() {
+                            cb(&dc_msg.label, &dc_msg.data, dc_msg.is_string);
                         }
                     }
                     else => break,
@@ -681,6 +834,26 @@ impl WebRtcPeerTransport {
         })
     }
 
+    /// Receives next DataChannel message from MockLoopback channel and dispatches callback.
+    pub async fn recv_loopback_data_channel(
+        &self,
+    ) -> Result<DataChannelPayload, WebRtcTransportError> {
+        let payload = {
+            let mut rx_guard = self.loopback_dc_rx.lock().await;
+            let rx = rx_guard
+                .as_mut()
+                .ok_or(WebRtcTransportError::ChannelClosed)?;
+            rx.recv().await
+        };
+        if let Some(msg) = payload {
+            if let Some(cb) = self.on_data_channel_message.read().clone() {
+                cb(&msg.label, &msg.data, msg.is_string);
+            }
+            return Ok(msg);
+        }
+        Err(WebRtcTransportError::ChannelClosed)
+    }
+
     pub fn set_ai_media_tap(&self, tap: Arc<dyn AiMediaTap>) {
         *self.ai_media_tap.write() = Some(tap);
     }
@@ -699,6 +872,230 @@ impl WebRtcPeerTransport {
 
     pub fn set_state_change_callback(&self, cb: StateChangeCallback) {
         *self.on_state_change.write() = Some(cb);
+    }
+
+    pub fn set_data_channel_message_callback(&self, cb: DataChannelMessageCallback) {
+        *self.on_data_channel_message.write() = Some(cb);
+    }
+
+    pub fn set_data_channel_open_callback(&self, cb: DataChannelOpenCallback) {
+        *self.on_data_channel_open.write() = Some(cb);
+    }
+
+    /// Creates a named `RTCDataChannel` with the requested reliability semantics.
+    /// In `Live` mode, call before `create_offer()` so SDP negotiation includes SCTP `m=application`.
+    pub async fn create_data_channel(
+        &self,
+        label: &str,
+        reliability: DataChannelReliability,
+    ) -> Result<(), WebRtcTransportError> {
+        if label.trim().is_empty() {
+            return Err(WebRtcTransportError::InvalidState(
+                "DataChannel label must not be empty".to_string(),
+            ));
+        }
+
+        if self.mode == TransportMode::Live {
+            let pc = self.peer_connection.as_ref().ok_or_else(|| {
+                WebRtcTransportError::InvalidState("PeerConnection is closed".to_string())
+            })?;
+            let init = match reliability {
+                DataChannelReliability::ReliableOrdered => RTCDataChannelInit {
+                    ordered: Some(true),
+                    ..Default::default()
+                },
+                DataChannelReliability::UnreliableUnordered => RTCDataChannelInit {
+                    ordered: Some(false),
+                    max_retransmits: Some(0),
+                    ..Default::default()
+                },
+            };
+            let dc = pc
+                .create_data_channel(label, Some(init))
+                .await
+                .map_err(|e| WebRtcTransportError::Internal(e.to_string()))?;
+            Self::wire_live_data_channel(
+                dc,
+                reliability,
+                Arc::clone(&self.data_channels),
+                Arc::clone(&self.data_channel_reliability),
+                Arc::clone(&self.on_data_channel_message),
+                Arc::clone(&self.on_data_channel_open),
+                Arc::clone(&self.dc_open_notify),
+            );
+            return Ok(());
+        }
+
+        self.loopback_open_channels
+            .write()
+            .insert(label.to_string());
+        self.data_channel_reliability
+            .write()
+            .insert(label.to_string(), reliability);
+        self.dc_open_notify.notify_waiters();
+        if let Some(cb) = self.on_data_channel_open.read().clone() {
+            cb(label);
+        }
+        Ok(())
+    }
+
+    /// Opens the 3 standard Fabushi remote-control channels:
+    /// `"control"` (reliable), `"input-fast"` (unreliable), and `"media-frame"` (unreliable).
+    pub async fn open_remote_control_channels(&self) -> Result<(), WebRtcTransportError> {
+        self.create_data_channel(
+            CONTROL_DATA_CHANNEL_LABEL,
+            DataChannelReliability::ReliableOrdered,
+        )
+        .await?;
+        self.create_data_channel(
+            INPUT_FAST_DATA_CHANNEL_LABEL,
+            DataChannelReliability::UnreliableUnordered,
+        )
+        .await?;
+        self.create_data_channel(
+            MEDIA_FRAME_DATA_CHANNEL_LABEL,
+            DataChannelReliability::UnreliableUnordered,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub fn has_data_channel(&self, label: &str) -> bool {
+        if self.mode == TransportMode::Live {
+            self.data_channels.read().contains_key(label)
+        } else {
+            self.loopback_open_channels.read().contains(label)
+        }
+    }
+
+    pub fn data_channel_reliability(&self, label: &str) -> Option<DataChannelReliability> {
+        self.data_channel_reliability.read().get(label).copied()
+    }
+
+    pub fn is_data_channel_open(&self, label: &str) -> bool {
+        if self.mode == TransportMode::Live {
+            self.data_channels
+                .read()
+                .get(label)
+                .is_some_and(|dc| dc.ready_state() == RTCDataChannelState::Open)
+        } else {
+            self.loopback_open_channels.read().contains(label)
+        }
+    }
+
+    /// Waits up to `timeout` for the named DataChannel to reach `Open` state.
+    pub async fn wait_for_data_channel_open(
+        &self,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<(), WebRtcTransportError> {
+        if self.is_data_channel_open(label) {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.is_data_channel_open(label) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(WebRtcTransportError::InvalidState(format!(
+                    "Timed out waiting for DataChannel '{label}' to open"
+                )));
+            }
+            let _ = tokio::time::timeout(
+                remaining.min(Duration::from_millis(50)),
+                self.dc_open_notify.notified(),
+            )
+            .await;
+        }
+    }
+
+    /// Sends raw binary bytes over a named DataChannel (`Live` SCTP or `MockLoopback`).
+    pub async fn send_data_channel(
+        &self,
+        label: &str,
+        data: &[u8],
+    ) -> Result<(), WebRtcTransportError> {
+        if self.mode == TransportMode::Live {
+            let dc = self
+                .data_channels
+                .read()
+                .get(label)
+                .cloned()
+                .ok_or_else(|| {
+                    WebRtcTransportError::InvalidState(format!(
+                        "DataChannel '{label}' does not exist"
+                    ))
+                })?;
+            if dc.ready_state() != RTCDataChannelState::Open {
+                return Err(WebRtcTransportError::InvalidState(format!(
+                    "DataChannel '{label}' is not open (state={:?})",
+                    dc.ready_state()
+                )));
+            }
+            let payload = data.to_vec().into();
+            dc.send(&payload)
+                .await
+                .map_err(|e| WebRtcTransportError::Internal(e.to_string()))?;
+            return Ok(());
+        }
+
+        let tx_opt = self.loopback_dc_tx.read().clone();
+        if let Some(tx) = tx_opt {
+            tx.send(DataChannelPayload {
+                label: label.to_string(),
+                is_string: false,
+                data: data.to_vec(),
+            })
+            .await
+            .map_err(|_| WebRtcTransportError::ChannelClosed)?;
+            return Ok(());
+        }
+        Err(WebRtcTransportError::ChannelClosed)
+    }
+
+    /// Sends a UTF-8 text message over a named DataChannel (`Live` SCTP or `MockLoopback`).
+    pub async fn send_data_channel_text(
+        &self,
+        label: &str,
+        text: &str,
+    ) -> Result<(), WebRtcTransportError> {
+        if self.mode == TransportMode::Live {
+            let dc = self
+                .data_channels
+                .read()
+                .get(label)
+                .cloned()
+                .ok_or_else(|| {
+                    WebRtcTransportError::InvalidState(format!(
+                        "DataChannel '{label}' does not exist"
+                    ))
+                })?;
+            if dc.ready_state() != RTCDataChannelState::Open {
+                return Err(WebRtcTransportError::InvalidState(format!(
+                    "DataChannel '{label}' is not open (state={:?})",
+                    dc.ready_state()
+                )));
+            }
+            dc.send_text(text)
+                .await
+                .map_err(|e| WebRtcTransportError::Internal(e.to_string()))?;
+            return Ok(());
+        }
+
+        let tx_opt = self.loopback_dc_tx.read().clone();
+        if let Some(tx) = tx_opt {
+            tx.send(DataChannelPayload {
+                label: label.to_string(),
+                is_string: true,
+                data: text.as_bytes().to_vec(),
+            })
+            .await
+            .map_err(|_| WebRtcTransportError::ChannelClosed)?;
+            return Ok(());
+        }
+        Err(WebRtcTransportError::ChannelClosed)
     }
 
     pub fn set_loopback_audio_tx(&self, tx: mpsc::Sender<RtpPacket>) {
@@ -943,6 +1340,14 @@ impl WebRtcPeerTransport {
     }
 
     pub async fn close(&mut self) -> Result<(), WebRtcTransportError> {
+        let dcs: Vec<Arc<RTCDataChannel>> = {
+            let mut guard = self.data_channels.write();
+            guard.drain().map(|(_, dc)| dc).collect()
+        };
+        for dc in dcs {
+            let _ = dc.close().await;
+        }
+        self.loopback_open_channels.write().clear();
         if let Some(pc) = self.peer_connection.take() {
             let _ = pc.close().await;
         }
@@ -951,5 +1356,170 @@ impl WebRtcPeerTransport {
         }
         self.set_state(PeerConnectionState::Closed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn test_mock_loopback_data_channels_reliable_and_unreliable() {
+        let (alice, bob) = WebRtcPeerTransport::create_loopback_pair(PeerTransportConfig::default());
+        alice.open_remote_control_channels().await.unwrap();
+        bob.open_remote_control_channels().await.unwrap();
+
+        assert!(alice.is_data_channel_open(CONTROL_DATA_CHANNEL_LABEL));
+        assert_eq!(
+            alice.data_channel_reliability(CONTROL_DATA_CHANNEL_LABEL),
+            Some(DataChannelReliability::ReliableOrdered)
+        );
+        assert_eq!(
+            alice.data_channel_reliability(INPUT_FAST_DATA_CHANNEL_LABEL),
+            Some(DataChannelReliability::UnreliableUnordered)
+        );
+        assert_eq!(
+            alice.data_channel_reliability(MEDIA_FRAME_DATA_CHANNEL_LABEL),
+            Some(DataChannelReliability::UnreliableUnordered)
+        );
+
+        let received = Arc::new(parking_lot::Mutex::new(Vec::<(String, Vec<u8>, bool)>::new()));
+        let rec_clone = Arc::clone(&received);
+        bob.set_data_channel_message_callback(Arc::new(move |label, data, is_string| {
+            rec_clone.lock().push((label.to_string(), data.to_vec(), is_string));
+        }));
+
+        alice
+            .send_data_channel_text(CONTROL_DATA_CHANNEL_LABEL, r#"{"op":"ping"}"#)
+            .await
+            .unwrap();
+        alice
+            .send_data_channel(INPUT_FAST_DATA_CHANNEL_LABEL, &[1, 2, 3, 4])
+            .await
+            .unwrap();
+
+        let first = bob.recv_loopback_data_channel().await.unwrap();
+        assert_eq!(first.label, CONTROL_DATA_CHANNEL_LABEL);
+        assert!(first.is_string);
+        assert_eq!(first.data, br#"{"op":"ping"}"#);
+
+        let second = bob.recv_loopback_data_channel().await.unwrap();
+        assert_eq!(second.label, INPUT_FAST_DATA_CHANNEL_LABEL);
+        assert!(!second.is_string);
+        assert_eq!(second.data, vec![1, 2, 3, 4]);
+
+        assert_eq!(received.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_live_webrtc_reliable_and_unreliable_data_channels() {
+        let cfg = PeerTransportConfig {
+            mode: TransportMode::Live,
+            enable_audio: false,
+            enable_video: false,
+            ..Default::default()
+        };
+        let mut alice = WebRtcPeerTransport::new(cfg.clone()).await.unwrap();
+        let mut bob = WebRtcPeerTransport::new(cfg).await.unwrap();
+
+        alice.open_remote_control_channels().await.unwrap();
+
+        let (a_ice_tx, mut a_ice_rx) = mpsc::unbounded_channel::<SignalingFrame>();
+        let (b_ice_tx, mut b_ice_rx) = mpsc::unbounded_channel::<SignalingFrame>();
+        alice.set_ice_candidate_callback(Arc::new(move |f| {
+            let _ = a_ice_tx.send(f);
+        }));
+        bob.set_ice_candidate_callback(Arc::new(move |f| {
+            let _ = b_ice_tx.send(f);
+        }));
+
+        let got_control = Arc::new(AtomicBool::new(false));
+        let got_input = Arc::new(AtomicUsize::new(0));
+        let got_ctrl_clone = Arc::clone(&got_control);
+        let got_input_clone = Arc::clone(&got_input);
+        bob.set_data_channel_message_callback(Arc::new(move |label, data, is_string| {
+            if label == CONTROL_DATA_CHANNEL_LABEL && is_string && data == br#"{"cmd":"lock"}"# {
+                got_ctrl_clone.store(true, Ordering::SeqCst);
+            } else if label == INPUT_FAST_DATA_CHANNEL_LABEL && !is_string && data == [0xAA, 0xBB] {
+                got_input_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        let offer = alice.create_offer().await.unwrap();
+        assert!(offer.contains("m=application"), "Offer SDP must negotiate DataChannels");
+        bob.set_remote_description(&offer, true).await.unwrap();
+        let answer = bob.create_answer().await.unwrap();
+        alice.set_remote_description(&answer, false).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            while let Ok(SignalingFrame::IceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+                ..
+            }) = a_ice_rx.try_recv()
+            {
+                let _ = bob.add_ice_candidate(&candidate, sdp_mid, sdp_mline_index).await;
+            }
+            while let Ok(SignalingFrame::IceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+                ..
+            }) = b_ice_rx.try_recv()
+            {
+                let _ = alice.add_ice_candidate(&candidate, sdp_mid, sdp_mline_index).await;
+            }
+            if alice.is_data_channel_open(CONTROL_DATA_CHANNEL_LABEL)
+                && alice.is_data_channel_open(INPUT_FAST_DATA_CHANNEL_LABEL)
+                && bob.is_data_channel_open(CONTROL_DATA_CHANNEL_LABEL)
+                && bob.is_data_channel_open(INPUT_FAST_DATA_CHANNEL_LABEL)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        alice
+            .wait_for_data_channel_open(CONTROL_DATA_CHANNEL_LABEL, Duration::from_secs(3))
+            .await
+            .unwrap();
+        bob.wait_for_data_channel_open(INPUT_FAST_DATA_CHANNEL_LABEL, Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bob.data_channel_reliability(CONTROL_DATA_CHANNEL_LABEL),
+            Some(DataChannelReliability::ReliableOrdered)
+        );
+        assert_eq!(
+            bob.data_channel_reliability(INPUT_FAST_DATA_CHANNEL_LABEL),
+            Some(DataChannelReliability::UnreliableUnordered)
+        );
+
+        alice
+            .send_data_channel_text(CONTROL_DATA_CHANNEL_LABEL, r#"{"cmd":"lock"}"#)
+            .await
+            .unwrap();
+        alice
+            .send_data_channel(INPUT_FAST_DATA_CHANNEL_LABEL, &[0xAA, 0xBB])
+            .await
+            .unwrap();
+
+        let msg_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < msg_deadline {
+            if got_control.load(Ordering::SeqCst) && got_input.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(got_control.load(Ordering::SeqCst), "reliable control channel failed");
+        assert!(got_input.load(Ordering::SeqCst) >= 1, "unreliable input-fast channel failed");
+
+        alice.close().await.unwrap();
+        bob.close().await.unwrap();
     }
 }

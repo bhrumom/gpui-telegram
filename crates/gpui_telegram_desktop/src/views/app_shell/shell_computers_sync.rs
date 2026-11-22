@@ -6,17 +6,29 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, AppContext, AsyncApp, Context, Entity, WeakEntity};
+use gpui::{App, AppContext, AsyncApp, ClipboardItem, Context, Entity, WeakEntity};
 use gpui_telegram_client::TelegramClient;
+use gpui_telegram_client::net::shared_remote_engine;
 use gpui_telegram_proto::computer_contracts::{
-    ComputerListResponse, ComputerNodeDto, ComputerNodeKind, PendingComputerCommandDto,
-    RemoteComputerCommandRequest, RemoteComputerOp, UpdateBotComputerRequest,
-    UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
+    ComputerListResponse, ComputerNodeKind, PendingComputerCommandDto, RemoteComputerCommandRequest,
+    RemoteComputerOp, UpdateBotComputerRequest,
+};
+use gpui_telegram_proto::remote_control_contracts::{
+    DisplayInfoDto, RemoteControllerKind, RemoteSessionDto,
 };
 
+use crate::app::cli_installer::{
+    detect_cli_install_status, install_fabushi_cli_one_click, startup_ensure_cli_linked_if_bundled,
+};
 use crate::i18n::tr_str;
+use crate::platform::mac::tray_mac::tray_action_ids;
+use crate::views::app_shell::desktop_ipc_host::DesktopLocalIpcHandler;
 use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand};
 use crate::views::drawer::inspector_tabs::{InspectorAction, InspectorSubpage};
+use crate::views::remote_controlled_window::{
+    RemoteControlledWindowAction, open_controlled_status_window,
+};
+use crate::views::remote_terminal_view::RemoteTerminalAction;
 use crate::views::settings::sections::SettingsComputersEvent;
 use crate::views::settings::settings_type::SettingsSectionType;
 use crate::views::shell::{ActiveWorkspacePanel, AppShell};
@@ -143,6 +155,17 @@ impl AppShell {
         let active_bot_id = self.effective_inspector_bot_id(cx);
         let active_bot_profile = active_bot_id
             .and_then(|id| self.computers.bot_profiles.get(&id).cloned());
+        let assist_cfg = self.computers.assist_config.clone();
+        let active_sessions = self.combined_remote_sessions();
+        self.computers.active_sessions = active_sessions.clone();
+        let mcp_grants = self.computers.mcp_grants.clone();
+        let mcp_url = self.computers.mcp_endpoint_url.clone().or_else(|| {
+            Some(format!(
+                "{}/mcp",
+                self.client.config.server_url.trim_end_matches('/')
+            ))
+        });
+        let cli_status = self.computers.cli_status.clone();
 
         self.inspector.update(cx, |insp, icx| {
             insp.sync_computers(nodes.clone());
@@ -165,9 +188,26 @@ impl AppShell {
                 sc.sync_computers(nodes.clone());
                 sc.sync_known_bots(bots, active_bot_id);
                 sc.sync_tailnet_status(tailnet_status.clone());
+                sc.sync_assist_config(assist_cfg.clone());
+                sc.sync_active_sessions(active_sessions.clone());
+                sc.sync_mcp_grants(mcp_url.clone(), mcp_grants.clone());
+                sc.sync_cli_status(cli_status.clone());
                 sc_cx.notify();
             });
         }
+
+        if let Some(win) = self.remote_host.controlled_window {
+            let sessions_for_win = active_sessions.clone();
+            let _ = win.update(cx, |view, _, vcx| {
+                view.set_sessions(sessions_for_win);
+                vcx.notify();
+            });
+        }
+
+        if let Some(ref handler) = self.remote_host.ipc_handler {
+            handler.set_local_node_id(self.computers.current_host_node_id.clone());
+        }
+        self.sync_remote_tray_status(cx);
 
         if let Some(ref wb_ent) = self.overlays.computer_overlay.clone() {
             let target_id = wb_ent.read(cx).node_id.clone();
@@ -193,6 +233,354 @@ impl AppShell {
                 }
             }
         }
+    }
+
+    pub fn combined_remote_sessions(&self) -> Vec<RemoteSessionDto> {
+        let mut sessions = shared_remote_engine().hub.list_sessions();
+        for s in &self.computers.active_sessions {
+            if !sessions.iter().any(|x| x.session_id == s.session_id) {
+                sessions.push(s.clone());
+            }
+        }
+        sessions.sort_by_key(|s| s.started_at_ms);
+        sessions
+    }
+
+    /// Initializes local IPC host (`LocalIpcServer` + `PtyMuxServer` + `RemoteControlHub`),
+    /// first-run `fabushi` CLI symlink detection, and native system tray menu bar indicator.
+    pub fn ensure_remote_host_runtime_bootstrapped(&mut self, cx: &mut Context<Self>) {
+        if self.remote_host.services_bootstrapped {
+            return;
+        }
+        self.remote_host.services_bootstrapped = true;
+
+        if cfg!(test) || std::env::var_os("GPUI_OFFLINE_TEST").is_some() {
+            return;
+        }
+
+        let cli_status = startup_ensure_cli_linked_if_bundled();
+        self.computers.cli_status = Some(cli_status);
+
+        let handler = Arc::new(DesktopLocalIpcHandler::new(self.client.clone()));
+        handler.set_local_node_id(self.computers.current_host_node_id.clone());
+        self.remote_host.ipc_handler = Some(handler.clone());
+        let ipc_client = self.client.clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let h = handler.clone();
+            let bind_res = run_on_tokio(&ipc_client, async move {
+                fabushi_remote_engine::ipc::LocalIpcServer::bind_default(h)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .and_then(|inner| inner);
+            let _ = weak.update(app, |shell, _| match bind_res {
+                Ok(srv) => {
+                    shell.remote_host.ipc_server = Some(srv);
+                }
+                Err(err) => {
+                    eprintln!("[desktop-ipc] failed to bind desktop LocalIpcServer: {err}");
+                }
+            });
+        })
+        .detach();
+
+        let _ = self.remote_host.tray_mac.create_icon();
+        let _ = self.remote_host.tray_win.tray();
+        self.sync_remote_tray_status(cx);
+        self.spawn_remote_host_poll_loop(cx);
+    }
+
+    pub fn sync_remote_tray_status(&mut self, cx: &App) {
+        let _ = cx;
+        let lang = self.active_lang_id().to_string();
+        let sessions = self.combined_remote_sessions();
+        let count = sessions.len();
+        let by_ai = sessions
+            .iter()
+            .any(|s| s.controller_kind == RemoteControllerKind::AiMcp);
+        let online = self.is_authenticated;
+        let allow_remote = self
+            .computers
+            .assist_config
+            .as_ref()
+            .map_or(true, |c| c.allow_assist);
+        let assist_id = self
+            .computers
+            .assist_config
+            .as_ref()
+            .map(|c| c.assist_id.clone())
+            .unwrap_or_default();
+        let assist_code = self
+            .computers
+            .assist_config
+            .as_ref()
+            .and_then(|c| c.current_code.clone());
+
+        self.remote_host.tray_mac.set_remote_control_status(
+            online,
+            count,
+            by_ai,
+            allow_remote,
+            assist_id.clone(),
+            assist_code.clone(),
+            &lang,
+        );
+        self.remote_host.tray_win.set_remote_control_status(
+            online,
+            count,
+            by_ai,
+            allow_remote,
+            assist_id,
+            assist_code,
+            &lang,
+        );
+    }
+
+    pub fn open_or_focus_controlled_status_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(existing) = self.remote_host.controlled_window {
+            let sessions = self.combined_remote_sessions();
+            let updated = existing
+                .update(cx, |view, window, vcx| {
+                    view.set_sessions(sessions);
+                    window.activate_window();
+                    vcx.notify();
+                })
+                .is_ok();
+            if updated {
+                return;
+            }
+            self.remote_host.controlled_window = None;
+        }
+
+        let hub = shared_remote_engine().hub.clone();
+        let sessions = self.combined_remote_sessions();
+        let lang = self.active_lang_id().to_string();
+        let mode = self.theme_state.theme_mode;
+        if let Ok(Some(handle)) = open_controlled_status_window(hub, sessions, lang, mode, cx) {
+            self.remote_host.controlled_window = Some(handle);
+            if let Ok(ent) = handle.update(cx, |_, _, vcx| vcx.entity()) {
+                cx.observe(&ent, |shell, view, cx| {
+                    let actions = view.update(cx, |v, _| v.take_actions());
+                    for act in actions {
+                        match act {
+                            RemoteControlledWindowAction::DisconnectAll { .. } => {
+                                shell.disconnect_all_remote_control(cx);
+                            }
+                            RemoteControlledWindowAction::DisconnectSession {
+                                session_id, ..
+                            } => {
+                                shell.disconnect_remote_session(session_id, cx);
+                            }
+                            RemoteControlledWindowAction::CloseRequested => {
+                                shell.remote_host.controlled_window = None;
+                            }
+                            RemoteControlledWindowAction::ToggleCollapse(_) => {}
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    pub fn disconnect_all_remote_control(&mut self, cx: &mut Context<Self>) {
+        let local_count = shared_remote_engine().hub.disconnect_all();
+        self.computers.active_sessions.clear();
+        self.sync_computers_to_views(cx);
+
+        let client = self.client.clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let c = client.clone();
+            let _ = run_on_tokio(&client, async move {
+                c.disconnect_all_remote_sessions_async().await.ok()
+            })
+            .await;
+            let _ = weak.update(app, |shell, cx| {
+                shell.enqueue_computer_toast(
+                    if local_count > 0 {
+                        "已立即断开所有远程控制与 AI MCP 会话"
+                    } else {
+                        "已触发全局远控抢占保护"
+                    },
+                    "Disconnected all remote control sessions",
+                    2200,
+                );
+                shell.sync_computers_to_views(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn disconnect_remote_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+        shared_remote_engine().hub.disconnect_session(&session_id);
+        self.computers
+            .active_sessions
+            .retain(|s| s.session_id != session_id);
+        self.sync_computers_to_views(cx);
+
+        if self.is_authenticated {
+            let client = self.client.clone();
+            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                let c = client.clone();
+                let sid = session_id.clone();
+                let _ = run_on_tokio(&client, async move {
+                    c.disconnect_remote_session_async(&sid).await.ok()
+                })
+                .await;
+                let _ = weak.update(app, |shell, cx| {
+                    shell.sync_computers_to_views(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    pub fn refresh_remote_assist_and_grants(&mut self, cx: &mut Context<Self>) {
+        let status = detect_cli_install_status();
+        self.computers.cli_status = Some(status);
+        let Some(fence) = self.computer_fence() else {
+            self.sync_computers_to_views(cx);
+            return;
+        };
+        let client = self.client.clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let c = client.clone();
+            let (assist_res, sessions_res, grants_res) = run_on_tokio(&client, async move {
+                let assist = c.get_remote_assist_info_async().await.map_err(|e| e.to_string());
+                let sess = c.list_remote_sessions_async().await.map_err(|e| e.to_string());
+                let grants = c.list_mcp_grants_async().await.map_err(|e| e.to_string());
+                (assist, sess, grants)
+            })
+            .await
+            .unwrap_or_else(|e| (Err(e.clone()), Err(e.clone()), Err(e)));
+
+            let _ = weak.update(app, |shell, cx| {
+                if !shell.computer_fence_matches(fence) {
+                    return;
+                }
+                if let Ok(cfg) = assist_res {
+                    shell.computers.assist_config = Some(cfg);
+                }
+                if let Ok(s) = sessions_res {
+                    shell.computers.active_sessions = s.sessions;
+                }
+                if let Ok(g) = grants_res {
+                    shell.computers.mcp_grants = g.grants;
+                }
+                shell.sync_computers_to_views(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn handle_tray_action(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        match action_id {
+            tray_action_ids::SHOW_FABUSHI | tray_action_ids::OPEN_ALIAS => {
+                self.active_panel = ActiveWorkspacePanel::Settings;
+                self.navigate_settings_to(SettingsSectionType::Computers, cx);
+                cx.activate(true);
+            }
+            tray_action_ids::CONTROLLED_STATUS => {
+                self.open_or_focus_controlled_status_window(cx);
+                cx.activate(true);
+            }
+            tray_action_ids::DISCONNECT_ALL => {
+                self.disconnect_all_remote_control(cx);
+            }
+            tray_action_ids::TOGGLE_ALLOW_REMOTE => {
+                let next = !self
+                    .computers
+                    .assist_config
+                    .as_ref()
+                    .map_or(true, |c| c.allow_assist);
+                if let Some(cfg) = self.computers.assist_config.as_mut() {
+                    cfg.allow_assist = next;
+                }
+                self.sync_remote_tray_status(cx);
+                if self.is_authenticated {
+                    let client = self.client.clone();
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        let c = client.clone();
+                        if let Ok(Ok(cfg)) =
+                            run_on_tokio(&client, async move {
+                                c.set_remote_assist_allow_async(next)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await
+                        {
+                            let _ = weak.update(app, |shell, cx| {
+                                shell.computers.assist_config = Some(cfg);
+                                shell.sync_computers_to_views(cx);
+                            });
+                        }
+                    })
+                    .detach();
+                }
+            }
+            tray_action_ids::COPY_ASSIST => {
+                if !self.remote_host.tray_mac.assist_id.trim().is_empty() {
+                    let clip = self.remote_host.tray_mac.formatted_assist_clipboard_text();
+                    cx.write_to_clipboard(ClipboardItem::new_string(clip));
+                    self.enqueue_computer_toast(
+                        "已复制设备协助码与验证码",
+                        "Copied Assist ID & code",
+                        2000,
+                    );
+                } else {
+                    self.refresh_remote_assist_and_grants(cx);
+                }
+            }
+            tray_action_ids::QUIT => {
+                cx.quit();
+            }
+            _ => {}
+        }
+    }
+
+    fn spawn_remote_host_poll_loop(&mut self, cx: &mut Context<Self>) {
+        if self.remote_host.hub_events_started {
+            return;
+        }
+        self.remote_host.hub_events_started = true;
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let mut last_count = 0usize;
+            loop {
+                app.background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                let keep = weak
+                    .update(app, |shell, cx| {
+                        while let Some(act) = shell.remote_host.tray_mac.poll_native_action() {
+                            shell.handle_tray_action(&act, cx);
+                        }
+                        while let Some(act) = shell.remote_host.tray_win.poll_native_action() {
+                            shell.handle_tray_action(&act, cx);
+                        }
+                        let current_sessions = shell.combined_remote_sessions();
+                        let count = current_sessions.len();
+                        if count != last_count {
+                            if last_count == 0 && count > 0 {
+                                shell.open_or_focus_controlled_status_window(cx);
+                            }
+                            last_count = count;
+                            shell.sync_remote_tray_status(cx);
+                            shell.sync_computers_to_views(cx);
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn apply_computer_list_response(&mut self, resp: ComputerListResponse) {
@@ -225,6 +613,7 @@ impl AppShell {
 
     /// Registers the current local machine on login and starts the background local-command relay loop.
     pub fn register_current_host_and_start_relay(&mut self, cx: &mut Context<Self>) {
+        self.ensure_remote_host_runtime_bootstrapped(cx);
         let Some(fence) = self.computer_fence() else {
             return;
         };
@@ -238,23 +627,32 @@ impl AppShell {
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let reg_client = client.clone();
-            let (reg_res, list_res, tailnet_st, tailnet_waiting) = run_on_tokio(&client, async move {
-                let reg = reg_client.register_current_host_computer_async().await;
-                let list = reg_client.list_computers_async().await;
-                let ts = reg_client.tailnet_status();
-                let waiting = reg_client.tailnet_pending_approvals();
-                (reg, list, ts, waiting)
-            })
-            .await
-            .map(|(reg, list, ts, waiting)| {
-                (
-                    reg.map_err(|e| e.to_string()),
-                    list.map_err(|e| e.to_string()),
-                    Some(ts),
-                    waiting,
-                )
-            })
-            .unwrap_or_else(|e| (Err(e.clone()), Err(e), None, Vec::new()));
+            let (reg_res, list_res, tailnet_st, tailnet_waiting, assist_res, sess_res, grants_res) =
+                run_on_tokio(&client, async move {
+                    let reg = reg_client.register_current_host_computer_async().await;
+                    let list = reg_client.list_computers_async().await;
+                    let ts = reg_client.tailnet_status();
+                    let waiting = reg_client.tailnet_pending_approvals();
+                    let assist = reg_client.get_remote_assist_info_async().await.ok();
+                    let sess = reg_client.list_remote_sessions_async().await.ok();
+                    let grants = reg_client.list_mcp_grants_async().await.ok();
+                    (reg, list, ts, waiting, assist, sess, grants)
+                })
+                .await
+                .map(|(reg, list, ts, waiting, assist, sess, grants)| {
+                    (
+                        reg.map_err(|e| e.to_string()),
+                        list.map_err(|e| e.to_string()),
+                        Some(ts),
+                        waiting,
+                        assist,
+                        sess,
+                        grants,
+                    )
+                })
+                .unwrap_or_else(|e| {
+                    (Err(e.clone()), Err(e), None, Vec::new(), None, None, None)
+                });
 
             let keep = weak
                 .update(app, |shell, cx| {
@@ -269,6 +667,15 @@ impl AppShell {
                     }
                     if let Some(ts) = tailnet_st {
                         shell.computers.tailnet_status = Some(ts);
+                    }
+                    if let Some(cfg) = assist_res {
+                        shell.computers.assist_config = Some(cfg);
+                    }
+                    if let Some(sr) = sess_res {
+                        shell.computers.active_sessions = sr.sessions;
+                    }
+                    if let Some(gr) = grants_res {
+                        shell.computers.mcp_grants = gr.grants;
                     }
                     shell.merge_pending_approvals(tailnet_waiting);
                     shell.sync_computers_to_views(cx);
@@ -297,7 +704,7 @@ impl AppShell {
 
                 let do_heartbeat = tick_count % 10 == 0;
                 let poll_client = client.clone();
-                let (relay_res, list_res, tailnet_st, tailnet_waiting) =
+                let (relay_res, list_res, tailnet_st, tailnet_waiting, sess_res) =
                     run_on_tokio(&client, async move {
                         if do_heartbeat {
                             let _ = poll_client.register_current_host_computer_async().await;
@@ -306,18 +713,24 @@ impl AppShell {
                         let list = poll_client.list_computers_async().await;
                         let ts = poll_client.tailnet_status();
                         let waiting = poll_client.tailnet_pending_approvals();
-                        (relay, list, ts, waiting)
+                        let sess = if tick_count % 3 == 0 {
+                            poll_client.list_remote_sessions_async().await.ok()
+                        } else {
+                            None
+                        };
+                        (relay, list, ts, waiting, sess)
                     })
                     .await
-                    .map(|(r, l, ts, waiting)| {
+                    .map(|(r, l, ts, waiting, sess)| {
                         (
                             r.map_err(|e| e.to_string()),
                             l.map_err(|e| e.to_string()),
                             Some(ts),
                             waiting,
+                            sess,
                         )
                     })
-                    .unwrap_or_else(|e| (Err(e.clone()), Err(e), None, Vec::new()));
+                    .unwrap_or_else(|e| (Err(e.clone()), Err(e), None, Vec::new(), None));
 
                 let cont = weak
                     .update(app, |shell, cx| {
@@ -332,6 +745,9 @@ impl AppShell {
                         }
                         if let Some(ts) = tailnet_st {
                             shell.computers.tailnet_status = Some(ts);
+                        }
+                        if let Some(sr) = sess_res {
+                            shell.computers.active_sessions = sr.sessions;
                         }
                         shell.merge_pending_approvals(tailnet_waiting);
                         shell.sync_computers_to_views(cx);
@@ -469,12 +885,12 @@ impl AppShell {
 
         let nid_for_obs = node_id.clone();
         cx.observe(&overlay, move |shell, ov, cx| {
-            let (close, cmd) = ov.update(cx, |w, _| (w.should_close, w.take_command()));
+            let (close, cmds) = ov.update(cx, |w, _| (w.should_close, w.take_commands()));
             if close {
                 shell.hide_remote_computer(cx);
                 return;
             }
-            if let Some(command) = cmd {
+            for command in cmds {
                 shell.handle_workbench_command(nid_for_obs.clone(), command, ov.clone(), cx);
             }
         })
@@ -493,11 +909,79 @@ impl AppShell {
         overlay: Entity<ComputerWorkbench>,
         cx: &mut Context<Self>,
     ) {
+        if let WorkbenchCommand::TerminalAction(RemoteTerminalAction::CopyToClipboard(text)) = &cmd
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            overlay.update(cx, |wb, wcx| {
+                wb.status_banner = Some(
+                    tr_str(&wb.language_id, "已复制终端选区到剪贴板", "Copied terminal selection")
+                        .to_string(),
+                );
+                wcx.notify();
+            });
+            return;
+        }
+        if let WorkbenchCommand::FileTransferAction {
+            transfer_id,
+            action,
+            ..
+        } = &cmd
+        {
+            let banner = if action == "pause" {
+                format!("Paused transfer {transfer_id}")
+            } else {
+                format!("Resumed transfer {transfer_id}")
+            };
+            overlay.update(cx, |wb, wcx| {
+                wb.status_banner = Some(banner);
+                wcx.notify();
+            });
+            return;
+        }
+        if let WorkbenchCommand::SetStreamSettings(settings) = &cmd {
+            overlay.update(cx, |wb, wcx| {
+                wb.status_banner = Some(format!(
+                    "{} ({}fps · {:?})",
+                    tr_str(&wb.language_id, "已应用画质与控制流设置", "Stream settings applied"),
+                    settings.target_fps,
+                    settings.quality
+                ));
+                wcx.notify();
+            });
+            return;
+        }
+        if let WorkbenchCommand::ToggleVirtualDisplay {
+            enabled,
+            width,
+            height,
+        } = &cmd
+        {
+            let dp = &shared_remote_engine().display_privacy;
+            if *enabled {
+                let _ = dp.create_virtual_display(*width, *height, 60);
+            } else {
+                for vd in dp.virtual_displays() {
+                    dp.remove_virtual_display(vd.display_id);
+                }
+            }
+            overlay.update(cx, |wb, wcx| {
+                wb.status_banner = Some(if *enabled {
+                    format!("Virtual display enabled ({width}x{height})")
+                } else {
+                    "Virtual display disabled".to_string()
+                });
+                wcx.notify();
+            });
+            return;
+        }
+
         let Some(fence) = self.computer_fence() else {
             return;
         };
         let operation = match &cmd {
-            WorkbenchCommand::RefreshScreen => RemoteComputerOp::CaptureScreen,
+            WorkbenchCommand::RefreshScreen | WorkbenchCommand::TakeScreenshot => {
+                RemoteComputerOp::CaptureScreen
+            }
             WorkbenchCommand::SendGuiClick { x, y } => RemoteComputerOp::GuiInput {
                 action: "click".to_string(),
                 x: Some(*x),
@@ -522,6 +1006,123 @@ impl AppShell {
                 path: path.clone(),
                 max_bytes: Some(64 * 1024),
             },
+            WorkbenchCommand::ListDisplays => RemoteComputerOp::DisplayList,
+            WorkbenchCommand::SwitchDisplay { display_index } => RemoteComputerOp::DisplaySwitch {
+                display_index: *display_index,
+            },
+            WorkbenchCommand::TogglePrivacyScreen { enabled, message } => {
+                RemoteComputerOp::PrivacyScreenToggle {
+                    enabled: *enabled,
+                    message: message.clone(),
+                }
+            }
+            WorkbenchCommand::SendRelativeMouseDelta { dx, dy } => RemoteComputerOp::MouseAction {
+                action: "move".to_string(),
+                x: None,
+                y: None,
+                dx: Some(*dx),
+                dy: Some(*dy),
+                button: None,
+                clicks: None,
+                scroll_x: None,
+                scroll_y: None,
+                relative: true,
+            },
+            WorkbenchCommand::SendHotkey { key, modifiers } => RemoteComputerOp::KeyboardAction {
+                action: "hotkey".to_string(),
+                text: None,
+                key: Some(key.clone()),
+                modifiers: modifiers.clone(),
+            },
+            WorkbenchCommand::PowerAction(action) => RemoteComputerOp::PowerAction {
+                action: action.clone(),
+            },
+            WorkbenchCommand::TerminalAction(act) => match act {
+                RemoteTerminalAction::NewSession {
+                    name,
+                    shell,
+                    cols,
+                    rows,
+                } => RemoteComputerOp::TerminalOp {
+                    op: "new".to_string(),
+                    session_name: Some(name.clone()),
+                    shell: shell.clone(),
+                    input: None,
+                    command: None,
+                    cols: Some(*cols),
+                    rows: Some(*rows),
+                    timeout_ms: None,
+                    new_name: None,
+                },
+                RemoteTerminalAction::RenameSession {
+                    session_id,
+                    new_name,
+                } => RemoteComputerOp::TerminalOp {
+                    op: "rename".to_string(),
+                    session_name: Some(session_id.clone()),
+                    shell: None,
+                    input: None,
+                    command: None,
+                    cols: None,
+                    rows: None,
+                    timeout_ms: None,
+                    new_name: Some(new_name.clone()),
+                },
+                RemoteTerminalAction::KillSession { session_id } => RemoteComputerOp::TerminalOp {
+                    op: "kill".to_string(),
+                    session_name: Some(session_id.clone()),
+                    shell: None,
+                    input: None,
+                    command: None,
+                    cols: None,
+                    rows: None,
+                    timeout_ms: None,
+                    new_name: None,
+                },
+                RemoteTerminalAction::SendInput { session_id, data } => RemoteComputerOp::TerminalOp {
+                    op: "write".to_string(),
+                    session_name: Some(session_id.clone()),
+                    shell: None,
+                    input: Some(data.clone()),
+                    command: None,
+                    cols: None,
+                    rows: None,
+                    timeout_ms: None,
+                    new_name: None,
+                },
+                RemoteTerminalAction::Resize {
+                    session_id,
+                    cols,
+                    rows,
+                } => RemoteComputerOp::TerminalOp {
+                    op: "resize".to_string(),
+                    session_name: Some(session_id.clone()),
+                    shell: None,
+                    input: None,
+                    command: None,
+                    cols: Some(*cols),
+                    rows: Some(*rows),
+                    timeout_ms: None,
+                    new_name: None,
+                },
+                RemoteTerminalAction::RefreshSession { session_id } => {
+                    RemoteComputerOp::TerminalOp {
+                        op: "read".to_string(),
+                        session_name: Some(session_id.clone()),
+                        shell: None,
+                        input: None,
+                        command: None,
+                        cols: None,
+                        rows: None,
+                        timeout_ms: None,
+                        new_name: None,
+                    }
+                }
+                RemoteTerminalAction::CopyToClipboard(_) => unreachable!(),
+            },
+            WorkbenchCommand::SetStreamSettings(_)
+            | WorkbenchCommand::ToggleVirtualDisplay { .. }
+            | WorkbenchCommand::FileTransferAction { .. } => unreachable!(),
         };
 
         let caller_label = self
@@ -569,7 +1170,7 @@ impl AppShell {
                         }
                         overlay.update(cx, |wb, wcx| {
                             match &cmd {
-                                WorkbenchCommand::RefreshScreen => {
+                                WorkbenchCommand::RefreshScreen | WorkbenchCommand::TakeScreenshot => {
                                     if out.stdout.contains("fallback_png") {
                                         wb.update_frame_url(None);
                                         wb.needs_screen_permission_guide = true;
@@ -586,7 +1187,11 @@ impl AppShell {
                                         wb.update_frame_url(out.frame_data_url.clone());
                                         wb.status_banner = Some(format!(
                                             "{} ({}ms)",
-                                            tr_str(&wb.language_id, "已更新实时画面", "Screen captured"),
+                                            if matches!(cmd, WorkbenchCommand::TakeScreenshot) {
+                                                tr_str(&wb.language_id, "已抓取高清截屏", "Screenshot captured")
+                                            } else {
+                                                tr_str(&wb.language_id, "已更新实时画面", "Screen captured")
+                                            },
                                             out.duration_ms
                                         ));
                                     } else if !out.stderr.is_empty() {
@@ -640,6 +1245,87 @@ impl AppShell {
                                         wb.status_banner = Some(out.stderr.clone());
                                     }
                                 }
+                                WorkbenchCommand::ListDisplays => {
+                                    if let Ok(displays) =
+                                        serde_json::from_str::<Vec<DisplayInfoDto>>(&out.stdout)
+                                    {
+                                        wb.set_displays(displays);
+                                    }
+                                }
+                                WorkbenchCommand::SwitchDisplay { display_index } => {
+                                    if out.ok {
+                                        wb.status_banner = Some(format!(
+                                            "{} #{display_index}",
+                                            tr_str(&wb.language_id, "已切换显示器", "Switched to display")
+                                        ));
+                                    } else if !out.stderr.is_empty() {
+                                        wb.status_banner = Some(out.stderr.clone());
+                                    }
+                                }
+                                WorkbenchCommand::TogglePrivacyScreen { enabled, .. } => {
+                                    wb.status_banner = Some(if out.ok {
+                                        if *enabled {
+                                            tr_str(&wb.language_id, "隐私屏已开启", "Privacy screen enabled")
+                                        } else {
+                                            tr_str(&wb.language_id, "隐私屏已关闭", "Privacy screen disabled")
+                                        }
+                                        .to_string()
+                                    } else {
+                                        out.stderr.clone()
+                                    });
+                                }
+                                WorkbenchCommand::SendHotkey { key, modifiers } => {
+                                    if !out.ok && !out.stderr.is_empty() {
+                                        wb.status_banner = Some(out.stderr.clone());
+                                    } else {
+                                        wb.status_banner = Some(format!(
+                                            "{} {:?}+{key}",
+                                            tr_str(&wb.language_id, "已发送组合键", "Sent hotkey"),
+                                            modifiers
+                                        ));
+                                    }
+                                }
+                                WorkbenchCommand::PowerAction(act) => {
+                                    wb.status_banner = Some(if out.ok {
+                                        format!(
+                                            "{}: {:?}",
+                                            tr_str(&wb.language_id, "电源指令已发送", "Power action sent"),
+                                            act
+                                        )
+                                    } else {
+                                        out.stderr.clone()
+                                    });
+                                }
+                                WorkbenchCommand::TerminalAction(act) => match act {
+                                    RemoteTerminalAction::NewSession { name, .. } => {
+                                        if out.ok && !out.stdout.is_empty() {
+                                            wb.feed_pty_output(Some(name), out.stdout.as_bytes(), wcx);
+                                        } else if !out.ok && !out.stderr.is_empty() {
+                                            wb.status_banner = Some(out.stderr.clone());
+                                        }
+                                    }
+                                    RemoteTerminalAction::RefreshSession { session_id }
+                                    | RemoteTerminalAction::SendInput { session_id, .. } => {
+                                        if out.ok && !out.stdout.is_empty() {
+                                            wb.feed_pty_output(
+                                                Some(session_id),
+                                                out.stdout.as_bytes(),
+                                                wcx,
+                                            );
+                                        } else if !out.ok && !out.stderr.is_empty() {
+                                            wb.status_banner = Some(out.stderr.clone());
+                                        }
+                                    }
+                                    _ => {
+                                        if !out.ok && !out.stderr.is_empty() {
+                                            wb.status_banner = Some(out.stderr.clone());
+                                        }
+                                    }
+                                },
+                                WorkbenchCommand::SendRelativeMouseDelta { .. }
+                                | WorkbenchCommand::SetStreamSettings(_)
+                                | WorkbenchCommand::ToggleVirtualDisplay { .. }
+                                | WorkbenchCommand::FileTransferAction { .. } => {}
                             }
                             wcx.notify();
                         });
@@ -651,6 +1337,8 @@ impl AppShell {
                                 cmd,
                                 WorkbenchCommand::SendGuiClick { .. }
                                     | WorkbenchCommand::SendGuiText { .. }
+                                    | WorkbenchCommand::SwitchDisplay { .. }
+                                    | WorkbenchCommand::SendHotkey { .. }
                             )
                         {
                             let nid_refresh = node_id.clone();
@@ -1125,6 +1813,196 @@ impl AppShell {
                     });
                 })
                 .detach();
+            }
+            SettingsComputersEvent::RefreshAssistInfo => {
+                self.refresh_remote_assist_and_grants(cx);
+            }
+            SettingsComputersEvent::ResetAssistTempCode => {
+                let Some(fence) = self.computer_fence() else { return; };
+                let client = self.client.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let c = client.clone();
+                    let res = run_on_tokio(&client, async move {
+                        c.reset_remote_assist_code_async().await.map_err(|e| e.to_string())
+                    })
+                    .await
+                    .and_then(|x| x);
+                    let _ = weak.update(app, |shell, cx| {
+                        if !shell.computer_fence_matches(fence) { return; }
+                        match res {
+                            Ok(cfg) => {
+                                shell.computers.assist_config = Some(cfg);
+                                shell.enqueue_computer_toast("已生成新临时验证码", "Temporary assist code rotated", 2000);
+                            }
+                            Err(e) => {
+                                shell.window_runtime.enqueue_toast(format!("Assist reset failed: {e}"), 2400);
+                            }
+                        }
+                        shell.sync_computers_to_views(cx);
+                    });
+                })
+                .detach();
+            }
+            SettingsComputersEvent::SetAssistCustomCode(code) => {
+                let Some(fence) = self.computer_fence() else { return; };
+                let client = self.client.clone();
+                let code = code.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let c = client.clone();
+                    let res = run_on_tokio(&client, async move {
+                        c.set_remote_assist_code_async(&code).await.map_err(|e| e.to_string())
+                    })
+                    .await
+                    .and_then(|x| x);
+                    let _ = weak.update(app, |shell, cx| {
+                        if !shell.computer_fence_matches(fence) { return; }
+                        match res {
+                            Ok(cfg) => {
+                                shell.computers.assist_config = Some(cfg);
+                                shell.enqueue_computer_toast("已保存自定义协助验证码", "Custom assist code saved", 2000);
+                            }
+                            Err(e) => {
+                                shell.window_runtime.enqueue_toast(format!("Failed: {e}"), 2400);
+                            }
+                        }
+                        shell.sync_computers_to_views(cx);
+                    });
+                })
+                .detach();
+            }
+            SettingsComputersEvent::SetAssistAllow(allow) => {
+                let Some(fence) = self.computer_fence() else { return; };
+                let allow = *allow;
+                let client = self.client.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let c = client.clone();
+                    let res = run_on_tokio(&client, async move {
+                        c.set_remote_assist_allow_async(allow).await.map_err(|e| e.to_string())
+                    })
+                    .await
+                    .and_then(|x| x);
+                    let _ = weak.update(app, |shell, cx| {
+                        if !shell.computer_fence_matches(fence) { return; }
+                        if let Ok(cfg) = res {
+                            shell.computers.assist_config = Some(cfg);
+                        }
+                        shell.sync_computers_to_views(cx);
+                    });
+                })
+                .detach();
+            }
+            SettingsComputersEvent::CopyAssistInvite { invite_text } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(invite_text.clone()));
+                self.enqueue_computer_toast("已复制远程协助邀请", "Copied remote assist invite", 2000);
+            }
+            SettingsComputersEvent::StartAssistConnect(req) => {
+                let Some(fence) = self.computer_fence() else { return; };
+                let client = self.client.clone();
+                let mut req = req.clone();
+                if req.requester_device_id.is_none() {
+                    req.requester_device_id = Some(client.device_id());
+                }
+                if req.requester_platform.is_none() {
+                    req.requester_platform = Some(std::env::consts::OS.to_string());
+                }
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let c = client.clone();
+                    let res = run_on_tokio(&client, async move {
+                        c.start_remote_assist_async(&req).await.map_err(|e| e.to_string())
+                    })
+                    .await
+                    .and_then(|x| x);
+                    let _ = weak.update(app, |shell, cx| {
+                        if !shell.computer_fence_matches(fence) { return; }
+                        match res {
+                            Ok(started) => {
+                                shell.open_remote_workbench_for_node(started.target_node_id, cx);
+                            }
+                            Err(e) => {
+                                if let Some(sc_ent) = shell.settings_router.read(cx).settings_computers.clone() {
+                                    sc_ent.update(cx, |sc, sc_cx| {
+                                        sc.status_message = Some(format!("Assist connect failed: {e}"));
+                                        sc_cx.notify();
+                                    });
+                                }
+                                shell.window_runtime.enqueue_toast(format!("Assist failed: {e}"), 2400);
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+            SettingsComputersEvent::OpenControlledStatusWindow => {
+                self.open_or_focus_controlled_status_window(cx);
+            }
+            SettingsComputersEvent::DisconnectAllRemoteControl => {
+                self.disconnect_all_remote_control(cx);
+            }
+            SettingsComputersEvent::RefreshMcpGrants => {
+                self.refresh_remote_assist_and_grants(cx);
+            }
+            SettingsComputersEvent::RevokeMcpGrant(family_id) => {
+                let Some(fence) = self.computer_fence() else { return; };
+                let client = self.client.clone();
+                let fid = family_id.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let c = client.clone();
+                    let fid_req = fid.clone();
+                    let res = run_on_tokio(&client, async move {
+                        c.revoke_mcp_grant_async(&fid_req).await.map_err(|e| e.to_string())
+                    })
+                    .await
+                    .and_then(|x| x);
+                    let _ = weak.update(app, |shell, cx| {
+                        if !shell.computer_fence_matches(fence) { return; }
+                        match res {
+                            Ok(()) => {
+                                shell.computers.mcp_grants.retain(|g| g.family_id != fid);
+                                shell.enqueue_computer_toast("已吊销该 AI MCP 授权", "MCP OAuth grant revoked", 2000);
+                                shell.sync_computers_to_views(cx);
+                            }
+                            Err(e) => {
+                                shell.window_runtime.enqueue_toast(format!("Revoke failed: {e}"), 2400);
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+            SettingsComputersEvent::CopyMcpClientConfig {
+                client_name,
+                config_json,
+            } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(config_json.clone()));
+                self.window_runtime.enqueue_toast(
+                    format!(
+                        "{} {client_name}",
+                        tr_str(self.active_lang_id(), "已复制 MCP 配置:", "Copied MCP config for")
+                    ),
+                    2200,
+                );
+            }
+            SettingsComputersEvent::RefreshCliStatus => {
+                self.computers.cli_status = Some(detect_cli_install_status());
+                self.sync_computers_to_views(cx);
+            }
+            SettingsComputersEvent::InstallFabushiCli => {
+                let msg = match install_fabushi_cli_one_click() {
+                    Ok(status) => {
+                        let m = status.status_message.clone();
+                        self.computers.cli_status = Some(status);
+                        m
+                    }
+                    Err(err) => err,
+                };
+                if let Some(sc_ent) = self.settings_router.read(cx).settings_computers.clone() {
+                    sc_ent.update(cx, |sc, sc_cx| {
+                        sc.status_message = Some(msg.clone());
+                        sc_cx.notify();
+                    });
+                }
+                self.window_runtime.enqueue_toast(msg, 2400);
+                self.sync_computers_to_views(cx);
             }
         }
     }

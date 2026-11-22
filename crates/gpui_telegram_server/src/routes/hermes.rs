@@ -1848,6 +1848,35 @@ fn flush_streamed_bot_message(
     consumer.dirty = false;
 }
 
+fn prompt_has_computer_exec_intent(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    [
+        "电脑",
+        "本机",
+        "桌面",
+        "终端",
+        "命令行",
+        "截屏",
+        "截图",
+        "剪贴板",
+        "运行",
+        "执行",
+        "computer",
+        "desktop",
+        "terminal",
+        "shell",
+        "exec",
+        "command",
+        "screenshot",
+        "clipboard",
+        "bash",
+        "powershell",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw) || trimmed.contains(kw))
+}
+
 pub(crate) async fn execute_bot_turn_streamed(
     state: &Arc<AppState>,
     params: BotStreamTurnParams,
@@ -1982,12 +2011,20 @@ pub(crate) async fn execute_bot_turn_streamed(
         _ => params.prompt.clone(),
     };
 
-    let has_online_computer = state
+    let now_ms = Utc::now().timestamp_millis();
+    let nodes = state
         .db
-        .list_computer_nodes(params.sender_id.0, None, Utc::now().timestamp_millis())
-        .unwrap_or_default()
-        .iter()
-        .any(|n| n.online);
+        .list_computer_nodes(params.sender_id.0, None, now_ms)
+        .unwrap_or_default();
+    let has_online_computer = nodes.iter().any(|n| n.online);
+    let has_bound_computer = state
+        .db
+        .get_bot_computer_profile_or_default(params.sender_id.0, params.bot_user_id.0)
+        .ok()
+        .is_some_and(|p| p.bound_node_id.as_deref().is_some_and(|s| !s.trim().is_empty()))
+        || nodes
+            .iter()
+            .any(|n| n.bound_bot_ids.contains(&params.bot_user_id.0));
     let configured_thinking = bot_inst
         .as_ref()
         .map(|inst| inst.settings().thinking_level)
@@ -1999,6 +2036,17 @@ pub(crate) async fn execute_bot_turn_streamed(
         !params.companion_apps.is_empty(),
         has_online_computer,
     );
+
+    let mut adaptive_toolsets = adaptive_profile.toolsets;
+    if has_online_computer
+        && (has_bound_computer || prompt_has_computer_exec_intent(&params.prompt))
+    {
+        if let Some(ref mut sets) = adaptive_toolsets {
+            if !sets.contains(&ToolsetId::ComputerUse) {
+                sets.push(ToolsetId::ComputerUse);
+            }
+        }
+    }
 
     let mut req = HermesTurnRequest::new(final_prompt)
         .with_chat_bot(params.chat_id.0, params.bot_user_id.0.to_string());
@@ -2012,7 +2060,7 @@ pub(crate) async fn execute_bot_turn_streamed(
             .map(|inst| FabushiBotHost::toolset_preset_for_name(&inst.settings().toolset_preset))
             .unwrap_or(ToolsetPreset::HermesTelegram),
     );
-    req.adaptive_toolsets = adaptive_profile.toolsets;
+    req.adaptive_toolsets = adaptive_toolsets;
     req.thinking_budget_tokens = adaptive_profile.thinking_budget_tokens;
     req.model = effective_model;
     req.system_prompt = fabushi_sp;

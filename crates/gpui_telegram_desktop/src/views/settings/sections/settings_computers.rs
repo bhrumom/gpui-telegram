@@ -1,11 +1,16 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::remote_control_contracts::{
+    AssistCodeMode, AssistStartRequest, McpOAuthGrantSummaryDto, RemoteAssistConfigDto,
+    RemoteControlMode, RemoteSessionDto,
+};
 use gpui_telegram_proto::{
     AuthorizedControllerEntry, AuthorizedControllerKind, CloudAuthMethod, ComputerNodeDto,
     ComputerNodeKind, ComputerRunPolicy, TailnetNodeStatus, TailnetPeerLiveState, TailnetRelayMode,
     UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
 };
 
+use crate::app::cli_installer::CliInstallStatus;
 use crate::components::ui::{
     TextInputController, delete_prev_word, pop_last_char, sanitize_paste_text,
 };
@@ -23,6 +28,101 @@ pub enum SettingsComputersPage {
     Overview,
     Detail(String),
     CloudForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsComputersTab {
+    #[default]
+    MyDevices,
+    RemoteAssist,
+    CloudComputers,
+    AiMcpHub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AssistInputField {
+    #[default]
+    None,
+    CustomCode,
+    TargetAssistId,
+    TargetAccessCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpClientPreset {
+    Antigravity,
+    Claude,
+    Cursor,
+    VsCode,
+}
+
+impl McpClientPreset {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Antigravity => "Antigravity",
+            Self::Claude => "Claude",
+            Self::Cursor => "Cursor",
+            Self::VsCode => "VS Code",
+        }
+    }
+}
+
+pub fn format_assist_id_display(assist_id: &str) -> String {
+    let digits: String = assist_id.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 9 {
+        format!("{} {} {}", &digits[0..3], &digits[3..6], &digits[6..9])
+    } else if assist_id.trim().is_empty() {
+        "--- --- ---".to_string()
+    } else {
+        assist_id.to_string()
+    }
+}
+
+pub fn is_valid_custom_assist_code(code: &str) -> bool {
+    let trimmed = code.trim();
+    let len = trimmed.len();
+    (8..=16).contains(&len) && trimmed.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+pub fn build_mcp_client_config_json(preset: McpClientPreset, endpoint_url: &str) -> String {
+    let url = if endpoint_url.trim().is_empty() {
+        "https://mcp.ombhrum.com/mcp"
+    } else {
+        endpoint_url.trim()
+    };
+    match preset {
+        McpClientPreset::Antigravity => serde_json::json!({
+            "mcpServers": {
+                "fabushi": {
+                    "serverUrl": url
+                }
+            }
+        }),
+        McpClientPreset::Claude => serde_json::json!({
+            "mcpServers": {
+                "fabushi": {
+                    "type": "http",
+                    "url": url
+                }
+            }
+        }),
+        McpClientPreset::Cursor => serde_json::json!({
+            "mcpServers": {
+                "fabushi": {
+                    "url": url
+                }
+            }
+        }),
+        McpClientPreset::VsCode => serde_json::json!({
+            "servers": {
+                "fabushi": {
+                    "type": "http",
+                    "url": url
+                }
+            }
+        }),
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,12 +152,31 @@ pub enum SettingsComputersEvent {
     TestNode(String),
     OpenRemoteWorkbench(String),
     RefreshComputers,
+    RefreshAssistInfo,
+    ResetAssistTempCode,
+    SetAssistCustomCode(String),
+    SetAssistAllow(bool),
+    CopyAssistInvite {
+        invite_text: String,
+    },
+    StartAssistConnect(AssistStartRequest),
+    OpenControlledStatusWindow,
+    DisconnectAllRemoteControl,
+    RefreshMcpGrants,
+    RevokeMcpGrant(String),
+    CopyMcpClientConfig {
+        client_name: String,
+        config_json: String,
+    },
+    RefreshCliStatus,
+    InstallFabushiCli,
 }
 
 pub struct SettingsComputersSections {
     pub palette: TdesktopThemePalette,
     pub language_id: String,
     pub page: SettingsComputersPage,
+    pub overview_tab: SettingsComputersTab,
     pub computers: Vec<ComputerNodeDto>,
     pub tailnet_status: Option<TailnetNodeStatus>,
     pub known_bots: Vec<(u64, String)>,
@@ -68,6 +187,20 @@ pub struct SettingsComputersSections {
     pub bot_picker_open: bool,
     pub detail_more_open: bool,
     pub pending_event: Option<SettingsComputersEvent>,
+
+    // Remote Control / Assist / AI MCP / CLI Hub state
+    pub active_sessions: Vec<RemoteSessionDto>,
+    pub assist_config: Option<RemoteAssistConfigDto>,
+    pub assist_focus: AssistInputField,
+    pub assist_custom_code_draft: String,
+    pub assist_target_id_draft: String,
+    pub assist_target_code_draft: String,
+    pub input_assist_custom_code: Option<Entity<TextInputController>>,
+    pub input_assist_target_id: Option<Entity<TextInputController>>,
+    pub input_assist_target_code: Option<Entity<TextInputController>>,
+    pub mcp_endpoint_url: String,
+    pub mcp_grants: Vec<McpOAuthGrantSummaryDto>,
+    pub cli_status: Option<CliInstallStatus>,
 
     // Cloud Server Form state + TextInputControllers
     pub editing_node_id: Option<String>,
@@ -97,6 +230,7 @@ impl SettingsComputersSections {
             palette,
             language_id: lang.to_string(),
             page: SettingsComputersPage::Overview,
+            overview_tab: SettingsComputersTab::MyDevices,
             computers: Vec::new(),
             tailnet_status: None,
             known_bots: Vec::new(),
@@ -107,6 +241,18 @@ impl SettingsComputersSections {
             bot_picker_open: false,
             detail_more_open: false,
             pending_event: None,
+            active_sessions: Vec::new(),
+            assist_config: None,
+            assist_focus: AssistInputField::None,
+            assist_custom_code_draft: String::new(),
+            assist_target_id_draft: String::new(),
+            assist_target_code_draft: String::new(),
+            input_assist_custom_code: None,
+            input_assist_target_id: None,
+            input_assist_target_code: None,
+            mcp_endpoint_url: "https://mcp.ombhrum.com/mcp".to_string(),
+            mcp_grants: Vec::new(),
+            cli_status: None,
             editing_node_id: None,
             form_focus: CloudFormField::None,
             form_name: String::new(),
@@ -149,9 +295,132 @@ impl SettingsComputersSections {
         self.current_bot_id = current_bot_id;
     }
 
+    pub fn sync_active_sessions(&mut self, sessions: Vec<RemoteSessionDto>) {
+        self.active_sessions = sessions;
+    }
+
+    pub fn sync_assist_config(&mut self, config: Option<RemoteAssistConfigDto>) {
+        self.assist_config = config;
+    }
+
+    pub fn sync_mcp_grants(
+        &mut self,
+        endpoint_url: Option<String>,
+        grants: Vec<McpOAuthGrantSummaryDto>,
+    ) {
+        if let Some(url) = endpoint_url.filter(|u| !u.trim().is_empty()) {
+            self.mcp_endpoint_url = url;
+        }
+        self.mcp_grants = grants;
+    }
+
+    pub fn sync_cli_status(&mut self, status: Option<CliInstallStatus>) {
+        self.cli_status = status;
+    }
+
+    pub fn set_overview_tab(&mut self, tab: SettingsComputersTab) {
+        self.overview_tab = tab;
+        self.assist_focus = AssistInputField::None;
+        match tab {
+            SettingsComputersTab::RemoteAssist => {
+                if self.assist_config.is_none() {
+                    self.pending_event = Some(SettingsComputersEvent::RefreshAssistInfo);
+                }
+            }
+            SettingsComputersTab::AiMcpHub => {
+                if self.mcp_grants.is_empty() {
+                    self.pending_event = Some(SettingsComputersEvent::RefreshMcpGrants);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn formatted_assist_invite_text(&self) -> String {
+        let cfg = self.assist_config.as_ref();
+        let raw_id = cfg.map(|c| c.assist_id.as_str()).unwrap_or("");
+        let id = format_assist_id_display(raw_id);
+        let code = cfg
+            .and_then(|c| c.current_code.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("------");
+        if self.language_id.starts_with("zh") {
+            format!("Fabushi 远程协助设备码: {id}  验证码: {code}")
+        } else {
+            format!("Fabushi Remote Assist ID: {id}  Code: {code}")
+        }
+    }
+
+    pub fn submit_assist_custom_code(&mut self) -> bool {
+        let code = self.assist_custom_code_draft.trim().to_string();
+        if !is_valid_custom_assist_code(&code) {
+            self.status_message = Some(
+                tr_str(
+                    &self.language_id,
+                    "自定义验证码需为 8-16 位数字或字母",
+                    "Custom access code must be 8-16 alphanumeric characters",
+                )
+                .to_string(),
+            );
+            return false;
+        }
+        self.assist_focus = AssistInputField::None;
+        self.status_message = None;
+        self.pending_event = Some(SettingsComputersEvent::SetAssistCustomCode(code));
+        true
+    }
+
+    pub fn submit_assist_connect(&mut self) -> bool {
+        let digits: String = self
+            .assist_target_id_draft
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let code = self.assist_target_code_draft.trim().to_string();
+        if digits.len() != 9 || code.is_empty() {
+            self.status_message = Some(
+                tr_str(
+                    &self.language_id,
+                    "请输入 9 位设备协助码和验证码",
+                    "Please enter a 9-digit Assist ID and access code",
+                )
+                .to_string(),
+            );
+            return false;
+        }
+        self.assist_focus = AssistInputField::None;
+        self.status_message = None;
+        self.pending_event = Some(SettingsComputersEvent::StartAssistConnect(
+            AssistStartRequest {
+                assist_id: digits,
+                access_code: code,
+                requester_device_id: None,
+                requester_name: None,
+                requester_platform: None,
+                mode: RemoteControlMode::Desktop,
+            },
+        ));
+        true
+    }
+
+    pub fn trigger_copy_mcp_preset(&mut self, preset: McpClientPreset) {
+        let json = build_mcp_client_config_json(preset, &self.mcp_endpoint_url);
+        let name = preset.display_name().to_string();
+        self.status_message = Some(format!(
+            "{} {}",
+            tr_str(&self.language_id, "已复制 MCP 配置：", "Copied MCP config for"),
+            name
+        ));
+        self.pending_event = Some(SettingsComputersEvent::CopyMcpClientConfig {
+            client_name: name,
+            config_json: json,
+        });
+    }
+
     pub fn open_overview(&mut self) {
         self.page = SettingsComputersPage::Overview;
         self.form_focus = CloudFormField::None;
+        self.assist_focus = AssistInputField::None;
         self.policy_menu_open = false;
         self.device_picker_open = false;
         self.bot_picker_open = false;
@@ -161,6 +430,7 @@ impl SettingsComputersSections {
     pub fn open_detail(&mut self, node_id: &str) {
         self.page = SettingsComputersPage::Detail(node_id.to_string());
         self.form_focus = CloudFormField::None;
+        self.assist_focus = AssistInputField::None;
         self.policy_menu_open = false;
         self.device_picker_open = false;
         self.bot_picker_open = false;
@@ -174,6 +444,7 @@ impl SettingsComputersSections {
     ) {
         self.page = SettingsComputersPage::CloudForm;
         self.form_focus = CloudFormField::DisplayName;
+        self.assist_focus = AssistInputField::None;
         self.policy_menu_open = false;
         self.device_picker_open = false;
         self.bot_picker_open = false;
@@ -234,49 +505,100 @@ impl SettingsComputersSections {
         if self.input_workdir.is_none() {
             self.input_workdir = Some(cx.new(|_| TextInputController::new()));
         }
+        if self.input_assist_custom_code.is_none() {
+            self.input_assist_custom_code = Some(cx.new(|_| TextInputController::new()));
+        }
+        if self.input_assist_target_id.is_none() {
+            self.input_assist_target_id = Some(cx.new(|_| TextInputController::new()));
+        }
+        if self.input_assist_target_code.is_none() {
+            self.input_assist_target_code = Some(cx.new(|_| TextInputController::new()));
+        }
     }
 
     pub fn is_input_active(&self) -> bool {
-        self.page == SettingsComputersPage::CloudForm && self.form_focus != CloudFormField::None
+        (self.page == SettingsComputersPage::CloudForm && self.form_focus != CloudFormField::None)
+            || (self.page == SettingsComputersPage::Overview
+                && self.overview_tab == SettingsComputersTab::RemoteAssist
+                && self.assist_focus != AssistInputField::None)
     }
 
     fn active_controller(&self) -> Option<&Entity<TextInputController>> {
-        match self.form_focus {
-            CloudFormField::DisplayName => self.input_name.as_ref(),
-            CloudFormField::Host => self.input_host.as_ref(),
-            CloudFormField::Port => self.input_port.as_ref(),
-            CloudFormField::Username => self.input_username.as_ref(),
-            CloudFormField::Credential => self.input_credential.as_ref(),
-            CloudFormField::AgentUrl => self.input_agent_url.as_ref(),
-            CloudFormField::Workdir => self.input_workdir.as_ref(),
-            CloudFormField::None => None,
+        if self.page == SettingsComputersPage::CloudForm {
+            return match self.form_focus {
+                CloudFormField::DisplayName => self.input_name.as_ref(),
+                CloudFormField::Host => self.input_host.as_ref(),
+                CloudFormField::Port => self.input_port.as_ref(),
+                CloudFormField::Username => self.input_username.as_ref(),
+                CloudFormField::Credential => self.input_credential.as_ref(),
+                CloudFormField::AgentUrl => self.input_agent_url.as_ref(),
+                CloudFormField::Workdir => self.input_workdir.as_ref(),
+                CloudFormField::None => None,
+            };
         }
+        if self.page == SettingsComputersPage::Overview
+            && self.overview_tab == SettingsComputersTab::RemoteAssist
+        {
+            return match self.assist_focus {
+                AssistInputField::CustomCode => self.input_assist_custom_code.as_ref(),
+                AssistInputField::TargetAssistId => self.input_assist_target_id.as_ref(),
+                AssistInputField::TargetAccessCode => self.input_assist_target_code.as_ref(),
+                AssistInputField::None => None,
+            };
+        }
+        None
     }
 
     pub fn active_field_text(&self) -> &str {
-        match self.form_focus {
-            CloudFormField::DisplayName => &self.form_name,
-            CloudFormField::Host => &self.form_host,
-            CloudFormField::Port => &self.form_port,
-            CloudFormField::Username => &self.form_username,
-            CloudFormField::Credential => &self.form_credential,
-            CloudFormField::AgentUrl => &self.form_agent_url,
-            CloudFormField::Workdir => &self.form_workdir,
-            CloudFormField::None => "",
+        if self.page == SettingsComputersPage::CloudForm {
+            return match self.form_focus {
+                CloudFormField::DisplayName => &self.form_name,
+                CloudFormField::Host => &self.form_host,
+                CloudFormField::Port => &self.form_port,
+                CloudFormField::Username => &self.form_username,
+                CloudFormField::Credential => &self.form_credential,
+                CloudFormField::AgentUrl => &self.form_agent_url,
+                CloudFormField::Workdir => &self.form_workdir,
+                CloudFormField::None => "",
+            };
         }
+        if self.page == SettingsComputersPage::Overview
+            && self.overview_tab == SettingsComputersTab::RemoteAssist
+        {
+            return match self.assist_focus {
+                AssistInputField::CustomCode => &self.assist_custom_code_draft,
+                AssistInputField::TargetAssistId => &self.assist_target_id_draft,
+                AssistInputField::TargetAccessCode => &self.assist_target_code_draft,
+                AssistInputField::None => "",
+            };
+        }
+        ""
     }
 
     fn active_field_mut(&mut self) -> Option<&mut String> {
-        match self.form_focus {
-            CloudFormField::DisplayName => Some(&mut self.form_name),
-            CloudFormField::Host => Some(&mut self.form_host),
-            CloudFormField::Port => Some(&mut self.form_port),
-            CloudFormField::Username => Some(&mut self.form_username),
-            CloudFormField::Credential => Some(&mut self.form_credential),
-            CloudFormField::AgentUrl => Some(&mut self.form_agent_url),
-            CloudFormField::Workdir => Some(&mut self.form_workdir),
-            CloudFormField::None => None,
+        if self.page == SettingsComputersPage::CloudForm {
+            return match self.form_focus {
+                CloudFormField::DisplayName => Some(&mut self.form_name),
+                CloudFormField::Host => Some(&mut self.form_host),
+                CloudFormField::Port => Some(&mut self.form_port),
+                CloudFormField::Username => Some(&mut self.form_username),
+                CloudFormField::Credential => Some(&mut self.form_credential),
+                CloudFormField::AgentUrl => Some(&mut self.form_agent_url),
+                CloudFormField::Workdir => Some(&mut self.form_workdir),
+                CloudFormField::None => None,
+            };
         }
+        if self.page == SettingsComputersPage::Overview
+            && self.overview_tab == SettingsComputersTab::RemoteAssist
+        {
+            return match self.assist_focus {
+                AssistInputField::CustomCode => Some(&mut self.assist_custom_code_draft),
+                AssistInputField::TargetAssistId => Some(&mut self.assist_target_id_draft),
+                AssistInputField::TargetAccessCode => Some(&mut self.assist_target_code_draft),
+                AssistInputField::None => None,
+            };
+        }
+        None
     }
 
     pub fn active_input_text_and_preedit(&self, cx: &App) -> (String, Option<String>) {
@@ -299,7 +621,8 @@ impl SettingsComputersSections {
     }
 
     pub fn push_input_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let allow_nl = self.form_focus == CloudFormField::Credential
+        let allow_nl = self.page == SettingsComputersPage::CloudForm
+            && self.form_focus == CloudFormField::Credential
             && self.form_auth_method == CloudAuthMethod::SshPrivateKey;
         let clean = sanitize_paste_text(text, allow_nl);
         if clean.is_empty() {
@@ -339,28 +662,51 @@ impl SettingsComputersSections {
                 true
             }
             "tab" => {
-                let order = [
-                    CloudFormField::DisplayName,
-                    CloudFormField::Host,
-                    CloudFormField::Port,
-                    CloudFormField::Username,
-                    CloudFormField::Credential,
-                    CloudFormField::AgentUrl,
-                    CloudFormField::Workdir,
-                ];
-                if let Some(pos) = order.iter().position(|f| *f == self.form_focus) {
-                    let next = if is_shift {
-                        (pos + order.len() - 1) % order.len()
-                    } else {
-                        (pos + 1) % order.len()
+                if self.page == SettingsComputersPage::CloudForm {
+                    let order = [
+                        CloudFormField::DisplayName,
+                        CloudFormField::Host,
+                        CloudFormField::Port,
+                        CloudFormField::Username,
+                        CloudFormField::Credential,
+                        CloudFormField::AgentUrl,
+                        CloudFormField::Workdir,
+                    ];
+                    if let Some(pos) = order.iter().position(|f| *f == self.form_focus) {
+                        let next = if is_shift {
+                            (pos + order.len() - 1) % order.len()
+                        } else {
+                            (pos + 1) % order.len()
+                        };
+                        self.form_focus = order[next];
+                        cx.notify();
+                    }
+                    return true;
+                }
+                if self.overview_tab == SettingsComputersTab::RemoteAssist {
+                    self.assist_focus = match self.assist_focus {
+                        AssistInputField::TargetAssistId => AssistInputField::TargetAccessCode,
+                        AssistInputField::TargetAccessCode => AssistInputField::TargetAssistId,
+                        other => other,
                     };
-                    self.form_focus = order[next];
                     cx.notify();
                 }
                 true
             }
             "enter" => {
-                self.submit_cloud_form();
+                if self.page == SettingsComputersPage::CloudForm {
+                    self.submit_cloud_form();
+                } else if self.overview_tab == SettingsComputersTab::RemoteAssist {
+                    match self.assist_focus {
+                        AssistInputField::CustomCode => {
+                            self.submit_assist_custom_code();
+                        }
+                        AssistInputField::TargetAssistId | AssistInputField::TargetAccessCode => {
+                            self.submit_assist_connect();
+                        }
+                        AssistInputField::None => {}
+                    }
+                }
                 cx.notify();
                 true
             }
@@ -775,7 +1121,75 @@ impl SettingsComputersSections {
             }
         }
 
-        settings_container(pal)
+        let tabs_bar = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.0))
+            .p(px(4.0))
+            .rounded(px(10.0))
+            .bg(rgb(pal.card_bg))
+            .border_1()
+            .border_color(rgb(pal.border_fg))
+            .children([
+                (
+                    SettingsComputersTab::MyDevices,
+                    "sc-tab-my-devices",
+                    tr_str(lang, "我的设备", "My Devices"),
+                ),
+                (
+                    SettingsComputersTab::RemoteAssist,
+                    "sc-tab-remote-assist",
+                    tr_str(lang, "远程协助", "Remote Assist"),
+                ),
+                (
+                    SettingsComputersTab::CloudComputers,
+                    "sc-tab-cloud",
+                    tr_str(lang, "云电脑", "Cloud PCs"),
+                ),
+                (
+                    SettingsComputersTab::AiMcpHub,
+                    "sc-tab-ai-mcp",
+                    tr_str(lang, "AI & 官方 MCP 授权中心", "AI & MCP Auth Hub"),
+                ),
+            ]
+            .into_iter()
+            .map(|(tab, id, label)| {
+                let active = self.overview_tab == tab;
+                div()
+                    .id(id)
+                    .cursor_pointer()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(if active { pal.accent } else { pal.card_bg }))
+                    .hover(|s| {
+                        s.bg(rgb(if active {
+                            pal.accent_hover
+                        } else {
+                            pal.hover_bg
+                        }))
+                    })
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(if active {
+                        pal.active_button_fg
+                    } else {
+                        pal.text_primary
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_overview_tab(tab);
+                            cx.notify();
+                        }),
+                    )
+                    .child(label)
+            }));
+
+        let mut container = settings_container(pal)
             .child(
                 div()
                     .w_full()
@@ -788,8 +1202,8 @@ impl SettingsComputersSections {
                             .text_color(rgb(pal.text_secondary))
                             .child(tr_str(
                                 lang,
-                                "管理当前账号下所有本地设备与常驻云电脑，控制权限与运行审批策略。",
-                                "Manage local devices, cloud computers, remote authorization & execution safety.",
+                                "管理当前账号设备、UU 级远程协助、常驻云电脑与官方 MCP AI 授权。",
+                                "Manage devices, remote assist, cloud PCs, and official MCP AI grants.",
                             )),
                     )
                     .child(
@@ -844,6 +1258,7 @@ impl SettingsComputersSections {
                             ),
                     ),
             )
+            .child(tabs_bar)
             .when_some(self.status_message.as_ref(), |col, msg| {
                 col.child(
                     div()
@@ -854,25 +1269,909 @@ impl SettingsComputersSections {
                         .text_color(rgb(pal.text_primary))
                         .child(msg.clone()),
                 )
-            })
-            .child(self.render_tailnet_mesh_card(pal, lang))
-            .when(cfg!(target_os = "macos"), |col| {
-                col.child(settings_subsection_title(
-                    tr_str(lang, "系统权限", "System Permissions"),
+            });
+
+        container = match self.overview_tab {
+            SettingsComputersTab::MyDevices => container
+                .child(self.render_remote_sessions_status_card(pal, lang, cx))
+                .child(self.render_tailnet_mesh_card(pal, lang))
+                .when(cfg!(target_os = "macos"), |col| {
+                    col.child(settings_subsection_title(
+                        tr_str(lang, "系统权限", "System Permissions"),
+                        pal,
+                    ))
+                    .child(self.render_macos_permissions_card(pal, lang, cx))
+                })
+                .child(settings_subsection_title(
+                    tr_str(lang, "本地电脑", "Local Computers"),
                     pal,
                 ))
-                .child(self.render_macos_permissions_card(pal, lang, cx))
-            })
+                .child(local_card),
+            SettingsComputersTab::RemoteAssist => {
+                container.child(self.render_remote_assist_tab(pal, lang, cx))
+            }
+            SettingsComputersTab::CloudComputers => container
+                .child(settings_subsection_title(
+                    tr_str(lang, "云电脑", "Cloud Computers"),
+                    pal,
+                ))
+                .child(cloud_card),
+            SettingsComputersTab::AiMcpHub => {
+                container.child(self.render_ai_mcp_hub_tab(pal, lang, cx))
+            }
+        };
+
+        container.into_any_element()
+    }
+
+    fn render_remote_sessions_status_card(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let count = self.active_sessions.len();
+        let active = count > 0;
+        let accent_hex = if active { 0x1E6BFF } else { pal.text_secondary };
+
+        settings_card(pal)
+            .child(
+                div()
+                    .p(px(14.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .w(px(8.0))
+                                            .h(px(8.0))
+                                            .rounded(px(999.0))
+                                            .bg(rgb(if active { 0x4ADE80 } else { accent_hex })),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(pal.text_primary))
+                                            .child(if active {
+                                                if lang.starts_with("zh") {
+                                                    format!("本机被控中 · 当前 {} 个活跃控制会话", count)
+                                                } else {
+                                                    format!("Being Controlled · {count} active session(s)")
+                                                }
+                                            } else {
+                                                tr_str(
+                                                    lang,
+                                                    "远控守护就绪 · 当前无外部控制会话",
+                                                    "Remote Control Ready · No active controllers",
+                                                )
+                                                .to_string()
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child(tr_str(
+                                        lang,
+                                        "可随时打开「本机被控中」状态浮窗查看控方设备/AI 并一键断开。",
+                                        "Open the Controlled Status Window anytime to inspect or disconnect controllers.",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("sc-open-controlled-window-btn")
+                                    .cursor_pointer()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .rounded(px(8.0))
+                                    .bg(rgb(0x1E6BFF))
+                                    .hover(|s| s.bg(rgb(0x1D4ED8)))
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xFFFFFF))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.pending_event = Some(
+                                                SettingsComputersEvent::OpenControlledStatusWindow,
+                                            );
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "被控状态窗口", "Status Window")),
+                            )
+                            .when(active, |row| {
+                                row.child(
+                                    div()
+                                        .id("sc-disconnect-all-btn")
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(pal.danger))
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xFFFFFF))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.pending_event = Some(
+                                                    SettingsComputersEvent::DisconnectAllRemoteControl,
+                                                );
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "断开所有远控", "Disconnect All")),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_remote_assist_tab(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cfg = self.assist_config.as_ref();
+        let assist_id_fmt = format_assist_id_display(cfg.map(|c| c.assist_id.as_str()).unwrap_or(""));
+        let allow_assist = cfg.is_some_and(|c| c.allow_assist);
+        let current_code = cfg
+            .and_then(|c| c.current_code.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("------")
+            .to_string();
+        let code_mode_label = match cfg.map(|c| c.code_mode) {
+            Some(AssistCodeMode::Custom) => tr_str(lang, "自定义验证码", "Custom Code"),
+            _ => tr_str(lang, "临时验证码 (定时失效)", "Temporary Code"),
+        };
+
+        let (custom_text, custom_pre) = self
+            .input_assist_custom_code
+            .as_ref()
+            .map(|c| c.read(cx).text_and_preedit(self.assist_custom_code_draft.clone()))
+            .unwrap_or_else(|| (self.assist_custom_code_draft.clone(), None));
+        let (target_id_text, target_id_pre) = self
+            .input_assist_target_id
+            .as_ref()
+            .map(|c| c.read(cx).text_and_preedit(self.assist_target_id_draft.clone()))
+            .unwrap_or_else(|| (self.assist_target_id_draft.clone(), None));
+        let (target_code_text, target_code_pre) = self
+            .input_assist_target_code
+            .as_ref()
+            .map(|c| c.read(cx).text_and_preedit(self.assist_target_code_draft.clone()))
+            .unwrap_or_else(|| (self.assist_target_code_draft.clone(), None));
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
             .child(settings_subsection_title(
-                tr_str(lang, "本地电脑", "Local Computers"),
+                tr_str(lang, "本机协助识别码与安全验证码", "This Device Assist ID & Code"),
                 pal,
             ))
-            .child(local_card)
+            .child(
+                settings_card(pal).child(
+                    div()
+                        .p(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(pal.text_primary))
+                                                .child(tr_str(
+                                                    lang,
+                                                    "允许远程协助连接本机",
+                                                    "Allow Remote Assist Connections",
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(rgb(pal.text_secondary))
+                                                .child(tr_str(
+                                                    lang,
+                                                    "关闭后任何设备均无法通过协助码控制此电脑。",
+                                                    "When disabled, external assist requests are rejected.",
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("sc-assist-allow-toggle")
+                                        .cursor_pointer()
+                                        .px(px(12.0))
+                                        .py(px(6.0))
+                                        .rounded(px(999.0))
+                                        .bg(rgb(if allow_assist {
+                                            pal.success
+                                        } else {
+                                            pal.input_bg
+                                        }))
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(if allow_assist {
+                                            0xFFFFFF
+                                        } else {
+                                            pal.text_primary
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                let next = !allow_assist;
+                                                if let Some(c) = this.assist_config.as_mut() {
+                                                    c.allow_assist = next;
+                                                }
+                                                this.pending_event = Some(
+                                                    SettingsComputersEvent::SetAssistAllow(next),
+                                                );
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if allow_assist {
+                                            tr_str(lang, "已允许", "Allowed")
+                                        } else {
+                                            tr_str(lang, "已禁止", "Blocked")
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p(px(12.0))
+                                .rounded(px(10.0))
+                                .bg(rgb(pal.window_bg))
+                                .border_1()
+                                .border_color(rgb(pal.border_fg))
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(pal.text_secondary))
+                                                .child(tr_str(lang, "我的 9 位设备码", "My 9-Digit Assist ID")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(22.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(0x1E6BFF))
+                                                .child(assist_id_fmt),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(pal.text_secondary))
+                                                .child(code_mode_label),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(18.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(pal.text_primary))
+                                                .child(current_code),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .id("sc-assist-reset-code-btn")
+                                                .cursor_pointer()
+                                                .px(px(10.0))
+                                                .py(px(6.0))
+                                                .rounded(px(8.0))
+                                                .bg(rgb(pal.input_bg))
+                                                .border_1()
+                                                .border_color(rgb(pal.border_fg))
+                                                .hover(|s| s.bg(rgb(pal.hover_bg)))
+                                                .text_size(px(12.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(pal.text_primary))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.pending_event = Some(
+                                                            SettingsComputersEvent::ResetAssistTempCode,
+                                                        );
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(tr_str(lang, "刷新临时码", "Reset Temp Code")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("sc-assist-copy-invite-btn")
+                                                .cursor_pointer()
+                                                .px(px(12.0))
+                                                .py(px(6.0))
+                                                .rounded(px(8.0))
+                                                .bg(rgb(pal.accent))
+                                                .hover(|s| s.bg(rgb(pal.accent_hover)))
+                                                .text_size(px(12.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(pal.active_button_fg))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        let invite = this.formatted_assist_invite_text();
+                                                        this.status_message = Some(format!(
+                                                            "{} {invite}",
+                                                            tr_str(
+                                                                &this.language_id,
+                                                                "已复制协助邀请：",
+                                                                "Copied invite:"
+                                                            )
+                                                        ));
+                                                        this.pending_event = Some(
+                                                            SettingsComputersEvent::CopyAssistInvite {
+                                                                invite_text: invite,
+                                                            },
+                                                        );
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(tr_str(lang, "复制协助邀请", "Copy Invite")),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("sc-assist-custom-code-input")
+                                        .cursor_text()
+                                        .flex_1()
+                                        .min_h(px(34.0))
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(pal.input_bg))
+                                        .border_1()
+                                        .border_color(rgb(if self.assist_focus == AssistInputField::CustomCode {
+                                            pal.accent
+                                        } else {
+                                            pal.border_fg
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.ensure_form_inputs(cx);
+                                                this.assist_focus = AssistInputField::CustomCode;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(render_ime_text_preview(
+                                            &custom_text,
+                                            custom_pre.as_deref(),
+                                            tr_str(
+                                                lang,
+                                                "设置自定义固定验证码（8-16 位数字字母）",
+                                                "Set custom access code (8-16 alphanumeric)",
+                                            ),
+                                            self.assist_focus == AssistInputField::CustomCode,
+                                            false,
+                                            pal.text_primary,
+                                            pal,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("sc-assist-save-custom-btn")
+                                        .cursor_pointer()
+                                        .px(px(12.0))
+                                        .py(px(7.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(pal.input_bg))
+                                        .border_1()
+                                        .border_color(rgb(pal.border_fg))
+                                        .hover(|s| s.bg(rgb(pal.hover_bg)))
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.text_primary))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.submit_assist_custom_code();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "设为自定义码", "Save Custom Code")),
+                                ),
+                        ),
+                ),
+            )
             .child(settings_subsection_title(
-                tr_str(lang, "云电脑", "Cloud Computers"),
+                tr_str(lang, "远程协助控制他人设备", "Assist Another Computer"),
                 pal,
             ))
-            .child(cloud_card)
+            .child(
+                settings_card(pal).child(
+                    div()
+                        .p(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id("sc-assist-target-id-input")
+                                .cursor_text()
+                                .w(px(200.0))
+                                .min_h(px(36.0))
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .rounded(px(8.0))
+                                .bg(rgb(pal.input_bg))
+                                .border_1()
+                                .border_color(rgb(if self.assist_focus == AssistInputField::TargetAssistId {
+                                    pal.accent
+                                } else {
+                                    pal.border_fg
+                                }))
+                                .flex()
+                                .items_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.ensure_form_inputs(cx);
+                                        this.assist_focus = AssistInputField::TargetAssistId;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(render_ime_text_preview(
+                                    &target_id_text,
+                                    target_id_pre.as_deref(),
+                                    tr_str(lang, "输入对方 9 位设备码", "Partner 9-digit ID"),
+                                    self.assist_focus == AssistInputField::TargetAssistId,
+                                    false,
+                                    pal.text_primary,
+                                    pal,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("sc-assist-target-code-input")
+                                .cursor_text()
+                                .flex_1()
+                                .min_w(px(160.0))
+                                .min_h(px(36.0))
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .rounded(px(8.0))
+                                .bg(rgb(pal.input_bg))
+                                .border_1()
+                                .border_color(rgb(if self.assist_focus == AssistInputField::TargetAccessCode {
+                                    pal.accent
+                                } else {
+                                    pal.border_fg
+                                }))
+                                .flex()
+                                .items_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.ensure_form_inputs(cx);
+                                        this.assist_focus = AssistInputField::TargetAccessCode;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(render_ime_text_preview(
+                                    &target_code_text,
+                                    target_code_pre.as_deref(),
+                                    tr_str(lang, "输入验证码", "Access code"),
+                                    self.assist_focus == AssistInputField::TargetAccessCode,
+                                    true,
+                                    pal.text_primary,
+                                    pal,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("sc-assist-connect-btn")
+                                .cursor_pointer()
+                                .px(px(14.0))
+                                .py(px(8.0))
+                                .rounded(px(8.0))
+                                .bg(rgb(pal.accent))
+                                .hover(|s| s.bg(rgb(pal.accent_hover)))
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(pal.active_button_fg))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.submit_assist_connect();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tr_str(lang, "开始远程协助", "Connect")),
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_ai_mcp_hub_tab(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cli = self.cli_status.as_ref();
+        let cli_installed = cli.is_some_and(|c| c.installed);
+        let cli_on_path = cli.is_some_and(|c| c.on_path);
+        let cli_path_str = cli
+            .map(|c| c.display_path())
+            .unwrap_or_else(|| "~/.local/bin/fabushi".to_string());
+        let cli_msg = cli
+            .map(|c| c.status_message.clone())
+            .unwrap_or_else(|| tr_str(lang, "点击刷新检测 CLI 状态", "Click refresh to inspect CLI status").to_string());
+
+        let mut grants_col = settings_card(pal);
+        if self.mcp_grants.is_empty() {
+            grants_col = grants_col.child(
+                div()
+                    .p(px(16.0))
+                    .text_size(px(12.5))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        lang,
+                        "当前没有已授权的官方 MCP AI 客户端令牌。在 Antigravity / Claude / Cursor 中配置上方 MCP 地址并通过 OAuth 授权后，可在此实时查看与吊销权限。",
+                        "No active OAuth 2.1 MCP grants yet. Authorized AI clients appear here for inspection and revocation.",
+                    )),
+            );
+        } else {
+            for (idx, grant) in self.mcp_grants.iter().enumerate() {
+                let fid = grant.family_id.clone();
+                let client_label = if grant.client_name.trim().is_empty() {
+                    grant.client_id.clone()
+                } else {
+                    grant.client_name.clone()
+                };
+                let scopes = grant.scopes.join(", ");
+                let btn_id = SharedString::from(format!("sc-revoke-mcp-grant-{idx}"));
+                grants_col = grants_col.child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(12.0))
+                        .border_b_1()
+                        .border_color(rgb(pal.border_fg))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.text_primary))
+                                        .child(client_label),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(rgb(pal.text_secondary))
+                                        .child(format!(
+                                            "scopes: [{}] · devices: {}",
+                                            scopes,
+                                            if grant.allowed_node_ids.is_empty() {
+                                                "all".to_string()
+                                            } else {
+                                                grant.allowed_node_ids.len().to_string()
+                                            }
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(btn_id)
+                                .cursor_pointer()
+                                .px(px(10.0))
+                                .py(px(5.0))
+                                .rounded(px(7.0))
+                                .bg(rgb(pal.danger))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0xFFFFFF))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.pending_event =
+                                            Some(SettingsComputersEvent::RevokeMcpGrant(fid.clone()));
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tr_str(lang, "吊销授权", "Revoke")),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(settings_subsection_title(
+                tr_str(lang, "官方 MCP Remote URL 与一键配置", "Official MCP Endpoint & One-Click Setup"),
+                pal,
+            ))
+            .child(
+                settings_card(pal).child(
+                    div()
+                        .p(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(rgb(pal.text_secondary))
+                                                .child(tr_str(
+                                                    lang,
+                                                    "官方 Streamable HTTP + OAuth 2.1 MCP 地址",
+                                                    "Official Streamable HTTP + OAuth 2.1 MCP URL",
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(0x14B8A6))
+                                                .child(self.mcp_endpoint_url.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("sc-mcp-refresh-grants-btn")
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(pal.input_bg))
+                                        .border_1()
+                                        .border_color(rgb(pal.border_fg))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(pal.text_primary))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.pending_event =
+                                                    Some(SettingsComputersEvent::RefreshMcpGrants);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "刷新授权", "Refresh Grants")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(8.0))
+                                .children([
+                                    (McpClientPreset::Antigravity, "sc-mcp-copy-antigravity"),
+                                    (McpClientPreset::Claude, "sc-mcp-copy-claude"),
+                                    (McpClientPreset::Cursor, "sc-mcp-copy-cursor"),
+                                    (McpClientPreset::VsCode, "sc-mcp-copy-vscode"),
+                                ]
+                                .into_iter()
+                                .map(|(preset, id)| {
+                                    div()
+                                        .id(id)
+                                        .cursor_pointer()
+                                        .px(px(11.0))
+                                        .py(px(6.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(pal.accent))
+                                        .hover(|s| s.bg(rgb(pal.accent_hover)))
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.active_button_fg))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.trigger_copy_mcp_preset(preset);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(format!(
+                                            "{} {}",
+                                            tr_str(lang, "复制配置:", "Copy"),
+                                            preset.display_name()
+                                        ))
+                                })),
+                        ),
+                ),
+            )
+            .child(settings_subsection_title(
+                tr_str(lang, "已授权的 AI MCP 客户端 (OAuth 2.1)", "Authorized MCP Clients"),
+                pal,
+            ))
+            .child(grants_col)
+            .child(settings_subsection_title(
+                tr_str(lang, "fabushi CLI 与本地 IPC 守护通道", "fabushi CLI & Local IPC Host"),
+                pal,
+            ))
+            .child(
+                settings_card(pal).child(
+                    div()
+                        .p(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(pal.text_primary))
+                                        .child(format!(
+                                            "fabushi CLI · {} · {}",
+                                            if cli_installed {
+                                                tr_str(lang, "已安装", "Installed")
+                                            } else {
+                                                tr_str(lang, "未安装到系统路径", "Not Installed")
+                                            },
+                                            if cli_on_path {
+                                                "PATH OK"
+                                            } else {
+                                                tr_str(lang, "未在 PATH 中", "Not in PATH")
+                                            }
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(rgb(pal.text_secondary))
+                                        .child(format!("{cli_path_str} · {cli_msg}")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("sc-cli-refresh-btn")
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(pal.input_bg))
+                                        .border_1()
+                                        .border_color(rgb(pal.border_fg))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(pal.text_primary))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.pending_event =
+                                                    Some(SettingsComputersEvent::RefreshCliStatus);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "检测状态", "Check PATH")),
+                                )
+                                .child(
+                                    div()
+                                        .id("sc-cli-install-btn")
+                                        .cursor_pointer()
+                                        .px(px(12.0))
+                                        .py(px(6.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(pal.accent))
+                                        .hover(|s| s.bg(rgb(pal.accent_hover)))
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.active_button_fg))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.pending_event =
+                                                    Some(SettingsComputersEvent::InstallFabushiCli);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "一键安装 CLI 到 PATH", "Install CLI")),
+                                ),
+                        ),
+                ),
+            )
             .into_any_element()
     }
 

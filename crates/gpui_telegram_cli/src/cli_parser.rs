@@ -3,10 +3,14 @@ use crate::registry::{
     infer_array_item_type, resolve_action, resolve_category, resolve_category_action,
     DEFAULT_SERVER_URL,
 };
-use gpui_telegram_core::action_bus::{ActionRegistry, CliArgumentSpec, CliSchemaExport, CliSubcommandSpec};
+use crate::unified_parser::{parse_unified_command, UnifiedCommand, UnifiedParseOutcome};
+use gpui_telegram_core::action_bus::{
+    ActionRegistry, CliArgumentSpec, CliSchemaExport, CliSubcommandSpec,
+};
 use serde_json::{Map, Number, Value};
 use std::collections::HashSet;
 use std::io::Read;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -27,7 +31,9 @@ pub struct GlobalOptions {
     pub server_url: String,
     pub server_explicit: bool,
     pub token: Option<String>,
+    pub socket_path: Option<PathBuf>,
     pub local: bool,
+    pub remote: bool,
     pub user_id: Option<u64>,
     pub approve: bool,
     pub approval_token: Option<String>,
@@ -38,24 +44,34 @@ pub struct GlobalOptions {
 
 impl GlobalOptions {
     pub fn from_env() -> Self {
-        let env_server = std::env::var("GPUI_TELEGRAM_SERVER_URL")
+        let env_server = std::env::var("FABUSHI_SERVER_URL")
             .ok()
+            .or_else(|| std::env::var("GPUI_TELEGRAM_SERVER_URL").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let server_explicit = env_server.is_some();
         let server_url = env_server.unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
 
-        let token = std::env::var("GPUI_TELEGRAM_TOKEN")
+        let token = std::env::var("FABUSHI_TOKEN")
             .ok()
+            .or_else(|| std::env::var("GPUI_TELEGRAM_TOKEN").ok())
             .or_else(|| std::env::var("GPUI_TG_TOKEN").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+
+        let socket_path = std::env::var("FABUSHI_IPC_SOCKET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         Self {
             server_url,
             server_explicit,
             token,
+            socket_path,
             local: false,
+            remote: false,
             user_id: None,
             approve: false,
             approval_token: None,
@@ -69,7 +85,7 @@ impl GlobalOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CliCommand {
     Help { topic: Option<String> },
-    Version,
+    Version { envelope: bool },
     List {
         category: Option<String>,
         remote: bool,
@@ -90,6 +106,7 @@ pub enum CliCommand {
         action_name: String,
         input: Value,
     },
+    Unified(UnifiedCommand),
 }
 
 #[derive(Debug, Clone)]
@@ -98,14 +115,18 @@ pub struct ParsedCli {
     pub command: CliCommand,
 }
 
-enum GlobalConsumeResult {
+pub(crate) enum GlobalConsumeResult {
     NotGlobal,
     Consumed,
     HelpFlag,
     VersionFlag,
 }
 
-fn next_arg_value(args: &[String], idx: &mut usize, flag: &str) -> Result<String, CliError> {
+pub(crate) fn next_arg_value(
+    args: &[String],
+    idx: &mut usize,
+    flag: &str,
+) -> Result<String, CliError> {
     if *idx + 1 >= args.len() {
         return Err(CliError::Usage(format!(
             "Option '{flag}' requires a value"
@@ -115,14 +136,14 @@ fn next_arg_value(args: &[String], idx: &mut usize, flag: &str) -> Result<String
     Ok(args[*idx].clone())
 }
 
-fn split_flag_eq(arg: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_flag_eq(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
         Some((k, v)) => (k, Some(v)),
         None => (arg, None),
     }
 }
 
-fn try_consume_global(
+pub(crate) fn try_consume_global(
     args: &[String],
     idx: &mut usize,
     opts: &mut GlobalOptions,
@@ -158,11 +179,30 @@ fn try_consume_global(
             opts.token = Some(trimmed);
             Ok(GlobalConsumeResult::Consumed)
         }
+        "--socket" => {
+            let val = match eq_val {
+                Some(v) => v.to_string(),
+                None => next_arg_value(args, idx, flag)?,
+            };
+            let trimmed = val.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(CliError::Usage("'--socket' cannot be empty".into()));
+            }
+            opts.socket_path = Some(PathBuf::from(trimmed));
+            Ok(GlobalConsumeResult::Consumed)
+        }
         "--local" => {
             if eq_val.is_some() {
                 return Err(CliError::Usage("'--local' does not take a value".into()));
             }
             opts.local = true;
+            Ok(GlobalConsumeResult::Consumed)
+        }
+        "--remote" => {
+            if eq_val.is_some() {
+                return Err(CliError::Usage("'--remote' does not take a value".into()));
+            }
+            opts.remote = true;
             Ok(GlobalConsumeResult::Consumed)
         }
         "--user-id" => {
@@ -253,7 +293,6 @@ pub fn parse_args(
     let mut help_requested = false;
     let mut version_requested = false;
 
-    // Leading global flags before the command/subcommand
     while idx < args.len() {
         let token = &args[idx];
         if !token.starts_with('-') {
@@ -280,8 +319,10 @@ pub fn parse_args(
 
     if version_requested && idx >= args.len() {
         return Ok(ParsedCli {
-            options: opts,
-            command: CliCommand::Version,
+            options: opts.clone(),
+            command: CliCommand::Version {
+                envelope: opts.output_format == Some(OutputFormat::Json),
+            },
         });
     }
 
@@ -326,11 +367,51 @@ pub fn parse_args(
                 command: CliCommand::Help { topic },
             })
         }
+        "version" => {
+            while idx < args.len() {
+                match try_consume_global(args, &mut idx, &mut opts)? {
+                    GlobalConsumeResult::Consumed
+                    | GlobalConsumeResult::HelpFlag
+                    | GlobalConsumeResult::VersionFlag => idx += 1,
+                    GlobalConsumeResult::NotGlobal => {
+                        return Err(CliError::Usage(format!(
+                            "Unexpected argument '{}' for 'version'",
+                            args[idx]
+                        )));
+                    }
+                }
+            }
+            Ok(ParsedCli {
+                options: opts,
+                command: CliCommand::Version { envelope: true },
+            })
+        }
         "list" => parse_list_args(args, idx, opts, help_requested),
         "export-schema" => parse_export_schema_args(args, idx, opts, help_requested),
         "schema" => parse_schema_args(args, idx, opts, help_requested),
         "approve" => parse_approve_args(args, idx, opts, help_requested),
         other => {
+            if let Some(outcome) =
+                parse_unified_command(other, args, idx, &mut opts, help_requested)?
+            {
+                return match outcome {
+                    UnifiedParseOutcome::Command(cmd) => Ok(ParsedCli {
+                        options: opts,
+                        command: CliCommand::Unified(cmd),
+                    }),
+                    UnifiedParseOutcome::Help(topic) => Ok(ParsedCli {
+                        options: opts,
+                        command: CliCommand::Help { topic: Some(topic) },
+                    }),
+                    UnifiedParseOutcome::Version => Ok(ParsedCli {
+                        options: opts.clone(),
+                        command: CliCommand::Version {
+                            envelope: opts.output_format == Some(OutputFormat::Json),
+                        },
+                    }),
+                };
+            }
+
             if let Some(sub) = resolve_action(schema, other) {
                 if help_requested {
                     return Ok(ParsedCli {
@@ -353,7 +434,6 @@ pub fn parse_args(
 
             if let Some(cat) = resolve_category(other) {
                 let cat_str = cat.as_str();
-                // Drain any global/help flags between category and action
                 while idx < args.len() && args[idx].starts_with('-') {
                     match try_consume_global(args, &mut idx, &mut opts)? {
                         GlobalConsumeResult::Consumed => idx += 1,
@@ -385,8 +465,10 @@ pub fn parse_args(
 
                 if version_requested && idx >= args.len() {
                     return Ok(ParsedCli {
-                        options: opts,
-                        command: CliCommand::Version,
+                        options: opts.clone(),
+                        command: CliCommand::Version {
+                            envelope: opts.output_format == Some(OutputFormat::Json),
+                        },
                     });
                 }
 
@@ -459,9 +541,7 @@ fn parse_list_args(
                     None => next_arg_value(args, &mut idx, flag)?,
                 };
                 if resolve_category(&val).is_none() {
-                    return Err(CliError::Validation(format!(
-                        "Unknown category '{val}'"
-                    )));
+                    return Err(CliError::Validation(format!("Unknown category '{val}'")));
                 }
                 category = Some(val);
                 idx += 1;
@@ -513,9 +593,13 @@ fn parse_list_args(
         ));
     }
 
+    let effective_remote = remote || opts.remote;
     Ok(ParsedCli {
         options: opts,
-        command: CliCommand::List { category, remote },
+        command: CliCommand::List {
+            category,
+            remote: effective_remote,
+        },
     })
 }
 
@@ -649,9 +733,13 @@ fn parse_schema_args(
         ));
     }
 
+    let effective_remote = remote || opts.remote;
     Ok(ParsedCli {
         options: opts,
-        command: CliCommand::Schema { action, remote },
+        command: CliCommand::Schema {
+            action,
+            remote: effective_remote,
+        },
     })
 }
 
@@ -821,8 +909,10 @@ fn parse_action_args(
                 None => next_arg_value(args, &mut idx, flag)?,
             };
 
-            if arg_spec.value_type == "array" && eq_val.is_none() && !val_str.trim_start().starts_with('[') {
-                // Support both comma-separated (`1,2`) and repeated flags (`--message-ids 1 --message-ids 2`)
+            if arg_spec.value_type == "array"
+                && eq_val.is_none()
+                && !val_str.trim_start().starts_with('[')
+            {
                 let parsed_arr = parse_array_value(flag, &val_str, item_type.as_deref())?;
                 match payload_map.get_mut(&arg_spec.name) {
                     Some(Value::Array(existing)) => existing.extend(parsed_arr),
@@ -831,8 +921,7 @@ fn parse_action_args(
                     }
                 }
             } else {
-                let parsed_val =
-                    parse_typed_arg(arg_spec, &val_str, item_type.as_deref())?;
+                let parsed_val = parse_typed_arg(arg_spec, &val_str, item_type.as_deref())?;
                 if arg_spec.value_type == "array" {
                     if let Value::Array(items) = parsed_val {
                         match payload_map.get_mut(&arg_spec.name) {
@@ -868,8 +957,10 @@ fn parse_action_args(
             }
             GlobalConsumeResult::VersionFlag => {
                 return Ok(ParsedCli {
-                    options: opts,
-                    command: CliCommand::Version,
+                    options: opts.clone(),
+                    command: CliCommand::Version {
+                        envelope: opts.output_format == Some(OutputFormat::Json),
+                    },
                 });
             }
             GlobalConsumeResult::NotGlobal => {
@@ -881,7 +972,6 @@ fn parse_action_args(
         }
     }
 
-    // Validate against schema: reject unknown keys in --json and verify required fields
     let valid_fields: HashSet<&str> = spec.arguments.iter().map(|a| a.name.as_str()).collect();
     for key in payload_map.keys() {
         if !valid_fields.contains(key.as_str()) {
@@ -914,7 +1004,7 @@ fn schema_prog_hint() -> &'static str {
     crate::registry::PROGRAM_NAME
 }
 
-fn parse_bool_str(flag: &str, raw: &str) -> Result<bool, CliError> {
+pub(crate) fn parse_bool_str(flag: &str, raw: &str) -> Result<bool, CliError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),

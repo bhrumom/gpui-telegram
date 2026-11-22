@@ -5,6 +5,7 @@ pub mod contracts;
 pub mod e2ee;
 pub mod message;
 pub mod miniapp_contracts;
+pub mod remote_control_contracts;
 pub mod semantic_tree;
 pub mod sync;
 pub mod tailnet_contracts;
@@ -26,6 +27,7 @@ pub use message::{
     VideoNoteItem, VoiceItem,
 };
 pub use miniapp_contracts::*;
+pub use remote_control_contracts::*;
 pub use sync::{
     ChatActionEvent, PtsUpdate, ReadHistoryEvent, ReactionEvent, SyncFilter,
     SyncGetDifferenceRequest, SyncGetDifferenceResponse, TypingAction, TypingEvent, UpdateEvent,

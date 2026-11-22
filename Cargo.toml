@@ -13,6 +13,8 @@ members = [
     "crates/gpui_telegram_desktop",
     "crates/gpui_telegram_cli",
     "crates/gpui_telegram_test_harness",
+    "crates/fabushi_remote_engine",
+    "crates/fabushi_remote_daemon",
     "crates/fabushi_miniapp",
     "crates/magpie_gateway",
     "crates/bot-browser",
@@ -39,7 +41,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Teamwork GPUI Telegram Contributors"]
@@ -58,6 +60,8 @@ gpui_telegram_client = { path = "crates/gpui_telegram_client" }
 gpui_telegram_desktop = { path = "crates/gpui_telegram_desktop" }
 gpui_telegram_cli = { path = "crates/gpui_telegram_cli" }
 gpui_telegram_test_harness = { path = "crates/gpui_telegram_test_harness" }
+fabushi_remote_engine = { path = "crates/fabushi_remote_engine" }
+fabushi_remote_daemon = { path = "crates/fabushi_remote_daemon" }
 fabushi_miniapp = { path = "crates/fabushi_miniapp" }
 magpie_gateway = { path = "crates/magpie_gateway" }
 bot-browser = { path = "crates/bot-browser" }

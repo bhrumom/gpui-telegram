@@ -91,7 +91,7 @@ fn is_valid_release_filename(filename: &str) -> bool {
     }
     filename.starts_with("Fabushi-")
         || filename.starts_with("gpui_telegram")
-        || filename.starts_with("gpui-tg-cli")
+        || filename.starts_with("fabushi")
         || filename == "latest-mac.json"
         || filename == "latest-windows.json"
         || filename == "SHA256SUMS"
@@ -410,6 +410,8 @@ mod tests {
 
         assert!(is_valid_release_filename("Fabushi-1.3.0-macos-arm64.zip"));
         assert!(is_valid_release_filename("gpui_telegram-v1.3.0-linux-x86_64.tar.gz"));
+        assert!(is_valid_release_filename("fabushi-v1.4.0-macos-arm64.tar.gz"));
+        assert!(!is_valid_release_filename("gpui-tg-cli-v1.3.0-macos-arm64.tar.gz"));
         assert!(is_valid_release_filename("latest-mac.json"));
         assert!(!is_valid_release_filename("../etc/passwd"));
         assert!(!is_valid_release_filename("secret.db"));

@@ -392,6 +392,59 @@ impl ComputerControlService {
         Ok(())
     }
 
+    /// Immediately aborts all pending/in-flight remote commands for `owner_user_id`
+    /// (called when host triggers the "disconnect-all" kill-switch).
+    pub fn abort_user_pending_commands(&self, owner_user_id: u64, reason: &str) -> usize {
+        let mut removed = Vec::new();
+        {
+            let mut guard = self.pending_commands.lock();
+            let matching_ids: Vec<String> = guard
+                .iter()
+                .filter_map(|(cid, entry)| {
+                    if entry.owner_user_id == owner_user_id {
+                        Some(cid.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for cid in matching_ids {
+                if let Some(entry) = guard.remove(&cid) {
+                    removed.push((cid, entry.dto));
+                }
+            }
+        }
+        let count = removed.len();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for (cid, dto) in removed {
+            let _ = self.db.record_computer_audit(
+                &cid,
+                owner_user_id,
+                &dto.node_id,
+                &dto.caller_label,
+                op_summary(&dto.operation),
+                false,
+                499,
+                now_ms,
+            );
+            if let Some(tx) = self.waiters.lock().remove(&cid) {
+                let _ = tx.send(RemoteComputerCommandResult {
+                    command_id: cid,
+                    node_id: dto.node_id,
+                    ok: false,
+                    exit_code: 499,
+                    stdout: String::new(),
+                    stderr: reason.to_string(),
+                    entries: Vec::new(),
+                    frame_data_url: None,
+                    executed_by: dto.target_device_id,
+                    duration_ms: 0,
+                });
+            }
+        }
+        count
+    }
+
     pub async fn verify_cloud_request(
         &self,
         owner_user_id: u64,
@@ -1373,6 +1426,18 @@ fn op_summary(op: &RemoteComputerOp) -> &'static str {
         RemoteComputerOp::ListDir { .. } => "list_dir",
         RemoteComputerOp::CaptureScreen => "capture_screen",
         RemoteComputerOp::GuiInput { .. } => "gui_input",
+        RemoteComputerOp::MouseAction { .. } => "mouse_action",
+        RemoteComputerOp::KeyboardAction { .. } => "keyboard_action",
+        RemoteComputerOp::ClipboardGet => "clipboard_get",
+        RemoteComputerOp::ClipboardSet { .. } => "clipboard_set",
+        RemoteComputerOp::PowerAction { .. } => "power_action",
+        RemoteComputerOp::DisplayList => "display_list",
+        RemoteComputerOp::DisplaySwitch { .. } => "display_switch",
+        RemoteComputerOp::PrivacyScreenToggle { .. } => "privacy_screen_toggle",
+        RemoteComputerOp::TerminalOp { .. } => "terminal_op",
+        RemoteComputerOp::AccessibilityTree { .. } => "accessibility_tree",
+        RemoteComputerOp::SemanticAction { .. } => "semantic_action",
+        RemoteComputerOp::FileChunkOp { .. } => "file_chunk_op",
         RemoteComputerOp::TestConnection => "test_connection",
     }
 }
@@ -1917,6 +1982,209 @@ async fn execute_local_fs_and_shell_op(
                 },
             }
         }
+        RemoteComputerOp::TerminalOp {
+            op: term_op,
+            command,
+            timeout_ms,
+            ..
+        } => {
+            if term_op == "exec" {
+                let cmd_str = command.as_deref().unwrap_or("").trim();
+                if cmd_str.is_empty() {
+                    return RemoteComputerCommandResult {
+                        command_id: command_id.to_string(),
+                        node_id: node_id.to_string(),
+                        ok: false,
+                        exit_code: 400,
+                        stdout: String::new(),
+                        stderr: "Missing command for terminal exec".to_string(),
+                        entries: Vec::new(),
+                        frame_data_url: None,
+                        executed_by: executed_by.to_string(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    };
+                }
+                let mut cmd = if cfg!(target_os = "windows") {
+                    let mut c = Command::new("cmd");
+                    c.args(["/C", cmd_str]);
+                    c
+                } else {
+                    let mut c = Command::new("sh");
+                    c.args(["-c", cmd_str]);
+                    c
+                };
+                if let Some(dir) = base_canon {
+                    cmd.current_dir(dir);
+                }
+                cmd.kill_on_drop(true);
+                let wait_ms = timeout_ms
+                    .unwrap_or(REMOTE_EXEC_TIMEOUT_MS_DEFAULT)
+                    .clamp(500, REMOTE_EXEC_TIMEOUT_MS_MAX);
+                match tokio::time::timeout(Duration::from_millis(wait_ms), cmd.output()).await {
+                    Ok(Ok(out)) => {
+                        let exit_code = out.status.code().unwrap_or(if out.status.success() { 0 } else { 1 });
+                        RemoteComputerCommandResult {
+                            command_id: command_id.to_string(),
+                            node_id: node_id.to_string(),
+                            ok: out.status.success(),
+                            exit_code,
+                            stdout: truncate_output_utf8(&out.stdout, MAX_OUTPUT_BYTES),
+                            stderr: truncate_output_utf8(&out.stderr, MAX_OUTPUT_BYTES),
+                            entries: Vec::new(),
+                            frame_data_url: None,
+                            executed_by: executed_by.to_string(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        }
+                    }
+                    Ok(Err(e)) => RemoteComputerCommandResult {
+                        command_id: command_id.to_string(),
+                        node_id: node_id.to_string(),
+                        ok: false,
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: format!("Failed to spawn terminal command: {e}"),
+                        entries: Vec::new(),
+                        frame_data_url: None,
+                        executed_by: executed_by.to_string(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    },
+                    Err(_) => RemoteComputerCommandResult {
+                        command_id: command_id.to_string(),
+                        node_id: node_id.to_string(),
+                        ok: false,
+                        exit_code: 124,
+                        stdout: String::new(),
+                        stderr: format!("Terminal command timed out after {wait_ms}ms"),
+                        entries: Vec::new(),
+                        frame_data_url: None,
+                        executed_by: executed_by.to_string(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    },
+                }
+            } else {
+                RemoteComputerCommandResult {
+                    command_id: command_id.to_string(),
+                    node_id: node_id.to_string(),
+                    ok: true,
+                    exit_code: 0,
+                    stdout: json!({ "terminal_op": term_op, "sessions": [] }).to_string(),
+                    stderr: String::new(),
+                    entries: Vec::new(),
+                    frame_data_url: None,
+                    executed_by: executed_by.to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+        }
+        RemoteComputerOp::DisplayList => RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: true,
+            exit_code: 0,
+            stdout: json!([{
+                "display_id": 0,
+                "name": "Headless Display",
+                "width": 1920,
+                "height": 1080,
+                "scale_factor_x100": 100,
+                "is_primary": true,
+                "is_virtual": true,
+                "refresh_hz": 60
+            }])
+            .to_string(),
+            stderr: String::new(),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: executed_by.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+        RemoteComputerOp::AccessibilityTree { .. } => RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: true,
+            exit_code: 0,
+            stdout: json!({
+                "element_id": "root",
+                "role": "application",
+                "name": executed_by,
+                "children": []
+            })
+            .to_string(),
+            stderr: String::new(),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: executed_by.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+        RemoteComputerOp::ClipboardGet => RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: true,
+            exit_code: 0,
+            stdout: json!({ "mime_type": "text/plain", "text": "" }).to_string(),
+            stderr: String::new(),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: executed_by.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+        RemoteComputerOp::MouseAction { action, .. } => RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: false,
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!("Mouse action `{action}` is unavailable in headless {executed_by}"),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: executed_by.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+        RemoteComputerOp::KeyboardAction { action, .. } => RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: false,
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!("Keyboard action `{action}` is unavailable in headless {executed_by}"),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: executed_by.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+        RemoteComputerOp::SemanticAction { element_id, action, .. } => RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: false,
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!(
+                "Semantic UI action `{action}` on `{element_id}` is unavailable in headless {executed_by}"
+            ),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: executed_by.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+        RemoteComputerOp::ClipboardSet { .. }
+        | RemoteComputerOp::PowerAction { .. }
+        | RemoteComputerOp::DisplaySwitch { .. }
+        | RemoteComputerOp::PrivacyScreenToggle { .. }
+        | RemoteComputerOp::FileChunkOp { .. } => RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: false,
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!(
+                "Operation `{}` requires an interactive local desktop host",
+                op_summary(op)
+            ),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: executed_by.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
     }
 }
 
@@ -2043,6 +2311,27 @@ fn build_remote_posix_script(op: &RemoteComputerOp, workdir: Option<&str>) -> St
                 "echo {} >&2; exit 1",
                 shell_quote_posix(&format!(
                     "gui_input `{action}` requires an HTTP desktop/agent endpoint"
+                ))
+            )
+        }
+        RemoteComputerOp::TerminalOp {
+            op: term_op,
+            command,
+            ..
+        } if term_op == "exec" => {
+            let cmd_str = command.as_deref().unwrap_or("");
+            if let Some(wd) = workdir.map(str::trim).filter(|s| !s.is_empty()) {
+                format!("cd {} && {}", shell_quote_posix(wd), cmd_str)
+            } else {
+                cmd_str.to_string()
+            }
+        }
+        other => {
+            format!(
+                "echo {} >&2; exit 1",
+                shell_quote_posix(&format!(
+                    "Operation `{}` requires an interactive Fabushi host",
+                    op_summary(other)
                 ))
             )
         }

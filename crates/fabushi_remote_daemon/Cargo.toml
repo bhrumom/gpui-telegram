@@ -1,0 +1,24 @@
+[package]
+name = "fabushi_remote_daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fabushi-remote-daemon"
+path = "src/main.rs"
+
+[dependencies]
+fabushi_remote_engine = { workspace = true }
+gpui_telegram_proto = { workspace = true }
+gpui_telegram_core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

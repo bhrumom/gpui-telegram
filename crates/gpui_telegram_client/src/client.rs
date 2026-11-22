@@ -23,8 +23,10 @@ use crate::net::{
     RemoteComputerOp, TailnetEngine, TailnetIdentity, TailnetNetMap, TailnetNodeStatus,
     UpdateBotComputerRequest, UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
     ApproveDeviceSyncRequest, ArchiveLocalBotReplyRequest, ArchiveLocalBotReplyResponse,
+    AssistStartRequest, AssistStartResponse,
     DeviceSyncActionResponse, DeviceSyncRequestBody, DeviceSyncRequestResponse,
-    DeviceSyncStatusResponse, PendingDeviceSyncListResponse, UpsertUserVaultItemRequest,
+    DeviceSyncStatusResponse, McpOAuthGrantsResponse, PendingDeviceSyncListResponse,
+    RemoteAssistConfigDto, RemoteSessionsResponse, UpsertUserVaultItemRequest,
     UpsertUserVaultItemResponse, UserVaultEnvelopeResponse, UserVaultKeyEnvelopeDto,
     UserVaultSyncPullResponse, WsChannel, WsTransport,
 };
@@ -1321,6 +1323,131 @@ impl TelegramClient {
             .http_client
             .update_bot_computer_profile(&token, bot_id, req)
             .await?)
+    }
+
+    pub fn get_remote_assist_info(&self) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.get_remote_assist_info(&token).await })
+    }
+
+    pub async fn get_remote_assist_info_async(&self) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        Ok(self.http_client.get_remote_assist_info(&token).await?)
+    }
+
+    pub fn reset_remote_assist_code(&self) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.reset_remote_assist_code(&token).await })
+    }
+
+    pub async fn reset_remote_assist_code_async(&self) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        Ok(self.http_client.reset_remote_assist_code(&token).await?)
+    }
+
+    pub fn set_remote_assist_code(&self, code: &str) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.set_remote_assist_code(&token, code).await })
+    }
+
+    pub async fn set_remote_assist_code_async(&self, code: &str) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        Ok(self.http_client.set_remote_assist_code(&token, code).await?)
+    }
+
+    pub fn set_remote_assist_allow(&self, allow_assist: bool) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.set_remote_assist_allow(&token, allow_assist).await })
+    }
+
+    pub async fn set_remote_assist_allow_async(
+        &self,
+        allow_assist: bool,
+    ) -> Result<RemoteAssistConfigDto> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .set_remote_assist_allow(&token, allow_assist)
+            .await?)
+    }
+
+    pub fn start_remote_assist(&self, req: &AssistStartRequest) -> Result<AssistStartResponse> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.start_remote_assist(&token, req).await })
+    }
+
+    pub async fn start_remote_assist_async(
+        &self,
+        req: &AssistStartRequest,
+    ) -> Result<AssistStartResponse> {
+        let token = self.require_token()?;
+        Ok(self.http_client.start_remote_assist(&token, req).await?)
+    }
+
+    pub fn list_remote_sessions(&self) -> Result<RemoteSessionsResponse> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.list_remote_sessions(&token).await })
+    }
+
+    pub async fn list_remote_sessions_async(&self) -> Result<RemoteSessionsResponse> {
+        let token = self.require_token()?;
+        Ok(self.http_client.list_remote_sessions(&token).await?)
+    }
+
+    pub fn disconnect_remote_session(&self, session_id: &str) -> Result<()> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.disconnect_remote_session(&token, session_id).await })
+    }
+
+    pub async fn disconnect_remote_session_async(&self, session_id: &str) -> Result<()> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .disconnect_remote_session(&token, session_id)
+            .await?)
+    }
+
+    pub fn disconnect_all_remote_sessions(&self) -> Result<serde_json::Value> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.disconnect_all_remote_sessions(&token).await })
+    }
+
+    pub async fn disconnect_all_remote_sessions_async(&self) -> Result<serde_json::Value> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .disconnect_all_remote_sessions(&token)
+            .await?)
+    }
+
+    pub fn list_mcp_grants(&self) -> Result<McpOAuthGrantsResponse> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.list_mcp_grants(&token).await })
+    }
+
+    pub async fn list_mcp_grants_async(&self) -> Result<McpOAuthGrantsResponse> {
+        let token = self.require_token()?;
+        Ok(self.http_client.list_mcp_grants(&token).await?)
+    }
+
+    pub fn revoke_mcp_grant(&self, family_id: &str) -> Result<()> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.revoke_mcp_grant(&token, family_id).await })
+    }
+
+    pub async fn revoke_mcp_grant_async(&self, family_id: &str) -> Result<()> {
+        let token = self.require_token()?;
+        Ok(self.http_client.revoke_mcp_grant(&token, family_id).await?)
     }
 
     pub async fn get_user_vault_envelope(

@@ -35,12 +35,23 @@ impl AppShell {
             && self.tasks_workspace.read(cx).active_input != StudioInputTarget::None
     }
 
-    /// Returns `true` when the `ComputerWorkbench` overlay's Remote Terminal input is focused.
+    /// Returns `true` when the `ComputerWorkbench` overlay's Remote Terminal or interactive PTY is focused.
     pub fn is_computer_workbench_input_active(&self, cx: &App) -> bool {
+        self.active_computer_terminal_overlay(cx).is_some()
+    }
+
+    fn active_computer_terminal_overlay(
+        &self,
+        cx: &App,
+    ) -> Option<gpui::Entity<crate::views::ComputerWorkbench>> {
         self.overlays
             .computer_overlay
             .as_ref()
-            .is_some_and(|ov| ov.read(cx).is_terminal_input_active())
+            .filter(|ov| {
+                let wb = ov.read(cx);
+                wb.is_terminal_input_active() || wb.is_interactive_pty_focused(cx)
+            })
+            .cloned()
     }
 
     /// Returns `true` when `ContextInspector` is showing `BotConfigEditor` with an active input field.
@@ -107,12 +118,7 @@ impl AppShell {
         if self.overlays.is_passcode_locked {
             return (self.overlays.passcode_unlock_input.clone(), pre());
         }
-        if let Some(ov) = self
-            .overlays
-            .computer_overlay
-            .as_ref()
-            .filter(|ov| ov.read(cx).is_terminal_input_active())
-        {
+        if let Some(ov) = self.active_computer_terminal_overlay(cx) {
             let (committed, term_pre) = ov.read(cx).terminal_text_and_preedit(cx);
             return (committed, term_pre.or_else(pre));
         }
@@ -179,13 +185,7 @@ impl AppShell {
             cx.notify();
             return;
         }
-        if let Some(ov) = self
-            .overlays
-            .computer_overlay
-            .as_ref()
-            .filter(|ov| ov.read(cx).is_terminal_input_active())
-            .cloned()
-        {
+        if let Some(ov) = self.active_computer_terminal_overlay(cx) {
             ov.update(cx, |w, wcx| w.clear_terminal_input(wcx));
             cx.notify();
             return;
@@ -242,13 +242,7 @@ impl AppShell {
             return;
         }
         self.record_user_activity();
-        if let Some(ov) = self
-            .overlays
-            .computer_overlay
-            .as_ref()
-            .filter(|ov| ov.read(cx).is_terminal_input_active())
-            .cloned()
-        {
+        if let Some(ov) = self.active_computer_terminal_overlay(cx) {
             ov.update(cx, |w, wcx| w.push_terminal_text(&clean, wcx));
         } else if let Some(box_ent) = self.miniapps.create_bot_box.as_ref().filter(|b| b.read(cx).is_visible).cloned() {
             box_ent.update(cx, |b, bcx| { b.push_text(&clean); bcx.notify(); });
@@ -493,17 +487,17 @@ impl AppShell {
             return true;
         }
         if self.is_authenticated {
-            if let Some(ov) = self
-                .overlays
-                .computer_overlay
-                .as_ref()
-                .filter(|ov| ov.read(cx).is_terminal_input_active())
-                .cloned()
-            {
+            if let Some(ov) = self.active_computer_terminal_overlay(cx) {
                 if key == "backspace" && self.ime.ime_preedit.take().is_some() {
                     ov.update(cx, |w, wcx| {
                         if let Some(c) = w.terminal_input.as_ref() {
                             c.update(wcx, |ctrl, _| ctrl.clear_preedit());
+                        }
+                        if let Some(term) = w.terminal_view.as_ref() {
+                            term.update(wcx, |t, tcx| {
+                                t.ime_preedit = None;
+                                tcx.notify();
+                            });
                         }
                         wcx.notify();
                     });
@@ -851,16 +845,16 @@ impl EntityInputHandler for AppShell {
         let non_composer = self.is_non_composer_text_capturing(cx);
         if new_text.is_empty() {
             self.ime.clear_preedit();
-            if let Some(ov) = self
-                .overlays
-                .computer_overlay
-                .as_ref()
-                .filter(|ov| ov.read(cx).is_terminal_input_active())
-                .cloned()
-            {
+            if let Some(ov) = self.active_computer_terminal_overlay(cx) {
                 ov.update(cx, |w, wcx| {
                     if let Some(c) = w.terminal_input.as_ref() {
                         c.update(wcx, |ctrl, _| ctrl.clear_preedit());
+                    }
+                    if let Some(term) = w.terminal_view.as_ref() {
+                        term.update(wcx, |t, tcx| {
+                            t.ime_preedit = None;
+                            tcx.notify();
+                        });
                     }
                     wcx.notify();
                 });
@@ -882,20 +876,18 @@ impl EntityInputHandler for AppShell {
         } else if non_composer {
             self.ime.ime_preedit = Some(new_text.to_string());
             self.ime.just_committed_ime = false;
-            if let Some(ov) = self
-                .overlays
-                .computer_overlay
-                .as_ref()
-                .filter(|ov| ov.read(cx).is_terminal_input_active())
-                .cloned()
-            {
+            if let Some(ov) = self.active_computer_terminal_overlay(cx) {
                 ov.update(cx, |w, wcx| {
-                    w.ensure_terminal_input(wcx);
-                    if let Some(c) = w.terminal_input.as_ref() {
-                        c.update(wcx, |ctrl, _| {
-                            ctrl.ime_preedit = Some(new_text.to_string());
-                            ctrl.just_committed_ime = false;
-                        });
+                    if w.is_interactive_pty_focused(wcx) {
+                        let _ = w.replace_and_mark_terminal_input(new_text, wcx);
+                    } else {
+                        w.ensure_terminal_input(wcx);
+                        if let Some(c) = w.terminal_input.as_ref() {
+                            c.update(wcx, |ctrl, _| {
+                                ctrl.ime_preedit = Some(new_text.to_string());
+                                ctrl.just_committed_ime = false;
+                            });
+                        }
                     }
                     wcx.notify();
                 });

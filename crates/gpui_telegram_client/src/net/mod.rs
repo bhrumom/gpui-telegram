@@ -19,6 +19,13 @@ pub use proxy::{ClientProxyConfig, ClientProxyType, ProxyHealthReport};
 
 pub use api_computers::{
     detect_local_host_info, detect_local_hostname, detect_real_lan_ips, execute_local_computer_op,
+    shared_remote_engine, LocalRemoteEngine,
+};
+pub use gpui_telegram_proto::remote_control_contracts::{
+    AssistAllowRequest, AssistCodeMode, AssistSetCodeRequest, AssistStartRequest,
+    AssistStartResponse, McpOAuthGrantSummaryDto, McpOAuthGrantsResponse, RemoteAssistConfigDto,
+    RemoteControlMode, RemoteControllerKind, RemoteSessionDisconnectRequest, RemoteSessionDto,
+    RemoteSessionsResponse,
 };
 pub use gpui_telegram_proto::tailnet_contracts::{
     DerpClientFrame, DerpServerFrame, DiscoPayload, PeerApiFrame, TailnetEndpoint,
