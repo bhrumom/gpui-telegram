@@ -249,6 +249,7 @@ fn clear_bot_composer_and_inspector(
         c_cx.notify();
     });
     shell.inspector.update(cx, |insp, insp_cx| {
+        insp.set_active_fabushi_bot(None);
         insp.sync_bot_details(false, 0, String::new(), Vec::new(), None, None, false);
         insp.sync_bot_profile_extra(0, false, String::new(), false, false, false, false, false);
         insp_cx.notify();
@@ -810,7 +811,32 @@ impl AppShell {
             .or_else(|| rc_opt.as_ref().map(|rc| rc.is_blocked))
             .unwrap_or(false);
 
+        let active_fab: Option<FabushiBotSummaryDto> = if is_viewer_owner_fabushi {
+            self.miniapps
+                .fabushi_bots
+                .iter()
+                .find(|fb| {
+                    (bot_id > 0 && fb.bot_user_id == bot_id as i64)
+                        || (!bot_username.is_empty()
+                            && fb.username.eq_ignore_ascii_case(&bot_username))
+                        || active_chat.is_some_and(|cid| fb.companion_chat_id == Some(cid as i64))
+                })
+                .cloned()
+        } else {
+            None
+        };
+
         self.inspector.update(cx, |insp, insp_cx| {
+            if !is_viewer_owner_fabushi {
+                insp.set_active_fabushi_bot(None);
+            } else if active_fab.is_some()
+                || insp
+                    .active_fabushi_bot
+                    .as_ref()
+                    .is_some_and(|b| bot_id > 0 && b.bot_user_id != bot_id as i64)
+            {
+                insp.set_active_fabushi_bot(active_fab.clone());
+            }
             insp.sync_bot_details(
                 true,
                 bot_id,
@@ -915,8 +941,17 @@ impl AppShell {
             sb.selection_revision
         });
         self.overlays.last_sidebar_selection_revision = sel_rev;
+        let prev_chat_id = self.stage.read(cx).active_chat_id;
         activate_chats_workspace(self, cx);
         self.sync_selected_chat_inspector_and_stage(chat_id, cx);
+        if self.composer.read(cx).is_compose_isolated && !self.is_compose_or_creation_modal_active(cx)
+        {
+            if prev_chat_id == Some(chat_id) {
+                self.exit_compose_or_modal_isolation(true, cx);
+            } else {
+                self.finish_compose_isolation_for_switched_chat(chat_id, cx);
+            }
+        }
         if inserted_new {
             self.refresh_chats(cx);
         }
@@ -998,6 +1033,10 @@ impl AppShell {
             sb.open_apps_center();
             sb_cx.notify();
         });
+        if self.composer.read(cx).is_compose_isolated && !self.is_compose_or_creation_modal_active(cx)
+        {
+            self.exit_compose_or_modal_isolation(true, cx);
+        }
         self.refresh_miniapps_catalog(None, cx);
         cx.notify();
     }
@@ -1855,9 +1894,10 @@ impl AppShell {
                         shell.miniapps.miniapp_overlay = None;
                         shell.miniapps.is_miniapp_minimized = false;
                         shell.miniapps.floating_pip_status = None;
-                        shell.window_runtime.enqueue_toast(
+                        shell.show_toast(
                             format!("Mini App launch failed: {}", e),
                             2600,
+                            cx,
                         );
                     }
                 }
@@ -2245,9 +2285,10 @@ impl AppShell {
                             .as_ref()
                             .is_none_or(|b| !b.read(cx).is_visible)
                         {
-                            shell.window_runtime.enqueue_toast(
+                            shell.show_toast(
                                 format!("Failed to load bot info: {}", e),
                                 2400,
+                                cx,
                             );
                         }
                     }
@@ -2330,6 +2371,39 @@ impl AppShell {
         let lang = self.active_lang_id().to_string();
         let subtitle = tr_str(&lang, "机器人", "bot").to_string();
 
+        let prev_chat_id = resolve_active_target_chat_id(
+            self.stage.read(cx).active_chat_id,
+            self.sidebar.read(cx).active_chat_id,
+        );
+        if let Some(prev) = prev_chat_id {
+            if !self.composer.read(cx).is_compose_isolated {
+                self.flush_pending_draft_for_chat(prev, cx);
+            }
+            if self.window_runtime.controller.clear_toasts_for_chat(prev) {
+                self.schedule_current_toast_dismiss(cx);
+            }
+        }
+        self.last_observed_toast_chat_id = None;
+        self.clear_compose_isolation_snapshot();
+        self.sidebar.update(cx, |sb, sb_cx| {
+            sb.exit_compose_mode();
+            sb.active_chat_id = None;
+            sb.search_focused = false;
+            sb_cx.notify();
+        });
+        self.composer.update(cx, |comp, c_cx| {
+            comp.clear();
+            comp.cancel_reply_or_edit();
+            comp.editor.attachments.clear();
+            comp.submitted_attachment = None;
+            comp.pending_attached_files = None;
+            comp.clear_bot_reply_keyboard();
+            comp.set_send_as_options(Vec::new(), None);
+            comp.is_compose_isolated = false;
+            comp.set_compose_placeholder_override(None);
+            comp.set_compose_send_disabled(false);
+            c_cx.notify();
+        });
         self.miniapps.pending_prestart_bot =
             Some(crate::views::app_shell::shell_state::PrestartBotTarget {
                 bot_id,
@@ -2338,15 +2412,8 @@ impl AppShell {
                 description: description.to_string(),
                 is_viewer_owner_fabushi: is_owner_fabushi,
             });
-        self.sidebar.update(cx, |sb, sb_cx| {
-            sb.active_chat_id = None;
-            sb.search_focused = false;
-            sb_cx.notify();
-        });
         self.stage.update(cx, |st, st_cx| {
-            st.active_chat_id = None;
-            st.messages.clear();
-            st.row_height_cache.rebuild_prefix_sums(&st.messages);
+            st.clear_selection();
             st.chat_title = title_str.clone();
             st.chat_subtitle = subtitle.clone();
             st.chat_avatar_initials = initials.clone();
@@ -2490,7 +2557,7 @@ impl AppShell {
                 match res {
                     Ok(r) => {
                         if let Some(ref toast) = r.toast {
-                            shell.window_runtime.enqueue_toast(toast, 2200);
+                            shell.show_toast(toast, 2200, cx);
                         }
                         let cid = r
                             .companion_chat_id
@@ -2509,9 +2576,7 @@ impl AppShell {
                         );
                     }
                     Err(e) => {
-                        shell
-                            .window_runtime
-                            .enqueue_toast(format!("Install failed: {}", e), 2400);
+                        shell.show_toast(format!("Install failed: {}", e), 2400, cx);
                     }
                 }
                 cx.notify();

@@ -1,97 +1,75 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 
-static const CGFloat kHudWidth = 304.0;
+static const CGFloat kHudWidth = 316.0;
 static const CGFloat kHudHeight = 114.0;
+static NSString * const kSystemSettingsBundleID = @"com.apple.systempreferences";
 
 static _Atomic uint64_t g_drag_event_seq = 0;
+static _Atomic int32_t g_last_dragged_kind = -1;
 static _Atomic uint64_t g_user_closed_seq = 0;
 static _Atomic bool g_hud_visible = false;
 static _Atomic int32_t g_hud_kind = -1;
+static _Atomic uint64_t g_hud_command_gen = 0;
 
-static BOOL fabushi_find_system_settings_frame(NSRect *outFrame, BOOL *outRunning) {
-    NSArray<NSRunningApplication *> *apps =
-        [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.systempreferences"];
-    if (outRunning) {
-        *outRunning = (apps.count > 0);
-    }
-    if (apps.count == 0) {
-        return NO;
-    }
+typedef struct {
+    BOOL running;
+    BOOL hidden;
+    BOOL frontmost;
+    BOOL hasOnScreenWindow;
+    BOOL hasAnyWindow;
+    BOOL coveredByOtherApp;
+    pid_t pid;
+    NSRect frame;     // AppKit bottom-left screen coordinates
+    CGRect cgFrame;   // CoreGraphics top-left screen coordinates
+} FabushiSettingsWindowState;
 
-    pid_t settingsPid = apps.firstObject.processIdentifier;
-    CFArrayRef winList = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID
-    );
-    if (!winList) {
-        return NO;
-    }
-
-    NSArray *windows = CFBridgingRelease(winList);
-    CGFloat primaryHeight = 0.0;
+static CGFloat fabushi_primary_screen_height(void) {
     NSScreen *primaryScreen = NSScreen.screens.firstObject ?: [NSScreen mainScreen];
-    if (primaryScreen) {
-        primaryHeight = primaryScreen.frame.size.height;
+    if (primaryScreen && primaryScreen.frame.size.height > 0.0) {
+        return primaryScreen.frame.size.height;
     }
-    if (primaryHeight <= 0.0) {
-        primaryHeight = 900.0;
-    }
+    return 900.0;
+}
 
-    CGRect bestRect = CGRectZero;
-    CGFloat bestArea = 0.0;
+static NSRect fabushi_cg_to_cocoa_rect(CGRect cgRect) {
+    CGFloat primaryHeight = fabushi_primary_screen_height();
+    CGFloat cocoaY = primaryHeight - cgRect.origin.y - cgRect.size.height;
+    return NSMakeRect(cgRect.origin.x, cocoaY, cgRect.size.width, cgRect.size.height);
+}
 
-    for (NSDictionary *win in windows) {
-        NSNumber *pidNum = win[(__bridge NSString *)kCGWindowOwnerPID];
-        if (!pidNum || pidNum.intValue != settingsPid) {
-            continue;
-        }
-        NSNumber *layerNum = win[(__bridge NSString *)kCGWindowLayer];
-        if (layerNum && layerNum.intValue != 0) {
-            continue;
-        }
-        NSDictionary *boundsDict = win[(__bridge NSString *)kCGWindowBounds];
-        if (!boundsDict) {
-            continue;
-        }
-        CGRect cgRect = CGRectZero;
-        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)boundsDict, &cgRect)) {
-            continue;
-        }
-        if (cgRect.size.width < 320.0 || cgRect.size.height < 280.0) {
-            continue;
-        }
-        CGFloat area = cgRect.size.width * cgRect.size.height;
-        if (area > bestArea) {
-            bestArea = area;
-            bestRect = cgRect;
-        }
-    }
-
-    if (bestArea <= 0.0) {
-        return NO;
-    }
-
-    if (outFrame) {
-        // Convert CoreGraphics top-left coordinates to AppKit bottom-left coordinates
-        CGFloat cocoaY = primaryHeight - bestRect.origin.y - bestRect.size.height;
-        *outFrame = NSMakeRect(bestRect.origin.x, cocoaY, bestRect.size.width, bestRect.size.height);
-    }
-    return YES;
+static CGRect fabushi_cocoa_to_cg_rect(NSRect cocoaRect) {
+    CGFloat primaryHeight = fabushi_primary_screen_height();
+    CGFloat cgY = primaryHeight - cocoaRect.origin.y - cocoaRect.size.height;
+    return CGRectMake(cocoaRect.origin.x, cgY, cocoaRect.size.width, cocoaRect.size.height);
 }
 
 static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettingsFrame) {
     NSScreen *targetScreen = [NSScreen mainScreen] ?: NSScreen.screens.firstObject;
     if (hasSettingsFrame) {
         NSPoint settingsCenter = NSMakePoint(NSMidX(settingsFrame), NSMidY(settingsFrame));
+        BOOL matched = NO;
         for (NSScreen *scr in NSScreen.screens) {
             if (NSPointInRect(settingsCenter, scr.frame)) {
                 targetScreen = scr;
+                matched = YES;
                 break;
+            }
+        }
+        if (!matched) {
+            CGFloat bestOverlap = 0.0;
+            for (NSScreen *scr in NSScreen.screens) {
+                NSRect inter = NSIntersectionRect(settingsFrame, scr.frame);
+                CGFloat area = inter.size.width * inter.size.height;
+                if (area > bestOverlap) {
+                    bestOverlap = area;
+                    targetScreen = scr;
+                }
             }
         }
     }
@@ -102,7 +80,7 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
 
     if (hasSettingsFrame) {
         // Anchor near the bottom of the System Settings detail pane (matching Gemini HUD placement)
-        CGFloat detailCenterX = settingsFrame.origin.x + settingsFrame.size.width * 0.62;
+        CGFloat detailCenterX = settingsFrame.origin.x + settingsFrame.size.width * 0.64;
         x = detailCenterX - kHudWidth * 0.5;
         y = settingsFrame.origin.y + 22.0;
     } else {
@@ -123,6 +101,219 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
     return NSMakePoint(floor(x), floor(y));
 }
 
+static BOOL fabushi_is_system_chrome_window(pid_t pid, NSString *ownerName) {
+    if (ownerName.length > 0 &&
+        ([ownerName isEqualToString:@"WindowServer"] ||
+         [ownerName isEqualToString:@"Dock"] ||
+         [ownerName isEqualToString:@"Control Center"] ||
+         [ownerName isEqualToString:@"ControlCenter"] ||
+         [ownerName isEqualToString:@"SystemUIServer"] ||
+         [ownerName isEqualToString:@"Notification Center"] ||
+         [ownerName isEqualToString:@"NotificationCenter"])) {
+        return YES;
+    }
+    if (pid > 0) {
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        NSString *bundleID = app.bundleIdentifier;
+        if (bundleID.length > 0 &&
+            ([bundleID isEqualToString:@"com.apple.dock"] ||
+             [bundleID isEqualToString:@"com.apple.controlcenter"] ||
+             [bundleID isEqualToString:@"com.apple.notificationcenterui"] ||
+             [bundleID isEqualToString:@"com.apple.systemuiserver"] ||
+             [bundleID isEqualToString:@"com.apple.WindowManager"])) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static FabushiSettingsWindowState fabushi_inspect_system_settings(CGWindowID hudWindowNumber) {
+    FabushiSettingsWindowState state;
+    memset(&state, 0, sizeof(state));
+
+    NSArray<NSRunningApplication *> *apps =
+        [NSRunningApplication runningApplicationsWithBundleIdentifier:kSystemSettingsBundleID];
+    NSRunningApplication *settingsApp = nil;
+    for (NSRunningApplication *app in apps) {
+        if (app.isTerminated) {
+            continue;
+        }
+        if (!settingsApp || app.isActive) {
+            settingsApp = app;
+        }
+    }
+    if (!settingsApp) {
+        return state;
+    }
+
+    state.running = YES;
+    state.pid = settingsApp.processIdentifier;
+    state.hidden = settingsApp.isHidden;
+
+    NSRunningApplication *frontApp = NSWorkspace.sharedWorkspace.frontmostApplication;
+    state.frontmost = (frontApp != nil &&
+                       !frontApp.isTerminated &&
+                       (frontApp.processIdentifier == state.pid ||
+                        [frontApp.bundleIdentifier isEqualToString:kSystemSettingsBundleID]));
+
+    CFArrayRef winList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID
+    );
+    if (winList) {
+        NSArray *windows = CFBridgingRelease(winList);
+        CGRect bestCGRect = CGRectZero;
+        CGFloat bestArea = 0.0;
+        NSUInteger bestIndex = NSNotFound;
+
+        for (NSUInteger i = 0; i < windows.count; i++) {
+            NSDictionary *win = windows[i];
+            NSNumber *pidNum = win[(__bridge NSString *)kCGWindowOwnerPID];
+            if (!pidNum || pidNum.intValue != state.pid) {
+                continue;
+            }
+            NSNumber *layerNum = win[(__bridge NSString *)kCGWindowLayer];
+            if (layerNum && layerNum.intValue != 0) {
+                continue;
+            }
+            NSNumber *alphaNum = win[(__bridge NSString *)kCGWindowAlpha];
+            if (alphaNum && alphaNum.doubleValue <= 0.01) {
+                continue;
+            }
+            NSDictionary *boundsDict = win[(__bridge NSString *)kCGWindowBounds];
+            if (!boundsDict) {
+                continue;
+            }
+            CGRect cgRect = CGRectZero;
+            if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)boundsDict, &cgRect)) {
+                continue;
+            }
+            if (cgRect.size.width < 320.0 || cgRect.size.height < 280.0) {
+                continue;
+            }
+            CGFloat area = cgRect.size.width * cgRect.size.height;
+            if (area > bestArea) {
+                bestArea = area;
+                bestCGRect = cgRect;
+                bestIndex = i;
+            }
+        }
+
+        if (bestArea > 0.0 && bestIndex != NSNotFound) {
+            state.hasOnScreenWindow = YES;
+            state.hasAnyWindow = YES;
+            state.cgFrame = bestCGRect;
+            state.frame = fabushi_cg_to_cocoa_rect(bestCGRect);
+
+            NSPoint hudOrigin = fabushi_compute_hud_origin(state.frame, YES);
+            CGRect hudCGRect = fabushi_cocoa_to_cg_rect(
+                NSMakeRect(hudOrigin.x, hudOrigin.y, kHudWidth, kHudHeight)
+            );
+            CGFloat hudArea = kHudWidth * kHudHeight;
+
+            // CGWindowListCopyWindowInfo is ordered front-to-back; inspect any window in front of Settings.
+            for (NSUInteger i = 0; i < bestIndex; i++) {
+                NSDictionary *win = windows[i];
+                NSNumber *pidNum = win[(__bridge NSString *)kCGWindowOwnerPID];
+                if (!pidNum || pidNum.intValue == state.pid) {
+                    continue;
+                }
+                NSNumber *winNumObj = win[(__bridge NSString *)kCGWindowNumber];
+                if (hudWindowNumber != kCGNullWindowID && winNumObj &&
+                    (CGWindowID)winNumObj.unsignedIntValue == hudWindowNumber) {
+                    continue;
+                }
+                NSNumber *alphaNum = win[(__bridge NSString *)kCGWindowAlpha];
+                double alpha = alphaNum ? alphaNum.doubleValue : 1.0;
+                if (alpha <= 0.01) {
+                    continue;
+                }
+                NSNumber *layerNum = win[(__bridge NSString *)kCGWindowLayer];
+                int layer = layerNum ? layerNum.intValue : 0;
+                if (layer < 0 || layer > 8) {
+                    continue;
+                }
+                NSString *ownerName = win[(__bridge NSString *)kCGWindowOwnerName];
+                if (fabushi_is_system_chrome_window((pid_t)pidNum.intValue, ownerName)) {
+                    continue;
+                }
+                NSDictionary *boundsDict = win[(__bridge NSString *)kCGWindowBounds];
+                if (!boundsDict) {
+                    continue;
+                }
+                CGRect winRect = CGRectZero;
+                if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)boundsDict, &winRect)) {
+                    continue;
+                }
+                if (winRect.size.width < 40.0 || winRect.size.height < 40.0) {
+                    continue;
+                }
+
+                if (layer == 0) {
+                    if (CGRectIntersectsRect(winRect, hudCGRect) ||
+                        CGRectIntersectsRect(winRect, bestCGRect)) {
+                        state.coveredByOtherApp = YES;
+                        break;
+                    }
+                } else if (alpha >= 0.5 && CGRectIntersectsRect(winRect, hudCGRect)) {
+                    CGRect inter = CGRectIntersection(winRect, hudCGRect);
+                    CGFloat interArea = inter.size.width * inter.size.height;
+                    if (interArea >= hudArea * 0.30) {
+                        state.coveredByOtherApp = YES;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Distinguish minimized / hidden / other-Space window vs genuinely closed window.
+    if (!state.hasOnScreenWindow && !state.hidden) {
+        CFArrayRef allList = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID
+        );
+        if (allList) {
+            NSArray *allWindows = CFBridgingRelease(allList);
+            for (NSDictionary *win in allWindows) {
+                NSNumber *pidNum = win[(__bridge NSString *)kCGWindowOwnerPID];
+                if (!pidNum || pidNum.intValue != state.pid) {
+                    continue;
+                }
+                NSNumber *layerNum = win[(__bridge NSString *)kCGWindowLayer];
+                if (layerNum && layerNum.intValue != 0) {
+                    continue;
+                }
+                NSDictionary *boundsDict = win[(__bridge NSString *)kCGWindowBounds];
+                if (!boundsDict) {
+                    continue;
+                }
+                CGRect cgRect = CGRectZero;
+                if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)boundsDict, &cgRect)) {
+                    continue;
+                }
+                if (cgRect.size.width >= 200.0 && cgRect.size.height >= 160.0) {
+                    state.hasAnyWindow = YES;
+                    break;
+                }
+            }
+        }
+    }
+
+    return state;
+}
+
+static void fabushi_perform_with_appearance(NSView *view, void (^block)(void)) {
+    if (!block) {
+        return;
+    }
+    if (@available(macOS 11.0, *)) {
+        [view.effectiveAppearance performAsCurrentDrawingAppearance:block];
+    } else {
+        block();
+    }
+}
+
 @interface FabushiPermissionHudPanel : NSPanel
 @end
 
@@ -135,6 +326,110 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
 }
 @end
 
+@interface FabushiHudBorderOverlayView : NSView
+@end
+
+@implementation FabushiHudBorderOverlayView
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        self.wantsLayer = YES;
+        self.layer.cornerRadius = 16.0;
+        self.layer.borderWidth = 1.0;
+        [self refreshBorderColor];
+    }
+    return self;
+}
+
+- (void)refreshBorderColor {
+    fabushi_perform_with_appearance(self, ^{
+        self.layer.borderColor = [[NSColor separatorColor] colorWithAlphaComponent:0.55].CGColor;
+    });
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+    [super viewDidChangeEffectiveAppearance];
+    [self refreshBorderColor];
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+    (void)point;
+    return nil;
+}
+
+@end
+
+@interface FabushiHudCloseButton : NSButton
+@property (nonatomic, assign) BOOL hovered;
+@property (nonatomic, strong) NSTrackingArea *hoverTrackingArea;
+@end
+
+@implementation FabushiHudCloseButton
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        self.wantsLayer = YES;
+        self.layer.cornerRadius = frameRect.size.height * 0.5;
+        self.layer.masksToBounds = YES;
+        [self refreshHoverAppearance];
+    }
+    return self;
+}
+
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+    (void)event;
+    return YES;
+}
+
+- (BOOL)shouldDelayWindowOrderingForEvent:(NSEvent *)event {
+    (void)event;
+    return YES;
+}
+
+- (BOOL)mouseDownCanMoveWindow {
+    return NO;
+}
+
+- (void)refreshHoverAppearance {
+    fabushi_perform_with_appearance(self, ^{
+        CGFloat alpha = self.hovered ? 0.12 : 0.0;
+        self.layer.backgroundColor = [[NSColor labelColor] colorWithAlphaComponent:alpha].CGColor;
+    });
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+    [super viewDidChangeEffectiveAppearance];
+    [self refreshHoverAppearance];
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (self.hoverTrackingArea) {
+        [self removeTrackingArea:self.hoverTrackingArea];
+    }
+    NSTrackingAreaOptions opts =
+        NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect;
+    self.hoverTrackingArea =
+        [[NSTrackingArea alloc] initWithRect:self.bounds options:opts owner:self userInfo:nil];
+    [self addTrackingArea:self.hoverTrackingArea];
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    (void)event;
+    self.hovered = YES;
+    [self refreshHoverAppearance];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    (void)event;
+    self.hovered = NO;
+    [self refreshHoverAppearance];
+}
+
+@end
+
 @interface FabushiDraggableAppPillView : NSView <NSDraggingSource>
 @property (nonatomic, copy) NSString *appPath;
 @property (nonatomic, copy) NSString *appName;
@@ -143,6 +438,10 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
 @property (nonatomic, assign) BOOL dragging;
 @property (nonatomic, assign) NSPoint mouseDownLocal;
 @property (nonatomic, assign) NSPoint mouseDownScreen;
+@property (nonatomic, assign) NSRect cachedSettingsFrame;
+@property (nonatomic, assign) BOOL cachedSettingsFrameValid;
+@property (nonatomic, copy) void (^onDragCompleted)(void);
+@property (nonatomic, copy) void (^onDragEndedWithoutDrop)(void);
 @property (nonatomic, strong) NSImageView *iconView;
 @property (nonatomic, strong) NSTextField *nameLabel;
 @property (nonatomic, strong) NSTextField *hintLabel;
@@ -168,14 +467,14 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
         _nameLabel.font = [NSFont systemFontOfSize:13.5 weight:NSFontWeightSemibold];
         _nameLabel.textColor = [NSColor labelColor];
         _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        _nameLabel.frame = NSMakeRect(42.0, 9.0, 146.0, 20.0);
+        _nameLabel.frame = NSMakeRect(42.0, 9.0, 152.0, 20.0);
         [self addSubview:_nameLabel];
 
         _hintLabel = [NSTextField labelWithString:@"按住拖入"];
         _hintLabel.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightMedium];
         _hintLabel.textColor = [NSColor secondaryLabelColor];
         _hintLabel.alignment = NSTextAlignmentRight;
-        _hintLabel.frame = NSMakeRect(190.0, 10.0, frameRect.size.width - 200.0, 18.0);
+        _hintLabel.frame = NSMakeRect(198.0, 10.0, frameRect.size.width - 208.0, 18.0);
         [self addSubview:_hintLabel];
 
         [self refreshAppearance];
@@ -203,9 +502,12 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
 }
 
 - (void)refreshAppearance {
-    CGFloat fillAlpha = self.dragging ? 0.14 : (self.hovered ? 0.10 : 0.055);
-    self.layer.backgroundColor = [[NSColor labelColor] colorWithAlphaComponent:fillAlpha].CGColor;
-    self.layer.borderColor = [[NSColor separatorColor] colorWithAlphaComponent:self.hovered ? 0.65 : 0.35].CGColor;
+    fabushi_perform_with_appearance(self, ^{
+        CGFloat fillAlpha = self.dragging ? 0.14 : (self.hovered ? 0.10 : 0.055);
+        self.layer.backgroundColor = [[NSColor labelColor] colorWithAlphaComponent:fillAlpha].CGColor;
+        self.layer.borderColor =
+            [[NSColor separatorColor] colorWithAlphaComponent:self.hovered ? 0.65 : 0.35].CGColor;
+    });
 }
 
 - (void)viewDidChangeEffectiveAppearance {
@@ -218,8 +520,10 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
     if (self.trackingArea) {
         [self removeTrackingArea:self.trackingArea];
     }
-    NSTrackingAreaOptions opts = NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect;
-    self.trackingArea = [[NSTrackingArea alloc] initWithRect:self.bounds options:opts owner:self userInfo:nil];
+    NSTrackingAreaOptions opts =
+        NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect;
+    self.trackingArea =
+        [[NSTrackingArea alloc] initWithRect:self.bounds options:opts owner:self userInfo:nil];
     [self addTrackingArea:self.trackingArea];
 }
 
@@ -241,6 +545,10 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
         [[NSCursor arrowCursor] set];
     }
     [self refreshAppearance];
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+    return [super hitTest:point] ? self : nil;
 }
 
 - (BOOL)acceptsFirstMouse:(NSEvent *)event {
@@ -307,7 +615,13 @@ static NSPoint fabushi_compute_hud_origin(NSRect settingsFrame, BOOL hasSettings
 
     NSRect dragFrame = NSMakeRect(cur.x - 26.0, cur.y - 26.0, 52.0, 52.0);
     [item setDraggingFrame:dragFrame contents:dragIcon];
-    [self beginDraggingSessionWithItems:@[item] event:event source:self];
+    NSDraggingSession *session =
+        [self beginDraggingSessionWithItems:@[item] event:event source:self];
+    if (!session) {
+        self.dragging = NO;
+        [[NSCursor arrowCursor] set];
+        [self refreshAppearance];
+    }
 }
 
 - (NSDragOperation)draggingSession:(NSDraggingSession *)session
@@ -327,25 +641,32 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     [[NSCursor arrowCursor] set];
     [self refreshAppearance];
 
-    BOOL droppedIntoSettings = (operation != NSDragOperationNone);
-    if (!droppedIntoSettings) {
-        NSRect settingsFrame = NSZeroRect;
-        BOOL settingsRunning = NO;
-        if (fabushi_find_system_settings_frame(&settingsFrame, &settingsRunning) &&
-            NSPointInRect(screenPoint, settingsFrame)) {
-            droppedIntoSettings = YES;
-        }
-    }
-    if (!droppedIntoSettings) {
-        CGFloat ddx = screenPoint.x - self.mouseDownScreen.x;
-        CGFloat ddy = screenPoint.y - self.mouseDownScreen.y;
-        if (ddx * ddx + ddy * ddy > 1600.0) {
-            droppedIntoSettings = YES;
-        }
+    NSRect hudFrame = self.window ? self.window.frame : NSZeroRect;
+    BOOL droppedOutsideHud = !self.window || !NSPointInRect(screenPoint, hudFrame);
+
+    CGWindowID hudWinNum =
+        (self.window && self.window.windowNumber > 0)
+            ? (CGWindowID)self.window.windowNumber
+            : kCGNullWindowID;
+    FabushiSettingsWindowState st = fabushi_inspect_system_settings(hudWinNum);
+
+    BOOL hasSettingsFrame = st.hasOnScreenWindow || self.cachedSettingsFrameValid;
+    NSRect settingsFrame = st.hasOnScreenWindow ? st.frame : self.cachedSettingsFrame;
+
+    BOOL droppedIntoSettings = NO;
+    if (operation != NSDragOperationNone) {
+        droppedIntoSettings = YES;
+    } else if (droppedOutsideHud && hasSettingsFrame &&
+               NSPointInRect(screenPoint, NSInsetRect(settingsFrame, -24.0, -24.0))) {
+        droppedIntoSettings = YES;
     }
 
     if (droppedIntoSettings) {
-        atomic_fetch_add(&g_drag_event_seq, 1);
+        if (self.onDragCompleted) {
+            self.onDragCompleted();
+        }
+    } else if (self.onDragEndedWithoutDrop) {
+        self.onDragEndedWithoutDrop();
     }
 }
 
@@ -354,13 +675,16 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
 @interface FabushiPermissionHudController : NSObject
 @property (nonatomic, strong) FabushiPermissionHudPanel *panel;
 @property (nonatomic, strong) NSVisualEffectView *backdrop;
-@property (nonatomic, strong) NSView *borderOverlay;
+@property (nonatomic, strong) FabushiHudBorderOverlayView *borderOverlay;
 @property (nonatomic, strong) NSTextField *instructionLabel;
 @property (nonatomic, strong) FabushiDraggableAppPillView *pillView;
-@property (nonatomic, strong) NSTimer *anchorTimer;
-@property (nonatomic, assign) NSInteger anchorTicks;
+@property (nonatomic, strong) NSTimer *syncTimer;
+@property (nonatomic, assign) BOOL sessionActive;
+@property (nonatomic, assign) int32_t sessionKind;
 @property (nonatomic, assign) BOOL sawSettingsWindow;
-@property (nonatomic, assign) NSPoint lastAnchoredOrigin;
+@property (nonatomic, assign) NSTimeInterval missingWindowSince;
+@property (nonatomic, assign) NSTimeInterval sessionStartedAt;
+@property (nonatomic, assign) BOOL workspaceObserversRegistered;
 @end
 
 @implementation FabushiPermissionHudController
@@ -370,6 +694,7 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         instance = [[FabushiPermissionHudController alloc] init];
+        instance.sessionKind = -1;
     });
     return instance;
 }
@@ -387,18 +712,20 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
                       defer:NO];
     panel.floatingPanel = YES;
     panel.hidesOnDeactivate = NO;
-    panel.level = NSFloatingWindowLevel + 1;
+    panel.level = NSFloatingWindowLevel;
     panel.collectionBehavior =
-        NSWindowCollectionBehaviorCanJoinAllSpaces |
+        NSWindowCollectionBehaviorMoveToActiveSpace |
         NSWindowCollectionBehaviorFullScreenAuxiliary |
-        NSWindowCollectionBehaviorStationary;
+        NSWindowCollectionBehaviorTransient |
+        NSWindowCollectionBehaviorIgnoresCycle;
     panel.opaque = NO;
     panel.backgroundColor = [NSColor clearColor];
     panel.hasShadow = YES;
-    panel.movableByWindowBackground = YES;
+    panel.movableByWindowBackground = NO;
     panel.releasedWhenClosed = NO;
 
-    NSVisualEffectView *backdrop = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, kHudWidth, kHudHeight)];
+    NSVisualEffectView *backdrop =
+        [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, kHudWidth, kHudHeight)];
     backdrop.material = NSVisualEffectMaterialPopover;
     backdrop.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     backdrop.state = NSVisualEffectStateActive;
@@ -406,11 +733,8 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     backdrop.layer.cornerRadius = 16.0;
     backdrop.layer.masksToBounds = YES;
 
-    NSView *borderOverlay = [[NSView alloc] initWithFrame:backdrop.bounds];
-    borderOverlay.wantsLayer = YES;
-    borderOverlay.layer.cornerRadius = 16.0;
-    borderOverlay.layer.borderWidth = 1.0;
-    borderOverlay.layer.borderColor = [[NSColor separatorColor] colorWithAlphaComponent:0.55].CGColor;
+    FabushiHudBorderOverlayView *borderOverlay =
+        [[FabushiHudBorderOverlayView alloc] initWithFrame:backdrop.bounds];
     [backdrop addSubview:borderOverlay];
 
     // Up arrow icon matching Gemini HUD
@@ -418,9 +742,10 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     if (@available(macOS 11.0, *)) {
         NSImage *sym = [NSImage imageWithSystemSymbolName:@"arrow.up" accessibilityDescription:nil];
         if (sym) {
-            NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13.0 weight:NSFontWeightMedium];
+            NSImageSymbolConfiguration *cfg =
+                [NSImageSymbolConfiguration configurationWithPointSize:13.0 weight:NSFontWeightMedium];
             sym = [sym imageWithSymbolConfiguration:cfg];
-            NSImageView *iv = [[NSImageView alloc] initWithFrame:NSMakeRect(14.0, 74.0, 16.0, 18.0)];
+            NSImageView *iv = [[NSImageView alloc] initWithFrame:NSMakeRect(14.0, 80.0, 16.0, 18.0)];
             iv.image = sym;
             iv.contentTintColor = [NSColor secondaryLabelColor];
             arrowView = iv;
@@ -430,7 +755,7 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
         NSTextField *arrowLbl = [NSTextField labelWithString:@"↑"];
         arrowLbl.font = [NSFont systemFontOfSize:13.5 weight:NSFontWeightMedium];
         arrowLbl.textColor = [NSColor secondaryLabelColor];
-        arrowLbl.frame = NSMakeRect(14.0, 74.0, 16.0, 18.0);
+        arrowLbl.frame = NSMakeRect(14.0, 80.0, 16.0, 18.0);
         arrowView = arrowLbl;
     }
     [backdrop addSubview:arrowView];
@@ -443,11 +768,12 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     instruction.lineBreakMode = NSLineBreakByWordWrapping;
     instruction.selectable = NO;
     instruction.editable = NO;
-    instruction.frame = NSMakeRect(36.0, 58.0, 232.0, 42.0);
+    instruction.frame = NSMakeRect(36.0, 58.0, kHudWidth - 72.0, 42.0);
     [backdrop addSubview:instruction];
 
-    // Close button top-right
-    NSButton *closeBtn = [[NSButton alloc] initWithFrame:NSMakeRect(kHudWidth - 30.0, kHudHeight - 30.0, 22.0, 22.0)];
+    // Close button top-right (acceptsFirstMouse so single-click works without activating Fabushi)
+    FabushiHudCloseButton *closeBtn =
+        [[FabushiHudCloseButton alloc] initWithFrame:NSMakeRect(kHudWidth - 32.0, kHudHeight - 32.0, 22.0, 22.0)];
     closeBtn.bordered = NO;
     closeBtn.bezelStyle = NSBezelStyleRegularSquare;
     closeBtn.target = self;
@@ -455,7 +781,8 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     if (@available(macOS 11.0, *)) {
         NSImage *xSym = [NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:@"Close"];
         if (xSym) {
-            NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:10.5 weight:NSFontWeightSemibold];
+            NSImageSymbolConfiguration *cfg =
+                [NSImageSymbolConfiguration configurationWithPointSize:10.5 weight:NSFontWeightSemibold];
             closeBtn.image = [xSym imageWithSymbolConfiguration:cfg];
             closeBtn.contentTintColor = [NSColor secondaryLabelColor];
         } else {
@@ -469,6 +796,13 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     // Draggable app pill at bottom
     FabushiDraggableAppPillView *pill =
         [[FabushiDraggableAppPillView alloc] initWithFrame:NSMakeRect(14.0, 14.0, kHudWidth - 28.0, 38.0)];
+    __weak typeof(self) weakSelf = self;
+    pill.onDragCompleted = ^{
+        [weakSelf handleDragCompleted];
+    };
+    pill.onDragEndedWithoutDrop = ^{
+        [weakSelf syncWithSystemSettings];
+    };
     [backdrop addSubview:pill];
 
     panel.contentView = backdrop;
@@ -480,40 +814,220 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     self.pillView = pill;
 }
 
+- (void)registerWorkspaceObserversIfNeeded {
+    if (self.workspaceObserversRegistered) {
+        return;
+    }
+    NSNotificationCenter *wsCenter = NSWorkspace.sharedWorkspace.notificationCenter;
+    [wsCenter addObserver:self
+                 selector:@selector(handleWorkspaceDidActivateApp:)
+                     name:NSWorkspaceDidActivateApplicationNotification
+                   object:nil];
+    [wsCenter addObserver:self
+                 selector:@selector(handleWorkspaceDidDeactivateApp:)
+                     name:NSWorkspaceDidDeactivateApplicationNotification
+                   object:nil];
+    [wsCenter addObserver:self
+                 selector:@selector(handleWorkspaceDidHideApp:)
+                     name:NSWorkspaceDidHideApplicationNotification
+                   object:nil];
+    [wsCenter addObserver:self
+                 selector:@selector(handleWorkspaceDidUnhideApp:)
+                     name:NSWorkspaceDidUnhideApplicationNotification
+                   object:nil];
+    [wsCenter addObserver:self
+                 selector:@selector(handleWorkspaceDidTerminateApp:)
+                     name:NSWorkspaceDidTerminateApplicationNotification
+                   object:nil];
+    [wsCenter addObserver:self
+                 selector:@selector(handleWorkspaceActiveSpaceDidChange:)
+                     name:NSWorkspaceActiveSpaceDidChangeNotification
+                   object:nil];
+    self.workspaceObserversRegistered = YES;
+}
+
+- (void)runOnMain:(dispatch_block_t)block {
+    if (!block) {
+        return;
+    }
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
+}
+
+- (void)handleWorkspaceDidActivateApp:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    [self runOnMain:^{
+        if (!self.sessionActive || !self.panel) {
+            return;
+        }
+        if (self.pillView.dragging) {
+            return;
+        }
+        if (![app.bundleIdentifier isEqualToString:kSystemSettingsBundleID]) {
+            if (self.panel.isVisible) {
+                [self.panel orderOut:nil];
+            }
+            return;
+        }
+        [self syncWithSystemSettings];
+    }];
+}
+
+- (void)handleWorkspaceDidDeactivateApp:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    [self runOnMain:^{
+        if (!self.sessionActive || !self.panel) {
+            return;
+        }
+        if (self.pillView.dragging) {
+            return;
+        }
+        if ([app.bundleIdentifier isEqualToString:kSystemSettingsBundleID] && self.panel.isVisible) {
+            [self.panel orderOut:nil];
+        }
+    }];
+}
+
+- (void)handleWorkspaceDidHideApp:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    [self runOnMain:^{
+        if (!self.sessionActive || !self.panel) {
+            return;
+        }
+        if (self.pillView.dragging) {
+            return;
+        }
+        if ([app.bundleIdentifier isEqualToString:kSystemSettingsBundleID] && self.panel.isVisible) {
+            [self.panel orderOut:nil];
+        }
+    }];
+}
+
+- (void)handleWorkspaceDidUnhideApp:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    [self runOnMain:^{
+        if (!self.sessionActive || !self.panel) {
+            return;
+        }
+        if ([app.bundleIdentifier isEqualToString:kSystemSettingsBundleID]) {
+            [self syncWithSystemSettings];
+        }
+    }];
+}
+
+- (void)handleWorkspaceDidTerminateApp:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    [self runOnMain:^{
+        if (!self.sessionActive) {
+            return;
+        }
+        if ([app.bundleIdentifier isEqualToString:kSystemSettingsBundleID] && self.sawSettingsWindow) {
+            [self hideHud];
+        }
+    }];
+}
+
+- (void)handleWorkspaceActiveSpaceDidChange:(NSNotification *)notification {
+    (void)notification;
+    [self runOnMain:^{
+        if (!self.sessionActive || !self.panel) {
+            return;
+        }
+        if (self.pillView.dragging) {
+            return;
+        }
+        [self syncWithSystemSettings];
+    }];
+}
+
 - (void)handleUserClose:(id)sender {
     (void)sender;
     atomic_fetch_add(&g_user_closed_seq, 1);
     [self hideHud];
 }
 
-- (void)repositionIfAppropriate {
-    if (!self.panel || !self.panel.isVisible) {
+- (void)handleDragCompleted {
+    int32_t draggedKind = self.sessionActive ? self.sessionKind : atomic_load(&g_hud_kind);
+    if (draggedKind >= 0) {
+        atomic_store(&g_last_dragged_kind, draggedKind);
+    }
+    atomic_fetch_add(&g_drag_event_seq, 1);
+    [self hideHud];
+}
+
+- (void)syncWithSystemSettings {
+    if (!self.sessionActive || !self.panel) {
         return;
     }
-    NSRect settingsFrame = NSZeroRect;
-    BOOL settingsRunning = NO;
-    BOOL hasFrame = fabushi_find_system_settings_frame(&settingsFrame, &settingsRunning);
+    if (self.pillView.dragging) {
+        // Never hide or shift the HUD mid-drag.
+        return;
+    }
 
-    if (hasFrame) {
-        self.sawSettingsWindow = YES;
-        // Stop forcing position if the user manually dragged the HUD panel elsewhere
-        NSPoint currentOrigin = self.panel.frame.origin;
-        CGFloat movedDist = hypot(currentOrigin.x - self.lastAnchoredOrigin.x,
-                                  currentOrigin.y - self.lastAnchoredOrigin.y);
-        if (self.anchorTicks <= 10 || movedDist < 8.0) {
-            NSPoint nextOrigin = fabushi_compute_hud_origin(settingsFrame, YES);
-            if (hypot(nextOrigin.x - currentOrigin.x, nextOrigin.y - currentOrigin.y) > 2.0) {
-                [self.panel setFrameOrigin:nextOrigin];
-            }
-            self.lastAnchoredOrigin = nextOrigin;
+    CGWindowID hudWinNum =
+        (self.panel.windowNumber > 0) ? (CGWindowID)self.panel.windowNumber : kCGNullWindowID;
+    FabushiSettingsWindowState st = fabushi_inspect_system_settings(hudWinNum);
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+
+    if (self.sawSettingsWindow) {
+        if (!st.running) {
+            [self hideHud];
+            return;
         }
-    } else if (self.sawSettingsWindow && !settingsRunning) {
-        // System Settings was closed by user -> cleanly dismiss floating HUD
-        [self hideHud];
-        return;
+        if (!st.hasOnScreenWindow && !st.hidden && !st.hasAnyWindow) {
+            if (self.panel.isVisible) {
+                [self.panel orderOut:nil];
+            }
+            if (self.missingWindowSince <= 0.0) {
+                self.missingWindowSince = now;
+            } else if (now - self.missingWindowSince >= 0.40) {
+                // System Settings window was closed (not minimized, hidden, or on another Space).
+                [self hideHud];
+            }
+            return;
+        }
+        self.missingWindowSince = 0.0;
+    } else {
+        // Grace period while System Settings launches after clicking "Open in Settings".
+        if (now - self.sessionStartedAt > 30.0) {
+            [self hideHud];
+            return;
+        }
     }
 
-    self.anchorTicks += 1;
+    BOOL shouldShowOnScreen =
+        st.running &&
+        !st.hidden &&
+        st.frontmost &&
+        st.hasOnScreenWindow &&
+        !st.coveredByOtherApp;
+
+    if (shouldShowOnScreen) {
+        self.sawSettingsWindow = YES;
+        self.missingWindowSince = 0.0;
+        self.pillView.cachedSettingsFrame = st.frame;
+        self.pillView.cachedSettingsFrameValid = YES;
+
+        NSPoint nextOrigin = fabushi_compute_hud_origin(st.frame, YES);
+        NSPoint curOrigin = self.panel.frame.origin;
+        if (!self.panel.isVisible ||
+            fabs(nextOrigin.x - curOrigin.x) >= 1.0 ||
+            fabs(nextOrigin.y - curOrigin.y) >= 1.0) {
+            [self.panel setFrameOrigin:nextOrigin];
+        }
+        if (!self.panel.isVisible) {
+            [self.panel orderFrontRegardless];
+            [self.panel invalidateShadow];
+        }
+    } else {
+        if (self.panel.isVisible) {
+            [self.panel orderOut:nil];
+        }
+    }
 }
 
 - (void)showWithKind:(int32_t)kind
@@ -522,36 +1036,46 @@ sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
          instruction:(NSString *)instruction
             dragHint:(NSString *)dragHint {
     [self ensurePanel];
+    [self registerWorkspaceObserversIfNeeded];
 
     self.instructionLabel.stringValue = instruction ?: @"";
     [self.pillView updateWithAppName:appName appPath:appPath dragHint:dragHint];
+    self.pillView.cachedSettingsFrame = NSZeroRect;
+    self.pillView.cachedSettingsFrameValid = NO;
 
-    NSRect settingsFrame = NSZeroRect;
-    BOOL settingsRunning = NO;
-    BOOL hasFrame = fabushi_find_system_settings_frame(&settingsFrame, &settingsRunning);
-    NSPoint origin = fabushi_compute_hud_origin(settingsFrame, hasFrame);
-    [self.panel setFrameOrigin:origin];
-    self.lastAnchoredOrigin = origin;
-    self.sawSettingsWindow = hasFrame;
-    self.anchorTicks = 0;
+    self.sessionActive = YES;
+    self.sessionKind = kind;
+    self.sawSettingsWindow = NO;
+    self.missingWindowSince = 0.0;
+    self.sessionStartedAt = [NSDate timeIntervalSinceReferenceDate];
 
-    [self.panel orderFrontRegardless];
     atomic_store(&g_hud_kind, kind);
     atomic_store(&g_hud_visible, true);
 
-    [self.anchorTimer invalidate];
+    // Only order on-screen once System Settings is actually on-screen & frontmost (no corner flash).
+    [self syncWithSystemSettings];
+
+    [self.syncTimer invalidate];
     __weak typeof(self) weakSelf = self;
-    self.anchorTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
-                                                       repeats:YES
-                                                         block:^(NSTimer * _Nonnull timer) {
+    self.syncTimer = [NSTimer timerWithTimeInterval:0.10
+                                            repeats:YES
+                                              block:^(NSTimer * _Nonnull timer) {
         (void)timer;
-        [weakSelf repositionIfAppropriate];
+        [weakSelf syncWithSystemSettings];
     }];
+    [[NSRunLoop mainRunLoop] addTimer:self.syncTimer forMode:NSRunLoopCommonModes];
 }
 
 - (void)hideHud {
-    [self.anchorTimer invalidate];
-    self.anchorTimer = nil;
+    self.sessionActive = NO;
+    self.sessionKind = -1;
+    self.sawSettingsWindow = NO;
+    self.missingWindowSince = 0.0;
+    self.pillView.cachedSettingsFrame = NSZeroRect;
+    self.pillView.cachedSettingsFrameValid = NO;
+
+    [self.syncTimer invalidate];
+    self.syncTimer = nil;
     if (self.panel) {
         [self.panel orderOut:nil];
     }
@@ -568,45 +1092,51 @@ void fabushi_permission_hud_show(
     const char *instruction_text,
     const char *drag_hint_text
 ) {
-    NSString *nsAppName = app_name ? [NSString stringWithUTF8String:app_name] : @"Fabushi";
-    NSString *nsAppPath = app_path ? [NSString stringWithUTF8String:app_path] : @"";
-    NSString *nsInstruction = instruction_text ? [NSString stringWithUTF8String:instruction_text] : @"";
-    NSString *nsHint = drag_hint_text ? [NSString stringWithUTF8String:drag_hint_text] : @"";
+    @autoreleasepool {
+        uint64_t gen = atomic_fetch_add(&g_hud_command_gen, 1) + 1;
+        NSString *nsAppName = app_name ? [NSString stringWithUTF8String:app_name] : @"Fabushi";
+        NSString *nsAppPath = app_path ? [NSString stringWithUTF8String:app_path] : @"";
+        NSString *nsInstruction = instruction_text ? [NSString stringWithUTF8String:instruction_text] : @"";
+        NSString *nsHint = drag_hint_text ? [NSString stringWithUTF8String:drag_hint_text] : @"";
 
-    dispatch_block_t work = ^{
-        @autoreleasepool {
-            if (!NSApp) {
-                return;
+        dispatch_block_t work = ^{
+            @autoreleasepool {
+                if (!NSApp || atomic_load(&g_hud_command_gen) != gen) {
+                    return;
+                }
+                [[FabushiPermissionHudController shared] showWithKind:kind
+                                                              appName:nsAppName
+                                                              appPath:nsAppPath
+                                                          instruction:nsInstruction
+                                                             dragHint:nsHint];
             }
-            [[FabushiPermissionHudController shared] showWithKind:kind
-                                                          appName:nsAppName
-                                                          appPath:nsAppPath
-                                                      instruction:nsInstruction
-                                                         dragHint:nsHint];
-        }
-    };
+        };
 
-    if ([NSThread isMainThread]) {
-        work();
-    } else {
-        dispatch_async(dispatch_get_main_queue(), work);
+        if ([NSThread isMainThread]) {
+            work();
+        } else {
+            dispatch_async(dispatch_get_main_queue(), work);
+        }
     }
 }
 
 void fabushi_permission_hud_hide(void) {
-    dispatch_block_t work = ^{
-        @autoreleasepool {
-            if (!NSApp) {
-                return;
+    @autoreleasepool {
+        uint64_t gen = atomic_fetch_add(&g_hud_command_gen, 1) + 1;
+        dispatch_block_t work = ^{
+            @autoreleasepool {
+                if (!NSApp || atomic_load(&g_hud_command_gen) != gen) {
+                    return;
+                }
+                [[FabushiPermissionHudController shared] hideHud];
             }
-            [[FabushiPermissionHudController shared] hideHud];
-        }
-    };
+        };
 
-    if ([NSThread isMainThread]) {
-        work();
-    } else {
-        dispatch_async(dispatch_get_main_queue(), work);
+        if ([NSThread isMainThread]) {
+            work();
+        } else {
+            dispatch_async(dispatch_get_main_queue(), work);
+        }
     }
 }
 
@@ -620,6 +1150,10 @@ int32_t fabushi_permission_hud_active_kind(void) {
 
 uint64_t fabushi_permission_hud_drag_event_seq(void) {
     return atomic_load(&g_drag_event_seq);
+}
+
+int32_t fabushi_permission_hud_last_dragged_kind(void) {
+    return atomic_load(&g_last_dragged_kind);
 }
 
 uint64_t fabushi_permission_hud_user_closed_seq(void) {

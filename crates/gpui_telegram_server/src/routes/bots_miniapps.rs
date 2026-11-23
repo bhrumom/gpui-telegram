@@ -5023,12 +5023,27 @@ pub fn render_miniapp_html(
     schema: &MiniAppUiSchema,
     initial_state: &Value,
 ) -> String {
-    let schema_json = serde_json::to_string(schema).unwrap_or_else(|_| "{}".into());
-    let state_json = serde_json::to_string(initial_state).unwrap_or_else(|_| "{}".into());
-    let init_data_escaped = serde_json::to_string(init_data_raw).unwrap_or_else(|_| "\"\"".into());
+    let schema_json = escape_json_for_inline_script(
+        &serde_json::to_string(schema).unwrap_or_else(|_| "{}".into()),
+    );
+    let state_json = escape_json_for_inline_script(
+        &serde_json::to_string(initial_state).unwrap_or_else(|_| "{}".into()),
+    );
+    let init_data_escaped = escape_json_for_inline_script(
+        &serde_json::to_string(init_data_raw).unwrap_or_else(|_| "\"\"".into()),
+    );
     let app_title_escaped = html_escape(&app.title);
     let bot_un_escaped = html_escape(&bot.username);
     let short_escaped = html_escape(&app.short_name);
+    let title_js = escape_json_for_inline_script(
+        &serde_json::to_string(&app.title).unwrap_or_else(|_| "\"\"".into()),
+    );
+    let bot_un_at_js = escape_json_for_inline_script(
+        &serde_json::to_string(&format!("@{}", bot.username)).unwrap_or_else(|_| "\"@\"".into()),
+    );
+    let icon_js = escape_json_for_inline_script(
+        &serde_json::to_string(&app.icon_emoji).unwrap_or_else(|_| "\"\"".into()),
+    );
 
     format!(
         r#"<!DOCTYPE html>
@@ -5123,7 +5138,18 @@ pub fn render_miniapp_html(
       root.innerHTML = '';
       const hdr = document.createElement('div');
       hdr.className = 'hdr';
-      hdr.innerHTML = '<div class="hdr-icon">{icon}</div><div><h1>' + (SCHEMA.title || '{title}') + '</h1><p>' + (SCHEMA.subtitle || '@{bot_un}') + '</p></div>';
+      const iconDiv = document.createElement('div');
+      iconDiv.className = 'hdr-icon';
+      iconDiv.textContent = {icon_js};
+      const metaDiv = document.createElement('div');
+      const h1 = document.createElement('h1');
+      h1.textContent = SCHEMA.title || {title_js};
+      const p = document.createElement('p');
+      p.textContent = SCHEMA.subtitle || {bot_un_at_js};
+      metaDiv.appendChild(h1);
+      metaDiv.appendChild(p);
+      hdr.appendChild(iconDiv);
+      hdr.appendChild(metaDiv);
       root.appendChild(hdr);
       (SCHEMA.widgets || []).forEach(w => {{
         const card = document.createElement('div'); card.className = 'card';
@@ -5180,11 +5206,47 @@ pub fn render_miniapp_html(
         bot_un = bot_un_escaped,
         bot_uid = bot.bot_user_id,
         short = short_escaped,
-        icon = html_escape(&app.icon_emoji),
+        icon_js = icon_js,
+        title_js = title_js,
+        bot_un_at_js = bot_un_at_js,
         init_data_escaped = init_data_escaped,
         schema_json = schema_json,
         state_json = state_json,
     )
+}
+
+pub(crate) fn escape_json_for_inline_script(json: &str) -> String {
+    json.replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+pub(crate) fn sanitize_css_color(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(hex) = trimmed.strip_prefix('#') {
+        if matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(format!("#{}", hex.to_ascii_lowercase()));
+        }
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "white" | "black" | "transparent" | "bg_color" | "secondary_bg_color" => {
+            if lower == "bg_color" {
+                Some("#ffffff".to_string())
+            } else if lower == "secondary_bg_color" {
+                Some("#f4f6f9".to_string())
+            } else {
+                Some(lower)
+            }
+        }
+        _ => None,
+    }
 }
 
 fn html_escape(input: &str) -> String {
@@ -6952,6 +7014,7 @@ pub async fn serve_miniapp_html(
       var pendingInvokes = [];
       var pendingPromises = {{}};
       var fallbackTimer = null;
+      var readyPingTimer = null;
 
       function postBridge(eventType, data) {{
         try {{
@@ -6986,6 +7049,24 @@ pub async fn serve_miniapp_html(
           }} catch (_) {{}}
         }}
         pendingInvokes.push(msg);
+        if (frame.contentWindow && !readyPingTimer) {{
+          readyPingTimer = setTimeout(function() {{
+            readyPingTimer = null;
+            if (!iframeReady && pendingInvokes.length && frame.contentWindow) {{
+              try {{
+                frame.contentWindow.postMessage({{ type: 'gpui_webmcp_ping_ready' }}, '*');
+              }} catch (_) {{}}
+              if (!fallbackTimer) {{
+                fallbackTimer = setTimeout(function() {{
+                  fallbackTimer = null;
+                  if (!iframeReady && pendingInvokes.length && frame.contentWindow) {{
+                    flushPendingInvokes();
+                  }}
+                }}, 800);
+              }}
+            }}
+          }}, 40);
+        }}
       }}
 
       function flushPendingInvokes() {{
@@ -7083,6 +7164,7 @@ pub async fn serve_miniapp_html(
           }} else if (d.type === 'gpui_webmcp_ready' || d.type === 'webmcp_ready') {{
             iframeReady = true;
             if (fallbackTimer) {{ clearTimeout(fallbackTimer); fallbackTimer = null; }}
+            if (readyPingTimer) {{ clearTimeout(readyPingTimer); readyPingTimer = null; }}
             if (d.url) iframeUrl = String(d.url);
             if (Array.isArray(d.tools)) iframeTools = d.tools;
             if (d.state_summary && typeof d.state_summary === 'object') iframeStateSummary = d.state_summary;
@@ -7144,13 +7226,12 @@ pub async fn serve_miniapp_html(
 </html>"#,
             title = html_escape(&app.title),
             bot_un = html_escape(&bot.username),
-            init_escaped = serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into()),
+            init_escaped = escape_json_for_inline_script(
+                &serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into()),
+            ),
             bot_uid = bot.bot_user_id,
-            bg = if app.background_color.trim().is_empty() {
-                "#ffffff"
-            } else {
-                app.background_color.trim()
-            },
+            bg = sanitize_css_color(&app.background_color)
+                .unwrap_or_else(|| "#ffffff".to_string()),
             iframe_src = html_escape(&iframe_src),
         );
         return (StatusCode::OK, Html(html)).into_response();
@@ -7162,7 +7243,9 @@ pub async fn serve_miniapp_html(
         .ok()
         .flatten();
     if let Some(bundle_html) = hosted_bundle {
-        let init_escaped = serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into());
+        let init_escaped = escape_json_for_inline_script(
+            &serde_json::to_string(&init_data).unwrap_or_else(|_| "\"\"".into()),
+        );
         let has_tg_sdk = bundle_html.contains("/js/telegram-web-app.js");
         let inject_init = format!(
             r#"<script>window.__TG_INIT_DATA__ = {}; window.__TG_BOT_ID__ = {};</script>"#,

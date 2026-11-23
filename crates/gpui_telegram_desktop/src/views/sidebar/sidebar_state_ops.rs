@@ -282,8 +282,6 @@ impl ChatSidebar {
         if f.exclude_archived && self.archived_ids.contains(&d.id) {
             return false;
         }
-        let lower = d.peer_name.to_lowercase();
-        let is_bot = self.bot_ids.contains(&d.id) || d.folder == "Bots" || lower.ends_with("bot");
         let is_channel = self.channel_chat_ids.contains(&d.id) || d.folder == "Channels";
         let is_group = !is_channel
             && (self.group_chat_ids.contains(&d.id) || d.folder == "Groups" || d.folder == "Work");
@@ -291,6 +289,10 @@ impl ChatSidebar {
             || d.peer_name == "Saved Messages"
             || d.peer_name == "已保存消息"
             || d.peer_name == "收藏夹";
+        let is_bot = !is_channel
+            && !is_group
+            && !is_saved
+            && (self.bot_ids.contains(&d.id) || d.folder == "Bots");
         let is_direct = !is_bot && !is_channel && !is_group && !is_saved;
         let is_contact =
             is_direct && (self.contact_chat_ids.contains(&d.id) || d.folder == "Personal");
@@ -1273,7 +1275,6 @@ impl ChatSidebar {
     }
 
     pub fn dialog_meta(&self, item: &DialogItemModel) -> SidebarDialogMeta {
-        let lower = item.peer_name.to_lowercase();
         let topics = self.forum_topics.get(&item.id).cloned();
         let mut folder_tags = Vec::new();
         if self.folder_tags_enabled {
@@ -1300,18 +1301,37 @@ impl ChatSidebar {
                 folder_tags.push(localized);
             }
         }
-        let fabushi_vis = self.bot_fabushi_visuals.get(&item.id).cloned();
-        let grok_avatar = self.bot_grok_avatars.get(&item.id).cloned();
+        let is_channel = self.channel_chat_ids.contains(&item.id) || item.folder == "Channels";
+        let is_group = !is_channel
+            && (self.group_chat_ids.contains(&item.id)
+                || item.folder == "Groups"
+                || item.folder == "Work");
+        let is_saved_messages = self.saved_messages_id == Some(item.id)
+            || item.peer_name == "Saved Messages"
+            || item.peer_name == "已保存消息"
+            || item.peer_name == "收藏夹";
+        let is_bot = !is_channel
+            && !is_group
+            && !is_saved_messages
+            && (self.bot_ids.contains(&item.id) || item.folder == "Bots");
+        let fabushi_vis = if is_bot {
+            self.bot_fabushi_visuals.get(&item.id).cloned()
+        } else {
+            None
+        };
+        let grok_avatar = if is_bot {
+            self.bot_grok_avatars.get(&item.id).cloned()
+        } else {
+            None
+        };
         SidebarDialogMeta {
             is_verified: self.verified_ids.contains(&item.id),
             is_premium: self.premium_ids.contains(&item.id),
-            is_bot: self.bot_ids.contains(&item.id) || item.folder == "Bots" || lower.ends_with("bot"),
+            is_bot,
             fabushi_shape: fabushi_vis.as_ref().map(|(s, _)| s.clone()),
             fabushi_color: fabushi_vis.as_ref().map(|(_, c)| *c),
             grok_avatar,
-            is_saved_messages: self.saved_messages_id == Some(item.id)
-                || item.peer_name == "Saved Messages"
-                || item.peer_name == "已保存消息",
+            is_saved_messages,
             is_unread_marked: self.unread_marked_ids.contains(&item.id),
             is_archived: self.archived_ids.contains(&item.id),
             draft_text: self.drafts.get(&item.id).cloned(),

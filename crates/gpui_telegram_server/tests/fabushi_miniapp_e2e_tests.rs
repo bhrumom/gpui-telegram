@@ -603,6 +603,21 @@ global.window.parent = global.window;
   const [resA, resB] = await Promise.all([pA, pB]);
   assert.strictEqual(resA.result.id, 'a');
   assert.strictEqual(resB.result.id, 'b');
+
+  // 7. Post-load + post-unready invoke recovers cleanly via async gpui_webmcp_ping_ready
+  onMsg({{ source: mockFrameWin, data: {{ type: 'gpui_webmcp_unready', url: 'https://miniapp.acme.example/app' }} }});
+  for (const fn of (frameListeners.load || [])) fn();
+  const prevCount = postedToFrame.length;
+  const pLate = global.window.__GPUI_WEBMCP__.invoke('req_late', 'call_tool', 'fabushi_send_dharma', {{}});
+  await new Promise(r => setTimeout(r, 90));
+  const pingMsgs = postedToFrame.slice(prevCount).filter(x => x.msg && x.msg.type === 'gpui_webmcp_ping_ready');
+  assert(pingMsgs.length >= 1, 'expected gpui_webmcp_ping_ready recovery message');
+  onMsg({{ source: mockFrameWin, data: {{ type: 'gpui_webmcp_ready', url: 'https://miniapp.acme.example/app', tools: [] }} }});
+  onMsg({{ source: mockFrameWin, data: {{ type: 'gpui_webmcp_response', payload: {{ request_id: 'req_late', ok: true, result: {{ late: true }} }} }} }});
+  const resLate = await pLate;
+  assert.strictEqual(resLate.ok, true);
+  assert.strictEqual(resLate.result.late, true);
+
   process.exit(0);
 }})().catch(err => {{ console.error(err); process.exit(1); }});
 "#,
@@ -622,4 +637,89 @@ global.window.parent = global.window;
             );
         }
     }
+}
+
+#[tokio::test]
+async fn tier5_miniapp_html_sanitizes_background_color_and_schema_xss() {
+    let (_dir, _state, router) = boot_temp_server("tier5_miniapp_xss");
+    let (_alice_uid, alice_token) = register_user(&router, "alice_xss_guard").await;
+
+    let (st_bot, bot_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/bots",
+        Some(&alice_token),
+        Some(json!({
+            "username": "xss_probe_bot",
+            "display_name": "XSS Probe Bot",
+            "description": "XSS sanitization test",
+            "about": "XSS test"
+        })),
+    )
+    .await;
+    assert_eq!(st_bot, StatusCode::CREATED, "create bot: {bot_val}");
+    let bot_token = bot_val["bot_token"].as_str().unwrap().to_string();
+
+    // 1. External Mini App with malicious background_color CSS/script breakout
+    let (st_ext, _) = http_json(
+        &router,
+        "POST",
+        &format!("/bot{bot_token}/publishMiniApp"),
+        None,
+        Some(json!({
+            "short_name": "ext",
+            "title": "Ext Portal",
+            "web_url": "https://miniapp.acme.example/app",
+            "background_color": "#fff;}</style><script>window.__xss_bg=1</script><style>"
+        })),
+    )
+    .await;
+    assert_eq!(st_ext, StatusCode::OK);
+
+    let (st_ext_html, ext_bytes) = http_raw(&router, "GET", "/miniapps/xss_probe_bot/ext", None, None).await;
+    assert_eq!(st_ext_html, StatusCode::OK);
+    let ext_html = String::from_utf8(ext_bytes).expect("utf8");
+    assert!(
+        !ext_html.contains("__xss_bg"),
+        "malicious background_color payload must be stripped: {ext_html}"
+    );
+    assert!(
+        ext_html.contains("background: #ffffff;"),
+        "invalid background_color must fall back to #ffffff"
+    );
+
+    // 2. Schema Mini App with </script> breakout and <img onerror=...> payload
+    let (st_sch, _) = http_json(
+        &router,
+        "POST",
+        &format!("/bot{bot_token}/publishMiniApp"),
+        None,
+        Some(json!({
+            "short_name": "sch",
+            "title": "Schema App",
+            "ui_schema": {
+                "title": "</script><script>window.__xss_schema=1</script>",
+                "subtitle": "<img src=x onerror=window.__xss_sub=1>",
+                "widgets": []
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st_sch, StatusCode::OK);
+
+    let (st_sch_html, sch_bytes) = http_raw(&router, "GET", "/miniapps/xss_probe_bot/sch", None, None).await;
+    assert_eq!(st_sch_html, StatusCode::OK);
+    let sch_html = String::from_utf8(sch_bytes).expect("utf8");
+    assert!(
+        !sch_html.contains("</script><script>window.__xss_schema"),
+        "schema JSON must escape < and > inside inline script"
+    );
+    assert!(
+        sch_html.contains("\\u003c/script\\u003e"),
+        "schema JSON must unicode-escape script tags"
+    );
+    assert!(
+        !sch_html.contains("hdr.innerHTML"),
+        "renderApp must use textContent instead of innerHTML"
+    );
 }

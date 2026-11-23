@@ -47,6 +47,7 @@ impl BotKeyboardButton {
 }
 
 /// Authentic BotKeyboard component state.
+#[derive(Debug, Clone)]
 pub struct BotKeyboard {
     pub rows: Vec<Vec<BotKeyboardButton>>,
     pub placeholder: Option<String>,
@@ -118,6 +119,14 @@ impl BotKeyboard {
             h.max(self.max_outer_height)
         } else {
             h.min(self.max_outer_height)
+        }
+    }
+
+    pub fn effective_height(&self) -> f32 {
+        if self.rows.is_empty() {
+            0.0
+        } else {
+            self.calculated_height()
         }
     }
 

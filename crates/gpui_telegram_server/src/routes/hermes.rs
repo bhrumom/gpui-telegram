@@ -1676,7 +1676,14 @@ fn looks_like_fabricated_webmcp_success(answer: &str) -> bool {
         "已提交",
         "已成功",
         "已完成",
-        "已为您",
+        "已为您完成",
+        "已为您发起",
+        "已为您发送",
+        "已为您提交",
+        "已为您执行",
+        "已为您处理",
+        "已为您创建",
+        "已为您更新",
         "正在向",
         "实时传输状态",
         "传输中",
@@ -2090,28 +2097,27 @@ impl StreamConsumerState {
             .iter()
             .filter(|step| match step.tool_name.as_str() {
                 "webmcp_call_tool" => {
-                    if step.status == StepStatus::Err {
-                        let is_readonly = matches!(
-                            step.webmcp_subtool.as_deref(),
-                            Some("get_state" | "page_inspect")
-                        );
-                        if is_readonly {
-                            return false;
-                        }
+                    let is_readonly = matches!(
+                        step.webmcp_subtool.as_deref(),
+                        Some("get_state" | "page_inspect")
+                    );
+                    if is_readonly {
+                        return false;
+                    }
+                    if step.status == StepStatus::Err || step.page_error.is_some() {
                         let later_ok = self.tool_steps.iter().any(|s| {
                             s.idx > step.idx
                                 && s.tool_name == "webmcp_call_tool"
                                 && s.status == StepStatus::Ok
-                                && s.webmcp_subtool == step.webmcp_subtool
+                                && s.page_error.is_none()
+                                && !matches!(
+                                    s.webmcp_subtool.as_deref(),
+                                    Some("get_state" | "page_inspect")
+                                )
+                                && (step.webmcp_subtool.is_none()
+                                    || s.webmcp_subtool == step.webmcp_subtool)
                         });
                         !later_ok
-                    } else if step.page_error.is_some() {
-                        !self.tool_steps.iter().any(|s| {
-                            s.idx > step.idx
-                                && s.tool_name.starts_with("webmcp_")
-                                && s.status == StepStatus::Ok
-                                && s.page_error.is_none()
-                        })
                     } else {
                         false
                     }
@@ -8606,5 +8612,55 @@ mod tests {
                 "expected honest failure preservation for: {honest}"
             );
         }
+    }
+
+    #[test]
+    fn tier5_failure_guard_ignores_yiweinin_explanation_and_readonly_page_error_masking() {
+        // 1. Honest explanation containing "已为您..." must NOT trigger fabricated-success guard
+        assert!(
+            !looks_like_fabricated_webmcp_success("已为您排查错误：工具未注册，操作失败"),
+            "honest diagnostic starting with '已为您' must not be treated as fabricated success"
+        );
+
+        // 2. A mutating webmcp_call_tool step with page_error MUST NOT be masked by a later read-only get_state
+        let mut consumer = StreamConsumerState::new();
+        consumer.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "tc_mut".into(),
+            tool_name: "webmcp_call_tool".into(),
+            arguments: r#"{"tool_name":"fabushi_send_dharma"}"#.into(),
+        });
+        consumer.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "tc_mut".into(),
+            tool_name: "webmcp_call_tool".into(),
+            success: true,
+            output: r#"{"ok":false,"page_error":"小程序内部异常"}"#.into(),
+            duration_ms: 12,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        consumer.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "tc_ro".into(),
+            tool_name: "webmcp_call_tool".into(),
+            arguments: r#"{"tool_name":"get_state"}"#.into(),
+        });
+        consumer.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "tc_ro".into(),
+            tool_name: "webmcp_call_tool".into(),
+            success: true,
+            output: r#"{"ok":true,"state":{}}"#.into(),
+            duration_ms: 8,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        let unresolved = consumer.unresolved_critical_webmcp_failures();
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "read-only get_state must NOT clear prior mutating tool's page_error"
+        );
+        assert_eq!(
+            unresolved[0].webmcp_subtool.as_deref(),
+            Some("fabushi_send_dharma")
+        );
     }
 }

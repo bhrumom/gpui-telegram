@@ -144,10 +144,12 @@ impl AppShell {
                 } else if let Some(pid) = self.current_peer_user_id(cx) {
                     self.start_webrtc_call(pid, name, false, cx);
                 } else {
-                    self.window_runtime.enqueue_toast(
-                        tr_str(lang, "请选择私聊用户或机器人对话", "Select a direct peer or bot chat"),
-                        2600,
-                    );
+                    let msg = tr_str(lang, "请选择私聊用户或机器人对话", "Select a direct peer or bot chat");
+                    if let Some(cid) = active_chat {
+                        self.show_chat_toast(cid, msg, 2600, cx);
+                    } else {
+                        self.show_toast(msg, 2600, cx);
+                    }
                 }
             }
             InspectorAction::StartVideoCall(name) => {
@@ -156,10 +158,12 @@ impl AppShell {
                 } else if let Some(pid) = self.current_peer_user_id(cx) {
                     self.start_webrtc_call(pid, name, true, cx);
                 } else {
-                    self.window_runtime.enqueue_toast(
-                        tr_str(lang, "请选择私聊用户或机器人对话", "Select a direct peer or bot chat"),
-                        2600,
-                    );
+                    let msg = tr_str(lang, "请选择私聊用户或机器人对话", "Select a direct peer or bot chat");
+                    if let Some(cid) = active_chat {
+                        self.show_chat_toast(cid, msg, 2600, cx);
+                    } else {
+                        self.show_toast(msg, 2600, cx);
+                    }
                 }
             }
             InspectorAction::CopyText(txt) => {
@@ -316,28 +320,36 @@ impl AppShell {
                                         });
                                         shell.sync_composer_mention_candidates(cid, None, cx);
                                     }
-                                    shell.window_runtime.enqueue_toast(
-                                        tr_str(
-                                            &lang_owned,
-                                            "已添加成员到当前群聊",
-                                            "Added member to group",
-                                        ),
-                                        2200,
-                                    );
-                                }
-                                Err(e) => {
-                                    shell.window_runtime.enqueue_toast(
-                                        format!(
-                                            "{}: {}",
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(
+                                            cid,
                                             tr_str(
                                                 &lang_owned,
-                                                "添加成员失败",
-                                                "Failed to add member"
+                                                "已添加成员到当前群聊",
+                                                "Added member to group",
                                             ),
-                                            e
-                                        ),
-                                        2600,
-                                    );
+                                            2200,
+                                            cx,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(
+                                            cid,
+                                            format!(
+                                                "{}: {}",
+                                                tr_str(
+                                                    &lang_owned,
+                                                    "添加成员失败",
+                                                    "Failed to add member"
+                                                ),
+                                                e
+                                            ),
+                                            2600,
+                                            cx,
+                                        );
+                                    }
                                 }
                             }
                             cx.notify();
@@ -456,6 +468,11 @@ impl AppShell {
                     };
                     let bot_un = app.bot_username.clone();
                     let short = app.short_name.clone();
+                    let target_cid = app
+                        .direct_chat_id
+                        .and_then(|v| u64::try_from(v).ok())
+                        .filter(|&id| id > 0)
+                        .or(active_chat);
                     cx.spawn(async move |weak: WeakEntity<Self>, app_cx: &mut AsyncApp| {
                         let res = if in_attach_now {
                             client.uninstall_mini_app(&bot_un, &short).await
@@ -468,7 +485,13 @@ impl AppShell {
                             }
                             if let Ok(r) = res {
                                 if let Some(t) = r.toast {
-                                    shell.window_runtime.enqueue_toast(t, 2200);
+                                    if let Some(cid) = target_cid {
+                                        if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                            shell.show_chat_toast(cid, t, 2200, cx);
+                                        }
+                                    } else {
+                                        shell.show_toast(t, 2200, cx);
+                                    }
                                 }
                                 shell.refresh_miniapps_catalog(None, cx);
                             }
@@ -476,10 +499,16 @@ impl AppShell {
                     })
                     .detach();
                 } else {
-                    self.window_runtime.enqueue_toast(
-                        tr_str(lang, "该机器人暂未绑定可安装的小程序", "No Mini App available for this bot"),
-                        2200,
+                    let msg = tr_str(
+                        lang,
+                        "该机器人暂未绑定可安装的小程序",
+                        "No Mini App available for this bot",
                     );
+                    if let Some(cid) = active_chat {
+                        self.show_chat_toast(cid, msg, 2200, cx);
+                    } else {
+                        self.show_toast(msg, 2200, cx);
+                    }
                 }
             }
             InspectorAction::RunBotCommand(cmd) => {
@@ -579,6 +608,7 @@ impl AppShell {
                         i.close();
                         icx.notify();
                     });
+                    self.enter_compose_or_modal_isolation(cx);
                     self.composer.update(cx, |c, ccx| {
                         c.is_input_focused = false;
                         ccx.notify();
@@ -594,11 +624,14 @@ impl AppShell {
                         );
                         sb_cx.notify();
                     });
+                    self.sync_compose_state_to_composer(true, cx);
                 } else {
-                    self.window_runtime.enqueue_toast(
-                        tr_str(lang, "未能识别该 Bot 信息", "Unable to resolve bot identity"),
-                        2200,
-                    );
+                    let msg = tr_str(lang, "未能识别该 Bot 信息", "Unable to resolve bot identity");
+                    if let Some(cid) = active_chat {
+                        self.show_chat_toast(cid, msg, 2200, cx);
+                    } else {
+                        self.show_toast(msg, 2200, cx);
+                    }
                 }
             }
             InspectorAction::ReportBot(_bot_id) => {
@@ -627,6 +660,7 @@ impl AppShell {
                 };
                 let client = self.client.clone();
                 let lang_owned = lang.to_string();
+                let target_cid = active_chat;
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     let res = client.patch_fabushi_bot(bot_id, &req).await;
                     let _ = weak.update(app, |shell, cx| {
@@ -652,16 +686,32 @@ impl AppShell {
                                 }
                                 shell.sync_fabushi_bots_to_views(cx);
                                 shell.refresh_miniapps_catalog(None, cx);
-                                shell.window_runtime.enqueue_toast(
-                                    tr_str(&lang_owned, "已更新 Fabushi 智能体配置", "Updated Fabushi bot settings"),
-                                    1800,
+                                let msg = tr_str(
+                                    &lang_owned,
+                                    "已更新 Fabushi 智能体配置",
+                                    "Updated Fabushi bot settings",
                                 );
+                                if let Some(cid) = target_cid {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, msg, 1800, cx);
+                                    }
+                                } else {
+                                    shell.show_toast(msg, 1800, cx);
+                                }
                             }
                             Err(e) => {
-                                shell.window_runtime.enqueue_toast(
-                                    format!("{}: {}", tr_str(&lang_owned, "更新失败", "Update failed"), e),
-                                    2600,
+                                let msg = format!(
+                                    "{}: {}",
+                                    tr_str(&lang_owned, "更新失败", "Update failed"),
+                                    e
                                 );
+                                if let Some(cid) = target_cid {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, msg, 2600, cx);
+                                    }
+                                } else {
+                                    shell.show_toast(msg, 2600, cx);
+                                }
                             }
                         }
                         cx.notify();
@@ -671,6 +721,164 @@ impl AppShell {
             }
         }
         cx.notify();
+    }
+
+    /// Shared cleanup for leaving or deleting a chat across both modal confirmation and sidebar
+    /// context-menu deletion so drafts, toasts, composer state, and inspector facts never leak.
+    pub(crate) fn cleanup_deleted_or_left_chat_state(
+        &mut self,
+        cid: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let was_active_chat = self.stage.read(cx).active_chat_id == Some(cid)
+            || self.sidebar.read(cx).active_chat_id == Some(cid);
+        self.session_sync.rich_chats_by_id.remove(&cid);
+        self.session_sync.chat_peer_user_ids.remove(&cid);
+        self.session_sync.last_draft_text_by_chat.remove(&cid);
+        self.session_sync.last_saved_draft_by_chat.remove(&cid);
+        self.client
+            .local_store
+            .set_draft(gpui_telegram_core::types::ChatId(cid as i64), None);
+
+        let cid_i64 = cid as i64;
+        for profile in self.miniapps.bot_profiles_cache.values_mut() {
+            if profile.existing_chat_id == Some(cid_i64) {
+                profile.existing_chat_id = None;
+                profile.has_started_chat = false;
+            }
+            if let Some(ref mut main_app) = profile.main_app {
+                if main_app.direct_chat_id == Some(cid_i64) {
+                    main_app.direct_chat_id = None;
+                }
+            }
+            for app in &mut profile.apps {
+                if app.direct_chat_id == Some(cid_i64) {
+                    app.direct_chat_id = None;
+                }
+            }
+        }
+        for fb in &mut self.miniapps.fabushi_bots {
+            if fb.companion_chat_id == Some(cid_i64) {
+                fb.companion_chat_id = None;
+            }
+        }
+        for app in self
+            .miniapps
+            .catalog_miniapps
+            .iter_mut()
+            .chain(self.miniapps.installed_miniapps.iter_mut())
+            .chain(self.miniapps.recent_mini_apps.iter_mut())
+        {
+            if app.direct_chat_id == Some(cid_i64) {
+                app.direct_chat_id = None;
+            }
+        }
+        if let Some(ref box_ent) = self.miniapps.bot_profile_box {
+            box_ent.update(cx, |bx, bx_cx| {
+                if bx.profile.existing_chat_id == Some(cid_i64) {
+                    bx.profile.existing_chat_id = None;
+                    bx.profile.has_started_chat = false;
+                    bx_cx.notify();
+                }
+            });
+        }
+        self.miniapps
+            .pending_webmcp_commands
+            .retain(|cmd| cmd.chat_id != cid_i64);
+        if self
+            .miniapps
+            .floating_pip_status
+            .as_ref()
+            .is_some_and(|pip| pip.chat_id == cid_i64)
+        {
+            self.miniapps.floating_pip_status = None;
+        }
+        if self.miniapps.miniapp_overlay.as_ref().is_some_and(|ov| {
+            let w = ov.read(cx);
+            w.companion_chat_id == Some(cid_i64) || w.source_chat_id == Some(cid_i64)
+        }) {
+            self.miniapps.miniapp_overlay = None;
+            self.miniapps.is_miniapp_minimized = false;
+        }
+
+        self.stage.update(cx, |st, _| {
+            st.chat_histories.remove(&cid);
+            st.chat_pinned_messages.remove(&cid);
+            st.chat_pinned_entries.remove(&cid);
+            st.chat_scroll_positions.remove(&cid);
+        });
+
+        let next_chat_id = self.sidebar.update(cx, |sb, sb_cx| {
+            let needs_delete = sb.dialogs.iter().any(|d| d.id == cid)
+                || sb.drafts.contains_key(&cid)
+                || sb.active_chat_id == Some(cid);
+            if needs_delete {
+                sb.delete_dialog(cid);
+                sb_cx.notify();
+            }
+            sb.dialogs.first().map(|d| d.id)
+        });
+
+        if self.window_runtime.controller.clear_toasts_for_chat(cid) {
+            self.schedule_current_toast_dismiss(cx);
+        }
+        if was_active_chat || self.last_observed_toast_chat_id == Some(cid) {
+            self.last_observed_toast_chat_id = None;
+        }
+        if was_active_chat
+            || self
+                .compose_isolation_snapshot
+                .as_ref()
+                .is_some_and(|s| s.chat_id == Some(cid))
+        {
+            self.clear_compose_isolation_snapshot();
+        }
+        if was_active_chat {
+            self.miniapps.pending_prestart_bot = None;
+            self.stage.update(cx, |st, _| {
+                st.active_chat_id = None;
+            });
+            if let Some(next_id) = next_chat_id {
+                self.composer.update(cx, |comp, c_cx| {
+                    comp.cancel_reply_or_edit();
+                    comp.editor.attachments.clear();
+                    comp.submitted_attachment = None;
+                    comp.pending_attached_files = None;
+                    comp.clear_bot_reply_keyboard();
+                    c_cx.notify();
+                });
+                self.sidebar.update(cx, |sb, _| sb.select_dialog(next_id));
+                self.sync_selected_chat_inspector_and_stage(next_id, cx);
+            } else {
+                self.stage.update(cx, |st, st_cx| {
+                    st.clear_selection();
+                    st_cx.notify();
+                });
+                let still_isolated = self.is_compose_or_creation_modal_active(cx);
+                self.composer.update(cx, |comp, c_cx| {
+                    comp.clear();
+                    comp.clear_bot_menu(Some(c_cx));
+                    comp.set_bot_slash_commands(Vec::new());
+                    comp.set_hermes_slash_enabled(false);
+                    comp.clear_bot_reply_keyboard();
+                    comp.cancel_reply_or_edit();
+                    comp.editor.attachments.clear();
+                    comp.submitted_attachment = None;
+                    comp.pending_attached_files = None;
+                    comp.set_send_as_options(Vec::new(), None);
+                    if !still_isolated {
+                        comp.is_compose_isolated = false;
+                    }
+                    c_cx.notify();
+                });
+                self.inspector.update(cx, |insp, insp_cx| {
+                    insp.clear_peer_facts();
+                    insp_cx.notify();
+                });
+                self.set_inspector_open(false, cx);
+                self.sync_composer_and_inspector_miniapp_state(cx);
+            }
+        }
     }
 
     /// Handles pin, mute, archive, clear history, and delete context-menu actions drained from
@@ -743,16 +951,7 @@ impl AppShell {
                 .detach();
             }
             SidebarContextAction::DeleteChat(id) => {
-                self.session_sync.rich_chats_by_id.remove(&id);
-                if self.stage.read(cx).active_chat_id == Some(id) {
-                    let next_id = self.sidebar.read(cx).dialogs.first().map(|d| d.id);
-                    if let Some(nid) = next_id {
-                        self.sidebar.update(cx, |sb, _| sb.select_dialog(nid));
-                        self.sync_selected_chat_inspector_and_stage(nid, cx);
-                    } else {
-                        self.stage.update(cx, |st, _| st.clear_selection());
-                    }
-                }
+                self.cleanup_deleted_or_left_chat_state(id, cx);
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     let _ = client.leave_or_delete_chat(id as i64).await;
                     let _ = weak.update(app, |s, cx| s.refresh_chats(cx));

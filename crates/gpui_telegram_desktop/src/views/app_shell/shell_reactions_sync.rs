@@ -336,8 +336,9 @@ impl AppShell {
                                     proto_counts,
                                 );
                             }
-                            shell.window_runtime.enqueue_toast(err_text, 2500);
-                            cx.notify();
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, err_text, 2500, cx);
+                            }
                         }
                     });
                 }

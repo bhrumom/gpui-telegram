@@ -462,14 +462,18 @@ impl AppShell {
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
                         shell.reset_talk_session_flags();
-                        shell.window_runtime.enqueue_toast(
-                            format!(
-                                "{}: {}",
-                                tr_str(shell.active_lang_id(), "AI 语音连接失败", "AI Talk failed"),
-                                err
-                            ),
-                            3200,
+                        let msg = format!(
+                            "{}: {}",
+                            tr_str(shell.active_lang_id(), "AI 语音连接失败", "AI Talk failed"),
+                            err
                         );
+                        if let Some(cid) = chat_opt {
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, msg, 3200, cx);
+                            }
+                        } else {
+                            shell.show_toast(msg, 3200, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -573,14 +577,18 @@ impl AppShell {
                         if let Some(ov) = shell.rtc_talk.talk_mode_overlay.clone() {
                             ov.update(cx, |o, _| o.set_state(TalkModeState::Listening));
                         }
-                        shell.window_runtime.enqueue_toast(
-                            format!(
-                                "{}: {}",
-                                tr_str(shell.active_lang_id(), "语音回合失败", "Talk turn failed"),
-                                err
-                            ),
-                            2800,
+                        let msg = format!(
+                            "{}: {}",
+                            tr_str(shell.active_lang_id(), "语音回合失败", "Talk turn failed"),
+                            err
                         );
+                        if let Some(cid) = bot_chat_id {
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, msg, 2800, cx);
+                            }
+                        } else {
+                            shell.show_toast(msg, 2800, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -732,14 +740,18 @@ impl AppShell {
                     }
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
-                        shell.window_runtime.enqueue_toast(
-                            format!(
-                                "{}: {}",
-                                tr_str(shell.active_lang_id(), "通话发起失败", "Call failed"),
-                                err
-                            ),
-                            3200,
+                        let msg = format!(
+                            "{}: {}",
+                            tr_str(shell.active_lang_id(), "通话发起失败", "Call failed"),
+                            err
                         );
+                        if let Some(cid) = chat_opt.and_then(|v| u64::try_from(v).ok()) {
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, msg, 3200, cx);
+                            }
+                        } else {
+                            shell.show_toast(msg, 3200, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -898,14 +910,12 @@ impl AppShell {
                 }
             }
             if let Err(err) = self.rtc_talk.voice_recorder.start() {
-                self.window_runtime.enqueue_toast(
-                    format!(
-                        "{}: {}",
-                        tr_str(self.active_lang_id(), "麦克风不可用", "Microphone error"),
-                        err
-                    ),
-                    3000,
+                let msg = format!(
+                    "{}: {}",
+                    tr_str(self.active_lang_id(), "麦克风不可用", "Microphone error"),
+                    err
                 );
+                self.show_toast(msg, 3000, cx);
             }
             cx.notify();
             return;

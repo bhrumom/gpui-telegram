@@ -3992,9 +3992,7 @@ impl AppShell {
             }
             st_cx.notify();
         });
-        self.window_runtime.enqueue_toast(toast_summary, 3200);
-        self.schedule_current_toast_dismiss(cx);
-        cx.notify();
+        self.show_chat_toast(chat_id, toast_summary, 3200, cx);
     }
 
     fn append_local_vault_notice(
@@ -4183,7 +4181,6 @@ impl AppShell {
                     ),
                     wakeup.origin
                 );
-                self.window_runtime.enqueue_toast(msg, 3200);
                 let cid_opt = wakeup
                     .chat_id
                     .and_then(|c| u64::try_from(c).ok())
@@ -4194,6 +4191,13 @@ impl AppShell {
                             self.sidebar.read(cx).active_chat_id,
                         )
                     });
+                if let Some(cid) = cid_opt {
+                    if self.stage.read(cx).active_chat_id == Some(cid) {
+                        self.show_chat_toast(cid, msg, 3200, cx);
+                    }
+                } else {
+                    self.show_toast(msg, 3200, cx);
+                }
                 if let Some(cid) = cid_opt {
                     if self.can_run_local_fabushi_turn(cx) {
                         let target = self.resolve_fabushi_bot_target(cid, cx).unwrap_or(
@@ -4241,6 +4245,7 @@ impl AppShell {
             | BotAssistCardAction::ClickCaptchaPoint { .. }
             | BotAssistCardAction::ResetCaptchaClicks { .. } => {}
             BotAssistCardAction::SubmitLogin { card_id } => {
+                let cid_u64 = self.resolve_bot_card_chat_id(&card_id, None, cx);
                 let sub_res = self.stage.update(cx, |st, st_cx| {
                     let res = st.take_bot_card_login_submission(&card_id);
                     st_cx.notify();
@@ -4249,25 +4254,34 @@ impl AppShell {
                 let submission = match sub_res {
                     Ok(sub) => sub,
                     Err(err_msg) => {
-                        self.window_runtime.enqueue_toast(err_msg, 2400);
+                        if let Some(cid) = cid_u64.filter(|&c| c != 0) {
+                            if self.stage.read(cx).active_chat_id == Some(cid) {
+                                self.show_chat_toast(cid, err_msg, 2400, cx);
+                            }
+                        } else {
+                            self.show_toast(err_msg, 2400, cx);
+                        }
                         cx.notify();
                         return;
                     }
                 };
                 let Some(orch) = self.bot_browser.orchestrator.clone() else {
-                    self.window_runtime.enqueue_toast(
-                        tr_str(
-                            lang,
-                            "本地安全浏览器服务未初始化",
-                            "Local bot browser orchestrator unavailable",
-                        ),
-                        2600,
+                    let msg = tr_str(
+                        lang,
+                        "本地安全浏览器服务未初始化",
+                        "Local bot browser orchestrator unavailable",
                     );
+                    if let Some(cid) = cid_u64.filter(|&c| c != 0) {
+                        if self.stage.read(cx).active_chat_id == Some(cid) {
+                            self.show_chat_toast(cid, msg, 2600, cx);
+                        }
+                    } else {
+                        self.show_toast(msg, 2600, cx);
+                    }
                     cx.notify();
                     return;
                 };
                 let card_id_for_ui = card_id.clone();
-                let cid_u64 = self.resolve_bot_card_chat_id(&card_id, None, cx);
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     let res = runtime
                         .spawn(async move { orch.submit_login_card(submission).await })
@@ -4304,12 +4318,23 @@ impl AppShell {
                                         "Credentials encrypted & saved locally",
                                     )
                                 };
-                                shell.window_runtime.enqueue_toast(note, 2600);
+                                if let Some(cid) = cid_u64.filter(|&c| c != 0) {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, note, 2600, cx);
+                                    }
+                                } else {
+                                    shell.show_toast(note, 2600, cx);
+                                }
                             }
                             Err(e) => {
-                                shell
-                                    .window_runtime
-                                    .enqueue_toast(format!("Vault login error: {e}"), 3200);
+                                let err_toast = format!("Vault login error: {e}");
+                                if let Some(cid) = cid_u64.filter(|&c| c != 0) {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, err_toast, 3200, cx);
+                                    }
+                                } else {
+                                    shell.show_toast(err_toast, 3200, cx);
+                                }
                             }
                         }
                         cx.notify();
@@ -4368,9 +4393,14 @@ impl AppShell {
                                 });
                             }
                             Err(e) => {
-                                shell
-                                    .window_runtime
-                                    .enqueue_toast(format!("Reuse approval failed: {e}"), 2800);
+                                let err_toast = format!("Reuse approval failed: {e}");
+                                if let Some(cid) = cid_u64.filter(|&c| c != 0) {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, err_toast, 2800, cx);
+                                    }
+                                } else {
+                                    shell.show_toast(err_toast, 2800, cx);
+                                }
                             }
                         }
                         cx.notify();
@@ -4379,6 +4409,7 @@ impl AppShell {
                 .detach();
             }
             BotAssistCardAction::SubmitCaptchaClicks { card_id } => {
+                let cid_u64 = self.resolve_bot_card_chat_id(&card_id, None, cx);
                 let points = self
                     .stage
                     .read(cx)
@@ -4387,17 +4418,24 @@ impl AppShell {
                     .map(|d| d.points.clone())
                     .unwrap_or_default();
                 if points.is_empty() {
-                    self.window_runtime.enqueue_toast(
-                        tr_str(lang, "请先在验证图上点击目标位置", "Click target points first"),
-                        2200,
+                    let msg = tr_str(
+                        lang,
+                        "请先在验证图上点击目标位置",
+                        "Click target points first",
                     );
+                    if let Some(cid) = cid_u64.filter(|&c| c != 0) {
+                        if self.stage.read(cx).active_chat_id == Some(cid) {
+                            self.show_chat_toast(cid, msg, 2200, cx);
+                        }
+                    } else {
+                        self.show_toast(msg, 2200, cx);
+                    }
                     cx.notify();
                     return;
                 }
                 let Some(orch) = self.bot_browser.orchestrator.clone() else {
                     return;
                 };
-                let cid_u64 = self.resolve_bot_card_chat_id(&card_id, None, cx);
                 let card_id_req = card_id.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     let res = runtime
@@ -4422,9 +4460,14 @@ impl AppShell {
                                 });
                             }
                             Err(e) => {
-                                shell
-                                    .window_runtime
-                                    .enqueue_toast(format!("Click captcha failed: {e}"), 2800);
+                                let err_toast = format!("Click captcha failed: {e}");
+                                if let Some(cid) = cid_u64.filter(|&c| c != 0) {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, err_toast, 2800, cx);
+                                    }
+                                } else {
+                                    shell.show_toast(err_toast, 2800, cx);
+                                }
                             }
                         }
                         cx.notify();

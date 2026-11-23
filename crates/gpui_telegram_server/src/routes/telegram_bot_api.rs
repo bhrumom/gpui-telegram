@@ -1826,8 +1826,14 @@ fn handle_publish_mini_app(
     let html_bundle = param_str(params, "html_bundle");
     let raw_web_url = param_str(params, "web_url").unwrap_or("").trim();
     let is_main_app = param_bool(params, "is_main_app");
-    let header_color = param_str(params, "header_color").unwrap_or("").trim();
-    let background_color = param_str(params, "background_color").unwrap_or("").trim();
+    let header_color = super::bots_miniapps::sanitize_css_color(
+        param_str(params, "header_color").unwrap_or("").trim(),
+    )
+    .unwrap_or_default();
+    let background_color = super::bots_miniapps::sanitize_css_color(
+        param_str(params, "background_color").unwrap_or("").trim(),
+    )
+    .unwrap_or_default();
     let ui_schema_json = params
         .get("ui_schema")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
@@ -1850,8 +1856,8 @@ fn handle_publish_mini_app(
         true,
         param_bool(params, "is_attach_enabled").unwrap_or(false) || bot.allow_attach_menu,
         false,
-        header_color,
-        background_color,
+        &header_color,
+        &background_color,
         is_main_app,
         false,
     ) {

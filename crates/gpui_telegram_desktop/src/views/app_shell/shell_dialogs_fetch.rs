@@ -548,7 +548,7 @@ impl AppShell {
                             shell.session_sync.session_token.as_deref(),
                             shell.session_sync.user_id,
                         ) {
-                            shell.window_runtime.enqueue_toast(
+                            shell.show_toast(
                                 format!(
                                     "{}: {}",
                                     tr_str(
@@ -559,6 +559,7 @@ impl AppShell {
                                     err
                                 ),
                                 3200,
+                                cx,
                             );
                         }
                     }
@@ -586,26 +587,26 @@ impl AppShell {
                 self.toggle_voice_recording(start, cx);
             }
             "photo" | "video" | "file" => {
-                self.window_runtime.enqueue_toast(
+                self.show_toast(
                     tr_str(
                         lang,
                         "请将文件拖拽至聊天窗口上传发送",
                         "Drop a local file into the chat window to upload and send",
                     ),
                     2600,
+                    cx,
                 );
-                cx.notify();
             }
             "location" => {
-                self.window_runtime.enqueue_toast(
+                self.show_toast(
                     tr_str(
                         lang,
                         "位置共享需要选择真实位置后发送",
                         "Location sharing requires selecting a location",
                     ),
                     2600,
+                    cx,
                 );
-                cx.notify();
             }
             _ => {}
         }

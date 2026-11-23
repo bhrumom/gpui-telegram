@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "bot-browser"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2115,7 +2115,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_magpie_gateway"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "e2e_suite"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2487,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_daemon"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2504,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_engine"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_agent"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3382,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_cli"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_client"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "aes",
  "argon2",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_coding"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_core"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "aes",
  "cbc",
@@ -3490,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_desktop"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "base64 0.22.1",
  "bot-browser",
@@ -3528,7 +3528,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_media"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "chrono",
  "fabushi-messaging-core",
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_proto"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3560,7 +3560,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_server"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3609,7 +3609,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_test_harness"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -3639,7 +3639,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_webrtc"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4711,7 +4711,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "magpie_gateway"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "axum",
  "base64 0.22.1",

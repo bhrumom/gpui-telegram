@@ -23,9 +23,11 @@ use crate::app::cli_installer::{
 use crate::i18n::tr_str;
 use crate::platform::mac::macos_permissions_drag::{
     cached_permissions_snapshot, hide_drag_hud, request_permissions_refresh,
+    should_defer_local_capture_for_permissions,
 };
 use crate::platform::mac::tray_mac::tray_action_ids;
 use crate::views::app_shell::desktop_ipc_host::DesktopLocalIpcHandler;
+use crate::views::app_shell::shell_actions::resolve_active_target_chat_id;
 use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand};
 use crate::views::drawer::inspector_tabs::{InspectorAction, InspectorSubpage};
 use crate::views::remote_controlled_window::{
@@ -873,9 +875,19 @@ impl AppShell {
             .cloned();
 
         let is_local_node = node_opt.as_ref().is_some_and(|n| n.is_current_device);
-        if is_local_node && cfg!(target_os = "macos") {
+        let initial_local_perm_snap = if is_local_node && cfg!(target_os = "macos") {
             request_permissions_refresh(true);
-        }
+            Some(cached_permissions_snapshot())
+        } else {
+            None
+        };
+        let defer_initial_capture = initial_local_perm_snap.as_ref().is_some_and(|snap| {
+            should_defer_local_capture_for_permissions(
+                is_local_node,
+                cfg!(target_os = "macos"),
+                snap.screen_state,
+            )
+        });
 
         let overlay = cx.new(|wcx| {
             let mut wb = ComputerWorkbench::new_live(fallback_name, pal, &lang);
@@ -886,6 +898,29 @@ impl AppShell {
             }
             if peer_opt.is_some() {
                 wb.sync_tailnet_peer_state(peer_opt.as_ref());
+            }
+            if defer_initial_capture {
+                if let Some(ref snap) = initial_local_perm_snap {
+                    wb.needs_screen_permission_guide = true;
+                    if !snap.accessibility_granted {
+                        wb.needs_accessibility_permission_guide = true;
+                    }
+                    wb.status_banner = Some(if snap.screen_state.needs_restart() {
+                        tr_str(
+                            &wb.language_id,
+                            "录屏权限已在系统设置中开启，请点击「重启 Fabushi」使其生效",
+                            "Screen Recording enabled in Settings — click Restart Fabushi to apply",
+                        )
+                        .to_string()
+                    } else {
+                        tr_str(
+                            &wb.language_id,
+                            "未获取到录屏权限：请点击「在设置中开启」并将悬浮卡片中的 Fabushi 拖入系统设置列表",
+                            "Screen Recording required: click Open in Settings and drag Fabushi into the list",
+                        )
+                        .to_string()
+                    });
+                }
             }
             wb.ensure_terminal_input(wcx);
             wb
@@ -906,7 +941,9 @@ impl AppShell {
         .detach();
 
         self.overlays.computer_overlay = Some(overlay.clone());
-        self.handle_workbench_command(node_id, WorkbenchCommand::RefreshScreen, overlay, cx);
+        if !defer_initial_capture {
+            self.handle_workbench_command(node_id, WorkbenchCommand::RefreshScreen, overlay, cx);
+        }
         cx.notify();
     }
 
@@ -1555,6 +1592,10 @@ impl AppShell {
         let Some(fence) = self.computer_fence() else {
             return;
         };
+        let target_cid = resolve_active_target_chat_id(
+            self.stage.read(cx).active_chat_id,
+            self.sidebar.read(cx).active_chat_id,
+        );
         let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let c = client.clone();
@@ -1570,26 +1611,49 @@ impl AppShell {
                 match res {
                     Ok(profile) => {
                         shell.computers.bot_profiles.insert(bot_id, profile.clone());
-                        shell.inspector.update(cx, |insp, icx| {
-                            if !profile.persona_prompt.is_empty() {
-                                insp.profile.bot_persona_prompt = profile.persona_prompt.clone();
-                            }
-                            insp.sync_bot_computer_profile(Some(profile));
-                            if return_to_main_subpage {
-                                insp.subpage = InspectorSubpage::Main;
-                            }
-                            icx.notify();
-                        });
-                        shell.enqueue_computer_toast(
+                        let still_in_target_chat = target_cid
+                            .is_none_or(|cid| shell.stage.read(cx).active_chat_id == Some(cid));
+                        if still_in_target_chat {
+                            shell.inspector.update(cx, |insp, icx| {
+                                if !profile.persona_prompt.is_empty() {
+                                    insp.profile.bot_persona_prompt =
+                                        profile.persona_prompt.clone();
+                                }
+                                insp.sync_bot_computer_profile(Some(profile));
+                                if return_to_main_subpage {
+                                    insp.subpage = InspectorSubpage::Main;
+                                }
+                                icx.notify();
+                            });
+                        }
+                        let msg = tr_str(
+                            shell.active_lang_id(),
                             "Bot 电脑与运行配置已保存",
                             "Bot computer configuration saved",
-                            2000,
                         );
+                        if let Some(cid) = target_cid {
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, msg, 2000, cx);
+                            }
+                        } else {
+                            shell.show_toast(msg, 2000, cx);
+                        }
                         shell.refresh_computers(cx);
                     }
                     Err(e) => {
-                        let pfx = tr_str(shell.active_lang_id(), "保存 Bot 配置失败", "Failed to save bot config");
-                        shell.window_runtime.enqueue_toast(format!("{pfx}: {e}"), 2600);
+                        let pfx = tr_str(
+                            shell.active_lang_id(),
+                            "保存 Bot 配置失败",
+                            "Failed to save bot config",
+                        );
+                        let msg = format!("{pfx}: {e}");
+                        if let Some(cid) = target_cid {
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, msg, 2600, cx);
+                            }
+                        } else {
+                            shell.show_toast(msg, 2600, cx);
+                        }
                         cx.notify();
                     }
                 }

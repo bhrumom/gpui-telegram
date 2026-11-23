@@ -66,16 +66,16 @@ impl AppShell {
                     sb.compose_title_focused = false;
                     scx.notify();
                 });
-                self.window_runtime.enqueue_toast(
+                self.show_toast(
                     tr_str(
                         lang,
                         "请先选择至少一位联系人或 AI Bot",
                         "Please select at least one contact or AI Bot first",
                     ),
                     2600,
+                    cx,
                 );
                 self.sync_compose_state_to_composer(true, cx);
-                cx.notify();
             }
             ComposeSendDecision::BlockedPendingCreation => {
                 self.composer.update(cx, |c, ccx| {
@@ -84,11 +84,11 @@ impl AppShell {
                     }
                     ccx.notify();
                 });
-                self.window_runtime.enqueue_toast(
+                self.show_toast(
                     tr_str(lang, "正在创建群聊，请稍候…", "Creating group, please wait…"),
                     2200,
+                    cx,
                 );
-                cx.notify();
             }
             ComposeSendDecision::DirectMessage { recipient } => {
                 self.dispatch_compose_single_dm_send(recipient, trimmed, cx);
@@ -324,8 +324,7 @@ impl AppShell {
                             ccx.notify();
                         });
                         shell.sync_compose_state_to_composer(true, cx);
-                        shell.window_runtime.enqueue_toast(err_msg, 3400);
-                        cx.notify();
+                        shell.show_toast(err_msg, 3400, cx);
                     }
                 }
             });
@@ -460,8 +459,7 @@ impl AppShell {
                             ccx.notify();
                         });
                         shell.sync_compose_state_to_composer(true, cx);
-                        shell.window_runtime.enqueue_toast(err_msg, 3600);
-                        cx.notify();
+                        shell.show_toast(err_msg, 3600, cx);
                     }
                 }
             });
@@ -492,15 +490,15 @@ impl AppShell {
         };
         if retry_text.trim().is_empty() {
             let lang = self.active_lang_id();
-            self.window_runtime.enqueue_toast(
+            self.show_toast(
                 tr_str(lang, "请输入首条消息后重试", "Enter a message to retry"),
                 2400,
+                cx,
             );
             self.composer.update(cx, |c, ccx| {
                 c.is_input_focused = true;
                 ccx.notify();
             });
-            cx.notify();
             return;
         }
         self.dispatch_compose_submitted_message(retry_text, cx);
@@ -563,13 +561,14 @@ impl AppShell {
     pub fn upload_and_send_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if self.theme_state.palette.is_apple_style() && self.sidebar.read(cx).is_plus_menu_open {
             let lang = self.active_lang_id();
-            self.window_runtime.enqueue_toast(
+            self.show_toast(
                 tr_str(
                     lang,
                     "请先发送首条消息创建对话后再发送附件",
                     "Create the chat with a message first before uploading attachments",
                 ),
                 2600,
+                cx,
             );
             return;
         }
@@ -816,9 +815,10 @@ impl AppShell {
             );
         }
         if open_loc {
-            self.window_runtime.enqueue_toast(
+            self.show_toast(
                 tr_str(lang, "请选择地图位置并发送", "Select a location to share"),
                 2200,
+                cx,
             );
         }
         if open_contact {

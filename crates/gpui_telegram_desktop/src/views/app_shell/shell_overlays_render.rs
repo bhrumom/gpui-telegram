@@ -1088,6 +1088,11 @@ impl AppShell {
         modal_backdrop_shell("telegram-contacts-modal-backdrop", macos_modal_backdrop_rgba(pal))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.sidebar.update(cx, |sb, scx| { sb.close_contacts_modal(); scx.notify(); });
+                if !this.is_compose_or_creation_modal_active(cx) {
+                    this.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    this.sync_compose_state_to_composer(true, cx);
+                }
                 cx.notify();
             }))
             .child(
@@ -1150,8 +1155,21 @@ impl AppShell {
                                                 scx.notify();
                                             });
                                             if let Some(cid) = cid_opt {
+                                                let prev = this.stage.read(cx).active_chat_id;
                                                 this.sync_selected_chat_inspector_and_stage(cid, cx);
+                                                if this.composer.read(cx).is_compose_isolated && !this.is_compose_or_creation_modal_active(cx) {
+                                                    if prev == Some(cid) {
+                                                        this.exit_compose_or_modal_isolation(true, cx);
+                                                    } else {
+                                                        this.finish_compose_isolation_for_switched_chat(cid, cx);
+                                                    }
+                                                }
                                             } else {
+                                                if !this.is_compose_or_creation_modal_active(cx) {
+                                                    this.exit_compose_or_modal_isolation(true, cx);
+                                                } else {
+                                                    this.sync_compose_state_to_composer(true, cx);
+                                                }
                                                 let req = CreateChatRequest { title: click_name.clone(), chat_type: Some(serde_json::json!(0)), peer_user_id: Some(uid), ..Default::default() };
                                                 let client = this.client.clone();
                                                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -1191,6 +1209,11 @@ impl AppShell {
                                 macos_secondary_pill_btn("contacts-modal-close-btn", tr_str(lang, "关闭", "Close"), pal)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.sidebar.update(cx, |sb, scx| { sb.close_contacts_modal(); scx.notify(); });
+                                        if !this.is_compose_or_creation_modal_active(cx) {
+                                            this.exit_compose_or_modal_isolation(true, cx);
+                                        } else {
+                                            this.sync_compose_state_to_composer(true, cx);
+                                        }
                                         cx.notify();
                                     })),
                             ),
@@ -1508,6 +1531,11 @@ impl AppShell {
         modal_backdrop_shell("telegram-creation-modal-backdrop", macos_modal_backdrop_rgba(pal))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
+                if !this.is_compose_or_creation_modal_active(cx) {
+                    this.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    this.sync_compose_state_to_composer(true, cx);
+                }
                 cx.notify();
             }))
             .child(
@@ -1526,6 +1554,11 @@ impl AppShell {
                                     .flex().items_center().justify_center()
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
+                                        if !this.is_compose_or_creation_modal_active(cx) {
+                                            this.exit_compose_or_modal_isolation(true, cx);
+                                        } else {
+                                            this.sync_compose_state_to_composer(true, cx);
+                                        }
                                         cx.notify();
                                     }))
                                     .child(tg_icon(IconName::Close, pal.scaled_px(14.0), pal.icon_fg)),
@@ -1546,6 +1579,11 @@ impl AppShell {
                                 macos_secondary_pill_btn("creation-modal-cancel-btn", tr_str(lang, "取消", "Cancel"), pal)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
+                                        if !this.is_compose_or_creation_modal_active(cx) {
+                                            this.exit_compose_or_modal_isolation(true, cx);
+                                        } else {
+                                            this.sync_compose_state_to_composer(true, cx);
+                                        }
                                         cx.notify();
                                     })),
                             )
@@ -2716,6 +2754,7 @@ impl AppShell {
 
     pub(crate) fn open_add_friend_from_compose_query(&mut self, cx: &mut Context<Self>) {
         self.ime.clear_preedit();
+        self.enter_compose_or_modal_isolation(cx);
         let raw_q = self.sidebar.read(cx).compose_recipient_query.trim().to_string();
         self.sidebar.update(cx, |sb, scx| {
             sb.open_add_contact_modal(AddContactKind::Friend);
@@ -3735,6 +3774,7 @@ impl AppShell {
                                                     cx.listener(|this, _, _, cx| {
                                                         cx.stop_propagation();
                                                         this.ime.clear_preedit();
+                                                        this.enter_compose_or_modal_isolation(cx);
                                                         this.sidebar.update(cx, |sb, scx| {
                                                             sb.open_add_contact_modal(
                                                                 AddContactKind::AiBot,
@@ -3760,6 +3800,7 @@ impl AppShell {
                                                     cx.listener(|this, _, _, cx| {
                                                         cx.stop_propagation();
                                                         this.ime.clear_preedit();
+                                                        this.enter_compose_or_modal_isolation(cx);
                                                         this.sidebar.update(cx, |sb, scx| {
                                                             sb.open_add_contact_modal(
                                                                 AddContactKind::Friend,
@@ -3786,6 +3827,7 @@ impl AppShell {
                                                         cx.listener(|this, _, _, cx| {
                                                             cx.stop_propagation();
                                                             this.ime.clear_preedit();
+                                                            this.enter_compose_or_modal_isolation(cx);
                                                             this.sidebar.update(cx, |sb, scx| {
                                                                 sb.open_compose_group_mode();
                                                                 scx.notify();

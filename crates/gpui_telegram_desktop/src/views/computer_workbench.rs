@@ -19,8 +19,8 @@ use crate::components::macos_permission_modal::{
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
 use crate::platform::mac::macos_permissions_drag::{
-    cached_permissions_snapshot, hide_drag_hud, permissions_snapshot_generation,
-    request_permissions_refresh,
+    ScreenPermissionState, cached_permissions_snapshot, hide_drag_hud,
+    permissions_snapshot_generation, request_permissions_refresh,
 };
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
@@ -316,8 +316,12 @@ pub struct ComputerWorkbench {
     viewport_bounds: Arc<std::sync::Mutex<Option<Bounds<Pixels>>>>,
     permission_poll_started: bool,
     last_perm_gen: u64,
-    last_perm_screen_active: bool,
+    last_perm_screen_state: ScreenPermissionState,
     last_perm_ax_active: bool,
+    last_perm_hud_visible: bool,
+    last_perm_stale_screen: bool,
+    last_perm_stale_ax: bool,
+    last_perm_drag_seq: u64,
 }
 
 impl ComputerWorkbench {
@@ -387,8 +391,12 @@ impl ComputerWorkbench {
             viewport_bounds: Arc::new(std::sync::Mutex::new(None)),
             permission_poll_started: false,
             last_perm_gen: 0,
-            last_perm_screen_active: false,
+            last_perm_screen_state: ScreenPermissionState::NotGranted,
             last_perm_ax_active: false,
+            last_perm_hud_visible: false,
+            last_perm_stale_screen: false,
+            last_perm_stale_ax: false,
+            last_perm_drag_seq: 0,
         }
     }
 
@@ -416,37 +424,63 @@ impl ComputerWorkbench {
         self.permission_poll_started = true;
         let init_snap = cached_permissions_snapshot();
         self.last_perm_gen = permissions_snapshot_generation();
-        self.last_perm_screen_active = init_snap.screen_state.is_active();
+        self.last_perm_screen_state = init_snap.screen_state;
         self.last_perm_ax_active = init_snap.accessibility_granted;
+        self.last_perm_hud_visible = init_snap.hud_visible;
+        self.last_perm_stale_screen = init_snap.stale_screen_suspected;
+        self.last_perm_stale_ax = init_snap.stale_ax_suspected;
+        self.last_perm_drag_seq = init_snap.last_drag_seq;
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| loop {
             app.background_executor()
-                .timer(Duration::from_millis(800))
+                .timer(Duration::from_millis(450))
                 .await;
             let keep = weak
                 .update(app, |this, cx| {
+                    let before_snap = cached_permissions_snapshot();
                     let modal_open = this.needs_screen_permission_guide
                         || this.needs_accessibility_permission_guide
                         || this.force_local_permission_modal;
-                    if modal_open && (this.is_local_device || this.force_local_permission_modal) {
+                    if (modal_open && (this.is_local_device || this.force_local_permission_modal))
+                        || before_snap.hud_visible
+                    {
                         request_permissions_refresh(false);
                         let snap = cached_permissions_snapshot();
                         let perm_gen = permissions_snapshot_generation();
-                        let screen_active = snap.screen_state.is_active();
+                        let screen_state = snap.screen_state;
                         let ax_active = snap.accessibility_granted;
                         let changed = perm_gen != this.last_perm_gen
-                            || screen_active != this.last_perm_screen_active
-                            || ax_active != this.last_perm_ax_active;
+                            || screen_state != this.last_perm_screen_state
+                            || ax_active != this.last_perm_ax_active
+                            || snap.hud_visible != this.last_perm_hud_visible
+                            || snap.stale_screen_suspected != this.last_perm_stale_screen
+                            || snap.stale_ax_suspected != this.last_perm_stale_ax
+                            || snap.last_drag_seq != this.last_perm_drag_seq;
 
                         if changed {
+                            let prev_screen_active = this.last_perm_screen_state.is_active();
                             let screen_just_became_active =
-                                !this.last_perm_screen_active && screen_active;
+                                !prev_screen_active && screen_state.is_active();
                             this.last_perm_gen = perm_gen;
-                            this.last_perm_screen_active = screen_active;
+                            this.last_perm_screen_state = screen_state;
                             this.last_perm_ax_active = ax_active;
+                            this.last_perm_hud_visible = snap.hud_visible;
+                            this.last_perm_stale_screen = snap.stale_screen_suspected;
+                            this.last_perm_stale_ax = snap.stale_ax_suspected;
+                            this.last_perm_drag_seq = snap.last_drag_seq;
 
                             if ax_active {
                                 this.needs_accessibility_permission_guide = false;
+                            }
+                            if screen_state.needs_restart() && this.is_local_device {
+                                this.status_banner = Some(
+                                    tr_str(
+                                        &this.language_id,
+                                        "录屏权限已在系统设置中开启，请点击「重启 Fabushi」使其生效",
+                                        "Screen Recording enabled in Settings — click Restart Fabushi to apply",
+                                    )
+                                    .to_string(),
+                                );
                             }
                             if screen_just_became_active {
                                 this.needs_screen_permission_guide = false;
@@ -503,6 +537,12 @@ impl ComputerWorkbench {
     }
 
     pub fn set_target_node(&mut self, node: &ComputerNodeDto) {
+        if self.node_id.as_deref() != Some(node.node_id.as_str()) {
+            self.needs_screen_permission_guide = false;
+            self.needs_accessibility_permission_guide = false;
+            self.force_local_permission_modal = false;
+            self.remote_permission_error = None;
+        }
         self.node_id = Some(node.node_id.clone());
         self.node_kind = node.kind;
         self.is_local_device = node.is_current_device;
@@ -2223,11 +2263,14 @@ impl ComputerWorkbench {
                         )
                     })
                     .when(
-                        self.needs_screen_permission_guide
+                        (self.needs_screen_permission_guide
                             || self.needs_accessibility_permission_guide
-                            || self.force_local_permission_modal,
+                            || self.force_local_permission_modal)
+                            && (cfg!(target_os = "macos") || !self.is_local_device),
                         |vp| {
-                            if self.is_local_device || self.force_local_permission_modal {
+                            if (self.is_local_device || self.force_local_permission_modal)
+                                && cfg!(target_os = "macos")
+                            {
                                 let snap = cached_permissions_snapshot();
                                 vp.child(render_gemini_permission_modal(
                                     &snap,
@@ -2237,17 +2280,25 @@ impl ComputerWorkbench {
                                         this.needs_screen_permission_guide = false;
                                         this.needs_accessibility_permission_guide = false;
                                         this.force_local_permission_modal = false;
+                                        this.remote_permission_error = None;
                                         cx.notify();
                                     }),
                                     cx.listener(|this, _, _, cx| {
+                                        let snap = cached_permissions_snapshot();
                                         this.needs_screen_permission_guide = false;
                                         this.needs_accessibility_permission_guide = false;
                                         this.force_local_permission_modal = false;
-                                        this.enqueue_command(WorkbenchCommand::RefreshScreen);
+                                        this.remote_permission_error = None;
+                                        if !this.is_local_device
+                                            || !cfg!(target_os = "macos")
+                                            || snap.screen_state.is_active()
+                                        {
+                                            this.enqueue_command(WorkbenchCommand::RefreshScreen);
+                                        }
                                         cx.notify();
                                     }),
                                 ))
-                            } else {
+                            } else if !self.is_local_device {
                                 vp.child(render_remote_host_permission_modal(
                                     &dev.name,
                                     self.needs_screen_permission_guide,
@@ -2258,11 +2309,13 @@ impl ComputerWorkbench {
                                     cx.listener(|this, _, _, cx| {
                                         this.needs_screen_permission_guide = false;
                                         this.needs_accessibility_permission_guide = false;
+                                        this.remote_permission_error = None;
                                         cx.notify();
                                     }),
                                     cx.listener(|this, _, _, cx| {
                                         this.needs_screen_permission_guide = false;
                                         this.needs_accessibility_permission_guide = false;
+                                        this.remote_permission_error = None;
                                         this.enqueue_command(WorkbenchCommand::RefreshScreen);
                                         cx.notify();
                                     }),
@@ -2272,6 +2325,8 @@ impl ComputerWorkbench {
                                         cx.notify();
                                     }),
                                 ))
+                            } else {
+                                vp
                             }
                         },
                     ),
@@ -2294,29 +2349,32 @@ impl ComputerWorkbench {
                             .flex_row()
                             .items_center()
                             .gap(px(8.0))
-                            .child(Self::quick_cmd_btn(
-                                "wb-perm-guide-btn",
-                                tr_str(lang, "系统权限", "Permissions"),
-                                self.needs_screen_permission_guide
-                                    || self.needs_accessibility_permission_guide
-                                    || self.force_local_permission_modal,
-                                pal,
-                                cx.listener(|this, _, _, cx| {
-                                    let is_open = this.needs_screen_permission_guide
-                                        || this.needs_accessibility_permission_guide
-                                        || this.force_local_permission_modal;
-                                    if is_open {
-                                        this.needs_screen_permission_guide = false;
-                                        this.needs_accessibility_permission_guide = false;
-                                        this.force_local_permission_modal = false;
-                                        hide_drag_hud();
-                                    } else {
-                                        this.force_local_permission_modal = true;
-                                        request_permissions_refresh(true);
-                                    }
-                                    cx.notify();
-                                }),
-                            ))
+                            .when(cfg!(target_os = "macos") || !self.is_local_device, |row| {
+                                row.child(Self::quick_cmd_btn(
+                                    "wb-perm-guide-btn",
+                                    tr_str(lang, "系统权限", "Permissions"),
+                                    self.needs_screen_permission_guide
+                                        || self.needs_accessibility_permission_guide
+                                        || self.force_local_permission_modal,
+                                    pal,
+                                    cx.listener(|this, _, _, cx| {
+                                        let is_open = this.needs_screen_permission_guide
+                                            || this.needs_accessibility_permission_guide
+                                            || this.force_local_permission_modal;
+                                        if is_open {
+                                            this.needs_screen_permission_guide = false;
+                                            this.needs_accessibility_permission_guide = false;
+                                            this.force_local_permission_modal = false;
+                                            this.remote_permission_error = None;
+                                            hide_drag_hud();
+                                        } else {
+                                            this.force_local_permission_modal = true;
+                                            request_permissions_refresh(true);
+                                        }
+                                        cx.notify();
+                                    }),
+                                ))
+                            })
                             .child(Self::quick_cmd_btn(
                                 "wb-refresh-btn",
                                 tr_str(lang, "刷新画面", "Refresh Screen"),

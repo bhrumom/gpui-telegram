@@ -510,6 +510,12 @@ impl ChatSidebar {
         self.verified_ids.clear();
         self.premium_ids.clear();
         self.bot_ids.clear();
+        self.contact_chat_ids.clear();
+        self.group_chat_ids.clear();
+        self.channel_chat_ids.clear();
+        self.custom_folders.clear();
+        self.bot_fabushi_visuals.clear();
+        self.bot_grok_avatars.clear();
         self.saved_messages_id = None;
         self.media_badges.clear();
         self.forum_topics.clear();

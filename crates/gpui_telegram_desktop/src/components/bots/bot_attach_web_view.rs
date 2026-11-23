@@ -465,6 +465,7 @@ impl BotAttachWebView {
         self.webmcp_needs_rediscover = false;
         self.webmcp_ready_probe_sent = false;
         self.launching_short_name.clear();
+        self.pending_actions.clear();
     }
 
     pub fn minimize(&mut self) {

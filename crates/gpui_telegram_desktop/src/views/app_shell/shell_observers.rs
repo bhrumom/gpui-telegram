@@ -46,7 +46,7 @@ impl AppShell {
         });
     }
 
-    pub(crate) fn enqueue_localized_toast(
+    pub fn enqueue_localized_toast(
         &mut self,
         zh: &'static str,
         en: &'static str,
@@ -54,9 +54,7 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let msg = tr_str(self.active_lang_id(), zh, en);
-        self.window_runtime.enqueue_toast(msg, duration_ms);
-        self.schedule_current_toast_dismiss(cx);
-        cx.notify();
+        self.show_toast(msg, duration_ms, cx);
     }
 
     /// Wires all child view subscriptions, entity observers, and the WS status monitor.
@@ -310,9 +308,16 @@ impl AppShell {
             if menu_req {
                 shell.sidebar.update(cx, |s, s_cx| {
                     s.is_account_popover_open = !s.is_account_popover_open;
-                    s.is_plus_menu_open = false;
+                    s.exit_compose_mode();
                     s_cx.notify();
                 });
+                if shell.composer.read(cx).is_compose_isolated
+                    && !shell.is_compose_or_creation_modal_active(cx)
+                {
+                    shell.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    shell.sync_compose_state_to_composer(true, cx);
+                }
                 cx.notify();
             }
             if archive_req {
@@ -510,7 +515,10 @@ impl AppShell {
                 }
             }
             if !prev_compose_or_modal && cur_compose_or_modal {
-                if let Some(old_cid) = shell.last_observed_toast_chat_id {
+                if let Some(old_cid) = shell
+                    .last_observed_toast_chat_id
+                    .or_else(|| shell.stage.read(cx).active_chat_id)
+                {
                     if shell.window_runtime.controller.clear_toasts_for_chat(old_cid) {
                         shell.schedule_current_toast_dismiss(cx);
                     }
@@ -747,9 +755,7 @@ impl AppShell {
                 cx.notify();
             }
             AuthWizardEvent::Toast { message, duration_ms } => {
-                self.window_runtime.enqueue_toast(message.clone(), *duration_ms);
-                self.schedule_current_toast_dismiss(cx);
-                cx.notify();
+                self.show_toast(message.clone(), *duration_ms, cx);
             }
             AuthWizardEvent::ToggleTheme => {
                 let next = toggle_desktop_theme_mode(self.theme_state.theme_mode);

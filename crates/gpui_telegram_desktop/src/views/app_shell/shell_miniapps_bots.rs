@@ -335,7 +335,7 @@ impl AppShell {
                             shell.miniapps.create_bot_box = None;
                             let is_coding_bot = created.bot.coding_agent.is_some();
                             upsert_fabushi_bot_summary(shell, created.bot.clone());
-                            shell.window_runtime.enqueue_toast(
+                            shell.show_toast(
                                 format!(
                                     "{} @{}",
                                     if is_coding_bot {
@@ -346,6 +346,7 @@ impl AppShell {
                                     created.bot.agent_id
                                 ),
                                 2800,
+                                cx,
                             );
                             let cid = created.companion_chat_id.max(0) as u64;
                             shell.sync_fabushi_bots_to_views(cx);
@@ -395,13 +396,14 @@ impl AppShell {
                             );
                             upsert_fabushi_bot_summary(shell, summary);
                             shell.sync_fabushi_bots_to_views(cx);
-                            shell.window_runtime.enqueue_toast(
+                            shell.show_toast(
                                 format!(
                                     "{} @{}",
                                     tr_str(&lang, "已创建 AI 机器人与小程序", "Created Bot & Mini App"),
                                     created.bot.username
                                 ),
                                 2800,
+                                cx,
                             );
                             let cid = created.companion_chat_id.max(0) as u64;
                             if cid > 0 {
@@ -473,13 +475,14 @@ impl AppShell {
                             );
                             upsert_fabushi_bot_summary(shell, summary);
                             shell.sync_fabushi_bots_to_views(cx);
-                            shell.window_runtime.enqueue_toast(
+                            shell.show_toast(
                                 format!(
                                     "{} @{}",
                                     tr_str(&lang, "已创建机器人", "Bot Created"),
                                     created.bot.username
                                 ),
                                 2600,
+                                cx,
                             );
                             if let Some(cid) = created.companion_chat_id.filter(|&id| id > 0) {
                                 shell.open_or_select_chat(
@@ -563,11 +566,12 @@ impl AppShell {
                             }
                             if let Ok(r) = res {
                                 if let Some(toast) = r.toast {
-                                    shell.window_runtime.enqueue_toast(toast, 2200);
+                                    shell.show_toast(toast, 2200, cx);
                                 } else {
-                                    shell.window_runtime.enqueue_toast(
+                                    shell.show_toast(
                                         tr_str(&lang_c, "已授权并添加到附件菜单", "Authorized and added to attach menu"),
                                         2200,
+                                        cx,
                                     );
                                 }
                                 shell.refresh_miniapps_catalog(None, cx);
@@ -607,9 +611,10 @@ impl AppShell {
                                     w.resolve_write_access(false);
                                     w_cx.notify();
                                 });
-                                shell.window_runtime.enqueue_toast(
+                                shell.show_toast(
                                     tr_str(&lang_c, "无法解析机器人 ID", "Unable to resolve bot id"),
                                     2200,
+                                    cx,
                                 );
                             });
                             return;
@@ -647,7 +652,7 @@ impl AppShell {
                                     {
                                         shell.load_historical_messages(resp.chat_id as u64, cx);
                                     }
-                                    shell.window_runtime.enqueue_toast(
+                                    shell.show_toast(
                                         if !resp.service_text.trim().is_empty() {
                                             resp.service_text
                                         } else {
@@ -659,6 +664,7 @@ impl AppShell {
                                             .to_string()
                                         },
                                         2400,
+                                        cx,
                                     );
                                 }
                                 Err(e) => {
@@ -666,9 +672,10 @@ impl AppShell {
                                         w.resolve_write_access(false);
                                         w_cx.notify();
                                     });
-                                    shell.window_runtime.enqueue_toast(
+                                    shell.show_toast(
                                         format!("Allow write access failed: {}", e),
                                         2400,
+                                        cx,
                                     );
                                 }
                             }
@@ -747,9 +754,10 @@ impl AppShell {
                     let _ = std::process::Command::new("open").arg(&full_url).spawn();
                     #[cfg(target_os = "linux")]
                     let _ = std::process::Command::new("xdg-open").arg(&full_url).spawn();
-                    self.window_runtime.enqueue_toast(
+                    self.show_toast(
                         format!("{}: {}", tr_str(&lang, "已在浏览器打开/复制链接", "Opened / Copied URL"), full_url),
                         2600,
+                        cx,
                     );
                 }
                 BotWebViewPendingAction::UninstallApp {
@@ -773,11 +781,11 @@ impl AppShell {
                                     let msg = r.toast.unwrap_or_else(|| {
                                         tr_str(&lang_c, "已移除小程序", "Removed Mini App").to_string()
                                     });
-                                    shell.window_runtime.enqueue_toast(msg, 2200);
+                                    shell.show_toast(msg, 2200, cx);
                                     shell.refresh_miniapps_catalog(None, cx);
                                 }
                                 Err(e) => {
-                                    shell.window_runtime.enqueue_toast(format!("Remove error: {}", e), 2400);
+                                    shell.show_toast(format!("Remove error: {}", e), 2400, cx);
                                 }
                             }
                             cx.notify();
@@ -805,7 +813,7 @@ impl AppShell {
                             match res {
                                 Ok(resp) => {
                                     if let Some(ref toast) = resp.toast {
-                                        shell.window_runtime.enqueue_toast(toast, 2400);
+                                        shell.show_toast(toast, 2400, cx);
                                     }
                                     let refresh_companion = resp
                                         .companion_chat_id
@@ -1018,9 +1026,10 @@ impl AppShell {
                     cx,
                 ) {
                     cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                    self.window_runtime.enqueue_toast(
+                    self.show_toast(
                         format!("{}: {}", tr_str(lang, "已复制应用链接", "Copied WebApp URL"), url),
                         2400,
+                        cx,
                     );
                 }
             }
@@ -1034,9 +1043,10 @@ impl AppShell {
                     cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
                     #[cfg(target_os = "macos")]
                     let _ = std::process::Command::new("open").arg(&url).spawn();
-                    self.window_runtime.enqueue_toast(
+                    self.show_toast(
                         format!("{}: {}", tr_str(lang, "已复制链接", "Copied URL"), url),
                         2400,
+                        cx,
                     );
                 }
             }
@@ -1091,7 +1101,9 @@ impl AppShell {
                         match res {
                             Ok(result) => {
                                 if let Some(ref toast) = result.toast {
-                                    shell.window_runtime.enqueue_toast(toast, 2400);
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, toast, 2400, cx);
+                                    }
                                 }
                                 let updated_txt = result.updated_text.clone();
                                 let updated_kb = result
@@ -1143,9 +1155,9 @@ impl AppShell {
                                 }
                             }
                             Err(e) => {
-                                shell
-                                    .window_runtime
-                                    .enqueue_toast(format!("Callback failed: {}", e), 2400);
+                                if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                    shell.show_chat_toast(cid, format!("Callback failed: {}", e), 2400, cx);
+                                }
                             }
                         }
                         cx.notify();
@@ -1161,9 +1173,10 @@ impl AppShell {
         let lang = self.active_lang_id();
         let trimmed = url.trim();
         if trimmed.is_empty() {
-            self.window_runtime.enqueue_toast(
+            self.show_toast(
                 tr_str(lang, "暂无可用链接", "No URL available"),
                 2000,
+                cx,
             );
             return;
         }
@@ -1174,9 +1187,10 @@ impl AppShell {
             #[cfg(target_os = "linux")]
             let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
         }
-        self.window_runtime.enqueue_toast(
+        self.show_toast(
             format!("{}: {}", tr_str(lang, "已打开链接", "Opened URL"), trimmed),
             2400,
+            cx,
         );
     }
 
@@ -1265,9 +1279,10 @@ impl AppShell {
                         shell.sync_composer_and_inspector_miniapp_state(cx);
                     }
                     Err(e) => {
-                        shell.window_runtime.enqueue_toast(
+                        shell.show_toast(
                             format!("{}: {}", tr_str(&lang_c, "操作失败", "Failed"), e),
                             2400,
+                            cx,
                         );
                     }
                 }

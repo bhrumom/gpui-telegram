@@ -46,18 +46,11 @@ impl AppShell {
             r_cx.notify();
         });
         match dest {
-            NavDestination::Chats | NavDestination::Folders | NavDestination::SavedMessages => {
+            NavDestination::Chats | NavDestination::Folders => {
                 self.active_panel = ActiveWorkspacePanel::Chats;
-                let target_saved = if dest == NavDestination::SavedMessages {
-                    let sb = self.sidebar.read(cx);
-                    sb.saved_messages_id.or_else(|| {
-                        let uid = self.session_sync.user_id?;
-                        sb.dialogs.iter().find(|d| d.id == uid).map(|d| d.id)
-                    })
-                } else {
-                    None
-                };
                 self.sidebar.update(cx, |sb, sb_cx| {
+                    sb.exit_compose_mode();
+                    sb.is_account_popover_open = false;
                     match dest {
                         NavDestination::Chats => sb.select_folder("All"),
                         NavDestination::Folders => {
@@ -70,18 +63,71 @@ impl AppShell {
                                 sb.select_folder(first_folder);
                             }
                         }
-                        NavDestination::SavedMessages => {
-                            if let Some(saved_id) = target_saved {
-                                sb.select_dialog(saved_id);
-                            }
-                        }
                         _ => {}
                     }
                     sb_cx.notify();
                 });
-                if let Some(saved_id) = target_saved {
-                    self.sync_selected_chat_inspector_and_stage(saved_id, cx);
+                if self.composer.read(cx).is_compose_isolated
+                    && !self.is_compose_or_creation_modal_active(cx)
+                {
+                    self.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    self.sync_compose_state_to_composer(true, cx);
                 }
+                self.stage.update(cx, |st, st_cx| {
+                    st.more_menu_open = false;
+                    st.ttl_submenu_open = false;
+                    st_cx.notify();
+                });
+            }
+            NavDestination::SavedMessages => {
+                self.active_panel = ActiveWorkspacePanel::Chats;
+                let target_saved = {
+                    let sb = self.sidebar.read(cx);
+                    sb.saved_messages_id.or_else(|| {
+                        let uid = self.session_sync.user_id?;
+                        sb.dialogs.iter().find(|d| d.id == uid).map(|d| d.id)
+                    })
+                };
+                let was_isolated = self.composer.read(cx).is_compose_isolated;
+                let prev_active = self.stage.read(cx).active_chat_id;
+                self.sidebar.update(cx, |sb, sb_cx| {
+                    sb.exit_compose_mode();
+                    sb.is_account_popover_open = false;
+                    if let Some(saved_id) = target_saved {
+                        sb.select_dialog(saved_id);
+                    }
+                    sb_cx.notify();
+                });
+                if let Some(saved_id) = target_saved {
+                    if prev_active == Some(saved_id) {
+                        if was_isolated && !self.is_compose_or_creation_modal_active(cx) {
+                            self.exit_compose_or_modal_isolation(true, cx);
+                        } else {
+                            self.sync_compose_state_to_composer(true, cx);
+                        }
+                        self.sync_selected_chat_inspector_and_stage(saved_id, cx);
+                    } else {
+                        // Keep `is_compose_isolated == true` across `sync_selected_chat_inspector_and_stage`
+                        // so the previous chat's saved draft is never flushed/overwritten before switching.
+                        self.sync_selected_chat_inspector_and_stage(saved_id, cx);
+                        if was_isolated && !self.is_compose_or_creation_modal_active(cx) {
+                            self.finish_compose_isolation_for_switched_chat(saved_id, cx);
+                        } else {
+                            self.clear_compose_isolation_snapshot();
+                            self.sync_compose_state_to_composer(true, cx);
+                        }
+                    }
+                } else if was_isolated && !self.is_compose_or_creation_modal_active(cx) {
+                    self.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    self.sync_compose_state_to_composer(true, cx);
+                }
+                self.stage.update(cx, |st, st_cx| {
+                    st.more_menu_open = false;
+                    st.ttl_submenu_open = false;
+                    st_cx.notify();
+                });
             }
             NavDestination::Calls => {
                 let shell = &mut *self;
@@ -127,6 +173,8 @@ impl AppShell {
         if matches!(
             dest,
             NavDestination::Calls
+                | NavDestination::TalkMode
+                | NavDestination::RemoteComputer
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
@@ -136,7 +184,13 @@ impl AppShell {
                 sb.is_account_popover_open = false;
                 sb_cx.notify();
             });
-            self.sync_compose_state_to_composer(true, cx);
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
+                self.exit_compose_or_modal_isolation(true, cx);
+            } else {
+                self.sync_compose_state_to_composer(true, cx);
+            }
             self.stage.update(cx, |st, st_cx| {
                 st.more_menu_open = false;
                 st.ttl_submenu_open = false;
@@ -205,6 +259,13 @@ impl AppShell {
                     sb.focus_search();
                     sb_cx.notify();
                 });
+                if self.composer.read(cx).is_compose_isolated
+                    && !self.is_compose_or_creation_modal_active(cx)
+                {
+                    self.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    self.sync_compose_state_to_composer(true, cx);
+                }
                 self.composer.update(cx, |c, c_cx| {
                     c.is_input_focused = false;
                     c_cx.notify();
@@ -213,6 +274,18 @@ impl AppShell {
                 true
             }
             "," if self.is_authenticated => {
+                self.sidebar.update(cx, |sb, sb_cx| {
+                    sb.exit_compose_mode();
+                    sb.is_account_popover_open = false;
+                    sb_cx.notify();
+                });
+                if self.composer.read(cx).is_compose_isolated
+                    && !self.is_compose_or_creation_modal_active(cx)
+                {
+                    self.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    self.sync_compose_state_to_composer(true, cx);
+                }
                 self.navigate_settings_to(SettingsSectionType::Main, cx);
                 true
             }
@@ -238,7 +311,13 @@ impl AppShell {
                     s.exit_compose_mode();
                     s_cx.notify();
                 });
-                self.sync_compose_state_to_composer(true, cx);
+                if self.composer.read(cx).is_compose_isolated
+                    && !self.is_compose_or_creation_modal_active(cx)
+                {
+                    self.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    self.sync_compose_state_to_composer(true, cx);
+                }
                 cx.notify();
                 true
             }
@@ -261,6 +340,7 @@ impl AppShell {
                     r_cx.notify();
                 });
                 self.ime.clear_preedit();
+                self.enter_compose_or_modal_isolation(cx);
                 self.sidebar.update(cx, |sb, sb_cx| {
                     if is_shift {
                         sb.open_compose_group_mode();

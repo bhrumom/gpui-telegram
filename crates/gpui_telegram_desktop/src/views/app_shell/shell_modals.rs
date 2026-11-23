@@ -33,6 +33,7 @@ impl AppShell {
                 r_cx.notify();
             });
             self.ime.clear_preedit();
+            self.enter_compose_or_modal_isolation(cx);
             self.sidebar.update(cx, |sb, sb_cx| {
                 sb.open_compose_group_mode();
                 sb_cx.notify();
@@ -45,8 +46,17 @@ impl AppShell {
             cx.notify();
             return;
         }
+        let is_creation_or_contacts = matches!(
+            kind,
+            ModalDialogKind::NewChannel
+                | ModalDialogKind::NewGroup
+                | ModalDialogKind::AddContact
+                | ModalDialogKind::Contacts
+        );
+        if is_creation_or_contacts {
+            self.enter_compose_or_modal_isolation(cx);
+        }
         self.sidebar.update(cx, |sb, _| sb.exit_compose_mode());
-        self.sync_compose_state_to_composer(true, cx);
         self.stage.update(cx, |st, _| {
             st.more_menu_open = false;
             st.ttl_submenu_open = false;
@@ -59,6 +69,14 @@ impl AppShell {
             m.show_dialog(title, kind, targets, w, h, LayerStackOption::CloseOther);
             mcx.notify();
         });
+        if self.composer.read(cx).is_compose_isolated
+            && !self.is_compose_or_creation_modal_active(cx)
+            && !is_creation_or_contacts
+        {
+            self.exit_compose_or_modal_isolation(true, cx);
+        } else {
+            self.sync_compose_state_to_composer(true, cx);
+        }
         if is_connection_modal {
             let client = self.client.clone();
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -81,7 +99,12 @@ impl AppShell {
         let lang = self.active_lang_id();
         self.main_menu_drawer.update(cx, |d, _| d.close());
         self.sidebar.update(cx, |sb, _| sb.exit_compose_mode());
-        self.sync_compose_state_to_composer(true, cx);
+        if self.composer.read(cx).is_compose_isolated && !self.is_compose_or_creation_modal_active(cx)
+        {
+            self.exit_compose_or_modal_isolation(true, cx);
+        } else {
+            self.sync_compose_state_to_composer(true, cx);
+        }
         self.stage.update(cx, |st, _| {
             st.more_menu_open = false;
             st.ttl_submenu_open = false;
@@ -119,6 +142,7 @@ impl AppShell {
                         r_cx.notify();
                     });
                     self.ime.clear_preedit();
+                    self.enter_compose_or_modal_isolation(cx);
                     self.sidebar.update(cx, |sb, sb_cx| {
                         sb.open_compose_group_mode();
                         sb_cx.notify();
@@ -245,6 +269,7 @@ impl AppShell {
                     // Guard against creating an empty 0-member group when multi-select compose is available.
                     let clean_title = title.trim().chars().take(72).collect::<String>();
                     self.active_panel = ActiveWorkspacePanel::Chats;
+                    self.enter_compose_or_modal_isolation(cx);
                     self.sidebar.update(cx, |sb, sb_cx| {
                         sb.open_compose_group_mode();
                         sb.compose_draft.custom_group_title = clean_title;
@@ -343,8 +368,10 @@ impl AppShell {
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                         if let Ok(path) = client.export_chat_history(cid as i64, fmt.as_deref()).await {
                             let _ = weak.update(app, |s, cx| {
-                                let pfx = tr_str(s.active_lang_id(), "已导出聊天记录", "Exported");
-                                s.window_runtime.enqueue_toast(format!("{pfx}: {path}"), 3000);
+                                if s.stage.read(cx).active_chat_id == Some(cid) {
+                                    let pfx = tr_str(s.active_lang_id(), "已导出聊天记录", "Exported");
+                                    s.show_chat_toast(cid, format!("{pfx}: {path}"), 3000, cx);
+                                }
                                 cx.notify();
                             });
                         }
@@ -374,9 +401,11 @@ impl AppShell {
                         st.row_height_cache.rebuild_prefix_sums(&st.messages);
                         st_cx.notify();
                     });
-                    self.window_runtime.enqueue_toast(
+                    self.show_chat_toast(
+                        cid,
                         tr_str(lang, "聊天记录已清空", "Chat history cleared"),
                         2200,
+                        cx,
                     );
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                         let _ = client.clear_chat_history(cid as i64).await;
@@ -388,25 +417,11 @@ impl AppShell {
             ModalActionOutcome::ConfirmLeaveOrDeleteChat => {
                 if let Some(cid) = active_chat {
                     let lang = self.active_lang_id();
-                    self.session_sync.rich_chats_by_id.remove(&cid);
-                    let next_chat_id = self.sidebar.update(cx, |sb, sb_cx| {
-                        sb.delete_dialog(cid);
-                        sb_cx.notify();
-                        sb.dialogs.first().map(|d| d.id)
-                    });
-                    if let Some(next_id) = next_chat_id {
-                        self.sidebar.update(cx, |sb, _| sb.select_dialog(next_id));
-                        self.sync_selected_chat_inspector_and_stage(next_id, cx);
-                    } else {
-                        self.stage.update(cx, |st, st_cx| {
-                            st.clear_selection();
-                            st_cx.notify();
-                        });
-                        self.set_inspector_open(false, cx);
-                    }
-                    self.window_runtime.enqueue_toast(
+                    self.cleanup_deleted_or_left_chat_state(cid, cx);
+                    self.show_toast(
                         tr_str(lang, "对话已移除", "Chat removed"),
                         2200,
+                        cx,
                     );
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                         let _ = client.leave_or_delete_chat(cid as i64).await;

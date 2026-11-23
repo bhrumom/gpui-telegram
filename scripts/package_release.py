@@ -824,17 +824,15 @@ def create_macos_dmg(
         os.chmod(dmg_path, 0o644)
 
         if sign_identity and shutil.which("codesign"):
-            run_signing_cmd_with_retry(
-                [
-                    "codesign",
-                    "--force",
-                    "--timestamp",
-                    "--sign",
-                    sign_identity,
-                    str(dmg_path),
-                ]
-            )
-            log(f"Developer ID signed macOS DMG: {dmg_path.name}")
+            cmd = ["codesign", "--force"]
+            if "Developer ID Application" in sign_identity:
+                cmd.append("--timestamp")
+            cmd.extend(["--sign", sign_identity, str(dmg_path)])
+            run_signing_cmd_with_retry(cmd)
+            if "Developer ID Application" in sign_identity:
+                log(f"Developer ID signed macOS DMG: {dmg_path.name}")
+            else:
+                log(f"Signed macOS DMG ({sign_identity}): {dmg_path.name}")
 
         if notarize:
             notarize_and_staple_target(dmg_path, is_app_bundle=False)
@@ -1216,8 +1214,14 @@ def install_to_applications(
 
     lsregister = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
     if Path(lsregister).exists():
+        # Unregister build-tree staging bundles in dist/ so LaunchServices & TCC
+        # never resolve com.ombhrum.fabushi to a stale ad-hoc dist/ copy over /Applications.
+        staging_dir = app_dir.parent
+        for stale_bundle in (staging_dir / f"{app_name}.app", staging_dir / "GPUI Telegram.app"):
+            if stale_bundle.exists() and stale_bundle.resolve() != target_app.resolve():
+                subprocess.run([lsregister, "-u", str(stale_bundle)], check=False, capture_output=True)
         subprocess.run([lsregister, "-f", str(target_app)], check=False, capture_output=True)
-        log("Registered bundle in macOS LaunchServices.")
+        log("Registered bundle in macOS LaunchServices (unregistered dist/ staging copies).")
     if shutil.which("mdimport"):
         subprocess.run(["mdimport", str(target_app)], check=False, capture_output=True)
         log("Triggered Spotlight metadata indexing via mdimport.")

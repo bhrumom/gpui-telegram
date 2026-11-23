@@ -37,6 +37,7 @@ use crate::views::app_shell::{
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
     ShellBotBrowserState, ShellPanelState,
 };
+use crate::views::composer::BotKeyboard;
 use crate::views::nav_rail::NavDestination;
 use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
@@ -88,13 +89,15 @@ pub fn nav_destination_for_shortcut_digit(key: &str) -> Option<NavDestination> {
 }
 
 /// Snapshot of per-chat composer metadata taken when entering `+` / modal isolation so canceling
-/// back to the same chat restores reply/edit/attachments cleanly.
+/// back to the same chat restores reply/edit/attachments/bot-keyboard cleanly.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ComposeIsolationSnapshot {
     pub chat_id: Option<u64>,
     pub replying_to: Option<(u64, String, String)>,
     pub editing_message: Option<(u64, String)>,
     pub attachments: Vec<PathBuf>,
+    pub bot_keyboard: Option<BotKeyboard>,
+    pub is_bot_keyboard_open: bool,
 }
 
 /// Root GPUI desktop view orchestrating workspace views, session lifecycle, routing, and overlays.
@@ -578,7 +581,18 @@ impl AppShell {
 
     /// Opens or navigates within the lazy `SettingsRouter` modal and dismisses conflicting popovers.
     pub fn navigate_settings_to(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
-        self.sidebar.update(cx, |sb, sb_cx| { sb.is_plus_menu_open = false; sb.is_account_popover_open = false; sb_cx.notify(); });
+        self.sidebar.update(cx, |sb, sb_cx| {
+            sb.exit_compose_mode();
+            sb.is_account_popover_open = false;
+            sb_cx.notify();
+        });
+        if self.composer.read(cx).is_compose_isolated
+            && !self.is_compose_or_creation_modal_active(cx)
+        {
+            self.exit_compose_or_modal_isolation(true, cx);
+        } else {
+            self.sync_compose_state_to_composer(true, cx);
+        }
         self.stage.update(cx, |st, st_cx| { st.more_menu_open = false; st.ttl_submenu_open = false; st_cx.notify(); });
 
         let was_outside = self.active_panel != ActiveWorkspacePanel::Settings;
@@ -826,6 +840,8 @@ impl AppShell {
                 replying_to: c.replying_to.clone(),
                 editing_message: c.editing_message.clone(),
                 attachments: c.editor.attachments.clone(),
+                bot_keyboard: c.bot_keyboard.has_markup().then(|| c.bot_keyboard.clone()),
+                is_bot_keyboard_open: c.is_bot_keyboard_open,
             }
         };
         self.compose_isolation_snapshot = Some(snapshot);
@@ -920,6 +936,10 @@ impl AppShell {
                         c.replying_to = snap.replying_to.clone();
                         c.editing_message = snap.editing_message.clone();
                         c.editor.attachments = snap.attachments.clone();
+                        if let Some(ref kb) = snap.bot_keyboard {
+                            c.bot_keyboard = kb.clone();
+                            c.is_bot_keyboard_open = snap.is_bot_keyboard_open;
+                        }
                     }
                 }
                 let draft = saved_draft.unwrap_or_default();
@@ -1030,6 +1050,16 @@ impl AppShell {
         duration_ms: u64,
         cx: &mut Context<Self>,
     ) {
+        let in_active_chat = self.is_authenticated
+            && self.active_panel == ActiveWorkspacePanel::Chats
+            && !(self.theme_state.palette.is_apple_style()
+                && self.sidebar.read(cx).is_plus_menu_open);
+        if in_active_chat {
+            if let Some(cid) = self.stage.read(cx).active_chat_id {
+                self.show_chat_toast(cid, text, duration_ms, cx);
+                return;
+            }
+        }
         self.window_runtime.enqueue_toast(text, duration_ms);
         self.schedule_current_toast_dismiss(cx);
         cx.notify();

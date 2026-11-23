@@ -233,6 +233,8 @@ pub fn reset_account_conversation_views(
     sidebar.dialogs.clear();
     sidebar.custom_folders.clear();
     sidebar.bot_ids.clear();
+    sidebar.bot_fabushi_visuals.clear();
+    sidebar.bot_grok_avatars.clear();
     sidebar.contact_chat_ids.clear();
     sidebar.group_chat_ids.clear();
     sidebar.channel_chat_ids.clear();

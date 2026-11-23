@@ -74,6 +74,20 @@ fn action_pill(
         .child(label)
 }
 
+fn pending_restart_pill(label: &'static str) -> Div {
+    div()
+        .px(px(14.0))
+        .py(px(6.5))
+        .rounded(px(999.0))
+        .bg(TdesktopThemePalette::rgba_with_alpha(BADGE_AMBER, 0.14))
+        .border_1()
+        .border_color(TdesktopThemePalette::rgba_with_alpha(BADGE_AMBER, 0.38))
+        .text_size(px(12.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(BADGE_AMBER))
+        .child(label)
+}
+
 fn done_pill(label: &'static str, pal: TdesktopThemePalette) -> Div {
     div()
         .px(px(14.0))
@@ -298,6 +312,8 @@ pub fn render_permission_rows_card(
                 )
                 .child(if screen_ok {
                     done_pill(tr_str(lang, "完成", "Done"), pal).into_any_element()
+                } else if screen_needs_restart {
+                    pending_restart_pill(tr_str(lang, "已开启", "Enabled")).into_any_element()
                 } else {
                     action_pill(
                         if id_prefix == "modal" {
@@ -516,8 +532,8 @@ pub fn render_gemini_permission_modal(
                                     .text_color(rgb(pal.text_primary))
                                     .child(tr_str(
                                         lang,
-                                        "悬浮拖拽卡片已显示在“系统设置”下方，可直接按住应用拖入授权列表。",
-                                        "The floating drag card is visible above System Settings — drag the app tile directly into the list.",
+                                        "悬浮拖拽卡片已就绪：切换至“系统设置”后，可直接按住卡片中的 Fabushi 拖入授权列表。",
+                                        "The floating drag card is active — switch to System Settings and drag the app tile into the list.",
                                     )),
                             )
                             .child(action_pill(

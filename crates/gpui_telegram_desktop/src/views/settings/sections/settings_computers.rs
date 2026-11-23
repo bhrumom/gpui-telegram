@@ -21,8 +21,8 @@ use crate::components::ui::{
 };
 use crate::i18n::tr_str;
 use crate::platform::mac::macos_permissions_drag::{
-    cached_permissions_snapshot, hide_drag_hud, permissions_snapshot_generation,
-    request_permissions_refresh,
+    ScreenPermissionState, cached_permissions_snapshot, hide_drag_hud,
+    permissions_snapshot_generation, request_permissions_refresh,
 };
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::TdesktopThemePalette;
@@ -236,8 +236,12 @@ pub struct SettingsComputersSections {
     pub permission_modal_open: bool,
     permission_poll_started: bool,
     last_perm_gen: u64,
-    last_perm_screen_active: bool,
+    last_perm_screen_state: ScreenPermissionState,
     last_perm_ax_active: bool,
+    last_perm_hud_visible: bool,
+    last_perm_stale_screen: bool,
+    last_perm_stale_ax: bool,
+    last_perm_drag_seq: u64,
 }
 
 impl SettingsComputersSections {
@@ -290,8 +294,12 @@ impl SettingsComputersSections {
             permission_modal_open: false,
             permission_poll_started: false,
             last_perm_gen: 0,
-            last_perm_screen_active: false,
+            last_perm_screen_state: ScreenPermissionState::NotGranted,
             last_perm_ax_active: false,
+            last_perm_hud_visible: false,
+            last_perm_stale_screen: false,
+            last_perm_stale_ax: false,
+            last_perm_drag_seq: 0,
         }
     }
 
@@ -306,37 +314,47 @@ impl SettingsComputersSections {
         self.permission_poll_started = true;
         let init_snap = cached_permissions_snapshot();
         self.last_perm_gen = permissions_snapshot_generation();
-        self.last_perm_screen_active = init_snap.screen_state.is_active();
+        self.last_perm_screen_state = init_snap.screen_state;
         self.last_perm_ax_active = init_snap.accessibility_granted;
+        self.last_perm_hud_visible = init_snap.hud_visible;
+        self.last_perm_stale_screen = init_snap.stale_screen_suspected;
+        self.last_perm_stale_ax = init_snap.stale_ax_suspected;
+        self.last_perm_drag_seq = init_snap.last_drag_seq;
         if init_snap.any_missing() {
             request_permissions_refresh(true);
         }
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| loop {
             app.background_executor()
-                .timer(Duration::from_millis(850))
+                .timer(Duration::from_millis(450))
                 .await;
             let keep = weak
                 .update(app, |this, cx| {
+                    let before_snap = cached_permissions_snapshot();
                     let perm_ui_visible = this.permission_modal_open
                         || (this.page == SettingsComputersPage::Overview
                             && this.overview_tab == SettingsComputersTab::MyDevices);
-                    if perm_ui_visible {
-                        let before_snap = cached_permissions_snapshot();
+                    if perm_ui_visible || before_snap.hud_visible {
                         if before_snap.any_missing() || before_snap.hud_visible {
                             request_permissions_refresh(false);
                         }
                         let snap = cached_permissions_snapshot();
                         let perm_gen = permissions_snapshot_generation();
-                        let screen_active = snap.screen_state.is_active();
-                        let ax_active = snap.accessibility_granted;
                         if perm_gen != this.last_perm_gen
-                            || screen_active != this.last_perm_screen_active
-                            || ax_active != this.last_perm_ax_active
+                            || snap.screen_state != this.last_perm_screen_state
+                            || snap.accessibility_granted != this.last_perm_ax_active
+                            || snap.hud_visible != this.last_perm_hud_visible
+                            || snap.stale_screen_suspected != this.last_perm_stale_screen
+                            || snap.stale_ax_suspected != this.last_perm_stale_ax
+                            || snap.last_drag_seq != this.last_perm_drag_seq
                         {
                             this.last_perm_gen = perm_gen;
-                            this.last_perm_screen_active = screen_active;
-                            this.last_perm_ax_active = ax_active;
+                            this.last_perm_screen_state = snap.screen_state;
+                            this.last_perm_ax_active = snap.accessibility_granted;
+                            this.last_perm_hud_visible = snap.hud_visible;
+                            this.last_perm_stale_screen = snap.stale_screen_suspected;
+                            this.last_perm_stale_ax = snap.stale_ax_suspected;
+                            this.last_perm_drag_seq = snap.last_drag_seq;
                             cx.notify();
                         }
                     }
@@ -2383,8 +2401,8 @@ impl SettingsComputersSections {
                                 .text_color(rgb(pal.text_primary))
                                 .child(tr_str(
                                     lang,
-                                    "已打开悬浮拖拽卡片：按住其中的 Fabushi 拖入“系统设置”列表即可完成授权。",
-                                    "Floating drag card is open — drag Fabushi into System Settings to grant access.",
+                                    "悬浮拖拽卡片已就绪：切换至“系统设置”后按住 Fabushi 拖入授权列表即可。",
+                                    "Floating drag card is active — switch to System Settings and drag Fabushi into the list.",
                                 )),
                         )
                         .child(
@@ -2399,10 +2417,14 @@ impl SettingsComputersSections {
                                 .border_color(rgb(pal.border_fg))
                                 .text_size(px(11.5))
                                 .text_color(rgb(pal.text_primary))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                    hide_drag_hud();
-                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        hide_drag_hud();
+                                        cx.notify();
+                                    }),
+                                )
                                 .child(tr_str(lang, "隐藏卡片", "Hide")),
                         ),
                 )

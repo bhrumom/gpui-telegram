@@ -292,7 +292,7 @@ fn toggle_chat_dialog_flag(
         (false, true) => tr_str(lang, "已开启消息免打扰", "Notifications muted"),
         (false, false) => tr_str(lang, "已恢复消息通知", "Notifications unmuted"),
     };
-    shell.window_runtime.enqueue_toast(toast_msg, 2000);
+    shell.show_chat_toast(cid, toast_msg, 2000, cx);
     let c = shell.client.clone();
     cx.spawn(async move |_: WeakEntity<AppShell>, _: &mut AsyncApp| {
         if is_pin {
@@ -767,13 +767,14 @@ impl AppShell {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        shell.window_runtime.enqueue_toast(
+                        shell.show_toast(
                             format!(
                                 "{}: {}",
                                 tr_str(&lang_owned, "打开私聊失败", "Failed to open DM"),
                                 e
                             ),
                             2400,
+                            cx,
                         );
                     }
                 }
@@ -870,6 +871,12 @@ impl AppShell {
             return;
         }
         if prev_chat_id != Some(chat_id) {
+            if let Some(prev) = prev_chat_id {
+                if self.window_runtime.controller.clear_toasts_for_chat(prev) {
+                    self.schedule_current_toast_dismiss(cx);
+                }
+            }
+            self.last_observed_toast_chat_id = Some(chat_id);
             let cached_draft = self
                 .client
                 .local_store
@@ -891,6 +898,11 @@ impl AppShell {
                 } else {
                     c.set_text(cached_draft.clone());
                 }
+                c.cancel_reply_or_edit();
+                c.editor.attachments.clear();
+                c.submitted_attachment = None;
+                c.pending_attached_files = None;
+                c.clear_bot_reply_keyboard();
                 c.set_send_as_options(cached_send_as_list, cached_chosen_send_as);
             });
             self.sidebar
@@ -1363,9 +1375,10 @@ impl AppShell {
         if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("url:") {
             let url = trimmed.trim_start_matches("url:").to_string();
             cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-            self.window_runtime.enqueue_toast(
+            self.show_toast(
                 format!("{}: {}", tr_str(lang, "已复制链接", "Copied URL"), url),
                 2600,
+                cx,
             );
             return;
         }
@@ -1441,7 +1454,7 @@ impl AppShell {
                         return;
                     }
                     let summary: String = toast.lines().next().unwrap_or(&toast).chars().take(120).collect();
-                    shell.window_runtime.enqueue_toast(summary, 3000);
+                    shell.show_toast(summary, 3000, cx);
                     shell.refresh_tasks_and_mcp(cx);
                     if let Some(cid) = active_chat {
                         shell.load_historical_messages(cid, cx);
@@ -1503,9 +1516,10 @@ impl AppShell {
                 let name = self.stage.read(cx).chat_title.clone();
                 self.start_webrtc_call(pid, name, call_vid, cx);
             } else {
-                self.window_runtime.enqueue_toast(
+                self.show_toast(
                     tr_str(lang, "当前群组或会话未绑定直接通话用户，请进入私聊或机器人对话。", "No direct user peer resolved for WebRTC call in this chat."),
                     3000,
+                    cx,
                 );
             }
         }
@@ -1599,8 +1613,7 @@ impl AppShell {
                 let _ = c.download_media_range(&url, 0, None).await;
                 let _ = weak.update(app, |s, cx| {
                     let pfx = tr_str(s.active_lang_id(), "已保存文件", "Saved");
-                    s.window_runtime.enqueue_toast(format!("{pfx}: {name}"), 2500);
-                    cx.notify();
+                    s.show_toast(format!("{pfx}: {name}"), 2500, cx);
                 });
             })
             .detach();
@@ -1643,7 +1656,7 @@ impl AppShell {
             } else {
                 tr_str(lang, "自动删除已设为 1 个月", "Auto-delete set to 1 month")
             };
-            self.window_runtime.enqueue_toast(toast_msg, 2200);
+            self.show_chat_toast(cid, toast_msg, 2200, cx);
             let c = self.client.clone();
             let lang_owned = lang.to_string();
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -1655,7 +1668,9 @@ impl AppShell {
                         s.stage.update(cx, |st, st_cx| {
                             if st.active_chat_id == Some(cid) { st.message_ttl_seconds = prev_ttl; st_cx.notify(); }
                         });
-                        s.window_runtime.enqueue_toast(tr_str(&lang_owned, "自动删除设置保存失败", "Failed to update auto-delete timer"), 2500);
+                        if s.stage.read(cx).active_chat_id == Some(cid) {
+                            s.show_chat_toast(cid, tr_str(&lang_owned, "自动删除设置保存失败", "Failed to update auto-delete timer"), 2500, cx);
+                        }
                     });
                 }
             })
@@ -1671,7 +1686,7 @@ impl AppShell {
                     rc.is_blocked = blocked_now;
                 }
                 let toast_msg = if blocked_now { tr_str(lang, "已屏蔽该用户", "User blocked") } else { tr_str(lang, "已取消屏蔽该用户", "User unblocked") };
-                self.window_runtime.enqueue_toast(toast_msg, 2200);
+                self.show_toast(toast_msg, 2200, cx);
                 let c = self.client.clone();
                 let lang_owned = lang.to_string();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -1686,13 +1701,15 @@ impl AppShell {
                             s.stage.update(cx, |st, st_cx| {
                                 if st.active_chat_id == active_chat { st.is_peer_blocked = prev_blocked; st_cx.notify(); }
                             });
-                            s.window_runtime.enqueue_toast(tr_str(&lang_owned, "屏蔽状态同步失败", "Failed to update block status"), 2500);
+                            if s.stage.read(cx).active_chat_id == active_chat {
+                                s.show_toast(tr_str(&lang_owned, "屏蔽状态同步失败", "Failed to update block status"), 2500, cx);
+                            }
                         }
                     });
                 })
                 .detach();
             } else {
-                self.window_runtime.enqueue_toast(tr_str(lang, "群组或收藏夹不支持单用户屏蔽", "Blocking applies only to direct user peers"), 2200);
+                self.show_toast(tr_str(lang, "群组或收藏夹不支持单用户屏蔽", "Blocking applies only to direct user peers"), 2200, cx);
             }
         }
         let leave_from_inspector = self.inspector.update(cx, |insp, _| insp.take_pending_leave_chat());
@@ -1753,9 +1770,8 @@ impl AppShell {
                                         e
                                     ),
                                 };
-                                shell.window_runtime.enqueue_toast(msg, 2400);
+                                shell.show_toast(msg, 2400, cx);
                                 shell.refresh_tasks_and_mcp(cx);
-                                cx.notify();
                             });
                         })
                         .detach();

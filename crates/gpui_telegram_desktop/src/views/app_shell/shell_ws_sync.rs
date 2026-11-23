@@ -204,7 +204,9 @@ impl AppShell {
                                 tr_str(shell.active_lang_id(), "发送失败", "Message send failed"),
                                 err
                             );
-                            shell.window_runtime.enqueue_toast(err_text, 3500);
+                            if shell.stage.read(cx).active_chat_id == Some(active_chat_id) {
+                                shell.show_chat_toast(active_chat_id, err_text, 3500, cx);
+                            }
                         }
                     }
                     cx.notify();
