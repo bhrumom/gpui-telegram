@@ -307,18 +307,24 @@ pub fn render_bot_profile_main(
             },
             cx,
         ));
-        if model.bot_can_join_groups {
+        if model.bot_can_join_groups || is_owner_fabushi {
+            let target_bot_id = inspector
+                .active_fabushi_bot
+                .as_ref()
+                .map(|b| b.bot_user_id.max(0) as u64)
+                .filter(|&id| id > 0)
+                .unwrap_or(bot_id);
             actions_sec = actions_sec.child(muse_icon_row(
                 "bot-profile-add-to-group",
                 IconName::GroupUsers,
                 pal.accent,
-                tr_str(lang, "添加到群组或频道", "Add to Group or Channel"),
-                None,
+                tr_str(lang, "添加到群聊", "Add to Group"),
+                Some(tr_str(lang, "拉入群聊并添加其他成员或 Bot", "Start a group with this bot").into()),
                 None,
                 Some(tg_icon(IconName::ChevronRight, 12.0, pal.text_secondary).into_any_element()),
                 pal,
                 move |this, _| {
-                    this.pending_action = Some(InspectorAction::OpenAddBotToGroup(bot_id));
+                    this.pending_action = Some(InspectorAction::OpenAddBotToGroup(target_bot_id));
                 },
                 cx,
             ));

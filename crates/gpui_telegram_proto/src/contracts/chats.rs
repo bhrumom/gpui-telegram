@@ -18,6 +18,8 @@ pub struct CreateChatRequest {
     pub member_ids: Vec<u64>,
     #[serde(default)]
     pub member_usernames: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

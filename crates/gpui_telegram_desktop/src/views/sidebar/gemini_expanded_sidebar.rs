@@ -141,7 +141,7 @@ pub fn render_expanded_gemini_top_bar<V: 'static>(
                         ))
                         .when(compose_hovered && !is_plus_active, |el| {
                             el.child(render_floating_pill_tooltip_at(
-                                tr_str(lang_id, "新建消息", "New Message"),
+                                tr_str(lang_id, "发起新对话", "New Chat"),
                                 -48.0,
                                 32.0,
                                 palette,

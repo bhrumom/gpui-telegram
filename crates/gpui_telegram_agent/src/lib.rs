@@ -32,8 +32,18 @@ pub use fabushi::{
 };
 
 pub use multi_agent::{
-    FloorControlQueue, FloorPriority, LoopBudget, LoopBudgetExceededError, ScopedCapabilityToken,
-    SharedGroupWorkspace, SharedWorkspaceEntry, DEFAULT_MAX_LOOP_HOPS,
+    evaluate_group_wake_gate, evaluate_outbound_turn_review, is_explicit_pass_sentinel,
+    FloorControlQueue, FloorPriority, FloorTurnGrant, GroupWakeBotCandidate, GroupWakeBotScore,
+    GroupWakeGateDecision, GroupWakeGateInput, GroupWakeReason, GroupWorkspaceBridge,
+    InMemoryGroupWorkspaceBridge, LoopBudget, LoopBudgetExceededError, OutboundReviewReason,
+    OutboundTurnReviewInput, OutboundTurnVerdict, RoomMemberTurnOutcome, ScopedCapabilityToken,
+    SharedGroupWorkspace, SharedGroupWorkspaceAdapter, SharedWorkspaceEntry, TurnDeliveryIntake,
+    DEFAULT_MAX_LOOP_HOPS,
+};
+
+pub use fabushi_bot::{
+    build_group_turn_guidance, is_room_session_key, parse_room_session_chat_id, room_session_key,
+    GroupTurnPromptContext, ROOM_SESSION_KEY_PREFIX,
 };
 
 pub use acp::{
@@ -44,7 +54,7 @@ pub use computer::{
     parse_cloud_credentials_from_prompt, redact_cloud_secrets, AgentCloudServerConfigInput,
     AgentComputerExecInput, AgentComputerExecOutput, AgentComputerNodeSummary,
     ComputerCloudProvider, ComputerControlLease, ComputerLeaseBroker, CuaAction, CuaExecutor,
-    LeaseState,
+    LeaseState, CUA_BACKEND_UNAVAILABLE_ERR,
 };
 pub use hermes::commands::{
     CommandDescriptor, CommandExecutionOutcome, CommandUiEffect, InlineActionButton,
@@ -54,9 +64,16 @@ pub use hermes::context::{
     AssembledPrompt, CompressionConfig, ContextCompressor, ContextRefResolver, PromptBuilder,
     WorkspaceContextDiscovery,
 };
-pub use hermes::memory::{HonchoDialectics, MemoryManager, MemoryTarget, SoulProfile};
+pub use hermes::memory::{
+    HonchoDialectics, MemoryManager, MemoryQuarantineQueue, MemoryRollupEntry, MemoryRollupHorizon,
+    MemoryTarget, QuarantineStatus, QuarantinedMemoryProposal, SoulProfile,
+};
 pub use hermes::providers::{ApiMode, MagpiePresetApplyInput, MoaCoordinator, ProviderConfig, ProviderRouter};
-pub use hermes::security::{ApprovalDecisionAction, ApprovalMode, SecurityEngine};
+pub use hermes::security::{
+    compute_content_sha256, ApprovalConsumeError, ApprovalDecisionAction, ApprovalMode,
+    AutoReviewPolicy, AutoReviewVerdict, SecurityEngine, ToolApprovalTier,
+    ValueBoundApprovalLedger, ValueBoundApprovalToken, DEFAULT_VALUE_BOUND_APPROVAL_TTL_MS,
+};
 pub use hermes::skills::SkillsManager;
 pub use hermes::state_db::HermesStateStore;
 pub use hermes::tools_agentic::{

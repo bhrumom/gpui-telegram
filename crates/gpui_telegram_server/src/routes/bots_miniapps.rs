@@ -2738,12 +2738,30 @@ pub async fn handle_ai_bot_reply_in_topic(
     text: &str,
     topic_id: Option<TopicId>,
 ) {
+    handle_ai_bot_reply_with_floor_fence(state, chat_id, sender_id, bot_user_id, text, topic_id, None)
+        .await;
+}
+
+pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    sender_id: UserId,
+    bot_user_id: UserId,
+    text: &str,
+    topic_id: Option<TopicId>,
+    floor_fence: Option<crate::routes::hermes::BotTurnFloorFence>,
+) {
     let _ = state.self_weak.set(Arc::downgrade(state));
+    if floor_fence.as_ref().is_some_and(|f| !f.is_active()) {
+        return;
+    }
     if bot_user_id.0 == BOTFATHER_USER_ID {
         let typing_guard =
             crate::routes::hermes::BotTypingGuard::start(Arc::clone(state), chat_id, bot_user_id);
         let (reply, kb) = handle_botfather_message(state, chat_id, sender_id, text).await;
-        let _ = send_bot_chat_reply_in_topic(state, chat_id, bot_user_id, &reply, kb, topic_id);
+        if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+            let _ = send_bot_chat_reply_in_topic(state, chat_id, bot_user_id, &reply, kb, topic_id);
+        }
         typing_guard.finish();
         return;
     }
@@ -2802,7 +2820,9 @@ pub async fn handle_ai_bot_reply_in_topic(
             );
             welcome.push_str("\n\n");
             welcome.push_str(&live_runtime);
-            let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome, kb);
+            if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome, kb);
+            }
             typing_guard.finish();
             return;
         }
@@ -2880,6 +2900,7 @@ pub async fn handle_ai_bot_reply_in_topic(
             extra_context_sections,
             companion_apps: apps,
             help_bot_commands_suffix,
+            floor_fence,
         },
     )
     .await;

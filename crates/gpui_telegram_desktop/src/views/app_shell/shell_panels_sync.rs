@@ -4,10 +4,15 @@ use gpui::{AppContext, AsyncApp, ClipboardItem, Context, WeakEntity};
 use gpui_telegram_proto::miniapp_contracts::MiniAppLaunchMode;
 
 use crate::i18n::tr_str;
-use crate::views::app_shell::shell_actions::{contacts_to_modal_rows, resolve_active_target_chat_id};
+use crate::theme::TdesktopThemePalette;
+use crate::views::app_shell::shell_actions::{
+    contacts_to_modal_rows, map_chat_members_to_inspector, peer_avatar_color,
+    resolve_active_target_chat_id,
+};
 use crate::views::app_shell::shell_settings_sync::{apply_folders_to_shell, apply_wallet_to_shell};
-use crate::views::app_shell::shell_truth::SessionRequestFence;
+use crate::views::app_shell::shell_truth::{derive_initials, SessionRequestFence};
 use crate::views::boxes::modal_types::ModalDialogKind;
+use crate::views::context_inspector::build_add_member_candidates;
 use crate::views::drawer::inspector_tabs::InspectorAction;
 use crate::views::shell::AppShell;
 use crate::views::sidebar::dialogs_row_view::SidebarContextAction;
@@ -205,13 +210,159 @@ impl AppShell {
                     .detach();
                 }
             }
-            InspectorAction::OpenAddMember => self.open_modal_dialog(
-                tr_str(lang, "添加成员", "Add Member"),
-                ModalDialogKind::Contacts,
-                400.0,
-                440.0,
-                cx,
-            ),
+            InspectorAction::OpenAddMember => {
+                let pending_add_uid = self
+                    .inspector
+                    .update(cx, |i, _| i.take_pending_add_member_user_id());
+                if let Some(target_uid) = pending_add_uid {
+                    let Some(cid) = active_chat else {
+                        return;
+                    };
+                    let Some(fence) = session_fence(self) else {
+                        return;
+                    };
+                    let client = self.client.clone();
+                    let lang_owned = lang.to_string();
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        let add_res = client.add_chat_members(cid as i64, &[target_uid]).await;
+                        let refreshed_members = if add_res.is_ok() {
+                            client.get_chat_members(cid as i64).await.ok()
+                        } else {
+                            None
+                        };
+                        let _ = weak.update(app, |shell, cx| {
+                            if !fence_matches(&fence, shell) {
+                                return;
+                            }
+                            match add_res {
+                                Ok(_) => {
+                                    if let Some(ref mems) = refreshed_members {
+                                        let mut mapped = map_chat_members_to_inspector(
+                                            mems,
+                                            &shell.session_sync.contacts_list,
+                                        );
+                                        let is_dark = shell.theme_state.palette.mode.is_dark();
+                                        for item in &mut mapped {
+                                            if let Some(fb) = shell
+                                                .miniapps
+                                                .fabushi_bots
+                                                .iter()
+                                                .find(|b| {
+                                                    b.bot_user_id > 0
+                                                        && b.bot_user_id as u64 == item.id
+                                                })
+                                            {
+                                                if !fb.display_name.trim().is_empty() {
+                                                    item.name = fb.display_name.trim().to_string();
+                                                    let init = derive_initials(&item.name);
+                                                    if !init.is_empty() {
+                                                        item.initials = init;
+                                                    }
+                                                }
+                                                let hue = if TdesktopThemePalette::is_tinted_bot_hue(
+                                                    &fb.avatar_color,
+                                                ) {
+                                                    fb.avatar_color.as_str()
+                                                } else {
+                                                    TdesktopThemePalette::bot_hue_name_for_id(
+                                                        item.id,
+                                                    )
+                                                };
+                                                item.color =
+                                                    TdesktopThemePalette::bot_hue_colors(hue, is_dark)
+                                                        .0;
+                                                item.role = "AI Bot".to_string();
+                                                item.is_online = true;
+                                            }
+                                        }
+                                        let member_count = mapped.len();
+                                        let invite_link = shell
+                                            .inspector
+                                            .read(cx)
+                                            .members
+                                            .invite_link
+                                            .clone();
+                                        shell.inspector.update(cx, |insp, icx| {
+                                            insp.sync_members(mapped, invite_link, true);
+                                            insp.remove_add_member_candidate(target_uid);
+                                            icx.notify();
+                                        });
+                                        shell.stage.update(cx, |st, st_cx| {
+                                            if st.active_chat_id == Some(cid) && member_count > 0 {
+                                                st.chat_subtitle = if lang_owned.starts_with("zh") {
+                                                    format!("{member_count} 位成员")
+                                                } else {
+                                                    format!("{member_count} members")
+                                                };
+                                                st_cx.notify();
+                                            }
+                                        });
+                                        shell.sync_composer_mention_candidates(
+                                            cid,
+                                            Some(mems.as_slice()),
+                                            cx,
+                                        );
+                                    } else {
+                                        shell.inspector.update(cx, |insp, icx| {
+                                            insp.remove_add_member_candidate(target_uid);
+                                            icx.notify();
+                                        });
+                                        shell.sync_composer_mention_candidates(cid, None, cx);
+                                    }
+                                    shell.window_runtime.enqueue_toast(
+                                        tr_str(
+                                            &lang_owned,
+                                            "已添加成员到当前群聊",
+                                            "Added member to group",
+                                        ),
+                                        2200,
+                                    );
+                                }
+                                Err(e) => {
+                                    shell.window_runtime.enqueue_toast(
+                                        format!(
+                                            "{}: {}",
+                                            tr_str(
+                                                &lang_owned,
+                                                "添加成员失败",
+                                                "Failed to add member"
+                                            ),
+                                            e
+                                        ),
+                                        2600,
+                                    );
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                } else {
+                    if self.session_sync.contacts_list.is_empty() {
+                        self.refresh_contacts(cx);
+                    }
+                    let mut existing_ids: Vec<u64> = self
+                        .inspector
+                        .read(cx)
+                        .members
+                        .members
+                        .iter()
+                        .map(|m| m.id)
+                        .collect();
+                    if let Some(me) = self.session_sync.user_id {
+                        existing_ids.push(me);
+                    }
+                    let candidates = build_add_member_candidates(
+                        &existing_ids,
+                        &self.session_sync.contacts_list,
+                        &self.miniapps.fabushi_bots,
+                    );
+                    self.inspector.update(cx, |insp, icx| {
+                        insp.open_add_member_picker(candidates);
+                        icx.notify();
+                    });
+                }
+            }
             InspectorAction::ChangeAutoDelete(secs) => {
                 if let Some(cid) = active_chat {
                     let ttl_u32 = match secs.trim() {
@@ -359,9 +510,89 @@ impl AppShell {
                     );
                 }
             }
-            InspectorAction::OpenAddBotToGroup(_bot_id) => {
-                let title = tr_str(lang, "添加到群组", "Add to Group");
-                self.open_modal_dialog(title, ModalDialogKind::NewGroup, 420.0, 380.0, cx);
+            InspectorAction::OpenAddBotToGroup(bot_id) => {
+                let is_dark = self.theme_state.palette.mode.is_dark();
+                let fab_bot = self
+                    .miniapps
+                    .fabushi_bots
+                    .iter()
+                    .find(|b| bot_id > 0 && b.bot_user_id > 0 && b.bot_user_id as u64 == bot_id)
+                    .cloned()
+                    .or_else(|| self.inspector.read(cx).active_fabushi_bot.clone());
+
+                let (user_id, display_name, username, agent_id, avatar_color) =
+                    if let Some(fb) = fab_bot {
+                        let uid = fb.bot_user_id.max(0) as u64;
+                        let uname = fb.username.trim().trim_start_matches('@').to_string();
+                        let name = if fb.display_name.trim().is_empty() {
+                            if !uname.is_empty() {
+                                uname.clone()
+                            } else {
+                                fb.agent_id.clone()
+                            }
+                        } else {
+                            fb.display_name.trim().to_string()
+                        };
+                        let hue = if TdesktopThemePalette::is_tinted_bot_hue(&fb.avatar_color) {
+                            fb.avatar_color.as_str()
+                        } else {
+                            TdesktopThemePalette::bot_hue_name_for_id(uid)
+                        };
+                        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(hue, is_dark);
+                        (
+                            if uid > 0 { uid } else { bot_id },
+                            name,
+                            (!uname.is_empty()).then_some(uname),
+                            (!fb.agent_id.trim().is_empty()).then_some(fb.agent_id),
+                            fill,
+                        )
+                    } else {
+                        let prof = &self.inspector.read(cx).profile;
+                        let uid = if bot_id > 0 { bot_id } else { prof.bot_id };
+                        let uname = prof.username.trim().trim_start_matches('@').to_string();
+                        let name = if prof.name.trim().is_empty() {
+                            if !uname.is_empty() {
+                                uname.clone()
+                            } else {
+                                format!("Bot {uid}")
+                            }
+                        } else {
+                            prof.name.trim().to_string()
+                        };
+                        let col = if prof.avatar_color != 0 {
+                            prof.avatar_color
+                        } else {
+                            peer_avatar_color(uid)
+                        };
+                        (uid, name, (!uname.is_empty()).then_some(uname), None, col)
+                    };
+
+                if user_id > 0 {
+                    self.inspector.update(cx, |i, icx| {
+                        i.close();
+                        icx.notify();
+                    });
+                    self.composer.update(cx, |c, ccx| {
+                        c.is_input_focused = false;
+                        ccx.notify();
+                    });
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.open_compose_with_seed_recipient(
+                            user_id,
+                            display_name,
+                            username,
+                            true,
+                            agent_id,
+                            avatar_color,
+                        );
+                        sb_cx.notify();
+                    });
+                } else {
+                    self.window_runtime.enqueue_toast(
+                        tr_str(lang, "未能识别该 Bot 信息", "Unable to resolve bot identity"),
+                        2200,
+                    );
+                }
             }
             InspectorAction::ReportBot(_bot_id) => {
                 self.enqueue_localized_toast(

@@ -1,5 +1,6 @@
 use crate::computer::{ComputerCloudProvider, ComputerLeaseBroker};
-use crate::mcp::{McpRegistry, ToolRiskLevel};
+use crate::mcp::{McpRegistry, ToolPermissionDock, ToolRiskLevel};
+use crate::multi_agent::GroupWorkspaceBridge;
 use crate::talk::TalkCoordinator;
 use mahayana_host_runtime::agents::agent_messaging::{
     SAND_CREATE_AGENT_TOOL_NAME, SAND_SEND_TO_AGENT_TOOL_NAME, SAND_UPDATE_AGENT_TOOL_NAME,
@@ -895,6 +896,8 @@ pub struct HermesToolContext {
     pub state_bridge: Option<Arc<dyn HermesStateBridge>>,
     pub teammate_handler: Option<Arc<dyn FabushiTeammateHandler>>,
     pub platform_im_bridge: Option<Arc<dyn PlatformImBridge>>,
+    pub group_workspace_bridge: Option<Arc<dyn GroupWorkspaceBridge>>,
+    pub permission_dock: Option<Arc<ToolPermissionDock>>,
     pub http_client: reqwest::Client,
     pub browser_cdp_url: Option<String>,
     pub bot_browser: Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>>,
@@ -936,6 +939,8 @@ impl HermesToolContext {
             state_bridge: None,
             teammate_handler: None,
             platform_im_bridge: None,
+            group_workspace_bridge: None,
+            permission_dock: None,
             http_client,
             browser_cdp_url: std::env::var("HERMES_BROWSER_CDP_URL").ok(),
             bot_browser: None,
@@ -990,6 +995,16 @@ impl HermesToolContext {
 
     pub fn with_platform_im_bridge(mut self, bridge: Arc<dyn PlatformImBridge>) -> Self {
         self.platform_im_bridge = Some(bridge);
+        self
+    }
+
+    pub fn with_group_workspace_bridge(mut self, bridge: Arc<dyn GroupWorkspaceBridge>) -> Self {
+        self.group_workspace_bridge = Some(bridge);
+        self
+    }
+
+    pub fn with_permission_dock(mut self, dock: Arc<ToolPermissionDock>) -> Self {
+        self.permission_dock = Some(dock);
         self
     }
 
@@ -1760,6 +1775,51 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             false,
         ),
         HermesToolSpec::new(
+            "group_workspace_list",
+            ToolsetId::Subagents,
+            "List all shared keys and artifacts stored in the current group room's SharedGroupWorkspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "chat_id": { "type": "integer", "description": "Optional group chat_id (defaults to active chat context)" }
+                }
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "group_workspace_read",
+            ToolsetId::Subagents,
+            "Read a structured artifact, plan, or note by key from the group room's SharedGroupWorkspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Workspace key to read" },
+                    "chat_id": { "type": "integer", "description": "Optional group chat_id (defaults to active chat context)" }
+                },
+                "required": ["key"]
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "group_workspace_write",
+            ToolsetId::Subagents,
+            "Write or update a structured artifact, plan, or note in the group room's SharedGroupWorkspace with optional optimistic revision checking.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Workspace key to create or update" },
+                    "value": { "description": "Structured JSON value (object, array, string, number, boolean) to store" },
+                    "expected_revision": { "type": "integer", "minimum": 0, "description": "Optional optimistic lock revision" },
+                    "chat_id": { "type": "integer", "description": "Optional group chat_id (defaults to active chat context)" }
+                },
+                "required": ["key", "value"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
             "cronjob_manage",
             ToolsetId::Cronjob,
             "Create, list, pause, resume, delete, preview, inspect history, or run cronjobs now.",
@@ -2249,12 +2309,16 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "mcp_call",
             ToolsetId::Mcp,
-            "Invoke an external MCP tool registered in McpRegistry with risk enforcement.",
+            "Invoke an external MCP tool registered in McpRegistry with 4-tier AutoReview & value-bound approval enforcement.",
             json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
-                    "arguments": { "type": "object" }
+                    "arguments": { "type": "object" },
+                    "approval_id": { "type": "string", "description": "Optional single-use value-bound approval token ID" },
+                    "approval_target": { "type": "string", "description": "Optional logical target bound to approval_id" },
+                    "working_directory": { "type": "string", "description": "Optional cwd bound to approval_id" },
+                    "content_sha256": { "type": "string", "description": "Optional SHA-256 content hash bound to approval_id" }
                 },
                 "required": ["name"]
             }),
@@ -3515,24 +3579,76 @@ mod tests {
     #[tokio::test]
     async fn test_computer_use_auto_lease_under_yolo_mode() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let ctx = HermesToolContext::new(dir.path())
-            .with_session("sess_yolo_cua", 1)
+        // 1. Without a bound ComputerCloudProvider, auto-lease succeeds under Yolo mode
+        //    but CUA execution honestly reports backend unavailability (never fabricates Ok).
+        let ctx_no_backend = HermesToolContext::new(dir.path())
+            .with_session("sess_yolo_cua_nobackend", 1)
             .with_approval_mode(ApprovalMode::Yolo);
 
-        assert!(!ctx.computer_broker.lock().unwrap().is_lease_active());
+        assert!(!ctx_no_backend.computer_broker.lock().unwrap().is_lease_active());
 
-        // Call computer_use CUA action WITHOUT acquiring lease manually first
+        let no_backend_res = HermesToolExecutor::execute(
+            "computer_use",
+            json!({ "action": "click", "x": 120, "y": 240 }),
+            &ctx_no_backend,
+        )
+        .await;
+        assert!(
+            !no_backend_res.success,
+            "computer_use without a remote provider must not fabricate success"
+        );
+        assert!(
+            no_backend_res.output.contains("CUA backend unavailable"),
+            "unexpected output: {}",
+            no_backend_res.output
+        );
+        assert!(
+            ctx_no_backend.computer_broker.lock().unwrap().is_lease_active(),
+            "broker should still hold an auto-acquired lease"
+        );
+
+        // 2. With a bound ComputerCloudProvider, auto-leased CUA routes through the real provider.
+        let recorded = Arc::new(Mutex::new(Vec::<AgentComputerExecInput>::new()));
+        let provider: Arc<dyn ComputerCloudProvider> = Arc::new(MockCloudComputerProvider {
+            nodes: vec![AgentComputerNodeSummary {
+                node_id: "cloud:cua-box".to_string(),
+                kind: "cloud_server".to_string(),
+                display_name: "CUA-Box".to_string(),
+                ip_address: "10.0.0.5".to_string(),
+                host: Some("10.0.0.5".to_string()),
+                os_name: "Linux".to_string(),
+                online: true,
+                is_current_device: false,
+                bound_to_this_bot: true,
+                run_policy: "allow_always".to_string(),
+                tier_badge: "Cloud".to_string(),
+            }],
+            recorded_exec: recorded.clone(),
+        });
+        let ctx = HermesToolContext::new(dir.path())
+            .with_session("sess_yolo_cua", 1)
+            .with_user_id(Some(42))
+            .with_chat_and_bot(Some(100), Some(7))
+            .with_approval_mode(ApprovalMode::Yolo)
+            .with_computer_provider(provider);
+
         let res = HermesToolExecutor::execute(
             "computer_use",
             json!({ "action": "click", "x": 120, "y": 240 }),
             &ctx,
         )
         .await;
-        assert!(res.success, "expected auto-leased click to succeed: {}", res.output);
+        assert!(res.success, "expected provider-backed click to succeed: {}", res.output);
         assert!(
             ctx.computer_broker.lock().unwrap().is_lease_active(),
             "broker should now hold an auto-acquired lease"
         );
+        let calls = recorded.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].op, "click");
+        assert_eq!(calls[0].x, Some(120));
+        assert_eq!(calls[0].y, Some(240));
+        assert_eq!(calls[0].node_id.as_deref(), Some("cloud:cua-box"));
 
         let status = HermesToolExecutor::execute("computer_status", json!({}), &ctx).await;
         assert!(status.success);

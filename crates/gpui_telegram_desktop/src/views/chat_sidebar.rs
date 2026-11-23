@@ -77,6 +77,46 @@ pub struct BotGrokAvatarVisual {
     pub execution_state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposeRecipientChip {
+    pub user_id: u64,
+    pub chat_id: Option<u64>,
+    pub username: Option<String>,
+    pub display_name: String,
+    pub initials: String,
+    pub is_bot: bool,
+    pub bot_id: Option<String>,
+    pub avatar_color: u32,
+    pub avatar_shape: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingComposeCreation {
+    pub title: String,
+    pub recipients: Vec<ComposeRecipientChip>,
+    pub initial_message: String,
+    pub client_nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposeCreationError {
+    pub message: String,
+    pub failed_draft: String,
+    pub recipients: Vec<ComposeRecipientChip>,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ComposeDraftState {
+    pub is_group_mode: bool,
+    pub selected_recipients: Vec<ComposeRecipientChip>,
+    pub highlighted_index: usize,
+    pub menu_open: bool,
+    pub custom_group_title: String,
+    pub pending_creation: Option<PendingComposeCreation>,
+    pub creation_error: Option<ComposeCreationError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAddContactRequest {
     pub local_dialog_id: u64,
@@ -209,6 +249,9 @@ pub struct ChatSidebar {
     // `+` button next to search box & Add Contact (Create AI Bot / Add Friend) / Create Group / Contacts modal state
     pub is_plus_menu_open: bool,
     pub compose_recipient_query: String,
+    pub compose_draft: ComposeDraftState,
+    pub compose_bot_notice_dismissed: bool,
+    pub compose_title_focused: bool,
     pub is_contacts_modal_open: bool,
     pub contacts_search_query: String,
     pub active_creation_modal: Option<SidebarCreationModal>,
@@ -303,6 +346,9 @@ impl ChatSidebar {
             story_clicked_peer: None,
             is_plus_menu_open: false,
             compose_recipient_query: String::new(),
+            compose_draft: ComposeDraftState::default(),
+            compose_bot_notice_dismissed: false,
+            compose_title_focused: false,
             is_contacts_modal_open: false,
             contacts_search_query: String::new(),
             active_creation_modal: None,
@@ -404,7 +450,7 @@ impl ChatSidebar {
         self.hovered_rail_dialog_id = None;
         self.is_account_popover_open = false;
         if collapsed {
-            self.is_plus_menu_open = false;
+            self.exit_compose_mode();
             self.context_menu = None;
             self.is_resizing = false;
         }
@@ -432,6 +478,9 @@ impl ChatSidebar {
         self.story_clicked_peer = None;
         self.is_plus_menu_open = false;
         self.compose_recipient_query.clear();
+        self.compose_draft = ComposeDraftState::default();
+        self.compose_bot_notice_dismissed = false;
+        self.compose_title_focused = false;
         self.is_account_popover_open = false;
         self.hovered_rail_dialog_id = None;
         self.is_contacts_modal_open = false;
@@ -473,8 +522,7 @@ impl ChatSidebar {
     }
 
     pub fn open_contacts_modal(&mut self) {
-        self.is_plus_menu_open = false;
-        self.compose_recipient_query.clear();
+        self.exit_compose_mode();
         self.is_account_popover_open = false;
         self.search_focused = false;
         self.is_contacts_modal_open = true;
@@ -496,8 +544,7 @@ impl ChatSidebar {
     pub fn focus_search(&mut self) {
         self.expand_from_user_if_collapsed();
         self.search_focused = true;
-        self.is_plus_menu_open = false;
-        self.compose_recipient_query.clear();
+        self.exit_compose_mode();
         self.is_account_popover_open = false;
         self.search_request_seq = self.search_request_seq.wrapping_add(1);
     }
@@ -546,24 +593,55 @@ impl ChatSidebar {
         self.search_request_seq = self.search_request_seq.wrapping_add(1);
     }
 
+    pub fn is_apple_compose_active(&self) -> bool {
+        self.palette.is_apple_style() && self.is_plus_menu_open
+    }
+
     pub fn toggle_plus_menu(&mut self) {
         self.is_account_popover_open = false;
         self.compose_recipient_query.clear();
+        self.compose_title_focused = false;
         if self.is_collapsed {
             self.expand_from_user_if_collapsed();
             self.is_plus_menu_open = true;
             self.search_focused = false;
+            self.compose_draft.is_group_mode = false;
+            self.compose_draft.selected_recipients.clear();
+            self.compose_draft.highlighted_index = 0;
+            self.compose_draft.menu_open = true;
+            self.compose_draft.custom_group_title.clear();
+            self.compose_draft.creation_error = None;
             return;
         }
         self.is_plus_menu_open = !self.is_plus_menu_open;
         if self.is_plus_menu_open {
             self.search_focused = false;
+            self.compose_draft.is_group_mode = false;
+            self.compose_draft.selected_recipients.clear();
+            self.compose_draft.highlighted_index = 0;
+            self.compose_draft.menu_open = true;
+            self.compose_draft.custom_group_title.clear();
+            self.compose_draft.creation_error = None;
+        } else {
+            self.compose_draft.is_group_mode = false;
+            self.compose_draft.selected_recipients.clear();
+            self.compose_draft.highlighted_index = 0;
+            self.compose_draft.menu_open = false;
+            self.compose_draft.custom_group_title.clear();
+            self.compose_draft.creation_error = None;
         }
     }
 
     pub fn exit_compose_mode(&mut self) {
         self.is_plus_menu_open = false;
         self.compose_recipient_query.clear();
+        self.compose_title_focused = false;
+        self.compose_draft.is_group_mode = false;
+        self.compose_draft.selected_recipients.clear();
+        self.compose_draft.highlighted_index = 0;
+        self.compose_draft.menu_open = false;
+        self.compose_draft.custom_group_title.clear();
+        self.compose_draft.creation_error = None;
     }
 
     pub fn select_folder(&mut self, folder: impl Into<String>) {

@@ -173,7 +173,12 @@ impl AppShell {
             );
         }
         if self.is_studio_input_active(cx) { return (String::new(), pre()); }
-        if self.is_apple_compose_input_active(cx) { return (sb.compose_recipient_query.clone(), pre()); }
+        if self.is_apple_compose_input_active(cx) {
+            if sb.compose_title_focused {
+                return (sb.compose_draft.custom_group_title.clone(), pre());
+            }
+            return (sb.compose_recipient_query.clone(), pre());
+        }
         if sb.search_focused { return (sb.search_query.clone(), pre()); }
         if self.stage.read(cx).search_open { return (self.stage.read(cx).search_query.clone(), pre()); }
         let c = self.composer.read(cx);
@@ -216,7 +221,15 @@ impl AppShell {
         } else if self.sidebar.read(cx).active_creation_modal.is_some() {
             self.sidebar.update(cx, |sb, scx| { sb.clear_creation_text(); scx.notify(); });
         } else if self.is_apple_compose_input_active(cx) {
-            self.sidebar.update(cx, |sb, scx| { sb.compose_recipient_query.clear(); scx.notify(); });
+            self.sidebar.update(cx, |sb, scx| {
+                if sb.compose_title_focused {
+                    sb.compose_draft.custom_group_title.clear();
+                } else {
+                    sb.compose_recipient_query.clear();
+                    sb.compose_draft.highlighted_index = 0;
+                }
+                scx.notify();
+            });
         } else if self.is_settings_input_active(cx) {
             self.settings_router.update(cx, |sr, scx| { sr.clear_active_input(scx); });
         } else if self.is_inspector_bot_input_active(cx) {
@@ -271,10 +284,41 @@ impl AppShell {
         } else if self.sidebar.read(cx).active_creation_modal.is_some() {
             self.sidebar.update(cx, |sb, scx| { sb.push_creation_text(&clean); scx.notify(); });
         } else if self.is_apple_compose_input_active(cx) {
-            self.sidebar.update(cx, |sb, scx| {
-                sb.compose_recipient_query.push_str(&clean);
-                scx.notify();
-            });
+            let title_focused = self.sidebar.read(cx).compose_title_focused;
+            if title_focused {
+                self.sidebar.update(cx, |sb, scx| {
+                    let mut next = sb.compose_draft.custom_group_title.clone();
+                    next.push_str(&clean);
+                    sb.compose_draft.custom_group_title = next.chars().take(72).collect();
+                    scx.notify();
+                });
+            } else if clean == "," || clean == "，" {
+                let (query_non_empty, menu_open, highlight) = {
+                    let sb = self.sidebar.read(cx);
+                    (
+                        !sb.compose_recipient_query.trim().is_empty(),
+                        sb.compose_draft.menu_open,
+                        sb.compose_draft.highlighted_index,
+                    )
+                };
+                let candidates = self.collect_apple_compose_recipients(cx);
+                if (query_non_empty || menu_open) && !candidates.is_empty() {
+                    let idx = highlight.min(candidates.len() - 1);
+                    let chosen = candidates[idx].clone();
+                    self.sidebar.update(cx, |sb, scx| {
+                        sb.compose_draft.is_group_mode = true;
+                        scx.notify();
+                    });
+                    self.select_apple_compose_candidate(chosen, cx);
+                }
+            } else {
+                self.sidebar.update(cx, |sb, scx| {
+                    sb.compose_recipient_query.push_str(&clean);
+                    sb.compose_draft.highlighted_index = 0;
+                    sb.compose_draft.menu_open = true;
+                    scx.notify();
+                });
+            }
         } else if self.is_settings_input_active(cx) {
             self.settings_router.update(cx, |sr, scx| { sr.push_input_text(&clean, scx); });
         } else if self.is_inspector_bot_input_active(cx) {
@@ -374,13 +418,43 @@ impl AppShell {
             self.sidebar.update(cx, |sb, scx| { sb.close_contacts_modal(); scx.notify(); });
             return true;
         }
-        if self.sidebar.read(cx).active_creation_modal.is_some() || self.sidebar.read(cx).is_plus_menu_open {
+        if self.sidebar.read(cx).active_creation_modal.is_some() {
             self.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
+            self.sync_compose_state_to_composer(true, cx);
             self.set_composer_focused(true, cx);
             return true;
         }
+        if self.theme_state.palette.is_apple_style() && self.sidebar.read(cx).is_plus_menu_open {
+            // Progressive 3-step Grok Bot Esc cascade:
+            // (0) blur custom title -> (1) clear query -> (2) close dropdown -> (3) exit compose mode
+            let mut exited_compose = false;
+            self.sidebar.update(cx, |sb, scx| {
+                if sb.compose_title_focused {
+                    sb.compose_title_focused = false;
+                } else if !sb.compose_recipient_query.is_empty() {
+                    sb.compose_recipient_query.clear();
+                    sb.compose_draft.highlighted_index = 0;
+                } else if sb.compose_draft.menu_open {
+                    sb.compose_draft.menu_open = false;
+                } else {
+                    sb.exit_compose_mode();
+                    exited_compose = true;
+                }
+                scx.notify();
+            });
+            if exited_compose {
+                self.sync_compose_state_to_composer(true, cx);
+                self.set_composer_focused(true, cx);
+            }
+            return true;
+        }
         if self.sidebar.read(cx).is_account_popover_open || self.sidebar.read(cx).is_plus_menu_open {
-            self.sidebar.update(cx, |s, scx| { s.is_account_popover_open = false; s.is_plus_menu_open = false; scx.notify(); });
+            self.sidebar.update(cx, |s, scx| {
+                s.is_account_popover_open = false;
+                s.exit_compose_mode();
+                scx.notify();
+            });
+            self.sync_compose_state_to_composer(true, cx);
             return true;
         }
         if self.main_menu_drawer.read(cx).is_open {
@@ -613,14 +687,73 @@ impl AppShell {
             return true;
         }
         if self.is_apple_compose_input_active(cx) {
+            if self.sidebar.read(cx).compose_title_focused {
+                match key {
+                    "backspace" => {
+                        if self.ime.ime_preedit.take().is_none() {
+                            self.sidebar.update(cx, |sb, scx| {
+                                backspace_string(&mut sb.compose_draft.custom_group_title, is_alt);
+                                scx.notify();
+                            });
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                    "enter" | "tab" => {
+                        if key == "enter"
+                            && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed())
+                        {
+                            return true;
+                        }
+                        self.ime.clear_preedit();
+                        self.sidebar.update(cx, |sb, scx| {
+                            sb.compose_title_focused = false;
+                            scx.notify();
+                        });
+                        self.set_composer_focused(true, cx);
+                        cx.notify();
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             match key {
                 "backspace" => {
                     if self.ime.ime_preedit.take().is_none() {
-                        self.sidebar.update(cx, |sb, scx| {
-                            backspace_string(&mut sb.compose_recipient_query, is_alt);
+                        let popped_chip = self.sidebar.update(cx, |sb, scx| {
+                            let popped = if sb.compose_recipient_query.is_empty() {
+                                sb.pop_last_compose_recipient().is_some()
+                            } else {
+                                backspace_string(&mut sb.compose_recipient_query, is_alt);
+                                sb.compose_draft.highlighted_index = 0;
+                                sb.compose_draft.menu_open = true;
+                                false
+                            };
                             scx.notify();
+                            popped
                         });
+                        if popped_chip {
+                            self.sync_compose_state_to_composer(true, cx);
+                        }
                     }
+                    cx.notify();
+                    return true;
+                }
+                "down" | "arrowdown" => {
+                    let total = self.collect_apple_compose_recipients(cx).len();
+                    self.sidebar.update(cx, |sb, scx| {
+                        sb.move_compose_highlight(1, total);
+                        scx.notify();
+                    });
+                    cx.notify();
+                    return true;
+                }
+                "up" | "arrowup" => {
+                    let total = self.collect_apple_compose_recipients(cx).len();
+                    self.sidebar.update(cx, |sb, scx| {
+                        sb.move_compose_highlight(-1, total);
+                        scx.notify();
+                    });
                     cx.notify();
                     return true;
                 }
@@ -628,18 +761,84 @@ impl AppShell {
                     if self.take_ime_preedit_commit(cx) || self.ime.take_just_committed() {
                         return true;
                     }
+                    let (query_empty, menu_open, highlight, selected) = {
+                        let sb = self.sidebar.read(cx);
+                        (
+                            sb.compose_recipient_query.trim().is_empty(),
+                            sb.compose_draft.menu_open,
+                            sb.compose_draft.highlighted_index,
+                            sb.compose_draft.selected_recipients.clone(),
+                        )
+                    };
                     let recipients = self.collect_apple_compose_recipients(cx);
-                    if let Some(first) = recipients.into_iter().next() {
-                        self.open_apple_compose_recipient(first, cx);
-                    } else if !self.sidebar.read(cx).compose_recipient_query.trim().is_empty() {
-                        self.open_add_friend_from_compose_query(cx);
+                    if !query_empty {
+                        if let Some(chosen) = recipients
+                            .get(highlight.min(recipients.len().saturating_sub(1)))
+                            .cloned()
+                        {
+                            self.select_apple_compose_candidate(chosen, cx);
+                        } else {
+                            self.open_add_friend_from_compose_query(cx);
+                        }
+                    } else if selected.len() == 1 {
+                        self.commit_single_compose_recipient_to_dm(selected[0].clone(), cx);
+                    } else if menu_open && !recipients.is_empty() {
+                        let idx = highlight.min(recipients.len() - 1);
+                        self.select_apple_compose_candidate(recipients[idx].clone(), cx);
+                    } else if !selected.is_empty() {
+                        self.set_composer_focused(true, cx);
                     }
                     cx.notify();
                     return true;
                 }
                 "tab" => {
                     self.ime.clear_preedit();
-                    self.set_composer_focused(true, cx);
+                    let (query_empty, menu_open, highlight, selected_len) = {
+                        let sb = self.sidebar.read(cx);
+                        (
+                            sb.compose_recipient_query.trim().is_empty(),
+                            sb.compose_draft.menu_open,
+                            sb.compose_draft.highlighted_index,
+                            sb.compose_draft.selected_recipients.len(),
+                        )
+                    };
+                    if !query_empty {
+                        let recipients = self.collect_apple_compose_recipients(cx);
+                        if let Some(chosen) = recipients
+                            .get(highlight.min(recipients.len().saturating_sub(1)))
+                            .cloned()
+                        {
+                            self.sidebar.update(cx, |sb, scx| {
+                                sb.compose_draft.is_group_mode = true;
+                                scx.notify();
+                            });
+                            self.select_apple_compose_candidate(chosen, cx);
+                        } else {
+                            self.set_composer_focused(true, cx);
+                        }
+                    } else if selected_len >= 1 {
+                        self.sidebar.update(cx, |sb, scx| {
+                            sb.compose_draft.menu_open = false;
+                            scx.notify();
+                        });
+                        self.set_composer_focused(true, cx);
+                    } else if menu_open {
+                        let recipients = self.collect_apple_compose_recipients(cx);
+                        if let Some(chosen) = recipients
+                            .get(highlight.min(recipients.len().saturating_sub(1)))
+                            .cloned()
+                        {
+                            self.sidebar.update(cx, |sb, scx| {
+                                sb.compose_draft.is_group_mode = true;
+                                scx.notify();
+                            });
+                            self.select_apple_compose_candidate(chosen, cx);
+                        } else {
+                            self.set_composer_focused(true, cx);
+                        }
+                    } else {
+                        self.set_composer_focused(true, cx);
+                    }
                     cx.notify();
                     return true;
                 }
@@ -1006,13 +1205,23 @@ impl EntityInputHandler for AppShell {
             return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(20.0))));
         }
         if self.is_apple_compose_input_active(cx) {
-            let sb_width = self.sidebar.read(cx).effective_width();
+            let (sb_width, chip_count, title_focused) = {
+                let sb = self.sidebar.read(cx);
+                (
+                    sb.effective_width(),
+                    sb.compose_draft.selected_recipients.len(),
+                    sb.compose_title_focused,
+                )
+            };
+            let chip_offset = if title_focused {
+                0.0
+            } else {
+                (chip_count as f32 * 82.0).min(320.0)
+            };
             let caret_x = element_bounds.origin.x
-                + px(sb_width + 78.0 + (char_count as f32 * 8.0).min(300.0));
-            return Some(Bounds::new(
-                point(caret_x, element_bounds.origin.y + px(18.0)),
-                size(px(2.0), px(18.0)),
-            ));
+                + px(sb_width + 82.0 + chip_offset + (char_count as f32 * 8.0).min(260.0));
+            let caret_y = element_bounds.origin.y + px(if title_focused { 66.0 } else { 22.0 });
+            return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))));
         }
         if self.stage.read(cx).search_open {
             let caret_x = element_bounds.origin.x + px(360.0) + px((char_count as f32 * 8.0).min(280.0));

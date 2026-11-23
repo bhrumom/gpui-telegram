@@ -931,6 +931,68 @@ pub fn apply_fenced_history_response_preserving(
     true
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeSendDecision {
+    /// Compose mode is open with 0 selected recipients -> block send, restore draft, prompt user.
+    BlockedEmptyRecipients,
+    /// A compose group/DM creation request is already in flight -> prevent duplicate submission.
+    BlockedPendingCreation,
+    /// Exactly 1 recipient selected -> open/create 1:1 DM and dispatch opening message.
+    DirectMessage {
+        recipient: crate::views::chat_sidebar::ComposeRecipientChip,
+    },
+    /// 2+ recipients selected -> create multi-member group (humans/bots/mixed) and dispatch opening message.
+    CreateGroup {
+        title: String,
+        recipients: Vec<crate::views::chat_sidebar::ComposeRecipientChip>,
+        member_ids: Vec<u64>,
+        member_usernames: Vec<String>,
+    },
+}
+
+/// Evaluates how a composer submit during Apple/Grok compose mode should be routed.
+pub fn evaluate_compose_send_decision(
+    sidebar: &ChatSidebar,
+    account_name: Option<&str>,
+) -> ComposeSendDecision {
+    if sidebar.compose_draft.pending_creation.is_some() {
+        return ComposeSendDecision::BlockedPendingCreation;
+    }
+    let recipients = &sidebar.compose_draft.selected_recipients;
+    if recipients.is_empty() {
+        return ComposeSendDecision::BlockedEmptyRecipients;
+    }
+    if recipients.len() == 1 {
+        return ComposeSendDecision::DirectMessage {
+            recipient: recipients[0].clone(),
+        };
+    }
+    let title = sidebar.effective_compose_group_title(account_name);
+    let mut member_ids = Vec::new();
+    let mut member_usernames = Vec::new();
+    for chip in recipients {
+        if chip.user_id > 0 && !member_ids.contains(&chip.user_id) {
+            member_ids.push(chip.user_id);
+        }
+        if let Some(ref un) = chip.username {
+            let clean = un.trim().trim_start_matches('@').to_string();
+            if !clean.is_empty()
+                && !member_usernames
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&clean))
+            {
+                member_usernames.push(clean);
+            }
+        }
+    }
+    ComposeSendDecision::CreateGroup {
+        title,
+        recipients: recipients.clone(),
+        member_ids,
+        member_usernames,
+    }
+}
+
 pub fn validate_selected_send_target(
     is_authenticated: bool,
     token: Option<&str>,
@@ -939,6 +1001,10 @@ pub fn validate_selected_send_target(
     stage: &ConversationStage,
 ) -> Option<VerifiedSendTarget> {
     if !is_authenticated {
+        return None;
+    }
+    // P0 guard: never leak a composer send into a previously selected chat while compose mode is open.
+    if sidebar.is_apple_compose_active() {
         return None;
     }
     let has_token = token.is_some_and(|t| !t.trim().is_empty());

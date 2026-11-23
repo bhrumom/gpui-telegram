@@ -32,8 +32,8 @@ getrandom = { workspace = true }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
+async-trait = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 image = { workspace = true }
 zeroize = { workspace = true }

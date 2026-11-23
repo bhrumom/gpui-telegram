@@ -16,8 +16,9 @@ use crate::views::drawer::bot_computer_inspector::{
     render_bot_settings_tab,
 };
 use crate::views::drawer::inspector_panels::{
-    render_contact_profile_panel, render_members_panel, render_settings_and_stats_panel,
-    render_shared_media_panel, segmented_active_bg, segmented_pill_shadow,
+    render_contact_profile_panel, render_members_panel_with_picker,
+    render_settings_and_stats_panel, render_shared_media_panel, segmented_active_bg,
+    segmented_pill_shadow,
 };
 use crate::views::drawer::inspector_tabs::*;
 use crate::views::drawer::statistics::info_statistics_inner_widget::ChartDataPoint;
@@ -32,6 +33,127 @@ pub const HEADER_HEIGHT: f32 = 54.0;
 pub const CONTEXT_INSPECTOR_HEADER_HEIGHT: f32 = HEADER_HEIGHT;
 pub const AVATAR_SIZE: f32 = 80.0;
 pub const CONTEXT_INSPECTOR_AVATAR_SIZE: f32 = AVATAR_SIZE;
+
+/// A contact or Fabushi AI Bot eligible to be added to the active group chat from the Inspector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddMemberCandidate {
+    pub user_id: u64,
+    pub display_name: String,
+    pub username: Option<String>,
+    pub initials: String,
+    pub avatar_color: u32,
+    pub is_bot: bool,
+    pub bot_hue: Option<String>,
+}
+
+/// Builds a deduplicated list of contacts and Fabushi AI bots not yet present in the active group.
+pub fn build_add_member_candidates(
+    existing_member_ids: &[u64],
+    contacts: &[gpui_telegram_proto::contracts::auth::ContactDto],
+    bots: &[gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto],
+) -> Vec<AddMemberCandidate> {
+    let existing: HashSet<u64> = existing_member_ids.iter().copied().collect();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut out: Vec<AddMemberCandidate> = Vec::new();
+
+    for fb in bots {
+        let uid = fb.bot_user_id.max(0) as u64;
+        if uid == 0 || existing.contains(&uid) || !seen.insert(uid) {
+            continue;
+        }
+        let uname = fb.username.trim().trim_start_matches('@').to_string();
+        let display_name = if fb.display_name.trim().is_empty() {
+            if !uname.is_empty() {
+                uname.clone()
+            } else {
+                fb.agent_id.clone()
+            }
+        } else {
+            fb.display_name.trim().to_string()
+        };
+        let initials = {
+            let d = crate::views::app_shell::shell_truth::derive_initials(&display_name);
+            if d.is_empty() { "B".to_string() } else { d }
+        };
+        let hue = if TdesktopThemePalette::is_tinted_bot_hue(&fb.avatar_color) {
+            fb.avatar_color.clone()
+        } else {
+            TdesktopThemePalette::bot_hue_name_for_id(uid).to_string()
+        };
+        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(&hue, true);
+        out.push(AddMemberCandidate {
+            user_id: uid,
+            display_name,
+            username: (!uname.is_empty()).then_some(uname),
+            initials,
+            avatar_color: fill,
+            is_bot: true,
+            bot_hue: Some(hue),
+        });
+    }
+
+    for c in contacts {
+        if c.user_id == 0 || existing.contains(&c.user_id) || !seen.insert(c.user_id) {
+            continue;
+        }
+        let mut full = c.first_name.trim().to_string();
+        if let Some(last) = c.last_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !full.is_empty() {
+                full.push(' ');
+            }
+            full.push_str(last);
+        }
+        let uname = c
+            .username
+            .as_deref()
+            .map(|u| u.trim().trim_start_matches('@').to_string())
+            .filter(|u| !u.is_empty());
+        let display_name = if full.is_empty() {
+            uname.clone().unwrap_or_else(|| format!("User {}", c.user_id))
+        } else {
+            full
+        };
+        let initials = {
+            let d = crate::views::app_shell::shell_truth::derive_initials(&display_name);
+            if d.is_empty() { "U".to_string() } else { d }
+        };
+        let hue = TdesktopThemePalette::bot_hue_name_for_id(c.user_id);
+        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(hue, true);
+        out.push(AddMemberCandidate {
+            user_id: c.user_id,
+            display_name,
+            username: uname,
+            initials,
+            avatar_color: fill,
+            is_bot: c.is_bot,
+            bot_hue: c.is_bot.then(|| hue.to_string()),
+        });
+    }
+
+    out
+}
+
+/// Filters `AddMemberCandidate` rows case-insensitively by display name, `@username`, ID, or bot tag.
+pub fn filter_add_member_candidates<'a>(
+    candidates: &'a [AddMemberCandidate],
+    query: &str,
+) -> Vec<&'a AddMemberCandidate> {
+    let q = query.trim().trim_start_matches('@').to_ascii_lowercase();
+    if q.is_empty() {
+        return candidates.iter().collect();
+    }
+    candidates
+        .iter()
+        .filter(|c| {
+            c.display_name.to_ascii_lowercase().contains(&q)
+                || c.username
+                    .as_deref()
+                    .is_some_and(|u| u.to_ascii_lowercase().contains(&q))
+                || c.user_id.to_string().contains(&q)
+                || (c.is_bot && (q == "bot" || q == "ai"))
+        })
+        .collect()
+}
 
 pub struct ContextInspector {
     pub is_open: bool,
@@ -74,6 +196,12 @@ pub struct ContextInspector {
     pub coding_model_input: Option<Entity<TextInputController>>,
     pub collapsed_sections: HashSet<&'static str>,
     pub avatar_editor_open: bool,
+    pub add_member_picker_open: bool,
+    pub add_member_search_focused: bool,
+    pub add_member_query: String,
+    pub add_member_candidates: Vec<AddMemberCandidate>,
+    pub add_member_search_input: Option<Entity<TextInputController>>,
+    pub pending_add_member_user_id: Option<u64>,
 }
 
 impl ContextInspector {
@@ -119,6 +247,12 @@ impl ContextInspector {
             coding_model_input: None,
             collapsed_sections: HashSet::new(),
             avatar_editor_open: false,
+            add_member_picker_open: false,
+            add_member_search_focused: false,
+            add_member_query: String::new(),
+            add_member_candidates: Vec::new(),
+            add_member_search_input: None,
+            pending_add_member_user_id: None,
         }
     }
 
@@ -216,6 +350,39 @@ impl ContextInspector {
         self.coding_draft_model_override.clear();
         self.collapsed_sections.clear();
         self.avatar_editor_open = false;
+        self.add_member_picker_open = false;
+        self.add_member_search_focused = false;
+        self.add_member_query.clear();
+        self.add_member_candidates.clear();
+        self.pending_add_member_user_id = None;
+    }
+
+    pub fn open_add_member_picker(&mut self, candidates: Vec<AddMemberCandidate>) {
+        self.add_member_candidates = candidates;
+        self.add_member_query.clear();
+        self.add_member_picker_open = true;
+        self.add_member_search_focused = true;
+        self.active_tab = InspectorTab::Members;
+    }
+
+    pub fn close_add_member_picker(&mut self) {
+        self.add_member_picker_open = false;
+        self.add_member_search_focused = false;
+        self.add_member_query.clear();
+    }
+
+    pub fn remove_add_member_candidate(&mut self, user_id: u64) {
+        self.add_member_candidates.retain(|c| c.user_id != user_id);
+    }
+
+    /// Queues an add-member request for the active group and notifies `AppShell` via `InspectorAction::OpenAddMember`.
+    pub fn request_add_member_to_active_group(&mut self, user_id: u64) {
+        self.pending_add_member_user_id = Some(user_id);
+        self.pending_action = Some(InspectorAction::OpenAddMember);
+    }
+
+    pub fn take_pending_add_member_user_id(&mut self) -> Option<u64> {
+        self.pending_add_member_user_id.take()
     }
 
     pub fn is_section_collapsed(&self, key: &'static str) -> bool {
@@ -393,6 +560,9 @@ impl ContextInspector {
         if self.coding_model_input.is_none() {
             self.coding_model_input = Some(cx.new(|_| TextInputController::new()));
         }
+        if self.add_member_search_input.is_none() {
+            self.add_member_search_input = Some(cx.new(|_| TextInputController::new()));
+        }
     }
 
     pub fn sync_computers(&mut self, computers: Vec<ComputerNodeDto>) {
@@ -442,7 +612,18 @@ impl ContextInspector {
         cx.notify();
     }
 
+    pub fn is_add_member_search_active(&self) -> bool {
+        self.is_open
+            && !self.profile.is_bot
+            && self.active_tab == InspectorTab::Members
+            && self.add_member_picker_open
+            && self.add_member_search_focused
+    }
+
     pub fn is_bot_input_active(&self) -> bool {
+        if self.is_add_member_search_active() {
+            return true;
+        }
         self.is_open
             && matches!(self.active_tab, InspectorTab::Profile | InspectorTab::Members)
             && self.profile.is_bot
@@ -459,6 +640,9 @@ impl ContextInspector {
     }
 
     fn active_bot_controller(&self) -> Option<&Entity<TextInputController>> {
+        if self.is_add_member_search_active() {
+            return self.add_member_search_input.as_ref();
+        }
         match self.bot_config_focus {
             BotConfigFocusField::Persona => self.persona_input.as_ref(),
             BotConfigFocusField::Model => self.model_input.as_ref(),
@@ -469,6 +653,9 @@ impl ContextInspector {
     }
 
     fn active_bot_draft_text(&self) -> &str {
+        if self.is_add_member_search_active() {
+            return &self.add_member_query;
+        }
         match self.bot_config_focus {
             BotConfigFocusField::Persona => &self.bot_draft_persona,
             BotConfigFocusField::Model => &self.bot_draft_model,
@@ -479,6 +666,9 @@ impl ContextInspector {
     }
 
     fn active_bot_draft_mut(&mut self) -> Option<&mut String> {
+        if self.is_add_member_search_active() {
+            return Some(&mut self.add_member_query);
+        }
         match self.bot_config_focus {
             BotConfigFocusField::Persona => Some(&mut self.bot_draft_persona),
             BotConfigFocusField::Model => Some(&mut self.bot_draft_model),
@@ -562,6 +752,17 @@ impl ContextInspector {
                 true
             }
             "enter" => {
+                if self.is_add_member_search_active() {
+                    if let Some(first) =
+                        filter_add_member_candidates(&self.add_member_candidates, &self.add_member_query)
+                            .first()
+                            .map(|c| c.user_id)
+                    {
+                        self.request_add_member_to_active_group(first);
+                        cx.notify();
+                    }
+                    return true;
+                }
                 if self.bot_config_focus == BotConfigFocusField::Persona {
                     self.bot_draft_persona.push('\n');
                     cx.notify();
@@ -569,6 +770,15 @@ impl ContextInspector {
                     self.bot_config_focus = BotConfigFocusField::None;
                     cx.notify();
                 }
+                true
+            }
+            "escape" if self.is_add_member_search_active() => {
+                if !self.add_member_query.is_empty() {
+                    self.add_member_query.clear();
+                } else {
+                    self.close_add_member_picker();
+                }
+                cx.notify();
                 true
             }
             _ => false,
@@ -627,7 +837,7 @@ impl Render for ContextInspector {
         } else {
             InspectorSubpage::Main
         };
-        if self.profile.is_bot
+        if (self.profile.is_bot
             && (subpage == InspectorSubpage::BotConfigEditor
                 || (subpage == InspectorSubpage::Main
                     && active_tab == InspectorTab::Members
@@ -635,7 +845,10 @@ impl Render for ContextInspector {
                         .active_fabushi_bot
                         .as_ref()
                         .and_then(|b| b.coding_agent.as_ref())
-                        .is_some()))
+                        .is_some())))
+            || (!self.profile.is_bot
+                && active_tab == InspectorTab::Members
+                && self.add_member_picker_open)
         {
             self.ensure_bot_inputs(cx);
         }
@@ -681,7 +894,7 @@ impl Render for ContextInspector {
                         }
                     }
                 } else {
-                    render_members_panel(&self.members, pal, lang, cx)
+                    render_members_panel_with_picker(self, pal, lang, cx)
                 }
             }
             InspectorTab::SharedMedia => render_shared_media_panel(&self.shared_media, pal, lang, cx),
@@ -1135,6 +1348,7 @@ impl ContextInspector {
                     cx.stop_propagation();
                     this.bot_config_focus = BotConfigFocusField::None;
                     this.avatar_editor_open = false;
+                    this.close_add_member_picker();
                     this.close();
                     cx.notify();
                 }),

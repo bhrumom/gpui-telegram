@@ -23,9 +23,86 @@ fn exposed_chat_username(chat: &ChatRecord) -> Option<String> {
 
 fn format_peer_display_name(user: &UserRecord) -> String {
     match &user.last_name {
-        Some(ln) if !ln.trim().is_empty() => format!("{} {}", user.first_name, ln.trim()),
-        _ => user.first_name.clone(),
+        Some(ln) if !ln.trim().is_empty() => format!("{} {}", user.first_name.trim(), ln.trim()).trim().to_string(),
+        _ => user.first_name.trim().to_string(),
     }
+}
+
+fn contains_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c as u32,
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+        )
+    })
+}
+
+fn truncate_title_chars(raw: &str, max_chars: usize) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    if max_chars <= 1 {
+        return trimmed.chars().take(max_chars).collect();
+    }
+    let prefix: String = trimmed.chars().take(max_chars - 1).collect();
+    let cleaned = prefix
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | '、' | '&' | '·'));
+    format!("{cleaned}…")
+}
+
+fn auto_generate_group_title_from_members(
+    state: &AppState,
+    creator_id: UserId,
+    member_ids: &[UserId],
+) -> String {
+    const MAX_AUTO_TITLE_CHARS: usize = 72;
+    let resolve_name = |uid: UserId| -> String {
+        if let Ok(Some(u)) = state.db.get_user(uid) {
+            let display = format_peer_display_name(&u);
+            if !display.is_empty() {
+                return display;
+            }
+            if let Some(un) = u.username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                return un.to_string();
+            }
+        }
+        if let Some(inst) = state.fabushi_bots.get_by_user_id(uid.0 as i64) {
+            let name = inst.profile().name;
+            if !name.trim().is_empty() {
+                return name.trim().to_string();
+            }
+            let un = inst.settings().username;
+            if !un.trim().is_empty() {
+                return un.trim().to_string();
+            }
+        }
+        format!("User {}", uid.0)
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    fn push_unique(names: &mut Vec<String>, name: String) {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(trimmed)) {
+            names.push(trimmed.to_string());
+        }
+    }
+
+    for &uid in member_ids {
+        push_unique(&mut names, resolve_name(uid));
+    }
+    if names.len() == 1 {
+        push_unique(&mut names, resolve_name(creator_id));
+    }
+
+    if names.is_empty() {
+        return "Group Chat".to_string();
+    }
+
+    let use_cjk = names.iter().any(|n| contains_cjk(n));
+    let sep = if use_cjk { "、" } else { ", " };
+    let joined = names.join(sep);
+    truncate_title_chars(&joined, MAX_AUTO_TITLE_CHARS)
 }
 
 fn resolve_direct_peer_and_bot(
@@ -143,6 +220,42 @@ pub async fn chats_list_clean(auth: AuthBearer, State(state): State<Arc<AppState
 
 pub async fn chats_create_strict(auth: AuthBearer, State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let payload = match parse_json_object(&body) { Ok(v) => v, Err(r) => return r };
+    let client_nonce = payload
+        .get("client_nonce")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
+    // Serialize idempotent nonce lookups/insertions synchronously (no `.await` inside handler)
+    // so concurrent retries with the same `(creator_user_id, client_nonce)` never race to spawn
+    // duplicate groups, while non-nonce requests execute without contention.
+    let _nonce_gate = client_nonce
+        .as_ref()
+        .map(|_| state.chat_create_nonce_gate.lock());
+
+    if let Some(ref nonce) = client_nonce {
+        if let Some(existing_cid) = state.chat_create_nonces.read().get(auth.user_id, nonce) {
+            if let Ok(Some(existing_chat)) = state.db.get_chat(existing_cid) {
+                let is_member = existing_chat.creator_id == auth.user_id
+                    || state
+                        .db
+                        .get_chat_member(existing_cid, auth.user_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| !crate::db::ServerDatabase::is_inactive_member_role(&m.role));
+                if is_member {
+                    return (
+                        StatusCode::CREATED,
+                        Json(chat_detail_json(&state, auth.user_id, &existing_chat)),
+                    )
+                        .into_response();
+                }
+            }
+            state.chat_create_nonces.write().remove(auth.user_id, nonce);
+        }
+    }
+
     let peer_user_id = payload
         .get("peer_user_id")
         .or_else(|| payload.get("user_id"))
@@ -156,24 +269,6 @@ pub async fn chats_create_strict(auth: AuthBearer, State(state): State<Arc<AppSt
             _ => return err_resp(StatusCode::BAD_REQUEST, "invalid_chat_type", "Unsupported chat_type"),
         },
         Some(_) => return err_resp(StatusCode::BAD_REQUEST, "invalid_chat_type", "chat_type must be a string or integer"),
-    };
-    let title = match payload.get("title") {
-        Some(Value::String(s)) => {
-            let t = s.trim();
-            if t.is_empty() || t.chars().count() > 255 {
-                return err_resp(StatusCode::BAD_REQUEST, "invalid_title", "title must be 1..=255 characters");
-            }
-            t.to_string()
-        }
-        Some(Value::Null) | None => {
-            if chat_type == 5 { "Saved Messages".to_string() }
-            else if let Some(peer) = peer_user_id {
-                state.db.get_user(peer).ok().flatten().map(|u| u.first_name).unwrap_or_else(|| format!("User {}", peer.0))
-            } else {
-                return err_resp(StatusCode::BAD_REQUEST, "invalid_title", "title is required and must be a non-empty string");
-            }
-        }
-        Some(_) => return err_resp(StatusCode::BAD_REQUEST, "invalid_title", "title must be a string"),
     };
     let about = payload.get("about").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let username = payload.get("username").and_then(|v| v.as_str()).map(|s| s.trim().trim_start_matches('@').to_string()).filter(|s| !s.is_empty());
@@ -201,11 +296,52 @@ pub async fn chats_create_strict(auth: AuthBearer, State(state): State<Arc<AppSt
         for v in arr {
             if let Some(un) = v.as_str().map(|s| s.trim().trim_start_matches('@')).filter(|s| !s.is_empty()) {
                 if let Ok(Some(u)) = state.db.get_user_by_username(un) {
-                    if u.user_id != auth.user_id && !member_ids.contains(&u.user_id) { member_ids.push(u.user_id); }
+                    if u.user_id != auth.user_id && !member_ids.contains(&u.user_id) {
+                        member_ids.push(u.user_id);
+                    }
+                } else if let Some(inst) = state.fabushi_bots.get_by_agent_id_or_username(un) {
+                    let buid = UserId(inst.bot_user_id as u64);
+                    if buid != auth.user_id && !member_ids.contains(&buid) {
+                        member_ids.push(buid);
+                    }
                 }
             }
         }
     }
+
+    let can_auto_title_group = matches!(chat_type, 1 | 2) && !member_ids.is_empty();
+    let title = match payload.get("title") {
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.chars().count() > 255 {
+                return err_resp(StatusCode::BAD_REQUEST, "invalid_title", "title must be 1..=255 characters");
+            }
+            if !t.is_empty() {
+                t.to_string()
+            } else if can_auto_title_group {
+                auto_generate_group_title_from_members(&state, auth.user_id, &member_ids)
+            } else if chat_type == 5 {
+                "Saved Messages".to_string()
+            } else if let Some(peer) = peer_user_id {
+                state.db.get_user(peer).ok().flatten().map(|u| u.first_name).unwrap_or_else(|| format!("User {}", peer.0))
+            } else {
+                return err_resp(StatusCode::BAD_REQUEST, "invalid_title", "title must be 1..=255 characters");
+            }
+        }
+        Some(Value::Null) | None => {
+            if chat_type == 5 {
+                "Saved Messages".to_string()
+            } else if let Some(peer) = peer_user_id {
+                state.db.get_user(peer).ok().flatten().map(|u| u.first_name).unwrap_or_else(|| format!("User {}", peer.0))
+            } else if can_auto_title_group {
+                auto_generate_group_title_from_members(&state, auth.user_id, &member_ids)
+            } else {
+                return err_resp(StatusCode::BAD_REQUEST, "invalid_title", "title is required and must be a non-empty string");
+            }
+        }
+        Some(_) => return err_resp(StatusCode::BAD_REQUEST, "invalid_title", "title must be a string"),
+    };
+
     // Reuse existing DM if direct/saved chat with same peer already exists
     if matches!(chat_type, 0 | 4 | 5) && member_ids.len() <= 1 {
         if let Ok(existing) = state.db.list_user_chats(auth.user_id) {
@@ -218,6 +354,12 @@ pub async fn chats_create_strict(auth: AuthBearer, State(state): State<Arc<AppSt
                         _ => false,
                     };
                     if matches {
+                        if let Some(nonce) = client_nonce {
+                            state
+                                .chat_create_nonces
+                                .write()
+                                .insert(auth.user_id, nonce, ch.chat_id);
+                        }
                         return (StatusCode::CREATED, Json(chat_detail_json(&state, auth.user_id, &ch))).into_response();
                     }
                 }
@@ -260,6 +402,12 @@ pub async fn chats_create_strict(auth: AuthBearer, State(state): State<Arc<AppSt
     state.gateway_hub.subscribe_chat(chat_id.0, auth.user_id);
     for &m in &member_ids {
         state.gateway_hub.subscribe_chat(chat_id.0, m);
+    }
+    if let Some(nonce) = client_nonce {
+        state
+            .chat_create_nonces
+            .write()
+            .insert(auth.user_id, nonce, chat_id);
     }
     (StatusCode::CREATED, Json(chat_detail_json(&state, auth.user_id, &rec))).into_response()
 }

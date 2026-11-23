@@ -1755,6 +1755,22 @@ impl StreamConsumerState {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct BotTurnFloorFence {
+    pub floor: gpui_telegram_agent::FloorControlQueue,
+    pub agent_id: String,
+    pub nonce: String,
+    pub is_winding_down: bool,
+    pub remaining_hops: u32,
+}
+
+impl BotTurnFloorFence {
+    pub(crate) fn is_active(&self) -> bool {
+        self.floor.validate_turn_nonce(&self.agent_id, &self.nonce)
+            == gpui_telegram_agent::TurnDeliveryIntake::Accepted
+    }
+}
+
 pub(crate) struct BotStreamTurnParams {
     pub chat_id: ChatId,
     pub sender_id: UserId,
@@ -1767,6 +1783,7 @@ pub(crate) struct BotStreamTurnParams {
     pub extra_context_sections: Vec<String>,
     pub companion_apps: Vec<MiniAppRecord>,
     pub help_bot_commands_suffix: Option<String>,
+    pub floor_fence: Option<BotTurnFloorFence>,
 }
 
 fn attach_companion_webapp_button(
@@ -1796,12 +1813,156 @@ fn attach_companion_webapp_button(
     }
 }
 
+fn is_explicitly_addressed_in_group_prompt(
+    state: &AppState,
+    bot_user_id: UserId,
+    agent_label: &str,
+    prompt: &str,
+) -> bool {
+    let mentions = crate::server::extract_at_mentions(prompt);
+    if mentions.is_empty() {
+        return false;
+    }
+    let bot_username = state
+        .fabushi_bots
+        .get_by_user_id(bot_user_id.0 as i64)
+        .map(|i| i.settings().username)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            state
+                .db
+                .get_bot_by_user_id(bot_user_id.0 as i64)
+                .ok()
+                .flatten()
+                .map(|b| b.username)
+        })
+        .or_else(|| {
+            state
+                .db
+                .get_user(bot_user_id)
+                .ok()
+                .flatten()
+                .and_then(|u| u.username)
+        })
+        .unwrap_or_default();
+    let bot_id_str = bot_user_id.0.to_string();
+
+    mentions.iter().any(|tok| {
+        let lower = tok.to_lowercase();
+        matches!(lower.as_str(), "all" | "everyone" | "here" | "所有人")
+            || (!agent_label.is_empty() && tok.eq_ignore_ascii_case(agent_label))
+            || (!bot_username.is_empty() && tok.eq_ignore_ascii_case(&bot_username))
+            || tok == &bot_id_str
+    })
+}
+
+fn should_suppress_group_outbound_reply(
+    state: &AppState,
+    params: &BotStreamTurnParams,
+    consumer: &StreamConsumerState,
+    is_group_chat: bool,
+    agent_label: &str,
+) -> bool {
+    if !is_group_chat {
+        return false;
+    }
+    if consumer.terminal_error.is_some() || consumer.approval_notice.is_some() {
+        return false;
+    }
+
+    let clean_candidate = strip_state_patches_for_display(consumer.raw_answer_text());
+    let explicitly_addressed = is_explicitly_addressed_in_group_prompt(
+        state,
+        params.bot_user_id,
+        agent_label,
+        &params.prompt,
+    );
+    let recent_room_messages: Vec<String> = if explicitly_addressed {
+        Vec::new()
+    } else {
+        state
+            .db
+            .list_messages_with_topic(params.chat_id, None, None, 10)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rec| rec.sender_id != params.sender_id && rec.sender_id != params.bot_user_id)
+            .filter_map(|rec| {
+                crate::messaging::pipeline::MessagePipeline::record_to_item(&rec)
+                    .ok()
+                    .map(|item| crate::server::extract_message_content_text(&item.content))
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .take(6)
+            .collect()
+    };
+
+    let verdict = gpui_telegram_agent::evaluate_outbound_turn_review(
+        &gpui_telegram_agent::OutboundTurnReviewInput {
+            agent_id: agent_label.to_string(),
+            candidate_text: clean_candidate,
+            recent_room_messages,
+            ..Default::default()
+        },
+    );
+
+    if verdict.outcome == gpui_telegram_agent::RoomMemberTurnOutcome::Pass || !verdict.should_send {
+        match verdict.reason {
+            gpui_telegram_agent::OutboundReviewReason::EmptyResponse => {
+                consumer.tool_steps.is_empty()
+                    && consumer.thinking_buf.trim().is_empty()
+                    && params.help_bot_commands_suffix.is_none()
+            }
+            gpui_telegram_agent::OutboundReviewReason::DuplicateEcho if explicitly_addressed => {
+                false
+            }
+            _ => {
+                tracing::info!(
+                    chat_id = params.chat_id.0,
+                    agent_id = %agent_label,
+                    reason = ?verdict.reason,
+                    "Suppressing group bot reply via Stage 2 outbound review (PASS)"
+                );
+                true
+            }
+        }
+    } else {
+        false
+    }
+}
+
 fn flush_streamed_bot_message(
     state: &Arc<AppState>,
     params: &BotStreamTurnParams,
     consumer: &mut StreamConsumerState,
     is_final: bool,
+    is_group_chat: bool,
+    agent_label: &str,
 ) {
+    if let Some(ref fence) = params.floor_fence {
+        if !fence.is_active() {
+            tracing::info!(
+                chat_id = params.chat_id.0,
+                agent_id = %fence.agent_id,
+                nonce = %fence.nonce,
+                "Suppressing bot reply commit: floor turn nonce is no longer active"
+            );
+            return;
+        }
+    }
+
+    // In group rooms, buffer intermediate drafts until completion so `[PASS]` stay-silent
+    // responses, duplicate echoes, or preempted turns never leak noisy messages into the room.
+    if is_group_chat && !is_final {
+        return;
+    }
+
+    if is_final
+        && should_suppress_group_outbound_reply(state, params, consumer, is_group_chat, agent_label)
+    {
+        return;
+    }
+
     if is_final && !params.companion_apps.is_empty() {
         let patches = extract_state_patches(consumer.raw_answer_text());
         if !patches.is_empty() {
@@ -1887,6 +2048,9 @@ fn flush_streamed_bot_message(
             }
             broadcast_chat_pts(state, params.chat_id, pts_update);
             consumer.last_rendered = rendered;
+            if is_group_chat && is_final {
+                crate::server::record_group_bot_reply(state, params.chat_id, params.bot_user_id);
+            }
         }
     }
 
@@ -1976,20 +2140,43 @@ pub(crate) async fn execute_bot_turn_streamed(
         include_state_patch_hint,
     );
 
+    let chat_rec = state.db.get_chat(params.chat_id).ok().flatten();
+    let is_group_chat = chat_rec
+        .as_ref()
+        .is_some_and(|c| matches!(c.chat_type, 1 | 2));
+    let agent_label = bot_inst
+        .as_ref()
+        .map(|i| i.agent_id.clone())
+        .or_else(|| params.floor_fence.as_ref().map(|f| f.agent_id.clone()))
+        .unwrap_or_else(|| format!("bot_{}", params.bot_user_id.0));
+
+    let group_session_key =
+        is_group_chat.then(|| gpui_telegram_agent::room_session_key(params.chat_id.0));
     let session_id_opt = resolve_and_apply_bot_session_policy(
         state,
         params.sender_id.0,
         params.bot_user_id,
         Some(params.chat_id),
-        None,
-        "telegram_bot",
+        group_session_key.as_deref(),
+        if is_group_chat {
+            "telegram_group"
+        } else {
+            "telegram_bot"
+        },
         effective_model.as_deref(),
         false,
     )
     .ok()
     .map(|(sid, _)| sid);
 
+    let room_name = chat_rec
+        .as_ref()
+        .map(|c| c.title.clone())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| format!("Group {}", params.chat_id.0));
+
     let mut room_groups = Vec::new();
+    let mut room_peer_labels: Vec<String> = Vec::new();
     if let Ok(member_ids) = state.db.get_chat_members(params.chat_id) {
         let bot_members: Vec<AgentAddress> = member_ids
             .iter()
@@ -1997,35 +2184,85 @@ pub(crate) async fn execute_bot_turn_streamed(
             .map(|inst| inst.agent_address())
             .collect();
         if bot_members.len() > 1 {
-            let chat_title = state
-                .db
-                .get_chat(params.chat_id)
-                .ok()
-                .flatten()
-                .map(|c| c.title)
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| format!("Group {}", params.chat_id.0));
             room_groups.push(AgentGroupAddress {
                 address: AgentAddress {
                     id: format!("chat:{}", params.chat_id.0),
-                    name: chat_title,
+                    name: room_name.clone(),
                     description: Some("Shared Telegram multi-bot conversation".to_string()),
                     is_group: true,
                 },
                 members: bot_members,
             });
         }
+        if is_group_chat {
+            for uid in &member_ids {
+                if *uid == params.bot_user_id {
+                    continue;
+                }
+                if let Some(inst) = state.fabushi_bots.get_by_user_id(uid.0 as i64) {
+                    let prof = inst.profile();
+                    let un = inst.settings().username;
+                    let label = if un.trim().is_empty() {
+                        prof.name
+                    } else {
+                        format!("{} (@{})", prof.name, un)
+                    };
+                    room_peer_labels.push(label);
+                } else if let Ok(Some(u)) = state.db.get_user(*uid) {
+                    let base_name = match &u.last_name {
+                        Some(ln) if !ln.trim().is_empty() => {
+                            format!("{} {}", u.first_name.trim(), ln.trim()).trim().to_string()
+                        }
+                        _ => u.first_name.trim().to_string(),
+                    };
+                    let label = match u.username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(un) if !base_name.is_empty() => format!("{base_name} (@{un})"),
+                        Some(un) => format!("@{un}"),
+                        None if !base_name.is_empty() => base_name,
+                        None => format!("User {}", uid.0),
+                    };
+                    room_peer_labels.push(label);
+                }
+            }
+        }
     }
+
+    let group_prompt_ctx = if is_group_chat {
+        let (is_winding_down, remaining_hops) = if let Some(ref fence) = params.floor_fence {
+            (fence.is_winding_down, fence.remaining_hops)
+        } else {
+            let groups = state.multi_agent_groups.read();
+            if let Some(room) = groups.get(&params.chat_id) {
+                let rem = room
+                    .loop_budget
+                    .max_hops()
+                    .saturating_sub(room.loop_budget.current_hop());
+                (rem <= 1, rem)
+            } else {
+                (false, gpui_telegram_agent::DEFAULT_MAX_LOOP_HOPS)
+            }
+        };
+        Some(gpui_telegram_agent::GroupTurnPromptContext {
+            room_name,
+            peers: room_peer_labels,
+            is_winding_down,
+            remaining_hops,
+        })
+    } else {
+        None
+    };
+
     let mentioned_teammates = state
         .fabushi_bots
         .collect_mentioned_teammates(params.bot_user_id.0 as i64, &params.prompt);
-    let (fabushi_sp, profile_delta_prefix) = if bot_inst.is_some() {
-        let (sp, delta) = state.fabushi_bots.build_turn_system_prompt(
+    let (fabushi_sp, profile_delta_prefix) = if bot_inst.is_some() || group_prompt_ctx.is_some() {
+        let (sp, delta) = state.fabushi_bots.build_turn_system_prompt_with_group_context(
             params.bot_user_id.0 as i64,
             params.chat_id.0,
             enriched_sp.as_deref().unwrap_or(""),
             &room_groups,
             &mentioned_teammates,
+            group_prompt_ctx.as_ref(),
         );
         (
             if sp.trim().is_empty() {
@@ -2088,6 +2325,13 @@ pub(crate) async fn execute_bot_turn_streamed(
     );
 
     let mut adaptive_toolsets = adaptive_profile.toolsets;
+    if is_group_chat {
+        if let Some(ref mut sets) = adaptive_toolsets {
+            if !sets.contains(&ToolsetId::Subagents) {
+                sets.push(ToolsetId::Subagents);
+            }
+        }
+    }
     if has_online_computer
         && (has_bound_computer || prompt_has_computer_exec_intent(&params.prompt))
     {
@@ -2137,7 +2381,14 @@ pub(crate) async fn execute_bot_turn_streamed(
                     url: None,
                 }]);
             }
-            flush_streamed_bot_message(state, &params, &mut err_consumer, true);
+            flush_streamed_bot_message(
+                state,
+                &params,
+                &mut err_consumer,
+                true,
+                is_group_chat,
+                &agent_label,
+            );
             state
         .webmcp_broker
         .mark_idle_for_bot(params.sender_id, params.bot_user_id);
@@ -2148,6 +2399,7 @@ pub(crate) async fn execute_bot_turn_streamed(
 
     const EDIT_THROTTLE: Duration = Duration::from_millis(120);
     let mut consumer = StreamConsumerState::new();
+    let mut preempted = false;
     let mut last_activity: (String, Option<String>) = (
         "thinking".to_string(),
         Some("正在理解请求...".to_string()),
@@ -2180,6 +2432,10 @@ pub(crate) async fn execute_bot_turn_streamed(
     }
 
     loop {
+        if params.floor_fence.as_ref().is_some_and(|f| !f.is_active()) {
+            preempted = true;
+            break;
+        }
         let sleep_fut = async {
             if let Some(last_edit) = consumer.last_edit_at.filter(|_| consumer.dirty) {
                 tokio::time::sleep_until(last_edit + EDIT_THROTTLE).await;
@@ -2191,9 +2447,20 @@ pub(crate) async fn execute_bot_turn_streamed(
             _ = sleep_fut => LoopWake::FlushTimer,
             ev = rx.recv() => LoopWake::Event(ev),
         };
+        if params.floor_fence.as_ref().is_some_and(|f| !f.is_active()) {
+            preempted = true;
+            break;
+        }
         match wake {
             LoopWake::FlushTimer => {
-                flush_streamed_bot_message(state, &params, &mut consumer, false);
+                flush_streamed_bot_message(
+                    state,
+                    &params,
+                    &mut consumer,
+                    false,
+                    is_group_chat,
+                    &agent_label,
+                );
             }
             LoopWake::Event(None) => break,
             LoopWake::Event(Some(first_ev)) => {
@@ -2223,20 +2490,34 @@ pub(crate) async fn execute_bot_turn_streamed(
                             url: None,
                         }]);
                     }
-                    flush_streamed_bot_message(state, &params, &mut consumer, true);
+                    flush_streamed_bot_message(
+                        state,
+                        &params,
+                        &mut consumer,
+                        true,
+                        is_group_chat,
+                        &agent_label,
+                    );
                     break;
                 } else if flush_now
                     || consumer
                         .last_edit_at
                         .is_none_or(|t| t.elapsed() >= EDIT_THROTTLE)
                 {
-                    flush_streamed_bot_message(state, &params, &mut consumer, false);
+                    flush_streamed_bot_message(
+                        state,
+                        &params,
+                        &mut consumer,
+                        false,
+                        is_group_chat,
+                        &agent_label,
+                    );
                 }
             }
         }
     }
 
-    if !consumer.saw_terminal_event {
+    if !preempted && !consumer.saw_terminal_event {
         if consumer.needs_provider_button
             && target_engine
                 .providers_for_user(&params.sender_id.0.to_string())
@@ -2253,7 +2534,14 @@ pub(crate) async fn execute_bot_turn_streamed(
                 url: None,
             }]);
         }
-        flush_streamed_bot_message(state, &params, &mut consumer, true);
+        flush_streamed_bot_message(
+            state,
+            &params,
+            &mut consumer,
+            true,
+            is_group_chat,
+            &agent_label,
+        );
     }
 
     if let Some(g) = exec_guard.as_mut() {

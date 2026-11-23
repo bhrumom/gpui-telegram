@@ -84,6 +84,246 @@ fn media_badge_svg_rgba(badge: DialogMessageMediaBadge, color: Rgba) -> Option<A
     Some(tg_icon_rgba(icon, 12.0, color).into_any_element())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogPreviewPriority {
+    BlockedApproval(String),
+    Draft(String),
+    LiveActivity(String),
+    Message(String),
+}
+
+fn strip_known_prefix<'a>(text: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    let trimmed = text.trim();
+    for p in prefixes {
+        if let Some(rest) = trimmed.strip_prefix(p) {
+            return Some(rest.trim());
+        }
+    }
+    None
+}
+
+/// Resolves Grok Bot's 4-tier sidebar preview priority order:
+/// (1) pending approval / blocked ("等你处理：…"),
+/// (2) unsent draft ("草稿：…"),
+/// (3) live agent activity / typing indicator,
+/// (4) last message snippet.
+pub fn resolve_dialog_preview_priority(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    lang_id: &str,
+) -> DialogPreviewPriority {
+    const BLOCKED_PREFIXES: &[&str] = &[
+        "等你处理：",
+        "等你处理:",
+        "需要批准：",
+        "需要批准:",
+        "[需要批准]",
+        "approval:",
+        "blocked:",
+        "Needs approval:",
+        "Approval required:",
+        "Waiting for approval:",
+    ];
+
+    let is_grok_blocked = meta.grok_avatar.as_ref().is_some_and(|g| {
+        let s = g.execution_state.trim().to_ascii_lowercase();
+        matches!(s.as_str(), "blocked" | "awaiting_approval" | "approval" | "needs_approval")
+    });
+    if let Some(ref typing) = item.typing_indicator {
+        if let Some(rest) = strip_known_prefix(typing, BLOCKED_PREFIXES) {
+            let detail = if rest.is_empty() {
+                tr_str(lang_id, "工具操作待确认", "Action awaiting approval").to_string()
+            } else {
+                rest.to_string()
+            };
+            return DialogPreviewPriority::BlockedApproval(detail);
+        }
+    }
+    if let Some(rest) = strip_known_prefix(&item.last_message, BLOCKED_PREFIXES) {
+        let detail = if rest.is_empty() {
+            tr_str(lang_id, "工具操作待确认", "Action awaiting approval").to_string()
+        } else {
+            rest.to_string()
+        };
+        return DialogPreviewPriority::BlockedApproval(detail);
+    }
+    if is_grok_blocked {
+        let detail = if item.last_message.trim().is_empty() {
+            tr_str(lang_id, "需要你的批准", "Needs your approval").to_string()
+        } else {
+            item.last_message.trim().to_string()
+        };
+        return DialogPreviewPriority::BlockedApproval(detail);
+    }
+
+    if let Some(draft) = meta.draft_text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return DialogPreviewPriority::Draft(draft.to_string());
+    }
+
+    if let Some(typing) = item
+        .typing_indicator
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return DialogPreviewPriority::LiveActivity(typing.to_string());
+    }
+
+    if let Some(ref ga) = meta.grok_avatar {
+        let st = ga.execution_state.trim().to_ascii_lowercase();
+        if !st.is_empty() && st != "idle" {
+            let label = match st.as_str() {
+                "tool" | "working" | "coding" => tr_str(lang_id, "正在执行工具…", "Running tools…"),
+                "writing" => tr_str(lang_id, "正在组织回复…", "Writing reply…"),
+                _ => tr_str(lang_id, "正在思考…", "Thinking…"),
+            };
+            return DialogPreviewPriority::LiveActivity(label.to_string());
+        }
+    }
+
+    DialogPreviewPriority::Message(item.last_message.clone())
+}
+
+fn derive_cluster_tiles(
+    seed_id: u64,
+    title: &str,
+    member_tiles: Option<&[(String, u32)]>,
+    is_dark: bool,
+) -> Vec<(String, u32)> {
+    if let Some(tiles) = member_tiles {
+        let valid: Vec<(String, u32)> = tiles
+            .iter()
+            .filter(|(lbl, _)| !lbl.trim().is_empty())
+            .take(3)
+            .cloned()
+            .collect();
+        if valid.len() >= 2 {
+            return valid;
+        }
+    }
+
+    let mut parts: Vec<String> = title
+        .split(|c: char| matches!(c, '、' | ',' | '&' | '·' | '/' | '|'))
+        .flat_map(|seg| seg.split("和"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().next().unwrap_or('G').to_uppercase().to_string())
+        .take(3)
+        .collect();
+
+    if parts.len() < 2 {
+        let chars: Vec<char> = title.chars().filter(|c| !c.is_whitespace()).collect();
+        parts.clear();
+        if chars.len() >= 2 {
+            parts.push(chars[0].to_uppercase().to_string());
+            parts.push(chars[1].to_uppercase().to_string());
+            if chars.len() >= 4 {
+                parts.push(chars[chars.len() / 2].to_uppercase().to_string());
+            }
+        } else if let Some(&first) = chars.first() {
+            parts.push(first.to_uppercase().to_string());
+            parts.push("AI".to_string());
+        } else {
+            parts.push("G".to_string());
+            parts.push("B".to_string());
+        }
+    }
+
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(idx, glyph)| {
+            let hue = TdesktopThemePalette::bot_hue_name_for_id(seed_id.wrapping_add(idx as u64 * 3 + 1));
+            let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(hue, is_dark);
+            (glyph, fill)
+        })
+        .collect()
+}
+
+/// Renders Grok Bot's overlapping composite group avatar (2–3 mini circular tiles with
+/// surface-matched cutout rings) for group chats without a custom photo.
+pub fn render_composite_group_avatar(
+    seed_id: u64,
+    title: &str,
+    member_tiles: Option<&[(String, u32)]>,
+    avatar_size_px: f32,
+    surface_bg_hex: u32,
+    is_dark: bool,
+) -> Div {
+    let tiles = derive_cluster_tiles(seed_id, title, member_tiles, is_dark);
+    let ring = rgb(surface_bg_hex);
+    let container = div()
+        .relative()
+        .w(px(avatar_size_px))
+        .h(px(avatar_size_px))
+        .flex_shrink_0();
+
+    if tiles.len() >= 3 {
+        let tile_d = (avatar_size_px * 0.56).round();
+        let font_px = (tile_d * 0.44).clamp(8.5, 13.0);
+        let positions = [
+            ((avatar_size_px - tile_d) * 0.5, 0.0),
+            (0.0, avatar_size_px - tile_d),
+            (avatar_size_px - tile_d, avatar_size_px - tile_d),
+        ];
+        tiles
+            .into_iter()
+            .zip(positions)
+            .fold(container, |acc, ((glyph, color), (left_px, top_px))| {
+                acc.child(
+                    div()
+                        .absolute()
+                        .left(px(left_px))
+                        .top(px(top_px))
+                        .w(px(tile_d))
+                        .h(px(tile_d))
+                        .rounded_full()
+                        .bg(rgb(color))
+                        .border_2()
+                        .border_color(ring)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(font_px))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xFFFFFF))
+                        .child(glyph),
+                )
+            })
+    } else {
+        let tile_d = (avatar_size_px * 0.66).round();
+        let font_px = (tile_d * 0.44).clamp(9.0, 14.0);
+        let positions = [
+            (0.0, 0.0),
+            (avatar_size_px - tile_d, avatar_size_px - tile_d),
+        ];
+        tiles
+            .into_iter()
+            .zip(positions)
+            .fold(container, |acc, ((glyph, color), (left_px, top_px))| {
+                acc.child(
+                    div()
+                        .absolute()
+                        .left(px(left_px))
+                        .top(px(top_px))
+                        .w(px(tile_d))
+                        .h(px(tile_d))
+                        .rounded_full()
+                        .bg(rgb(color))
+                        .border_2()
+                        .border_color(ring)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(font_px))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xFFFFFF))
+                        .child(glyph),
+                )
+            })
+    }
+}
+
 /// Shared circular / animated bot avatar renderer used by both dialog rows and the Apple Messages
 /// 3-column Pinned Chats avatar grid.
 pub(crate) fn render_dialog_avatar(
@@ -105,9 +345,14 @@ pub(crate) fn render_dialog_avatar(
         }
     };
     let avatar_size = px(avatar_size_px);
-    let initials_font_px = (avatar_size_px * 0.33).clamp(13.0, 19.0);
-    let saved_icon_px = (avatar_size_px * 0.48).clamp(18.0, 26.0);
-    let bot_icon_px = (avatar_size_px * 0.44).clamp(18.0, 24.0);
+    let initials_font_px = (avatar_size_px * 0.35).clamp(12.0, 19.0);
+    let saved_icon_px = (avatar_size_px * 0.48).clamp(17.0, 26.0);
+    let bot_icon_px = (avatar_size_px * 0.44).clamp(17.0, 24.0);
+    let is_group_dialog = !meta.is_saved_messages
+        && !meta.is_bot
+        && meta.grok_avatar.is_none()
+        && (item.folder == "Groups"
+            || meta.topics.as_ref().is_some_and(|t| !t.topics.is_empty()));
 
     let render_classic_circle = || -> Div {
         let mut el = div()
@@ -139,7 +384,16 @@ pub(crate) fn render_dialog_avatar(
     };
 
     let mut avatar = if !meta.is_saved_messages {
-        if let Some(ref ga) = meta.grok_avatar {
+        if is_group_dialog {
+            render_composite_group_avatar(
+                item.id,
+                &item.peer_name,
+                None,
+                avatar_size_px,
+                surface_bg_hex,
+                palette.mode.is_dark(),
+            )
+        } else if let Some(ref ga) = meta.grok_avatar {
             if !ga.shape.eq_ignore_ascii_case("classic") {
                 render_grok_bot_avatar(
                     GrokBotAvatarProps::new(&ga.agent_id, &ga.shape, &ga.color, avatar_size_px)
@@ -196,8 +450,18 @@ pub(crate) fn render_dialog_avatar(
         render_classic_circle()
     };
 
-    if item.is_online && !meta.is_saved_messages {
-        let dot_px = (avatar_size_px * 0.24).clamp(10.0, 13.0);
+    let is_agent_running = item.typing_indicator.is_some()
+        || meta.grok_avatar.as_ref().is_some_and(|g| {
+            let s = g.execution_state.trim().to_ascii_lowercase();
+            !s.is_empty() && s != "idle" && s != "blocked" && s != "awaiting_approval"
+        });
+    if (item.is_online || is_agent_running) && !meta.is_saved_messages {
+        let dot_px = (avatar_size_px * 0.24).clamp(8.5, 11.5);
+        let dot_color = if is_agent_running {
+            palette.accent
+        } else {
+            palette.online_dot_fg
+        };
         avatar = avatar.relative().child(
             div()
                 .absolute()
@@ -206,7 +470,7 @@ pub(crate) fn render_dialog_avatar(
                 .w(px(dot_px))
                 .h(px(dot_px))
                 .rounded_full()
-                .bg(rgb(palette.online_dot_fg))
+                .bg(rgb(dot_color))
                 .border_2()
                 .border_color(online_dot_border),
         );
@@ -248,76 +512,35 @@ pub fn render_dialog_row_item<V: 'static>(
     pill.is_muted = item.is_muted;
 
     if palette.is_apple_style() {
-        let row_height = palette.scaled_px(68.0);
-        let row_bg_hex = if is_selected {
-            palette.dialogs_active_bg
+        // Grok Bot `dC` sidebar row rhythm: 54px height, 10px pill radius, 36px avatar, 8px gap,
+        // translucent 6% hover / 8% active fills, and 4-tier preview priority order.
+        let is_dark = palette.mode.is_dark();
+        let row_height = palette.scaled_px(54.0);
+        let row_hover_bg = palette.row_hover_rgba();
+        let row_active_bg = palette.row_active_rgba();
+        let row_surface_hex = if is_selected {
+            if is_dark { 0x1F1F1F } else { 0xE5E5E5 }
         } else {
             palette.dialogs_bg
         };
-        let apple_hover_bg = if palette.mode.is_dark() {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
-        };
-        let selected_sub_rgba = TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.85);
-        let name_fg: Rgba = if is_selected {
-            rgb(0xFFFFFF)
-        } else {
-            rgb(palette.text_primary)
-        };
-        let sub_fg: Rgba = if is_selected {
-            selected_sub_rgba
-        } else {
-            rgb(palette.text_secondary)
-        };
-        let time_fg: Rgba = if is_selected {
-            selected_sub_rgba
-        } else {
-            rgb(palette.msg_in_date_fg)
-        };
-        let chevron_rgba: Rgba = if is_selected {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.80)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.55)
-        };
-        let avatar_size_px = palette.scaled_px(44.0);
-        let online_border = if is_selected {
-            rgb(palette.dialogs_active_bg)
-        } else {
-            palette.sidebar_bg_rgba()
-        };
+        let name_fg: Rgba = rgb(palette.text_primary);
+        let sub_fg: Rgba = rgb(palette.text_secondary);
+        let time_fg: Rgba = rgb(palette.msg_in_date_fg);
+        let avatar_size_px = palette.scaled_px(36.0);
+        let online_border = rgb(row_surface_hex);
         let avatar = render_dialog_avatar(
             item,
             meta,
             palette,
             avatar_size_px,
-            row_bg_hex,
+            row_surface_hex,
             online_border,
         );
 
+        let preview_priority = resolve_dialog_preview_priority(item, meta, lang_id);
+        let is_blocked = matches!(preview_priority, DialogPreviewPriority::BlockedApproval(_));
         let has_unread = item.unread_count > 0 || meta.is_unread_marked;
-        let unread_dot_bg = if is_selected {
-            rgb(0xFFFFFF)
-        } else if item.is_muted {
-            rgb(palette.muted_badge_bg)
-        } else {
-            rgb(palette.accent)
-        };
-        let unread_gutter = div()
-            .w(px(palette.scaled_px(14.0)))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(has_unread, |el| {
-                el.child(
-                    div()
-                        .w(px(palette.scaled_px(8.0)))
-                        .h(px(palette.scaled_px(8.0)))
-                        .rounded_full()
-                        .bg(unread_dot_bg),
-                )
-            });
+        let (_, _, warn_text_hex) = TdesktopThemePalette::bot_hue_colors("yellow", is_dark);
 
         let mut title_row = div()
             .flex_1()
@@ -330,33 +553,33 @@ pub fn render_dialog_row_item<V: 'static>(
                 div()
                     .truncate()
                     .text_size(px(palette.scaled_px(13.5)))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(if is_selected || has_unread {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
                     .text_color(name_fg)
                     .child(item.peer_name.clone()),
             );
         if meta.is_verified {
             title_row = title_row.child(tg_icon(
                 IconName::Verified,
-                palette.scaled_px(13.0),
-                if is_selected { 0xFFFFFF } else { palette.accent },
+                palette.scaled_px(12.5),
+                palette.accent,
             ));
         }
         if meta.is_premium {
             title_row = title_row.child(tg_icon(
                 IconName::PremiumStar,
-                palette.scaled_px(12.0),
-                if is_selected { 0xFFFFFF } else { palette.accent },
+                palette.scaled_px(11.5),
+                palette.accent,
             ));
         }
         if item.is_muted {
             title_row = title_row.child(tg_icon_rgba(
                 IconName::Mute,
-                palette.scaled_px(11.5),
-                if is_selected {
-                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.78)
-                } else {
-                    TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.72)
-                },
+                palette.scaled_px(11.0),
+                TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.72),
             ));
         }
 
@@ -369,120 +592,111 @@ pub fn render_dialog_row_item<V: 'static>(
             .child(title_row)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(3.0))
                     .flex_shrink_0()
-                    .child(
-                        div()
-                            .text_size(px(palette.scaled_px(11.5)))
-                            .text_color(time_fg)
-                            .child(item.timestamp.clone()),
-                    )
-                    .child(tg_icon_rgba(
-                        IconName::ChevronRight,
-                        palette.scaled_px(11.0),
-                        chevron_rgba,
-                    )),
+                    .text_size(px(palette.scaled_px(11.5)))
+                    .text_color(time_fg)
+                    .child(item.timestamp.clone()),
             );
 
         let preview_font = px(palette.scaled_px(12.5));
-        let preview_max_h = px(palette.scaled_px(34.0));
-        let preview_line: AnyElement = if preview_ui.is_draft {
-            let draft_prefix_color = if is_selected {
-                rgb(0xFFFFFF)
-            } else {
-                rgb(palette.danger)
-            };
-            div()
+        let preview_line: AnyElement = match preview_priority {
+            DialogPreviewPriority::BlockedApproval(detail) => div()
                 .w_full()
-                .max_h(preview_max_h)
                 .overflow_hidden()
                 .flex()
-                .items_start()
+                .items_center()
                 .gap(px(3.0))
                 .text_size(preview_font)
-                .line_height(relative(1.32))
                 .child(
                     div()
                         .flex_shrink_0()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(draft_prefix_color)
-                        .child(tr_str(lang_id, "草稿:", "Draft:")),
+                        .text_color(rgb(warn_text_hex))
+                        .child(tr_str(lang_id, "等你处理：", "Needs you: ")),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
+                        .truncate()
                         .text_color(sub_fg)
-                        .child(preview_ui.text),
+                        .child(detail),
                 )
-                .into_any_element()
-        } else if let Some(ref typing) = item.typing_indicator {
-            div()
+                .into_any_element(),
+            DialogPreviewPriority::Draft(draft) => div()
                 .w_full()
-                .max_h(preview_max_h)
-                .overflow_hidden()
-                .text_size(preview_font)
-                .line_height(relative(1.32))
-                .text_color(if is_selected {
-                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.92)
-                } else {
-                    rgb(palette.accent)
-                })
-                .child(typing.clone())
-                .into_any_element()
-        } else if let Some(icon) = media_badge_svg_rgba(preview_ui.media_badge, sub_fg) {
-            div()
-                .w_full()
-                .max_h(preview_max_h)
                 .overflow_hidden()
                 .flex()
-                .items_start()
-                .gap(px(4.0))
-                .child(div().pt(px(2.0)).flex_shrink_0().child(icon))
+                .items_center()
+                .gap(px(3.0))
+                .text_size(preview_font)
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(palette.danger))
+                        .child(tr_str(lang_id, "草稿：", "Draft: ")),
+                )
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .text_size(preview_font)
-                        .line_height(relative(1.32))
+                        .truncate()
                         .text_color(sub_fg)
-                        .child(preview_ui.text),
+                        .child(draft),
                 )
-                .into_any_element()
-        } else {
-            div()
+                .into_any_element(),
+            DialogPreviewPriority::LiveActivity(activity) => div()
                 .w_full()
-                .max_h(preview_max_h)
                 .overflow_hidden()
+                .truncate()
                 .text_size(preview_font)
-                .line_height(relative(1.32))
-                .text_color(sub_fg)
-                .child(preview_ui.text)
-                .into_any_element()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(palette.accent))
+                .child(activity)
+                .into_any_element(),
+            DialogPreviewPriority::Message(text) => {
+                if let Some(icon) = media_badge_svg_rgba(preview_ui.media_badge, sub_fg) {
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(div().flex_shrink_0().child(icon))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(preview_font)
+                                .text_color(sub_fg)
+                                .child(text),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .truncate()
+                        .text_size(preview_font)
+                        .text_color(sub_fg)
+                        .child(text)
+                        .into_any_element()
+                }
+            }
         };
 
         let mut right_aux = div()
             .flex()
             .items_center()
-            .gap(px(4.0))
+            .gap(px(5.0))
             .flex_shrink_0();
         let mut has_aux = false;
 
         if let Some(ref open_uri) = meta.miniapp_open_uri {
             has_aux = true;
             let uri_owned = open_uri.clone();
-            let pill_bg = if is_selected {
-                rgb(0xFFFFFF)
-            } else {
-                rgb(palette.accent)
-            };
-            let pill_fg = if is_selected {
-                rgb(palette.accent)
-            } else {
-                rgb(0xFFFFFF)
-            };
             right_aux = right_aux.child(
                 div()
                     .id(("dialog-row-open-miniapp", item.id))
@@ -490,10 +704,10 @@ pub fn render_dialog_row_item<V: 'static>(
                     .px(px(palette.scaled_px(8.0)))
                     .py(px(palette.scaled_px(2.0)))
                     .rounded_full()
-                    .bg(pill_bg)
-                    .text_size(px(palette.scaled_px(11.0)))
+                    .bg(rgb(palette.accent))
+                    .text_size(px(palette.scaled_px(10.5)))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(pill_fg)
+                    .text_color(rgb(0xFFFFFF))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _w, cx| {
@@ -505,23 +719,26 @@ pub fn render_dialog_row_item<V: 'static>(
             );
         }
 
-        // Keep unread state crisp: left blue dot is primary; for multi-message unread counts,
-        // show a subtle, lightweight count pill without heavy badge clutter.
-        if item.unread_count > 1 {
+        // Trailing attention slot priority (Grok Bot §2.5): blocked amber dot > unread dot/pill
+        if is_blocked {
             has_aux = true;
-            let (count_bg, count_fg) = if is_selected {
-                (
-                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.24),
-                    rgb(0xFFFFFF),
-                )
-            } else if item.is_muted {
+            right_aux = right_aux.child(
+                div()
+                    .w(px(palette.scaled_px(8.0)))
+                    .h(px(palette.scaled_px(8.0)))
+                    .rounded_full()
+                    .bg(rgb(warn_text_hex)),
+            );
+        } else if item.unread_count > 1 {
+            has_aux = true;
+            let (count_bg, count_fg) = if item.is_muted {
                 (
                     TdesktopThemePalette::rgba_with_alpha(palette.muted_badge_bg, 0.22),
                     rgb(palette.text_secondary),
                 )
             } else {
                 (
-                    TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14),
+                    TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16),
                     rgb(palette.accent),
                 )
             };
@@ -540,6 +757,20 @@ pub fn render_dialog_row_item<V: 'static>(
                     .text_color(count_fg)
                     .child(format!("{}", pill.count)),
             );
+        } else if has_unread {
+            has_aux = true;
+            let dot_bg = if item.is_muted {
+                rgb(palette.muted_badge_bg)
+            } else {
+                rgb(palette.accent)
+            };
+            right_aux = right_aux.child(
+                div()
+                    .w(px(palette.scaled_px(7.5)))
+                    .h(px(palette.scaled_px(7.5)))
+                    .rounded_full()
+                    .bg(dot_bg),
+            );
         }
 
         if meta.topics.as_ref().is_some_and(|t| !t.topics.is_empty()) {
@@ -556,11 +787,7 @@ pub fn render_dialog_row_item<V: 'static>(
                     .px(px(4.0))
                     .py(px(2.0))
                     .rounded(px(5.0))
-                    .bg(if is_selected {
-                        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.20)
-                    } else {
-                        TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.12)
-                    })
+                    .bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.12))
                     .flex()
                     .items_center()
                     .on_mouse_down(
@@ -570,22 +797,18 @@ pub fn render_dialog_row_item<V: 'static>(
                             on_toggle_topics(this, cx);
                         }),
                     )
-                    .child(tg_icon(
-                        chev,
-                        10.0,
-                        if is_selected { 0xFFFFFF } else { palette.accent },
-                    )),
+                    .child(tg_icon(chev, 10.0, palette.accent)),
             );
         }
 
         let bottom_row = div()
             .w_full()
             .flex()
-            .items_start()
+            .items_center()
             .justify_between()
             .gap(px(6.0))
             .child(div().flex_1().min_w(px(0.0)).child(preview_line))
-            .when(has_aux, |el| el.child(div().pt(px(1.0)).child(right_aux)));
+            .when(has_aux, |el| el.child(right_aux));
 
         return div()
             .id(("sidebar-dialog-row", item.id))
@@ -593,14 +816,14 @@ pub fn render_dialog_row_item<V: 'static>(
             .h(px(row_height))
             .flex_shrink_0()
             .w_full()
-            .pl(px(palette.scaled_px(4.0)))
-            .pr(px(palette.scaled_px(10.0)))
-            .py(px(palette.scaled_px(8.0)))
+            .px(px(palette.scaled_px(8.0)))
+            .py(px(palette.scaled_px(6.0)))
             .rounded(px(palette.scaled_px(10.0)))
-            .when(is_selected, |el| el.bg(rgb(palette.dialogs_active_bg)))
-            .hover(move |s| if is_selected { s } else { s.bg(apple_hover_bg) })
+            .when(is_selected, |el| el.bg(row_active_bg))
+            .hover(move |s| if is_selected { s } else { s.bg(row_hover_bg) })
             .flex()
             .items_center()
+            .gap(px(palette.scaled_px(8.0)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _ev, _w, cx| {
@@ -613,11 +836,9 @@ pub fn render_dialog_row_item<V: 'static>(
                     on_context(this, ev.position, cx);
                 }),
             )
-            .child(unread_gutter)
-            .child(div().ml(px(palette.scaled_px(2.0))).flex_shrink_0().child(avatar))
+            .child(avatar)
             .child(
                 div()
-                    .ml(px(palette.scaled_px(8.0)))
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
@@ -625,7 +846,7 @@ pub fn render_dialog_row_item<V: 'static>(
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .gap(px(palette.scaled_px(2.0)))
+                    .gap(px(palette.scaled_px(1.5)))
                     .child(top_row)
                     .child(bottom_row),
             )

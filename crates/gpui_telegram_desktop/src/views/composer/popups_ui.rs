@@ -34,6 +34,202 @@ pub fn render_autocomplete_popup<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, ComposerPopupAction, &mut Context<V>) + Clone + 'static,
 ) -> Option<AnyElement> {
+    let is_dark = palette.mode.is_dark();
+    let is_apple = palette.is_apple_style();
+
+    // Rich Grok Bot `@mention` elevated listbox (14px radius, 32px rows, AI Bot / @everyone badges)
+    if emoji_token.is_none()
+        && ac.is_open
+        && ac.autocomplete_type == AutocompleteType::Mentions
+        && !ac.mention_rows.is_empty()
+    {
+        let sel_idx = ac.selected_index.max(0) as usize;
+        let hbg = palette.row_hover_rgba();
+        let active_bg = palette.row_active_rgba();
+        let mut box_el = div()
+            .id("composer-autocomplete-popup")
+            .w(px(360.0))
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .mb(px(6.0))
+            .p(px(6.0))
+            .rounded(px(14.0))
+            .bg(rgb(palette.menu_bg))
+            .border_1()
+            .border_color(palette.hairline_border_rgba())
+            .when(is_dark, |el| el.border_t_1().border_color(palette.specular_top_highlight_rgba()))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        box_el = if is_apple {
+            box_el.shadow(palette.popover_shadows())
+        } else {
+            box_el.shadow_lg()
+        };
+
+        for (idx, m) in ac.mention_rows.iter().take(12).enumerate() {
+            let act = on_action.clone();
+            let active = idx == sel_idx;
+            let insert = if !m.username.trim().is_empty() {
+                format!("@{} ", m.username.trim().trim_start_matches('@'))
+            } else {
+                format!("@{} ", m.name.trim())
+            };
+            let role_badge = ac.role_hint_for(m);
+            let is_everyone = m.is_everyone();
+            let hue = if is_everyone {
+                "cyan"
+            } else if m.is_bot {
+                TdesktopThemePalette::bot_hue_name_for_id(m.user_id.wrapping_add(1))
+            } else {
+                TdesktopThemePalette::bot_hue_name_for_id(m.user_id)
+            };
+            let (avatar_fill, badge_bg, badge_fg) =
+                TdesktopThemePalette::bot_hue_colors(hue, is_dark);
+            let initials: String = m
+                .name
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .take(1)
+                .collect::<String>()
+                .to_uppercase();
+            let avatar = if is_everyone {
+                div()
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(rgb(badge_bg))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(badge_fg))
+                    .child("@")
+            } else if m.is_bot {
+                div()
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(rgb(avatar_fill))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(tg_icon(IconName::BotRobot, 13.0, 0xFFFFFF))
+            } else {
+                div()
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(rgb(avatar_fill))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xFFFFFF))
+                    .child(if initials.is_empty() { "U".to_string() } else { initials })
+            };
+
+            let handle_label = if !m.username.trim().is_empty() {
+                format!("@{}", m.username.trim().trim_start_matches('@'))
+            } else {
+                String::new()
+            };
+            let display_title = if m.name.trim().is_empty() {
+                handle_label.clone()
+            } else {
+                m.name.clone()
+            };
+
+            box_el = box_el.child(
+                div()
+                    .id(SharedString::from(format!("ac-row-{}", idx)))
+                    .min_h(px(32.0))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(8.0))
+                    .when(active, |el| el.bg(active_bg))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hbg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            act(this, ComposerPopupAction::ChooseAutocomplete(insert.clone()), cx);
+                        }),
+                    )
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(avatar)
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(13.0))
+                                            .font_weight(if active {
+                                                FontWeight::SEMIBOLD
+                                            } else {
+                                                FontWeight::MEDIUM
+                                            })
+                                            .text_color(rgb(palette.text_primary))
+                                            .child(display_title),
+                                    )
+                                    .when(!handle_label.is_empty(), |row| {
+                                        row.child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(palette.text_secondary))
+                                                .child(handle_label),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(6.0))
+                            .py(px(1.5))
+                            .rounded_full()
+                            .bg(if m.is_bot || is_everyone {
+                                rgb(badge_bg).into()
+                            } else {
+                                TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.12)
+                            })
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if m.is_bot || is_everyone {
+                                rgb(badge_fg)
+                            } else {
+                                rgb(palette.text_secondary)
+                            })
+                            .child(role_badge),
+                    ),
+            );
+        }
+
+        return Some(box_el.into_any_element());
+    }
+
     let mut rows: Vec<(String, String, String)> = Vec::new();
     if let Some(etok) = emoji_token {
         let q = etok.to_lowercase();
@@ -44,11 +240,7 @@ pub fn render_autocomplete_popup<V: 'static>(
         }
     } else if ac.is_open {
         match ac.autocomplete_type {
-            AutocompleteType::Mentions => {
-                for m in &ac.mention_rows {
-                    rows.push((format!("@{}", m.username), m.name.clone(), format!("@{} ", m.username)));
-                }
-            }
+            AutocompleteType::Mentions => {}
             AutocompleteType::Hashtags => {
                 for h in &ac.hashtag_rows {
                     rows.push((format!("#{}", h.tag), "Hashtag".to_string(), format!("#{} ", h.tag)));
@@ -73,7 +265,6 @@ pub fn render_autocomplete_popup<V: 'static>(
 
     let sel_idx = ac.selected_index.max(0) as usize;
     let hbg = palette.menu_hover_bg;
-    let is_apple = palette.is_apple_style();
     let mut box_el = div()
         .id("composer-autocomplete-popup")
         .w(px(340.0))
@@ -89,7 +280,7 @@ pub fn render_autocomplete_popup<V: 'static>(
         })
         .border_1()
         .border_color(if is_apple {
-            palette.separator_rgba()
+            palette.hairline_border_rgba()
         } else {
             rgb(palette.border_fg).into()
         })
@@ -108,9 +299,10 @@ pub fn render_autocomplete_popup<V: 'static>(
         box_el = box_el.child(
             div()
                 .id(SharedString::from(format!("ac-row-{}", idx)))
+                .min_h(px(32.0))
                 .px(px(10.0))
                 .py(px(6.0))
-                .rounded(px(7.0))
+                .rounded(px(8.0))
                 .when(active, |el| el.bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.20)))
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(hbg)))

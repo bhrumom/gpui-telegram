@@ -166,18 +166,107 @@ impl TdesktopThemePalette {
         Self::rgba_with_alpha(self.dialogs_bg, 1.0)
     }
 
-    /// Hairline translucent separator matching macOS HIG (`rgba(0,0,0,0.07)` light / `rgba(255,255,255,0.08)` dark).
+    /// Hairline translucent separator matching Grok Bot `sand-*` tokens
+    /// (`rgba(28,28,28,0.08)` light / `rgba(255,255,255,0.10)` dark).
     pub fn separator_rgba(&self) -> Rgba {
         if self.mode.is_dark() {
-            Self::rgba_with_alpha(0xFFFFFF, 0.08)
+            Self::rgba_with_alpha(0xFFFFFF, 0.10)
         } else {
-            Self::rgba_with_alpha(0x000000, 0.07)
+            Self::rgba_with_alpha(0x1C1C1C, 0.08)
         }
+    }
+
+    /// Translucent card / popover border (`--sand-border-secondary-translucent`).
+    pub fn hairline_border_rgba(&self) -> Rgba {
+        if self.mode.is_dark() {
+            Self::rgba_with_alpha(0xFFFFFF, 0.10)
+        } else {
+            Self::rgba_with_alpha(0x1C1C1C, 0.12)
+        }
+    }
+
+    /// Top specular highlight for dark-mode elevation separation without muddy shadows
+    /// (`--sand-specular-primary`: 12% white in dark mode; crisp white bevel in light mode).
+    pub fn specular_top_highlight_rgba(&self) -> Rgba {
+        if self.mode.is_dark() {
+            Self::rgba_with_alpha(0xFFFFFF, 0.12)
+        } else {
+            Self::rgba_with_alpha(0xFFFFFF, 0.72)
+        }
+    }
+
+    /// Subtle translucent row hover fill matching Grok Bot `--sand-bg-hover` (6% ink).
+    pub fn row_hover_rgba(&self) -> Rgba {
+        if self.mode.is_dark() {
+            Self::rgba_with_alpha(0xF5F5F5, 0.06)
+        } else {
+            Self::rgba_with_alpha(0x1C1C1C, 0.06)
+        }
+    }
+
+    /// Subtle translucent row active/selected fill matching Grok Bot `--sand-bg-active` (8% ink).
+    pub fn row_active_rgba(&self) -> Rgba {
+        if self.mode.is_dark() {
+            Self::rgba_with_alpha(0xF5F5F5, 0.08)
+        } else {
+            Self::rgba_with_alpha(0x1C1C1C, 0.08)
+        }
+    }
+
+    /// Grok Bot 9-hue per-bot color palette lookup returning `(bubble_fill, pill_bg, pill_text)`
+    /// across `blue`, `red`, `green`, `yellow`, `orange`, `cyan`, `purple`, `magenta`, `brown`.
+    /// Used for 1:1 bot chat user bubbles and clickable hue-tinted group sender pills.
+    pub fn bot_hue_colors(hue_name: &str, is_dark: bool) -> (u32, u32, u32) {
+        let normalized = hue_name.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "red" | "danger" | "rose" | "crimson" => {
+                if is_dark { (0xCF2B35, 0x36191C, 0xFF6463) } else { (0xC82532, 0xFFEAEC, 0xCD2834) }
+            }
+            "green" | "success" | "emerald" | "mint" => {
+                if is_dark { (0x0E9F5A, 0x162E22, 0x00BA69) } else { (0x0D9655, 0xE7F9F0, 0x00854A) }
+            }
+            "yellow" | "warn" | "amber" | "gold" => {
+                if is_dark { (0xC8770C, 0x352815, 0xE28600) } else { (0xC2730B, 0xFEF4E7, 0xAA6300) }
+            }
+            "orange" | "coral" => {
+                if is_dark { (0xCD5309, 0x362115, 0xFE6600) } else { (0xD2550A, 0xFFF0E7, 0xC14C00) }
+            }
+            "cyan" | "teal" | "aqua" => {
+                if is_dark { (0x0E9886, 0x162D2A, 0x00B7A2) } else { (0x0D9381, 0xE7F8F6, 0x008273) }
+            }
+            "purple" | "violet" | "lavender" | "indigo" => {
+                if is_dark { (0x7845D7, 0x271F39, 0xA582FF) } else { (0x7442D1, 0xF4EEFE, 0x7547D0) }
+            }
+            "magenta" | "pink" | "fuchsia" => {
+                if is_dark { (0xCF297E, 0x361A28, 0xFF55A4) } else { (0xC82779, 0xFEEBF5, 0xC62378) }
+            }
+            "brown" | "bronze" | "earth" => {
+                if is_dark { (0x8C5D31, 0x2A221B, 0xC59E7D) } else { (0x86592E, 0xF5F0EB, 0x996B42) }
+            }
+            // Default / "blue" / "accent" / neutral fallback
+            _ => {
+                if is_dark { (0x116DD2, 0x162639, 0x4D9BFF) } else { (0x126FD4, 0xE7F2FF, 0x0B6DD3) }
+            }
+        }
+    }
+
+    /// Deterministic 9-hue selector for a peer or bot numeric ID.
+    pub const fn bot_hue_name_for_id(id: u64) -> &'static str {
+        const HUES: [&str; 9] = [
+            "blue", "purple", "cyan", "green", "orange", "magenta", "red", "yellow", "brown",
+        ];
+        HUES[(id as usize) % HUES.len()]
+    }
+
+    /// Returns whether `hue_name` represents an explicit chromatic bot tint (excluding neutral black/gray).
+    pub fn is_tinted_bot_hue(hue_name: &str) -> bool {
+        let lower = hue_name.trim().to_ascii_lowercase();
+        !lower.is_empty() && !matches!(lower.as_str(), "black" | "gray" | "grey" | "neutral" | "default")
     }
 
     /// Grouped rounded card surface fill for Inspector drawers and macOS modal cards.
     pub fn card_surface_rgba(&self) -> Rgba {
-        let alpha = if self.is_apple_style() { 0.94 } else { 1.0 };
+        let alpha = if self.is_apple_style() { 0.96 } else { 1.0 };
         Self::rgba_with_alpha(self.card_bg, alpha)
     }
 
@@ -195,27 +284,27 @@ impl TdesktopThemePalette {
         }
     }
 
-    /// Two-layer soft macOS ambient + contact shadow for popovers, menus, Tapbacks, and modals.
+    /// Elevation shadows for popovers, menus, and modals.
+    /// In Grok Bot dark mode (`sand-dark`), dark shadows are eliminated (`Vec::new()`) in favor of
+    /// 4-step luminance separation, translucent hairline borders, and top specular highlights.
     pub fn popover_shadows(&self) -> Vec<BoxShadow> {
         if self.mode.is_dark() {
-            vec![
-                BoxShadow {
-                    color: hsla(0.0, 0.0, 0.0, 0.44),
-                    offset: point(px(0.0), px(10.0)),
-                    blur_radius: px(28.0),
-                    spread_radius: px(0.0),
-                },
-                BoxShadow {
-                    color: hsla(0.0, 0.0, 0.0, 0.28),
-                    offset: point(px(0.0), px(2.0)),
-                    blur_radius: px(6.0),
-                    spread_radius: px(0.0),
-                },
-            ]
+            if self.is_apple_style() {
+                Vec::new()
+            } else {
+                vec![
+                    BoxShadow {
+                        color: hsla(0.0, 0.0, 0.0, 0.36),
+                        offset: point(px(0.0), px(8.0)),
+                        blur_radius: px(22.0),
+                        spread_radius: px(0.0),
+                    },
+                ]
+            }
         } else {
             vec![
                 BoxShadow {
-                    color: hsla(0.0, 0.0, 0.0, 0.14),
+                    color: hsla(0.0, 0.0, 0.0, 0.10),
                     offset: point(px(0.0), px(8.0)),
                     blur_radius: px(24.0),
                     spread_radius: px(0.0),

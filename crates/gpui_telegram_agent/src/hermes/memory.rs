@@ -12,6 +12,16 @@ pub const MEMORY_MAX_CHARS: usize = 2200;
 pub const USER_MAX_CHARS: usize = 1375;
 /// Canonical delimiter separating entries in `MEMORY.md` and `USER.md`.
 pub const MEMORY_DELIMITER: &str = "\n§\n";
+/// Filename for persisted untrusted group/team memory quarantine proposals.
+pub const MEMORY_QUARANTINE_FILE: &str = "MEMORY_QUARANTINE.json";
+/// Filename for persisted hierarchical temporal memory rollups ("Dreaming").
+pub const MEMORY_ROLLUP_FILE: &str = "MEMORY_ROLLUP.json";
+/// Maximum total proposals retained in the quarantine queue.
+pub const MAX_QUARANTINE_ITEMS: usize = 128;
+/// Maximum hierarchical rollup entries retained alongside `MEMORY.md`.
+pub const MAX_ROLLUP_ENTRIES: usize = 64;
+/// Maximum character budget for each consolidated rollup summary.
+pub const MAX_ROLLUP_SUMMARY_CHARS: usize = 1200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -520,6 +530,334 @@ impl MemoryManager {
         self.write_blob("SOUL.md", "soul_md", markdown)?;
         Ok(SoulProfile::parse(markdown))
     }
+
+    // =========================================================================
+    // Untrusted Group/Team Memory Quarantine & Hierarchical Rollup ("Dreaming")
+    // =========================================================================
+
+    pub fn load_quarantine_queue(&self) -> Result<MemoryQuarantineQueue> {
+        let raw = self.read_blob(MEMORY_QUARANTINE_FILE, "memory_quarantine_json")?;
+        if raw.trim().is_empty() {
+            return Ok(MemoryQuarantineQueue::new());
+        }
+        serde_json::from_str::<MemoryQuarantineQueue>(&raw)
+            .map_err(|e| TelegramError::Serialization(format!("Invalid memory quarantine JSON: {e}")))
+    }
+
+    pub fn save_quarantine_queue(&self, queue: &MemoryQuarantineQueue) -> Result<()> {
+        let serialized = serde_json::to_string_pretty(queue)?;
+        self.write_blob(MEMORY_QUARANTINE_FILE, "memory_quarantine_json", &serialized)
+    }
+
+    /// Quarantines a memory proposal originating from a multi-party group/team chat so untrusted
+    /// participants cannot directly mutate the bot's long-term `MEMORY.md` or `USER.md`.
+    pub fn propose_group_memory(
+        &self,
+        source_chat_id: i64,
+        proposed_by: impl Into<String>,
+        target: MemoryTarget,
+        content: impl Into<String>,
+    ) -> Result<QuarantinedMemoryProposal> {
+        let mut queue = self.load_quarantine_queue()?;
+        let proposal = queue.propose_from_group(source_chat_id, proposed_by, target, content)?;
+        self.save_quarantine_queue(&queue)?;
+        Ok(proposal)
+    }
+
+    pub fn list_pending_quarantine(&self) -> Result<Vec<QuarantinedMemoryProposal>> {
+        Ok(self.load_quarantine_queue()?.list_pending())
+    }
+
+    /// Approves a quarantined proposal and atomically promotes it into `MEMORY.md` or `USER.md`.
+    pub fn approve_quarantined_memory(
+        &self,
+        proposal_id: &str,
+        reviewer: impl Into<String>,
+    ) -> Result<(QuarantinedMemoryProposal, MemoryMutationResult)> {
+        let mut queue = self.load_quarantine_queue()?;
+        let res = queue.approve_and_promote(proposal_id, reviewer, self)?;
+        self.save_quarantine_queue(&queue)?;
+        Ok(res)
+    }
+
+    /// Rejects a quarantined proposal without touching `MEMORY.md` or `USER.md`.
+    pub fn reject_quarantined_memory(
+        &self,
+        proposal_id: &str,
+        reviewer: impl Into<String>,
+        reason: Option<String>,
+    ) -> Result<QuarantinedMemoryProposal> {
+        let mut queue = self.load_quarantine_queue()?;
+        let res = queue.reject(proposal_id, reviewer, reason)?;
+        self.save_quarantine_queue(&queue)?;
+        Ok(res)
+    }
+
+    pub fn list_memory_rollups(&self) -> Result<Vec<MemoryRollupEntry>> {
+        let raw = self.read_blob(MEMORY_ROLLUP_FILE, "memory_rollup_json")?;
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        serde_json::from_str::<Vec<MemoryRollupEntry>>(&raw)
+            .map_err(|e| TelegramError::Serialization(format!("Invalid memory rollup JSON: {e}")))
+    }
+
+    /// Consolidates current memory entries into a bounded hierarchical rollup entry
+    /// (Daily / Weekly / Monthly "Dreaming" summary) persisted alongside `MEMORY.md`.
+    pub fn consolidate_memory_rollup(
+        &self,
+        horizon: MemoryRollupHorizon,
+        period_key: impl Into<String>,
+        target: MemoryTarget,
+    ) -> Result<MemoryRollupEntry> {
+        let period = period_key.into().trim().to_string();
+        if period.is_empty() {
+            return Err(TelegramError::Validation(
+                "Memory rollup period_key cannot be empty".into(),
+            ));
+        }
+        let read = self.read(target)?;
+        let mut deduped = Vec::new();
+        let mut seen = BTreeSet::new();
+        for entry in read.entries {
+            let norm = entry.trim().to_string();
+            if !norm.is_empty() && seen.insert(norm.to_lowercase()) {
+                deduped.push(norm);
+            }
+        }
+
+        let summary_raw = if deduped.is_empty() {
+            format!("[{}:{}] No entries recorded.", horizon.as_str(), period)
+        } else {
+            let bullets: Vec<String> = deduped.iter().map(|e| format!("- {e}")).collect();
+            format!(
+                "[{}:{} | {} | {} item(s)]\n{}",
+                horizon.as_str(),
+                period,
+                target.file_name(),
+                deduped.len(),
+                bullets.join("\n")
+            )
+        };
+        let summary = truncate_chars_bounded(&summary_raw, MAX_ROLLUP_SUMMARY_CHARS);
+
+        let entry = MemoryRollupEntry {
+            rollup_id: format!("rlp_{}", uuid::Uuid::new_v4().simple()),
+            horizon,
+            period_key: period.clone(),
+            summary,
+            source_entry_count: deduped.len(),
+            source_entries: deduped,
+            consolidated_at_ms: now_ms(),
+        };
+
+        let mut rollups = self.list_memory_rollups()?;
+        rollups.retain(|r| !(r.horizon == horizon && r.period_key == period));
+        rollups.push(entry.clone());
+        if rollups.len() > MAX_ROLLUP_ENTRIES {
+            let drain_count = rollups.len() - MAX_ROLLUP_ENTRIES;
+            rollups.drain(0..drain_count);
+        }
+        let serialized = serde_json::to_string_pretty(&rollups)?;
+        self.write_blob(MEMORY_ROLLUP_FILE, "memory_rollup_json", &serialized)?;
+        Ok(entry)
+    }
+}
+
+fn truncate_chars_bounded(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = raw.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Review status for an untrusted group/team memory proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+/// A memory proposal captured from a shared group/team room awaiting owner/manager review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedMemoryProposal {
+    pub proposal_id: String,
+    pub source_chat_id: i64,
+    pub proposed_by: String,
+    pub target: MemoryTarget,
+    pub content: String,
+    pub status: QuarantineStatus,
+    pub created_at_ms: i64,
+    pub reviewed_by: Option<String>,
+    pub reviewed_at_ms: Option<i64>,
+    pub review_note: Option<String>,
+}
+
+/// Quarantine queue preventing untrusted group/team prompts from directly mutating `MEMORY.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryQuarantineQueue {
+    pub proposals: Vec<QuarantinedMemoryProposal>,
+}
+
+impl MemoryQuarantineQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn propose_from_group(
+        &mut self,
+        source_chat_id: i64,
+        proposed_by: impl Into<String>,
+        target: MemoryTarget,
+        content: impl Into<String>,
+    ) -> Result<QuarantinedMemoryProposal> {
+        let cleaned = MemoryManager::sanitize_entry(&content.into())?;
+        if let Some(existing) = self.proposals.iter().find(|p| {
+            p.status == QuarantineStatus::Pending
+                && p.target == target
+                && p.content.eq_ignore_ascii_case(&cleaned)
+        }) {
+            return Ok(existing.clone());
+        }
+
+        if self.proposals.len() >= MAX_QUARANTINE_ITEMS {
+            if let Some(resolved_pos) = self
+                .proposals
+                .iter()
+                .position(|p| p.status != QuarantineStatus::Pending)
+            {
+                self.proposals.remove(resolved_pos);
+            } else {
+                self.proposals.remove(0);
+            }
+        }
+
+        let proposal = QuarantinedMemoryProposal {
+            proposal_id: format!("mqp_{}", uuid::Uuid::new_v4().simple()),
+            source_chat_id,
+            proposed_by: proposed_by.into(),
+            target,
+            content: cleaned,
+            status: QuarantineStatus::Pending,
+            created_at_ms: now_ms(),
+            reviewed_by: None,
+            reviewed_at_ms: None,
+            review_note: None,
+        };
+        self.proposals.push(proposal.clone());
+        Ok(proposal)
+    }
+
+    pub fn list_pending(&self) -> Vec<QuarantinedMemoryProposal> {
+        self.proposals
+            .iter()
+            .filter(|p| p.status == QuarantineStatus::Pending)
+            .cloned()
+            .collect()
+    }
+
+    pub fn list_all(&self) -> &[QuarantinedMemoryProposal] {
+        &self.proposals
+    }
+
+    pub fn get(&self, proposal_id: &str) -> Option<&QuarantinedMemoryProposal> {
+        self.proposals.iter().find(|p| p.proposal_id == proposal_id)
+    }
+
+    pub fn approve_and_promote(
+        &mut self,
+        proposal_id: &str,
+        reviewer: impl Into<String>,
+        memory: &MemoryManager,
+    ) -> Result<(QuarantinedMemoryProposal, MemoryMutationResult)> {
+        let pos = self
+            .proposals
+            .iter()
+            .position(|p| p.proposal_id == proposal_id)
+            .ok_or_else(|| {
+                TelegramError::NotFound(format!("Quarantined proposal '{proposal_id}' not found"))
+            })?;
+        if self.proposals[pos].status != QuarantineStatus::Pending {
+            return Err(TelegramError::Validation(format!(
+                "Quarantined proposal '{proposal_id}' is already {:?}",
+                self.proposals[pos].status
+            )));
+        }
+
+        let target = self.proposals[pos].target;
+        let content = self.proposals[pos].content.clone();
+        let mutation = memory.add(target, &content)?;
+
+        let item = &mut self.proposals[pos];
+        item.status = QuarantineStatus::Approved;
+        item.reviewed_by = Some(reviewer.into());
+        item.reviewed_at_ms = Some(now_ms());
+        Ok((item.clone(), mutation))
+    }
+
+    pub fn reject(
+        &mut self,
+        proposal_id: &str,
+        reviewer: impl Into<String>,
+        reason: Option<String>,
+    ) -> Result<QuarantinedMemoryProposal> {
+        let pos = self
+            .proposals
+            .iter()
+            .position(|p| p.proposal_id == proposal_id)
+            .ok_or_else(|| {
+                TelegramError::NotFound(format!("Quarantined proposal '{proposal_id}' not found"))
+            })?;
+        if self.proposals[pos].status != QuarantineStatus::Pending {
+            return Err(TelegramError::Validation(format!(
+                "Quarantined proposal '{proposal_id}' is already {:?}",
+                self.proposals[pos].status
+            )));
+        }
+
+        let item = &mut self.proposals[pos];
+        item.status = QuarantineStatus::Rejected;
+        item.reviewed_by = Some(reviewer.into());
+        item.reviewed_at_ms = Some(now_ms());
+        item.review_note = reason;
+        Ok(item.clone())
+    }
+}
+
+/// Temporal horizon for hierarchical memory consolidation ("Dreaming").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRollupHorizon {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl MemoryRollupHorizon {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+        }
+    }
+}
+
+/// Consolidated bounded temporal rollup synthesized from `MEMORY.md` / `USER.md` entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRollupEntry {
+    pub rollup_id: String,
+    pub horizon: MemoryRollupHorizon,
+    pub period_key: String,
+    pub summary: String,
+    pub source_entry_count: usize,
+    pub source_entries: Vec<String>,
+    pub consolidated_at_ms: i64,
 }
 
 // =============================================================================

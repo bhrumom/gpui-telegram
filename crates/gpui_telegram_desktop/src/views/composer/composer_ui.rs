@@ -227,8 +227,51 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, ComposerBarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    render_text_input_strip_with_options(
+        text,
+        cursor,
+        selection,
+        preedit,
+        is_focused,
+        is_editing,
+        has_attachments,
+        is_formatting_open,
+        is_emoji_open,
+        content_height,
+        overflow_scroll,
+        bot_menu_view,
+        None,
+        false,
+        palette,
+        lang_id,
+        cx,
+        on_action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_text_input_strip_with_options<V: 'static>(
+    text: &str,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+    preedit: Option<&str>,
+    is_focused: bool,
+    is_editing: bool,
+    has_attachments: bool,
+    is_formatting_open: bool,
+    is_emoji_open: bool,
+    content_height: Pixels,
+    overflow_scroll: bool,
+    bot_menu_view: Option<AnyElement>,
+    placeholder_override: Option<&str>,
+    send_disabled: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, ComposerBarAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
     let is_empty = text.is_empty() && preedit.map_or(true, |p| p.is_empty());
-    let show_send = !is_empty || is_editing || has_attachments;
+    let show_send = (!is_empty || is_editing || has_attachments) && !send_disabled;
     let a_att = on_action.clone();
     let a_fmt = on_action.clone();
     let a_emo = on_action.clone();
@@ -241,11 +284,17 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
     let before = &text[..cur];
     let after = &text[cur..];
     let is_apple = palette.is_apple_style();
-    let placeholder_text = if is_apple {
-        tr_str(lang_id, "消息", "Message")
-    } else {
-        tr_key_or(lang_id, "lng_message_ph", "Write a message...")
-    };
+    let placeholder_text = placeholder_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if is_apple {
+                tr_str(lang_id, "消息", "Message").to_string()
+            } else {
+                tr_key_or(lang_id, "lng_message_ph", "Write a message...").to_string()
+            }
+        });
 
     let composer_font = px(palette.scaled_px(palette.font_size_px as f32));
     let text_el = if is_empty {
@@ -313,25 +362,27 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
         };
         let pill_border: Rgba = if is_focused {
             TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.72)
-        } else if is_dark {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.11)
         } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.10)
+            palette.hairline_border_rgba()
         };
-        let pill_shadow = vec![
-            BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, if is_dark { 0.30 } else { 0.07 }),
-                offset: point(px(0.0), px(3.0)),
-                blur_radius: px(16.0),
-                spread_radius: px(0.0),
-            },
-            BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, if is_dark { 0.18 } else { 0.05 }),
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(3.0),
-                spread_radius: px(0.0),
-            },
-        ];
+        let pill_shadow = if is_dark {
+            Vec::new()
+        } else {
+            vec![
+                BoxShadow {
+                    color: hsla(0.0, 0.0, 0.0, 0.07),
+                    offset: point(px(0.0), px(3.0)),
+                    blur_radius: px(16.0),
+                    spread_radius: px(0.0),
+                },
+                BoxShadow {
+                    color: hsla(0.0, 0.0, 0.0, 0.05),
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(3.0),
+                    spread_radius: px(0.0),
+                },
+            ]
+        };
         let attach_hover = TdesktopThemePalette::rgba_with_alpha(
             palette.text_primary,
             if is_dark { 0.10 } else { 0.06 },
@@ -383,13 +434,23 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
                 ))
         } else {
             let _ = &a_sopt;
+            let disabled_bg = if send_disabled {
+                TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, if is_dark { 0.14 } else { 0.10 })
+            } else {
+                TdesktopThemePalette::rgba_with_alpha(accent, if is_dark { 0.22 } else { 0.14 })
+            };
+            let disabled_fg = if send_disabled {
+                TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, if is_dark { 0.42 } else { 0.40 })
+            } else {
+                TdesktopThemePalette::rgba_with_alpha(accent, if is_dark { 0.65 } else { 0.55 })
+            };
             div()
                 .id("cmp-send-btn")
                 .w(px(30.0))
                 .h(px(30.0))
                 .rounded_full()
                 .flex_shrink_0()
-                .bg(TdesktopThemePalette::rgba_with_alpha(accent, if is_dark { 0.22 } else { 0.14 }))
+                .bg(disabled_bg)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -399,7 +460,7 @@ pub fn render_text_input_strip_with_bot_menu<V: 'static>(
                 .child(tg_icon_rgba(
                     IconName::ArrowUp,
                     14.5,
-                    TdesktopThemePalette::rgba_with_alpha(accent, if is_dark { 0.65 } else { 0.55 }),
+                    disabled_fg,
                 ))
         };
 

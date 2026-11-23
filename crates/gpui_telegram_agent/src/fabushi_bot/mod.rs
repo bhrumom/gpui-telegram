@@ -19,6 +19,8 @@ use crate::hermes::toolsets::{
     AgenticStateBackend, FabushiTeammateHandler, PlatformImBridge, ToolsetId, ToolsetPreset,
 };
 use crate::hermes::{HermesEngine, HermesEngineConfig};
+use crate::mcp::ToolPermissionDock;
+use crate::multi_agent::GroupWorkspaceBridge;
 use chrono::Utc;
 use fabushi_messaging_core::actor::ActorId;
 use fabushi_messaging_core::bot::{BotCommand, BotInvocation, BotProfile, BotRegistry};
@@ -56,6 +58,80 @@ use tempfile::TempDir;
 
 pub const OFFICIAL_DEFAULT_BOT_USER_ID: i64 = 777_000;
 pub const OFFICIAL_DEFAULT_AGENT_ID: &str = "fabushi-ai-bot";
+pub const ROOM_SESSION_KEY_PREFIX: &str = "group:";
+
+/// Returns Grok Bot's canonical per-agent room session key (`group:<chat_id>`), keeping
+/// group chat context strictly isolated from a bot's 1:1 DM session.
+pub fn room_session_key(chat_id: i64) -> String {
+    format!("{ROOM_SESSION_KEY_PREFIX}{chat_id}")
+}
+
+/// Returns `true` if `session_key` identifies a room-scoped session (`group:<chat_id>`).
+pub fn is_room_session_key(session_key: &str) -> bool {
+    session_key
+        .trim()
+        .strip_prefix(ROOM_SESSION_KEY_PREFIX)
+        .is_some_and(|rest| !rest.trim().is_empty())
+}
+
+/// Parses the numeric `chat_id` from a `group:<chat_id>` session key if valid.
+pub fn parse_room_session_chat_id(session_key: &str) -> Option<i64> {
+    session_key
+        .trim()
+        .strip_prefix(ROOM_SESSION_KEY_PREFIX)
+        .and_then(|rest| rest.trim().parse::<i64>().ok())
+}
+
+/// Optional group-room orchestration metadata injected into a bot's turn system prompt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupTurnPromptContext {
+    pub room_name: String,
+    pub peers: Vec<String>,
+    pub is_winding_down: bool,
+    pub remaining_hops: u32,
+}
+
+/// Builds multi-agent group turn guidance injecting room identity, peer awareness,
+/// the `[PASS]` stay-silent protocol, shared workspace usage, and winding-down convergence.
+pub fn build_group_turn_guidance(
+    room_name: &str,
+    peers: &[String],
+    is_winding_down: bool,
+    remaining_hops: u32,
+) -> String {
+    let display_room = if room_name.trim().is_empty() {
+        "Group Chat"
+    } else {
+        room_name.trim()
+    };
+    let peer_list = if peers.is_empty() {
+        "None".to_string()
+    } else {
+        peers
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut lines = vec![
+        "## Group Room Turn Protocol".to_string(),
+        format!("Room: {display_room}"),
+        format!("Teammates in Room: {peer_list}"),
+        format!("Remaining Multi-Agent Turn Budget: {remaining_hops} hop(s)"),
+        "- Stay-Silent Protocol: If another teammate already answered completely, or the message does not require your role/expertise and you have nothing materially new to contribute, respond ONLY with `[PASS]` (or `<PASS/>` / `NO_REPLY`) to yield the floor cleanly without cluttering the room.".to_string(),
+        "- Shared Group Workspace: Use `group_workspace_list`, `group_workspace_read`, and `group_workspace_write` to coordinate structured plans, checklists, and intermediate artifacts with room teammates.".to_string(),
+    ];
+
+    if is_winding_down || remaining_hops <= 1 {
+        lines.push(
+            "- WINDING DOWN: Multi-agent turn budget for this room exchange is nearly exhausted. Converge immediately: provide a concise, actionable final synthesis for the user, avoid unnecessary peer handoffs, or output `[PASS]` if a teammate already concluded the answer.".to_string(),
+        );
+    }
+
+    lines.join("\n")
+}
 
 #[derive(Debug, Clone)]
 pub struct FabushiBotProvisionSpec {
@@ -316,6 +392,8 @@ pub struct FabushiBotHost {
     teammate_handler: RwLock<Option<Arc<dyn FabushiTeammateHandler>>>,
     platform_im_bridge: RwLock<Option<Arc<dyn PlatformImBridge>>>,
     agentic_backend: RwLock<Option<Arc<dyn AgenticStateBackend>>>,
+    group_workspace_bridge: RwLock<Option<Arc<dyn GroupWorkspaceBridge>>>,
+    permission_dock: RwLock<Option<Arc<ToolPermissionDock>>>,
     instances: RwLock<HashMap<i64, Arc<FabushiBotInstance>>>,
     agent_id_index: RwLock<HashMap<String, i64>>,
     username_index: RwLock<HashMap<String, i64>>,
@@ -361,6 +439,8 @@ impl FabushiBotHost {
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
+            group_workspace_bridge: RwLock::new(None),
+            permission_dock: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -399,6 +479,8 @@ impl FabushiBotHost {
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
+            group_workspace_bridge: RwLock::new(None),
+            permission_dock: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -425,6 +507,8 @@ impl FabushiBotHost {
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
+            group_workspace_bridge: RwLock::new(None),
+            permission_dock: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -450,6 +534,8 @@ impl FabushiBotHost {
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
+            group_workspace_bridge: RwLock::new(None),
+            permission_dock: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -619,6 +705,35 @@ impl FabushiBotHost {
             for inst in instances.values() {
                 if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
                     inst.hermes.set_agentic_backend(Arc::clone(&backend));
+                }
+            }
+        }
+    }
+
+    pub fn set_group_workspace_bridge(&self, bridge: Arc<dyn GroupWorkspaceBridge>) {
+        if let Ok(mut guard) = self.group_workspace_bridge.write() {
+            *guard = Some(Arc::clone(&bridge));
+        }
+        self.core_engine
+            .set_group_workspace_bridge(Arc::clone(&bridge));
+        if let Ok(instances) = self.instances.read() {
+            for inst in instances.values() {
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_group_workspace_bridge(Arc::clone(&bridge));
+                }
+            }
+        }
+    }
+
+    pub fn set_permission_dock(&self, dock: Arc<ToolPermissionDock>) {
+        if let Ok(mut guard) = self.permission_dock.write() {
+            *guard = Some(Arc::clone(&dock));
+        }
+        self.core_engine.set_permission_dock(Arc::clone(&dock));
+        if let Ok(instances) = self.instances.read() {
+            for inst in instances.values() {
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_permission_dock(Arc::clone(&dock));
                 }
             }
         }
@@ -1219,6 +1334,21 @@ impl FabushiBotHost {
             } else if let Some(backend) = self.core_engine.agentic_backend() {
                 engine.set_agentic_backend(backend);
             }
+            if let Some(ws) = self
+                .group_workspace_bridge
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+            {
+                engine.set_group_workspace_bridge(ws);
+            } else if let Some(ws) = self.core_engine.group_workspace_bridge() {
+                engine.set_group_workspace_bridge(ws);
+            }
+            if let Some(dock) = self.permission_dock.read().ok().and_then(|g| g.clone()) {
+                engine.set_permission_dock(dock);
+            } else if let Some(dock) = self.core_engine.permission_dock() {
+                engine.set_permission_dock(dock);
+            }
             let runner =
                 Arc::new(AcpRunner::new(&preferred_model).with_hermes_engine(Arc::clone(&engine)));
             (engine, runner)
@@ -1456,7 +1586,43 @@ impl FabushiBotHost {
         room_groups: &[AgentGroupAddress],
         mentioned_teammates: &[AgentAddress],
     ) -> (String, Option<String>) {
+        self.build_turn_system_prompt_with_group_context(
+            bot_user_id,
+            chat_id,
+            base_system_prompt,
+            room_groups,
+            mentioned_teammates,
+            None,
+        )
+    }
+
+    /// Extended variant of [`FabushiBotHost::build_turn_system_prompt`] that also injects
+    /// room session isolation (`group:<chat_id>`), `[PASS]` stay-silent protocol, and
+    /// winding-down convergence guidance when executing inside a multi-agent group room.
+    pub fn build_turn_system_prompt_with_group_context(
+        &self,
+        bot_user_id: i64,
+        chat_id: i64,
+        base_system_prompt: &str,
+        room_groups: &[AgentGroupAddress],
+        mentioned_teammates: &[AgentAddress],
+        group_ctx: Option<&GroupTurnPromptContext>,
+    ) -> (String, Option<String>) {
         let Some(instance) = self.get_by_user_id(bot_user_id) else {
+            if let Some(gctx) = group_ctx {
+                let guidance = build_group_turn_guidance(
+                    &gctx.room_name,
+                    &gctx.peers,
+                    gctx.is_winding_down,
+                    gctx.remaining_hops,
+                );
+                let combined = if base_system_prompt.trim().is_empty() {
+                    guidance
+                } else {
+                    format!("{}\n\n{}", base_system_prompt.trim(), guidance)
+                };
+                return (combined, None);
+            }
             return (base_system_prompt.to_string(), None);
         };
         let profile = instance.profile();
@@ -1480,6 +1646,9 @@ impl FabushiBotHost {
             "Isolated Home: {}",
             instance.agent_dir.display()
         ));
+        if group_ctx.is_some() {
+            profile_lines.push(format!("Room Session Scope: {}", room_session_key(chat_id)));
+        }
         let profile_section = profile_lines.join("\n");
 
         let others: Vec<AgentAddress> = self
@@ -1522,6 +1691,14 @@ impl FabushiBotHost {
         sections.push(directory_prompt);
         if let Some(mentioned_ctx) = build_mentioned_agents_context(mentioned_teammates) {
             sections.push(mentioned_ctx);
+        }
+        if let Some(gctx) = group_ctx {
+            sections.push(build_group_turn_guidance(
+                &gctx.room_name,
+                &gctx.peers,
+                gctx.is_winding_down,
+                gctx.remaining_hops,
+            ));
         }
 
         (sections.join("\n\n"), profile_update_prefix)

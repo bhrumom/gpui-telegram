@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -1375,12 +1376,460 @@ pub fn check_tool_invocation_reasonableness(
     TirVerdict::Allow
 }
 
-/// Unified security facade combining `DangerRule` table, `ApprovalQueue`, `TirPolicy`, and injection scanner.
+/// Grok Bot 5-layer safety approval tier for tools and connectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalTier {
+    #[default]
+    AutoReview,
+    Ask,
+    Blocked,
+    AlwaysAllow,
+}
+
+impl ToolApprovalTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AutoReview => "auto_review",
+            Self::Ask => "ask",
+            Self::Blocked => "blocked",
+            Self::AlwaysAllow => "always_allow",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto_review" | "auto" => Some(Self::AutoReview),
+            "ask" | "prompt" => Some(Self::Ask),
+            "blocked" | "block" | "deny" | "never" => Some(Self::Blocked),
+            "always_allow" | "always" | "allow" => Some(Self::AlwaysAllow),
+            _ => None,
+        }
+    }
+}
+
+/// Natural-language & per-tool auto-review policy modeled after Grok Bot's `SandAutoReviewControls`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoReviewPolicy {
+    pub default_tier: ToolApprovalTier,
+    #[serde(default)]
+    pub per_tool_tiers: HashMap<String, ToolApprovalTier>,
+    #[serde(default)]
+    pub allow_instructions: Vec<String>,
+    #[serde(default)]
+    pub block_instructions: Vec<String>,
+}
+
+impl Default for AutoReviewPolicy {
+    fn default() -> Self {
+        Self::new(ToolApprovalTier::AutoReview)
+    }
+}
+
+/// Verdict produced by [`AutoReviewPolicy::evaluate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum AutoReviewVerdict {
+    Allow,
+    Ask { proposed_allow_rule: String },
+    Block { reason: String },
+}
+
+impl AutoReviewPolicy {
+    pub fn new(default_tier: ToolApprovalTier) -> Self {
+        Self {
+            default_tier,
+            per_tool_tiers: HashMap::new(),
+            allow_instructions: Vec::new(),
+            block_instructions: Vec::new(),
+        }
+    }
+
+    pub fn set_tool_tier(&mut self, tool_name: impl Into<String>, tier: ToolApprovalTier) {
+        self.per_tool_tiers.insert(tool_name.into(), tier);
+    }
+
+    pub fn tier_for_tool(&self, tool_name: &str) -> ToolApprovalTier {
+        self.per_tool_tiers
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.default_tier)
+    }
+
+    pub fn add_allow_instruction(&mut self, instruction: impl Into<String>) {
+        let trimmed = instruction.into().trim().to_string();
+        if !trimmed.is_empty() && !self.allow_instructions.contains(&trimmed) {
+            self.allow_instructions.push(trimmed);
+        }
+    }
+
+    pub fn add_block_instruction(&mut self, instruction: impl Into<String>) {
+        let trimmed = instruction.into().trim().to_string();
+        if !trimmed.is_empty() && !self.block_instructions.contains(&trimmed) {
+            self.block_instructions.push(trimmed);
+        }
+    }
+
+    /// Evaluates `(tool_name, args, is_destructive)` against per-tool tiers and natural-language
+    /// `block_instructions` / `allow_instructions`.
+    pub fn evaluate(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        is_destructive: bool,
+    ) -> AutoReviewVerdict {
+        let tier = self.tier_for_tool(tool_name);
+        if tier == ToolApprovalTier::Blocked {
+            return AutoReviewVerdict::Block {
+                reason: format!("Tool '{tool_name}' is blocked by ToolApprovalTier::Blocked"),
+            };
+        }
+
+        let searchable = format!("{} {}", tool_name, args).to_lowercase();
+        for rule in &self.block_instructions {
+            if auto_review_rule_matches(rule, &searchable) {
+                return AutoReviewVerdict::Block {
+                    reason: format!("Blocked by auto-review rule: {rule}"),
+                };
+            }
+        }
+
+        match tier {
+            ToolApprovalTier::Blocked => unreachable!(),
+            ToolApprovalTier::AlwaysAllow => AutoReviewVerdict::Allow,
+            ToolApprovalTier::Ask => AutoReviewVerdict::Ask {
+                proposed_allow_rule: Self::synthesize_allow_rule(tool_name, args),
+            },
+            ToolApprovalTier::AutoReview => {
+                for rule in &self.allow_instructions {
+                    if auto_review_rule_matches(rule, &searchable) {
+                        return AutoReviewVerdict::Allow;
+                    }
+                }
+                if is_destructive {
+                    return AutoReviewVerdict::Ask {
+                        proposed_allow_rule: Self::synthesize_allow_rule(tool_name, args),
+                    };
+                }
+                if let Some(cmd) = args
+                    .get("command")
+                    .or_else(|| args.get("code"))
+                    .and_then(Value::as_str)
+                {
+                    if evaluate_command_risk(cmd).is_dangerous() {
+                        return AutoReviewVerdict::Ask {
+                            proposed_allow_rule: Self::synthesize_allow_rule(tool_name, args),
+                        };
+                    }
+                }
+                AutoReviewVerdict::Allow
+            }
+        }
+    }
+
+    pub fn synthesize_allow_rule(tool_name: &str, args: &Value) -> String {
+        if let Some(cmd) = args.get("command").and_then(Value::as_str) {
+            let first_words: Vec<&str> = cmd.split_whitespace().take(3).collect();
+            if !first_words.is_empty() {
+                return format!("allow {tool_name} {}", first_words.join(" "));
+            }
+        }
+        for key in ["path", "file_path", "target", "table", "url"] {
+            if let Some(val) = args.get(key).and_then(Value::as_str) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return format!("allow {tool_name} on {trimmed}");
+                }
+            }
+        }
+        format!("allow {tool_name}")
+    }
+}
+
+fn auto_review_rule_matches(rule: &str, searchable_lower: &str) -> bool {
+    let mut cleaned = rule.trim().to_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+    for prefix in [
+        "always allow ",
+        "never allow ",
+        "do not allow ",
+        "do not ",
+        "disallow ",
+        "forbid ",
+        "block ",
+        "deny ",
+        "never ",
+        "allow ",
+        "permit ",
+    ] {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            cleaned = rest.trim().to_string();
+            break;
+        }
+    }
+    if cleaned.is_empty() {
+        return false;
+    }
+    if searchable_lower.contains(&cleaned) {
+        return true;
+    }
+
+    let tokens: Vec<String> = cleaned
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '/' && c != '.')
+        .filter(|t| t.len() >= 2)
+        .filter(|t| {
+            !matches!(
+                *t,
+                "in" | "on"
+                    | "to"
+                    | "of"
+                    | "at"
+                    | "by"
+                    | "the"
+                    | "for"
+                    | "and"
+                    | "any"
+                    | "all"
+                    | "with"
+                    | "from"
+                    | "tool"
+                    | "tools"
+                    | "command"
+                    | "commands"
+                    | "action"
+                    | "actions"
+            )
+        })
+        .map(|t| {
+            if t.len() >= 5 && t.ends_with('s') && !t.ends_with("ss") {
+                t[..t.len() - 1].to_string()
+            } else {
+                t.to_string()
+            }
+        })
+        .collect();
+
+    !tokens.is_empty() && tokens.iter().all(|tok| searchable_lower.contains(tok.as_str()))
+}
+
+/// Default TTL (1 hour, matching Grok Bot's `36e5` ms) for value-bound single-use approval tokens.
+pub const DEFAULT_VALUE_BOUND_APPROVAL_TTL_MS: i64 = 3_600_000;
+
+/// Computes lowercase hex SHA-256 digest for TOCTOU-protected content binding.
+pub fn compute_content_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+/// Single-use, value-bound approval token tying approval strictly to `(action, target, cwd, content_sha256)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueBoundApprovalToken {
+    pub approval_id: String,
+    pub action: String,
+    pub target: String,
+    pub working_directory: Option<String>,
+    pub content_sha256: Option<String>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub spent: bool,
+    pub retired: bool,
+}
+
+/// Typed rejection reasons returned by [`ValueBoundApprovalLedger::verify_and_consume`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum ApprovalConsumeError {
+    #[error("Approval token '{approval_id}' not found")]
+    NotFound { approval_id: String },
+    #[error("Approval token '{approval_id}' has already been spent")]
+    AlreadySpent { approval_id: String },
+    #[error("Approval token '{approval_id}' has been retired")]
+    Retired { approval_id: String },
+    #[error("Approval token '{approval_id}' expired at {expires_at_ms}ms (now={now_ms}ms)")]
+    Expired {
+        approval_id: String,
+        expires_at_ms: i64,
+        now_ms: i64,
+    },
+    #[error("Approval action mismatch: expected '{expected}', got '{actual}'")]
+    ActionMismatch { expected: String, actual: String },
+    #[error("Approval target mismatch: expected '{expected}', got '{actual}'")]
+    TargetMismatch { expected: String, actual: String },
+    #[error("Approval working_directory mismatch: expected '{expected:?}', got '{actual:?}'")]
+    CwdMismatch {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+    #[error("Approval content_sha256 mismatch: expected '{expected:?}', got '{actual:?}'")]
+    ContentHashMismatch {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+}
+
+/// Single-use, TOCTOU-resistant ledger for value-bound tool approvals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ValueBoundApprovalLedger {
+    tokens: HashMap<String, ValueBoundApprovalToken>,
+}
+
+impl ValueBoundApprovalLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn issue_approval(
+        &mut self,
+        action: impl Into<String>,
+        target: impl Into<String>,
+        working_directory: Option<String>,
+        content_sha256: Option<String>,
+        created_at_ms: i64,
+        ttl_ms: i64,
+    ) -> ValueBoundApprovalToken {
+        let approval_id = format!("vba_{}", uuid::Uuid::new_v4().simple());
+        let effective_ttl = ttl_ms.max(1);
+        let token = ValueBoundApprovalToken {
+            approval_id: approval_id.clone(),
+            action: action.into(),
+            target: target.into(),
+            working_directory,
+            content_sha256,
+            created_at_ms,
+            expires_at_ms: created_at_ms.saturating_add(effective_ttl),
+            spent: false,
+            retired: false,
+        };
+        self.tokens.insert(approval_id, token.clone());
+        token
+    }
+
+    pub fn issue_approval_now(
+        &mut self,
+        action: impl Into<String>,
+        target: impl Into<String>,
+        working_directory: Option<String>,
+        content_sha256: Option<String>,
+        ttl_ms: Option<i64>,
+    ) -> ValueBoundApprovalToken {
+        let now_ms = Utc::now().timestamp_millis();
+        self.issue_approval(
+            action,
+            target,
+            working_directory,
+            content_sha256,
+            now_ms,
+            ttl_ms.unwrap_or(DEFAULT_VALUE_BOUND_APPROVAL_TTL_MS),
+        )
+    }
+
+    pub fn get(&self, approval_id: &str) -> Option<&ValueBoundApprovalToken> {
+        self.tokens.get(approval_id)
+    }
+
+    /// Atomically verifies every bound parameter (`action`, `target`, `cwd`, `content_sha256`),
+    /// expiry, retirement, and single-use status, consuming (`spent = true`) only on exact match.
+    pub fn verify_and_consume(
+        &mut self,
+        approval_id: &str,
+        action: &str,
+        target: &str,
+        cwd: Option<&str>,
+        content_sha256: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), ApprovalConsumeError> {
+        let Some(token) = self.tokens.get_mut(approval_id) else {
+            return Err(ApprovalConsumeError::NotFound {
+                approval_id: approval_id.to_string(),
+            });
+        };
+        if token.retired {
+            return Err(ApprovalConsumeError::Retired {
+                approval_id: approval_id.to_string(),
+            });
+        }
+        if token.spent {
+            return Err(ApprovalConsumeError::AlreadySpent {
+                approval_id: approval_id.to_string(),
+            });
+        }
+        if now_ms >= token.expires_at_ms {
+            return Err(ApprovalConsumeError::Expired {
+                approval_id: approval_id.to_string(),
+                expires_at_ms: token.expires_at_ms,
+                now_ms,
+            });
+        }
+        if token.action != action {
+            return Err(ApprovalConsumeError::ActionMismatch {
+                expected: token.action.clone(),
+                actual: action.to_string(),
+            });
+        }
+        if token.target != target {
+            return Err(ApprovalConsumeError::TargetMismatch {
+                expected: token.target.clone(),
+                actual: target.to_string(),
+            });
+        }
+        if token.working_directory.as_deref() != cwd {
+            return Err(ApprovalConsumeError::CwdMismatch {
+                expected: token.working_directory.clone(),
+                actual: cwd.map(ToString::to_string),
+            });
+        }
+        if token.content_sha256.as_deref() != content_sha256 {
+            return Err(ApprovalConsumeError::ContentHashMismatch {
+                expected: token.content_sha256.clone(),
+                actual: content_sha256.map(ToString::to_string),
+            });
+        }
+
+        token.spent = true;
+        Ok(())
+    }
+
+    /// Explicitly revokes/retires an issued approval token so it can no longer be consumed.
+    pub fn retire_approval(&mut self, approval_id: &str) -> bool {
+        if let Some(token) = self.tokens.get_mut(approval_id) {
+            token.retired = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn prune_expired(&mut self, now_ms: i64) -> usize {
+        let before = self.tokens.len();
+        self.tokens
+            .retain(|_, tok| !tok.spent && !tok.retired && now_ms < tok.expires_at_ms);
+        before.saturating_sub(self.tokens.len())
+    }
+
+    pub fn active_count(&self, now_ms: i64) -> usize {
+        self.tokens
+            .values()
+            .filter(|tok| !tok.spent && !tok.retired && now_ms < tok.expires_at_ms)
+            .count()
+    }
+}
+
+/// Unified security facade combining `DangerRule` table, `ApprovalQueue`, `TirPolicy`,
+/// `AutoReviewPolicy`, `ValueBoundApprovalLedger`, and injection scanner.
 #[derive(Debug, Clone)]
 pub struct SecurityEngine {
     pub rules: Vec<DangerRule>,
     pub approvals: ApprovalQueue,
     pub tir_policy: TirPolicy,
+    pub auto_review: AutoReviewPolicy,
+    pub value_bound_ledger: ValueBoundApprovalLedger,
 }
 
 impl SecurityEngine {
@@ -1389,6 +1838,8 @@ impl SecurityEngine {
             rules: builtin_danger_rules(),
             approvals: ApprovalQueue::new(ApprovalMode::Prompt),
             tir_policy: TirPolicy::for_workspace(workspace_root),
+            auto_review: AutoReviewPolicy::default(),
+            value_bound_ledger: ValueBoundApprovalLedger::new(),
         }
     }
 

@@ -23,7 +23,30 @@ use crate::views::app_shell::window_connecting_widget::ConnectionStatus as Banne
 
 impl AppShell {
     pub fn open_modal_dialog(&mut self, title: impl Into<String>, kind: ModalDialogKind, w: f32, h: f32, cx: &mut Context<Self>) {
-        self.sidebar.update(cx, |sb, _| sb.is_plus_menu_open = false);
+        // When Apple/Grok multi-select compose is available, never fall back to the legacy
+        // 0-member `NewGroup` modal; route directly into multi-select compose group mode.
+        if matches!(kind, ModalDialogKind::NewGroup) && self.theme_state.palette.is_apple_style() {
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.nav_rail.update(cx, |r, r_cx| {
+                r.set_active_destination(NavDestination::Chats);
+                r_cx.notify();
+            });
+            self.ime.clear_preedit();
+            self.sidebar.update(cx, |sb, sb_cx| {
+                sb.open_compose_group_mode();
+                sb_cx.notify();
+            });
+            self.composer.update(cx, |c, c_cx| {
+                c.is_input_focused = false;
+                c_cx.notify();
+            });
+            self.sync_compose_state_to_composer(true, cx);
+            cx.notify();
+            return;
+        }
+        self.sidebar.update(cx, |sb, _| sb.exit_compose_mode());
+        self.sync_compose_state_to_composer(true, cx);
         self.stage.update(cx, |st, _| {
             st.more_menu_open = false;
             st.ttl_submenu_open = false;
@@ -57,7 +80,8 @@ impl AppShell {
     pub fn handle_main_menu_command(&mut self, cmd: MainMenuCommand, cx: &mut Context<Self>) {
         let lang = self.active_lang_id();
         self.main_menu_drawer.update(cx, |d, _| d.close());
-        self.sidebar.update(cx, |sb, _| sb.is_plus_menu_open = false);
+        self.sidebar.update(cx, |sb, _| sb.exit_compose_mode());
+        self.sync_compose_state_to_composer(true, cx);
         self.stage.update(cx, |st, _| {
             st.more_menu_open = false;
             st.ttl_submenu_open = false;
@@ -86,7 +110,34 @@ impl AppShell {
                 self.navigate_settings_to(SettingsSectionType::Information, cx);
             }
             MainMenuCommand::NewFabushiBot => self.open_fabushi_creator_modal(cx),
-            MainMenuCommand::NewGroup => self.open_modal_dialog(tr_str(lang, "新建群组", "New Group"), ModalDialogKind::NewGroup, 420.0, 380.0, cx),
+            MainMenuCommand::NewGroup => {
+                if self.theme_state.palette.is_apple_style() {
+                    self.active_panel = ActiveWorkspacePanel::Chats;
+                    self.last_handled_nav_dest = Some(NavDestination::Chats);
+                    self.nav_rail.update(cx, |r, r_cx| {
+                        r.set_active_destination(NavDestination::Chats);
+                        r_cx.notify();
+                    });
+                    self.ime.clear_preedit();
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.open_compose_group_mode();
+                        sb_cx.notify();
+                    });
+                    self.composer.update(cx, |c, c_cx| {
+                        c.is_input_focused = false;
+                        c_cx.notify();
+                    });
+                    self.sync_compose_state_to_composer(true, cx);
+                } else {
+                    self.open_modal_dialog(
+                        tr_str(lang, "新建群组", "New Group"),
+                        ModalDialogKind::NewGroup,
+                        420.0,
+                        380.0,
+                        cx,
+                    );
+                }
+            }
             MainMenuCommand::NewChannel => self.open_modal_dialog(tr_str(lang, "新建频道", "New Channel"), ModalDialogKind::NewChannel, 420.0, 380.0, cx),
             MainMenuCommand::Contacts => {
                 self.refresh_contacts(cx);
@@ -190,15 +241,43 @@ impl AppShell {
                 }).detach();
             }
             ModalActionOutcome::CreateGroupSubmitted { title, enable_forum_topics, .. } => {
-                let req = CreateChatRequest {
-                    title, chat_type: Some(serde_json::json!(1)),
-                    is_forum: enable_forum_topics, ..Default::default()
-                };
-                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    if let Ok(created) = client.create_chat(&req).await {
-                        let _ = weak.update(app, |s, cx| { s.refresh_chats(cx); s.sync_selected_chat_inspector_and_stage(created.chat_id as u64, cx); });
-                    }
-                }).detach();
+                if self.theme_state.palette.is_apple_style() && !enable_forum_topics {
+                    // Guard against creating an empty 0-member group when multi-select compose is available.
+                    let clean_title = title.trim().chars().take(72).collect::<String>();
+                    self.active_panel = ActiveWorkspacePanel::Chats;
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.open_compose_group_mode();
+                        sb.compose_draft.custom_group_title = clean_title;
+                        sb_cx.notify();
+                    });
+                    self.composer.update(cx, |c, c_cx| {
+                        c.is_input_focused = false;
+                        c_cx.notify();
+                    });
+                    self.sync_compose_state_to_composer(true, cx);
+                    let toast_msg = tr_str(
+                        self.active_lang_id(),
+                        "请选择至少一位联系人或 AI Bot 以创建群聊",
+                        "Select at least one contact or AI Bot to create the group",
+                    );
+                    self.window_runtime.enqueue_toast(toast_msg, 2600);
+                } else {
+                    let req = CreateChatRequest {
+                        title,
+                        chat_type: Some(serde_json::json!(1)),
+                        is_forum: enable_forum_topics,
+                        ..Default::default()
+                    };
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if let Ok(created) = client.create_chat(&req).await {
+                            let _ = weak.update(app, |s, cx| {
+                                s.refresh_chats(cx);
+                                s.sync_selected_chat_inspector_and_stage(created.chat_id as u64, cx);
+                            });
+                        }
+                    })
+                    .detach();
+                }
             }
             ModalActionOutcome::CreateChannelSubmitted { title, username_slug, .. } => {
                 let req = CreateChatRequest {

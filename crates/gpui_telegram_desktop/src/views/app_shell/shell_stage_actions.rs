@@ -1,21 +1,29 @@
 //! Stage action dispatch, chat inspector synchronization, bot peer detection, and theme propagation.
 
+use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use gpui::{AppContext, AsyncApp, ClipboardItem, Context, WeakEntity};
 use gpui_telegram_client::net::hermes_client::{
     HermesApprovalDecisionRequest, HermesCommandRequest, HermesRichChatDto,
 };
+use gpui_telegram_client::net::http_client::ChatMemberItem;
 use gpui_telegram_core::types::ChatId;
-use gpui_telegram_proto::contracts::DraftDto;
-use gpui_telegram_proto::miniapp_contracts::{parse_miniapp_uri, MiniAppLaunchMode};
+use gpui_telegram_proto::contracts::auth::ContactDto;
+use gpui_telegram_proto::contracts::{CreateChatRequest, DraftDto};
+use gpui_telegram_proto::miniapp_contracts::{
+    parse_miniapp_uri, FabushiBotSummaryDto, MiniAppLaunchMode,
+};
 
 use crate::app::session::send_as_peers::{SendAsKey, SendAsPeer};
+use crate::components::tool_permission_dock::{
+    PendingToolApproval, ToolApprovalDecision, ToolApprovalPolicyTier,
+};
 use crate::i18n::tr_str;
-use crate::theme::TdesktopThemeMode;
+use crate::theme::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::app_shell::shell_actions::{
     build_chat_profile_facts, map_channel_stats_to_chart, map_chat_members_to_inspector,
-    map_stage_media_to_gallery, resolve_active_target_chat_id,
+    map_stage_media_to_gallery, peer_avatar_color, resolve_active_target_chat_id,
 };
 use crate::views::app_shell::shell_theme::{
     compute_shell_palette, propagate_theme_and_locale, tdesktop_mode_to_app_theme, ShellThemeTargets,
@@ -24,12 +32,159 @@ use crate::views::app_shell::shell_truth::{
     derive_initials, select_authoritative_dialog, SessionRequestFence,
 };
 use crate::views::boxes::modal_types::ModalDialogKind;
-use crate::views::conversation_stage::PinnedBannerEntry;
+use crate::views::composer::field_autocomplete::MentionRow;
+use crate::views::conversation_stage::{PinnedBannerEntry, StageAction};
 use crate::views::iv::IvViewer;
 use crate::views::media_viewer::MediaViewerItem;
 use crate::views::nav_rail::NavDestination;
 use crate::views::shell::AppShell;
 use crate::views::MediaViewer;
+
+fn contact_display_name(c: &ContactDto) -> String {
+    let mut full = c.first_name.trim().to_string();
+    if let Some(last) = c.last_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if !full.is_empty() {
+            full.push(' ');
+        }
+        full.push_str(last);
+    }
+    if full.is_empty() {
+        c.username
+            .as_deref()
+            .map(|u| u.trim().trim_start_matches('@').to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("User {}", c.user_id))
+    } else {
+        full
+    }
+}
+
+/// Builds deduplicated `@mention` autocomplete candidates + role hints for the active chat.
+///
+/// - **Groups**: prepends `@everyone` (`"所有人 / 全部 Bot"`), then includes all group members
+///   enriched with Fabushi bot metadata (`is_bot = true`, `"AI Bot"`, real `@username`) and contacts.
+/// - **DMs / Global**: includes active peer (if any) followed by all available Fabushi bots.
+pub fn build_mention_candidates(
+    is_group: bool,
+    members: &[ChatMemberItem],
+    contacts: &[ContactDto],
+    fabushi_bots: &[FabushiBotSummaryDto],
+    active_dm_peer: Option<(u64, String, String, bool)>,
+) -> Vec<(MentionRow, Option<String>)> {
+    let mut out: Vec<(MentionRow, Option<String>)> = Vec::new();
+    let mut seen_ids: HashSet<u64> = HashSet::new();
+    let mut seen_usernames: HashSet<String> = HashSet::new();
+
+    if is_group {
+        seen_usernames.insert("everyone".to_string());
+        out.push((
+            MentionRow::new(0, "everyone", "所有人 / 全部 Bot", false),
+            Some("所有人".to_string()),
+        ));
+
+        for m in members {
+            if m.user_id == 0 || !seen_ids.insert(m.user_id) {
+                continue;
+            }
+            if let Some(fb) = fabushi_bots
+                .iter()
+                .find(|b| b.bot_user_id > 0 && b.bot_user_id as u64 == m.user_id)
+            {
+                let uname = fb.username.trim().trim_start_matches('@').to_string();
+                let effective_un = if uname.is_empty() {
+                    fb.agent_id.trim().to_string()
+                } else {
+                    uname
+                };
+                let name = if fb.display_name.trim().is_empty() {
+                    effective_un.clone()
+                } else {
+                    fb.display_name.trim().to_string()
+                };
+                if !effective_un.is_empty() {
+                    seen_usernames.insert(effective_un.to_ascii_lowercase());
+                }
+                out.push((
+                    MentionRow::new(m.user_id, effective_un, name, true),
+                    Some("AI Bot".to_string()),
+                ));
+                continue;
+            }
+
+            let contact = contacts.iter().find(|c| c.user_id == m.user_id);
+            let is_bot = contact.is_some_and(|c| c.is_bot);
+            let name = contact
+                .map(contact_display_name)
+                .unwrap_or_else(|| format!("User {}", m.user_id));
+            let uname = contact
+                .and_then(|c| c.username.as_deref())
+                .map(|u| u.trim().trim_start_matches('@').to_string())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| format!("user_{}", m.user_id));
+            let role_hint = if is_bot {
+                "AI Bot".to_string()
+            } else {
+                match m.role.trim().to_ascii_lowercase().as_str() {
+                    "owner" | "creator" => "群主".to_string(),
+                    "admin" | "administrator" => "管理员".to_string(),
+                    _ => "成员".to_string(),
+                }
+            };
+            seen_usernames.insert(uname.to_ascii_lowercase());
+            out.push((MentionRow::new(m.user_id, uname, name, is_bot), Some(role_hint)));
+        }
+    } else if let Some((uid, username, display_name, is_bot)) = active_dm_peer {
+        let clean_un = username.trim().trim_start_matches('@').to_string();
+        if uid > 0 {
+            seen_ids.insert(uid);
+        }
+        if !clean_un.is_empty() {
+            seen_usernames.insert(clean_un.to_ascii_lowercase());
+        }
+        if !clean_un.is_empty() || !display_name.trim().is_empty() {
+            let role = if is_bot { "AI Bot" } else { "成员" };
+            out.push((
+                MentionRow::new(uid, clean_un, display_name, is_bot),
+                Some(role.to_string()),
+            ));
+        }
+    }
+
+    // For DMs/global (or groups where member roster hasn't resolved yet), also expose available Fabushi bots.
+    if !is_group || members.is_empty() {
+        for fb in fabushi_bots {
+            let uid = fb.bot_user_id.max(0) as u64;
+            let uname = fb.username.trim().trim_start_matches('@').to_string();
+            let effective_un = if uname.is_empty() {
+                fb.agent_id.trim().to_string()
+            } else {
+                uname
+            };
+            let key = effective_un.to_ascii_lowercase();
+            if effective_un.is_empty() || seen_usernames.contains(&key) {
+                continue;
+            }
+            if uid > 0 && seen_ids.contains(&uid) {
+                continue;
+            }
+            if uid > 0 {
+                seen_ids.insert(uid);
+            }
+            seen_usernames.insert(key);
+            let name = if fb.display_name.trim().is_empty() {
+                effective_un.clone()
+            } else {
+                fb.display_name.trim().to_string()
+            };
+            out.push((
+                MentionRow::new(uid, effective_un, name, true),
+                Some("AI Bot".to_string()),
+            ));
+        }
+    }
+
+    out
+}
 
 fn normalized_username(raw: Option<&str>) -> String {
     let trimmed = raw.unwrap_or("").trim();
@@ -340,6 +495,289 @@ impl AppShell {
         .detach();
     }
 
+    /// Synchronizes live `@mention` autocomplete candidates, group composite avatar tiles, and
+    /// per-bot hue mappings for `chat_id`.
+    pub fn sync_composer_mention_candidates(
+        &mut self,
+        chat_id: u64,
+        members: Option<&[ChatMemberItem]>,
+        cx: &mut Context<Self>,
+    ) {
+        let rc_opt = self.session_sync.rich_chats_by_id.get(&chat_id).cloned();
+        let is_group = rc_opt
+            .as_ref()
+            .map(|rc| rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3))
+            .unwrap_or_else(|| self.stage.read(cx).is_group_chat);
+
+        let fallback_members: Vec<ChatMemberItem> = if members.is_none() && is_group {
+            self.inspector
+                .read(cx)
+                .members
+                .members
+                .iter()
+                .map(|m| ChatMemberItem {
+                    user_id: m.id,
+                    role: m.role.clone(),
+                    admin_title: None,
+                    admin_rights: 0,
+                    permissions_bitmask: 0,
+                    joined_at_ms: 0,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let effective_members = members.unwrap_or(&fallback_members);
+
+        let active_dm_peer = if !is_group {
+            let peer_uid = rc_opt
+                .as_ref()
+                .and_then(|rc| rc.peer_user_id)
+                .or_else(|| self.session_sync.chat_peer_user_ids.get(&chat_id).copied())
+                .unwrap_or(0);
+            let fb_match = self
+                .miniapps
+                .fabushi_bots
+                .iter()
+                .find(|b| peer_uid > 0 && b.bot_user_id > 0 && b.bot_user_id as u64 == peer_uid);
+            if let Some(fb) = fb_match {
+                Some((
+                    peer_uid,
+                    fb.username.clone(),
+                    fb.display_name.clone(),
+                    true,
+                ))
+            } else if let Some(ref rc) = rc_opt {
+                let uname = rc
+                    .peer_username
+                    .clone()
+                    .or_else(|| rc.username.clone())
+                    .unwrap_or_default();
+                let name = rc
+                    .peer_display_name
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| rc.title.clone());
+                Some((peer_uid, uname, name, rc.is_bot))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let candidates = build_mention_candidates(
+            is_group,
+            effective_members,
+            &self.session_sync.contacts_list,
+            &self.miniapps.fabushi_bots,
+            active_dm_peer,
+        );
+        self.composer.update(cx, |c, c_cx| {
+            c.set_mention_candidates_with_roles(candidates);
+            c_cx.notify();
+        });
+
+        let bot_hues: HashMap<u64, String> = self
+            .miniapps
+            .fabushi_bots
+            .iter()
+            .filter(|b| b.bot_user_id > 0)
+            .map(|b| (b.bot_user_id as u64, b.avatar_color.clone()))
+            .collect();
+        let is_dark = self.theme_state.palette.mode.is_dark();
+        let member_tiles: Vec<(String, u32)> = if is_group && !effective_members.is_empty() {
+            effective_members
+                .iter()
+                .take(3)
+                .map(|m| {
+                    if let Some(fb) = self
+                        .miniapps
+                        .fabushi_bots
+                        .iter()
+                        .find(|b| b.bot_user_id > 0 && b.bot_user_id as u64 == m.user_id)
+                    {
+                        let init = derive_initials(&fb.display_name);
+                        let hue = if TdesktopThemePalette::is_tinted_bot_hue(&fb.avatar_color) {
+                            fb.avatar_color.as_str()
+                        } else {
+                            TdesktopThemePalette::bot_hue_name_for_id(m.user_id)
+                        };
+                        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(hue, is_dark);
+                        (if init.is_empty() { "B".to_string() } else { init }, fill)
+                    } else if let Some(c) = self
+                        .session_sync
+                        .contacts_list
+                        .iter()
+                        .find(|c| c.user_id == m.user_id)
+                    {
+                        let name = contact_display_name(c);
+                        let init = derive_initials(&name);
+                        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(
+                            TdesktopThemePalette::bot_hue_name_for_id(m.user_id),
+                            is_dark,
+                        );
+                        (if init.is_empty() { "U".to_string() } else { init }, fill)
+                    } else {
+                        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(
+                            TdesktopThemePalette::bot_hue_name_for_id(m.user_id),
+                            is_dark,
+                        );
+                        ("M".to_string(), fill)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        self.stage.update(cx, |st, st_cx| {
+            st.set_bot_hues_map(bot_hues);
+            if st.active_chat_id == Some(chat_id) && !member_tiles.is_empty() {
+                st.set_group_member_tiles(member_tiles);
+            }
+            st_cx.notify();
+        });
+    }
+
+    /// Navigates straight to a group message sender's 1:1 DM (reusing an existing DM or creating one).
+    pub fn open_sender_dm_by_user_id(
+        &mut self,
+        user_id: u64,
+        sender_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        if user_id == 0 {
+            return;
+        }
+        if self.session_sync.user_id == Some(user_id) {
+            return;
+        }
+        // 1. Check existing 1:1 DM in rich_chats_by_id / chat_peer_user_ids / contacts_list
+        let existing_dm_chat_id = self
+            .session_sync
+            .rich_chats_by_id
+            .iter()
+            .find(|(_, rc)| {
+                !rc.is_group
+                    && !rc.is_channel
+                    && !matches!(rc.chat_type, 1 | 2 | 3)
+                    && rc.peer_user_id == Some(user_id)
+            })
+            .map(|(&cid, _)| cid)
+            .or_else(|| {
+                self.session_sync
+                    .contacts_list
+                    .iter()
+                    .find(|c| c.user_id == user_id)
+                    .and_then(|c| c.chat_id)
+                    .filter(|&cid| cid > 0)
+                    .map(|cid| cid as u64)
+            });
+
+        if let Some(dm_cid) = existing_dm_chat_id {
+            self.sidebar.update(cx, |sb, sb_cx| {
+                sb.select_dialog(dm_cid);
+                sb_cx.notify();
+            });
+            self.sync_selected_chat_inspector_and_stage(dm_cid, cx);
+            return;
+        }
+
+        let Some(fence) = session_fence(self) else {
+            return;
+        };
+        let is_bot = self
+            .miniapps
+            .fabushi_bots
+            .iter()
+            .any(|b| b.bot_user_id > 0 && b.bot_user_id as u64 == user_id)
+            || self
+                .session_sync
+                .contacts_list
+                .iter()
+                .any(|c| c.user_id == user_id && c.is_bot);
+        let title = if sender_name.trim().is_empty() {
+            format!("User {user_id}")
+        } else {
+            sender_name
+        };
+        let req = CreateChatRequest {
+            title,
+            chat_type: Some(serde_json::json!(if is_bot { 4 } else { 0 })),
+            peer_user_id: Some(user_id),
+            ..Default::default()
+        };
+        let client = self.client.clone();
+        let lang_owned = self.active_lang_id().to_string();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = client.create_chat(&req).await;
+            let _ = weak.update(app, |shell, cx| {
+                if !fence_matches(&fence, shell) {
+                    return;
+                }
+                match res {
+                    Ok(created) if created.chat_id > 0 => {
+                        let cid = created.chat_id as u64;
+                        let init = derive_initials(&created.title);
+                        let color = peer_avatar_color(user_id);
+                        shell.sidebar.update(cx, |sb, sb_cx| {
+                            if !sb.dialogs.iter().any(|d| d.id == cid) {
+                                sb.dialogs.insert(
+                                    0,
+                                    crate::views::chat_sidebar::DialogItemModel {
+                                        id: cid,
+                                        peer_name: created.title.clone(),
+                                        avatar_initials: if init.is_empty() {
+                                            "U".to_string()
+                                        } else {
+                                            init
+                                        },
+                                        avatar_color: color,
+                                        last_message: String::new(),
+                                        timestamp: String::new(),
+                                        unread_count: 0,
+                                        is_muted: false,
+                                        is_pinned: false,
+                                        is_online: is_bot,
+                                        typing_indicator: None,
+                                        delivery_status:
+                                            crate::views::chat_sidebar::DialogDeliveryStatus::Read,
+                                        folder: if is_bot {
+                                            "Bots".to_string()
+                                        } else {
+                                            "Personal".to_string()
+                                        },
+                                    },
+                                );
+                            }
+                            if is_bot {
+                                sb.bot_ids.insert(cid);
+                            }
+                            sb.select_dialog(cid);
+                            sb_cx.notify();
+                        });
+                        shell.sync_selected_chat_inspector_and_stage(cid, cx);
+                        shell.refresh_chats(cx);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        shell.window_runtime.enqueue_toast(
+                            format!(
+                                "{}: {}",
+                                tr_str(&lang_owned, "打开私聊失败", "Failed to open DM"),
+                                e
+                            ),
+                            2400,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Synchronizes sidebar/stage/inspector selection and asynchronously fetches authoritative chat details.
     pub fn sync_selected_chat_inspector_and_stage(&mut self, chat_id: u64, cx: &mut Context<Self>) {
         let prev_chat_id = self.stage.read(cx).active_chat_id;
@@ -436,6 +874,8 @@ impl AppShell {
         self.sync_composer_and_inspector_miniapp_state(cx);
         self.sync_active_bot_computer_to_inspector(cx);
         self.sync_fabushi_bots_to_views(cx);
+        self.sync_composer_mention_candidates(chat_id, None, cx);
+        let active_bot_id_for_approvals = self.active_chat_bot_id(cx);
         let lang = self.active_lang_id().to_string();
         let contacts = self.session_sync.contacts_list.clone();
         let client = self.client.clone();
@@ -465,6 +905,16 @@ impl AppShell {
                 None
             };
             let members = client.get_chat_members(chat_id as i64).await.ok();
+            let approvals_bot_id = active_bot_id_for_approvals.or_else(|| {
+                rich_chat
+                    .as_ref()
+                    .filter(|rc| rc.is_bot)
+                    .and_then(|rc| rc.peer_user_id)
+            });
+            let pending_approvals = client
+                .hermes_list_approvals_for_bot(approvals_bot_id)
+                .await
+                .ok();
             let invites = client.list_invites(chat_id as i64).await.ok();
             let pins = client.list_pinned_messages(chat_id as i64).await.ok();
             let draft = client.get_draft(chat_id as i64).await.ok().flatten();
@@ -623,7 +1073,33 @@ impl AppShell {
                             .unwrap_or_else(|| details.as_ref().is_some_and(|d| d.chat_type != 0) && !rc_is_bot_flag);
                         if is_grp {
                             if let Some(ref mems) = members {
-                                insp.sync_members(map_chat_members_to_inspector(mems, &contacts), inv, true);
+                                let mut mapped = map_chat_members_to_inspector(mems, &contacts);
+                                let is_dark = shell.theme_state.palette.mode.is_dark();
+                                for item in &mut mapped {
+                                    if let Some(fb) = shell
+                                        .miniapps
+                                        .fabushi_bots
+                                        .iter()
+                                        .find(|b| b.bot_user_id > 0 && b.bot_user_id as u64 == item.id)
+                                    {
+                                        if !fb.display_name.trim().is_empty() {
+                                            item.name = fb.display_name.trim().to_string();
+                                            let init = derive_initials(&item.name);
+                                            if !init.is_empty() {
+                                                item.initials = init;
+                                            }
+                                        }
+                                        let hue = if TdesktopThemePalette::is_tinted_bot_hue(&fb.avatar_color) {
+                                            fb.avatar_color.as_str()
+                                        } else {
+                                            TdesktopThemePalette::bot_hue_name_for_id(item.id)
+                                        };
+                                        item.color = TdesktopThemePalette::bot_hue_colors(hue, is_dark).0;
+                                        item.role = "AI Bot".to_string();
+                                        item.is_online = true;
+                                    }
+                                }
+                                insp.sync_members(mapped, inv, true);
                             } else {
                                 insp.sync_members(Vec::new(), inv, true);
                             }
@@ -707,6 +1183,38 @@ impl AppShell {
                 if is_active_chat {
                     shell.sync_composer_and_inspector_miniapp_state(cx);
                     shell.sync_active_bot_computer_to_inspector(cx);
+                    shell.sync_composer_mention_candidates(chat_id, members.as_deref(), cx);
+                    if let Some(approvals) = pending_approvals {
+                        let mapped: Vec<PendingToolApproval> = approvals
+                            .into_iter()
+                            .filter(|a| a.status.eq_ignore_ascii_case("pending"))
+                            .map(|a| {
+                                let tier = ToolApprovalPolicyTier::from_policy_str(&a.risk_level);
+                                let summary = if a.reason.trim().is_empty() {
+                                    a.command_preview.clone()
+                                } else {
+                                    a.reason.clone()
+                                };
+                                PendingToolApproval {
+                                    id: a.approval_id,
+                                    tool_name: a.tool_name,
+                                    summary,
+                                    arguments_preview: a.command_preview.clone(),
+                                    risk_level: a.risk_level,
+                                    created_at: String::new(),
+                                    target: a.command_preview,
+                                    cwd: String::new(),
+                                    policy_tier: tier,
+                                }
+                            })
+                            .collect();
+                        shell.stage.update(cx, |st, st_cx| {
+                            if st.active_chat_id == Some(chat_id) {
+                                st.sync_pending_tool_approvals(mapped);
+                                st_cx.notify();
+                            }
+                        });
+                    }
                 }
                 shell.sync_fabushi_bots_to_views(cx);
                 cx.notify();
@@ -1115,6 +1623,63 @@ impl AppShell {
             .update(cx, |st, _| st.pending_bot_assist_action.take());
         if let Some(act) = bot_assist_act {
             self.handle_bot_assist_card_action(act, cx);
+        }
+        let stage_act = self.stage.update(cx, |st, _| st.take_stage_action());
+        if let Some(act) = stage_act {
+            match act {
+                StageAction::OpenSenderDm {
+                    user_id,
+                    sender_name,
+                } => {
+                    self.open_sender_dm_by_user_id(user_id, sender_name, cx);
+                }
+                StageAction::DecideToolApproval {
+                    approval_id,
+                    decision,
+                } => {
+                    let dec_str = match decision {
+                        ToolApprovalDecision::AllowOnce => "approve_once",
+                        ToolApprovalDecision::AllowAlways => "approve_permanent",
+                        ToolApprovalDecision::Deny => "denied",
+                    };
+                    if let Some(fence) = session_fence(self) {
+                        let client = self.client.clone();
+                        let lang_owned = lang.to_string();
+                        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                            let res = client
+                                .hermes_decide_approval(
+                                    &approval_id,
+                                    &HermesApprovalDecisionRequest {
+                                        decision: dec_str.to_string(),
+                                        reason: Some("Stage ToolPermissionDock".to_string()),
+                                    },
+                                )
+                                .await;
+                            let _ = weak.update(app, |shell, cx| {
+                                if !fence_matches(&fence, shell) {
+                                    return;
+                                }
+                                let msg = match res {
+                                    Ok(a) => format!(
+                                        "{}: {}",
+                                        tr_str(&lang_owned, "已处理工具审批", "Tool approval updated"),
+                                        a.status
+                                    ),
+                                    Err(e) => format!(
+                                        "{}: {}",
+                                        tr_str(&lang_owned, "审批提交失败", "Approval decision failed"),
+                                        e
+                                    ),
+                                };
+                                shell.window_runtime.enqueue_toast(msg, 2400);
+                                shell.refresh_tasks_and_mcp(cx);
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            }
         }
         if let Some(act) = bot_act {
             self.execute_hermes_inline_callback(act, cx);

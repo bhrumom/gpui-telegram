@@ -17,10 +17,11 @@ use crate::app::session::send_as_peers::SendAsPeer;
 use crate::theme::TdesktopThemePalette;
 use crate::views::composer::attachments_drawer::ComposerAttachMiniApp;
 use crate::views::composer::composer_ui::{
-    render_composer_context_banner, render_text_input_strip_with_bot_menu,
+    render_composer_context_banner, render_text_input_strip_with_options,
     render_voice_recording_strip, ComposerBarAction,
 };
 use crate::views::composer::editor_state::ComposerEditorState;
+use crate::views::composer::field_autocomplete::MentionRow;
 use crate::views::composer::popups_ui::{
     render_attachments_drawer_with_apps, render_formatting_toolbar, render_send_options_popup,
 };
@@ -225,6 +226,8 @@ pub struct CanonicalComposer {
     pub pending_launch_miniapp: Option<(u64, String, String, String)>,
     pub send_as_options: Vec<SendAsPeer>,
     pub selected_send_as_peer_id: Option<u64>,
+    pub compose_placeholder_override: Option<String>,
+    pub compose_send_disabled: bool,
 }
 
 impl CanonicalComposer {
@@ -282,7 +285,29 @@ impl CanonicalComposer {
             pending_launch_miniapp: None,
             send_as_options: Vec::new(),
             selected_send_as_peer_id: None,
+            compose_placeholder_override: None,
+            compose_send_disabled: false,
         }
+    }
+
+    /// Overrides the composer input placeholder (e.g. `"发消息给 A、B 和 C"` in `NewChatBar` compose mode).
+    pub fn set_compose_placeholder_override(&mut self, placeholder: Option<String>) {
+        self.compose_placeholder_override = placeholder.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Disables and dims the primary send CTA (e.g. when 0 recipients are selected or group creation is in flight).
+    pub fn set_compose_send_disabled(&mut self, disabled: bool) {
+        self.compose_send_disabled = disabled;
+    }
+
+    /// Populates live `@mention` autocomplete candidates for the active chat/group.
+    pub fn set_mention_candidates(&mut self, rows: Vec<MentionRow>) {
+        self.autocomplete.set_mention_candidates(rows);
+    }
+
+    /// Populates live `@mention` autocomplete candidates with explicit role badge hints.
+    pub fn set_mention_candidates_with_roles(&mut self, rows: Vec<(MentionRow, Option<String>)>) {
+        self.autocomplete.set_mention_candidates_with_roles(rows);
     }
 
     pub fn set_send_as_options(&mut self, options: Vec<SendAsPeer>, chosen_id: Option<u64>) {
@@ -795,7 +820,7 @@ impl Render for CanonicalComposer {
                 } else {
                     None
                 };
-                render_text_input_strip_with_bot_menu(
+                render_text_input_strip_with_options(
                     &text,
                     cursor,
                     selection,
@@ -808,6 +833,8 @@ impl Render for CanonicalComposer {
                     self.calculate_content_height(),
                     self.is_overflow_scroll_active(),
                     bot_menu_view,
+                    self.compose_placeholder_override.as_deref(),
+                    self.compose_send_disabled,
                     &self.palette,
                     &self.lang_id,
                     cx,

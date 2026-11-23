@@ -132,10 +132,11 @@ impl AppShell {
                 | NavDestination::Settings
         ) {
             self.sidebar.update(cx, |sb, sb_cx| {
-                sb.is_plus_menu_open = false;
+                sb.exit_compose_mode();
                 sb.is_account_popover_open = false;
                 sb_cx.notify();
             });
+            self.sync_compose_state_to_composer(true, cx);
             self.stage.update(cx, |st, st_cx| {
                 st.more_menu_open = false;
                 st.ttl_submenu_open = false;
@@ -234,9 +235,10 @@ impl AppShell {
             "e" => {
                 self.sidebar.update(cx, |s, s_cx| {
                     s.is_account_popover_open = !s.is_account_popover_open;
-                    s.is_plus_menu_open = false;
+                    s.exit_compose_mode();
                     s_cx.notify();
                 });
+                self.sync_compose_state_to_composer(true, cx);
                 cx.notify();
                 true
             }
@@ -252,23 +254,32 @@ impl AppShell {
                 true
             }
             "n" => {
-                if is_shift {
-                    self.open_modal_dialog(
-                        tr_str(lang, "新建频道", "New Channel"),
-                        ModalDialogKind::NewChannel,
-                        420.0,
-                        380.0,
-                        cx,
-                    );
-                } else {
-                    self.open_modal_dialog(
-                        tr_str(lang, "新建群组", "New Group"),
-                        ModalDialogKind::NewGroup,
-                        420.0,
-                        380.0,
-                        cx,
-                    );
-                }
+                self.active_panel = ActiveWorkspacePanel::Chats;
+                self.last_handled_nav_dest = Some(NavDestination::Chats);
+                self.nav_rail.update(cx, |r, r_cx| {
+                    r.set_active_destination(NavDestination::Chats);
+                    r_cx.notify();
+                });
+                self.ime.clear_preedit();
+                self.sidebar.update(cx, |sb, sb_cx| {
+                    if is_shift {
+                        sb.open_compose_group_mode();
+                    } else if !sb.is_plus_menu_open {
+                        sb.toggle_plus_menu();
+                    } else {
+                        sb.compose_recipient_query.clear();
+                        sb.compose_draft.menu_open = true;
+                        sb.compose_draft.highlighted_index = 0;
+                        sb.compose_title_focused = false;
+                    }
+                    sb_cx.notify();
+                });
+                self.composer.update(cx, |c, c_cx| {
+                    c.is_input_focused = false;
+                    c_cx.notify();
+                });
+                self.sync_compose_state_to_composer(true, cx);
+                cx.notify();
                 true
             }
             "p" => {

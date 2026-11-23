@@ -687,6 +687,36 @@ impl AppShell {
         false
     }
 
+    /// Syncs dynamic compose placeholder and send-disabled state onto `CanonicalComposer`
+    /// while Apple/Grok compose mode is active, resetting both when leaving compose mode.
+    pub(crate) fn sync_compose_state_to_composer(
+        &self,
+        notify_composer: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id().to_string();
+        let (placeholder_override, send_disabled) = {
+            let sb = self.sidebar.read(cx);
+            if pal.is_apple_style() && sb.is_plus_menu_open {
+                (
+                    Some(sb.compose_placeholder_text(&lang)),
+                    sb.compose_draft.selected_recipients.is_empty()
+                        || sb.compose_draft.pending_creation.is_some(),
+                )
+            } else {
+                (None, false)
+            }
+        };
+        self.composer.update(cx, |c, ccx| {
+            c.set_compose_placeholder_override(placeholder_override);
+            c.set_compose_send_disabled(send_disabled);
+            if notify_composer {
+                ccx.notify();
+            }
+        });
+    }
+
     fn render_toast_banner(&self, text: String, pal: TdesktopThemePalette, cx: &mut Context<Self>) -> Stateful<Div> {
         let is_apple = pal.is_apple_style();
         let mut toast = div()
@@ -811,6 +841,7 @@ impl Render for AppShell {
                 pal.is_apple_style() && sb.is_plus_menu_open,
             )
         };
+        self.sync_compose_state_to_composer(false, cx);
 
         div()
             .id("app-shell-authenticated-root")

@@ -81,6 +81,59 @@ pub fn render_stage_top_bar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    render_stage_top_bar_with_group(
+        chat_id,
+        title,
+        subtitle,
+        initials,
+        avatar_url,
+        active_fabushi_bot,
+        is_bot_chat,
+        false,
+        None,
+        bot_activity_state,
+        select_mode_active,
+        selected_count,
+        message_ttl_seconds,
+        search_open,
+        search_query,
+        search_match_cursor,
+        search_match_total,
+        is_inspector_open,
+        more_menu_open,
+        palette,
+        lang_id,
+        cx,
+        on_action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_stage_top_bar_with_group<V: 'static>(
+    chat_id: Option<u64>,
+    title: &str,
+    subtitle: &str,
+    initials: &str,
+    avatar_url: Option<&str>,
+    active_fabushi_bot: Option<&FabushiBotSummaryDto>,
+    is_bot_chat: bool,
+    is_group_chat: bool,
+    group_member_tiles: Option<&[(String, u32)]>,
+    bot_activity_state: &str,
+    select_mode_active: bool,
+    selected_count: usize,
+    message_ttl_seconds: u32,
+    search_open: bool,
+    search_query: &str,
+    search_match_cursor: usize,
+    search_match_total: usize,
+    is_inspector_open: bool,
+    more_menu_open: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
     let is_apple = palette.is_apple_style();
     let bar_h = px(palette.scaled_px(if is_apple {
         APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT
@@ -265,19 +318,31 @@ pub fn render_stage_top_bar<V: 'static>(
             .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"));
         let show_dynamic_bot_avatar =
             fab_non_classic.is_some() || (is_bot_chat && (img_src.is_none() || is_typing));
-        let avatar_ring_col = if is_dark {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.16)
+        let show_group_composite =
+            (is_group_chat || is_group_sub) && img_src.is_none() && !show_dynamic_bot_avatar;
+        let avatar_ring_col = palette.hairline_border_rgba();
+        let avatar_shadow = if is_dark {
+            Vec::new()
         } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.08)
+            vec![BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, 0.10),
+                offset: point(px(0.0), px(2.0)),
+                blur_radius: px(8.0),
+                spread_radius: px(0.0),
+            }]
         };
-        let avatar_shadow = vec![BoxShadow {
-            color: hsla(0.0, 0.0, 0.0, if is_dark { 0.32 } else { 0.12 }),
-            offset: point(px(0.0), px(2.0)),
-            blur_radius: px(8.0),
-            spread_radius: px(0.0),
-        }];
 
-        if show_dynamic_bot_avatar {
+        if show_group_composite {
+            crate::views::sidebar::dialogs_row_view::render_composite_group_avatar(
+                chat_id.unwrap_or(0),
+                title,
+                group_member_tiles,
+                avatar_size_px,
+                palette.stage_bg,
+                is_dark,
+            )
+            .into_any_element()
+        } else if show_dynamic_bot_avatar {
             if let Some(fab) = fab_non_classic {
                 let effective_state = if !bot_activity_state.trim().is_empty()
                     && !bot_activity_state.eq_ignore_ascii_case("idle")
@@ -407,25 +472,13 @@ pub fn render_stage_top_bar<V: 'static>(
         } else {
             TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.98)
         };
-        let glass_pill_border = if is_dark {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.12)
+        let glass_pill_border = if is_inspector_open {
+            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.55)
         } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.08)
+            palette.hairline_border_rgba()
         };
-        let pill_shadow = vec![
-            BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, if is_dark { 0.34 } else { 0.10 }),
-                offset: point(px(0.0), px(4.0)),
-                blur_radius: px(14.0),
-                spread_radius: px(0.0),
-            },
-            BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, if is_dark { 0.22 } else { 0.05 }),
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(3.0),
-                spread_radius: px(0.0),
-            },
-        ];
+        let right_pill_border = palette.hairline_border_rgba();
+        let pill_shadow = palette.popover_shadows();
 
         let mut root = div()
             .relative()
@@ -548,7 +601,7 @@ pub fn render_stage_top_bar<V: 'static>(
                 .rounded_full()
                 .bg(glass_pill_bg)
                 .border_1()
-                .border_color(glass_pill_border)
+                .border_color(right_pill_border)
                 .shadow(pill_shadow)
                 .flex()
                 .items_center()

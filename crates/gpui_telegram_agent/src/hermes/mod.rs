@@ -22,7 +22,8 @@ pub mod trajectory;
 pub mod user_providers;
 
 use crate::computer::{ComputerCloudProvider, ComputerLeaseBroker};
-use crate::mcp::McpRegistry;
+use crate::mcp::{McpRegistry, ToolPermissionDock};
+use crate::multi_agent::GroupWorkspaceBridge;
 use crate::talk::TalkCoordinator;
 use crate::tasks::CronRoutine;
 use chrono::Utc;
@@ -3201,6 +3202,8 @@ struct HermesEngineInner {
     teammate_handler: RwLock<Option<Arc<dyn toolsets::FabushiTeammateHandler>>>,
     platform_im_bridge: RwLock<Option<Arc<dyn PlatformImBridge>>>,
     agentic_backend: RwLock<Option<Arc<dyn AgenticStateBackend>>>,
+    group_workspace_bridge: RwLock<Option<Arc<dyn GroupWorkspaceBridge>>>,
+    permission_dock: RwLock<Option<Arc<ToolPermissionDock>>>,
     bound_agent_id: RwLock<Option<String>>,
 }
 
@@ -3368,6 +3371,8 @@ impl HermesEngine {
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
+            group_workspace_bridge: RwLock::new(None),
+            permission_dock: RwLock::new(None),
             bound_agent_id: RwLock::new(None),
             config,
         });
@@ -3512,6 +3517,34 @@ impl HermesEngine {
     pub fn agentic_backend(&self) -> Option<Arc<dyn AgenticStateBackend>> {
         self.inner
             .agentic_backend
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    pub fn set_group_workspace_bridge(&self, bridge: Arc<dyn GroupWorkspaceBridge>) {
+        if let Ok(mut guard) = self.inner.group_workspace_bridge.write() {
+            *guard = Some(bridge);
+        }
+    }
+
+    pub fn group_workspace_bridge(&self) -> Option<Arc<dyn GroupWorkspaceBridge>> {
+        self.inner
+            .group_workspace_bridge
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    pub fn set_permission_dock(&self, dock: Arc<ToolPermissionDock>) {
+        if let Ok(mut guard) = self.inner.permission_dock.write() {
+            *guard = Some(dock);
+        }
+    }
+
+    pub fn permission_dock(&self) -> Option<Arc<ToolPermissionDock>> {
+        self.inner
+            .permission_dock
             .read()
             .ok()
             .and_then(|g| g.clone())
@@ -3967,6 +4000,8 @@ impl HermesEngine {
         ctx.terminal_backend = self.inner.config.terminal_backend.clone();
         ctx.teammate_handler = self.teammate_handler();
         ctx.platform_im_bridge = self.platform_im_bridge();
+        ctx.group_workspace_bridge = self.group_workspace_bridge();
+        ctx.permission_dock = self.permission_dock();
         ctx.bound_agent_id = self.bound_agent_id();
         ctx
     }

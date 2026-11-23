@@ -1,12 +1,23 @@
 pub mod capability_token;
 pub mod floor_control;
 pub mod loop_budget;
+pub mod reply_gate;
 pub mod workspace;
 
 pub use capability_token::ScopedCapabilityToken;
-pub use floor_control::{FloorControlQueue, FloorPriority};
+pub use floor_control::{
+    FloorControlQueue, FloorPriority, FloorTurnGrant, RoomMemberTurnOutcome, TurnDeliveryIntake,
+};
 pub use loop_budget::{LoopBudget, LoopBudgetExceededError, DEFAULT_MAX_LOOP_HOPS};
-pub use workspace::{SharedGroupWorkspace, SharedWorkspaceEntry};
+pub use reply_gate::{
+    evaluate_group_wake_gate, evaluate_outbound_turn_review, is_explicit_pass_sentinel,
+    GroupWakeBotCandidate, GroupWakeBotScore, GroupWakeGateDecision, GroupWakeGateInput,
+    GroupWakeReason, OutboundReviewReason, OutboundTurnReviewInput, OutboundTurnVerdict,
+};
+pub use workspace::{
+    GroupWorkspaceBridge, InMemoryGroupWorkspaceBridge, SharedGroupWorkspace,
+    SharedGroupWorkspaceAdapter, SharedWorkspaceEntry,
+};
 
 #[cfg(test)]
 mod tests {

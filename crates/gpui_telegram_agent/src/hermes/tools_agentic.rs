@@ -9,8 +9,9 @@ use crate::acp::{SubagentLifecycleStatus, SubagentLineage};
 use crate::computer::{
     redact_cloud_secrets, AgentCloudServerConfigInput, AgentComputerExecInput,
     AgentComputerExecOutput, ComputerCloudProvider, CuaAction, CuaExecutor,
+    CUA_BACKEND_UNAVAILABLE_ERR,
 };
-use crate::mcp::{ToolPermissionDock, ToolRiskLevel};
+use crate::mcp::{ToolPermissionDock, ToolPermissionRequest, ToolRiskLevel};
 use crate::talk::TalkSessionState;
 use crate::tasks::{CronExecutionRecord, CronRoutine};
 
@@ -18,7 +19,9 @@ use mahayana_host_runtime::agents::agent_messaging::{
     SAND_CREATE_AGENT_TOOL_NAME, SAND_SEND_TO_AGENT_TOOL_NAME, SAND_UPDATE_AGENT_TOOL_NAME,
 };
 
-use super::security::{scan_content_for_injection, ApprovalMode};
+use super::security::{
+    compute_content_sha256, scan_content_for_injection, ApprovalMode, AutoReviewVerdict,
+};
 use super::toolsets::{
     HermesInlineButton, HermesToolContext, HermesToolResult, HermesUiAction,
     SubagentDelegationOutcome, SubagentDelegationRequest, ToolsetId,
@@ -168,7 +171,7 @@ pub async fn execute_agentic_tool(
         "clarify" => tool_clarify(args, ctx).await,
         "desktop_ui_inspect" => tool_desktop_ui_inspect(ctx).await,
         "desktop_ui_act" => tool_desktop_ui_act(args, ctx).await,
-        "computer_use" => tool_computer_use(args, ctx),
+        "computer_use" => tool_computer_use(args, ctx).await,
         "computer_list" => tool_computer_list(ctx).await,
         "computer_bind" => tool_computer_bind(args, ctx).await,
         "computer_configure_cloud" => tool_computer_configure_cloud(args, ctx).await,
@@ -184,6 +187,9 @@ pub async fn execute_agentic_tool(
         "memory" => tool_memory(args, ctx).await,
         "skill_manage" => tool_skill_manage(args, ctx).await,
         "honcho_profile" => tool_honcho_profile(args, ctx).await,
+        "group_workspace_list" => tool_group_workspace_list(args, ctx).await,
+        "group_workspace_read" => tool_group_workspace_read(args, ctx).await,
+        "group_workspace_write" => tool_group_workspace_write(args, ctx).await,
         name if name == SAND_SEND_TO_AGENT_TOOL_NAME => tool_fabushi_send_to_agent(args, ctx),
         name if name == SAND_CREATE_AGENT_TOOL_NAME => tool_fabushi_create_agent(args, ctx),
         name if name == SAND_UPDATE_AGENT_TOOL_NAME => tool_fabushi_update_agent(args, ctx),
@@ -1262,16 +1268,16 @@ async fn tool_desktop_ui_act(args: Value, ctx: &HermesToolContext) -> HermesTool
     .with_ui_action(action)
 }
 
-fn tool_computer_use(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+async fn tool_computer_use(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
     let Some(action_name) = args.get("action").and_then(|v| v.as_str()) else {
         return HermesToolResult::err("computer_use", "Missing required 'action'");
-    };
-    let Ok(mut broker) = ctx.computer_broker.lock() else {
-        return HermesToolResult::err("computer_use", "ComputerLeaseBroker lock poisoned");
     };
 
     match action_name {
         "acquire_lease" => {
+            let Ok(mut broker) = ctx.computer_broker.lock() else {
+                return HermesToolResult::err("computer_use", "ComputerLeaseBroker lock poisoned");
+            };
             let device_id = args
                 .get("device_id")
                 .and_then(|v| v.as_str())
@@ -1289,6 +1295,9 @@ fn tool_computer_use(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
             }
         }
         "release_lease" => {
+            let Ok(mut broker) = ctx.computer_broker.lock() else {
+                return HermesToolResult::err("computer_use", "ComputerLeaseBroker lock poisoned");
+            };
             let lease_id = args
                 .get("lease_id")
                 .and_then(|v| v.as_str())
@@ -1303,6 +1312,9 @@ fn tool_computer_use(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
             )
         }
         "emergency_takeover" => {
+            let Ok(mut broker) = ctx.computer_broker.lock() else {
+                return HermesToolResult::err("computer_use", "ComputerLeaseBroker lock poisoned");
+            };
             let generation = broker.emergency_takeover();
             HermesToolResult::ok(
                 "computer_use",
@@ -1311,6 +1323,9 @@ fn tool_computer_use(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
             )
         }
         "lease_status" => {
+            let Ok(broker) = ctx.computer_broker.lock() else {
+                return HermesToolResult::err("computer_use", "ComputerLeaseBroker lock poisoned");
+            };
             let active = broker.is_lease_active();
             let generation = broker.current_generation();
             let lease = broker.active_lease().cloned();
@@ -1343,13 +1358,103 @@ fn tool_computer_use(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
                 },
                 _ => unreachable!(),
             };
-            let Some(lease) = broker.active_lease().cloned() else {
-                return HermesToolResult::err(
-                    "computer_use",
-                    "No active ComputerControlLease; call computer_use(action='acquire_lease') first",
-                );
+
+            let (lease, generation) = {
+                let Ok(broker) = ctx.computer_broker.lock() else {
+                    return HermesToolResult::err("computer_use", "ComputerLeaseBroker lock poisoned");
+                };
+                let Some(lease) = broker.active_lease().cloned() else {
+                    return HermesToolResult::err(
+                        "computer_use",
+                        "No active ComputerControlLease; call computer_use(action='acquire_lease') first",
+                    );
+                };
+                (lease, broker.current_generation())
             };
-            let generation = broker.current_generation();
+
+            if let Err(err) = CuaExecutor::validate_fenced_lease(&lease, generation) {
+                return HermesToolResult::err("computer_use", err.to_string());
+            }
+
+            // Route through real ComputerCloudProvider when available and a remote computer is bound/online.
+            if let (Some(provider), Some(user_id)) = (ctx.computer_provider.as_ref(), ctx.user_id) {
+                let bot_id = ctx.bot_id.and_then(|id| u64::try_from(id).ok());
+                let explicit_node = args
+                    .get("node_id")
+                    .or_else(|| args.get("device_id"))
+                    .or_else(|| args.get("computer_id"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "local" && *s != "local_desktop")
+                    .map(ToString::to_string);
+
+                let resolved_node = if explicit_node.is_some() {
+                    explicit_node
+                } else {
+                    match provider.list_computers(user_id, bot_id).await {
+                        Ok(nodes) => {
+                            let bound_online = nodes.iter().find(|n| n.online && n.bound_to_this_bot);
+                            let single_online = {
+                                let online: Vec<_> = nodes.iter().filter(|n| n.online).collect();
+                                (online.len() == 1).then(|| online[0])
+                            };
+                            let single_bound = {
+                                let bound: Vec<_> =
+                                    nodes.iter().filter(|n| n.bound_to_this_bot).collect();
+                                (bound.len() == 1).then(|| bound[0])
+                            };
+                            bound_online
+                                .or(single_online)
+                                .or(single_bound)
+                                .map(|n| n.node_id.clone())
+                        }
+                        Err(err) => {
+                            return HermesToolResult::err(
+                                "computer_use",
+                                redact_cloud_secrets(&err.to_string()),
+                            );
+                        }
+                    }
+                };
+
+                if resolved_node.is_none() && !matches!(cua, CuaAction::Wait { .. }) {
+                    return HermesToolResult::err("computer_use", CUA_BACKEND_UNAVAILABLE_ERR);
+                }
+
+                match CuaExecutor::execute_action_via_provider(
+                    &cua,
+                    &lease,
+                    generation,
+                    provider.as_ref(),
+                    user_id,
+                    bot_id,
+                    resolved_node,
+                )
+                .await
+                {
+                    Ok(out) => {
+                        let proto = CuaExecutor::action_to_protocol(&cua);
+                        let mut res = exec_output_to_tool_result("computer_use", out);
+                        if let Some(Value::Object(ref mut map)) = res.structured {
+                            map.insert("generation".into(), json!(generation));
+                            map.insert("lease_id".into(), json!(lease.lease_id));
+                            map.insert(
+                                "protocol_action".into(),
+                                serde_json::to_value(&proto).unwrap_or(Value::Null),
+                            );
+                        }
+                        return res;
+                    }
+                    Err(e) => {
+                        return HermesToolResult::err(
+                            "computer_use",
+                            redact_cloud_secrets(&e.to_string()),
+                        );
+                    }
+                }
+            }
+
+            // No remote computer backend attached: honestly fail instead of fabricating success.
             match CuaExecutor::execute_action_fenced(&cua, &lease, generation) {
                 Ok(msg) => {
                     let proto = CuaExecutor::action_to_protocol(&cua);
@@ -1392,7 +1497,7 @@ fn require_computer_provider_and_user(
 
 async fn tool_computer_list(ctx: &HermesToolContext) -> HermesToolResult {
     let Some(provider) = ctx.computer_provider.as_ref().map(Arc::clone) else {
-        let lease = tool_computer_use(json!({ "action": "lease_status" }), ctx);
+        let lease = tool_computer_use(json!({ "action": "lease_status" }), ctx).await;
         let payload = json!({
             "fallback": "lease_status",
             "computers": [],
@@ -2078,18 +2183,121 @@ fn tool_mcp_call(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
         return HermesToolResult::err("mcp_call", format!("MCP tool '{tool_name}' is not registered"));
     };
 
-    let dock = ToolPermissionDock::new();
-    let assessed = dock.evaluate_risk(def, &call_args);
     let mode = ctx
         .security
         .read()
         .map(|s| s.approvals.get_session_mode(&ctx.session_id))
         .unwrap_or(ApprovalMode::Prompt);
+
+    let (assessed, verdict) = if let Some(shared_dock) = ctx.permission_dock.as_ref() {
+        shared_dock.evaluate_auto_review(def, &call_args)
+    } else {
+        let fallback_dock = ToolPermissionDock::new();
+        let risk = fallback_dock.evaluate_risk(def, &call_args);
+        let verdict = ctx
+            .security
+            .read()
+            .map(|s| {
+                let destructive = matches!(
+                    risk,
+                    ToolRiskLevel::High | ToolRiskLevel::CriticalDestructive
+                ) || def.requires_approval;
+                s.auto_review.evaluate(tool_name, &call_args, destructive)
+            })
+            .unwrap_or(AutoReviewVerdict::Allow);
+        (risk, verdict)
+    };
+
     if assessed == ToolRiskLevel::CriticalDestructive && mode == ApprovalMode::Deny {
         return HermesToolResult::err(
             "mcp_call",
             format!("MCP tool '{tool_name}' blocked due to CriticalDestructive risk assessment"),
         );
+    }
+
+    match verdict {
+        AutoReviewVerdict::Block { reason } => {
+            return HermesToolResult::err(
+                "mcp_call",
+                format!("MCP tool '{tool_name}' blocked by policy: {reason}"),
+            );
+        }
+        AutoReviewVerdict::Ask {
+            proposed_allow_rule,
+        } if !matches!(mode, ApprovalMode::Yolo | ApprovalMode::PermanentAllow) => {
+            if let Some(shared_dock) = ctx.permission_dock.as_ref() {
+                if let Some(approval_id) = args
+                    .get("approval_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let target = args
+                        .get("approval_target")
+                        .or_else(|| args.get("target"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| call_args.to_string());
+                    let cwd = args
+                        .get("working_directory")
+                        .or_else(|| args.get("cwd"))
+                        .and_then(Value::as_str);
+                    let content_sha = args
+                        .get("content_sha256")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| {
+                            call_args
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .map(|c| compute_content_sha256(c.as_bytes()))
+                        });
+                    let now_ms = Utc::now().timestamp_millis();
+                    if let Err(err) = shared_dock.verify_and_consume_approval(
+                        approval_id,
+                        tool_name,
+                        &target,
+                        cwd,
+                        content_sha.as_deref(),
+                        now_ms,
+                    ) {
+                        return HermesToolResult::err(
+                            "mcp_call",
+                            format!("Value-bound approval rejected for MCP tool '{tool_name}': {err}"),
+                        );
+                    }
+                } else {
+                    let req_id = format!("mcp_perm_{}", uuid::Uuid::new_v4().simple());
+                    let caller = ctx
+                        .bound_agent_id
+                        .clone()
+                        .unwrap_or_else(|| ctx.session_id.clone());
+                    let req = ToolPermissionRequest::new(
+                        req_id.clone(),
+                        tool_name,
+                        call_args.clone(),
+                        assessed,
+                        caller,
+                    );
+                    shared_dock.submit_shared_request(req);
+                    let mut res = HermesToolResult::err(
+                        "mcp_call",
+                        format!(
+                            "MCP tool '{tool_name}' requires user approval in ToolPermissionDock (request_id={req_id}, proposed_rule='{proposed_allow_rule}')"
+                        ),
+                    );
+                    res.structured = Some(json!({
+                        "approval_required": true,
+                        "request_id": req_id,
+                        "tool_name": tool_name,
+                        "risk_level": format!("{assessed:?}"),
+                        "proposed_allow_rule": proposed_allow_rule,
+                    }));
+                    return res;
+                }
+            }
+        }
+        _ => {}
     }
 
     match reg.execute_tool(tool_name, call_args) {
@@ -2099,6 +2307,164 @@ fn tool_mcp_call(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
             Some(val),
         ),
         Err(e) => HermesToolResult::err("mcp_call", e),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 4b. Shared Group Workspace Collaboration Tools
+// ----------------------------------------------------------------------------
+
+fn resolve_group_workspace_chat_id(
+    tool_name: &str,
+    args: &Value,
+    ctx: &HermesToolContext,
+) -> Result<i64, HermesToolResult> {
+    let explicit = args.get("chat_id").and_then(Value::as_i64);
+    if let (Some(pinned), Some(req_cid)) = (ctx.chat_id, explicit) {
+        if pinned != req_cid {
+            return Err(HermesToolResult::err(
+                tool_name,
+                format!(
+                    "Cross-chat workspace mismatch: tool context is pinned to chat {pinned}, got {req_cid}"
+                ),
+            ));
+        }
+    }
+    explicit.or(ctx.chat_id).ok_or_else(|| {
+        HermesToolResult::err(
+            tool_name,
+            "Missing chat_id in arguments or HermesToolContext for group workspace operation",
+        )
+    })
+}
+
+async fn tool_group_workspace_list(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let Some(bridge) = ctx.group_workspace_bridge.as_ref() else {
+        return HermesToolResult::err(
+            "group_workspace_list",
+            "GroupWorkspaceBridge is not attached to HermesToolContext",
+        );
+    };
+    let chat_id = match resolve_group_workspace_chat_id("group_workspace_list", &args, ctx) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+
+    match bridge.list_keys(chat_id).await {
+        Ok(entries) => {
+            let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+            let payload = json!({
+                "chat_id": chat_id,
+                "count": entries.len(),
+                "keys": keys,
+                "entries": entries,
+            });
+            HermesToolResult::ok(
+                "group_workspace_list",
+                serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                Some(payload),
+            )
+        }
+        Err(err) => HermesToolResult::err("group_workspace_list", err),
+    }
+}
+
+async fn tool_group_workspace_read(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let Some(bridge) = ctx.group_workspace_bridge.as_ref() else {
+        return HermesToolResult::err(
+            "group_workspace_read",
+            "GroupWorkspaceBridge is not attached to HermesToolContext",
+        );
+    };
+    let Some(key) = args
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("group_workspace_read", "Missing required 'key' parameter");
+    };
+    let chat_id = match resolve_group_workspace_chat_id("group_workspace_read", &args, ctx) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+
+    match bridge.read_key(chat_id, key).await {
+        Ok(Some(entry)) => {
+            let payload = json!({
+                "chat_id": chat_id,
+                "found": true,
+                "entry": entry,
+            });
+            HermesToolResult::ok(
+                "group_workspace_read",
+                serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                Some(payload),
+            )
+        }
+        Ok(None) => {
+            let payload = json!({
+                "chat_id": chat_id,
+                "key": key,
+                "found": false,
+                "entry": Value::Null,
+            });
+            HermesToolResult::ok(
+                "group_workspace_read",
+                format!("Workspace key '{key}' not found in chat {chat_id}"),
+                Some(payload),
+            )
+        }
+        Err(err) => HermesToolResult::err("group_workspace_read", err),
+    }
+}
+
+async fn tool_group_workspace_write(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let Some(bridge) = ctx.group_workspace_bridge.as_ref() else {
+        return HermesToolResult::err(
+            "group_workspace_write",
+            "GroupWorkspaceBridge is not attached to HermesToolContext",
+        );
+    };
+    let Some(key) = args
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("group_workspace_write", "Missing required 'key' parameter");
+    };
+    let Some(value) = args.get("value").cloned() else {
+        return HermesToolResult::err("group_workspace_write", "Missing required 'value' parameter");
+    };
+    let expected_revision = args.get("expected_revision").and_then(Value::as_u64);
+    let chat_id = match resolve_group_workspace_chat_id("group_workspace_write", &args, ctx) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    let updated_by = ctx
+        .bound_agent_id
+        .clone()
+        .or_else(|| ctx.bot_id.map(|id| format!("bot_{id}")))
+        .unwrap_or_else(|| ctx.session_id.clone());
+
+    match bridge
+        .write_key(chat_id, key, value, &updated_by, expected_revision)
+        .await
+    {
+        Ok((revision, entry)) => {
+            let payload = json!({
+                "chat_id": chat_id,
+                "revision": revision,
+                "entry": entry,
+            });
+            HermesToolResult::ok(
+                "group_workspace_write",
+                format!("Wrote workspace key '{key}' (revision={revision})"),
+                Some(payload),
+            )
+        }
+        Err(err) => HermesToolResult::err("group_workspace_write", err),
     }
 }
 
@@ -2536,9 +2902,11 @@ mod tests {
         assert!(mcp_res.success);
         assert!(mcp_res.output.contains("hello"));
 
-        // CUA computer_use acquire + fenced click
+        // CUA computer_use acquire + honest backend-unavailable check when unbound + takeover
         assert!(HermesToolExecutor::execute("computer_use", json!({ "action": "acquire_lease", "device_id": "box1" }), &ctx).await.success);
-        assert!(HermesToolExecutor::execute("computer_use", json!({ "action": "click", "x": 100, "y": 200 }), &ctx).await.success);
+        let unbound_click = HermesToolExecutor::execute("computer_use", json!({ "action": "click", "x": 100, "y": 200 }), &ctx).await;
+        assert!(!unbound_click.success);
+        assert!(unbound_click.output.contains("CUA backend unavailable"));
         assert!(HermesToolExecutor::execute("computer_use", json!({ "action": "emergency_takeover" }), &ctx).await.success);
     }
 }

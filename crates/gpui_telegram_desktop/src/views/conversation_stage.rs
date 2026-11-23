@@ -25,6 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 
+use crate::components::tool_permission_dock::{
+    render_tool_permission_dock_inline, PendingToolApproval, ToolApprovalDecision,
+    ToolPermissionDock,
+};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::stage::history_drag_area::HistoryDragArea;
 use crate::views::stage::history_view_highlight_manager::{
@@ -38,7 +42,7 @@ use crate::views::stage::stage_bubble::{
 use crate::views::stage::stage_context_menu::ReactionOverlayMode;
 use crate::views::stage::stage_bars::{
     render_pinned_banner_46px, render_scroll_to_bottom_fab, render_stage_more_menu_overlay,
-    render_stage_search_bar, render_stage_top_bar, TopBarUiAction,
+    render_stage_search_bar, render_stage_top_bar_with_group, TopBarUiAction,
     APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT, APPLE_STAGE_TOP_BAR_HEIGHT,
 };
 use crate::views::stage::wallpaper::{
@@ -302,6 +306,116 @@ pub struct MessageContextMenuState {
     pub text_snippet: Option<String>,
 }
 
+pub const DEFAULT_ROOM_AGENT_STALE_AFTER_MS: u64 = 25_000;
+
+/// Live multi-agent floor control, handoff trail, and shared workspace state for a group chat.
+/// Automatically expires when `now_ms - updated_at_ms > stale_after_ms` so crashed turns never
+/// leave stuck activity indicators in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomAgentLiveState {
+    pub current_speaker: Option<String>,
+    pub queued_count: usize,
+    pub loop_hops: u32,
+    pub last_handoff: Option<(String, String, u32, u32)>,
+    pub updated_at_ms: i64,
+    pub stale_after_ms: u64,
+    pub workspace_revision: u64,
+    pub last_workspace_key: Option<String>,
+}
+
+impl Default for RoomAgentLiveState {
+    fn default() -> Self {
+        Self {
+            current_speaker: None,
+            queued_count: 0,
+            loop_hops: 0,
+            last_handoff: None,
+            updated_at_ms: 0,
+            stale_after_ms: DEFAULT_ROOM_AGENT_STALE_AFTER_MS,
+            workspace_revision: 0,
+            last_workspace_key: None,
+        }
+    }
+}
+
+impl RoomAgentLiveState {
+    pub fn is_expired(&self, now_ms: i64) -> bool {
+        if self.updated_at_ms <= 0 {
+            return true;
+        }
+        now_ms.saturating_sub(self.updated_at_ms) > self.stale_after_ms as i64
+    }
+
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        !self.is_expired(now_ms)
+            && (self.current_speaker.is_some()
+                || self.queued_count > 0
+                || self.last_handoff.is_some()
+                || self.last_workspace_key.is_some())
+    }
+
+    pub fn apply_floor_changed(
+        &mut self,
+        current_speaker: Option<String>,
+        queued_count: usize,
+        loop_hops: u32,
+        now_ms: i64,
+    ) {
+        let cleaned = current_speaker.filter(|s| !s.trim().is_empty());
+        self.current_speaker = cleaned;
+        self.queued_count = queued_count;
+        self.loop_hops = loop_hops;
+        if self.current_speaker.is_none() && self.queued_count == 0 {
+            self.last_handoff = None;
+        }
+        self.updated_at_ms = now_ms;
+    }
+
+    pub fn apply_handoff(
+        &mut self,
+        from_agent: String,
+        to_agent: String,
+        hop: u32,
+        max_hops: u32,
+        now_ms: i64,
+    ) {
+        self.loop_hops = hop;
+        self.last_handoff = Some((from_agent, to_agent.clone(), hop, max_hops));
+        if self.current_speaker.is_none() && !to_agent.trim().is_empty() {
+            self.current_speaker = Some(to_agent);
+        }
+        self.updated_at_ms = now_ms;
+    }
+
+    pub fn apply_workspace_updated(&mut self, revision: u64, key: String, now_ms: i64) {
+        self.workspace_revision = revision;
+        self.last_workspace_key = (!key.trim().is_empty()).then_some(key);
+        self.updated_at_ms = now_ms;
+    }
+
+    pub fn format_handoff_trail(&self, lang_id: &str) -> Option<String> {
+        let (from, to, hop, max_hops) = self.last_handoff.as_ref()?;
+        if lang_id.starts_with("zh") {
+            Some(format!("{from} → {to} · 第 {hop}/{max_hops} 轮"))
+        } else {
+            Some(format!("{from} → {to} · Turn {hop}/{max_hops}"))
+        }
+    }
+}
+
+/// Interactive stage-level intents emitted by `ConversationStage` to `AppShell`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageAction {
+    OpenSenderDm {
+        user_id: u64,
+        sender_name: String,
+    },
+    DecideToolApproval {
+        approval_id: String,
+        decision: ToolApprovalDecision,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedBannerEntry {
     pub msg_id: u64,
@@ -415,6 +529,11 @@ pub struct ConversationStage {
     pub active_bot_card_field: Option<(String, BotAssistLoginField)>,
     pub bot_assist_ime_preedit: Option<String>,
     pub pending_bot_assist_action: Option<BotAssistCardAction>,
+    pub room_agent_states: HashMap<u64, RoomAgentLiveState>,
+    pub pending_stage_action: Option<StageAction>,
+    pub permission_dock: ToolPermissionDock,
+    pub group_member_tiles: Vec<(String, u32)>,
+    pub bot_hues_by_user_id: HashMap<u64, String>,
 }
 
 impl ConversationStage {
@@ -525,9 +644,81 @@ impl ConversationStage {
             active_bot_card_field: None,
             bot_assist_ime_preedit: None,
             pending_bot_assist_action: None,
+            room_agent_states: HashMap::new(),
+            pending_stage_action: None,
+            permission_dock: ToolPermissionDock::new(0),
+            group_member_tiles: Vec::new(),
+            bot_hues_by_user_id: HashMap::new(),
         };
         stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
         stage
+    }
+
+    pub fn take_stage_action(&mut self) -> Option<StageAction> {
+        self.pending_stage_action.take()
+    }
+
+    pub fn on_agent_floor_changed(
+        &mut self,
+        chat_id: u64,
+        current_speaker: Option<String>,
+        queued_count: usize,
+        loop_hops: u32,
+        now_ms: i64,
+    ) {
+        let entry = self.room_agent_states.entry(chat_id).or_default();
+        entry.apply_floor_changed(current_speaker, queued_count, loop_hops, now_ms);
+    }
+
+    pub fn on_agent_handoff(
+        &mut self,
+        chat_id: u64,
+        from_agent: String,
+        to_agent: String,
+        hop: u32,
+        max_hops: u32,
+        now_ms: i64,
+    ) {
+        let entry = self.room_agent_states.entry(chat_id).or_default();
+        entry.apply_handoff(from_agent, to_agent, hop, max_hops, now_ms);
+    }
+
+    pub fn on_agent_workspace_updated(
+        &mut self,
+        chat_id: u64,
+        revision: u64,
+        key: String,
+        now_ms: i64,
+    ) {
+        let entry = self.room_agent_states.entry(chat_id).or_default();
+        entry.apply_workspace_updated(revision, key, now_ms);
+    }
+
+    pub fn active_room_agent_state(&self, now_ms: i64) -> Option<&RoomAgentLiveState> {
+        let cid = self.active_chat_id?;
+        self.room_agent_states
+            .get(&cid)
+            .filter(|st| st.is_active(now_ms))
+    }
+
+    pub fn sync_pending_tool_approvals(&mut self, requests: Vec<PendingToolApproval>) {
+        self.permission_dock.palette = self.palette;
+        self.permission_dock.language_id = self.lang_id.clone();
+        self.permission_dock.sync_requests(requests);
+    }
+
+    pub fn push_pending_tool_approval(&mut self, req: PendingToolApproval) {
+        self.permission_dock.palette = self.palette;
+        self.permission_dock.language_id = self.lang_id.clone();
+        self.permission_dock.push_request(req);
+    }
+
+    pub fn set_group_member_tiles(&mut self, tiles: Vec<(String, u32)>) {
+        self.group_member_tiles = tiles;
+    }
+
+    pub fn set_bot_hues_map(&mut self, map: HashMap<u64, String>) {
+        self.bot_hues_by_user_id = map;
     }
 
     pub fn reset(&mut self) {
@@ -547,6 +738,10 @@ impl ConversationStage {
         self.bot_activity_detail = None;
         self.is_viewer_owner_fabushi_bot = false;
         self.pending_bot_start = false;
+        self.room_agent_states.clear();
+        self.pending_stage_action = None;
+        self.permission_dock.sync_requests(Vec::new());
+        self.group_member_tiles.clear();
         self.clear_all_bot_card_drafts();
     }
 
@@ -639,6 +834,8 @@ impl ConversationStage {
             self.active_bot_card_field = None;
             self.bot_assist_ime_preedit = None;
             self.pending_bot_assist_action = None;
+            self.group_member_tiles.clear();
+            self.permission_dock.sync_requests(Vec::new());
         }
         self.active_chat_id = Some(chat_id);
         self.chat_title = title.to_string();
@@ -748,14 +945,33 @@ impl ConversationStage {
             })
             .map(|m| m.id);
 
+        let mut row_palette = self.palette;
+        if !is_group_chat && row_palette.is_apple_style() {
+            if let Some(ref fab) = self.active_fabushi_bot {
+                if TdesktopThemePalette::is_tinted_bot_hue(&fab.avatar_color) {
+                    let (bubble_fill, _, _) = TdesktopThemePalette::bot_hue_colors(
+                        &fab.avatar_color,
+                        row_palette.mode.is_dark(),
+                    );
+                    row_palette.msg_out_bg = bubble_fill;
+                    row_palette.msg_out_bg_top = bubble_fill;
+                    row_palette.msg_out_bg_bottom = bubble_fill;
+                }
+            }
+        }
+        let is_dark = row_palette.mode.is_dark();
+
         for idx in start_idx..=end_idx.min(total_msgs.saturating_sub(1)) {
             let msg = &self.messages[idx];
             let (attached_prev, attached_next) = compute_attachment(&self.messages, idx);
             let is_outgoing = msg.direction == MessageDirection::Outgoing;
+            let show_group_author_pill = !is_outgoing && !attached_prev && is_group_chat;
             let group = BubbleGroupLayout {
                 attached_to_prev: attached_prev,
                 attached_to_next: attached_next,
-                show_sender_name: !is_outgoing && !attached_prev && is_group_chat,
+                // In Apple/Grok style we render the clickable hue-tinted `.sand-group-author` pill
+                // directly above the row so `stage_bubble.rs` doesn't render a duplicate plain label.
+                show_sender_name: false,
                 show_bottom_avatar: !is_outgoing && !attached_next,
                 show_tail: !attached_next,
                 reserve_avatar_column: !is_outgoing && is_group_chat,
@@ -790,7 +1006,7 @@ impl ConversationStage {
             let is_row_hovered =
                 self.hovered_message_id == Some(msg.id) || self.hovered_gutter_id == Some(msg.id);
 
-            message_rows.push(render_message_row_apple(
+            let bubble_row = render_message_row_apple(
                 msg,
                 meta,
                 self.active_fabushi_bot.as_ref(),
@@ -817,12 +1033,89 @@ impl ConversationStage {
                     active_field: self.active_bot_card_field.as_ref(),
                     ime_preedit: self.bot_assist_ime_preedit.as_deref(),
                 }),
-                &self.palette,
+                &row_palette,
                 &self.lang_id,
                 window,
                 cx,
                 |this, action, cx| this.handle_bubble_action(action, cx),
-            ));
+            );
+
+            if show_group_author_pill && !msg.sender_name.trim().is_empty() {
+                let sender_uid = msg.sender_id;
+                let sender_name = msg.sender_name.clone();
+                let is_known_bot = self.bot_hues_by_user_id.contains_key(&sender_uid);
+                let hue_name = self
+                    .bot_hues_by_user_id
+                    .get(&sender_uid)
+                    .map(String::as_str)
+                    .filter(|h| TdesktopThemePalette::is_tinted_bot_hue(h))
+                    .unwrap_or_else(|| TdesktopThemePalette::bot_hue_name_for_id(sender_uid));
+                let (dot_fill, pill_bg, pill_text) =
+                    TdesktopThemePalette::bot_hue_colors(hue_name, is_dark);
+                let pill_border = TdesktopThemePalette::rgba_with_alpha(pill_text, if is_dark { 0.24 } else { 0.18 });
+                let pill_hover = TdesktopThemePalette::rgba_with_alpha(pill_text, if is_dark { 0.22 } else { 0.14 });
+                let click_name = sender_name.clone();
+                let pill_row = div()
+                    .w_full()
+                    .pl(px(46.0))
+                    .pt(px(6.0))
+                    .pb(px(1.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(("sand-group-author-pill", msg.id))
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded_full()
+                            .bg(rgb(pill_bg))
+                            .border_1()
+                            .border_color(pill_border)
+                            .hover(move |s| s.bg(pill_hover))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.pending_stage_action = Some(StageAction::OpenSenderDm {
+                                        user_id: sender_uid,
+                                        sender_name: click_name.clone(),
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .when(is_known_bot, |row| {
+                                row.child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded_full()
+                                        .bg(rgb(dot_fill)),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pill_text))
+                                    .child(sender_name),
+                            ),
+                    );
+                message_rows.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .child(pill_row)
+                        .child(bubble_row)
+                        .into_any_element(),
+                );
+            } else {
+                message_rows.push(bubble_row);
+            }
         }
         message_rows
     }
@@ -1018,7 +1311,9 @@ impl Render for ConversationStage {
 
         let mut top_chrome_children: Vec<AnyElement> = Vec::new();
         if show_top_chrome {
-            top_chrome_children.push(render_stage_top_bar(
+            let header_tiles = (!self.group_member_tiles.is_empty())
+                .then_some(self.group_member_tiles.as_slice());
+            top_chrome_children.push(render_stage_top_bar_with_group(
                 self.active_chat_id,
                 &self.chat_title,
                 &self.chat_subtitle,
@@ -1026,6 +1321,8 @@ impl Render for ConversationStage {
                 self.chat_avatar_url.as_deref(),
                 self.active_fabushi_bot.as_ref(),
                 self.is_bot_chat,
+                is_group_chat,
+                header_tiles,
                 &self.bot_activity_state,
                 self.select_mode_active,
                 self.selected_message_ids.len(),
@@ -1189,6 +1486,162 @@ impl Render for ConversationStage {
                         el.child(div().id("stage-top-spacer").w_full().h(px(top_spacer_height)).flex_shrink_0())
                     })
                     .children(message_rows)
+                    .when_some(
+                        self.active_room_agent_state(stage_now_ms() as i64).cloned(),
+                        |el, live| {
+                            let is_dark = self.palette.mode.is_dark();
+                            let lang = self.lang_id.as_str();
+                            let is_zh = lang.starts_with("zh");
+                            let speaker_name = live
+                                .current_speaker
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    if is_zh { "AI 智能体".to_string() } else { "AI Agent".to_string() }
+                                });
+                            let seed_hash = speaker_name
+                                .bytes()
+                                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+                            let (speaker_fill, speaker_bg, speaker_fg) =
+                                TdesktopThemePalette::bot_hue_colors(
+                                    TdesktopThemePalette::bot_hue_name_for_id(seed_hash),
+                                    is_dark,
+                                );
+                            let (_, handoff_bg, handoff_fg) =
+                                TdesktopThemePalette::bot_hue_colors("purple", is_dark);
+                            let (_, ws_bg, ws_fg) =
+                                TdesktopThemePalette::bot_hue_colors("cyan", is_dark);
+                            let speaker_initial: String = speaker_name
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .take(1)
+                                .collect::<String>()
+                                .to_uppercase();
+                            let handoff_trail = live.format_handoff_trail(lang);
+                            let ws_pulse = live.last_workspace_key.as_ref().map(|k| {
+                                if is_zh {
+                                    format!("共享工作区 #{} · {k}", live.workspace_revision)
+                                } else {
+                                    format!("Workspace #{} · {k}", live.workspace_revision)
+                                }
+                            });
+                            let speaker_line = if live.current_speaker.is_some() {
+                                if is_zh {
+                                    format!("{speaker_name} 正在发言…")
+                                } else {
+                                    format!("{speaker_name} is responding…")
+                                }
+                            } else if is_zh {
+                                "多智能体协作同步中…".to_string()
+                            } else {
+                                "Multi-agent room active…".to_string()
+                            };
+                            el.child(
+                                div()
+                                    .id("stage-sand-activity-line")
+                                    .w_full()
+                                    .px(px(16.0))
+                                    .pt(px(8.0))
+                                    .pb(px(4.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .flex_wrap()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .px(px(9.0))
+                                            .py(px(4.0))
+                                            .rounded_full()
+                                            .bg(rgb(speaker_bg))
+                                            .border_1()
+                                            .border_color(TdesktopThemePalette::rgba_with_alpha(
+                                                speaker_fg, 0.24,
+                                            ))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .w(px(20.0))
+                                                    .h(px(20.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(speaker_fill))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(rgb(0xFFFFFF))
+                                                    .child(if speaker_initial.is_empty() {
+                                                        "B".to_string()
+                                                    } else {
+                                                        speaker_initial
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(speaker_fg))
+                                                    .child(speaker_line),
+                                            )
+                                            .when(live.queued_count > 0, |row| {
+                                                row.child(
+                                                    div()
+                                                        .px(px(6.0))
+                                                        .py(px(1.0))
+                                                        .rounded_full()
+                                                        .bg(TdesktopThemePalette::rgba_with_alpha(
+                                                            speaker_fg, 0.16,
+                                                        ))
+                                                        .text_size(px(10.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(rgb(speaker_fg))
+                                                        .child(if is_zh {
+                                                            format!("+{} 排队", live.queued_count)
+                                                        } else {
+                                                            format!("+{} queued", live.queued_count)
+                                                        }),
+                                                )
+                                            }),
+                                    )
+                                    .when_some(handoff_trail, |row, trail| {
+                                        row.child(
+                                            div()
+                                                .px(px(8.0))
+                                                .py(px(4.0))
+                                                .rounded_full()
+                                                .bg(rgb(handoff_bg))
+                                                .border_1()
+                                                .border_color(TdesktopThemePalette::rgba_with_alpha(
+                                                    handoff_fg, 0.24,
+                                                ))
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(handoff_fg))
+                                                .child(trail),
+                                        )
+                                    })
+                                    .when_some(ws_pulse, |row, ws_lbl| {
+                                        row.child(
+                                            div()
+                                                .px(px(8.0))
+                                                .py(px(4.0))
+                                                .rounded_full()
+                                                .bg(rgb(ws_bg))
+                                                .border_1()
+                                                .border_color(TdesktopThemePalette::rgba_with_alpha(
+                                                    ws_fg, 0.24,
+                                                ))
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(ws_fg))
+                                                .child(ws_lbl),
+                                        )
+                                    }),
+                            )
+                        },
+                    )
                     .when(
                         self.is_bot_chat
                             && !self.bot_activity_state.is_empty()
@@ -1400,6 +1853,31 @@ impl Render for ConversationStage {
             .when_some(drag_overlay, |el, overlay| el.child(overlay));
 
         root = root.child(transcript);
+
+        if let Some(dock_el) = render_tool_permission_dock_inline(
+            &self.permission_dock,
+            &self.palette,
+            &self.lang_id,
+            cx,
+            |this, cx| {
+                this.permission_dock.step_prev();
+                cx.notify();
+            },
+            |this, cx| {
+                this.permission_dock.step_next();
+                cx.notify();
+            },
+            |this, approval_id, decision, cx| {
+                this.permission_dock.decide(&approval_id, decision);
+                this.pending_stage_action = Some(StageAction::DecideToolApproval {
+                    approval_id,
+                    decision,
+                });
+                cx.notify();
+            },
+        ) {
+            root = root.child(dock_el);
+        }
 
         if is_apple {
             if !top_chrome_children.is_empty() {

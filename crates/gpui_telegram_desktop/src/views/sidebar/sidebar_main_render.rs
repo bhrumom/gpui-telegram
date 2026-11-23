@@ -78,8 +78,12 @@ impl Render for ChatSidebar {
         let is_search_focused = self.search_focused;
         let is_plus_open = self.is_plus_menu_open;
         let is_apple_compose = palette.is_apple_style() && is_plus_open;
-        let compose_query = self.compose_recipient_query.clone();
-        let row_active_id = if is_apple_compose { None } else { active_id };
+        let pending_creation = self.compose_draft.pending_creation.clone();
+        let row_active_id = if is_apple_compose || pending_creation.is_some() {
+            None
+        } else {
+            active_id
+        };
         let creation_modal = self.active_creation_modal;
         let contact_kind = self.contact_kind;
         let active_field = self.active_creation_field;
@@ -110,7 +114,7 @@ impl Render for ChatSidebar {
             return render_collapsed_gemini_sidebar(
                 &nav_snapshot,
                 &rail_dialogs,
-                active_id,
+                row_active_id,
                 self.hovered_rail_item,
                 self.hovered_rail_dialog_id,
                 &palette,
@@ -385,110 +389,6 @@ impl Render for ChatSidebar {
                 .collect();
 
             let mut scroll_sections: Vec<AnyElement> = Vec::new();
-            if is_apple_compose {
-                scroll_sections.push(
-                    div()
-                        .w_full()
-                        .px(px(palette.scaled_px(8.0)))
-                        .pt(px(palette.scaled_px(4.0)))
-                        .child(
-                            div()
-                                .id("sidebar-compose-draft-row")
-                                .cursor_pointer()
-                                .h(px(palette.scaled_px(64.0)))
-                                .w_full()
-                                .pl(px(palette.scaled_px(18.0)))
-                                .pr(px(palette.scaled_px(10.0)))
-                                .py(px(palette.scaled_px(8.0)))
-                                .rounded(px(palette.scaled_px(10.0)))
-                                .bg(rgb(palette.dialogs_active_bg))
-                                .flex()
-                                .items_center()
-                                .gap(px(palette.scaled_px(10.0)))
-                                .child(
-                                    div()
-                                        .w(px(palette.scaled_px(44.0)))
-                                        .h(px(palette.scaled_px(44.0)))
-                                        .rounded_full()
-                                        .flex_shrink_0()
-                                        .bg(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.22))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(tg_icon(
-                                            IconName::ContactsUsers,
-                                            palette.scaled_px(20.0),
-                                            0xFFFFFF,
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .flex()
-                                        .flex_col()
-                                        .justify_center()
-                                        .gap(px(palette.scaled_px(2.0)))
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .text_size(px(palette.scaled_px(13.5)))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(0xFFFFFF))
-                                                .child(tr_str(&lang_id, "新信息", "New Message")),
-                                        )
-                                        .when(!compose_query.trim().is_empty(), |col| {
-                                            col.child(
-                                                div()
-                                                    .truncate()
-                                                    .text_size(px(palette.scaled_px(12.0)))
-                                                    .text_color(
-                                                        TdesktopThemePalette::rgba_with_alpha(
-                                                            0xFFFFFF, 0.85,
-                                                        ),
-                                                    )
-                                                    .child(format!(
-                                                        "{}{}",
-                                                        tr_str(&lang_id, "至: ", "To: "),
-                                                        compose_query.trim()
-                                                    )),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .id("sidebar-compose-draft-close")
-                                        .cursor_pointer()
-                                        .w(px(palette.scaled_px(22.0)))
-                                        .h(px(palette.scaled_px(22.0)))
-                                        .rounded_full()
-                                        .flex_shrink_0()
-                                        .hover(|s| {
-                                            s.bg(TdesktopThemePalette::rgba_with_alpha(
-                                                0xFFFFFF, 0.20,
-                                            ))
-                                        })
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _ev, _w, cx| {
-                                                cx.stop_propagation();
-                                                this.exit_compose_mode();
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(tg_icon(
-                                            IconName::Close,
-                                            palette.scaled_px(11.0),
-                                            0xFFFFFF,
-                                        )),
-                                ),
-                        )
-                        .into_any_element(),
-                );
-            }
             if is_apple {
                 if let Some(pinned_grid) = render_pinned_chats_grid(
                     &pinned_grid_items,
@@ -519,6 +419,78 @@ impl Render for ChatSidebar {
                     .bg(palette.separator_rgba())
                     .into_any_element()
             };
+
+            let render_pending_creation_standin =
+                |pending: &crate::views::chat_sidebar::PendingComposeCreation| -> AnyElement {
+                    let row_bg = if palette.mode.is_dark() {
+                        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+                    } else {
+                        TdesktopThemePalette::rgba_with_alpha(0x1C1C1C, 0.08)
+                    };
+                    let avatar_bg = if palette.mode.is_dark() {
+                        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.12)
+                    } else {
+                        TdesktopThemePalette::rgba_with_alpha(0x1C1C1C, 0.10)
+                    };
+                    let icon_kind = if pending.recipients.len() >= 2 {
+                        IconName::GroupUsers
+                    } else {
+                        IconName::ContactsUsers
+                    };
+                    div()
+                        .id("sidebar-compose-creating-row")
+                        .h(px(palette.scaled_px(54.0)))
+                        .w_full()
+                        .px(px(palette.scaled_px(10.0)))
+                        .py(px(palette.scaled_px(6.0)))
+                        .rounded(px(palette.scaled_px(10.0)))
+                        .bg(row_bg)
+                        .opacity(0.86)
+                        .flex()
+                        .items_center()
+                        .gap(px(palette.scaled_px(10.0)))
+                        .child(
+                            div()
+                                .w(px(palette.scaled_px(36.0)))
+                                .h(px(palette.scaled_px(36.0)))
+                                .rounded_full()
+                                .flex_shrink_0()
+                                .bg(avatar_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(tg_icon(
+                                    icon_kind,
+                                    palette.scaled_px(17.0),
+                                    palette.text_secondary,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .justify_center()
+                                .gap(px(palette.scaled_px(2.0)))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(palette.scaled_px(13.5)))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(palette.text_primary))
+                                        .child(pending.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(palette.scaled_px(12.0)))
+                                        .text_color(rgb(palette.text_secondary))
+                                        .child(tr_str(&lang_id, "创建中…", "Creating…")),
+                                ),
+                        )
+                        .into_any_element()
+                };
 
             let mut list: Vec<AnyElement> = Vec::new();
             if let Some(arch_header) = render_archived_header_row(
@@ -574,7 +546,14 @@ impl Render for ChatSidebar {
             }
 
             let selected_topic = self.selected_topic_id;
+            let mut standin_inserted = false;
             for (idx, (item, meta)) in main_with_meta.iter().enumerate() {
+                if !standin_inserted && !item.is_pinned {
+                    if let Some(ref pending) = pending_creation {
+                        list.push(render_pending_creation_standin(pending));
+                        standin_inserted = true;
+                    }
+                }
                 list.push(render_sidebar_dialog_row(
                     item,
                     idx,
@@ -609,10 +588,16 @@ impl Render for ChatSidebar {
                     }
                 }
             }
+            if !standin_inserted {
+                if let Some(ref pending) = pending_creation {
+                    list.push(render_pending_creation_standin(pending));
+                }
+            }
 
             let has_any_dialog = !pinned_grid_items.is_empty()
                 || !archived_with_meta.is_empty()
-                || !main_with_meta.is_empty();
+                || !main_with_meta.is_empty()
+                || pending_creation.is_some();
             if !has_any_dialog {
                 list.push(
                     div()

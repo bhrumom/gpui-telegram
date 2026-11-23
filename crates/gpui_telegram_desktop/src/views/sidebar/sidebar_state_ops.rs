@@ -7,9 +7,9 @@ use gpui_telegram_proto::miniapp_contracts::CLASSIC_INITIALS_AVATAR_SHAPE;
 
 use crate::i18n::tr_str;
 use crate::views::chat_sidebar::{
-    AddContactKind, BotGrokAvatarVisual, CategorizedSearchResult, ChatSidebar, CreationInputField,
-    DialogDeliveryStatus, DialogItemModel, PendingAddContactRequest, PendingCreateGroupRequest,
-    SidebarCreationModal,
+    AddContactKind, BotGrokAvatarVisual, CategorizedSearchResult, ChatSidebar, ComposeDraftState,
+    ComposeRecipientChip, CreationInputField, DialogDeliveryStatus, DialogItemModel,
+    PendingAddContactRequest, PendingCreateGroupRequest, SidebarCreationModal,
 };
 use crate::views::nav_rail::{NavDestination, NavRail};
 use crate::views::sidebar::dialogs_row_view::{SidebarContextAction, SidebarDialogMeta};
@@ -364,8 +364,7 @@ impl ChatSidebar {
     }
 
     fn reset_creation_inputs(&mut self, modal: SidebarCreationModal) {
-        self.is_plus_menu_open = false;
-        self.compose_recipient_query.clear();
+        self.exit_compose_mode();
         self.is_account_popover_open = false;
         self.search_focused = false;
         self.active_creation_modal = Some(modal);
@@ -391,11 +390,359 @@ impl ChatSidebar {
 
     pub fn close_creation_modal(&mut self) {
         self.active_creation_modal = None;
-        self.is_plus_menu_open = false;
-        self.compose_recipient_query.clear();
+        self.exit_compose_mode();
         self.creation_primary_input.clear();
         self.creation_secondary_input.clear();
         self.creation_tertiary_input.clear();
+    }
+
+    /// Adds a recipient chip to the multi-select compose draft, deduplicating by `user_id`
+    /// (or handle/name when `user_id == 0`). Flips `is_group_mode` once ≥2 recipients are picked.
+    pub fn add_compose_recipient(&mut self, chip: ComposeRecipientChip) -> bool {
+        let duplicate = if chip.user_id > 0 {
+            self.compose_draft
+                .selected_recipients
+                .iter()
+                .any(|existing| existing.user_id == chip.user_id)
+        } else if let Some(ref un) = chip.username {
+            self.compose_draft
+                .selected_recipients
+                .iter()
+                .any(|existing| {
+                    existing
+                        .username
+                        .as_deref()
+                        .is_some_and(|e| e.eq_ignore_ascii_case(un))
+                })
+        } else {
+            self.compose_draft
+                .selected_recipients
+                .iter()
+                .any(|existing| existing.display_name.eq_ignore_ascii_case(&chip.display_name))
+        };
+        if duplicate {
+            return false;
+        }
+        self.compose_draft.selected_recipients.push(chip);
+        if self.compose_draft.selected_recipients.len() >= 2 {
+            self.compose_draft.is_group_mode = true;
+        }
+        self.compose_recipient_query.clear();
+        self.compose_draft.highlighted_index = 0;
+        self.compose_draft.menu_open = true;
+        self.compose_draft.creation_error = None;
+        true
+    }
+
+    /// Removes a selected recipient chip by `user_id`.
+    pub fn remove_compose_recipient(&mut self, user_id: u64) -> bool {
+        let before = self.compose_draft.selected_recipients.len();
+        self.compose_draft
+            .selected_recipients
+            .retain(|chip| chip.user_id != user_id);
+        let removed = self.compose_draft.selected_recipients.len() != before;
+        if removed {
+            self.compose_draft.highlighted_index = 0;
+            self.compose_draft.creation_error = None;
+        }
+        removed
+    }
+
+    /// Removes and returns the last selected recipient chip (e.g. Backspace on empty query).
+    pub fn pop_last_compose_recipient(&mut self) -> Option<ComposeRecipientChip> {
+        let popped = self.compose_draft.selected_recipients.pop();
+        if popped.is_some() {
+            self.compose_draft.highlighted_index = 0;
+            self.compose_draft.creation_error = None;
+        }
+        popped
+    }
+
+    /// Toggles a recipient chip: removes it if already selected, otherwise adds it.
+    /// Returns `true` if the chip is now selected.
+    pub fn toggle_compose_recipient(&mut self, chip: ComposeRecipientChip) -> bool {
+        let already_selected = if chip.user_id > 0 {
+            self.compose_draft
+                .selected_recipients
+                .iter()
+                .any(|existing| existing.user_id == chip.user_id)
+        } else if let Some(ref un) = chip.username {
+            self.compose_draft
+                .selected_recipients
+                .iter()
+                .any(|existing| {
+                    existing
+                        .username
+                        .as_deref()
+                        .is_some_and(|e| e.eq_ignore_ascii_case(un))
+                })
+        } else {
+            false
+        };
+        if already_selected {
+            if chip.user_id > 0 {
+                self.remove_compose_recipient(chip.user_id);
+            } else if let Some(ref un) = chip.username {
+                self.compose_draft.selected_recipients.retain(|existing| {
+                    !existing
+                        .username
+                        .as_deref()
+                        .is_some_and(|e| e.eq_ignore_ascii_case(un))
+                });
+                self.compose_draft.highlighted_index = 0;
+                self.compose_draft.creation_error = None;
+            }
+            false
+        } else {
+            self.add_compose_recipient(chip)
+        }
+    }
+
+    /// Opens compose directly in multi-select group mode (`⌘⇧N` or "New Group" action).
+    /// Preserves any already-selected chips if compose was already open.
+    pub fn open_compose_group_mode(&mut self) {
+        let was_open = self.is_plus_menu_open;
+        self.expand_from_user_if_collapsed();
+        self.is_account_popover_open = false;
+        self.search_focused = false;
+        self.is_contacts_modal_open = false;
+        self.active_creation_modal = None;
+        self.is_plus_menu_open = true;
+        self.compose_recipient_query.clear();
+        self.compose_title_focused = false;
+        if !was_open {
+            let preserved_pending = self.compose_draft.pending_creation.clone();
+            self.compose_draft = ComposeDraftState {
+                is_group_mode: true,
+                menu_open: true,
+                pending_creation: preserved_pending,
+                ..ComposeDraftState::default()
+            };
+        } else {
+            self.compose_draft.is_group_mode = true;
+            self.compose_draft.menu_open = true;
+            self.compose_draft.highlighted_index = 0;
+            self.compose_draft.creation_error = None;
+        }
+    }
+
+    /// Opens multi-select compose pre-seeded with a specific contact or AI Bot chip
+    /// (e.g. triggered from Inspector `OpenAddBotToGroup`).
+    pub fn open_compose_with_seed_recipient(
+        &mut self,
+        user_id: u64,
+        display_name: String,
+        username: Option<String>,
+        is_bot: bool,
+        bot_id: Option<String>,
+        avatar_color: u32,
+    ) {
+        self.expand_from_user_if_collapsed();
+        self.is_account_popover_open = false;
+        self.search_focused = false;
+        self.is_contacts_modal_open = false;
+        self.active_creation_modal = None;
+        self.is_plus_menu_open = true;
+        self.compose_recipient_query.clear();
+        self.compose_title_focused = false;
+
+        let preserved_pending = self.compose_draft.pending_creation.clone();
+        self.compose_draft = ComposeDraftState {
+            is_group_mode: true,
+            menu_open: true,
+            pending_creation: preserved_pending,
+            ..ComposeDraftState::default()
+        };
+
+        let clean_name = display_name.trim().to_string();
+        let clean_username = username
+            .map(|u| u.trim().trim_start_matches('@').to_string())
+            .filter(|u| !u.is_empty());
+        let label = if !clean_name.is_empty() {
+            clean_name
+        } else if let Some(ref un) = clean_username {
+            un.clone()
+        } else if user_id > 0 {
+            format!("User {user_id}")
+        } else {
+            "Bot".to_string()
+        };
+        let initials = initials_or_fallback(&label, if is_bot { "AI" } else { "U" });
+        let avatar_shape = if is_bot {
+            self.bot_grok_avatars
+                .values()
+                .find(|vis| {
+                    bot_id
+                        .as_deref()
+                        .is_some_and(|bid| !bid.is_empty() && vis.agent_id.eq_ignore_ascii_case(bid))
+                        || clean_username
+                            .as_deref()
+                            .is_some_and(|un| vis.agent_id.eq_ignore_ascii_case(un))
+                })
+                .map(|vis| vis.shape.clone())
+        } else {
+            None
+        };
+
+        let chip = ComposeRecipientChip {
+            user_id,
+            chat_id: None,
+            username: clean_username,
+            display_name: label,
+            initials,
+            is_bot,
+            bot_id,
+            avatar_color: if avatar_color != 0 { avatar_color } else { 0x5E5CE6 },
+            avatar_shape,
+        };
+        self.add_compose_recipient(chip);
+    }
+
+    /// Generates a Grok Bot-style narrow-conjunction group title (`"A、B、C"` / `"A, B & C"`),
+    /// collapsed and safely truncated to ≤72 Unicode characters.
+    pub fn auto_generate_group_title(&self, account_name: Option<&str>) -> String {
+        let mut raw_names: Vec<String> = self
+            .compose_draft
+            .selected_recipients
+            .iter()
+            .filter_map(|chip| {
+                let trimmed = chip.display_name.trim();
+                if !trimmed.is_empty() {
+                    Some(trimmed.to_string())
+                } else {
+                    chip.username
+                        .as_deref()
+                        .map(|u| u.trim().trim_start_matches('@').to_string())
+                        .filter(|u| !u.is_empty())
+                }
+            })
+            .collect();
+
+        if let Some(acc) = account_name.map(str::trim).filter(|s| !s.is_empty()) {
+            let already_present = raw_names.iter().any(|n| n.eq_ignore_ascii_case(acc));
+            if !already_present {
+                if raw_names.len() == 1 {
+                    raw_names.push(acc.to_string());
+                } else if raw_names.len() >= 2 {
+                    raw_names.insert(0, acc.to_string());
+                } else {
+                    raw_names.push(acc.to_string());
+                }
+            }
+        }
+
+        let is_en = self.language_id.to_ascii_lowercase().starts_with("en");
+        if raw_names.is_empty() {
+            return if is_en {
+                "New Group".to_string()
+            } else {
+                "新建群聊".to_string()
+            };
+        }
+
+        let joined = if !is_en {
+            raw_names.join("、")
+        } else {
+            match raw_names.len() {
+                1 => raw_names[0].clone(),
+                2 => format!("{} & {}", raw_names[0], raw_names[1]),
+                n => format!("{} & {}", raw_names[..n - 1].join(", "), raw_names[n - 1]),
+            }
+        };
+
+        let collapsed = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.chars().count() <= 72 {
+            collapsed
+        } else {
+            let mut truncated: String = collapsed.chars().take(71).collect();
+            while truncated.ends_with([' ', '、', ',', '&']) {
+                truncated.pop();
+            }
+            truncated.push('…');
+            truncated
+        }
+    }
+
+    /// Returns the user-entered custom group title if non-empty, otherwise falls back to
+    /// [`Self::auto_generate_group_title`].
+    pub fn effective_compose_group_title(&self, account_name: Option<&str>) -> String {
+        let custom = self.compose_draft.custom_group_title.trim();
+        if !custom.is_empty() {
+            custom.chars().take(72).collect()
+        } else {
+            self.auto_generate_group_title(account_name)
+        }
+    }
+
+    /// Formats the bottom composer placeholder while compose mode is active:
+    /// `"发消息给联系人或 Bot"` when 0 recipients are selected, or `"发消息给 {names}"` when ≥1.
+    pub fn compose_placeholder_text(&self, lang_id: &str) -> String {
+        let is_en = lang_id.to_ascii_lowercase().starts_with("en");
+        let names: Vec<String> = self
+            .compose_draft
+            .selected_recipients
+            .iter()
+            .filter_map(|chip| {
+                let trimmed = chip.display_name.trim();
+                if !trimmed.is_empty() {
+                    Some(trimmed.to_string())
+                } else {
+                    chip.username
+                        .as_deref()
+                        .map(|u| u.trim().trim_start_matches('@').to_string())
+                        .filter(|u| !u.is_empty())
+                }
+            })
+            .collect();
+        if names.is_empty() {
+            return if is_en {
+                "Message a contact or Bot".to_string()
+            } else {
+                "发消息给联系人或 Bot".to_string()
+            };
+        }
+        let formatted = if !is_en {
+            match names.len() {
+                1 => names[0].clone(),
+                2 => format!("{} 和 {}", names[0], names[1]),
+                n => format!("{} 和 {}", names[..n - 1].join("、"), names[n - 1]),
+            }
+        } else {
+            match names.len() {
+                1 => names[0].clone(),
+                2 => format!("{} and {}", names[0], names[1]),
+                n => format!("{}, and {}", names[..n - 1].join(", "), names[n - 1]),
+            }
+        };
+        if is_en {
+            format!("Message {formatted}")
+        } else {
+            format!("发消息给 {formatted}")
+        }
+    }
+
+    pub fn has_compose_bot_recipient(&self) -> bool {
+        self.compose_draft
+            .selected_recipients
+            .iter()
+            .any(|chip| chip.is_bot)
+    }
+
+    pub fn set_compose_recipient_query(&mut self, query: impl Into<String>) {
+        self.compose_recipient_query = query.into();
+        self.compose_draft.highlighted_index = 0;
+        self.compose_draft.menu_open = true;
+    }
+
+    pub fn move_compose_highlight(&mut self, delta: isize, total: usize) {
+        if total == 0 {
+            self.compose_draft.highlighted_index = 0;
+            return;
+        }
+        let cur = self.compose_draft.highlighted_index.min(total - 1) as isize;
+        let next = (cur + delta).rem_euclid(total as isize) as usize;
+        self.compose_draft.highlighted_index = next;
+        self.compose_draft.menu_open = true;
     }
 
     fn creation_field_mut(&mut self) -> &mut String {
@@ -1001,21 +1348,21 @@ impl ChatSidebar {
                 self.standalone_active_destination = dest;
                 self.context_menu = None;
                 if dest != NavDestination::Chats {
-                    self.is_plus_menu_open = false;
+                    self.exit_compose_mode();
                 }
                 self.update_nav_rail(cx, |r| r.select(dest));
                 cx.notify();
             }
             UnifiedSidebarAction::SelectDialog(dialog_id) => {
                 self.is_account_popover_open = false;
-                self.is_plus_menu_open = false;
+                self.exit_compose_mode();
                 self.context_menu = None;
                 self.select_dialog_from_user(dialog_id);
                 cx.notify();
             }
             UnifiedSidebarAction::OpenMainMenu => {
                 self.is_account_popover_open = !self.is_account_popover_open;
-                self.is_plus_menu_open = false;
+                self.exit_compose_mode();
                 self.context_menu = None;
                 cx.notify();
             }

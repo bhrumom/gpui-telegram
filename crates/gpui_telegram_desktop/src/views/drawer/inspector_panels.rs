@@ -4,6 +4,7 @@
 use crate::i18n::tr_str;
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::TdesktopThemePalette;
+use crate::views::context_inspector::{filter_add_member_candidates, AddMemberCandidate};
 use crate::views::drawer::inspector_tabs::{
     InspectorAction, InspectorTab, MembersTabModel, ProfileTabModel, SettingsTabModel,
     SharedFileItem, SharedMediaItem, SharedMediaSubTab, SharedMediaTabModel,
@@ -554,7 +555,359 @@ pub fn render_members_panel(
     lang: &str,
     cx: &mut Context<ContextInspector>,
 ) -> AnyElement {
+    render_members_panel_inner(model, false, false, "", None, &[], pal, lang, cx)
+}
+
+/// Renders the Group Members inspector tab along with Grok Bot's inline searchable
+/// `"+ 添加成员"` picker (contacts + Fabushi AI Bots) when open.
+pub fn render_members_panel_with_picker(
+    inspector: &ContextInspector,
+    pal: TdesktopThemePalette,
+    lang: &str,
+    cx: &mut Context<ContextInspector>,
+) -> AnyElement {
+    let preedit = inspector
+        .add_member_search_input
+        .as_ref()
+        .and_then(|ctrl| ctrl.read(cx).ime_preedit.clone());
+    render_members_panel_inner(
+        &inspector.members,
+        inspector.add_member_picker_open,
+        inspector.add_member_search_focused,
+        &inspector.add_member_query,
+        preedit.as_deref(),
+        &inspector.add_member_candidates,
+        pal,
+        lang,
+        cx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_members_panel_inner(
+    model: &MembersTabModel,
+    picker_open: bool,
+    search_focused: bool,
+    search_query: &str,
+    search_preedit: Option<&str>,
+    candidates: &[AddMemberCandidate],
+    pal: TdesktopThemePalette,
+    lang: &str,
+    cx: &mut Context<ContextInspector>,
+) -> AnyElement {
+    let is_dark = pal.mode.is_dark();
     let invite = model.invite_link.clone();
+    let picker_panel: Option<AnyElement> = picker_open.then(|| {
+        let filtered = filter_add_member_candidates(candidates, search_query);
+        let row_hover = pal.row_hover_rgba();
+        let combined_empty = search_query.is_empty() && search_preedit.map_or(true, |p| p.is_empty());
+        let search_display = if combined_empty {
+            if search_focused {
+                format!("| {}", tr_str(lang, "搜索联系人或 AI Bot…", "Search contacts or AI Bots…"))
+            } else {
+                tr_str(lang, "搜索联系人或 AI Bot…", "Search contacts or AI Bots…").to_string()
+            }
+        } else if let Some(pre) = search_preedit.filter(|p| !p.is_empty()) {
+            format!("{search_query}{pre}|")
+        } else if search_focused {
+            format!("{search_query}|")
+        } else {
+            search_query.to_string()
+        };
+
+        let (_, bot_badge_bg, bot_badge_fg) =
+            TdesktopThemePalette::bot_hue_colors("purple", is_dark);
+
+        let mut list = div()
+            .id("inspector-add-member-list")
+            .w_full()
+            .max_h(px(240.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+
+        if filtered.is_empty() {
+            list = list.child(
+                div()
+                    .w_full()
+                    .py(px(14.0))
+                    .px(px(10.0))
+                    .text_center()
+                    .text_size(px(12.0))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(if candidates.is_empty() {
+                        tr_str(
+                            lang,
+                            "所有联系人与 AI Bot 均已在群内",
+                            "All contacts and AI Bots are already in this group",
+                        )
+                    } else {
+                        tr_str(lang, "未找到匹配的联系人或 Bot", "No matching contacts or bots")
+                    }),
+            );
+        } else {
+            for cand in filtered {
+                let uid = cand.user_id;
+                let handle = cand
+                    .username
+                    .as_deref()
+                    .map(|u| format!("@{u}"))
+                    .unwrap_or_default();
+                let avatar_bg = cand.avatar_color;
+                let avatar_el = if cand.is_bot {
+                    div()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(rgb(avatar_bg))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(tg_icon(IconName::BotRobot, 14.0, 0xFFFFFF))
+                } else {
+                    div()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(rgb(avatar_bg))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xFFFFFF))
+                        .child(cand.initials.clone())
+                };
+
+                list = list.child(
+                    div()
+                        .id(("inspector-add-cand-row", uid))
+                        .w_full()
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .rounded(px(8.0))
+                        .hover(move |s| s.bg(row_hover))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(avatar_el)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(1.0))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.0))
+                                                .min_w(px(0.0))
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(12.5))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(rgb(pal.text_primary))
+                                                        .child(cand.display_name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .px(px(5.0))
+                                                        .py(px(1.0))
+                                                        .rounded_full()
+                                                        .bg(if cand.is_bot {
+                                                            rgb(bot_badge_bg).into()
+                                                        } else {
+                                                            TdesktopThemePalette::rgba_with_alpha(
+                                                                pal.text_secondary,
+                                                                0.12,
+                                                            )
+                                                        })
+                                                        .text_size(px(9.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(if cand.is_bot {
+                                                            rgb(bot_badge_fg)
+                                                        } else {
+                                                            rgb(pal.text_secondary)
+                                                        })
+                                                        .child(if cand.is_bot {
+                                                            "AI Bot"
+                                                        } else {
+                                                            tr_str(lang, "联系人", "Human")
+                                                        }),
+                                                ),
+                                        )
+                                        .when(!handle.is_empty(), |col| {
+                                            col.child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(pal.text_secondary))
+                                                    .child(handle),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(("inspector-add-member-btn", uid))
+                                .cursor_pointer()
+                                .flex_shrink_0()
+                                .px(px(8.0))
+                                .py(px(3.5))
+                                .rounded_full()
+                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
+                                .hover(move |s| {
+                                    s.bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.24))
+                                })
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(pal.accent))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.request_add_member_to_active_group(uid);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tr_str(lang, "+ 添加", "+ Add")),
+                        ),
+                );
+            }
+        }
+
+        grouped_card(pal)
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(pal.text_primary))
+                            .child(tr_str(lang, "添加成员 / AI Bot", "Add Member / AI Bot")),
+                    )
+                    .child(
+                        div()
+                            .id("inspector-add-member-picker-close")
+                            .cursor_pointer()
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .rounded_full()
+                            .hover(move |s| s.bg(row_hover))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.close_add_member_picker();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tg_icon(IconName::Close, 11.5, pal.icon_fg)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("inspector-add-member-search")
+                    .cursor_text()
+                    .w_full()
+                    .h(px(32.0))
+                    .px(px(9.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(pal.window_bg))
+                    .border_1()
+                    .border_color(if search_focused {
+                        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.72)
+                    } else {
+                        pal.hairline_border_rgba()
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.add_member_search_focused = true;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(tg_icon(IconName::Search, 12.5, pal.text_secondary))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .text_color(if combined_empty {
+                                        rgb(pal.text_secondary)
+                                    } else {
+                                        rgb(pal.text_primary)
+                                    })
+                                    .child(search_display),
+                            ),
+                    )
+                    .when(!search_query.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .id("inspector-add-member-search-clear")
+                                .cursor_pointer()
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .rounded_full()
+                                .hover(move |s| s.bg(row_hover))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.add_member_query.clear();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tg_icon(IconName::Close, 10.0, pal.icon_fg)),
+                        )
+                    }),
+            )
+            .child(list)
+            .into_any_element()
+    });
+
     let members_card = if model.members.is_empty() {
         grouped_card(pal)
             .child(empty_panel(
@@ -692,11 +1045,15 @@ pub fn render_members_panel(
                 )
                 .child(
                     div()
+                        .id("inspector-toggle-add-member-picker")
                         .cursor_pointer()
                         .px(px(10.0))
                         .py(px(4.0))
                         .rounded(px(999.0))
-                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.12))
+                        .bg(TdesktopThemePalette::rgba_with_alpha(
+                            pal.accent,
+                            if picker_open { 0.22 } else { 0.12 },
+                        ))
                         .hover(move |s| {
                             s.bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.22))
                         })
@@ -705,14 +1062,23 @@ pub fn render_members_panel(
                         .text_color(rgb(pal.accent))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, _e, _w, cx| {
-                                this.pending_action = Some(InspectorAction::OpenAddMember);
+                            cx.listener(move |this, _e, _w, cx| {
+                                if this.add_member_picker_open {
+                                    this.close_add_member_picker();
+                                } else {
+                                    this.pending_action = Some(InspectorAction::OpenAddMember);
+                                }
                                 cx.notify();
                             }),
                         )
-                        .child(tr_str(lang, "+ 添加成员", "+ Add Member").to_string()),
+                        .child(if picker_open {
+                            tr_str(lang, "收起添加", "Done").to_string()
+                        } else {
+                            tr_str(lang, "+ 添加成员", "+ Add Member").to_string()
+                        }),
                 ),
         )
+        .when_some(picker_panel, |col, panel| col.child(panel))
         .when(!invite.is_empty(), |el| {
             let cp = invite.clone();
             el.child(

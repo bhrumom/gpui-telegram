@@ -292,7 +292,7 @@ pub type AlipayUserDto = UserDto;
 pub type SendMessageResponse = SendMessageHttpResponse;
 pub type HistoricalMessageItem = HistoricalMessage;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateChatPayload {
     pub title: String,
     #[serde(default)]
@@ -303,6 +303,8 @@ pub struct CreateChatPayload {
     pub member_usernames: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2089,6 +2091,7 @@ impl HttpClient {
             member_ids,
             member_usernames,
             about,
+            client_nonce: None,
         };
 
         self.run_on_tokio(async move {

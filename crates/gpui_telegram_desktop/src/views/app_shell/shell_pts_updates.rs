@@ -8,11 +8,12 @@ use gpui_telegram_core::types::{ChatId, MessageId};
 use gpui_telegram_proto::contracts::CallSignalRequest as CallSignalPayload;
 use gpui_telegram_proto::message::{MessageItem as Message, ReactionCount};
 use gpui_telegram_proto::miniapp_contracts::MiniAppControlMode;
-use gpui_telegram_proto::sync::{TypingAction, UpdateEvent};
+use gpui_telegram_proto::sync::{ChatActionEvent, TypingAction, UpdateEvent};
 use gpui_telegram_webrtc::SignalingFrame;
 
 use crate::i18n::tr_str;
-use crate::views::app_shell::shell_actions::peer_avatar_color;
+use crate::theme::TdesktopThemePalette;
+use crate::views::app_shell::shell_actions::{map_chat_members_to_inspector, peer_avatar_color};
 use crate::views::app_shell::shell_settings_sync::apply_folders_to_shell;
 use crate::views::app_shell::shell_state::reconcile_stage_message_list;
 use crate::views::app_shell::shell_truth::{
@@ -1174,6 +1175,227 @@ impl AppShell {
                 self.apply_call_updated_event(call_id, state, signal, cx);
             }
             UpdateEvent::StoryUpdated { .. } | UpdateEvent::ForumTopicChanged { .. } => {
+                cx.notify();
+            }
+            UpdateEvent::ChatAction(action @ (ChatActionEvent::UserJoined { .. } | ChatActionEvent::UserLeft { .. })) => {
+                let target_chat_u64 = u64::try_from(chat_id.0).unwrap_or(0);
+                let joined_uid = match action {
+                    ChatActionEvent::UserJoined { user_id } => Some(user_id.0),
+                    _ => None,
+                };
+                if target_chat_u64 > 0
+                    && self.stage.read(cx).active_chat_id == Some(target_chat_u64)
+                {
+                    if let (Some(token), Some(uid)) = (
+                        self.session_sync.session_token.clone(),
+                        self.session_sync.user_id,
+                    ) {
+                        let fence = SessionRequestFence {
+                            auth_generation: self.session_sync.auth_generation,
+                            request_generation: 0,
+                            token,
+                            user_id: uid,
+                        };
+                        let client = self.client.clone();
+                        let lang_owned = self.active_lang_id().to_string();
+                        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                            if let Ok(mems) = client.get_chat_members(target_chat_u64 as i64).await {
+                                let _ = weak.update(app, |shell, cx| {
+                                    if !fence.matches(
+                                        shell.is_authenticated,
+                                        shell.session_sync.auth_generation,
+                                        0,
+                                        shell.session_sync.session_token.as_deref(),
+                                        shell.session_sync.user_id,
+                                    ) {
+                                        return;
+                                    }
+                                    if shell.stage.read(cx).active_chat_id != Some(target_chat_u64) {
+                                        return;
+                                    }
+                                    let mut mapped = map_chat_members_to_inspector(
+                                        &mems,
+                                        &shell.session_sync.contacts_list,
+                                    );
+                                    let is_dark = shell.theme_state.palette.mode.is_dark();
+                                    for item in &mut mapped {
+                                        if let Some(fb) = shell
+                                            .miniapps
+                                            .fabushi_bots
+                                            .iter()
+                                            .find(|b| {
+                                                b.bot_user_id > 0
+                                                    && b.bot_user_id as u64 == item.id
+                                            })
+                                        {
+                                            if !fb.display_name.trim().is_empty() {
+                                                item.name = fb.display_name.trim().to_string();
+                                                let init = derive_initials(&item.name);
+                                                if !init.is_empty() {
+                                                    item.initials = init;
+                                                }
+                                            }
+                                            let hue = if TdesktopThemePalette::is_tinted_bot_hue(
+                                                &fb.avatar_color,
+                                            ) {
+                                                fb.avatar_color.as_str()
+                                            } else {
+                                                TdesktopThemePalette::bot_hue_name_for_id(item.id)
+                                            };
+                                            item.color =
+                                                TdesktopThemePalette::bot_hue_colors(hue, is_dark)
+                                                    .0;
+                                            item.role = "AI Bot".to_string();
+                                            item.is_online = true;
+                                        }
+                                    }
+                                    let member_count = mapped.len();
+                                    let invite_link = shell
+                                        .inspector
+                                        .read(cx)
+                                        .members
+                                        .invite_link
+                                        .clone();
+                                    shell.inspector.update(cx, |insp, icx| {
+                                        insp.sync_members(mapped, invite_link, true);
+                                        if let Some(juid) = joined_uid.filter(|&id| id > 0) {
+                                            insp.remove_add_member_candidate(juid);
+                                        }
+                                        icx.notify();
+                                    });
+                                    shell.stage.update(cx, |st, st_cx| {
+                                        if st.active_chat_id == Some(target_chat_u64)
+                                            && member_count > 0
+                                        {
+                                            st.chat_subtitle = if lang_owned.starts_with("zh") {
+                                                format!("{member_count} 位成员")
+                                            } else {
+                                                format!("{member_count} members")
+                                            };
+                                            st_cx.notify();
+                                        }
+                                    });
+                                    shell.sync_composer_mention_candidates(
+                                        target_chat_u64,
+                                        Some(mems.as_slice()),
+                                        cx,
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
+                    }
+                }
+                cx.notify();
+            }
+            UpdateEvent::AgentFloorChanged {
+                chat_id: ev_chat,
+                current_speaker,
+                queued_count,
+                loop_hops,
+            } => {
+                let target_chat_u64 = if ev_chat.0 > 0 {
+                    ev_chat.0 as u64
+                } else if chat_id.0 > 0 {
+                    chat_id.0 as u64
+                } else {
+                    0
+                };
+                if target_chat_u64 > 0 {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let lang = self.active_lang_id();
+                    let sidebar_indicator = current_speaker.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|sp| {
+                        if queued_count > 0 {
+                            if lang.starts_with("zh") {
+                                format!("{sp} 正在发言 (+{queued_count} 排队)")
+                            } else {
+                                format!("{sp} speaking (+{queued_count} queued)")
+                            }
+                        } else if lang.starts_with("zh") {
+                            format!("{sp} 正在发言…")
+                        } else {
+                            format!("{sp} is responding…")
+                        }
+                    });
+                    self.stage.update(cx, |st, st_cx| {
+                        st.on_agent_floor_changed(
+                            target_chat_u64,
+                            current_speaker.clone(),
+                            queued_count,
+                            loop_hops,
+                            now_ms,
+                        );
+                        st_cx.notify();
+                    });
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.set_typing(target_chat_u64, sidebar_indicator);
+                        sb_cx.notify();
+                    });
+                }
+                cx.notify();
+            }
+            UpdateEvent::AgentHandoffEvent {
+                chat_id: ev_chat,
+                from_agent,
+                to_agent,
+                hop,
+                max_hops,
+            } => {
+                let target_chat_u64 = if ev_chat.0 > 0 {
+                    ev_chat.0 as u64
+                } else if chat_id.0 > 0 {
+                    chat_id.0 as u64
+                } else {
+                    0
+                };
+                if target_chat_u64 > 0 {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let lang = self.active_lang_id();
+                    let indicator = if lang.starts_with("zh") {
+                        format!("{from_agent} → {to_agent} · 第 {hop}/{max_hops} 轮")
+                    } else {
+                        format!("{from_agent} → {to_agent} · Turn {hop}/{max_hops}")
+                    };
+                    self.stage.update(cx, |st, st_cx| {
+                        st.on_agent_handoff(
+                            target_chat_u64,
+                            from_agent,
+                            to_agent,
+                            hop,
+                            max_hops,
+                            now_ms,
+                        );
+                        st_cx.notify();
+                    });
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.set_typing(target_chat_u64, Some(indicator));
+                        sb_cx.notify();
+                    });
+                }
+                cx.notify();
+            }
+            UpdateEvent::AgentWorkspaceUpdated {
+                chat_id: ev_chat,
+                revision,
+                key,
+                value: _,
+                updated_by: _,
+            } => {
+                let target_chat_u64 = if ev_chat.0 > 0 {
+                    ev_chat.0 as u64
+                } else if chat_id.0 > 0 {
+                    chat_id.0 as u64
+                } else {
+                    0
+                };
+                if target_chat_u64 > 0 {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    self.stage.update(cx, |st, st_cx| {
+                        st.on_agent_workspace_updated(target_chat_u64, revision, key, now_ms);
+                        st_cx.notify();
+                    });
+                }
                 cx.notify();
             }
             UpdateEvent::BotActivityChanged {
