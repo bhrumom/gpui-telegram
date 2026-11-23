@@ -324,16 +324,42 @@ pub fn render_composite_group_avatar(
     }
 }
 
-/// Shared circular / animated bot avatar renderer used by both dialog rows and the Apple Messages
-/// 3-column Pinned Chats avatar grid.
-pub(crate) fn render_dialog_avatar(
+/// Resolved visual avatar kind shared across expanded dialog rows, the pinned chats grid,
+/// and the collapsed sidebar rail so all sidebar layouts render identical avatars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogAvatarKind {
+    SavedMessages {
+        bg_hex: u32,
+    },
+    CompositeGroup {
+        seed_id: u64,
+    },
+    GrokBot {
+        source_id: String,
+        shape: String,
+        color: String,
+        state: GrokPersonaState,
+    },
+    FabushiShape {
+        shape: String,
+        bg_hex: u32,
+    },
+    ClassicBotIcon {
+        bg_hex: u32,
+    },
+    ClassicInitials {
+        bg_hex: u32,
+        initials: String,
+    },
+}
+
+/// Resolves the canonical avatar variant for a dialog using the same rules across expanded
+/// rows, pinned tiles, and the collapsed sidebar rail.
+pub fn resolve_dialog_avatar_kind(
     item: &DialogItemModel,
     meta: &SidebarDialogMeta,
     palette: &TdesktopThemePalette,
-    avatar_size_px: f32,
-    surface_bg_hex: u32,
-    online_dot_border: Rgba,
-) -> Div {
+) -> DialogAvatarKind {
     let avatar_bg = if meta.is_saved_messages {
         palette.accent
     } else {
@@ -344,110 +370,152 @@ pub(crate) fn render_dialog_avatar(
             base
         }
     };
-    let avatar_size = px(avatar_size_px);
-    let initials_font_px = (avatar_size_px * 0.35).clamp(12.0, 19.0);
-    let saved_icon_px = (avatar_size_px * 0.48).clamp(17.0, 26.0);
-    let bot_icon_px = (avatar_size_px * 0.44).clamp(17.0, 24.0);
-    let is_group_dialog = !meta.is_saved_messages
-        && !meta.is_bot
+
+    if meta.is_saved_messages {
+        return DialogAvatarKind::SavedMessages { bg_hex: avatar_bg };
+    }
+
+    let is_group_dialog = !meta.is_bot
         && meta.grok_avatar.is_none()
         && (item.folder == "Groups"
             || meta.topics.as_ref().is_some_and(|t| !t.topics.is_empty()));
+    if is_group_dialog {
+        return DialogAvatarKind::CompositeGroup { seed_id: item.id };
+    }
 
-    let render_classic_circle = || -> Div {
-        let mut el = div()
-            .relative()
-            .w(avatar_size)
-            .h(avatar_size)
-            .flex_shrink_0()
-            .rounded_full()
-            .bg(rgb(avatar_bg))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_color(rgb(0xFFFFFF))
-            .font_weight(FontWeight::BOLD)
-            .text_size(px(initials_font_px));
-        el = if meta.is_saved_messages {
-            el.child(tg_icon(IconName::SavedMessages, saved_icon_px, 0xFFFFFF))
-        } else if meta.is_bot
+    let classic_fallback = || {
+        if meta.is_bot
             && item
                 .avatar_initials
                 .chars()
                 .all(|c| !c.is_ascii_alphanumeric())
         {
-            el.child(tg_icon(IconName::BotRobot, bot_icon_px, 0xFFFFFF))
+            DialogAvatarKind::ClassicBotIcon { bg_hex: avatar_bg }
         } else {
-            el.child(item.avatar_initials.clone())
-        };
-        el
+            DialogAvatarKind::ClassicInitials {
+                bg_hex: avatar_bg,
+                initials: item.avatar_initials.clone(),
+            }
+        }
     };
 
-    let mut avatar = if !meta.is_saved_messages {
-        if is_group_dialog {
-            render_composite_group_avatar(
-                item.id,
-                &item.peer_name,
-                None,
-                avatar_size_px,
-                surface_bg_hex,
-                palette.mode.is_dark(),
-            )
-        } else if let Some(ref ga) = meta.grok_avatar {
-            if !ga.shape.eq_ignore_ascii_case("classic") {
-                render_grok_bot_avatar(
-                    GrokBotAvatarProps::new(&ga.agent_id, &ga.shape, &ga.color, avatar_size_px)
-                        .with_state(GrokPersonaState::from_activity_str(
-                            &ga.execution_state,
-                            item.typing_indicator.is_some(),
-                        ))
-                        .with_follow_pointer(true)
-                        .with_paused(false)
-                        .with_surface_bg(surface_bg_hex),
-                )
+    if let Some(ref ga) = meta.grok_avatar {
+        if !ga.shape.eq_ignore_ascii_case("classic") {
+            return DialogAvatarKind::GrokBot {
+                source_id: ga.agent_id.clone(),
+                shape: ga.shape.clone(),
+                color: ga.color.clone(),
+                state: GrokPersonaState::from_activity_str(
+                    &ga.execution_state,
+                    item.typing_indicator.is_some(),
+                ),
+            };
+        }
+        return classic_fallback();
+    }
+
+    if let Some(ref shape) = meta.fabushi_shape {
+        if !shape.eq_ignore_ascii_case("classic") {
+            return DialogAvatarKind::FabushiShape {
+                shape: shape.clone(),
+                bg_hex: avatar_bg,
+            };
+        }
+        return classic_fallback();
+    }
+
+    if meta.is_bot {
+        const DEFAULT_BOT_SHAPES: [&str; 6] = [
+            "circle", "squircle", "hexagon", "shield", "cloud", "diamond",
+        ];
+        const DEFAULT_BOT_COLORS: [&str; 6] = [
+            "blue", "cyan", "purple", "emerald", "amber", "rose",
+        ];
+        let idx = (item.id as usize) % DEFAULT_BOT_SHAPES.len();
+        return DialogAvatarKind::GrokBot {
+            source_id: format!("bot-{}", item.id),
+            shape: DEFAULT_BOT_SHAPES[idx].to_string(),
+            color: DEFAULT_BOT_COLORS[idx].to_string(),
+            state: if item.typing_indicator.is_some() {
+                GrokPersonaState::Thinking
             } else {
-                render_classic_circle()
-            }
-        } else if let Some(ref shape) = meta.fabushi_shape {
-            if !shape.eq_ignore_ascii_case("classic") {
-                crate::components::avatar::render_fabushi_shape_avatar(
-                    shape,
-                    avatar_bg,
-                    &item.peer_name,
-                    avatar_size_px,
-                )
-            } else {
-                render_classic_circle()
-            }
-        } else if meta.is_bot {
-            const DEFAULT_BOT_SHAPES: [&str; 6] = [
-                "circle", "squircle", "hexagon", "shield", "cloud", "diamond",
-            ];
-            const DEFAULT_BOT_COLORS: [&str; 6] = [
-                "blue", "cyan", "purple", "emerald", "amber", "rose",
-            ];
-            let idx = (item.id as usize) % DEFAULT_BOT_SHAPES.len();
-            render_grok_bot_avatar(
-                GrokBotAvatarProps::new(
-                    &format!("bot-{}", item.id),
-                    DEFAULT_BOT_SHAPES[idx],
-                    DEFAULT_BOT_COLORS[idx],
-                    avatar_size_px,
-                )
-                .with_state(if item.typing_indicator.is_some() {
-                    GrokPersonaState::Thinking
-                } else {
-                    GrokPersonaState::Idle
-                })
+                GrokPersonaState::Idle
+            },
+        };
+    }
+
+    classic_fallback()
+}
+
+/// Shared circular / animated bot avatar renderer used by expanded dialog rows, the Apple Messages
+/// 3-column Pinned Chats avatar grid, and the collapsed sidebar rail.
+pub(crate) fn render_dialog_avatar(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    palette: &TdesktopThemePalette,
+    avatar_size_px: f32,
+    surface_bg_hex: u32,
+    online_dot_border: Rgba,
+) -> Div {
+    let avatar_size = px(avatar_size_px);
+    let initials_font_px = (avatar_size_px * 0.35).clamp(12.0, 19.0);
+    let saved_icon_px = (avatar_size_px * 0.48).clamp(17.0, 26.0);
+    let bot_icon_px = (avatar_size_px * 0.44).clamp(17.0, 24.0);
+
+    let circle_base = |bg_hex: u32| -> Div {
+        div()
+            .relative()
+            .w(avatar_size)
+            .h(avatar_size)
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(rgb(bg_hex))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0xFFFFFF))
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(initials_font_px))
+    };
+
+    let mut avatar = match resolve_dialog_avatar_kind(item, meta, palette) {
+        DialogAvatarKind::SavedMessages { bg_hex } => {
+            circle_base(bg_hex).child(tg_icon(IconName::SavedMessages, saved_icon_px, 0xFFFFFF))
+        }
+        DialogAvatarKind::CompositeGroup { seed_id } => render_composite_group_avatar(
+            seed_id,
+            &item.peer_name,
+            None,
+            avatar_size_px,
+            surface_bg_hex,
+            palette.mode.is_dark(),
+        ),
+        DialogAvatarKind::GrokBot {
+            source_id,
+            shape,
+            color,
+            state,
+        } => render_grok_bot_avatar(
+            GrokBotAvatarProps::new(&source_id, &shape, &color, avatar_size_px)
+                .with_state(state)
                 .with_follow_pointer(true)
                 .with_paused(false)
                 .with_surface_bg(surface_bg_hex),
+        ),
+        DialogAvatarKind::FabushiShape { shape, bg_hex } => {
+            crate::components::avatar::render_fabushi_shape_avatar(
+                &shape,
+                bg_hex,
+                &item.peer_name,
+                avatar_size_px,
             )
-        } else {
-            render_classic_circle()
         }
-    } else {
-        render_classic_circle()
+        DialogAvatarKind::ClassicBotIcon { bg_hex } => {
+            circle_base(bg_hex).child(tg_icon(IconName::BotRobot, bot_icon_px, 0xFFFFFF))
+        }
+        DialogAvatarKind::ClassicInitials { bg_hex, initials } => {
+            circle_base(bg_hex).child(initials)
+        }
     };
 
     let is_agent_running = item.typing_indicator.is_some()

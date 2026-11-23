@@ -8,6 +8,7 @@ use gpui_telegram_proto::miniapp_contracts::{
     MiniAppControlMode, MiniAppTakeoverEvent, GROK_AVATAR_SHAPES,
 };
 
+use crate::app::session::send_as_peers::SendAsKey;
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, trigger_grok_avatar_bounce, trigger_grok_avatar_spin,
     GrokBotAvatarProps, GrokPersonaState, GROK_COLOR_PALETTE,
@@ -26,7 +27,7 @@ use crate::views::app_shell::peer_avatar_color;
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::chat_sidebar::{
     AddContactKind, ComposeRecipientChip, CreationInputField, DialogDeliveryStatus,
-    DialogItemModel, SidebarCreationModal,
+    DialogItemModel, PendingComposeCreation, SidebarCreationModal,
 };
 use crate::views::drawer::inspector_panels::{segmented_active_bg, segmented_pill_shadow};
 use crate::views::nav_rail::NavDestination;
@@ -574,6 +575,7 @@ impl AppShell {
                                                             },
                                                         );
                                                     }
+                                                    this.miniapps.bump_launch_generation();
                                                     this.miniapps.is_miniapp_minimized = false;
                                                     this.miniapps.floating_pip_status = None;
                                                     if let Some(ov) =
@@ -769,7 +771,13 @@ impl AppShell {
         if let Some(box_ent) = self.miniapps.create_bot_box.clone().filter(|b| b.read(cx).is_visible) {
             layers.push(
                 modal_backdrop_shell("create-managed-bot-backdrop", macos_modal_backdrop_rgba(pal))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.miniapps.create_bot_box = None; cx.notify(); }))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.miniapps.create_bot_box = None;
+                        if !this.is_compose_or_creation_modal_active(cx) {
+                            this.exit_compose_or_modal_isolation(true, cx);
+                        }
+                        cx.notify();
+                    }))
                     .child(div().on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation())).child(box_ent))
                     .into_any_element(),
             );
@@ -2566,25 +2574,47 @@ impl AppShell {
             self.sidebar.read(cx).dialogs.iter().any(|d| d.id == cid)
         });
 
-        self.sidebar.update(cx, |sb, scx| {
-            sb.exit_compose_mode();
-            if let Some(cid) = existing_chat.filter(|_| has_local_dialog) {
-                sb.select_dialog_from_user(cid);
-            }
-            scx.notify();
-        });
-        self.sync_compose_state_to_composer(true, cx);
-
         if let Some(cid) = existing_chat.filter(|_| has_local_dialog) {
-            self.sync_selected_chat_inspector_and_stage(cid, cx);
-            self.composer.update(cx, |c, ccx| {
-                if !carry_draft.trim().is_empty() {
-                    c.set_text(carry_draft);
-                }
-                c.is_input_focused = true;
-                ccx.notify();
+            let same_chat = self.stage.read(cx).active_chat_id == Some(cid);
+            self.sidebar.update(cx, |sb, scx| {
+                sb.exit_compose_mode();
+                sb.select_dialog_from_user(cid);
+                scx.notify();
             });
+            // Keep `is_compose_isolated == true` during `sync_selected_chat_inspector_and_stage`
+            // so `prev_chat_id`'s saved draft is never flushed/clobbered before switching.
+            self.sync_selected_chat_inspector_and_stage(cid, cx);
+            if same_chat && carry_draft.trim().is_empty() {
+                self.exit_compose_or_modal_isolation(true, cx);
+            } else {
+                self.finish_compose_isolation_for_switched_chat(cid, cx);
+                let show_start_bar = self.stage.read(cx).show_bot_start_bar;
+                self.composer.update(cx, |c, ccx| {
+                    if !carry_draft.trim().is_empty() {
+                        c.set_text(carry_draft);
+                    }
+                    c.is_input_focused = !show_start_bar;
+                    ccx.notify();
+                });
+            }
         } else {
+            // Keep compose isolation active while `create_chat` is in flight so `carry_draft`
+            // cannot leak into the background chat via `handle_composer_draft_change`.
+            let seq = self.client.next_client_nonce();
+            let client_nonce = format!("dm-{}-{}", chrono::Utc::now().timestamp_millis(), seq);
+            self.sidebar.update(cx, |sb, scx| {
+                sb.compose_draft.menu_open = false;
+                sb.compose_draft.creation_error = None;
+                sb.compose_draft.pending_creation = Some(PendingComposeCreation {
+                    title: chip.display_name.clone(),
+                    recipients: vec![chip.clone()],
+                    initial_message: carry_draft.clone(),
+                    client_nonce: client_nonce.clone(),
+                });
+                scx.notify();
+            });
+            self.sync_compose_state_to_composer(true, cx);
+
             let chat_type_num = if chip.is_bot { 4 } else { 0 };
             let req = CreateChatRequest {
                 title: chip.display_name.clone(),
@@ -2595,6 +2625,7 @@ impl AppShell {
                 } else {
                     Vec::new()
                 },
+                client_nonce: Some(client_nonce),
                 ..Default::default()
             };
             let client = self.client.clone();
@@ -2607,6 +2638,8 @@ impl AppShell {
                             let now_label =
                                 tr_str(s.active_lang_id(), "刚刚", "Just now").to_string();
                             s.sidebar.update(cx, |sb, scx| {
+                                sb.compose_draft.pending_creation = None;
+                                sb.exit_compose_mode();
                                 if !sb.dialogs.iter().any(|d| d.id == cid) {
                                     sb.dialogs.insert(
                                         0,
@@ -2643,11 +2676,13 @@ impl AppShell {
                                 scx.notify();
                             });
                             s.sync_selected_chat_inspector_and_stage(cid, cx);
+                            s.finish_compose_isolation_for_switched_chat(cid, cx);
+                            let show_start_bar = s.stage.read(cx).show_bot_start_bar;
                             s.composer.update(cx, |c, ccx| {
                                 if !carry_draft.trim().is_empty() {
                                     c.set_text(carry_draft);
                                 }
-                                c.is_input_focused = true;
+                                c.is_input_focused = !show_start_bar;
                                 ccx.notify();
                             });
                             s.refresh_chats(cx);
@@ -2656,6 +2691,15 @@ impl AppShell {
                     }
                     Err(err) => {
                         let _ = weak.update(app, |s, cx| {
+                            s.sidebar.update(cx, |sb, scx| {
+                                sb.compose_draft.pending_creation = None;
+                                sb.is_plus_menu_open = true;
+                                if sb.compose_draft.selected_recipients.is_empty() {
+                                    sb.compose_draft.selected_recipients = vec![chip_clone.clone()];
+                                }
+                                scx.notify();
+                            });
+                            s.sync_compose_state_to_composer(true, cx);
                             let prefix =
                                 tr_str(s.active_lang_id(), "无法打开对话", "Failed to open chat");
                             s.window_runtime
@@ -3129,10 +3173,24 @@ impl AppShell {
                                                         MouseButton::Left,
                                                         cx.listener(move |this, _, _, cx| {
                                                             cx.stop_propagation();
-                                                            this.sidebar.update(cx, |sb, scx| {
+                                                            let became_empty = this.sidebar.update(cx, |sb, scx| {
                                                                 sb.remove_compose_recipient(uid);
+                                                                let empty = sb.compose_draft.selected_recipients.is_empty();
+                                                                if sb.compose_draft.selected_recipients.len() < 2 {
+                                                                    sb.compose_title_focused = false;
+                                                                }
+                                                                if empty {
+                                                                    sb.compose_draft.menu_open = true;
+                                                                }
                                                                 scx.notify();
+                                                                empty
                                                             });
+                                                            if became_empty {
+                                                                this.composer.update(cx, |c, ccx| {
+                                                                    c.is_input_focused = false;
+                                                                    ccx.notify();
+                                                                });
+                                                            }
                                                             this.sync_compose_state_to_composer(
                                                                 true, cx,
                                                             );
@@ -3277,11 +3335,7 @@ impl AppShell {
                                                         sb.exit_compose_mode();
                                                         scx.notify();
                                                     });
-                                                    this.sync_compose_state_to_composer(true, cx);
-                                                    this.composer.update(cx, |c, ccx| {
-                                                        c.is_input_focused = true;
-                                                        ccx.notify();
-                                                    });
+                                                    this.exit_compose_or_modal_isolation(true, cx);
                                                     cx.notify();
                                                 }),
                                             )
@@ -3756,13 +3810,6 @@ impl AppShell {
                                                     cx.listener(|this, _, _, cx| {
                                                         cx.stop_propagation();
                                                         this.ime.clear_preedit();
-                                                        this.sidebar.update(cx, |sb, scx| {
-                                                            sb.exit_compose_mode();
-                                                            scx.notify();
-                                                        });
-                                                        this.sync_compose_state_to_composer(
-                                                            true, cx,
-                                                        );
                                                         let title = tr_str(
                                                             this.active_lang_id(),
                                                             "新建频道",
@@ -3775,6 +3822,11 @@ impl AppShell {
                                                             380.0,
                                                             cx,
                                                         );
+                                                        this.sidebar.update(cx, |sb, scx| {
+                                                            sb.exit_compose_mode();
+                                                            scx.notify();
+                                                        });
+                                                        this.enter_compose_or_modal_isolation(cx);
                                                         cx.notify();
                                                     }),
                                                 ),

@@ -132,6 +132,16 @@ impl ShellSessionSyncState {
         self.latest_http_reaction_by_msg.clear();
     }
 
+    /// Clears cached peer lists, chat metadata, search cursor, and per-chat draft maps.
+    pub fn clear_peer_and_draft_caches(&mut self) {
+        self.last_dispatched_search_seq = 0;
+        self.contacts_list.clear();
+        self.rich_chats_by_id.clear();
+        self.chat_peer_user_ids.clear();
+        self.last_draft_text_by_chat.clear();
+        self.last_saved_draft_by_chat.clear();
+    }
+
     /// Resets account-bound session identity, cached peer maps, and optimistic tracking on logout.
     pub fn reset_on_logout(&mut self) {
         self.bump_generations();
@@ -140,14 +150,9 @@ impl ShellSessionSyncState {
         self.user_id = None;
         self.username = None;
         self.ws_stream_started = false;
-        self.last_dispatched_search_seq = 0;
-        self.contacts_list.clear();
-        self.rich_chats_by_id.clear();
-        self.chat_peer_user_ids.clear();
+        self.clear_peer_and_draft_caches();
         self.send_as_peers = SendAsPeersSession::default();
         self.draft_debounce_gen = self.draft_debounce_gen.wrapping_add(1);
-        self.last_draft_text_by_chat.clear();
-        self.last_saved_draft_by_chat.clear();
         self.clear_message_tracking();
     }
 }
@@ -193,6 +198,7 @@ pub struct FloatingPipStatus {
 #[derive(Default)]
 pub struct ShellMiniAppState {
     pub miniapp_overlay: Option<Entity<BotAttachWebView>>,
+    pub miniapp_launch_generation: u64,
     pub is_miniapp_minimized: bool,
     pub floating_pip_status: Option<FloatingPipStatus>,
     pub pending_webmcp_commands: std::collections::VecDeque<
@@ -219,9 +225,17 @@ impl ShellMiniAppState {
         Self::default()
     }
 
+    /// Advances the launch generation fence to invalidate any stale in-flight `/launch` completions.
+    pub fn bump_launch_generation(&mut self) -> u64 {
+        self.miniapp_launch_generation = self.miniapp_launch_generation.wrapping_add(1);
+        self.miniapp_launch_generation
+    }
+
     /// Clears active Mini App overlays and account-scoped bot/app registries.
     pub fn reset(&mut self) {
+        let next_gen = self.miniapp_launch_generation.wrapping_add(1);
         *self = Self::default();
+        self.miniapp_launch_generation = next_gen;
     }
 }
 

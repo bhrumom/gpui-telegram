@@ -20,7 +20,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const STAGE_TOAST_BANNER_DURATION_MS: u64 = 2_000;
 
 use gpui::*;
 use gpui::prelude::FluentBuilder;
@@ -516,6 +518,7 @@ pub struct ConversationStage {
     pub copied_code_msg: Option<u64>,
     pub more_menu_open: bool,
     pub toast_banner: Option<String>,
+    pub toast_banner_gen: u64,
     pub active_fabushi_bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>,
     pub is_bot_chat: bool,
     pub bot_activity_state: String,
@@ -631,6 +634,7 @@ impl ConversationStage {
             copied_code_msg: None,
             more_menu_open: bool::default(),
             toast_banner: None,
+            toast_banner_gen: 0,
             active_fabushi_bot: None,
             is_bot_chat: false,
             bot_activity_state: "idle".to_string(),
@@ -656,6 +660,41 @@ impl ConversationStage {
 
     pub fn take_stage_action(&mut self) -> Option<StageAction> {
         self.pending_stage_action.take()
+    }
+
+    pub fn dismiss_toast_banner(&mut self) {
+        self.toast_banner = None;
+        self.toast_banner_gen = self.toast_banner_gen.wrapping_add(1);
+    }
+
+    pub fn show_toast_banner(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.show_toast_banner_with_duration(
+            message,
+            Duration::from_millis(STAGE_TOAST_BANNER_DURATION_MS),
+            cx,
+        );
+    }
+
+    pub fn show_toast_banner_with_duration(
+        &mut self,
+        message: impl Into<String>,
+        duration: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.toast_banner = Some(message.into());
+        self.toast_banner_gen = self.toast_banner_gen.wrapping_add(1);
+        let generation = self.toast_banner_gen;
+        cx.notify();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            app.background_executor().timer(duration).await;
+            let _ = weak.update(app, |this, cx| {
+                if this.toast_banner_gen == generation {
+                    this.toast_banner = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn on_agent_floor_changed(
@@ -723,6 +762,8 @@ impl ConversationStage {
 
     pub fn reset(&mut self) {
         self.clear_selection();
+        self.dismiss_toast_banner();
+        self.active_fabushi_bot = None;
         self.chat_histories.clear();
         self.chat_pinned_messages.clear();
         self.chat_pinned_entries.clear();
@@ -815,6 +856,10 @@ impl ConversationStage {
             self.chat_scroll_positions.insert(prev_id, (self.scroll_handle.offset(), self.is_at_bottom()));
         }
         if self.active_chat_id != Some(chat_id) {
+            self.dismiss_toast_banner();
+            self.copied_code_msg = None;
+            self.active_fabushi_bot = None;
+            self.room_agent_states.clear();
             self.active_context_menu = None;
             self.context_menu_reactions_expanded = false;
             self.pending_reply = None;
@@ -1283,10 +1328,13 @@ impl Render for ConversationStage {
                     let strings: Vec<String> = dropped.iter().map(|p| p.display().to_string()).collect();
                     let (_zone, _) = this.drag_area.drop_files(strings, false);
                     this.pending_dropped_paths = Some(dropped);
-                    this.toast_banner = Some(
-                        crate::i18n::tr_str(&this.lang_id, "已添加拖入文件为附件", "Dropped files ready to attach").to_string(),
-                    );
-                    cx.notify();
+                    let toast_msg = crate::i18n::tr_str(
+                        &this.lang_id,
+                        "已添加拖入文件为附件",
+                        "Dropped files ready to attach",
+                    )
+                    .to_string();
+                    this.show_toast_banner(toast_msg, cx);
                 }
             }))
             .relative()

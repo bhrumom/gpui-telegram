@@ -85,7 +85,8 @@ impl AppShell {
         });
     }
 
-    fn is_non_composer_text_capturing(&self, cx: &App) -> bool {
+    /// Returns `true` when keyboard/IME input should target a non-composer field or be suppressed.
+    pub fn is_non_composer_text_capturing(&self, cx: &App) -> bool {
         let sb = self.sidebar.read(cx);
         self.overlays.is_passcode_locked
             || self.is_computer_workbench_input_active(cx)
@@ -101,6 +102,7 @@ impl AppShell {
             || self.is_inspector_bot_input_active(cx)
             || self.is_bot_card_input_active(cx)
             || self.stage.read(cx).search_open
+            || self.should_hide_composer(cx)
     }
 
     fn take_ime_preedit_commit(&mut self, cx: &mut Context<Self>) -> bool {
@@ -248,7 +250,7 @@ impl AppShell {
                 st.recompute_search_matches();
                 stcx.notify();
             });
-        } else {
+        } else if !self.should_hide_composer(cx) {
             self.composer.update(cx, |c, ccx| { c.clear(); ccx.notify(); });
         }
         cx.notify();
@@ -348,7 +350,7 @@ impl AppShell {
             });
         } else if self.is_studio_input_active(cx) {
             self.tasks_workspace.update(cx, |w, wcx| { w.apply_text_key_to_active_input("", Some(&clean)); wcx.notify(); });
-        } else {
+        } else if !self.should_hide_composer(cx) {
             self.composer.update(cx, |c, ccx| {
                 c.is_input_focused = true;
                 if c.ime_machine.is_composing() { c.ime_machine.on_ime_commit(&clean); } else { c.ime_machine.insert_text(&clean); }
@@ -386,6 +388,9 @@ impl AppShell {
         }
         if self.miniapps.create_bot_box.as_ref().is_some_and(|b| b.read(cx).is_visible) {
             self.miniapps.create_bot_box = None;
+            if !self.is_compose_or_creation_modal_active(cx) {
+                self.exit_compose_or_modal_isolation(true, cx);
+            }
             return true;
         }
         if let Some(ref ov) = self.miniapps.miniapp_overlay {
@@ -443,8 +448,12 @@ impl AppShell {
                 scx.notify();
             });
             if exited_compose {
-                self.sync_compose_state_to_composer(true, cx);
-                self.set_composer_focused(true, cx);
+                if !self.is_compose_or_creation_modal_active(cx) {
+                    self.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    self.sync_compose_state_to_composer(true, cx);
+                    self.set_composer_focused(true, cx);
+                }
             }
             return true;
         }
@@ -959,6 +968,7 @@ impl AppShell {
         if self.active_panel == ActiveWorkspacePanel::Chats
             && !self.sidebar.read(cx).search_focused
             && self.sidebar.read(cx).active_creation_modal.is_none()
+            && !self.should_hide_composer(cx)
             && matches!(key, "up" | "down" | "tab" | "enter")
             && self.composer.update(cx, |c, ccx| { let ok = c.handle_hermes_autocomplete_nav(key, is_shift); if ok { ccx.notify(); } ok })
         {
@@ -995,6 +1005,9 @@ impl AppShell {
             cx.notify();
             return true;
         }
+        if self.should_hide_composer(cx) {
+            return false;
+        }
         match key {
             "enter" => {
                 if self.ime.take_just_committed() {
@@ -1027,30 +1040,8 @@ impl AppShell {
             _ => false,
         }
     }
-}
-
-impl EntityInputHandler for AppShell {
-    fn text_for_range(&mut self, range_utf16: Range<usize>, _: &mut Option<Range<usize>>, _: &mut Window, cx: &mut Context<Self>) -> Option<String> {
-        let full = self.combined_active_text(cx);
-        let start = utf16_offset_to_utf8(&full, range_utf16.start);
-        let end = utf16_offset_to_utf8(&full, range_utf16.end).max(start);
-        Some(full.get(start..end).unwrap_or("").to_string())
-    }
-
-    fn selected_text_range(&mut self, _: bool, _: &mut Window, cx: &mut Context<Self>) -> Option<UTF16Selection> {
-        let total = self.active_utf16_len(cx);
-        Some(UTF16Selection { range: total..total, reversed: false })
-    }
-
-    fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
-        let (committed, preedit) = self.active_text_and_preedit(cx);
-        preedit.filter(|p| !p.is_empty()).map(|p| {
-            let start = utf16_len(&committed);
-            start..start + utf16_len(&p)
-        })
-    }
-
-    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    /// Commits any pending IME preedit for the active input (equivalent to `EntityInputHandler::unmark_text`).
+    pub fn commit_ime_unmark_text(&mut self, cx: &mut Context<Self>) {
         if !self.is_authenticated {
             let pending = self.auth_wizard.update(cx, |w, wcx| {
                 w.ime.just_committed_ime = true;
@@ -1064,29 +1055,16 @@ impl EntityInputHandler for AppShell {
         }
         self.ime.mark_ime_committed();
         if let Some(p) = self.ime.ime_preedit.take().filter(|p| !p.is_empty()) { self.insert_committed_text(&p, cx); return; }
-        if let Some(p) = self.composer.read(cx).ime_machine.preedit_text().map(str::to_string) {
-            self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_commit(&p); ccx.notify(); });
+        if !self.should_hide_composer(cx) {
+            if let Some(p) = self.composer.read(cx).ime_machine.preedit_text().map(str::to_string) {
+                self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_commit(&p); ccx.notify(); });
+            }
         }
         cx.notify();
     }
 
-    fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
-        let was_composing = self.has_active_ime_preedit(cx) || self.composer.read(cx).ime_machine.is_composing();
-        self.insert_committed_text(text, cx);
-        if was_composing {
-            if self.is_authenticated { self.ime.mark_ime_committed(); }
-            else { self.auth_wizard.update(cx, |w, _| w.ime.mark_ime_committed()); }
-        }
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        _: Option<Range<usize>>,
-        new_text: &str,
-        _: Option<Range<usize>>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Updates or clears the active IME preedit (equivalent to `EntityInputHandler::replace_and_mark_text_in_range`).
+    pub fn update_ime_marked_text(&mut self, new_text: &str, cx: &mut Context<Self>) {
         if !self.is_authenticated {
             self.auth_wizard.update(cx, |w, wcx| {
                 if new_text.is_empty() { w.ime.clear_preedit(); }
@@ -1166,6 +1144,52 @@ impl EntityInputHandler for AppShell {
             });
         }
         cx.notify();
+    }
+}
+
+impl EntityInputHandler for AppShell {
+    fn text_for_range(&mut self, range_utf16: Range<usize>, _: &mut Option<Range<usize>>, _: &mut Window, cx: &mut Context<Self>) -> Option<String> {
+        let full = self.combined_active_text(cx);
+        let start = utf16_offset_to_utf8(&full, range_utf16.start);
+        let end = utf16_offset_to_utf8(&full, range_utf16.end).max(start);
+        Some(full.get(start..end).unwrap_or("").to_string())
+    }
+
+    fn selected_text_range(&mut self, _: bool, _: &mut Window, cx: &mut Context<Self>) -> Option<UTF16Selection> {
+        let total = self.active_utf16_len(cx);
+        Some(UTF16Selection { range: total..total, reversed: false })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        let (committed, preedit) = self.active_text_and_preedit(cx);
+        preedit.filter(|p| !p.is_empty()).map(|p| {
+            let start = utf16_len(&committed);
+            start..start + utf16_len(&p)
+        })
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.commit_ime_unmark_text(cx);
+    }
+
+    fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
+        let was_composing = self.has_active_ime_preedit(cx) || self.composer.read(cx).ime_machine.is_composing();
+        self.insert_committed_text(text, cx);
+        if was_composing {
+            if self.is_authenticated { self.ime.mark_ime_committed(); }
+            else { self.auth_wizard.update(cx, |w, _| w.ime.mark_ime_committed()); }
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_ime_marked_text(new_text, cx);
     }
 
     fn bounds_for_range(&mut self, _: Range<usize>, element_bounds: Bounds<Pixels>, _: &mut Window, cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {

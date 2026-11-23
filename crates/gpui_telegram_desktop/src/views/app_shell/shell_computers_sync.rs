@@ -21,6 +21,9 @@ use crate::app::cli_installer::{
     detect_cli_install_status, install_fabushi_cli_one_click, startup_ensure_cli_linked_if_bundled,
 };
 use crate::i18n::tr_str;
+use crate::platform::mac::macos_permissions_drag::{
+    cached_permissions_snapshot, hide_drag_hud, request_permissions_refresh,
+};
 use crate::platform::mac::tray_mac::tray_action_ids;
 use crate::views::app_shell::desktop_ipc_host::DesktopLocalIpcHandler;
 use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand};
@@ -869,6 +872,11 @@ impl AppShell {
             })
             .cloned();
 
+        let is_local_node = node_opt.as_ref().is_some_and(|n| n.is_current_device);
+        if is_local_node && cfg!(target_os = "macos") {
+            request_permissions_refresh(true);
+        }
+
         let overlay = cx.new(|wcx| {
             let mut wb = ComputerWorkbench::new_live(fallback_name, pal, &lang);
             if let Some(ref node) = node_opt {
@@ -887,6 +895,7 @@ impl AppShell {
         cx.observe(&overlay, move |shell, ov, cx| {
             let (close, cmds) = ov.update(cx, |w, _| (w.should_close, w.take_commands()));
             if close {
+                hide_drag_hud();
                 shell.hide_remote_computer(cx);
                 return;
             }
@@ -1173,17 +1182,59 @@ impl AppShell {
                                 WorkbenchCommand::RefreshScreen | WorkbenchCommand::TakeScreenshot => {
                                     if out.stdout.contains("fallback_png") {
                                         wb.update_frame_url(None);
-                                        wb.needs_screen_permission_guide = true;
-                                        wb.status_banner = Some(
-                                            tr_str(
-                                                &wb.language_id,
-                                                "未开启录屏权限：请点击「在“系统设置”中启用」，然后在系统设置中开启 Fabushi 开关",
-                                                "Screen Recording not enabled: click 'Enable in System Settings' and toggle Fabushi on",
-                                            )
-                                            .to_string(),
-                                        );
+                                        let is_perm_denied = out
+                                            .stdout
+                                            .contains("fallback_png_permission_denied")
+                                            || out.stderr.is_empty()
+                                            || out.stderr.to_ascii_lowercase().contains("permission")
+                                            || out.stderr.to_ascii_lowercase().contains("tcc")
+                                            || out.stderr.contains("-3801")
+                                            || out.stderr.contains("录屏");
+                                        wb.remote_permission_error = if !out.stderr.is_empty() {
+                                            Some(out.stderr.clone())
+                                        } else {
+                                            None
+                                        };
+                                        if is_perm_denied {
+                                            wb.needs_screen_permission_guide = true;
+                                            if wb.is_local_device {
+                                                request_permissions_refresh(true);
+                                                let snap = cached_permissions_snapshot();
+                                                wb.status_banner = Some(if snap.screen_state.needs_restart() {
+                                                    tr_str(
+                                                        &wb.language_id,
+                                                        "录屏权限已在系统设置中开启，请点击「重启 Fabushi」使其生效",
+                                                        "Screen Recording enabled in Settings — click Restart Fabushi to apply",
+                                                    )
+                                                    .to_string()
+                                                } else {
+                                                    tr_str(
+                                                        &wb.language_id,
+                                                        "未获取到录屏权限：请点击「在设置中开启」并将悬浮卡片中的 Fabushi 拖入系统设置列表",
+                                                        "Screen Recording required: click Open in Settings and drag Fabushi into the list",
+                                                    )
+                                                    .to_string()
+                                                });
+                                            } else {
+                                                wb.status_banner = Some(
+                                                    tr_str(
+                                                        &wb.language_id,
+                                                        "被控端未开启录屏权限（或开启后尚未重启 Fabushi），请在被控端完成授权",
+                                                        "Remote host missing Screen Recording permission (or needs restart after enabling)",
+                                                    )
+                                                    .to_string(),
+                                                );
+                                            }
+                                        } else {
+                                            wb.status_banner = Some(format!(
+                                                "{}: {}",
+                                                tr_str(&wb.language_id, "抓取桌面画面失败", "Screen capture failed"),
+                                                out.stderr
+                                            ));
+                                        }
                                     } else if out.frame_data_url.is_some() {
                                         wb.needs_screen_permission_guide = false;
+                                        wb.remote_permission_error = None;
                                         wb.update_frame_url(out.frame_data_url.clone());
                                         wb.status_banner = Some(format!(
                                             "{} ({}ms)",
@@ -1201,24 +1252,45 @@ impl AppShell {
                                 WorkbenchCommand::SendGuiClick { x, y } => {
                                     if out.ok {
                                         wb.needs_accessibility_permission_guide = false;
+                                        wb.remote_permission_error = None;
                                         wb.status_banner = Some(format!(
                                             "{} ({x}, {y})",
                                             tr_str(&wb.language_id, "远程点击已生效", "Click applied")
                                         ));
                                     } else {
-                                        if out.stderr.contains("辅助功能") || out.stderr.to_ascii_lowercase().contains("accessibility") {
+                                        if out.stderr.contains("辅助功能")
+                                            || out.stderr.to_ascii_lowercase().contains("accessibility")
+                                            || out.stderr.to_ascii_lowercase().contains("permission")
+                                        {
                                             wb.needs_accessibility_permission_guide = true;
+                                            wb.remote_permission_error = Some(out.stderr.clone());
+                                            if wb.is_local_device {
+                                                request_permissions_refresh(true);
+                                            }
                                         }
                                         wb.status_banner = Some(out.stderr.clone());
                                     }
                                 }
                                 WorkbenchCommand::SendGuiText { .. } => {
-                                    wb.status_banner = Some(if out.ok {
-                                        tr_str(&wb.language_id, "文本已发送到远程桌面", "Text delivered")
-                                            .to_string()
+                                    if out.ok {
+                                        wb.needs_accessibility_permission_guide = false;
+                                        wb.status_banner = Some(
+                                            tr_str(&wb.language_id, "文本已发送到远程桌面", "Text delivered")
+                                                .to_string(),
+                                        );
                                     } else {
-                                        out.stderr.clone()
-                                    });
+                                        if out.stderr.contains("辅助功能")
+                                            || out.stderr.to_ascii_lowercase().contains("accessibility")
+                                            || out.stderr.to_ascii_lowercase().contains("permission")
+                                        {
+                                            wb.needs_accessibility_permission_guide = true;
+                                            wb.remote_permission_error = Some(out.stderr.clone());
+                                            if wb.is_local_device {
+                                                request_permissions_refresh(true);
+                                            }
+                                        }
+                                        wb.status_banner = Some(out.stderr.clone());
+                                    }
                                 }
                                 WorkbenchCommand::RunShell { command, .. } => {
                                     wb.push_terminal_output(
@@ -1276,8 +1348,19 @@ impl AppShell {
                                 }
                                 WorkbenchCommand::SendHotkey { key, modifiers } => {
                                     if !out.ok && !out.stderr.is_empty() {
+                                        if out.stderr.contains("辅助功能")
+                                            || out.stderr.to_ascii_lowercase().contains("accessibility")
+                                            || out.stderr.to_ascii_lowercase().contains("permission")
+                                        {
+                                            wb.needs_accessibility_permission_guide = true;
+                                            wb.remote_permission_error = Some(out.stderr.clone());
+                                            if wb.is_local_device {
+                                                request_permissions_refresh(true);
+                                            }
+                                        }
                                         wb.status_banner = Some(out.stderr.clone());
                                     } else {
+                                        wb.needs_accessibility_permission_guide = false;
                                         wb.status_banner = Some(format!(
                                             "{} {:?}+{key}",
                                             tr_str(&wb.language_id, "已发送组合键", "Sent hotkey"),
@@ -1322,8 +1405,21 @@ impl AppShell {
                                         }
                                     }
                                 },
-                                WorkbenchCommand::SendRelativeMouseDelta { .. }
-                                | WorkbenchCommand::SetStreamSettings(_)
+                                WorkbenchCommand::SendRelativeMouseDelta { .. } => {
+                                    if !out.ok
+                                        && (out.stderr.contains("辅助功能")
+                                            || out.stderr.to_ascii_lowercase().contains("accessibility")
+                                            || out.stderr.to_ascii_lowercase().contains("permission"))
+                                    {
+                                        wb.needs_accessibility_permission_guide = true;
+                                        wb.remote_permission_error = Some(out.stderr.clone());
+                                        if wb.is_local_device {
+                                            request_permissions_refresh(true);
+                                        }
+                                        wb.status_banner = Some(out.stderr.clone());
+                                    }
+                                }
+                                WorkbenchCommand::SetStreamSettings(_)
                                 | WorkbenchCommand::ToggleVirtualDisplay { .. }
                                 | WorkbenchCommand::FileTransferAction { .. } => {}
                             }

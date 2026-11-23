@@ -924,3 +924,178 @@ async fn test_numeric_named_bot_reply_uses_display_name_without_debug_banner() {
         assert!(!reply.contains("Configure an upstream API key"), "reply leaked API key tip: {reply}");
     }
 }
+
+#[tokio::test]
+async fn test_webmcp_call_tool_failure_surfaces_registered_tools_and_webview_open_guidance() {
+    use gpui_telegram_agent::hermes::toolsets::{HermesToolExecutor, ToolsetPreset};
+    use gpui_telegram_core::types::UserId;
+    use gpui_telegram_proto::miniapp_contracts::{
+        MiniAppControlMode, MiniAppWebMcpResponse, WebMcpToolDescriptor,
+    };
+    use gpui_telegram_proto::sync::UpdateEvent;
+    use gpui_telegram_proto::ws::WsServerFrame;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::mpsc;
+
+    let dir = TempDirGuard::new("webmcp_error_context");
+    let (state, app) = open_durable(&dir);
+    let (uid, _tok) = reg(&app, "alice_webmcp_err").await;
+
+    let bot = state
+        .db
+        .create_registered_bot(
+            uid as i64,
+            "dharma_err_bot",
+            "Dharma Error Bot",
+            "desc",
+            "about",
+            "persona",
+            "",
+            "https://dharma.example/app",
+            "[]",
+            false,
+            true,
+        )
+        .expect("create bot");
+    state
+        .db
+        .create_or_upsert_mini_app_with_options(
+            bot.bot_user_id,
+            "dharma_err_bot",
+            "fabushi",
+            "全球法布施",
+            "Dharma Mini App",
+            "tools",
+            "☸️",
+            Some("https://dharma.example/app"),
+            "{}",
+            true,
+            true,
+            false,
+            "",
+            "",
+            None,
+            false,
+        )
+        .expect("seed miniapp");
+    let (chat_rec, _) = state
+        .db
+        .ensure_companion_bot_chat_record(UserId(uid), UserId(bot.bot_user_id as u64))
+        .expect("companion chat");
+
+    let uid_str = uid.to_string();
+    let mut ctx = state.fabushi_core().build_tool_context_with_user(
+        "sess_webmcp_err",
+        Some(chat_rec.0),
+        None,
+        Some(&uid_str),
+        1,
+        Some(ToolsetPreset::Full),
+        0,
+        Arc::new(AtomicBool::new(false)),
+    );
+    ctx.bot_id = Some(bot.bot_user_id);
+
+    // Case 1: Headless fallback (no connected WebView)
+    let disc = HermesToolExecutor::execute("webmcp_discover", json!({}), &ctx).await;
+    assert!(disc.success, "discover failed: {:?}", disc.error);
+    let disc_v: Value = serde_json::from_str(&disc.output).unwrap();
+    assert_eq!(disc_v["webview_connected"], false);
+    assert!(
+        disc_v["notice"]
+            .as_str()
+            .is_some_and(|n| n.contains("全球法布施") && n.contains("打开")),
+        "expected headless notice with app title, got {disc_v}"
+    );
+
+    let unreg_headless = HermesToolExecutor::execute(
+        "webmcp_call_tool",
+        json!({ "tool_name": "fabushi_send_dharma", "arguments": { "sutra": "金刚经" } }),
+        &ctx,
+    )
+    .await;
+    assert!(!unreg_headless.success);
+    let err1 = unreg_headless.error.as_deref().unwrap_or("");
+    assert!(err1.contains("未注册的 WebMCP 工具: fabushi_send_dharma"), "got {err1}");
+    assert!(err1.contains("全球法布施"), "missing app title in error: {err1}");
+    assert!(err1.contains("get_state"), "missing headless tools in error: {err1}");
+
+    // Case 2: Live WS client returning !ok with registered_tools + boot_error
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    state.gateway_hub.register(UserId(uid), tx);
+    let state_bg = Arc::clone(&state);
+    let responder = tokio::spawn(async move {
+        let mut round = 0usize;
+        while let Some(frame) = rx.recv().await {
+            if let WsServerFrame::Update(UpdateEvent::MiniAppWebMcpCommand(cmd)) = frame {
+                round += 1;
+                let resp = if round == 1 {
+                    MiniAppWebMcpResponse {
+                        request_id: cmd.request_id,
+                        ok: false,
+                        result: json!({}),
+                        error: Some("未注册的 WebMCP 工具: fabushi_send_dharma".to_string()),
+                        tools: vec![
+                            WebMcpToolDescriptor {
+                                name: "get_state".to_string(),
+                                description: "state".to_string(),
+                                input_schema: json!({}),
+                                read_only: true,
+                            },
+                            WebMcpToolDescriptor {
+                                name: "page_inspect".to_string(),
+                                description: "inspect".to_string(),
+                                input_schema: json!({}),
+                                read_only: true,
+                            },
+                        ],
+                        state_summary: Some(json!({
+                            "boot_error": "HTTP 404 (/api/v1/fabushi-miniapp/app.wasm)"
+                        })),
+                        control_mode: MiniAppControlMode::AiControlling,
+                    }
+                } else {
+                    MiniAppWebMcpResponse {
+                        request_id: cmd.request_id,
+                        ok: false,
+                        result: json!({}),
+                        error: Some("未注册的 WebMCP 工具: fabushi_send_dharma".to_string()),
+                        tools: Vec::new(),
+                        state_summary: None,
+                        control_mode: MiniAppControlMode::AiControlling,
+                    }
+                };
+                state_bg
+                    .webmcp_broker
+                    .resolve_rpc_response(UserId(uid), resp);
+                if round >= 2 {
+                    break;
+                }
+            }
+        }
+    });
+
+    let live_err_with_tools = HermesToolExecutor::execute(
+        "webmcp_call_tool",
+        json!({ "tool_name": "fabushi_send_dharma", "arguments": { "sutra": "金刚经" } }),
+        &ctx,
+    )
+    .await;
+    assert!(!live_err_with_tools.success);
+    let err2 = live_err_with_tools.error.as_deref().unwrap_or("");
+    assert!(err2.contains("当前已注册工具: [get_state, page_inspect]"), "got {err2}");
+    assert!(err2.contains("HTTP 404 (/api/v1/fabushi-miniapp/app.wasm)"), "got {err2}");
+
+    // Case 3: Live WS client returning !ok with empty tools -> Mini App open/refresh guidance
+    let live_err_empty_tools = HermesToolExecutor::execute(
+        "webmcp_call_tool",
+        json!({ "tool_name": "fabushi_send_dharma", "arguments": {} }),
+        &ctx,
+    )
+    .await;
+    assert!(!live_err_empty_tools.success);
+    let err3 = live_err_empty_tools.error.as_deref().unwrap_or("");
+    assert!(err3.contains("请先在桌面端打开或刷新「全球法布施」小程序窗口后重试"), "got {err3}");
+
+    let _ = responder.await;
+}

@@ -16,8 +16,9 @@ use gpui_telegram_client::net::hermes_client::HermesCommandDescriptor;
 use crate::app::session::send_as_peers::SendAsPeer;
 use crate::theme::TdesktopThemePalette;
 use crate::views::composer::attachments_drawer::ComposerAttachMiniApp;
+use crate::views::composer::bot_keyboard::BotKeyboardButton;
 use crate::views::composer::composer_ui::{
-    render_composer_context_banner, render_text_input_strip_with_options,
+    render_composer_context_banner, render_text_input_strip_with_full_options,
     render_voice_recording_strip, ComposerBarAction,
 };
 use crate::views::composer::editor_state::ComposerEditorState;
@@ -28,8 +29,9 @@ use crate::views::composer::popups_ui::{
 use crate::views::stage::view::controls::history_view_bot_menu_button::HistoryViewBotMenuButtonViewControls;
 use crate::views::composer::selector_ui::render_tabbed_selector_popup;
 use crate::views::composer::{
-    AttachmentsDrawer, EmojiListWidget, FieldAutocomplete, FormattingBar, GifsListWidget,
-    ImeSafetyMachine, KeyAction, StickersListWidget, TabbedSelector, VoiceGestureMachine,
+    AttachmentsDrawer, BotKeyboard, EmojiListWidget, FieldAutocomplete, FormattingBar,
+    GifsListWidget, ImeSafetyMachine, KeyAction, StickersListWidget, TabbedSelector,
+    VoiceGestureMachine,
 };
 
 pub const MIN_COMPOSER_HEIGHT: f32 = 44.0;
@@ -210,6 +212,7 @@ pub struct CanonicalComposer {
     pub hermes_ac_matches: Vec<HermesSlashOption>,
     pub hermes_ac_selected: usize,
     pub hermes_slash_enabled: bool,
+    pub(crate) hermes_ac_pinned_by_button: bool,
     pub bot_slash_commands: Vec<BotSlashCommandItem>,
     pub bot_ac_visible: bool,
     pub bot_ac_matches: Vec<BotSlashCommandItem>,
@@ -224,10 +227,14 @@ pub struct CanonicalComposer {
     pub bot_menu_controls: HistoryViewBotMenuButtonViewControls,
     pub bot_menu_entity: Option<Entity<HistoryViewBotMenuButtonViewControls>>,
     pub pending_launch_miniapp: Option<(u64, String, String, String)>,
+    pub bot_keyboard: BotKeyboard,
+    pub is_bot_keyboard_open: bool,
+    pub pending_bot_keyboard_press: Option<BotKeyboardButton>,
     pub send_as_options: Vec<SendAsPeer>,
     pub selected_send_as_peer_id: Option<u64>,
     pub compose_placeholder_override: Option<String>,
     pub compose_send_disabled: bool,
+    pub is_compose_isolated: bool,
 }
 
 impl CanonicalComposer {
@@ -269,6 +276,7 @@ impl CanonicalComposer {
             hermes_ac_matches: Vec::new(),
             hermes_ac_selected: 0,
             hermes_slash_enabled: false,
+            hermes_ac_pinned_by_button: false,
             bot_slash_commands: Vec::new(),
             bot_ac_visible: false,
             bot_ac_matches: Vec::new(),
@@ -283,10 +291,14 @@ impl CanonicalComposer {
             bot_menu_controls: HistoryViewBotMenuButtonViewControls::new(),
             bot_menu_entity: None,
             pending_launch_miniapp: None,
+            bot_keyboard: BotKeyboard::new(),
+            is_bot_keyboard_open: false,
+            pending_bot_keyboard_press: None,
             send_as_options: Vec::new(),
             selected_send_as_peer_id: None,
             compose_placeholder_override: None,
             compose_send_disabled: false,
+            is_compose_isolated: false,
         }
     }
 
@@ -311,6 +323,9 @@ impl CanonicalComposer {
     }
 
     pub fn set_send_as_options(&mut self, options: Vec<SendAsPeer>, chosen_id: Option<u64>) {
+        if self.is_compose_isolated {
+            return;
+        }
         self.send_as_options = options;
         self.selected_send_as_peer_id = chosen_id.filter(|id| {
             self.send_as_options.iter().any(|p| p.peer_id == *id)
@@ -377,8 +392,12 @@ impl CanonicalComposer {
         text: impl Into<String>,
         menu_url: impl Into<String>,
     ) {
+        if self.is_compose_isolated {
+            return;
+        }
         self.bot_menu_controls.accent_color = self.palette.accent;
         self.bot_menu_controls.set_bot_menu(bot_id, bot_username, text, menu_url);
+        self.sync_bot_menu_compact_state(None);
     }
 
     pub fn sync_bot_menu_with_cx(
@@ -389,12 +408,20 @@ impl CanonicalComposer {
         menu_url: String,
         cx: &mut Context<Self>,
     ) {
+        if self.is_compose_isolated {
+            return;
+        }
         self.set_bot_menu(bot_id, bot_username.clone(), text.clone(), menu_url.clone());
         let accent = self.palette.accent;
+        let is_small = self.bot_menu_controls.is_small;
         let ent = self.ensure_bot_menu_entity(cx);
         ent.update(cx, |ctrl, c_cx| {
             ctrl.accent_color = accent;
             ctrl.set_bot_menu(bot_id, bot_username, text, menu_url);
+            if ctrl.is_small != is_small {
+                let lbl = ctrl.text.clone();
+                ctrl.refresh(lbl, is_small);
+            }
             c_cx.notify();
         });
     }
@@ -407,6 +434,109 @@ impl CanonicalComposer {
                 ctrl_cx.notify();
             });
         }
+    }
+
+    pub(crate) fn clear_bot_menu_without_notify(&mut self, cx: &mut App) {
+        self.bot_menu_controls.clear_bot_menu();
+        if let Some(ent) = self.bot_menu_entity.clone() {
+            ent.update(cx, |ctrl, _| {
+                ctrl.clear_bot_menu();
+            });
+        }
+    }
+
+    pub fn sync_bot_menu_compact_state(&mut self, cx: Option<&mut Context<Self>>) {
+        let should_be_small = !self.ime_machine.text().is_empty()
+            || self
+                .ime_machine
+                .preedit_text()
+                .is_some_and(|p| !p.is_empty());
+        if !self.bot_menu_controls.is_active {
+            return;
+        }
+        let label = self.bot_menu_controls.text.clone();
+        if self.bot_menu_controls.is_small != should_be_small {
+            self.bot_menu_controls.refresh(label.clone(), should_be_small);
+        }
+        if let (Some(ent), Some(c_cx)) = (self.bot_menu_entity.clone(), cx) {
+            ent.update(c_cx, |ctrl, ctrl_cx| {
+                if ctrl.is_small != should_be_small {
+                    ctrl.refresh(label.clone(), should_be_small);
+                    ctrl_cx.notify();
+                }
+            });
+        }
+    }
+
+    pub fn set_bot_reply_keyboard(
+        &mut self,
+        rows: Vec<Vec<BotKeyboardButton>>,
+        flags_mask: u32,
+        placeholder: Option<String>,
+    ) {
+        if self.is_compose_isolated {
+            return;
+        }
+        if rows.is_empty() {
+            self.clear_bot_reply_keyboard();
+        } else {
+            self.bot_keyboard.set_markup(rows, flags_mask, placeholder);
+            self.is_bot_keyboard_open = true;
+            self.pending_bot_keyboard_press = None;
+        }
+    }
+
+    pub fn clear_bot_reply_keyboard(&mut self) {
+        self.bot_keyboard.clear();
+        self.is_bot_keyboard_open = false;
+        self.pending_bot_keyboard_press = None;
+    }
+
+    pub fn toggle_bot_keyboard(&mut self) {
+        if self.bot_keyboard.has_markup() {
+            self.is_bot_keyboard_open = !self.is_bot_keyboard_open;
+        } else {
+            self.is_bot_keyboard_open = false;
+        }
+    }
+
+    pub fn take_bot_keyboard_press(&mut self) -> Option<BotKeyboardButton> {
+        self.pending_bot_keyboard_press.take()
+    }
+
+    /// Resets per-chat state when entering `+` New Chat / group compose picker or creation modals
+    /// so no prior bot's Mini App menu button, slash commands, reply/edit context, attachments,
+    /// mention candidates, send-as peer, or draft text leaks into the picker.
+    pub fn reset_for_compose_picker(&mut self, cx: Option<&mut Context<Self>>) {
+        self.clear_bot_menu(cx);
+        self.clear_bot_slash_commands();
+        self.set_hermes_slash_enabled(false);
+        self.hermes_ac_pinned_by_button = false;
+        self.cancel_reply_or_edit();
+        self.set_send_as_options(Vec::new(), None);
+        self.editor.attachments.clear();
+        self.submitted_attachment = None;
+        self.pending_attached_files = None;
+        self.editor.send_options_open = false;
+        self.editor.send_silent = false;
+        self.editor.scheduled_at_secs = None;
+        self.editor.selector_search_focused = false;
+        self.editor.undo_stack.clear();
+        self.editor.redo_stack.clear();
+        self.autocomplete.mention_rows.clear();
+        self.autocomplete.all_mention_candidates.clear();
+        self.autocomplete.mention_role_hints.clear();
+        self.clear();
+        self.attachments_drawer.close();
+        self.is_emoji_picker_open = false;
+        self.is_formatting_open = false;
+        self.formatting_bar.is_visible = false;
+        self.context_ref_hint_open = false;
+        self.voice_gesture.cancel();
+        self.pending_launch_miniapp = None;
+        self.clear_bot_reply_keyboard();
+        self.is_input_focused = false;
+        self.is_compose_isolated = true;
     }
 
     pub fn set_attach_mini_apps(&mut self, apps: Vec<ComposerAttachMiniApp>, peer_type_mask: u8) {
@@ -449,6 +579,9 @@ impl CanonicalComposer {
     }
 
     pub fn set_bot_slash_commands(&mut self, commands: Vec<BotSlashCommandItem>) {
+        if self.is_compose_isolated {
+            return;
+        }
         self.bot_slash_commands = commands;
         self.bot_ac_visible = false;
         self.bot_ac_matches.clear();
@@ -467,36 +600,63 @@ impl CanonicalComposer {
     }
 
     pub fn set_hermes_slash_enabled(&mut self, enabled: bool) {
+        if self.is_compose_isolated && enabled {
+            return;
+        }
         self.hermes_slash_enabled = enabled;
         if !enabled {
             self.hermes_ac_visible = false;
             self.hermes_ac_matches.clear();
             self.hermes_ac_selected = 0;
+            self.hermes_ac_pinned_by_button = false;
         }
         self.sync_autocomplete();
     }
 
     pub fn toggle_bot_commands_popup(&mut self) {
-        if self.bot_slash_commands.is_empty() {
-            self.bot_ac_visible = false;
-            self.bot_ac_matches.clear();
-            self.bot_ac_pinned_by_button = false;
+        if !self.bot_slash_commands.is_empty() {
+            if self.bot_ac_visible {
+                self.bot_ac_visible = false;
+                self.bot_ac_matches.clear();
+                self.bot_ac_selected = 0;
+                self.bot_ac_pinned_by_button = false;
+            } else {
+                self.bot_ac_matches = self.bot_slash_commands.clone();
+                self.bot_ac_selected = 0;
+                self.bot_ac_visible = true;
+                self.bot_ac_pinned_by_button = true;
+                self.hermes_ac_visible = false;
+                self.hermes_ac_matches.clear();
+                self.hermes_ac_pinned_by_button = false;
+                self.autocomplete.hide();
+                self.is_input_focused = true;
+            }
             return;
         }
-        if self.bot_ac_visible {
-            self.bot_ac_visible = false;
-            self.bot_ac_matches.clear();
-            self.bot_ac_selected = 0;
-            self.bot_ac_pinned_by_button = false;
+
+        self.bot_ac_visible = false;
+        self.bot_ac_matches.clear();
+        self.bot_ac_pinned_by_button = false;
+
+        if self.hermes_slash_enabled && !self.hermes_commands.is_empty() {
+            if self.hermes_ac_visible {
+                self.hermes_ac_visible = false;
+                self.hermes_ac_matches.clear();
+                self.hermes_ac_selected = 0;
+                self.hermes_ac_pinned_by_button = false;
+            } else {
+                self.hermes_ac_matches = self.hermes_commands.clone();
+                self.hermes_ac_selected = 0;
+                self.hermes_ac_visible = true;
+                self.hermes_ac_pinned_by_button = true;
+                self.autocomplete.hide();
+                self.is_input_focused = true;
+            }
         } else {
-            self.bot_ac_matches = self.bot_slash_commands.clone();
-            self.bot_ac_selected = 0;
-            self.bot_ac_visible = true;
-            self.bot_ac_pinned_by_button = true;
             self.hermes_ac_visible = false;
             self.hermes_ac_matches.clear();
-            self.autocomplete.hide();
-            self.is_input_focused = true;
+            self.hermes_ac_selected = 0;
+            self.hermes_ac_pinned_by_button = false;
         }
     }
 
@@ -545,6 +705,7 @@ impl CanonicalComposer {
 
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.ime_machine = ImeSafetyMachine::with_text(text);
+        self.sync_bot_menu_compact_state(None);
     }
 
     pub fn text(&self) -> &str {
@@ -561,7 +722,9 @@ impl CanonicalComposer {
         self.hermes_ac_visible = false;
         self.hermes_ac_matches.clear();
         self.hermes_ac_selected = 0;
+        self.hermes_ac_pinned_by_button = false;
         self.autocomplete.hide();
+        self.sync_bot_menu_compact_state(None);
     }
 
     pub fn apply_theme(&mut self, palette: TdesktopThemePalette, lang_id: impl Into<String>) {
@@ -774,7 +937,11 @@ impl Render for CanonicalComposer {
             })
             .when_some(banner, |el, b| el.child(b))
             .when_some(context_ref_strip, |el, strip| el.child(wrap_center(strip, false)))
-            .when_some(self.active_send_as_label().map(str::to_string), |el, label| {
+            .when_some(
+                (!self.is_compose_isolated)
+                    .then(|| self.active_send_as_label().map(str::to_string))
+                    .flatten(),
+                |el, label| {
                 let bg = self.palette.input_bg;
                 let border: Rgba = if is_apple {
                     self.palette.separator_rgba()
@@ -813,14 +980,54 @@ impl Render for CanonicalComposer {
                     this.handle_bar_action(act, cx);
                 })
             } else {
-                let bot_menu_view = if self.bot_menu_controls.is_active {
-                    Some(self.ensure_bot_menu_entity(cx).into_any_element())
-                } else if !self.bot_slash_commands.is_empty() {
+                let should_be_small = !text.is_empty()
+                    || preedit.as_deref().is_some_and(|p| !p.is_empty());
+                if !self.is_compose_isolated
+                    && self.bot_menu_controls.is_active
+                    && self.bot_menu_controls.is_small != should_be_small
+                {
+                    let label = self.bot_menu_controls.text.clone();
+                    self.bot_menu_controls.refresh(label, should_be_small);
+                }
+                let show_web_menu = !self.is_compose_isolated && self.bot_menu_controls.is_active;
+                let show_slash_btn = !self.is_compose_isolated
+                    && (!self.bot_slash_commands.is_empty() || self.hermes_slash_enabled);
+                let bot_menu_view = if show_web_menu && show_slash_btn {
+                    let menu_ent = self.ensure_bot_menu_entity(cx);
+                    let label = self.bot_menu_controls.text.clone();
+                    menu_ent.update(cx, |ctrl, _| {
+                        if ctrl.is_small != should_be_small {
+                            ctrl.refresh(label, should_be_small);
+                        }
+                    });
+                    Some(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(menu_ent)
+                            .child(self.render_bot_slash_toggle_button(cx))
+                            .into_any_element(),
+                    )
+                } else if show_web_menu {
+                    let menu_ent = self.ensure_bot_menu_entity(cx);
+                    let label = self.bot_menu_controls.text.clone();
+                    menu_ent.update(cx, |ctrl, _| {
+                        if ctrl.is_small != should_be_small {
+                            ctrl.refresh(label, should_be_small);
+                        }
+                    });
+                    Some(menu_ent.into_any_element())
+                } else if show_slash_btn {
                     Some(self.render_bot_slash_toggle_button(cx))
                 } else {
                     None
                 };
-                render_text_input_strip_with_options(
+                let effective_placeholder = self
+                    .compose_placeholder_override
+                    .as_deref()
+                    .or(self.bot_keyboard.placeholder.as_deref());
+                render_text_input_strip_with_full_options(
                     &text,
                     cursor,
                     selection,
@@ -830,10 +1037,12 @@ impl Render for CanonicalComposer {
                     !self.editor.attachments.is_empty(),
                     self.is_formatting_open,
                     self.is_emoji_picker_open,
+                    !self.is_compose_isolated && self.bot_keyboard.has_markup(),
+                    !self.is_compose_isolated && self.is_bot_keyboard_open,
                     self.calculate_content_height(),
                     self.is_overflow_scroll_active(),
                     bot_menu_view,
-                    self.compose_placeholder_override.as_deref(),
+                    effective_placeholder,
                     self.compose_send_disabled,
                     &self.palette,
                     &self.lang_id,
@@ -841,5 +1050,26 @@ impl Render for CanonicalComposer {
                     |this, act, cx| this.handle_bar_action(act, cx),
                 )
             })
+            .when(
+                !is_recording
+                    && !self.is_compose_isolated
+                    && self.bot_keyboard.has_markup()
+                    && self.is_bot_keyboard_open,
+                |el| {
+                    let kb_view = self.bot_keyboard.render_reply_keyboard(
+                        &self.palette,
+                        cx,
+                        |this, r, c, btn, cx| {
+                            this.bot_keyboard.selected_button = Some((r, c));
+                            this.pending_bot_keyboard_press = Some(btn);
+                            if this.bot_keyboard.single_use {
+                                this.is_bot_keyboard_open = false;
+                            }
+                            cx.notify();
+                        },
+                    );
+                    el.child(wrap_center(kb_view, false))
+                },
+            )
     }
 }

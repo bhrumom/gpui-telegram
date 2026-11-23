@@ -751,60 +751,8 @@ pub fn build_ai_oauth_vault_bundle(
     })
 }
 
-/// Hydrates locally discovered AI OAuth / ADC subscriptions directly into the desktop's
-/// in-process `FabushiBotHost` (`core_engine` + all provisioned bot instances).
-pub fn hydrate_local_subscriptions_into_fabushi(
-    host: &FabushiBotHost,
-    items: &[ClientSubscriptionSyncItem],
-) -> usize {
-    if items.is_empty() {
-        return 0;
-    }
-    let count = items.len();
-    let core = host.core_engine();
-    core.providers().ingest_client_subscriptions(items.to_vec(), true);
-    host.sync_all_providers();
-    count
-}
-
-/// Hydrates a decrypted `AiOauthVaultBundle` into the desktop's in-process `FabushiBotHost`.
-pub fn hydrate_ai_oauth_vault_bundle_into_fabushi(
-    host: &FabushiBotHost,
-    bundle: &AiOauthVaultBundle,
-) -> Result<usize, String> {
-    let mut count = 0usize;
-    let core = host.core_engine();
-    if !bundle.providers_json.is_null() {
-        if let Ok(router_state) =
-            serde_json::from_value::<ProviderRouterState>(bundle.providers_json.clone())
-        {
-            let has_non_placeholder = router_state
-                .providers
-                .values()
-                .any(|p| p.enabled && p.id != "local_hermes" && p.api_mode != ApiMode::LocalHermes)
-                || router_state.subscriptions.iter().any(|s| s.active);
-            if has_non_placeholder {
-                core.providers().sync_from_state(&router_state);
-                count = count.max(router_state.subscriptions.len().max(1));
-            }
-        }
-    }
-    if let Ok(items) =
-        serde_json::from_value::<Vec<ClientSubscriptionSyncItem>>(bundle.subscriptions_json.clone())
-    {
-        if !items.is_empty() {
-            count = hydrate_local_subscriptions_into_fabushi(host, &items);
-            return Ok(count);
-        }
-    }
-    host.sync_all_providers();
-    Ok(count)
-}
-
-/// Returns `true` when `host` has a usable non-placeholder AI provider configured locally.
-pub fn has_usable_local_fabushi_provider(host: &FabushiBotHost) -> bool {
-    let core = host.core_engine();
-    let router = core.providers();
+/// Returns `true` when `router` has a usable non-placeholder AI provider or active subscription.
+pub fn is_provider_router_usable(router: &ProviderRouter) -> bool {
     if router.needs_provider_selection() {
         return false;
     }
@@ -814,6 +762,125 @@ pub fn has_usable_local_fabushi_provider(host: &FabushiBotHost) -> bool {
         && !active_model.eq_ignore_ascii_case("hermes-local-v1"))
         || router.has_configured_provider()
         || router.has_active_subscription()
+}
+
+/// Hydrates locally discovered AI OAuth / ADC subscriptions directly into the desktop's
+/// in-process `FabushiBotHost` for `user_id` (or global base router when `user_id` is `None`).
+pub fn hydrate_local_subscriptions_into_fabushi_for_user(
+    host: &FabushiBotHost,
+    items: &[ClientSubscriptionSyncItem],
+    user_id: Option<&str>,
+) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    let count = items.len();
+    let core = host.core_engine();
+    if let Some(uid) = user_id.map(str::trim).filter(|s| !s.is_empty()) {
+        core.providers_for_user(uid)
+            .ingest_client_subscriptions(items.to_vec(), true);
+        core.persist_user_providers_state(uid);
+    } else {
+        core.providers().ingest_client_subscriptions(items.to_vec(), true);
+    }
+    host.sync_all_providers();
+    count
+}
+
+/// Hydrates locally discovered AI OAuth / ADC subscriptions directly into the desktop's
+/// in-process `FabushiBotHost` (`core_engine` + all provisioned bot instances).
+pub fn hydrate_local_subscriptions_into_fabushi(
+    host: &FabushiBotHost,
+    items: &[ClientSubscriptionSyncItem],
+) -> usize {
+    hydrate_local_subscriptions_into_fabushi_for_user(host, items, None)
+}
+
+/// Hydrates a decrypted `AiOauthVaultBundle` into the desktop's in-process `FabushiBotHost`
+/// for `user_id` (or global base router when `user_id` is `None`).
+pub fn hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
+    host: &FabushiBotHost,
+    bundle: &AiOauthVaultBundle,
+    user_id: Option<&str>,
+) -> Result<usize, String> {
+    let mut count = 0usize;
+    let core = host.core_engine();
+    let normalized_uid = user_id.map(str::trim).filter(|s| !s.is_empty());
+    if !bundle.providers_json.is_null() {
+        if let Ok(router_state) =
+            serde_json::from_value::<ProviderRouterState>(bundle.providers_json.clone())
+        {
+            let usable_provider_count = router_state
+                .providers
+                .values()
+                .filter(|p| {
+                    p.enabled
+                        && p.id != "local_hermes"
+                        && p.api_mode != ApiMode::LocalHermes
+                        && (!p.credentials.is_empty() || p.no_key_required)
+                })
+                .count();
+            let usable_sub_count = router_state
+                .subscriptions
+                .iter()
+                .filter(|s| {
+                    s.active
+                        && router_state.providers.get(&s.id).is_none_or(|p| p.enabled)
+                        && (s.access_token
+                            .as_deref()
+                            .is_some_and(|t| !t.trim().is_empty())
+                            || router_state.synced_vertex_adcs.contains_key(&s.id)
+                            || router_state.synced_codex_oauths.contains_key(&s.id)
+                            || router_state.providers.get(&s.id).is_some_and(|p| {
+                                p.enabled && (!p.credentials.is_empty() || p.no_key_required)
+                            }))
+                })
+                .count();
+            let has_non_placeholder = usable_provider_count > 0 || usable_sub_count > 0;
+            if has_non_placeholder {
+                if let Some(uid) = normalized_uid {
+                    core.providers_for_user(uid).sync_from_state(&router_state);
+                    core.persist_user_providers_state(uid);
+                } else {
+                    core.providers().sync_from_state(&router_state);
+                }
+                count = count.max(usable_provider_count.max(usable_sub_count).max(1));
+            }
+        }
+    }
+    if let Ok(items) =
+        serde_json::from_value::<Vec<ClientSubscriptionSyncItem>>(bundle.subscriptions_json.clone())
+    {
+        if !items.is_empty() {
+            let sub_count =
+                hydrate_local_subscriptions_into_fabushi_for_user(host, &items, normalized_uid);
+            return Ok(count.max(sub_count));
+        }
+    }
+    host.sync_all_providers();
+    Ok(count)
+}
+
+/// Hydrates a decrypted `AiOauthVaultBundle` into the desktop's in-process `FabushiBotHost`.
+pub fn hydrate_ai_oauth_vault_bundle_into_fabushi(
+    host: &FabushiBotHost,
+    bundle: &AiOauthVaultBundle,
+) -> Result<usize, String> {
+    hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(host, bundle, None)
+}
+
+/// Returns `true` when `host` has a usable non-placeholder AI provider configured locally for `user_id`.
+pub fn has_usable_local_fabushi_provider_for_user(
+    host: &FabushiBotHost,
+    user_id: Option<&str>,
+) -> bool {
+    let router = host.core_engine().resolve_providers(user_id);
+    is_provider_router_usable(&router)
+}
+
+/// Returns `true` when `host` has a usable non-placeholder AI provider configured locally.
+pub fn has_usable_local_fabushi_provider(host: &FabushiBotHost) -> bool {
+    has_usable_local_fabushi_provider_for_user(host, None)
 }
 
 #[cfg(test)]

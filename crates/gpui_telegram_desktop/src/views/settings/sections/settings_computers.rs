@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_proto::remote_control_contracts::{
@@ -11,10 +13,17 @@ use gpui_telegram_proto::{
 };
 
 use crate::app::cli_installer::CliInstallStatus;
+use crate::components::macos_permission_modal::{
+    render_gemini_permission_modal, render_permission_rows_card,
+};
 use crate::components::ui::{
     TextInputController, delete_prev_word, pop_last_char, sanitize_paste_text,
 };
 use crate::i18n::tr_str;
+use crate::platform::mac::macos_permissions_drag::{
+    cached_permissions_snapshot, hide_drag_hud, permissions_snapshot_generation,
+    request_permissions_refresh,
+};
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::TdesktopThemePalette;
 use crate::views::computer_workbench::render_ime_text_preview;
@@ -222,6 +231,13 @@ pub struct SettingsComputersSections {
     pub input_credential: Option<Entity<TextInputController>>,
     pub input_agent_url: Option<Entity<TextInputController>>,
     pub input_workdir: Option<Entity<TextInputController>>,
+
+    // macOS Gemini-style permission setup modal & live polling state
+    pub permission_modal_open: bool,
+    permission_poll_started: bool,
+    last_perm_gen: u64,
+    last_perm_screen_active: bool,
+    last_perm_ax_active: bool,
 }
 
 impl SettingsComputersSections {
@@ -271,7 +287,67 @@ impl SettingsComputersSections {
             input_credential: None,
             input_agent_url: None,
             input_workdir: None,
+            permission_modal_open: false,
+            permission_poll_started: false,
+            last_perm_gen: 0,
+            last_perm_screen_active: false,
+            last_perm_ax_active: false,
         }
+    }
+
+    fn ensure_permission_poll_loop(&mut self, cx: &mut Context<Self>) {
+        if self.permission_poll_started
+            || !cfg!(target_os = "macos")
+            || cfg!(test)
+            || std::env::var_os("GPUI_OFFLINE_TEST").is_some()
+        {
+            return;
+        }
+        self.permission_poll_started = true;
+        let init_snap = cached_permissions_snapshot();
+        self.last_perm_gen = permissions_snapshot_generation();
+        self.last_perm_screen_active = init_snap.screen_state.is_active();
+        self.last_perm_ax_active = init_snap.accessibility_granted;
+        if init_snap.any_missing() {
+            request_permissions_refresh(true);
+        }
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| loop {
+            app.background_executor()
+                .timer(Duration::from_millis(850))
+                .await;
+            let keep = weak
+                .update(app, |this, cx| {
+                    let perm_ui_visible = this.permission_modal_open
+                        || (this.page == SettingsComputersPage::Overview
+                            && this.overview_tab == SettingsComputersTab::MyDevices);
+                    if perm_ui_visible {
+                        let before_snap = cached_permissions_snapshot();
+                        if before_snap.any_missing() || before_snap.hud_visible {
+                            request_permissions_refresh(false);
+                        }
+                        let snap = cached_permissions_snapshot();
+                        let perm_gen = permissions_snapshot_generation();
+                        let screen_active = snap.screen_state.is_active();
+                        let ax_active = snap.accessibility_granted;
+                        if perm_gen != this.last_perm_gen
+                            || screen_active != this.last_perm_screen_active
+                            || ax_active != this.last_perm_ax_active
+                        {
+                            this.last_perm_gen = perm_gen;
+                            this.last_perm_screen_active = screen_active;
+                            this.last_perm_ax_active = ax_active;
+                            cx.notify();
+                        }
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
     }
 
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) {
@@ -2179,134 +2255,172 @@ impl SettingsComputersSections {
         &self,
         pal: TdesktopThemePalette,
         lang: &str,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::platform::mac::macos_permissions_drag::{
-            has_accessibility_permission, has_screen_recording_permission,
-            open_accessibility_settings, open_screen_recording_settings,
-        };
+        let snap = cached_permissions_snapshot();
+        let all_ready = snap.all_ready();
+        let bundle_path = snap.signing.drag_target_path().to_string();
 
-        let screen_ok = has_screen_recording_permission();
-        let ax_ok = has_accessibility_permission();
-
-        let perm_row = |id: &'static str,
-                        title: &'static str,
-                        desc: &'static str,
-                        granted: bool,
-                        on_open: fn()| {
-            let badge_color = if granted { pal.success } else { pal.accent };
-            let badge_label = if granted {
-                tr_str(lang, "已开启", "Enabled")
-            } else {
-                tr_str(lang, "未开启", "Not Enabled")
-            };
-            div()
-                .px(px(16.0))
-                .py(px(12.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .px(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(if all_ready {
+                                pal.success
+                            } else {
+                                pal.text_secondary
+                            }))
+                            .child(if all_ready {
+                                tr_str(
+                                    lang,
+                                    "远程控制所需系统权限已全部生效",
+                                    "All remote control system permissions are active",
+                                )
+                            } else if snap.screen_state.needs_restart() {
+                                tr_str(
+                                    lang,
+                                    "录屏权限已在系统设置中开启，点击下方“重启 Fabushi”即可生效",
+                                    "Screen Recording enabled in System Settings — click Restart below to apply",
+                                )
+                            } else {
+                                tr_str(
+                                    lang,
+                                    "支持拖拽悬浮应用卡片到系统设置列表一键授权，状态自动实时更新",
+                                    "Drag the floating app card into System Settings to grant — status updates live",
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("settings-perm-recheck-btn")
+                                    .cursor_pointer()
+                                    .px(px(10.0))
+                                    .py(px(4.0))
+                                    .rounded(px(999.0))
+                                    .bg(TdesktopThemePalette::rgba_with_alpha(
+                                        pal.text_primary,
+                                        0.07,
+                                    ))
+                                    .border_1()
+                                    .border_color(rgb(pal.border_fg))
+                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(pal.text_primary))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            request_permissions_refresh(true);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "重新检测", "Re-check")),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-perm-wizard-btn")
+                                    .cursor_pointer()
+                                    .px(px(11.0))
+                                    .py(px(4.0))
+                                    .rounded(px(999.0))
+                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16))
+                                    .border_1()
+                                    .border_color(rgb(pal.accent))
+                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.permission_modal_open = true;
+                                            request_permissions_refresh(true);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "打开授权向导", "Open Setup Guide")),
+                            ),
+                    ),
+            )
+            .child(render_permission_rows_card("settings", &snap, pal, lang))
+            .when(snap.hud_visible, |col| {
+                col.child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(10.0))
+                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.12))
+                        .border_1()
+                        .border_color(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.3))
                         .flex()
-                        .flex_col()
-                        .gap(px(3.0))
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
                         .child(
                             div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .text_size(px(13.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_primary))
-                                        .child(title),
-                                )
-                                .child(
-                                    div()
-                                        .px(px(7.0))
-                                        .py(px(1.5))
-                                        .rounded(px(999.0))
-                                        .bg(TdesktopThemePalette::rgba_with_alpha(
-                                            badge_color,
-                                            0.14,
-                                        ))
-                                        .text_size(px(10.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(badge_color))
-                                        .child(badge_label),
-                                ),
+                                .flex_1()
+                                .text_size(px(11.5))
+                                .text_color(rgb(pal.text_primary))
+                                .child(tr_str(
+                                    lang,
+                                    "已打开悬浮拖拽卡片：按住其中的 Fabushi 拖入“系统设置”列表即可完成授权。",
+                                    "Floating drag card is open — drag Fabushi into System Settings to grant access.",
+                                )),
                         )
                         .child(
                             div()
-                                .text_size(px(12.0))
-                                .text_color(rgb(pal.text_secondary))
-                                .child(desc),
+                                .id("settings-perm-hide-hud-btn")
+                                .cursor_pointer()
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded(px(999.0))
+                                .bg(rgb(pal.input_bg))
+                                .border_1()
+                                .border_color(rgb(pal.border_fg))
+                                .text_size(px(11.5))
+                                .text_color(rgb(pal.text_primary))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                    hide_drag_hud();
+                                })
+                                .child(tr_str(lang, "隐藏卡片", "Hide")),
                         ),
                 )
-                .child(
+            })
+            .when(snap.any_missing() && !bundle_path.is_empty(), |col| {
+                col.child(
                     div()
-                        .id(id)
-                        .cursor_pointer()
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .rounded(px(999.0))
-                        .bg(if granted {
-                            rgb(pal.input_bg).into()
+                        .px(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(rgb(pal.text_secondary))
+                        .truncate()
+                        .child(if lang.starts_with("zh") {
+                            format!("当前运行应用路径：{bundle_path}")
                         } else {
-                            TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
-                        })
-                        .border_1()
-                        .border_color(rgb(if granted { pal.border_fg } else { pal.accent }))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(if granted {
-                            pal.text_secondary
-                        } else {
-                            pal.accent
-                        }))
-                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                            cx.stop_propagation();
-                            on_open();
-                        })
-                        .child(tr_str(
-                            lang,
-                            "在“系统设置”中启用",
-                            "Enable in System Settings",
-                        )),
+                            format!("Running app path: {bundle_path}")
+                        }),
                 )
-        };
-
-        settings_card(pal)
-            .child(perm_row(
-                "settings-perm-screen-btn",
-                tr_str(lang, "录屏与系统录音", "Screen Recording"),
-                tr_str(
-                    lang,
-                    "用于实时查看远程桌面画面",
-                    "Required to view the live remote desktop screen",
-                ),
-                screen_ok,
-                open_screen_recording_settings,
-            ))
-            .child(div().h(px(1.0)).mx(px(16.0)).bg(rgb(pal.border_fg)))
-            .child(perm_row(
-                "settings-perm-ax-btn",
-                tr_str(lang, "辅助功能", "Accessibility"),
-                tr_str(
-                    lang,
-                    "用于远程鼠标点击与键盘操控",
-                    "Required to send remote mouse clicks and keystrokes",
-                ),
-                ax_ok,
-                open_accessibility_settings,
-            ))
+            })
             .into_any_element()
     }
 
@@ -3966,14 +4080,35 @@ impl SettingsComputersSections {
 impl Render for SettingsComputersSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_form_inputs(cx);
+        self.ensure_permission_poll_loop(cx);
         let pal = self.palette;
         let lang = self.language_id.clone();
-        match self.page.clone() {
+        let page_view = match self.page.clone() {
             SettingsComputersPage::Overview => self.render_overview(pal, &lang, cx),
             SettingsComputersPage::Detail(node_id) => {
                 self.render_detail(&node_id, pal, &lang, cx)
             }
             SettingsComputersPage::CloudForm => self.render_cloud_form(pal, &lang, cx),
-        }
+        };
+        div()
+            .relative()
+            .size_full()
+            .child(page_view)
+            .when(self.permission_modal_open && cfg!(target_os = "macos"), |el| {
+                let snap = cached_permissions_snapshot();
+                el.child(render_gemini_permission_modal(
+                    &snap,
+                    pal,
+                    &lang,
+                    cx.listener(|this, _, _, cx| {
+                        this.permission_modal_open = false;
+                        cx.notify();
+                    }),
+                    cx.listener(|this, _, _, cx| {
+                        this.permission_modal_open = false;
+                        cx.notify();
+                    }),
+                ))
+            })
     }
 }

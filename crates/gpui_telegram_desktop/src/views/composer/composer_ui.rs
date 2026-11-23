@@ -16,6 +16,7 @@ pub enum ComposerBarAction {
     ToggleAttachments,
     ToggleFormatting,
     ToggleEmojiPicker,
+    ToggleBotKeyboard,
     OpenBotMenu,
     FocusInput,
     SendOrSave,
@@ -270,11 +271,59 @@ pub fn render_text_input_strip_with_options<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, ComposerBarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    render_text_input_strip_with_full_options(
+        text,
+        cursor,
+        selection,
+        preedit,
+        is_focused,
+        is_editing,
+        has_attachments,
+        is_formatting_open,
+        is_emoji_open,
+        false,
+        false,
+        content_height,
+        overflow_scroll,
+        bot_menu_view,
+        placeholder_override,
+        send_disabled,
+        palette,
+        lang_id,
+        cx,
+        on_action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_text_input_strip_with_full_options<V: 'static>(
+    text: &str,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+    preedit: Option<&str>,
+    is_focused: bool,
+    is_editing: bool,
+    has_attachments: bool,
+    is_formatting_open: bool,
+    is_emoji_open: bool,
+    has_bot_keyboard: bool,
+    is_bot_keyboard_open: bool,
+    content_height: Pixels,
+    overflow_scroll: bool,
+    bot_menu_view: Option<AnyElement>,
+    placeholder_override: Option<&str>,
+    send_disabled: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, ComposerBarAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
     let is_empty = text.is_empty() && preedit.map_or(true, |p| p.is_empty());
     let show_send = (!is_empty || is_editing || has_attachments) && !send_disabled;
     let a_att = on_action.clone();
     let a_fmt = on_action.clone();
     let a_emo = on_action.clone();
+    let a_kb = on_action.clone();
     let a_foc = on_action.clone();
     let a_snd = on_action.clone();
     let a_sopt = on_action.clone();
@@ -474,33 +523,44 @@ pub fn render_text_input_strip_with_options<V: 'static>(
             .justify_center()
             .child(
                 div()
-                    .id("cmp-input-wrap")
                     .w_full()
                     .max_w(px(740.0))
-                    .min_h(px(palette.scaled_px(46.0)))
-                    .h(scaled_capsule_h)
-                    .pl(px(8.0))
-                    .pr(px(8.0))
-                    .py(px(6.0))
-                    .rounded(px(23.0))
-                    .bg(rgb(pill_bg))
-                    .border_1()
-                    .border_color(pill_border)
-                    .shadow(pill_shadow)
-                    .cursor_text()
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                        a_foc(this, ComposerBarAction::FocusInput, cx);
-                    }))
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(6.0))
+                    .items_end()
+                    .gap(px(8.0))
+                    .when_some(bot_menu_view, |row, btn| {
+                        row.child(
+                            div()
+                                .h(px(palette.scaled_px(46.0)))
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .child(btn),
+                        )
+                    })
                     .child(
                         div()
+                            .id("cmp-input-wrap")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(palette.scaled_px(46.0)))
+                            .h(scaled_capsule_h)
+                            .pl(px(8.0))
+                            .pr(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(23.0))
+                            .bg(rgb(pill_bg))
+                            .border_1()
+                            .border_color(pill_border)
+                            .shadow(pill_shadow)
+                            .cursor_text()
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                a_foc(this, ComposerBarAction::FocusInput, cx);
+                            }))
                             .flex()
                             .items_center()
-                            .gap(px(4.0))
-                            .flex_shrink_0()
+                            .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .id("cmp-attach-btn")
@@ -523,71 +583,101 @@ pub fn render_text_input_strip_with_options<V: 'static>(
                                     .text_color(rgb(palette.text_secondary))
                                     .child("+"),
                             )
-                            .when_some(bot_menu_view, |row, btn| row.child(btn)),
-                    )
-                    .child(
-                        div()
-                            .id("cmp-text-scroll")
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .px(px(4.0))
-                            .when(overflow_scroll, |el| el.overflow_y_scroll().max_h(px(164.0)))
-                            .child(text_el),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(2.0))
-                            .flex_shrink_0()
                             .child(
                                 div()
-                                    .id("cmp-fmt-toggle")
-                                    .px(px(6.0))
-                                    .py(px(3.0))
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(attach_hover))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        a_fmt(this, ComposerBarAction::ToggleFormatting, cx);
-                                    }))
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(if is_formatting_open {
-                                        palette.accent
-                                    } else {
-                                        palette.text_secondary
-                                    }))
-                                    .child("Aa"),
+                                    .id("cmp-text-scroll")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .px(px(4.0))
+                                    .when(overflow_scroll, |el| el.overflow_y_scroll().max_h(px(164.0)))
+                                    .child(text_el),
                             )
                             .child(
                                 div()
-                                    .id("cmp-emoji-toggle")
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(attach_hover))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        a_emo(this, ComposerBarAction::ToggleEmojiPicker, cx);
-                                    }))
-                                    .child(tg_icon(
-                                        IconName::SmileEmoji,
-                                        16.5,
-                                        if is_emoji_open {
-                                            palette.accent
-                                        } else {
-                                            palette.text_secondary
-                                        },
-                                    )),
-                            )
-                            .child(mic_btn)
-                            .child(send_btn),
+                                    .gap(px(2.0))
+                                    .flex_shrink_0()
+                                    .when(has_bot_keyboard, |cluster| {
+                                        let kb_active_bg = TdesktopThemePalette::rgba_with_alpha(
+                                            palette.accent,
+                                            if is_dark { 0.22 } else { 0.14 },
+                                        );
+                                        cluster.child(
+                                            div()
+                                                .id("cmp-bot-kb-toggle")
+                                                .w(px(28.0))
+                                                .h(px(28.0))
+                                                .rounded_full()
+                                                .cursor_pointer()
+                                                .when(is_bot_keyboard_open, |d| d.bg(kb_active_bg))
+                                                .hover(move |s| s.bg(attach_hover))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    a_kb(this, ComposerBarAction::ToggleBotKeyboard, cx);
+                                                }))
+                                                .text_size(px(13.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(if is_bot_keyboard_open {
+                                                    palette.accent
+                                                } else {
+                                                    palette.text_secondary
+                                                }))
+                                                .child("⌘"),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("cmp-fmt-toggle")
+                                            .px(px(6.0))
+                                            .py(px(3.0))
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(attach_hover))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                a_fmt(this, ComposerBarAction::ToggleFormatting, cx);
+                                            }))
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(if is_formatting_open {
+                                                palette.accent
+                                            } else {
+                                                palette.text_secondary
+                                            }))
+                                            .child("Aa"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("cmp-emoji-toggle")
+                                            .w(px(28.0))
+                                            .h(px(28.0))
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(attach_hover))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                a_emo(this, ComposerBarAction::ToggleEmojiPicker, cx);
+                                            }))
+                                            .child(tg_icon(
+                                                IconName::SmileEmoji,
+                                                16.5,
+                                                if is_emoji_open {
+                                                    palette.accent
+                                                } else {
+                                                    palette.text_secondary
+                                                },
+                                            )),
+                                    )
+                                    .child(mic_btn)
+                                    .child(send_btn),
+                            ),
                     ),
             )
             .into_any_element();
@@ -632,6 +722,7 @@ pub fn render_text_input_strip_with_options<V: 'static>(
             div()
                 .id("cmp-input-wrap")
                 .flex_1()
+                .min_w(px(0.0))
                 .min_h(px(palette.scaled_px(44.0)))
                 .h(scaled_content_h)
                 .px(px(palette.scaled_px(12.0)))
@@ -652,6 +743,7 @@ pub fn render_text_input_strip_with_options<V: 'static>(
                     div()
                         .id("cmp-text-scroll")
                         .flex_1()
+                        .min_w(px(0.0))
                         .when(overflow_scroll, |el| el.overflow_y_scroll().max_h(px(172.0)))
                         .child(text_el),
                 )
@@ -660,6 +752,32 @@ pub fn render_text_input_strip_with_options<V: 'static>(
                         .flex()
                         .items_center()
                         .gap(px(4.0))
+                        .when(has_bot_keyboard, |cluster| {
+                            cluster.child(
+                                div()
+                                    .id("cmp-bot-kb-toggle")
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        a_kb(this, ComposerBarAction::ToggleBotKeyboard, cx);
+                                    }))
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(if is_bot_keyboard_open {
+                                        palette.icon_active
+                                    } else {
+                                        palette.icon_fg
+                                    }))
+                                    .child("⌘"),
+                            )
+                        })
                         .child(
                             div()
                                 .id("cmp-fmt-toggle")

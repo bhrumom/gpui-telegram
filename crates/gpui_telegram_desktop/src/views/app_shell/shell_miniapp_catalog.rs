@@ -1337,6 +1337,29 @@ impl AppShell {
     #[allow(clippy::too_many_arguments)]
     /// Routes an incoming server WebMCP command either to the matching mounted Mini App overlay
     /// or auto-launches it silently in Floating PiP mode so AI can inspect and control it live.
+    fn take_matching_pending_webmcp_commands(
+        &mut self,
+        bot_username: &str,
+        short_name: &str,
+    ) -> Vec<gpui_telegram_proto::miniapp_contracts::MiniAppWebMcpCommand> {
+        let target_bot = bot_username.trim().trim_start_matches('@');
+        let target_short = short_name.trim();
+        let mut matched = Vec::new();
+        let mut remaining = std::collections::VecDeque::new();
+        while let Some(c) = self.miniapps.pending_webmcp_commands.pop_front() {
+            let c_bot = c.bot_username.trim().trim_start_matches('@');
+            if c_bot.eq_ignore_ascii_case(target_bot)
+                && c.short_name.trim().eq_ignore_ascii_case(target_short)
+            {
+                matched.push(c);
+            } else {
+                remaining.push_back(c);
+            }
+        }
+        self.miniapps.pending_webmcp_commands = remaining;
+        matched
+    }
+
     pub fn launch_miniapp_for_webmcp(
         &mut self,
         cmd: gpui_telegram_proto::miniapp_contracts::MiniAppWebMcpCommand,
@@ -1374,14 +1397,43 @@ impl AppShell {
                 active_tool: cmd.tool_name.clone(),
             });
 
-        let already_matches = self.miniapps.miniapp_overlay.as_ref().is_some_and(|ov| {
-            let w = ov.read(cx);
-            w.bot_username
-                .trim_start_matches('@')
-                .eq_ignore_ascii_case(cmd.bot_username.trim_start_matches('@'))
-                && w.current_short_name().eq_ignore_ascii_case(&cmd.short_name)
-                && !w.is_loading
-        });
+        let (already_matches, in_flight_same_app) = self
+            .miniapps
+            .miniapp_overlay
+            .as_ref()
+            .map(|ov| {
+                let w = ov.read(cx);
+                let w_bot = w.bot_username.trim().trim_start_matches('@');
+                let w_short = if w.is_loading && !w.launching_short_name.is_empty() {
+                    w.launching_short_name.clone()
+                } else {
+                    w.current_short_name()
+                };
+                let target_matches = w_bot
+                    .eq_ignore_ascii_case(cmd.bot_username.trim_start_matches('@'))
+                    && w_short.eq_ignore_ascii_case(&cmd.short_name);
+                let ctx_bot = w
+                    .launch_context
+                    .as_ref()
+                    .map(|c| c.app.bot_username.trim().trim_start_matches('@'));
+                let ctx_short = w
+                    .active_bot
+                    .as_ref()
+                    .map(|b| b.short_name.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| w.launch_context.as_ref().map(|c| c.app.short_name.as_str()))
+                    .filter(|s| !s.is_empty());
+                let has_ctx = (w.active_bot.is_some() || w.launch_context.is_some())
+                    && ctx_bot.is_none_or(|b| b.eq_ignore_ascii_case(w_bot))
+                    && (!w.is_loading
+                        || w.launching_short_name.is_empty()
+                        || ctx_short.is_some_and(|s| s.eq_ignore_ascii_case(&w.launching_short_name)));
+                (
+                    target_matches && (!w.is_loading || has_ctx),
+                    target_matches && w.is_loading && !has_ctx,
+                )
+            })
+            .unwrap_or((false, false));
 
         if already_matches {
             if let Some(ref ov) = self.miniapps.miniapp_overlay {
@@ -1400,6 +1452,36 @@ impl AppShell {
                         w.pip_live_preview = true;
                     }
                     w.dispatch_webmcp_command(cmd);
+                    wcx.notify();
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        if in_flight_same_app {
+            self.miniapps.pending_webmcp_commands.push_back(cmd);
+            if want_takeover {
+                self.miniapps.is_miniapp_minimized = false;
+                if let Some(ref ov) = self.miniapps.miniapp_overlay {
+                    ov.update(cx, |w, wcx| {
+                        w.is_open = true;
+                        w.is_floating_pip = false;
+                        w.disclaimer_accepted = true;
+                        wcx.notify();
+                    });
+                }
+            } else if let Some(ref ov) = self.miniapps.miniapp_overlay {
+                let open_now = ov.read(cx).is_open;
+                if !open_now {
+                    self.miniapps.is_miniapp_minimized = true;
+                }
+                ov.update(cx, |w, wcx| {
+                    if !w.is_open {
+                        w.is_floating_pip = true;
+                        w.pip_live_preview = true;
+                    }
+                    w.disclaimer_accepted = true;
                     wcx.notify();
                 });
             }
@@ -1498,6 +1580,26 @@ impl AppShell {
             return false;
         }
 
+        let (has_existing_ctx, actual_bot, actual_short) = {
+            let w = ov.read(cx);
+            (
+                w.active_bot.is_some() || w.launch_context.is_some(),
+                w.bot_username.trim().trim_start_matches('@').to_string(),
+                w.current_short_name(),
+            )
+        };
+        let mut queued_cmds = if has_existing_ctx {
+            let mut cmds = self.take_matching_pending_webmcp_commands(bot_un, short);
+            if !actual_bot.is_empty()
+                && (!actual_bot.eq_ignore_ascii_case(bot_un)
+                    || !actual_short.eq_ignore_ascii_case(short))
+            {
+                cmds.extend(self.take_matching_pending_webmcp_commands(&actual_bot, &actual_short));
+            }
+            cmds
+        } else {
+            Vec::new()
+        };
         self.miniapps.is_miniapp_minimized = false;
         self.miniapps.pending_miniapp_confirm = None;
         ov.update(cx, |w, w_cx| {
@@ -1505,6 +1607,9 @@ impl AppShell {
             w.is_floating_pip = false;
             w.menu_open = false;
             w.confirm_close_open = false;
+            for cmd in queued_cmds.drain(..) {
+                w.dispatch_webmcp_command(cmd);
+            }
             w_cx.notify();
         });
         cx.notify();
@@ -1590,6 +1695,7 @@ impl AppShell {
             return;
         }
         let server_base = self.client.http_client.base_url.clone();
+        let launch_gen = self.miniapps.bump_launch_generation();
         let ov = self.ensure_miniapp_overlay(cx);
         self.miniapps.is_miniapp_minimized = false;
         let title_hint = self
@@ -1603,7 +1709,21 @@ impl AppShell {
             })
             .map(|a| a.title.clone())
             .unwrap_or_else(|| short.clone());
+        if self
+            .miniapps
+            .floating_pip_status
+            .as_ref()
+            .is_some_and(|ps| {
+                !ps.bot_username
+                    .trim_start_matches('@')
+                    .eq_ignore_ascii_case(&bot_un)
+                    || !ps.short_name.eq_ignore_ascii_case(&short)
+            })
+        {
+            self.miniapps.floating_pip_status = None;
+        }
         ov.update(cx, |w, w_cx| {
+            w.reset_for_new_launch();
             w.set_server_base_url(server_base);
             w.is_open = true;
             w.is_floating_pip = false;
@@ -1634,28 +1754,54 @@ impl AppShell {
                 if !fence_matches(&fence, shell) {
                     return;
                 }
+                let is_current_launch = shell.miniapps.miniapp_launch_generation == launch_gen;
                 match res {
                     Ok(mut ctx) => {
+                        let match_bot = ctx.app.bot_username.trim_start_matches('@').to_string();
+                        let match_short = ctx.app.short_name.clone();
+                        if !is_current_launch {
+                            let same_target_active = shell
+                                .miniapps
+                                .miniapp_overlay
+                                .as_ref()
+                                .is_some_and(|ov| {
+                                    let w = ov.read(cx);
+                                    let w_bot = w.bot_username.trim().trim_start_matches('@');
+                                    let w_short = if w.is_loading && !w.launching_short_name.is_empty() {
+                                        w.launching_short_name.clone()
+                                    } else {
+                                        w.current_short_name()
+                                    };
+                                    (w_bot.eq_ignore_ascii_case(&bot_un)
+                                        && w_short.eq_ignore_ascii_case(&short))
+                                        || (!match_bot.is_empty()
+                                            && w_bot.eq_ignore_ascii_case(&match_bot)
+                                            && w_short.eq_ignore_ascii_case(&match_short))
+                                });
+                            if !same_target_active {
+                                let _ = shell
+                                    .take_matching_pending_webmcp_commands(&match_bot, &match_short);
+                                if !match_bot.eq_ignore_ascii_case(&bot_un)
+                                    || !match_short.eq_ignore_ascii_case(&short)
+                                {
+                                    let _ =
+                                        shell.take_matching_pending_webmcp_commands(&bot_un, &short);
+                                }
+                            }
+                            return;
+                        }
                         let uid = ctx.app.bot_user_id.max(0) as u64;
                         if uid > 0 && shell.miniapps.accepted_app_tos_bots.contains(&uid) {
                             ctx.app.app_tos_accepted = true;
                         }
-                        let match_bot = ctx.app.bot_username.trim_start_matches('@').to_string();
-                        let match_short = ctx.app.short_name.clone();
-                        let mut queued_cmds = Vec::new();
-                        let mut remaining = std::collections::VecDeque::new();
-                        while let Some(c) = shell.miniapps.pending_webmcp_commands.pop_front() {
-                            if c.bot_username
-                                .trim_start_matches('@')
-                                .eq_ignore_ascii_case(&match_bot)
-                                && c.short_name.eq_ignore_ascii_case(&match_short)
-                            {
-                                queued_cmds.push(c);
-                            } else {
-                                remaining.push_back(c);
-                            }
+                        let mut queued_cmds =
+                            shell.take_matching_pending_webmcp_commands(&match_bot, &match_short);
+                        if !match_bot.eq_ignore_ascii_case(&bot_un)
+                            || !match_short.eq_ignore_ascii_case(&short)
+                        {
+                            queued_cmds
+                                .extend(shell.take_matching_pending_webmcp_commands(&bot_un, &short));
                         }
-                        shell.miniapps.pending_webmcp_commands = remaining;
                         let stay_in_pip = shell.miniapps.is_miniapp_minimized
                             && !queued_cmds.iter().any(|c| c.operation == "request_takeover");
                         let _ = ov_weak.update(cx, |w, w_cx| {
@@ -1678,12 +1824,37 @@ impl AppShell {
                         shell.refresh_recent_miniapps(cx);
                     }
                     Err(e) => {
+                        if !is_current_launch {
+                            let same_target_active = shell
+                                .miniapps
+                                .miniapp_overlay
+                                .as_ref()
+                                .is_some_and(|ov| {
+                                    let w = ov.read(cx);
+                                    let w_bot = w.bot_username.trim().trim_start_matches('@');
+                                    let w_short = if w.is_loading && !w.launching_short_name.is_empty() {
+                                        w.launching_short_name.clone()
+                                    } else {
+                                        w.current_short_name()
+                                    };
+                                    w_bot.eq_ignore_ascii_case(&bot_un)
+                                        && w_short.eq_ignore_ascii_case(&short)
+                                });
+                            if !same_target_active {
+                                let _ = shell.take_matching_pending_webmcp_commands(&bot_un, &short);
+                            }
+                            return;
+                        }
+                        let _ = shell.take_matching_pending_webmcp_commands(&bot_un, &short);
                         let _ = ov_weak.update(cx, |w, w_cx| {
                             w.is_loading = false;
                             w.close();
                             w_cx.notify();
                         });
+                        shell.miniapps.bump_launch_generation();
                         shell.miniapps.miniapp_overlay = None;
+                        shell.miniapps.is_miniapp_minimized = false;
+                        shell.miniapps.floating_pip_status = None;
                         shell.window_runtime.enqueue_toast(
                             format!("Mini App launch failed: {}", e),
                             2600,

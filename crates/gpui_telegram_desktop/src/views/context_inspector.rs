@@ -1,6 +1,7 @@
 //! ContextInspectorDrawer 320px Right Drawer (`SPEC-02-GPUI-COMPONENT-HIERARCHY` § 2.5).
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, render_grok_persona_avatar, trigger_grok_avatar_spin,
@@ -33,6 +34,7 @@ pub const HEADER_HEIGHT: f32 = 54.0;
 pub const CONTEXT_INSPECTOR_HEADER_HEIGHT: f32 = HEADER_HEIGHT;
 pub const AVATAR_SIZE: f32 = 80.0;
 pub const CONTEXT_INSPECTOR_AVATAR_SIZE: f32 = AVATAR_SIZE;
+pub const INSPECTOR_COPIED_FEEDBACK_DURATION_MS: u64 = 2_000;
 
 /// A contact or Fabushi AI Bot eligible to be added to the active group chat from the Inspector.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +171,9 @@ pub struct ContextInspector {
     pub is_contact_blocked: bool,
     pub pending_media_open: Option<(String, bool)>,
     pub pending_action: Option<InspectorAction>,
+    pub pending_leave_chat: bool,
     pub copied_feedback: Option<String>,
+    pub copied_feedback_gen: u64,
     pub channel_boost_level: u32,
     pub channel_boosts_current: u32,
     pub channel_boosts_target: u32,
@@ -220,7 +224,9 @@ impl ContextInspector {
             is_contact_blocked: false,
             pending_media_open: None,
             pending_action: None,
+            pending_leave_chat: false,
             copied_feedback: None,
+            copied_feedback_gen: 0,
             channel_boost_level: 0,
             channel_boosts_current: 0,
             channel_boosts_target: 30,
@@ -321,18 +327,23 @@ impl ContextInspector {
         SettingsTabModel { e2ee_fingerprint: String::new(), auto_delete_period: "Off".into(), notification_sound: "Default (Aurora)".into() }
     }
 
-    fn clear_peer_facts(&mut self) {
+    pub fn clear_peer_facts(&mut self) {
+        self.active_tab = InspectorTab::Profile;
         self.profile = Self::empty_profile();
         self.members = Self::empty_members();
         self.shared_media = Self::empty_media();
         self.settings = Self::empty_settings();
         self.media_items.clear();
         self.channel_stats.clear();
+        self.channel_boost_level = 0;
+        self.channel_boosts_current = 0;
+        self.channel_boosts_target = 30;
         self.is_secret_chat_active = false;
         self.is_contact_blocked = false;
         self.pending_media_open = None;
         self.pending_action = None;
-        self.copied_feedback = None;
+        self.pending_leave_chat = false;
+        self.clear_copied_feedback();
         self.subpage = InspectorSubpage::Main;
         self.bot_computer_profile = None;
         self.bot_config_focus = BotConfigFocusField::None;
@@ -400,6 +411,42 @@ impl ContextInspector {
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) { self.palette = palette; }
     pub fn set_language(&mut self, lang: impl Into<String>) { self.language_id = lang.into(); }
     pub fn take_action(&mut self) -> Option<InspectorAction> { self.pending_action.take() }
+    pub fn take_pending_leave_chat(&mut self) -> bool { std::mem::take(&mut self.pending_leave_chat) }
+
+    pub fn clear_copied_feedback(&mut self) {
+        self.copied_feedback_gen = self.copied_feedback_gen.wrapping_add(1);
+        self.copied_feedback = None;
+    }
+
+    pub fn show_copied_feedback(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
+        self.show_copied_feedback_with_duration(
+            msg,
+            Duration::from_millis(INSPECTOR_COPIED_FEEDBACK_DURATION_MS),
+            cx,
+        );
+    }
+
+    pub fn show_copied_feedback_with_duration(
+        &mut self,
+        msg: impl Into<String>,
+        duration: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.copied_feedback_gen.wrapping_add(1);
+        self.copied_feedback_gen = generation;
+        self.copied_feedback = Some(msg.into());
+        cx.notify();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            app.background_executor().timer(duration).await;
+            let _ = weak.update(app, |this, cx| {
+                if this.copied_feedback_gen == generation {
+                    this.copied_feedback = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
     pub fn set_active_fabushi_bot(&mut self, bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>) {
         self.active_fabushi_bot = bot.clone();
         let editing_coding = self.subpage == InspectorSubpage::Main
@@ -458,9 +505,19 @@ impl ContextInspector {
         true
     }
     pub fn set_tab(&mut self, tab: InspectorTab) { self.active_tab = tab; }
-    pub fn toggle_open(&mut self) { self.is_open = !self.is_open; }
+    pub fn toggle_open(&mut self) {
+        if self.is_open {
+            self.close();
+        } else {
+            self.open();
+        }
+    }
     pub fn open(&mut self) { self.is_open = true; }
-    pub fn close(&mut self) { self.is_open = false; }
+    pub fn close(&mut self) {
+        self.is_open = false;
+        self.pending_leave_chat = false;
+        self.clear_copied_feedback();
+    }
     pub fn set_auto_delete_period(&mut self, period: impl Into<String>) { self.settings.auto_delete_period = period.into(); }
 
     pub fn set_peer(&mut self, name: &str, subtitle: &str, initials: &str, color: u32) {
@@ -820,6 +877,9 @@ impl Default for ContextInspector { fn default() -> Self { Self::new() } }
 impl Render for ContextInspector {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_open {
+            if self.copied_feedback.is_some() {
+                self.clear_copied_feedback();
+            }
             return div().w(px(0.0)).h_full().overflow_hidden().into_any_element();
         }
         let pal = self.palette;
@@ -869,6 +929,7 @@ impl Render for ContextInspector {
                 } else {
                     render_contact_profile_panel(
                         &self.profile,
+                        &self.members,
                         &self.shared_media,
                         &self.collapsed_sections,
                         self.is_secret_chat_active,

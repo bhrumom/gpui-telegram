@@ -1528,6 +1528,147 @@ fn test_unified_sidebar_collapsed_constants() {
 }
 
 #[test]
+fn test_collapsed_sidebar_rail_avatars_match_expanded_dialog_avatars() {
+    use gpui_telegram_desktop::components::grok_bot_avatar::GrokPersonaState;
+    use gpui_telegram_desktop::views::chat_sidebar::{
+        BotGrokAvatarVisual, ChatSidebar, DialogDeliveryStatus, DialogItemModel,
+    };
+    use gpui_telegram_desktop::views::sidebar::dialogs_row_view::{
+        resolve_dialog_avatar_kind, DialogAvatarKind,
+    };
+
+    let mut sb = ChatSidebar::new();
+    let palette = sb.palette;
+
+    let make_dialog = |id: u64, name: &str, initials: &str, color: u32, folder: &str, pinned: bool| {
+        DialogItemModel {
+            id,
+            peer_name: name.to_string(),
+            avatar_initials: initials.to_string(),
+            avatar_color: color,
+            last_message: String::new(),
+            timestamp: "09:15".to_string(),
+            unread_count: 0,
+            is_muted: false,
+            is_pinned: pinned,
+            is_online: true,
+            typing_indicator: None,
+            delivery_status: DialogDeliveryStatus::Read,
+            folder: folder.to_string(),
+        }
+    };
+
+    sb.dialogs = vec![
+        make_dialog(1001, "Alice", "AL", 0x3B82F6, "All", false),
+        make_dialog(601440062, "全球法布施", "全", 0x2AABEE, "Bots", true),
+        make_dialog(1002, "工程讨论群", "工", 0x9B59B6, "Groups", false),
+        make_dialog(1003, "已保存消息", "已", 0x2AABEE, "All", false),
+        make_dialog(1004, "Shape Bot", "SB", 0x2AABEE, "Bots", false),
+        make_dialog(1005, "Plain Bot", "PB", 0x2AABEE, "Bots", false),
+        make_dialog(1006, "Classic Bot", "CB", 0x2AABEE, "Bots", false),
+        make_dialog(1007, "Archived Chat", "AC", 0x64748B, "All", false),
+    ];
+    sb.archived_ids.push(1007);
+    sb.saved_messages_id = Some(1003);
+    sb.bot_ids.extend([601440062, 1004, 1005, 1006]);
+    sb.bot_grok_avatars.insert(
+        601440062,
+        BotGrokAvatarVisual {
+            agent_id: "fabushi_bot".to_string(),
+            shape: "blob".to_string(),
+            color: "pink".to_string(),
+            execution_state: "working".to_string(),
+        },
+    );
+    sb.bot_fabushi_visuals
+        .insert(1004, ("hex".to_string(), 0x10B981));
+    sb.bot_grok_avatars.insert(
+        1006,
+        BotGrokAvatarVisual {
+            agent_id: "classic_bot".to_string(),
+            shape: "classic".to_string(),
+            color: "#F59E0B".to_string(),
+            execution_state: "idle".to_string(),
+        },
+    );
+    sb.bot_fabushi_visuals
+        .insert(1006, ("classic".to_string(), 0xF59E0B));
+
+    let collapsed = sb.collapsed_rail_dialogs();
+    // Archived dialog excluded; pinned dialog (全球法布施) placed first
+    let ids: Vec<u64> = collapsed.iter().map(|(d, _)| d.id).collect();
+    assert_eq!(ids, vec![601440062, 1001, 1002, 1003, 1004, 1005, 1006]);
+
+    // Every dialog in the collapsed rail must resolve to the exact same avatar kind as expanded mode
+    for (dialog, collapsed_meta) in &collapsed {
+        let expanded_meta = sb.dialog_meta(dialog);
+        assert_eq!(
+            resolve_dialog_avatar_kind(dialog, collapsed_meta, &palette),
+            resolve_dialog_avatar_kind(dialog, &expanded_meta, &palette),
+            "collapsed and expanded avatar mismatch for dialog {}",
+            dialog.id
+        );
+    }
+
+    // Verify specific avatar kinds match expected visual types (not regressed to plain initials)
+    let kind_by_id = |id: u64| {
+        let (d, m) = collapsed
+            .iter()
+            .find(|(d, _)| d.id == id)
+            .expect("dialog present in collapsed rail");
+        resolve_dialog_avatar_kind(d, m, &palette)
+    };
+
+    assert_eq!(
+        kind_by_id(601440062),
+        DialogAvatarKind::GrokBot {
+            source_id: "fabushi_bot".to_string(),
+            shape: "blob".to_string(),
+            color: "pink".to_string(),
+            state: GrokPersonaState::Working,
+        }
+    );
+    assert_eq!(
+        kind_by_id(1001),
+        DialogAvatarKind::ClassicInitials {
+            bg_hex: 0x3B82F6,
+            initials: "AL".to_string(),
+        }
+    );
+    assert_eq!(
+        kind_by_id(1002),
+        DialogAvatarKind::CompositeGroup { seed_id: 1002 }
+    );
+    assert_eq!(
+        kind_by_id(1003),
+        DialogAvatarKind::SavedMessages {
+            bg_hex: palette.accent
+        }
+    );
+    assert_eq!(
+        kind_by_id(1004),
+        DialogAvatarKind::FabushiShape {
+            shape: "hex".to_string(),
+            bg_hex: 0x10B981,
+        }
+    );
+    assert!(matches!(
+        kind_by_id(1005),
+        DialogAvatarKind::GrokBot {
+            state: GrokPersonaState::Idle,
+            ..
+        }
+    ));
+    assert_eq!(
+        kind_by_id(1006),
+        DialogAvatarKind::ClassicInitials {
+            bg_hex: 0xF59E0B,
+            initials: "CB".to_string(),
+        }
+    );
+}
+
+#[test]
 fn test_conversation_stage_bot_thinking_avatar_activity_lifecycle_and_chat_switch_reset() {
     let mut stage = gpui_telegram_desktop::views::ConversationStage::new();
     stage.set_chat(777, "全球法布施", "bot", "法", 0x2AABEE);
@@ -1552,4 +1693,791 @@ fn test_conversation_stage_bot_thinking_avatar_activity_lifecycle_and_chat_switc
     assert!(!stage.is_bot_chat);
     assert_eq!(stage.bot_activity_state, "idle");
     assert!(stage.bot_activity_detail.is_none());
+}
+
+// ============================================================================
+// 6. M1 Inspector Isolation, Group Branching & Copy/Stage Toast Tests
+// ============================================================================
+
+#[test]
+fn test_context_inspector_clear_peer_facts_and_close_isolation() {
+    use gpui_telegram_desktop::views::drawer::inspector_tabs::{
+        InspectorSubpage, InspectorTab, SharedMediaItem,
+    };
+    use gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto;
+
+    let mut inspector = ContextInspector::new();
+    inspector.open();
+    inspector.active_tab = InspectorTab::Members;
+    inspector.subpage = InspectorSubpage::ComputersList;
+    inspector.profile.name = "全球法布施 Bot".to_string();
+    inspector.profile.username = "@fabushi_bot".to_string();
+    inspector.profile.phone = "+15551234567".to_string();
+    inspector.profile.bio = "全球法布施与净心禅室 AI 助手".to_string();
+    inspector.profile.avatar_path = Some("/tmp/fabushi_bot.png".to_string());
+    inspector.profile.is_bot = true;
+    inspector.profile.is_verified = true;
+    inspector.profile.facts.push(("Engine".to_string(), "Fabushi".to_string()));
+    inspector.media_items.push(SharedMediaItem {
+        id: 1,
+        url: "https://example.com/1.png".to_string(),
+        local_path: None,
+        caption: "cap".to_string(),
+        is_video: false,
+        duration_sec: 0,
+    });
+    inspector.copied_feedback = Some("已复制: @fabushi_bot".to_string());
+    inspector.channel_boost_level = 5;
+    inspector.channel_boosts_current = 12;
+    inspector.channel_boosts_target = 50;
+    inspector.pending_leave_chat = true;
+    inspector.set_active_fabushi_bot(Some(FabushiBotSummaryDto {
+        bot_user_id: 777001,
+        agent_id: "fabushi".to_string(),
+        username: "fabushi_bot".to_string(),
+        display_name: "全球法布施 Bot".to_string(),
+        ..Default::default()
+    }));
+
+    let prev_gen = inspector.copied_feedback_gen;
+    inspector.clear_peer_facts();
+
+    assert!(inspector.profile.bio.is_empty());
+    assert!(inspector.profile.username.is_empty());
+    assert!(inspector.profile.phone.is_empty());
+    assert!(inspector.profile.avatar_path.is_none());
+    assert!(!inspector.profile.is_verified);
+    assert!(!inspector.profile.is_bot);
+    assert!(inspector.profile.facts.is_empty());
+    assert!(inspector.media_items.is_empty());
+    assert!(inspector.copied_feedback.is_none());
+    assert_eq!(inspector.copied_feedback_gen, prev_gen.wrapping_add(1));
+    assert_eq!(inspector.subpage, InspectorSubpage::Main);
+    assert_eq!(inspector.active_tab, InspectorTab::Profile);
+    assert!(inspector.active_fabushi_bot.is_none());
+    assert_eq!(inspector.channel_boost_level, 0);
+    assert_eq!(inspector.channel_boosts_current, 0);
+    assert_eq!(inspector.channel_boosts_target, 30);
+    assert!(!inspector.pending_leave_chat);
+
+    // close() and toggle_open() -> closed immediately clear copied_feedback & bump generation
+    inspector.open();
+    inspector.copied_feedback = Some("已复制: 123".to_string());
+    let g1 = inspector.copied_feedback_gen;
+    inspector.close();
+    assert!(!inspector.is_open);
+    assert!(inspector.copied_feedback.is_none());
+    assert_eq!(inspector.copied_feedback_gen, g1.wrapping_add(1));
+
+    inspector.open();
+    inspector.copied_feedback = Some("已复制: 456".to_string());
+    let g2 = inspector.copied_feedback_gen;
+    inspector.toggle_open();
+    assert!(!inspector.is_open);
+    assert!(inspector.copied_feedback.is_none());
+    assert_eq!(inspector.copied_feedback_gen, g2.wrapping_add(1));
+}
+
+#[test]
+fn test_group_vs_bot_vs_user_profile_branching_and_no_duplicate_bio() {
+    use gpui_telegram_client::net::http_client::ChatDetails;
+    use gpui_telegram_desktop::theme::TdesktopThemePalette;
+    use gpui_telegram_desktop::views::app_shell::shell_actions::build_chat_profile_facts;
+    use gpui_telegram_desktop::views::drawer::inspector_panels::build_contact_profile_layout;
+    use gpui_telegram_desktop::views::drawer::inspector_tabs::{
+        MemberItem, MembersTabModel, ProfileTabModel,
+    };
+
+    let pal = TdesktopThemePalette::default();
+
+    // 1. build_chat_profile_facts must NOT duplicate Bio/简介 into facts
+    let group_details = ChatDetails {
+        chat_id: 202,
+        title: "AA 记账分账助手".to_string(),
+        chat_type: 2,
+        creator_id: 1,
+        about: Some("群聊共享记账说明".to_string()),
+        members_count: 5,
+        is_forum: false,
+        photo_file_id: None,
+        pts: 0,
+    };
+    let facts_zh = build_chat_profile_facts(&group_details, "zh-CN");
+    assert!(
+        !facts_zh.iter().any(|(k, _)| k == "简介" || k.eq_ignore_ascii_case("Bio")),
+        "build_chat_profile_facts must not emit duplicate Bio row: {facts_zh:?}"
+    );
+    assert!(facts_zh.iter().any(|(k, v)| k == "类型" && v == "超级群组"));
+    assert!(facts_zh.iter().any(|(k, v)| k == "成员" && v == "5"));
+
+    // 2. Group with empty bio: shows Group Info, Type, Members, Invite Link, Edit Group, Leave Group;
+    //    NEVER shows phone, bio, Secret Chat, Edit Contact Info, or Block Contact.
+    let make_base_profile = || ProfileTabModel {
+        name: "AA 记账分账助手".to_string(),
+        username: String::new(),
+        phone: "+15559998888".to_string(), // even if somehow present, group layout must hide phone
+        bio: String::new(),
+        status: "2 位成员".to_string(),
+        avatar_initials: "AA".to_string(),
+        avatar_color: 0x2AABEE,
+        avatar_path: None,
+        facts: vec![
+            ("类型".to_string(), "群组".to_string()),
+            ("简介".to_string(), "旧简介".to_string()),
+        ],
+        is_notifications_enabled: true,
+        is_bot: false,
+        bot_id: 0,
+        bot_persona_prompt: String::new(),
+        bot_commands: Vec::new(),
+        miniapp_title: None,
+        miniapp_url: None,
+        in_attach_menu: false,
+        bot_mau_count: 0,
+        bot_has_main_app: false,
+        bot_privacy_policy_url: String::new(),
+        bot_has_settings: false,
+        bot_can_join_groups: false,
+        is_viewer_owner: false,
+        is_verified: false,
+        is_blocked: false,
+    };
+    let group_profile = make_base_profile();
+    let group_members = MembersTabModel {
+        members: vec![
+            MemberItem {
+                id: 1,
+                name: "Alice".to_string(),
+                initials: "AL".to_string(),
+                color: 0x2AABEE,
+                role: "Owner".to_string(),
+                is_online: true,
+            },
+            MemberItem {
+                id: 2,
+                name: "Bob".to_string(),
+                initials: "BO".to_string(),
+                color: 0x8E44AD,
+                role: "Member".to_string(),
+                is_online: false,
+            },
+        ],
+        search_query: String::new(),
+        invite_link: "https://t.me/+group_invite".to_string(),
+        is_group_or_channel: true,
+    };
+    let group_layout = build_contact_profile_layout(&group_profile, &group_members, pal, "zh-CN");
+    assert!(group_layout.is_group_or_channel);
+    assert!(!group_layout.is_channel);
+    assert_eq!(group_layout.info_section_title, "群组信息");
+    assert_eq!(group_layout.privacy_section_title, "通知与管理");
+    assert!(!group_layout.show_secret_chat);
+    assert!(!group_layout.show_block_contact);
+    assert!(group_layout.show_members_row);
+    assert_eq!(group_layout.edit_row_label, "编辑群组信息");
+    assert_eq!(group_layout.leave_row_label.as_deref(), Some("退出群组"));
+    assert!(group_layout.info_rows.iter().all(|r| r.value != "+15559998888"));
+    assert!(group_layout.info_rows.iter().all(|r| r.subtitle != "简介" && r.subtitle != "群组简介"));
+    assert!(group_layout.info_rows.iter().any(|r| r.subtitle.contains("邀请链接") && r.value == "https://t.me/+group_invite"));
+    assert!(group_layout.info_rows.iter().any(|r| r.subtitle == "成员" && r.value == "2"));
+
+    // 3. Channel with non-empty bio renders Channel Info / 频道简介 once & Leave Channel
+    let mut channel_profile = make_base_profile();
+    channel_profile.bio = "Official channel updates".to_string();
+    channel_profile.username = "@official_news".to_string();
+    channel_profile.facts = vec![
+        ("Type".to_string(), "Channel".to_string()),
+        ("Bio".to_string(), "Official channel updates".to_string()),
+    ];
+    let chan_layout = build_contact_profile_layout(&channel_profile, &group_members, pal, "en-US");
+    assert!(chan_layout.is_channel);
+    assert_eq!(chan_layout.info_section_title, "Channel Info");
+    assert_eq!(chan_layout.edit_row_label, "Edit Channel Info");
+    assert_eq!(chan_layout.leave_row_label.as_deref(), Some("Leave Channel"));
+    assert_eq!(
+        chan_layout
+            .info_rows
+            .iter()
+            .filter(|r| r.subtitle == "Channel Description" || r.subtitle == "Bio")
+            .count(),
+        1
+    );
+    assert!(chan_layout.info_rows.iter().any(|r| r.subtitle.contains("Public Link") && r.value == "@official_news"));
+
+    // 4. 1v1 User layout keeps Contact Info, Secret Chat, Edit Contact Info, Block Contact (and no Leave Group)
+    let mut user_profile = group_profile;
+    user_profile.bio = "Rust developer".to_string();
+    user_profile.username = "@alice".to_string();
+    user_profile.facts.clear();
+    let user_members = MembersTabModel {
+        members: Vec::new(),
+        search_query: String::new(),
+        invite_link: String::new(),
+        is_group_or_channel: false,
+    };
+    let user_layout = build_contact_profile_layout(&user_profile, &user_members, pal, "zh-CN");
+    assert!(!user_layout.is_group_or_channel);
+    assert_eq!(user_layout.info_section_title, "联系信息");
+    assert_eq!(user_layout.privacy_section_title, "通知与隐私");
+    assert!(user_layout.show_secret_chat);
+    assert!(user_layout.show_block_contact);
+    assert!(!user_layout.show_members_row);
+    assert_eq!(user_layout.edit_row_label, "编辑联系人信息");
+    assert!(user_layout.leave_row_label.is_none());
+    assert!(user_layout.info_rows.iter().any(|r| r.value == "+15559998888"));
+}
+
+#[test]
+fn test_stage_set_chat_clears_toast_banner_active_fabushi_bot_and_room_agent_states() {
+    use gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto;
+
+    let mut stage = ConversationStage::new();
+    stage.set_chat(101, "Fabushi Bot", "bot", "FB", 0x8F59F9);
+    stage.toast_banner = Some("Copied to clipboard".to_string());
+    let gen_before = stage.toast_banner_gen;
+    stage.set_active_fabushi_bot(Some(FabushiBotSummaryDto {
+        bot_user_id: 777001,
+        agent_id: "fabushi".to_string(),
+        username: "fabushi_bot".to_string(),
+        display_name: "Fabushi Bot".to_string(),
+        ..Default::default()
+    }));
+    stage.on_agent_floor_changed(101, Some("Fabushi Bot".to_string()), 1, 1, 10_000);
+    assert!(stage.active_room_agent_state(15_000).is_some());
+
+    // Same-chat set_chat preserves active_fabushi_bot
+    stage.set_chat(101, "Fabushi Bot", "bot", "FB", 0x8F59F9);
+    assert!(stage.active_fabushi_bot.is_some());
+
+    // Switching to another chat clears toast_banner (+ bumps gen), active_fabushi_bot, and room_agent_states
+    stage.set_chat(202, "AA 记账分账助手", "3 members", "AA", 0x2AABEE);
+    assert!(stage.toast_banner.is_none());
+    assert_eq!(stage.toast_banner_gen, gen_before.wrapping_add(1));
+    assert!(stage.active_fabushi_bot.is_none());
+    assert!(!stage.is_bot_chat);
+    assert!(stage.room_agent_states.is_empty());
+    assert!(stage.active_room_agent_state(15_000).is_none());
+
+    // reset() also clears toast_banner, active_fabushi_bot, and room_agent_states
+    stage.toast_banner = Some("Toast".to_string());
+    stage.set_active_fabushi_bot(Some(FabushiBotSummaryDto {
+        bot_user_id: 777002,
+        ..Default::default()
+    }));
+    stage.on_agent_floor_changed(202, Some("Helper".to_string()), 0, 1, 20_000);
+    stage.reset();
+    assert!(stage.toast_banner.is_none());
+    assert!(stage.active_fabushi_bot.is_none());
+    assert!(stage.room_agent_states.is_empty());
+}
+
+mod m1_headless_gpui {
+    use futures::FutureExt;
+    use gpui::{App, AppContext, Application, AsyncApp};
+    use gpui_telegram_desktop::theme::{TelegramAssetSource, TdesktopThemePalette};
+    use gpui_telegram_desktop::views::boxes::peers::BotProfileBox;
+    use gpui_telegram_desktop::views::context_inspector::ContextInspector;
+    use gpui_telegram_desktop::views::conversation_stage::ConversationStage;
+    use gpui_telegram_desktop::views::drawer::inspector_panels::render_contact_profile_panel;
+    use gpui_telegram_proto::miniapp_contracts::{BotPublicProfileDto, BotRegistryEntry};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    const CHILD_ENV: &str = "GPUI_DESKTOP_VIEWS_HEADLESS_CHILD";
+    const CHILD_TARGET_ENV: &str = "GPUI_DESKTOP_VIEWS_HEADLESS_TARGET";
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct TempConfigDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempConfigDirGuard {
+        fn new(prefix: &str) -> Self {
+            let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "gpui_tg_desktop_views_{prefix}_{}_{}",
+                std::process::id(),
+                seq
+            ));
+            std::fs::create_dir_all(&dir).expect("create isolated temp config dir");
+            Self { path: dir }
+        }
+    }
+
+    impl Drop for TempConfigDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "panic".to_string()
+        }
+    }
+
+    fn dispatch_headless_target(target: &str) -> ! {
+        let async_fn: fn(
+            AsyncApp,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>> = match target {
+            "test_headless_gpui_copied_feedback_auto_dismiss_generation_fence_and_switch_clear" => {
+                |app| Box::pin(body_copied_feedback_timers(app))
+            }
+            "test_headless_gpui_stage_toast_banner_auto_dismiss_generation_fence_and_set_chat_clear" => {
+                |app| Box::pin(body_stage_toast_timers(app))
+            }
+            "test_headless_gpui_render_contact_profile_panel_branches" => {
+                |app| Box::pin(body_render_contact_profile_panel_branches(app))
+            }
+            "test_headless_gpui_inspector_pending_leave_chat_immediate_modal_no_double_trigger" => {
+                |app| Box::pin(body_inspector_pending_leave_chat_immediate_modal(app))
+            }
+            other => {
+                eprintln!("unknown headless gpui test target: {other}");
+                std::process::exit(101);
+            }
+        };
+        let target_owned = target.to_string();
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Application::headless()
+                .with_assets(TelegramAssetSource::new())
+                .run(move |cx: &mut App| {
+                    let t = target_owned.clone();
+                    cx.spawn(async move |app: &mut AsyncApp| {
+                        let app_clone = app.clone();
+                        let res = std::panic::AssertUnwindSafe(async_fn(app_clone))
+                            .catch_unwind()
+                            .await;
+                        match res {
+                            Ok(()) => std::process::exit(0),
+                            Err(payload) => {
+                                let msg = panic_payload_to_string(payload);
+                                eprintln!("[headless async child panic] {t}: {msg}");
+                                std::process::exit(101);
+                            }
+                        }
+                    })
+                    .detach();
+                });
+        }));
+        if let Err(payload) = outer {
+            let msg = panic_payload_to_string(payload);
+            eprintln!("[headless outer panic] {target}: {msg}");
+            std::process::exit(101);
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[used]
+    #[unsafe(link_section = "__DATA,__mod_init_func")]
+    static MACOS_HEADLESS_MAIN_THREAD_ENTRY: extern "C" fn() = macos_mod_init_headless_entry;
+
+    #[cfg(target_os = "macos")]
+    extern "C" fn macos_mod_init_headless_entry() {
+        if std::env::var(CHILD_ENV).as_deref() == Ok("1") {
+            if let Ok(target) = std::env::var(CHILD_TARGET_ENV) {
+                dispatch_headless_target(&target);
+            }
+        }
+    }
+
+    fn run_in_headless_subprocess(test_fn_name: &str) {
+        if std::env::var(CHILD_ENV).as_deref() == Ok("1") {
+            dispatch_headless_target(test_fn_name);
+        }
+        let cfg_guard = TempConfigDirGuard::new(test_fn_name);
+        let exe = std::env::current_exe().expect("current_exe");
+        let output = std::process::Command::new(exe)
+            .env(CHILD_ENV, "1")
+            .env(CHILD_TARGET_ENV, test_fn_name)
+            .env("GPUI_TELEGRAM_CONFIG_DIR", &cfg_guard.path)
+            .env("GPUI_OFFLINE_TEST", "1")
+            .arg("--exact")
+            .arg(test_fn_name)
+            .arg("--nocapture")
+            .output()
+            .expect("spawn headless gpui child");
+
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "headless child test `{test_fn_name}` failed (status {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                output.status.code()
+            );
+        }
+    }
+
+    async fn body_copied_feedback_timers(mut app: AsyncApp) {
+        let insp = app
+            .new(|_| ContextInspector::new())
+            .expect("create ContextInspector entity");
+
+        // 1. Auto-dismiss & generation fence on ContextInspector
+        insp.update(&mut app, |i, cx| {
+            i.open();
+            i.show_copied_feedback_with_duration("已复制: first", Duration::from_millis(50), cx);
+            assert_eq!(i.copied_feedback.as_deref(), Some("已复制: first"));
+            assert_eq!(i.copied_feedback_gen, 1);
+        })
+        .unwrap();
+
+        app.background_executor().timer(Duration::from_millis(15)).await;
+
+        insp.update(&mut app, |i, cx| {
+            i.show_copied_feedback_with_duration("已复制: second", Duration::from_millis(120), cx);
+            assert_eq!(i.copied_feedback.as_deref(), Some("已复制: second"));
+            assert_eq!(i.copied_feedback_gen, 2);
+        })
+        .unwrap();
+
+        // Past first 50ms timer, before second 120ms timer: generation fence keeps "second"
+        app.background_executor().timer(Duration::from_millis(55)).await;
+        insp.read_with(&app, |i, _| {
+            assert_eq!(i.copied_feedback.as_deref(), Some("已复制: second"));
+        })
+        .unwrap();
+
+        // Past second timer: auto-dismissed
+        app.background_executor().timer(Duration::from_millis(95)).await;
+        insp.read_with(&app, |i, _| {
+            assert!(i.copied_feedback.is_none());
+        })
+        .unwrap();
+
+        // 2. Chat switch (clear_peer_facts) & close() clear immediately and fence pending timer
+        insp.update(&mut app, |i, cx| {
+            i.show_copied_feedback_with_duration("已复制: switch", Duration::from_millis(60), cx);
+            assert!(i.copied_feedback.is_some());
+            i.clear_peer_facts();
+            assert!(i.copied_feedback.is_none());
+            i.show_copied_feedback_with_duration("已复制: close", Duration::from_millis(60), cx);
+            assert!(i.copied_feedback.is_some());
+            i.close();
+            assert!(i.copied_feedback.is_none());
+        })
+        .unwrap();
+
+        app.background_executor().timer(Duration::from_millis(80)).await;
+        insp.read_with(&app, |i, _| {
+            assert!(i.copied_feedback.is_none());
+        })
+        .unwrap();
+
+        // 3. BotProfileBox generation-fenced auto-dismiss and close() clear
+        let profile = BotPublicProfileDto {
+            bot: BotRegistryEntry {
+                bot_user_id: 600_001,
+                username: "grok_bot".to_string(),
+                display_name: "Grok Bot".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let box_ent = app
+            .new(|_| BotProfileBox::new(profile, TdesktopThemePalette::default(), "zh-CN"))
+            .expect("create BotProfileBox entity");
+
+        box_ent
+            .update(&mut app, |b, cx| {
+                b.show_copied_feedback_with_duration(
+                    "已复制: @grok_bot",
+                    Duration::from_millis(50),
+                    cx,
+                );
+                assert_eq!(b.copied_feedback.as_deref(), Some("已复制: @grok_bot"));
+            })
+            .unwrap();
+        app.background_executor().timer(Duration::from_millis(15)).await;
+        box_ent
+            .update(&mut app, |b, cx| {
+                b.show_copied_feedback_with_duration(
+                    "已复制: https://t.me/grok_bot",
+                    Duration::from_millis(120),
+                    cx,
+                );
+            })
+            .unwrap();
+        app.background_executor().timer(Duration::from_millis(55)).await;
+        box_ent
+            .read_with(&app, |b, _| {
+                assert_eq!(
+                    b.copied_feedback.as_deref(),
+                    Some("已复制: https://t.me/grok_bot")
+                );
+            })
+            .unwrap();
+        app.background_executor().timer(Duration::from_millis(95)).await;
+        box_ent
+            .read_with(&app, |b, _| {
+                assert!(b.copied_feedback.is_none());
+            })
+            .unwrap();
+
+        box_ent
+            .update(&mut app, |b, cx| {
+                b.show_copied_feedback_with_duration("已复制: temp", Duration::from_millis(100), cx);
+                b.close();
+                assert!(b.copied_feedback.is_none());
+            })
+            .unwrap();
+    }
+
+    async fn body_stage_toast_timers(mut app: AsyncApp) {
+        let stage = app
+            .new(|_| ConversationStage::new())
+            .expect("create ConversationStage entity");
+
+        stage
+            .update(&mut app, |st, cx| {
+                st.set_chat(1, "Bot", "bot", "BT", 0x2AABEE);
+                let base_gen = st.toast_banner_gen;
+                st.show_toast_banner_with_duration("Copied A", Duration::from_millis(50), cx);
+                assert_eq!(st.toast_banner.as_deref(), Some("Copied A"));
+                assert_eq!(st.toast_banner_gen, base_gen + 1);
+            })
+            .unwrap();
+
+        app.background_executor().timer(Duration::from_millis(15)).await;
+
+        stage
+            .update(&mut app, |st, cx| {
+                let prev_gen = st.toast_banner_gen;
+                st.show_toast_banner_with_duration("Copied B", Duration::from_millis(120), cx);
+                assert_eq!(st.toast_banner.as_deref(), Some("Copied B"));
+                assert_eq!(st.toast_banner_gen, prev_gen + 1);
+            })
+            .unwrap();
+
+        app.background_executor().timer(Duration::from_millis(55)).await;
+        stage
+            .read_with(&app, |st, _| {
+                assert_eq!(st.toast_banner.as_deref(), Some("Copied B"));
+            })
+            .unwrap();
+
+        app.background_executor().timer(Duration::from_millis(95)).await;
+        stage
+            .read_with(&app, |st, _| {
+                assert!(st.toast_banner.is_none());
+            })
+            .unwrap();
+
+        // Chat switch clears active toast immediately and fences pending timer
+        stage
+            .update(&mut app, |st, cx| {
+                st.show_toast_banner_with_duration("Copied C", Duration::from_millis(60), cx);
+                assert!(st.toast_banner.is_some());
+                st.set_chat(2, "Group", "2 members", "GR", 0x2AABEE);
+                assert!(st.toast_banner.is_none());
+            })
+            .unwrap();
+
+        app.background_executor().timer(Duration::from_millis(80)).await;
+        stage
+            .read_with(&app, |st, _| {
+                assert!(st.toast_banner.is_none());
+            })
+            .unwrap();
+
+        // Manual dismiss clears toast immediately
+        stage
+            .update(&mut app, |st, cx| {
+                st.show_toast_banner_with_duration("Copied D", Duration::from_millis(200), cx);
+                st.dismiss_toast_banner();
+                assert!(st.toast_banner.is_none());
+            })
+            .unwrap();
+    }
+
+    async fn body_render_contact_profile_panel_branches(mut app: AsyncApp) {
+        let pal = TdesktopThemePalette::default();
+        let insp = app
+            .new(|_| {
+                let mut i = ContextInspector::new();
+                i.open();
+                i.set_palette(pal);
+                i.set_language("zh-CN");
+                i
+            })
+            .expect("create ContextInspector entity");
+
+        insp.update(&mut app, |i, cx| {
+            // Group branch renders cleanly
+            i.profile.name = "AA 记账分账助手".to_string();
+            i.profile.is_bot = false;
+            i.profile.facts = vec![
+                ("类型".to_string(), "群组".to_string()),
+                ("成员".to_string(), "3".to_string()),
+            ];
+            i.members.is_group_or_channel = true;
+            i.members.invite_link = "https://t.me/+test".to_string();
+            let _group_el = render_contact_profile_panel(
+                &i.profile,
+                &i.members,
+                &i.shared_media,
+                &i.collapsed_sections,
+                i.is_secret_chat_active,
+                i.is_contact_blocked,
+                i.copied_feedback.as_ref(),
+                pal,
+                "zh-CN",
+                cx,
+            );
+
+            // 1v1 User branch renders cleanly
+            i.clear_peer_facts();
+            i.profile.name = "Alice".to_string();
+            i.profile.phone = "+15550001111".to_string();
+            i.profile.username = "@alice".to_string();
+            i.profile.bio = "Hello".to_string();
+            let _user_el = render_contact_profile_panel(
+                &i.profile,
+                &i.members,
+                &i.shared_media,
+                &i.collapsed_sections,
+                i.is_secret_chat_active,
+                i.is_contact_blocked,
+                i.copied_feedback.as_ref(),
+                pal,
+                "zh-CN",
+                cx,
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_headless_gpui_copied_feedback_auto_dismiss_generation_fence_and_switch_clear() {
+        run_in_headless_subprocess(
+            "test_headless_gpui_copied_feedback_auto_dismiss_generation_fence_and_switch_clear",
+        );
+    }
+
+    #[test]
+    fn test_headless_gpui_stage_toast_banner_auto_dismiss_generation_fence_and_set_chat_clear() {
+        run_in_headless_subprocess(
+            "test_headless_gpui_stage_toast_banner_auto_dismiss_generation_fence_and_set_chat_clear",
+        );
+    }
+
+    #[test]
+    fn test_headless_gpui_render_contact_profile_panel_branches() {
+        run_in_headless_subprocess("test_headless_gpui_render_contact_profile_panel_branches");
+    }
+
+    async fn body_inspector_pending_leave_chat_immediate_modal(mut app: AsyncApp) {
+        use gpui_telegram_client::{AuthResponse, ClientConfig, TelegramClient};
+        use gpui_telegram_desktop::views::app_shell::shell_truth::{
+            apply_authoritative_chat_list, select_authoritative_dialog,
+        };
+        use gpui_telegram_desktop::views::boxes::modal_types::ModalDialogKind;
+        use gpui_telegram_desktop::views::AppShell;
+        use gpui_telegram_client::ChatSummary;
+        use std::sync::Arc;
+
+        let mut cfg = ClientConfig::default();
+        cfg.server_url = "http://127.0.0.1:9".to_string();
+        let client = Arc::new(TelegramClient::new(cfg));
+        let _rt = client.runtime().enter();
+        client.set_auth_session(AuthResponse {
+            token: "tok_leave_group".to_string(),
+            session_id: "sess_leave_group".to_string(),
+            user_id: 1001,
+            username: "tester".to_string(),
+            first_name: None,
+            created_at: None,
+            expires_at: None,
+        });
+
+        let shell = app
+            .new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.sidebar.update(cx, |sb, sb_cx| {
+                    s.stage.update(sb_cx, |st, st_cx| {
+                        s.inspector.update(st_cx, |insp, _| {
+                            apply_authoritative_chat_list(
+                                sb,
+                                st,
+                                insp,
+                                &[ChatSummary {
+                                    chat_id: 505,
+                                    title: "AA 记账分账助手".to_string(),
+                                    chat_type: 1,
+                                    last_message: None,
+                                    unread_count: 0,
+                                    is_group: Some(true),
+                                    is_bot: Some(false),
+                                    avatar_color: Some(0x2AABEE),
+                                    updated_at: Some(1_700_000_000_000),
+                                }],
+                            );
+                            select_authoritative_dialog(sb, st, insp, 505);
+                            st.chat_subtitle = "3 位成员".to_string();
+                            st.is_group_chat = false;
+                            insp.members.is_group_or_channel = true;
+                        });
+                    });
+                });
+                s
+            })
+            .expect("create AppShell entity");
+
+        let inspector = shell.read_with(&app, |s, _| s.inspector.clone()).unwrap();
+        inspector
+            .update(&mut app, |i, icx| {
+                i.pending_leave_chat = true;
+                icx.notify();
+            })
+            .unwrap();
+
+        app.background_executor().timer(Duration::from_millis(20)).await;
+
+        shell
+            .update(&mut app, |s, cx| {
+                assert!(
+                    !s.inspector.read(cx).pending_leave_chat,
+                    "pending_leave_chat must be drained immediately by inspector observer"
+                );
+                assert!(
+                    s.modal_container.read(cx).is_modal_active(),
+                    "LeaveOrDeleteChat modal must open immediately on pending_leave_chat notify"
+                );
+                assert!(
+                    matches!(
+                        s.modal_container.read(cx).dialog.kind,
+                        Some(ModalDialogKind::LeaveOrDeleteChat { is_group: true, .. })
+                    ),
+                    "Expected LeaveOrDeleteChat with is_group=true, got {:?}",
+                    s.modal_container.read(cx).dialog.kind
+                );
+
+                // Dismiss modal and verify subsequent handle_stage_pending_actions does NOT double-trigger
+                s.modal_container.update(cx, |m, mcx| {
+                    m.hide_all();
+                    mcx.notify();
+                });
+                assert!(!s.modal_container.read(cx).is_modal_active());
+                s.handle_stage_pending_actions(cx);
+                assert!(
+                    !s.modal_container.read(cx).is_modal_active(),
+                    "handle_stage_pending_actions must not double-trigger LeaveOrDeleteChat"
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_headless_gpui_inspector_pending_leave_chat_immediate_modal_no_double_trigger() {
+        run_in_headless_subprocess(
+            "test_headless_gpui_inspector_pending_leave_chat_immediate_modal_no_double_trigger",
+        );
+    }
 }

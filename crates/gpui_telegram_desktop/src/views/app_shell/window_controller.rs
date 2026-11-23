@@ -19,6 +19,10 @@ pub struct ToastNotification {
     pub text: String,
     pub duration_ms: u64,
     pub created_at: u64,
+    #[serde(default)]
+    pub chat_id: Option<u64>,
+    #[serde(default)]
+    pub allow_chat_auto_scope: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,11 +136,28 @@ impl WindowController {
     }
 
     pub fn show_toast(&mut self, text: impl Into<String>, duration_ms: u64) {
+        let _ = self.enqueue_toast_with_chat(None, text, duration_ms);
+    }
+
+    pub fn show_chat_toast(&mut self, chat_id: u64, text: impl Into<String>, duration_ms: u64) -> u64 {
+        self.enqueue_toast_with_chat(Some(chat_id), text, duration_ms)
+    }
+
+    fn enqueue_toast_with_chat(
+        &mut self,
+        chat_id: Option<u64>,
+        text: impl Into<String>,
+        duration_ms: u64,
+    ) -> u64 {
+        let id = self.next_toast_id;
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let toast = ToastNotification {
-            id: self.next_toast_id,
+            id,
             text: text.into(),
             duration_ms: if duration_ms == 0 { 3000 } else { duration_ms },
-            created_at: 0,
+            created_at: now_ms,
+            chat_id,
+            allow_chat_auto_scope: chat_id.is_none(),
         };
         self.next_toast_id += 1;
         if self.current_toast.is_none() {
@@ -144,10 +165,59 @@ impl WindowController {
         } else {
             self.toast_queue.push_back(toast);
         }
+        id
     }
 
     pub fn dismiss_current_toast(&mut self) {
         self.current_toast = self.toast_queue.pop_front();
+    }
+
+    pub fn dismiss_toast_if_id(&mut self, toast_id: u64) -> bool {
+        if self.current_toast.as_ref().is_some_and(|t| t.id == toast_id) {
+            self.current_toast = self.toast_queue.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn stamp_current_toast_chat_id_if_unset(&mut self, chat_id: u64) {
+        if let Some(ref mut toast) = self.current_toast {
+            if toast.chat_id.is_none() && toast.allow_chat_auto_scope {
+                toast.chat_id = Some(chat_id);
+                toast.allow_chat_auto_scope = false;
+            }
+        }
+    }
+
+    pub fn clear_toasts_for_chat(&mut self, chat_id: u64) -> bool {
+        let queue_before = self.toast_queue.len();
+        self.toast_queue.retain(|t| t.chat_id != Some(chat_id));
+        for t in &mut self.toast_queue {
+            if t.chat_id.is_none() {
+                t.allow_chat_auto_scope = false;
+            }
+        }
+        let mut changed = self.toast_queue.len() != queue_before;
+        if self
+            .current_toast
+            .as_ref()
+            .is_some_and(|t| t.chat_id == Some(chat_id))
+        {
+            self.current_toast = self.toast_queue.pop_front();
+            changed = true;
+        }
+        if let Some(ref mut cur) = self.current_toast {
+            if cur.chat_id.is_none() {
+                cur.allow_chat_auto_scope = false;
+            }
+        }
+        changed
+    }
+
+    pub fn clear_all_toasts(&mut self) {
+        self.current_toast = None;
+        self.toast_queue.clear();
     }
 
     pub fn show_right_column(&mut self) {

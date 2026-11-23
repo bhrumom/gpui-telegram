@@ -302,12 +302,210 @@ fn render_media_thumb_tile(
         })
 }
 
-/// Renders the Muse-inspired Contact Info profile panel (Hero & segmented bar live in `ContextInspector::render`):
-/// collapsible contact facts rows with circular hairline badges, optional 3-column shared media preview,
-/// notifications & privacy switches, and clean destructive row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactProfileInfoRow {
+    pub icon: IconName,
+    pub icon_color: u32,
+    pub value: String,
+    pub subtitle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactProfileLayoutSpec {
+    pub is_group_or_channel: bool,
+    pub is_channel: bool,
+    pub info_section_title: String,
+    pub info_rows: Vec<ContactProfileInfoRow>,
+    pub privacy_section_title: String,
+    pub show_secret_chat: bool,
+    pub show_members_row: bool,
+    pub members_row_label: Option<String>,
+    pub edit_row_label: String,
+    pub leave_row_label: Option<String>,
+    pub show_block_contact: bool,
+}
+
+fn is_bio_fact_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    trimmed == "简介" || trimmed.eq_ignore_ascii_case("Bio")
+}
+
+fn is_members_fact_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    trimmed == "成员" || trimmed.eq_ignore_ascii_case("Members")
+}
+
+/// Computes the strict 3-way peer layout specification for non-Bot inspector profiles
+/// (`Group / Supergroup / Channel` vs `1v1 User`).
+pub fn build_contact_profile_layout(
+    model: &ProfileTabModel,
+    members: &MembersTabModel,
+    pal: TdesktopThemePalette,
+    lang: &str,
+) -> ContactProfileLayoutSpec {
+    let is_group_or_channel = members.is_group_or_channel;
+    let is_channel = is_group_or_channel
+        && model.facts.iter().any(|(k, v)| {
+            (k == "类型" || k.eq_ignore_ascii_case("Type"))
+                && (v == "频道" || v.eq_ignore_ascii_case("Channel"))
+        });
+
+    let mut info_rows: Vec<ContactProfileInfoRow> = Vec::new();
+    if is_group_or_channel {
+        if !model.username.trim().is_empty() {
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::ContactsUsers,
+                icon_color: pal.accent,
+                value: model.username.trim().to_string(),
+                subtitle: tr_str(lang, "公开链接 · 点击复制", "Public Link · Click to copy").into(),
+            });
+        }
+        if !members.invite_link.trim().is_empty() {
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::GroupUsers,
+                icon_color: pal.accent,
+                value: members.invite_link.trim().to_string(),
+                subtitle: tr_str(lang, "邀请链接 · 点击复制", "Invite Link · Click to copy").into(),
+            });
+        }
+        if !model.bio.trim().is_empty() {
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::FolderAll,
+                icon_color: pal.text_secondary,
+                value: model.bio.trim().to_string(),
+                subtitle: if is_channel {
+                    tr_str(lang, "频道简介", "Channel Description")
+                } else {
+                    tr_str(lang, "群组简介", "Group Description")
+                }
+                .into(),
+            });
+        }
+        let mut has_members_fact = false;
+        for (label, val) in &model.facts {
+            if is_bio_fact_label(label) {
+                continue;
+            }
+            if is_members_fact_label(label) {
+                has_members_fact = true;
+            }
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::FileDoc,
+                icon_color: pal.text_secondary,
+                value: val.clone(),
+                subtitle: label.clone(),
+            });
+        }
+        if !has_members_fact && !members.members.is_empty() {
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::GroupUsers,
+                icon_color: pal.text_secondary,
+                value: members.members.len().to_string(),
+                subtitle: tr_str(lang, "成员", "Members").into(),
+            });
+        }
+    } else {
+        if !model.phone.trim().is_empty() {
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::PhoneCall,
+                icon_color: pal.accent,
+                value: model.phone.clone(),
+                subtitle: tr_str(lang, "手机号 · 点击复制", "Mobile · Click to copy").into(),
+            });
+        }
+        if !model.username.trim().is_empty() {
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::ContactsUsers,
+                icon_color: pal.accent,
+                value: model.username.clone(),
+                subtitle: tr_str(lang, "用户名 · 点击复制", "Username · Click to copy").into(),
+            });
+        }
+        if !model.bio.trim().is_empty() {
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::FolderAll,
+                icon_color: pal.text_secondary,
+                value: model.bio.clone(),
+                subtitle: tr_str(lang, "简介", "Bio").into(),
+            });
+        }
+        for (label, val) in &model.facts {
+            if !model.bio.trim().is_empty() && is_bio_fact_label(label) {
+                continue;
+            }
+            info_rows.push(ContactProfileInfoRow {
+                icon: IconName::FileDoc,
+                icon_color: pal.text_secondary,
+                value: val.clone(),
+                subtitle: label.clone(),
+            });
+        }
+    }
+
+    let info_section_title = if is_channel {
+        tr_str(lang, "频道信息", "Channel Info").to_string()
+    } else if is_group_or_channel {
+        tr_str(lang, "群组信息", "Group Info").to_string()
+    } else {
+        tr_str(lang, "联系信息", "Contact Info").to_string()
+    };
+
+    let privacy_section_title = if is_group_or_channel {
+        tr_str(lang, "通知与管理", "Group Settings").to_string()
+    } else {
+        tr_str(lang, "通知与隐私", "Notifications & Privacy").to_string()
+    };
+
+    let edit_row_label = if is_channel {
+        tr_str(lang, "编辑频道信息", "Edit Channel Info").to_string()
+    } else if is_group_or_channel {
+        tr_str(lang, "编辑群组信息", "Edit Group Info").to_string()
+    } else {
+        tr_str(lang, "编辑联系人信息", "Edit Contact Info").to_string()
+    };
+
+    let leave_row_label = if is_channel {
+        Some(tr_str(lang, "离开频道", "Leave Channel").to_string())
+    } else if is_group_or_channel {
+        Some(tr_str(lang, "退出群组", "Leave Group").to_string())
+    } else {
+        None
+    };
+
+    let members_row_label = is_group_or_channel.then(|| {
+        if !members.members.is_empty() {
+            if lang.starts_with("zh") {
+                format!("查看群成员 ({})", members.members.len())
+            } else {
+                format!("Members ({})", members.members.len())
+            }
+        } else {
+            tr_str(lang, "群成员列表", "View Members").to_string()
+        }
+    });
+
+    ContactProfileLayoutSpec {
+        is_group_or_channel,
+        is_channel,
+        info_section_title,
+        info_rows,
+        privacy_section_title,
+        show_secret_chat: !is_group_or_channel,
+        show_members_row: is_group_or_channel,
+        members_row_label,
+        edit_row_label,
+        leave_row_label,
+        show_block_contact: !is_group_or_channel,
+    }
+}
+
+/// Renders the Muse-inspired Profile panel (Hero & segmented bar live in `ContextInspector::render`):
+/// strictly branched for `Group/Channel` vs `1v1 User`, with collapsible facts rows,
+/// optional 3-column shared media preview, notifications/management rows, and clean destructive row.
 #[allow(clippy::too_many_arguments)]
 pub fn render_contact_profile_panel(
     model: &ProfileTabModel,
+    members: &MembersTabModel,
     shared_media: &SharedMediaTabModel,
     collapsed_sections: &std::collections::HashSet<&'static str>,
     is_secret_chat_active: bool,
@@ -317,65 +515,38 @@ pub fn render_contact_profile_panel(
     lang: &str,
     cx: &mut Context<ContextInspector>,
 ) -> AnyElement {
-    let mut rows: Vec<(IconName, u32, String, String)> = Vec::new();
-    if !model.phone.is_empty() {
-        rows.push((
-            IconName::PhoneCall,
-            pal.accent,
-            model.phone.clone(),
-            tr_str(lang, "手机号 · 点击复制", "Mobile · Click to copy").into(),
-        ));
-    }
-    if !model.username.is_empty() {
-        rows.push((
-            IconName::ContactsUsers,
-            pal.accent,
-            model.username.clone(),
-            tr_str(lang, "用户名 · 点击复制", "Username · Click to copy").into(),
-        ));
-    }
-    if !model.bio.is_empty() {
-        rows.push((
-            IconName::FolderAll,
-            pal.text_secondary,
-            model.bio.clone(),
-            tr_str(lang, "简介", "Bio").into(),
-        ));
-    }
-    for (label, val) in &model.facts {
-        rows.push((IconName::FileDoc, pal.text_secondary, val.clone(), label.clone()));
-    }
+    let layout = build_contact_profile_layout(model, members, pal, lang);
 
     let info_collapsed = collapsed_sections.contains("contact-sec-info");
     let media_collapsed = collapsed_sections.contains("contact-sec-media");
     let privacy_collapsed = collapsed_sections.contains("contact-sec-privacy");
 
-    let info_section = (!rows.is_empty()).then(|| {
+    let info_section = (!layout.info_rows.is_empty()).then(|| {
         let mut sec = div().w_full().flex().flex_col().gap(px(2.0)).child(
             muse_collapsible_header(
                 "contact-sec-info-hdr",
                 "contact-sec-info",
-                tr_str(lang, "联系信息", "Contact Info"),
+                &layout.info_section_title,
                 info_collapsed,
                 pal,
                 cx,
             ),
         );
         if !info_collapsed {
-            for (idx, (icon, col, val, subtitle)) in rows.into_iter().enumerate() {
-                let cp = val.clone();
+            for (idx, row) in layout.info_rows.into_iter().enumerate() {
+                let cp = row.value.clone();
                 let copied_prefix = tr_str(lang, "已复制", "Copied").to_string();
                 sec = sec.child(muse_icon_row(
                     SharedString::from(format!("contact-info-row-{idx}")),
-                    icon,
-                    col,
-                    val,
-                    Some(subtitle),
+                    row.icon,
+                    row.icon_color,
+                    row.value,
+                    Some(row.subtitle),
                     None,
                     Some(tg_icon(IconName::Copy, 12.5, pal.text_secondary).into_any_element()),
                     pal,
-                    move |this, _| {
-                        this.copied_feedback = Some(format!("{copied_prefix}: {cp}"));
+                    move |this, cx| {
+                        this.show_copied_feedback(format!("{copied_prefix}: {cp}"), cx);
                         this.pending_action = Some(InspectorAction::CopyText(cp.clone()));
                     },
                     cx,
@@ -440,7 +611,7 @@ pub fn render_contact_profile_panel(
         muse_collapsible_header(
             "contact-sec-privacy-hdr",
             "contact-sec-privacy",
-            tr_str(lang, "通知与隐私", "Notifications & Privacy"),
+            &layout.privacy_section_title,
             privacy_collapsed,
             pal,
             cx,
@@ -448,32 +619,50 @@ pub fn render_contact_profile_panel(
     );
     if !privacy_collapsed {
         let mute_on = model.is_notifications_enabled;
-        privacy_sec = privacy_sec
-            .child(muse_icon_row(
-                "inspector-quick-mute",
-                if mute_on { IconName::Speaker } else { IconName::Mute },
-                if mute_on { pal.accent } else { pal.text_secondary },
-                tr_str(lang, "消息通知", "Notifications"),
-                Some(
-                    if mute_on {
-                        tr_str(lang, "已开启声音与横幅提醒", "Alerts enabled")
-                    } else {
-                        tr_str(lang, "已静音通知", "Muted")
-                    }
-                    .to_string(),
-                ),
-                None,
-                Some(apple_switch_pill(mute_on, pal).into_any_element()),
-                pal,
-                |this, _| {
-                    this.profile.is_notifications_enabled = !this.profile.is_notifications_enabled;
-                    this.pending_action = Some(InspectorAction::ToggleNotifications(
-                        this.profile.is_notifications_enabled,
-                    ));
-                },
-                cx,
-            ))
-            .child(muse_icon_row(
+        privacy_sec = privacy_sec.child(muse_icon_row(
+            "inspector-quick-mute",
+            if mute_on { IconName::Speaker } else { IconName::Mute },
+            if mute_on { pal.accent } else { pal.text_secondary },
+            tr_str(lang, "消息通知", "Notifications"),
+            Some(
+                if mute_on {
+                    tr_str(lang, "已开启声音与横幅提醒", "Alerts enabled")
+                } else {
+                    tr_str(lang, "已静音通知", "Muted")
+                }
+                .to_string(),
+            ),
+            None,
+            Some(apple_switch_pill(mute_on, pal).into_any_element()),
+            pal,
+            |this, _| {
+                this.profile.is_notifications_enabled = !this.profile.is_notifications_enabled;
+                this.pending_action = Some(InspectorAction::ToggleNotifications(
+                    this.profile.is_notifications_enabled,
+                ));
+            },
+            cx,
+        ));
+        if layout.show_members_row {
+            if let Some(ref members_label) = layout.members_row_label {
+                privacy_sec = privacy_sec.child(muse_icon_row(
+                    "inspector-group-members-row",
+                    IconName::GroupUsers,
+                    pal.accent,
+                    members_label.clone(),
+                    None,
+                    None,
+                    Some(tg_icon(IconName::ChevronRight, 12.0, pal.text_secondary).into_any_element()),
+                    pal,
+                    |this, _| {
+                        this.set_tab(InspectorTab::Members);
+                    },
+                    cx,
+                ));
+            }
+        }
+        if layout.show_secret_chat {
+            privacy_sec = privacy_sec.child(muse_icon_row(
                 "inspector-secret-chat-toggle",
                 IconName::Lock,
                 if is_secret_chat_active { pal.success } else { pal.accent },
@@ -490,22 +679,39 @@ pub fn render_contact_profile_panel(
                     this.is_secret_chat_active = !this.is_secret_chat_active;
                 },
                 cx,
-            ))
-            .child(muse_icon_row(
-                "inspector-edit-peer-row",
-                IconName::Edit,
-                pal.icon_fg,
-                tr_str(lang, "编辑联系人信息", "Edit Contact Info"),
+            ));
+        }
+        privacy_sec = privacy_sec.child(muse_icon_row(
+            "inspector-edit-peer-row",
+            IconName::Edit,
+            pal.icon_fg,
+            layout.edit_row_label,
+            None,
+            None,
+            Some(tg_icon(IconName::ChevronRight, 12.0, pal.text_secondary).into_any_element()),
+            pal,
+            |this, _| {
+                this.pending_action = Some(InspectorAction::OpenEditPeer);
+            },
+            cx,
+        ));
+        if let Some(leave_label) = layout.leave_row_label {
+            privacy_sec = privacy_sec.child(muse_icon_row(
+                "inspector-leave-group-row",
+                IconName::DeleteTrash,
+                pal.danger,
+                leave_label,
                 None,
+                Some(pal.danger),
                 None,
-                Some(tg_icon(IconName::ChevronRight, 12.0, pal.text_secondary).into_any_element()),
                 pal,
                 |this, _| {
-                    this.pending_action = Some(InspectorAction::OpenEditPeer);
+                    this.pending_leave_chat = true;
                 },
                 cx,
-            ))
-            .child(muse_icon_row(
+            ));
+        } else if layout.show_block_contact {
+            privacy_sec = privacy_sec.child(muse_icon_row(
                 "inspector-block-contact-row",
                 IconName::Close,
                 pal.danger,
@@ -523,6 +729,7 @@ pub fn render_contact_profile_panel(
                 },
                 cx,
             ));
+        }
     }
 
     div()
@@ -1081,6 +1288,7 @@ fn render_members_panel_inner(
         .when_some(picker_panel, |col, panel| col.child(panel))
         .when(!invite.is_empty(), |el| {
             let cp = invite.clone();
+            let copied_prefix = tr_str(lang, "已复制", "Copied").to_string();
             el.child(
                 grouped_card(pal)
                     .p(px(12.0))
@@ -1123,6 +1331,7 @@ fn render_members_panel_inner(
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _e, _w, cx| {
+                                    this.show_copied_feedback(format!("{copied_prefix}: {cp}"), cx);
                                     this.pending_action =
                                         Some(InspectorAction::CopyText(cp.clone()));
                                     cx.notify();

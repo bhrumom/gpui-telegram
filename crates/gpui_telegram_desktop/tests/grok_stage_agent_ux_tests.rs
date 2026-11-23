@@ -8,9 +8,15 @@ use gpui_telegram_desktop::components::tool_permission_dock::{
 };
 use gpui_telegram_desktop::theme::{TdesktopThemeMode, TdesktopThemePalette};
 use gpui_telegram_desktop::views::app_shell::shell_stage_actions::build_mention_candidates;
-use gpui_telegram_desktop::views::canonical_composer::CanonicalComposer;
+use gpui_telegram_desktop::views::app_shell::shell_truth::validate_selected_send_target;
+use gpui_telegram_desktop::app::session::send_as_peers::SendAsPeer;
+use gpui_telegram_desktop::views::app_shell::window_controller::WindowController;
+use gpui_telegram_desktop::views::canonical_composer::{BotSlashCommandItem, CanonicalComposer};
+use gpui_telegram_desktop::views::composer::bot_keyboard::{
+    flags as kb_flags, BotKeyboardButton, BotKeyboardButtonKind,
+};
 use gpui_telegram_desktop::views::chat_sidebar::{
-    BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel,
+    BotGrokAvatarVisual, ChatSidebar, DialogDeliveryStatus, DialogItemModel,
 };
 use gpui_telegram_desktop::views::composer::field_autocomplete::{
     AutocompleteChooseMethod, AutocompleteType, FieldAutocomplete, MentionRow,
@@ -409,4 +415,232 @@ fn test_sidebar_preview_priority_order_and_tool_permission_dock_stepping() {
         Some(("apr-1".to_string(), ToolApprovalDecision::AllowOnce))
     );
     assert_eq!(dock.active_request().map(|r| r.id.as_str()), Some("apr-2"));
+}
+
+#[test]
+fn test_window_controller_id_fenced_dismiss_and_chat_scoped_clear() {
+    let mut ctrl = WindowController::new();
+    let t1_id = ctrl.show_chat_toast(10, "PROVIDER_ERROR on chat 10", 1500);
+    ctrl.show_toast("Global system notice", 2000);
+    let _t3_id = ctrl.show_chat_toast(10, "Second chat 10 notice", 1500);
+
+    let cur = ctrl.current_toast.as_ref().expect("toast 1 active");
+    assert_eq!(cur.id, t1_id);
+    assert_eq!(cur.chat_id, Some(10));
+    assert!(cur.created_at > 0);
+
+    // Wrong / stale toast ID must NOT dismiss current toast
+    assert!(!ctrl.dismiss_toast_if_id(999_999));
+    assert_eq!(ctrl.current_toast.as_ref().map(|t| t.id), Some(t1_id));
+
+    // Matching toast ID dismisses toast 1 and promotes global toast 2
+    assert!(ctrl.dismiss_toast_if_id(t1_id));
+    assert_eq!(
+        ctrl.current_toast.as_ref().map(|t| t.text.as_str()),
+        Some("Global system notice")
+    );
+    assert_eq!(ctrl.current_toast.as_ref().and_then(|t| t.chat_id), None);
+
+    // Clearing chat 10 removes queued toast 3 while preserving global toast 2
+    assert!(ctrl.clear_toasts_for_chat(10));
+    assert_eq!(
+        ctrl.current_toast.as_ref().map(|t| t.text.as_str()),
+        Some("Global system notice")
+    );
+    assert!(ctrl.toast_queue.is_empty());
+
+    // Dismiss global toast, enqueue chat 20 toast + global toast, clear chat 20
+    ctrl.dismiss_current_toast();
+    assert!(ctrl.current_toast.is_none());
+    let t4_id = ctrl.show_chat_toast(20, "Chat 20 error", 1500);
+    ctrl.show_toast("Global after chat 20", 2000);
+    assert_eq!(ctrl.current_toast.as_ref().map(|t| t.id), Some(t4_id));
+    assert!(ctrl.clear_toasts_for_chat(20));
+    assert_eq!(
+        ctrl.current_toast.as_ref().map(|t| t.text.as_str()),
+        Some("Global after chat 20")
+    );
+
+    // Global toast promoted during clear_toasts_for_chat(20) stays global (not auto-stamped)
+    ctrl.stamp_current_toast_chat_id_if_unset(42);
+    assert_eq!(ctrl.current_toast.as_ref().and_then(|t| t.chat_id), None);
+
+    // Freshly enqueued untagged toast gets stamped None -> Some(42) once, never overwritten
+    ctrl.dismiss_current_toast();
+    ctrl.show_toast("Active chat untagged", 2000);
+    ctrl.stamp_current_toast_chat_id_if_unset(42);
+    assert_eq!(ctrl.current_toast.as_ref().and_then(|t| t.chat_id), Some(42));
+    ctrl.stamp_current_toast_chat_id_if_unset(99);
+    assert_eq!(ctrl.current_toast.as_ref().and_then(|t| t.chat_id), Some(42));
+}
+
+#[test]
+fn test_composer_reset_for_compose_picker_and_bot_keyboard_wiring() {
+    let mut composer = CanonicalComposer::new();
+    composer.set_bot_menu(
+        600_005,
+        "fabushi_bot",
+        "全球法布施",
+        "gpui-miniapp://fabushi_bot/fabushi",
+    );
+    assert!(composer.bot_menu_controls.is_active);
+    assert!(!composer.bot_menu_controls.is_small);
+
+    // Typing shrinks MenuButton to compact 36px icon; clearing expands it back
+    composer.set_text("hello");
+    assert!(composer.bot_menu_controls.is_small);
+    assert!((composer.bot_menu_controls.width_px - 36.0).abs() < 0.01);
+    composer.clear();
+    assert!(!composer.bot_menu_controls.is_small);
+
+    composer.set_bot_slash_commands(vec![BotSlashCommandItem {
+        command: "start".to_string(),
+        description: "Start bot".to_string(),
+        bot_username: "fabushi_bot".to_string(),
+        avatar_initials: "FB".to_string(),
+        avatar_color: 0x0A84FF,
+    }]);
+    composer.set_hermes_slash_enabled(true);
+    composer.begin_reply(77, "Fabushi".to_string(), "Previous reply".to_string());
+    composer.set_send_as_options(
+        vec![SendAsPeer {
+            peer_id: 1001,
+            title: "Main Account".to_string(),
+            premium_required: false,
+        }],
+        Some(1001),
+    );
+    composer.editor.attachments.push(std::path::PathBuf::from("/tmp/sample.txt"));
+    composer.set_mention_candidates(vec![MentionRow::new(600_005, "fabushi_bot", "Fabushi", true)]);
+    composer.toggle_attachments();
+    composer.toggle_formatting();
+    composer.set_text("unsent bot draft");
+
+    // Wire BotKeyboard reply markup & toggle
+    composer.set_bot_reply_keyboard(
+        vec![vec![
+            BotKeyboardButton::new("Help", BotKeyboardButtonKind::Default),
+            BotKeyboardButton::new("Open App", BotKeyboardButtonKind::WebApp("gpui-miniapp://fabushi_bot/app".into())),
+        ]],
+        kb_flags::RESIZE | kb_flags::SINGLE_USE,
+        Some("Choose an action".to_string()),
+    );
+    assert!(composer.bot_keyboard.has_markup());
+    assert!(composer.bot_keyboard.single_use);
+    assert!(composer.is_bot_keyboard_open);
+    composer.toggle_bot_keyboard();
+    assert!(!composer.is_bot_keyboard_open);
+    composer.toggle_bot_keyboard();
+    assert!(composer.is_bot_keyboard_open);
+
+    // Entering `+` compose picker resets all chat/bot-specific state
+    composer.reset_for_compose_picker(None);
+    assert!(composer.is_compose_isolated);
+    assert!(!composer.bot_menu_controls.is_active);
+    assert!(composer.bot_slash_commands.is_empty());
+    assert!(!composer.hermes_slash_enabled);
+    assert!(composer.replying_to.is_none());
+    assert!(composer.editing_message.is_none());
+    assert!(composer.send_as_options.is_empty());
+    assert!(composer.selected_send_as_peer_id.is_none());
+    assert!(composer.editor.attachments.is_empty());
+    assert!(composer.autocomplete.all_mention_candidates.is_empty());
+    assert!(composer.text().is_empty());
+    assert!(!composer.attachments_drawer.is_open);
+    assert!(!composer.is_formatting_open);
+    assert!(!composer.is_input_focused);
+    assert!(!composer.bot_keyboard.has_markup());
+    assert!(!composer.is_bot_keyboard_open);
+}
+
+#[test]
+fn test_composer_isolation_guards_and_hermes_slash_compact_sync() {
+    let mut composer = CanonicalComposer::new();
+    composer.set_bot_menu(
+        600_005,
+        "fabushi_bot",
+        "全球法布施",
+        "gpui-miniapp://fabushi_bot/fabushi",
+    );
+    composer.set_hermes_slash_enabled(true);
+
+    // 1. Selecting a Hermes slash autocomplete command immediately shrinks MenuButton (`is_small == true`).
+    composer.set_text("/he");
+    composer.sync_autocomplete();
+    assert!(composer.hermes_ac_visible);
+    assert!(!composer.hermes_ac_matches.is_empty());
+    composer.clear();
+    composer.set_text("/help");
+    composer.sync_autocomplete();
+    composer.select_hermes_autocomplete_index(0);
+    assert!(composer.text().starts_with('/'));
+    assert!(
+        composer.bot_menu_controls.is_small,
+        "select_hermes_autocomplete_index must sync bot_menu_controls.is_small immediately"
+    );
+
+    // 2. While `is_compose_isolated == true`, bot/miniapp/send-as/reply-keyboard setters are ignored.
+    composer.reset_for_compose_picker(None);
+    assert!(composer.is_compose_isolated);
+    composer.set_bot_menu(
+        600_005,
+        "fabushi_bot",
+        "全球法布施",
+        "gpui-miniapp://fabushi_bot/fabushi",
+    );
+    composer.set_bot_slash_commands(vec![BotSlashCommandItem {
+        command: "start".to_string(),
+        description: "Start".to_string(),
+        bot_username: "fabushi_bot".to_string(),
+        avatar_initials: "FB".to_string(),
+        avatar_color: 0x0A84FF,
+    }]);
+    composer.set_hermes_slash_enabled(true);
+    composer.set_send_as_options(
+        vec![SendAsPeer {
+            peer_id: 1001,
+            title: "Main Account".to_string(),
+            premium_required: false,
+        }],
+        Some(1001),
+    );
+    composer.set_bot_reply_keyboard(
+        vec![vec![BotKeyboardButton::new("Hi", BotKeyboardButtonKind::Default)]],
+        kb_flags::RESIZE,
+        None,
+    );
+    assert!(!composer.bot_menu_controls.is_active);
+    assert!(composer.bot_slash_commands.is_empty());
+    assert!(!composer.hermes_slash_enabled);
+    assert!(composer.send_as_options.is_empty());
+    assert!(!composer.bot_keyboard.has_markup());
+
+    // 3. `validate_selected_send_target` blocks sending when `stage.show_bot_start_bar == true`.
+    let mut sidebar = ChatSidebar::new();
+    sidebar.dialogs.push(DialogItemModel {
+        id: 501,
+        peer_name: "Bot".to_string(),
+        avatar_initials: "BT".to_string(),
+        avatar_color: 0x0A84FF,
+        last_message: String::new(),
+        timestamp: String::new(),
+        unread_count: 0,
+        is_muted: false,
+        is_pinned: false,
+        is_online: true,
+        typing_indicator: None,
+        delivery_status: DialogDeliveryStatus::Read,
+        folder: "Bots".to_string(),
+    });
+    sidebar.select_dialog(501);
+    let mut stage = ConversationStage::new();
+    stage.set_chat(501, "Bot", "bot", "BT", 0x0A84FF);
+    assert!(
+        validate_selected_send_target(true, Some("tok"), Some(10), &sidebar, &stage).is_some()
+    );
+    stage.show_bot_start_bar = true;
+    assert!(
+        validate_selected_send_target(true, Some("tok"), Some(10), &sidebar, &stage).is_none(),
+        "validate_selected_send_target must return None while START bar is active"
+    );
 }

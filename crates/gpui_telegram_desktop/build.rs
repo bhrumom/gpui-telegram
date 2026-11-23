@@ -1,5 +1,22 @@
 fn main() {
     println!("cargo:rerun-if-changed=assets/AppIcon.ico");
+    println!("cargo:rerun-if-changed=native/macos_permission_hud.m");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        #[cfg(target_os = "macos")]
+        {
+            cc::Build::new()
+                .file("native/macos_permission_hud.m")
+                .flag("-fobjc-arc")
+                .flag("-Wno-deprecated-declarations")
+                .compile("fabushi_macos_permission_hud");
+
+            println!("cargo:rustc-link-lib=framework=AppKit");
+            println!("cargo:rustc-link-lib=framework=Foundation");
+            println!("cargo:rustc-link-lib=framework=CoreGraphics");
+            println!("cargo:rustc-link-lib=framework=QuartzCore");
+        }
+    }
 
     #[cfg(windows)]
     {

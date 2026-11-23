@@ -561,6 +561,7 @@ fn tier5_outbox_duplicate_nonce_idempotency_and_missing_token_handling() {
         scheduled_at_ms: None,
         inline_keyboard: None,
         send_as_peer_id: None,
+        skip_server_bot_reply: false,
     };
 
     rt.block_on(client.send_message_durable(req.clone())).unwrap();
@@ -597,6 +598,7 @@ fn tier5_outbox_duplicate_nonce_idempotency_and_missing_token_handling() {
         scheduled_at_ms: None,
         inline_keyboard: None,
         send_as_peer_id: None,
+        skip_server_bot_reply: false,
     };
     let send_no_tok = rt.block_on(client_no_tok.send_message_durable(missing_tok_req));
     assert!(send_no_tok.is_err(), "Missing token must fail direct send and queue in outbox");

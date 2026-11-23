@@ -2276,13 +2276,18 @@ async fn body_appshell_zero_friction_split_key_and_v1_upgrade(mut cx: AsyncApp) 
         })
         .unwrap();
 
-    for _ in 0..80 {
+    for _ in 0..120 {
         cx.background_executor()
             .timer(Duration::from_millis(25))
             .await;
         let upgraded = legacy_mock.lock().unwrap().auth_version == 2
             && !legacy_mock.lock().unwrap().upgrade_requests.is_empty();
-        if upgraded {
+        let client_unlocked = shell_v1
+            .read_with(&cx, |s, _| {
+                s.bot_browser.vault_custody_status == VaultCustodyStatus::UnlockedAndSynced
+            })
+            .unwrap_or(false);
+        if upgraded && client_unlocked {
             break;
         }
     }

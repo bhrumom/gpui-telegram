@@ -75,6 +75,7 @@ impl CanonicalComposer {
             if trigger == '/' {
                 let q = token.trim_start_matches('/').to_ascii_lowercase();
                 self.bot_ac_pinned_by_button = false;
+                self.hermes_ac_pinned_by_button = false;
                 if !self.bot_slash_commands.is_empty() {
                     let mut prefix = Vec::new();
                     let mut substr = Vec::new();
@@ -149,6 +150,7 @@ impl CanonicalComposer {
                 self.bot_ac_pinned_by_button = false;
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
+                self.hermes_ac_pinned_by_button = false;
                 self.context_ref_hint_open = true;
                 self.autocomplete.show_filtered(&token);
             } else if trigger == '#' {
@@ -157,6 +159,7 @@ impl CanonicalComposer {
                 self.bot_ac_pinned_by_button = false;
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
+                self.hermes_ac_pinned_by_button = false;
                 self.context_ref_hint_open = false;
                 self.autocomplete.show_filtered(&token);
             } else {
@@ -165,6 +168,7 @@ impl CanonicalComposer {
                 self.bot_ac_pinned_by_button = false;
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
+                self.hermes_ac_pinned_by_button = false;
                 self.context_ref_hint_open = false;
                 self.autocomplete.hide();
             }
@@ -174,8 +178,15 @@ impl CanonicalComposer {
                 self.bot_ac_matches.clear();
                 self.bot_ac_pinned_by_button = false;
             }
-            self.hermes_ac_visible = false;
-            self.hermes_ac_matches.clear();
+            if !(self.hermes_ac_pinned_by_button
+                && text.is_empty()
+                && self.hermes_slash_enabled
+                && self.bot_slash_commands.is_empty())
+            {
+                self.hermes_ac_visible = false;
+                self.hermes_ac_matches.clear();
+                self.hermes_ac_pinned_by_button = false;
+            }
             self.context_ref_hint_open = false;
             let trimmed = text.trim();
             if self.suggest_stickers_by_emoji
@@ -209,6 +220,7 @@ impl CanonicalComposer {
                 self.autocomplete.hide();
             }
         }
+        self.sync_bot_menu_compact_state(None);
     }
 
     pub fn select_bot_autocomplete_index(&mut self, idx: usize) {
@@ -226,6 +238,7 @@ impl CanonicalComposer {
             self.bot_ac_matches.clear();
             self.bot_ac_selected = 0;
             self.bot_ac_pinned_by_button = false;
+            self.sync_bot_menu_compact_state(None);
         }
     }
 
@@ -236,6 +249,8 @@ impl CanonicalComposer {
             self.hermes_ac_visible = false;
             self.hermes_ac_matches.clear();
             self.hermes_ac_selected = 0;
+            self.hermes_ac_pinned_by_button = false;
+            self.sync_bot_menu_compact_state(None);
         }
     }
 
@@ -308,6 +323,7 @@ impl CanonicalComposer {
                 "escape" => {
                     self.hermes_ac_visible = false;
                     self.hermes_ac_matches.clear();
+                    self.hermes_ac_pinned_by_button = false;
                     self.context_ref_hint_open = false;
                     self.autocomplete.hide();
                     return true;
@@ -601,6 +617,7 @@ impl CanonicalComposer {
                 self.bot_ac_pinned_by_button = false;
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
+                self.hermes_ac_pinned_by_button = false;
                 self.context_ref_hint_open = false;
                 self.autocomplete.hide();
                 self.cancel_reply_or_edit();
@@ -627,6 +644,7 @@ impl CanonicalComposer {
             ComposerBarAction::ToggleAttachments => self.toggle_attachments(),
             ComposerBarAction::ToggleFormatting => self.toggle_formatting(),
             ComposerBarAction::ToggleEmojiPicker => self.toggle_emoji_picker(),
+            ComposerBarAction::ToggleBotKeyboard => self.toggle_bot_keyboard(),
             ComposerBarAction::OpenBotMenu => {
                 if self.bot_menu_controls.is_active {
                     self.pending_launch_miniapp = Some((
@@ -762,13 +780,13 @@ impl CanonicalComposer {
 
     pub(crate) fn render_bot_slash_toggle_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = self.palette;
-        let active = self.bot_ac_visible;
+        let active = self.bot_ac_visible || self.hermes_ac_visible;
         div()
             .id("composer-bot-slash-btn")
             .cursor_pointer()
             .flex_shrink_0()
-            .w(px(34.0))
-            .h(px(34.0))
+            .w(px(36.0))
+            .h(px(36.0))
             .rounded_full()
             .bg(rgb(if active { pal.accent } else { pal.input_bg }))
             .border_1()
@@ -870,6 +888,7 @@ impl CanonicalComposer {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     this.select_bot_autocomplete_index(idx);
+                                    this.sync_bot_menu_compact_state(Some(cx));
                                     cx.notify();
                                 }),
                             )
@@ -992,6 +1011,7 @@ impl CanonicalComposer {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     this.select_hermes_autocomplete_index(idx);
+                                    this.sync_bot_menu_compact_state(Some(cx));
                                     cx.notify();
                                 }),
                             )

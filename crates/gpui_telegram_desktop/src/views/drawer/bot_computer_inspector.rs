@@ -151,8 +151,8 @@ pub fn render_bot_profile_main(
                 None,
                 Some(tg_icon(IconName::Copy, 12.5, pal.text_secondary).into_any_element()),
                 pal,
-                move |this, _| {
-                    this.copied_feedback = Some(format!("{copied_prefix}: {cp_fb}"));
+                move |this, cx| {
+                    this.show_copied_feedback(format!("{copied_prefix}: {cp_fb}"), cx);
                     this.pending_action = Some(InspectorAction::CopyText(cp.clone()));
                 },
                 cx,

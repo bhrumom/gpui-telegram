@@ -66,10 +66,18 @@ struct BridgeState {
     notify_tx: UnboundedSender<()>,
 }
 
-const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
+pub const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
 (function() {
   if (window.__gpuiTelegramProxyInstalled) return;
   window.__gpuiTelegramProxyInstalled = true;
+  var isTopFrame = (window === window.top);
+  function hasTgAppFrame() {
+    try {
+      return !!(document && document.getElementById && document.getElementById('tg-app-frame')) || !!window.__GPUI_WEBMCP_HOST_WRAPPER__;
+    } catch (_) {
+      return !!window.__GPUI_WEBMCP_HOST_WRAPPER__;
+    }
+  }
   var postBridgeEvent = function(eventType, eventData) {
     try {
       var payload = {
@@ -81,9 +89,11 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
       }
     } catch (e) {}
   };
-  window.TelegramWebviewProxy = {
-    postEvent: postBridgeEvent
-  };
+  if (isTopFrame) {
+    window.TelegramWebviewProxy = {
+      postEvent: postBridgeEvent
+    };
+  }
   window.TelegramGameProxy = window.TelegramGameProxy || {
     receiveEvent: function(eventType, eventData) {
       if (window.Telegram && window.Telegram.WebView && typeof window.Telegram.WebView.receiveEvent === 'function') {
@@ -94,7 +104,10 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
   window.addEventListener('message', function(ev) {
     try {
       var d = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data;
-      if (d && d.eventType) {
+      if (!d || typeof d !== 'object') return;
+      if (d.type && String(d.type).indexOf('gpui_webmcp_') === 0) return;
+      if (d.type === 'telegram_web_app_event' && hasTgAppFrame()) return;
+      if (d.eventType) {
         postBridgeEvent(d.eventType, d.eventData);
       }
     } catch (e) {}
@@ -104,6 +117,9 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
     var toolsMap = existing._tools || {};
     var stateProvider = typeof existing._stateProvider === 'function' ? existing._stateProvider : null;
     var pageErrors = Array.isArray(existing._pageErrors) ? existing._pageErrors : [];
+    var pendingToolWaiters = [];
+    var toolsChangedTimer = null;
+    var domReadyAt = (document.readyState === 'interactive' || document.readyState === 'complete') ? Date.now() : 0;
     function pushPageError(msg) {
       var clean = String(msg || '').replace(/\s+/g, ' ').trim().slice(0, 240);
       if (!clean) return;
@@ -273,13 +289,76 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
         return { name: t.name, description: String(t.description || ''), input_schema: t.inputSchema || { type: 'object', properties: {} }, read_only: !!(t.annotations && t.annotations.readOnlyHint) };
       });
     }
+    function wakeToolWaiters(toolName) {
+      if (!pendingToolWaiters.length) return;
+      var remaining = [];
+      for (var i = 0; i < pendingToolWaiters.length; i++) {
+        var w = pendingToolWaiters[i];
+        var found = toolsMap[w.toolName] || builtins()[w.toolName];
+        if ((w.toolName === toolName || found) && found && typeof found.execute === 'function') {
+          if (w.timer) clearTimeout(w.timer);
+          try { w.resolve(found); } catch (_) {}
+        } else {
+          remaining.push(w);
+        }
+      }
+      pendingToolWaiters = remaining;
+    }
+    function waitForTool(toolName, maxWaitMs) {
+      var b = builtins();
+      var existingTool = toolsMap[toolName] || b[toolName];
+      if (existingTool && typeof existingTool.execute === 'function') {
+        return Promise.resolve(existingTool);
+      }
+      var budget = Number(maxWaitMs || 2500);
+      if (domReadyAt > 0 && document.readyState === 'complete' && (Date.now() - domReadyAt) > 1200) {
+        budget = Math.min(budget, 1200);
+      }
+      return new Promise(function(resolve) {
+        var entry = { toolName: String(toolName || ''), resolve: resolve, timer: null };
+        entry.timer = setTimeout(function() {
+          pendingToolWaiters = pendingToolWaiters.filter(function(item) { return item !== entry; });
+          var latest = toolsMap[entry.toolName] || builtins()[entry.toolName] || null;
+          resolve(latest);
+        }, budget);
+        pendingToolWaiters.push(entry);
+      });
+    }
+    function scheduleToolsChanged() {
+      if (toolsChangedTimer) clearTimeout(toolsChangedTimer);
+      toolsChangedTimer = setTimeout(function() {
+        toolsChangedTimer = null;
+        var descriptors = listDescriptors();
+        var curUrl = String(window.location && window.location.href || '');
+        if (!isTopFrame && window.parent && window.parent !== window) {
+          try {
+            window.parent.postMessage({
+              type: 'gpui_webmcp_tools_changed',
+              url: curUrl,
+              tools: descriptors
+            }, '*');
+          } catch (_) {}
+        } else if (!hasTgAppFrame()) {
+          postBridgeEvent('gpui_webmcp_tools_changed', {
+            url: curUrl,
+            in_iframe: false,
+            tools: descriptors
+          });
+        }
+      }, 0);
+    }
     function registerTool(def) {
       if (!def || !def.name || typeof def.execute !== 'function') return;
-      toolsMap[String(def.name)] = def;
+      var name = String(def.name);
+      toolsMap[name] = def;
+      wakeToolWaiters(name);
+      scheduleToolsChanged();
     }
     function setStateProvider(fn) {
       stateProvider = typeof fn === 'function' ? fn : null;
-      if (window.__GPUI_WEBMCP__) window.__GPUI_WEBMCP__._stateProvider = stateProvider;
+      if (window.__GPUI_WEBMCP__ && window.__GPUI_WEBMCP__._isEarlyShim) {
+        window.__GPUI_WEBMCP__._stateProvider = stateProvider;
+      }
     }
     function reportStatus(statusOrSummary) {
       var payload = {};
@@ -288,18 +367,49 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
       } else if (statusOrSummary && typeof statusOrSummary === 'object') {
         payload = Object.assign({}, statusOrSummary);
       }
-      postBridgeEvent('webmcp_state_update', payload);
+      if (!isTopFrame && window.parent && window.parent !== window) {
+        try {
+          window.parent.postMessage({ type: 'gpui_webmcp_state_update', payload: payload }, '*');
+        } catch (_) {}
+      } else {
+        postBridgeEvent('webmcp_state_update', payload);
+      }
+    }
+    function emitReadySignal() {
+      var curUrl = String(window.location && window.location.href || '');
+      if (!isTopFrame && window.parent && window.parent !== window) {
+        try {
+          window.parent.postMessage({
+            type: 'gpui_webmcp_ready',
+            url: curUrl,
+            tools: listDescriptors(),
+            state_summary: readStateSummary()
+          }, '*');
+        } catch (_) {}
+        return true;
+      }
+      if (hasTgAppFrame()) {
+        return false;
+      }
+      postBridgeEvent('__gpui_webmcp_page_ready', {
+        url: curUrl,
+        in_iframe: false,
+        tools: listDescriptors(),
+        state_summary: readStateSummary()
+      });
+      return true;
     }
     var mc = {
       registerTool: registerTool,
-      unregisterTool: function(n) { delete toolsMap[String(n || '')]; },
+      unregisterTool: function(n) { delete toolsMap[String(n || '')]; scheduleToolsChanged(); },
       provideContext: function(c) {
         toolsMap = {};
         var arr = (c && Array.isArray(c.tools)) ? c.tools : [];
         for (var i = 0; i < arr.length; i++) registerTool(arr[i]);
         if (c && typeof c.getState === 'function') setStateProvider(c.getState);
+        scheduleToolsChanged();
       },
-      clearContext: function() { toolsMap = {}; setStateProvider(null); },
+      clearContext: function() { toolsMap = {}; setStateProvider(null); scheduleToolsChanged(); },
       setStateProvider: setStateProvider,
       reportStatus: reportStatus
     };
@@ -314,41 +424,105 @@ const TELEGRAM_WEBVIEW_PROXY_BOOT_JS: &str = r#"
         navigator.modelContext.reportStatus = mc.reportStatus;
       }
     } catch (_) {}
-    window.__GPUI_WEBMCP__ = {
-      _tools: toolsMap,
-      _stateProvider: stateProvider,
-      _pageErrors: pageErrors,
-      discover: listDescriptors,
-      readState: readStateSummary,
-      invoke: function(requestId, operation, toolName, args) {
-        function reply(ok, result, err) {
-          postBridgeEvent('webmcp_response', {
-            request_id: String(requestId || ''),
-            ok: !!ok,
-            result: result == null ? {} : result,
-            error: err ? String(err) : null,
-            tools: operation === 'discover' ? listDescriptors() : [],
-            state_summary: readStateSummary(),
-            control_mode: 'ai_controlling'
-          });
+    if (!window.__GPUI_WEBMCP__ || !window.__GPUI_WEBMCP__._isHostWrapper) {
+      window.__GPUI_WEBMCP__ = {
+        _isEarlyShim: true,
+        _tools: toolsMap,
+        _stateProvider: stateProvider,
+        _pageErrors: pageErrors,
+        discover: listDescriptors,
+        readState: readStateSummary,
+        checkReady: emitReadySignal,
+        invoke: function(requestId, operation, toolName, args, replyTarget) {
+          function reply(ok, result, err) {
+            var respPayload = {
+              request_id: String(requestId || ''),
+              ok: !!ok,
+              result: result == null ? {} : result,
+              error: err ? String(err) : null,
+              tools: (operation === 'discover' || !ok) ? listDescriptors() : [],
+              state_summary: readStateSummary(),
+              control_mode: 'ai_controlling'
+            };
+            if (replyTarget && typeof replyTarget.postMessage === 'function') {
+              try {
+                replyTarget.postMessage({
+                  type: 'gpui_webmcp_response',
+                  request_id: respPayload.request_id,
+                  payload: respPayload
+                }, '*');
+                return;
+              } catch (_) {}
+            }
+            postBridgeEvent('webmcp_response', respPayload);
+          }
+          try {
+            if (operation === 'discover') { reply(true, { count: listDescriptors().length }, null); return; }
+            if (operation === 'get_state') { reply(true, readStateSummary(), null); return; }
+            var b = builtins();
+            var t = toolsMap[toolName] || b[toolName];
+            if (!t || typeof t.execute !== 'function') {
+              if (toolName) {
+                waitForTool(String(toolName), 2500).then(function(found) {
+                  if (!found || typeof found.execute !== 'function') {
+                    reply(false, {}, '未注册的 WebMCP 工具: ' + String(toolName || ''));
+                    return;
+                  }
+                  try {
+                    Promise.resolve(found.execute(args || {})).then(function(r) { reply(true, r, null); }).catch(function(e) { reply(false, {}, e && e.message ? e.message : String(e)); });
+                  } catch (e) {
+                    reply(false, {}, e && e.message ? e.message : String(e));
+                  }
+                });
+                return;
+              }
+              reply(false, {}, '未注册的 WebMCP 工具: ' + String(toolName || ''));
+              return;
+            }
+            Promise.resolve(t.execute(args || {})).then(function(r) { reply(true, r, null); }).catch(function(e) { reply(false, {}, e && e.message ? e.message : String(e)); });
+          } catch (e) { reply(false, {}, e && e.message ? e.message : String(e)); }
         }
+      };
+    }
+    if (!isTopFrame) {
+      window.addEventListener('message', function(ev) {
         try {
-          if (operation === 'discover') { reply(true, { count: listDescriptors().length }, null); return; }
-          if (operation === 'get_state') { reply(true, readStateSummary(), null); return; }
-          var b = builtins();
-          var t = toolsMap[toolName] || b[toolName];
-          if (!t || typeof t.execute !== 'function') { reply(false, {}, '未注册的 WebMCP 工具: ' + String(toolName || '')); return; }
-          Promise.resolve(t.execute(args || {})).then(function(r) { reply(true, r, null); }).catch(function(e) { reply(false, {}, e && e.message ? e.message : String(e)); });
-        } catch (e) { reply(false, {}, e && e.message ? e.message : String(e)); }
-      }
-    };
+          var d = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data;
+          if (!d || typeof d !== 'object') return;
+          if (d.type === 'gpui_webmcp_invoke') {
+            var target = ev.source || window.parent;
+            if (window.__GPUI_WEBMCP__ && typeof window.__GPUI_WEBMCP__.invoke === 'function') {
+              window.__GPUI_WEBMCP__.invoke(d.request_id, d.operation, d.tool_name, d.arguments, target);
+            }
+          } else if (d.type === 'gpui_webmcp_ping_ready') {
+            if (document.readyState === 'interactive' || document.readyState === 'complete') {
+              emitReadySignal();
+            }
+          }
+        } catch (_) {}
+      });
+      var sendUnready = function() {
+        try {
+          if (window.parent && window.parent !== window) {
+            window.parent.postMessage({
+              type: 'gpui_webmcp_unready',
+              url: String(window.location && window.location.href || '')
+            }, '*');
+          }
+        } catch (_) {}
+      };
+      window.addEventListener('pagehide', sendUnready);
+      window.addEventListener('beforeunload', sendUnready);
+    }
+    window.addEventListener('DOMContentLoaded', function() {
+      domReadyAt = Date.now();
+      emitReadySignal();
+    });
+    if (document.readyState === 'interactive' || document.readyState === 'complete') {
+      domReadyAt = Date.now();
+      emitReadySignal();
+    }
   })();
-  window.addEventListener('DOMContentLoaded', function() {
-    postBridgeEvent('__gpui_webmcp_page_ready', { url: String(window.location && window.location.href || '') });
-  });
-  if (document.readyState === 'interactive' || document.readyState === 'complete') {
-    postBridgeEvent('__gpui_webmcp_page_ready', { url: String(window.location && window.location.href || '') });
-  }
 })();
 "#;
 
@@ -703,7 +877,11 @@ impl MacOsWkWebView {
         }
     }
 
-    pub fn reload(&self) {
+    pub fn loaded_url(&self) -> &str {
+        &self.loaded_url
+    }
+
+    pub fn reload(&mut self) {
         if self.webview.is_null() {
             return;
         }

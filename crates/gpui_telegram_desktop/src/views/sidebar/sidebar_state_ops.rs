@@ -1323,6 +1323,22 @@ impl ChatSidebar {
         }
     }
 
+    /// Returns the ordered non-archived dialog slice (pinned first, then regular) paired with
+    /// each dialog's [`SidebarDialogMeta`] so the collapsed rail renders identical avatars and
+    /// badges as the expanded sidebar.
+    pub fn collapsed_rail_dialogs(&self) -> Vec<(&DialogItemModel, SidebarDialogMeta)> {
+        self.dialogs
+            .iter()
+            .filter(|d| !self.archived_ids.contains(&d.id) && d.is_pinned)
+            .chain(
+                self.dialogs
+                    .iter()
+                    .filter(|d| !self.archived_ids.contains(&d.id) && !d.is_pinned),
+            )
+            .map(|d| (d, self.dialog_meta(d)))
+            .collect()
+    }
+
     fn update_nav_rail(&mut self, cx: &mut Context<Self>, update: impl FnOnce(&mut NavRail)) {
         self.is_account_popover_open = false;
         if let Some(rail) = self.nav_rail.clone() {

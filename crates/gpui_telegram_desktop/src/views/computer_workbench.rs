@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -12,8 +13,15 @@ use gpui_telegram_proto::{
     ComputerNodeDto, ComputerNodeKind, ComputerRunPolicy, TailnetPeerLiveState, TailnetRelayMode,
 };
 
+use crate::components::macos_permission_modal::{
+    render_gemini_permission_modal, render_remote_host_permission_modal,
+};
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
+use crate::platform::mac::macos_permissions_drag::{
+    cached_permissions_snapshot, hide_drag_hud, permissions_snapshot_generation,
+    request_permissions_refresh,
+};
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::remote_terminal_view::{RemoteTerminalAction, RemoteTerminalView};
@@ -288,8 +296,11 @@ pub struct ComputerWorkbench {
     pub pending_command: Option<WorkbenchCommand>,
     pub pending_commands: VecDeque<WorkbenchCommand>,
     pub tailnet_peer: Option<TailnetPeerLiveState>,
+    pub is_local_device: bool,
     pub needs_screen_permission_guide: bool,
     pub needs_accessibility_permission_guide: bool,
+    pub force_local_permission_modal: bool,
+    pub remote_permission_error: Option<String>,
     pub hud_expanded: bool,
     pub hud_active_popover: Option<WorkbenchHudPopover>,
     pub stream_settings: RemoteStreamSettingsDto,
@@ -303,6 +314,10 @@ pub struct ComputerWorkbench {
     cached_frame_src: Option<String>,
     cached_frame_image: Option<Arc<gpui::Image>>,
     viewport_bounds: Arc<std::sync::Mutex<Option<Bounds<Pixels>>>>,
+    permission_poll_started: bool,
+    last_perm_gen: u64,
+    last_perm_screen_active: bool,
+    last_perm_ax_active: bool,
 }
 
 impl ComputerWorkbench {
@@ -343,8 +358,11 @@ impl ComputerWorkbench {
             pending_command: None,
             pending_commands: VecDeque::new(),
             tailnet_peer: None,
+            is_local_device: false,
             needs_screen_permission_guide: false,
             needs_accessibility_permission_guide: false,
+            force_local_permission_modal: false,
+            remote_permission_error: None,
             hud_expanded: true,
             hud_active_popover: None,
             stream_settings: RemoteStreamSettingsDto::default(),
@@ -367,6 +385,10 @@ impl ComputerWorkbench {
             cached_frame_src: None,
             cached_frame_image: None,
             viewport_bounds: Arc::new(std::sync::Mutex::new(None)),
+            permission_poll_started: false,
+            last_perm_gen: 0,
+            last_perm_screen_active: false,
+            last_perm_ax_active: false,
         }
     }
 
@@ -381,6 +403,69 @@ impl ComputerWorkbench {
         s.palette = palette;
         s.language_id = language_id.to_string();
         s
+    }
+
+    pub fn ensure_permission_poll_loop(&mut self, cx: &mut Context<Self>) {
+        if self.permission_poll_started
+            || !cfg!(target_os = "macos")
+            || cfg!(test)
+            || std::env::var_os("GPUI_OFFLINE_TEST").is_some()
+        {
+            return;
+        }
+        self.permission_poll_started = true;
+        let init_snap = cached_permissions_snapshot();
+        self.last_perm_gen = permissions_snapshot_generation();
+        self.last_perm_screen_active = init_snap.screen_state.is_active();
+        self.last_perm_ax_active = init_snap.accessibility_granted;
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| loop {
+            app.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
+            let keep = weak
+                .update(app, |this, cx| {
+                    let modal_open = this.needs_screen_permission_guide
+                        || this.needs_accessibility_permission_guide
+                        || this.force_local_permission_modal;
+                    if modal_open && (this.is_local_device || this.force_local_permission_modal) {
+                        request_permissions_refresh(false);
+                        let snap = cached_permissions_snapshot();
+                        let perm_gen = permissions_snapshot_generation();
+                        let screen_active = snap.screen_state.is_active();
+                        let ax_active = snap.accessibility_granted;
+                        let changed = perm_gen != this.last_perm_gen
+                            || screen_active != this.last_perm_screen_active
+                            || ax_active != this.last_perm_ax_active;
+
+                        if changed {
+                            let screen_just_became_active =
+                                !this.last_perm_screen_active && screen_active;
+                            this.last_perm_gen = perm_gen;
+                            this.last_perm_screen_active = screen_active;
+                            this.last_perm_ax_active = ax_active;
+
+                            if ax_active {
+                                this.needs_accessibility_permission_guide = false;
+                            }
+                            if screen_just_became_active {
+                                this.needs_screen_permission_guide = false;
+                                if ax_active {
+                                    this.force_local_permission_modal = false;
+                                }
+                                this.enqueue_command(WorkbenchCommand::RefreshScreen);
+                            }
+                            cx.notify();
+                        }
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
     }
 
     pub fn ensure_terminal_input(&mut self, cx: &mut Context<Self>) {
@@ -420,6 +505,7 @@ impl ComputerWorkbench {
     pub fn set_target_node(&mut self, node: &ComputerNodeDto) {
         self.node_id = Some(node.node_id.clone());
         self.node_kind = node.kind;
+        self.is_local_device = node.is_current_device;
         self.run_policy = node.run_policy;
         self.is_connected = node.online;
         self.tailnet_peer = None;
@@ -2138,214 +2224,55 @@ impl ComputerWorkbench {
                     })
                     .when(
                         self.needs_screen_permission_guide
-                            || self.needs_accessibility_permission_guide,
+                            || self.needs_accessibility_permission_guide
+                            || self.force_local_permission_modal,
                         |vp| {
-                            use crate::platform::mac::macos_permissions_drag::{
-                                has_accessibility_permission, has_screen_recording_permission,
-                                open_accessibility_settings, open_screen_recording_settings,
-                            };
-
-                            let screen_ok = has_screen_recording_permission();
-                            let ax_ok = has_accessibility_permission();
-                            let perm_row = |id: &'static str,
-                                            title: &'static str,
-                                            desc: &'static str,
-                                            granted: bool,
-                                            on_open: fn()| {
-                                let badge_color = if granted { pal.success } else { pal.accent };
-                                div()
-                                    .px(px(14.0))
-                                    .py(px(10.0))
-                                    .rounded(px(10.0))
-                                    .bg(rgb(pal.card_bg))
-                                    .border_1()
-                                    .border_color(rgb(pal.border_fg))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(12.0))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(2.0))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(8.0))
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(rgb(pal.text_primary))
-                                                            .child(title),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .px(px(6.0))
-                                                            .py(px(1.0))
-                                                            .rounded(px(999.0))
-                                                            .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                                badge_color,
-                                                                0.14,
-                                                            ))
-                                                            .text_size(px(10.5))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(rgb(badge_color))
-                                                            .child(if granted {
-                                                                tr_str(lang, "已开启", "Enabled")
-                                                            } else {
-                                                                tr_str(lang, "未开启", "Not Enabled")
-                                                            }),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(pal.text_secondary))
-                                                    .child(desc),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(id)
-                                            .cursor_pointer()
-                                            .px(px(12.0))
-                                            .py(px(6.0))
-                                            .rounded(px(999.0))
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                pal.accent,
-                                                0.18,
-                                            ))
-                                            .border_1()
-                                            .border_color(rgb(pal.accent))
-                                            .text_xs()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(pal.accent))
-                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                                cx.stop_propagation();
-                                                on_open();
-                                            })
-                                            .child(tr_str(
-                                                lang,
-                                                "在“系统设置”中启用",
-                                                "Enable in System Settings",
-                                            )),
-                                    )
-                            };
-
-                            vp.child(
-                                div()
-                                    .id("wb-permission-guide-overlay")
-                                    .absolute()
-                                    .inset_0()
-                                    .bg(rgba(0x0B0F17E6))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .p(px(20.0))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .child(
-                                        div()
-                                            .w(px(520.0))
-                                            .max_w_full()
-                                            .p(px(20.0))
-                                            .rounded(px(16.0))
-                                            .bg(rgb(pal.modal_bg))
-                                            .border_1()
-                                            .border_color(rgb(pal.border_fg))
-                                            .shadow_lg()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(12.0))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .child(
-                                                        div()
-                                                            .text_base()
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_color(rgb(pal.text_primary))
-                                                            .child(tr_str(
-                                                                lang,
-                                                                "开启远程操控权限",
-                                                                "Enable Remote Control Permissions",
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id("wb-guide-close-btn")
-                                                            .cursor_pointer()
-                                                            .px(px(8.0))
-                                                            .py(px(2.0))
-                                                            .rounded(px(6.0))
-                                                            .hover(move |s| s.bg(rgb(pal.hover_bg)))
-                                                            .text_sm()
-                                                            .text_color(rgb(pal.text_secondary))
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(|this, _, _, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.needs_screen_permission_guide = false;
-                                                                    this.needs_accessibility_permission_guide = false;
-                                                                    cx.notify();
-                                                                }),
-                                                            )
-                                                            .child("×"),
-                                                    ),
-                                            )
-                                            .child(perm_row(
-                                                "wb-guide-screen-btn",
-                                                tr_str(lang, "录屏与系统录音", "Screen Recording"),
-                                                tr_str(
-                                                    lang,
-                                                    "实时显示本机桌面画面",
-                                                    "View the live desktop screen",
-                                                ),
-                                                screen_ok,
-                                                open_screen_recording_settings,
-                                            ))
-                                            .child(perm_row(
-                                                "wb-guide-ax-btn",
-                                                tr_str(lang, "辅助功能", "Accessibility"),
-                                                tr_str(
-                                                    lang,
-                                                    "响应远程鼠标点击与键盘输入",
-                                                    "Send remote mouse clicks and keystrokes",
-                                                ),
-                                                ax_ok,
-                                                open_accessibility_settings,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .justify_end()
-                                                    .pt(px(4.0))
-                                                    .child(Self::quick_cmd_btn(
-                                                        "wb-guide-recheck-btn",
-                                                        tr_str(lang, "已完成，刷新画面", "Done, Refresh"),
-                                                        true,
-                                                        pal,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.needs_screen_permission_guide = false;
-                                                            this.needs_accessibility_permission_guide = false;
-                                                            this.pending_command =
-                                                                Some(WorkbenchCommand::RefreshScreen);
-                                                            cx.notify();
-                                                        }),
-                                                    )),
-                                            ),
-                                    ),
-                            )
+                            if self.is_local_device || self.force_local_permission_modal {
+                                let snap = cached_permissions_snapshot();
+                                vp.child(render_gemini_permission_modal(
+                                    &snap,
+                                    *pal,
+                                    lang,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.needs_screen_permission_guide = false;
+                                        this.needs_accessibility_permission_guide = false;
+                                        this.force_local_permission_modal = false;
+                                        cx.notify();
+                                    }),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.needs_screen_permission_guide = false;
+                                        this.needs_accessibility_permission_guide = false;
+                                        this.force_local_permission_modal = false;
+                                        this.enqueue_command(WorkbenchCommand::RefreshScreen);
+                                        cx.notify();
+                                    }),
+                                ))
+                            } else {
+                                vp.child(render_remote_host_permission_modal(
+                                    &dev.name,
+                                    self.needs_screen_permission_guide,
+                                    self.needs_accessibility_permission_guide,
+                                    self.remote_permission_error.as_deref(),
+                                    *pal,
+                                    lang,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.needs_screen_permission_guide = false;
+                                        this.needs_accessibility_permission_guide = false;
+                                        cx.notify();
+                                    }),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.needs_screen_permission_guide = false;
+                                        this.needs_accessibility_permission_guide = false;
+                                        this.enqueue_command(WorkbenchCommand::RefreshScreen);
+                                        cx.notify();
+                                    }),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.force_local_permission_modal = true;
+                                        request_permissions_refresh(true);
+                                        cx.notify();
+                                    }),
+                                ))
+                            }
                         },
                     ),
             )
@@ -2371,13 +2298,22 @@ impl ComputerWorkbench {
                                 "wb-perm-guide-btn",
                                 tr_str(lang, "系统权限", "Permissions"),
                                 self.needs_screen_permission_guide
-                                    || self.needs_accessibility_permission_guide,
+                                    || self.needs_accessibility_permission_guide
+                                    || self.force_local_permission_modal,
                                 pal,
                                 cx.listener(|this, _, _, cx| {
-                                    let next = !(this.needs_screen_permission_guide
-                                        || this.needs_accessibility_permission_guide);
-                                    this.needs_screen_permission_guide = next;
-                                    this.needs_accessibility_permission_guide = false;
+                                    let is_open = this.needs_screen_permission_guide
+                                        || this.needs_accessibility_permission_guide
+                                        || this.force_local_permission_modal;
+                                    if is_open {
+                                        this.needs_screen_permission_guide = false;
+                                        this.needs_accessibility_permission_guide = false;
+                                        this.force_local_permission_modal = false;
+                                        hide_drag_hud();
+                                    } else {
+                                        this.force_local_permission_modal = true;
+                                        request_permissions_refresh(true);
+                                    }
                                     cx.notify();
                                 }),
                             ))
@@ -2918,6 +2854,7 @@ impl Render for ComputerWorkbench {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_terminal_input(cx);
         self.ensure_terminal_view(cx);
+        self.ensure_permission_poll_loop(cx);
         let pal = self.palette;
         let lang = self.language_id.clone();
         let dev = self.device.clone();
@@ -3148,6 +3085,7 @@ impl Render for ComputerWorkbench {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
+                                            hide_drag_hud();
                                             this.should_close = true;
                                             cx.notify();
                                         }),

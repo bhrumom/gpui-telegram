@@ -436,3 +436,190 @@ async fn clean_im_platform_has_zero_fabushi_tables_and_supports_generic_external
     assert_eq!(btn["text"].as_str(), Some("Open Acme Portal"));
     assert_eq!(btn["web_app_url"].as_str(), Some(external_url));
 }
+
+#[tokio::test]
+async fn external_miniapp_iframe_wrapper_relays_webmcp_and_forwards_hash_init_data() {
+    let (_dir, _state, router) = boot_temp_server("external_miniapp_iframe_webmcp");
+    let (_alice_uid, alice_token) = register_user(&router, "alice_iframe_webmcp").await;
+
+    let (st_bot, bot_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/bots",
+        Some(&alice_token),
+        Some(json!({
+            "username": "acme_iframe_bot",
+            "display_name": "Acme Iframe Bot",
+            "description": "External Mini App Iframe Test",
+            "about": "Tests cross-frame WebMCP relay"
+        })),
+    )
+    .await;
+    assert_eq!(st_bot, StatusCode::CREATED, "create bot: {bot_val}");
+    let bot_token = bot_val["bot_token"].as_str().unwrap().to_string();
+
+    let external_url = "https://miniapp.acme.example/app";
+    let (st_pub, pub_val) = http_json(
+        &router,
+        "POST",
+        &format!("/bot{bot_token}/publishMiniApp"),
+        None,
+        Some(json!({
+            "short_name": "portal",
+            "title": "Acme Portal",
+            "description": "External WebMCP Portal",
+            "category": "tools",
+            "icon_emoji": "🌐",
+            "web_url": external_url,
+            "is_main_app": true
+        })),
+    )
+    .await;
+    assert_eq!(st_pub, StatusCode::OK, "publishMiniApp: {pub_val}");
+
+    let (st_html, html_bytes) = http_raw(
+        &router,
+        "GET",
+        "/miniapps/acme_iframe_bot/portal",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st_html, StatusCode::OK);
+    let html = String::from_utf8(html_bytes).expect("utf8 html");
+    assert!(html.contains("<iframe id=\"tg-app-frame\""), "missing iframe");
+    for marker in [
+        "gpui_webmcp_invoke",
+        "gpui_webmcp_response",
+        "gpui_webmcp_ready",
+        "gpui_webmcp_tools_changed",
+        "gpui_webmcp_unready",
+        "window.__GPUI_WEBMCP__",
+        "tgWebAppData=",
+    ] {
+        assert!(html.contains(marker), "wrapper HTML missing '{marker}'");
+    }
+
+    // Extract the inline relay <script> block and execute it under node (when available)
+    let frame_tag_pos = html.find("<iframe id=\"tg-app-frame\"").unwrap();
+    let script_open = html[frame_tag_pos..].find("<script>").unwrap() + frame_tag_pos + "<script>".len();
+    let script_close = html[script_open..].find("</script>").unwrap() + script_open;
+    let wrapper_js = &html[script_open..script_close];
+
+    let node_check = std::process::Command::new("node").arg("--version").output();
+    if let Ok(ver) = node_check {
+        if ver.status.success() {
+            let test_driver = format!(
+                r#"
+const assert = require('assert');
+const listeners = {{}};
+const frameListeners = {{}};
+const postedToFrame = [];
+const bridgeEvents = [];
+const mockFrameWin = {{
+  postMessage(msg, targetOrigin) {{
+    postedToFrame.push({{ msg, targetOrigin }});
+  }}
+}};
+const mockFrame = {{
+  src: {initial_src},
+  getAttribute(k) {{ return k === 'src' ? this.src : null; }},
+  contentWindow: mockFrameWin,
+  addEventListener(type, fn) {{
+    (frameListeners[type] = frameListeners[type] || []).push(fn);
+  }}
+}};
+global.document = {{
+  getElementById(id) {{ return id === 'tg-app-frame' ? mockFrame : null; }}
+}};
+global.window = {{
+  location: {{ hash: '#tgWebAppData=user%3D1001&auth_date%3D1' }},
+  parent: null,
+  TelegramWebviewProxy: {{
+    postEvent(evType, evData) {{
+      bridgeEvents.push({{ eventType: evType, eventData: JSON.parse(evData) }});
+    }}
+  }},
+  addEventListener(type, fn) {{
+    (listeners[type] = listeners[type] || []).push(fn);
+  }}
+}};
+global.window.parent = global.window;
+
+{wrapper_js}
+
+(async () => {{
+  // 1. Hash tgWebAppData forwarded into frame.src
+  assert(mockFrame.src.includes('#tgWebAppData=user%3D1001'), 'expected tgWebAppData forwarded to frame.src: ' + mockFrame.src);
+
+  // 2. invoke() before gpui_webmcp_ready queues instead of failing immediately
+  const p1 = global.window.__GPUI_WEBMCP__.invoke('req_1', 'call_tool', 'fabushi_send_dharma', {{ sutra: '金刚经' }});
+  assert.strictEqual(postedToFrame.length, 0, 'invoke before ready must queue');
+
+  // 3. gpui_webmcp_ready from frame flushes queued invoke and bridges __gpui_webmcp_page_ready
+  const onMsg = (listeners.message || [])[0];
+  onMsg({{
+    source: mockFrameWin,
+    data: {{
+      type: 'gpui_webmcp_ready',
+      url: 'https://miniapp.acme.example/app',
+      tools: [{{ name: 'fabushi_send_dharma', description: 'Send', input_schema: {{}}, read_only: false }}],
+      state_summary: {{ ready: true }}
+    }}
+  }});
+  assert.strictEqual(postedToFrame.length, 1, 'queued invoke must flush on ready');
+  assert.strictEqual(postedToFrame[0].msg.type, 'gpui_webmcp_invoke');
+  assert.strictEqual(postedToFrame[0].msg.request_id, 'req_1');
+  assert.strictEqual(postedToFrame[0].msg.tool_name, 'fabushi_send_dharma');
+  assert(bridgeEvents.some(e => e.eventType === '__gpui_webmcp_page_ready' && e.eventData.in_iframe === true));
+
+  // 4. gpui_webmcp_response resolves promise and bridges webmcp_response
+  onMsg({{
+    source: mockFrameWin,
+    data: {{
+      type: 'gpui_webmcp_response',
+      request_id: 'req_1',
+      payload: {{ request_id: 'req_1', ok: true, result: {{ sent: true }}, error: null, tools: [], state_summary: {{ count: 1 }}, control_mode: 'ai_controlling' }}
+    }}
+  }});
+  const r1 = await p1;
+  assert.strictEqual(r1.ok, true);
+  assert.strictEqual(r1.result.sent, true);
+  assert(bridgeEvents.some(e => e.eventType === 'webmcp_response' && e.eventData.request_id === 'req_1' && e.eventData.ok === true));
+
+  // 5. gpui_webmcp_unready resets readiness so subsequent invokes queue
+  onMsg({{ source: mockFrameWin, data: {{ type: 'gpui_webmcp_unready', url: 'https://miniapp.acme.example/app' }} }});
+  assert(bridgeEvents.some(e => e.eventType === '__gpui_webmcp_page_unready'));
+  const pA = global.window.__GPUI_WEBMCP__.invoke('req_a', 'call_tool', 't_a', {{}});
+  const pB = global.window.__GPUI_WEBMCP__.invoke('req_b', 'call_tool', 't_b', {{}});
+  assert.strictEqual(postedToFrame.length, 1, 'invokes after unready must queue until next ready');
+
+  onMsg({{ source: mockFrameWin, data: {{ type: 'gpui_webmcp_ready', url: 'https://miniapp.acme.example/app', tools: [] }} }});
+  assert.strictEqual(postedToFrame.length, 3, 'both queued invokes flush on next ready');
+
+  // 6. Concurrent out-of-order responses resolve independently by request_id
+  onMsg({{ source: mockFrameWin, data: {{ type: 'gpui_webmcp_response', payload: {{ request_id: 'req_b', ok: true, result: {{ id: 'b' }} }} }} }});
+  onMsg({{ source: mockFrameWin, data: {{ type: 'gpui_webmcp_response', payload: {{ request_id: 'req_a', ok: true, result: {{ id: 'a' }} }} }} }});
+  const [resA, resB] = await Promise.all([pA, pB]);
+  assert.strictEqual(resA.result.id, 'a');
+  assert.strictEqual(resB.result.id, 'b');
+  process.exit(0);
+}})().catch(err => {{ console.error(err); process.exit(1); }});
+"#,
+                initial_src = serde_json::to_string(external_url).unwrap(),
+                wrapper_js = wrapper_js,
+            );
+            let out = std::process::Command::new("node")
+                .arg("-e")
+                .arg(&test_driver)
+                .output()
+                .expect("run node wrapper simulation");
+            assert!(
+                out.status.success(),
+                "node iframe relay simulation failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}

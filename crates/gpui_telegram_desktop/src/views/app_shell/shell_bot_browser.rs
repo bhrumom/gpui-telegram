@@ -52,8 +52,9 @@ use zeroize::{Zeroize as _, Zeroizing};
 use crate::i18n::tr_str;
 use crate::views::app_shell::local_subscription_bridge::{
     build_ai_oauth_vault_bundle, discover_local_subscriptions_for_server,
-    discovered_subscriptions_fingerprint, has_usable_local_fabushi_provider,
-    hydrate_ai_oauth_vault_bundle_into_fabushi, hydrate_local_subscriptions_into_fabushi,
+    discovered_subscriptions_fingerprint, has_usable_local_fabushi_provider_for_user,
+    hydrate_ai_oauth_vault_bundle_into_fabushi_for_user,
+    hydrate_local_subscriptions_into_fabushi_for_user,
 };
 use crate::views::app_shell::shell_actions::{peer_avatar_color, resolve_active_target_chat_id};
 use crate::views::app_shell::shell_settings_sync::format_ms_human;
@@ -64,8 +65,8 @@ use crate::views::chat_sidebar::DialogDeliveryStatus;
 use crate::views::settings::sections::{PendingDeviceSyncRow, VaultCustodyStatus};
 use crate::views::shell::AppShell;
 use crate::views::stage::cards::{
-    BotAssistCardAction, DeliveryStatus, MessageContent, MessageDirection, MessageItemModel,
-    ServiceType, BOT_ASSIST_LOCAL_MSG_ID_BASE,
+    BotAssistCardAction, DeliveryStatus, InlineButtonType, InlineKeyboardButton, MessageContent,
+    MessageDirection, MessageItemModel, ServiceType, BOT_ASSIST_LOCAL_MSG_ID_BASE,
 };
 
 pub const MAX_PROFILE_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
@@ -955,15 +956,21 @@ async fn finalize_unlocked_vault_runtime(
     };
 
     if is_first_creation {
-        let host_core = host.as_ref().map(|h| h.core_engine());
-        let router_ref = host_core.as_ref().map(|e| e.providers());
+        let uid_str = user_id.to_string();
         if let Some(ref h) = host {
             if !local_subs.is_empty() {
-                let _ = hydrate_local_subscriptions_into_fabushi(h, &local_subs);
+                let _ = hydrate_local_subscriptions_into_fabushi_for_user(
+                    h,
+                    &local_subs,
+                    Some(&uid_str),
+                );
             }
         }
-        let ai_bundle = if !local_subs.is_empty() || router_ref.is_some() {
-            build_ai_oauth_vault_bundle(&local_subs, router_ref).ok()
+        let user_router = host
+            .as_ref()
+            .map(|h| h.core_engine().providers_for_user(&uid_str));
+        let ai_bundle = if !local_subs.is_empty() || user_router.is_some() {
+            build_ai_oauth_vault_bundle(&local_subs, user_router.as_ref()).ok()
         } else {
             None
         };
@@ -1102,6 +1109,21 @@ impl AppShell {
         if let Some(ref orch) = self.bot_browser.orchestrator {
             host.set_bot_browser(Arc::clone(orch));
         }
+        if let Some(uid) = self.session_sync.user_id {
+            let uid_str = uid.to_string();
+            if !self.magpie_local.discovered_items.is_empty()
+                && !has_usable_local_fabushi_provider_for_user(&host, Some(&uid_str))
+            {
+                hydrate_local_subscriptions_into_fabushi_for_user(
+                    &host,
+                    &self.magpie_local.discovered_items,
+                    Some(&uid_str),
+                );
+                self.bot_browser.hydrated_subscriptions_fingerprint = Some(
+                    discovered_subscriptions_fingerprint(&self.magpie_local.discovered_items),
+                );
+            }
+        }
         self.bot_browser.local_fabushi = Some(host);
     }
 
@@ -1132,14 +1154,15 @@ impl AppShell {
 
     /// Returns `true` when `local_fabushi` is attached and has a usable non-placeholder AI provider configured locally.
     pub fn can_run_local_fabushi_turn(&self, _cx: &App) -> bool {
-        self.bot_browser
-            .local_fabushi
-            .as_ref()
-            .is_some_and(|host| has_usable_local_fabushi_provider(host))
+        let uid_str = self.session_sync.user_id.map(|u| u.to_string());
+        self.bot_browser.local_fabushi.as_ref().is_some_and(|host| {
+            has_usable_local_fabushi_provider_for_user(host, uid_str.as_deref())
+                || has_usable_local_fabushi_provider_for_user(host, None)
+        })
     }
 
     /// Resolves whether `chat_id` is a conversational Fabushi Bot DM (excluding BotFather, groups, channels,
-    /// and known standard non-Fabushi bots).
+    /// non-owned bots, and known standard non-Fabushi bots).
     pub fn resolve_fabushi_bot_target(
         &self,
         chat_id: u64,
@@ -1158,6 +1181,7 @@ impl AppShell {
             return None;
         }
 
+        let viewer_uid = self.session_sync.user_id;
         let peer_uid = self
             .session_sync
             .chat_peer_user_ids
@@ -1178,6 +1202,11 @@ impl AppShell {
                 || fb.companion_chat_id == Some(chat_id as i64)
         }) {
             if fb.coding_agent.is_some() {
+                return None;
+            }
+            if fb.bot_user_id != OFFICIAL_DEFAULT_BOT_USER_ID
+                && viewer_uid.is_none_or(|u| fb.owner_user_id != u as i64)
+            {
                 return None;
             }
             return Some(LocalFabushiBotTarget {
@@ -1228,6 +1257,11 @@ impl AppShell {
             if !prof.bot.is_fabushi_bot && prof.bot.bot_user_id != OFFICIAL_DEFAULT_BOT_USER_ID {
                 return None;
             }
+            if prof.bot.bot_user_id != OFFICIAL_DEFAULT_BOT_USER_ID
+                && viewer_uid.is_none_or(|u| prof.bot.owner_user_id != u as i64)
+            {
+                return None;
+            }
             return Some(LocalFabushiBotTarget {
                 bot_user_id: prof.bot.bot_user_id,
                 display_name: if prof.bot.display_name.trim().is_empty() {
@@ -1268,26 +1302,52 @@ impl AppShell {
             .iter()
             .chain(self.miniapps.attach_menu_bots.iter())
             .any(|b| {
-                b.coding_agent.is_some()
-                    && (peer_uid == Some(b.bot_user_id.max(0) as u64)
-                        || peer_uname
-                            .as_deref()
-                            .is_some_and(|u| !u.is_empty() && b.username.eq_ignore_ascii_case(u)))
+                let matches_peer = peer_uid == Some(b.bot_user_id.max(0) as u64)
+                    || peer_uname
+                        .as_deref()
+                        .is_some_and(|u| !u.is_empty() && b.username.eq_ignore_ascii_case(u));
+                matches_peer
+                    && (b.coding_agent.is_some()
+                        || (b.bot_user_id != OFFICIAL_DEFAULT_BOT_USER_ID
+                            && (!b.is_fabushi_bot
+                                || viewer_uid.is_none_or(|u| b.owner_user_id != u as i64))))
             })
         {
             return None;
         }
 
         if peer_uid == Some(OFFICIAL_DEFAULT_BOT_USER_ID as u64) {
+            let safe_title = sb
+                .dialogs
+                .iter()
+                .find(|d| d.id == chat_id)
+                .map(|d| d.peer_name.clone())
+                .or_else(|| {
+                    let st = self.stage.read(cx);
+                    (st.active_chat_id == Some(chat_id)).then(|| st.chat_title.clone())
+                })
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "Fabushi AI".to_string());
             return Some(LocalFabushiBotTarget {
                 bot_user_id: OFFICIAL_DEFAULT_BOT_USER_ID,
-                display_name: "Fabushi AI".to_string(),
+                display_name: safe_title,
                 provision_spec: None,
             });
         }
 
-        if self.is_chat_bot(chat_id, cx) {
-            let st_title = self.stage.read(cx).chat_title.clone();
+        if self.is_chat_bot(chat_id, cx)
+            && peer_uid == Some(OFFICIAL_DEFAULT_BOT_USER_ID as u64)
+        {
+            let st_title = sb
+                .dialogs
+                .iter()
+                .find(|d| d.id == chat_id)
+                .map(|d| d.peer_name.clone())
+                .or_else(|| {
+                    let st = self.stage.read(cx);
+                    (st.active_chat_id == Some(chat_id)).then(|| st.chat_title.clone())
+                })
+                .unwrap_or_default();
             let looks_like_fabushi = (700_000_000..750_000_000).contains(&chat_id)
                 || st_title.contains("Autonomous Agent")
                 || st_title.contains("Fabushi")
@@ -1297,9 +1357,7 @@ impl AppShell {
                     .is_some_and(|u| u.contains("fabushi") || u.contains("hermes"));
             if looks_like_fabushi {
                 return Some(LocalFabushiBotTarget {
-                    bot_user_id: peer_uid
-                        .and_then(|u| i64::try_from(u).ok())
-                        .unwrap_or(OFFICIAL_DEFAULT_BOT_USER_ID),
+                    bot_user_id: OFFICIAL_DEFAULT_BOT_USER_ID,
                     display_name: if st_title.trim().is_empty() {
                         "Fabushi AI".to_string()
                     } else {
@@ -1788,7 +1846,12 @@ impl AppShell {
                                 local_subs
                             };
                             if !merged_subs.is_empty() {
-                                let _ = hydrate_local_subscriptions_into_fabushi(&h, &merged_subs);
+                                let uid_str = user_id.to_string();
+                                let _ = hydrate_local_subscriptions_into_fabushi_for_user(
+                                    &h,
+                                    &merged_subs,
+                                    Some(&uid_str),
+                                );
                                 shell.bot_browser.hydrated_subscriptions_fingerprint =
                                     Some(discovered_subscriptions_fingerprint(&merged_subs));
                             }
@@ -1848,8 +1911,13 @@ impl AppShell {
 
         self.attach_bot_browser_orchestrator(bundle.orchestrator, cx);
         if let Some(host) = bundle.host {
+            let uid_str = self.session_sync.user_id.map(|u| u.to_string());
             if let Some(ref oauth_bundle) = bundle.pull_report.ai_oauth_bundle {
-                let _ = hydrate_ai_oauth_vault_bundle_into_fabushi(&host, oauth_bundle);
+                let _ = hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
+                    &host,
+                    oauth_bundle,
+                    uid_str.as_deref(),
+                );
             }
             let merged_subs = if !self.magpie_local.discovered_items.is_empty() {
                 self.magpie_local.discovered_items.clone()
@@ -1857,7 +1925,11 @@ impl AppShell {
                 bundle.local_subs
             };
             if !merged_subs.is_empty() {
-                let _ = hydrate_local_subscriptions_into_fabushi(&host, &merged_subs);
+                let _ = hydrate_local_subscriptions_into_fabushi_for_user(
+                    &host,
+                    &merged_subs,
+                    uid_str.as_deref(),
+                );
                 self.bot_browser.hydrated_subscriptions_fingerprint =
                     Some(discovered_subscriptions_fingerprint(&merged_subs));
             }
@@ -2686,16 +2758,19 @@ impl AppShell {
                 } else {
                     discover_local_subscriptions_for_server(&base_url)
                 };
+                let uid_str = user_id.to_string();
                 if !subs.is_empty() {
-                    hydrate_local_subscriptions_into_fabushi(&host, &subs);
+                    hydrate_local_subscriptions_into_fabushi_for_user(&host, &subs, Some(&uid_str));
                 } else if let Some(ref prev_host) = existing_fabushi {
+                    let prev_user_router = prev_host.core_engine().providers_for_user(&uid_str);
                     host.core_engine()
-                        .providers()
-                        .sync_from_router(prev_host.core_engine().providers());
+                        .providers_for_user(&uid_str)
+                        .sync_from_router(&prev_user_router);
+                    host.core_engine().persist_user_providers_state(&uid_str);
                     host.sync_all_providers();
                 }
-                let ai_bundle =
-                    build_ai_oauth_vault_bundle(&subs, Some(host.core_engine().providers()))?;
+                let user_router = host.core_engine().providers_for_user(&uid_str);
+                let ai_bundle = build_ai_oauth_vault_bundle(&subs, Some(&user_router))?;
                 Ok((
                     Arc::new(unlocked_key),
                     envelope,
@@ -3007,15 +3082,22 @@ impl AppShell {
                 let lang = shell.active_lang_id();
                 match pull_res {
                     Ok((report, credential_metas, pending_approvals)) => {
+                        let uid_str = user_id.to_string();
                         let mut oauth_hydrated = 0usize;
                         if let Some(ref bundle) = report.ai_oauth_bundle {
-                            oauth_hydrated =
-                                hydrate_ai_oauth_vault_bundle_into_fabushi(&host, bundle)
-                                    .unwrap_or(0);
+                            oauth_hydrated = hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
+                                &host,
+                                bundle,
+                                Some(&uid_str),
+                            )
+                            .unwrap_or(0);
                         }
                         if !local_subs.is_empty() {
-                            let local_cnt =
-                                hydrate_local_subscriptions_into_fabushi(&host, &local_subs);
+                            let local_cnt = hydrate_local_subscriptions_into_fabushi_for_user(
+                                &host,
+                                &local_subs,
+                                Some(&uid_str),
+                            );
                             oauth_hydrated = oauth_hydrated.max(local_cnt);
                             shell.bot_browser.hydrated_subscriptions_fingerprint =
                                 Some(discovered_subscriptions_fingerprint(&local_subs));
@@ -3134,15 +3216,21 @@ impl AppShell {
                             since_rev,
                         )
                         .await?;
+                        let uid_str = user_id.to_string();
                         if let (Some(host), Some(bundle)) =
                             (&local_fabushi, &pull_report.ai_oauth_bundle)
                         {
-                            let _ = hydrate_ai_oauth_vault_bundle_into_fabushi(host, bundle);
+                            let _ = hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
+                                host,
+                                bundle,
+                                Some(&uid_str),
+                            );
                         }
-                        let host_core = local_fabushi.as_ref().map(|h| h.core_engine());
-                        let router_ref = host_core.as_ref().map(|e| e.providers());
-                        let ai_bundle = if !subs.is_empty() || router_ref.is_some() {
-                            Some(build_ai_oauth_vault_bundle(&subs, router_ref)?)
+                        let user_router = local_fabushi
+                            .as_ref()
+                            .map(|h| h.core_engine().providers_for_user(&uid_str));
+                        let ai_bundle = if !subs.is_empty() || user_router.is_some() {
+                            Some(build_ai_oauth_vault_bundle(&subs, user_router.as_ref())?)
                         } else {
                             None
                         };
@@ -3239,19 +3327,26 @@ impl AppShell {
         {
             return;
         }
+        let uid_str = self.session_sync.user_id.map(|u| u.to_string());
         let fp = discovered_subscriptions_fingerprint(&items);
-        if self
+        let already_usable = self
             .bot_browser
-            .hydrated_subscriptions_fingerprint
-            .as_deref()
-            == Some(fp.as_str())
+            .local_fabushi
+            .as_ref()
+            .is_none_or(|h| has_usable_local_fabushi_provider_for_user(h, uid_str.as_deref()));
+        if already_usable
+            && self
+                .bot_browser
+                .hydrated_subscriptions_fingerprint
+                .as_deref()
+                == Some(fp.as_str())
         {
             return;
         }
         self.bot_browser.hydrated_subscriptions_fingerprint = Some(fp);
 
         if let Some(ref host) = self.bot_browser.local_fabushi {
-            hydrate_local_subscriptions_into_fabushi(host, &items);
+            hydrate_local_subscriptions_into_fabushi_for_user(host, &items, uid_str.as_deref());
         }
 
         let (Some(unlocked_key), Some(user_id)) = (
@@ -3265,7 +3360,7 @@ impl AppShell {
             .bot_browser
             .local_fabushi
             .as_ref()
-            .map(|h| h.core_engine().providers().clone());
+            .map(|h| h.core_engine().providers_for_user(&user_id.to_string()));
         let Ok(bundle) = build_ai_oauth_vault_bundle(&items, router_snap.as_ref()) else {
             return;
         };
@@ -3492,12 +3587,23 @@ impl AppShell {
         let runtime = self.client.runtime().clone();
         let bot_user_id = target.bot_user_id;
         let bot_display_name = target.display_name.clone();
+        let bot_display_name_err = target.display_name.clone();
         let provision_spec = target.provision_spec.clone();
         let session_id_for_run = session_id.clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let turn_res = runtime
                 .spawn(async move {
+                    let uid_str = user_id.to_string();
+                    let core = host.core_engine();
+                    if !has_usable_local_fabushi_provider_for_user(&host, Some(&uid_str))
+                        && has_usable_local_fabushi_provider_for_user(&host, None)
+                    {
+                        core.providers_for_user(&uid_str)
+                            .sync_from_router(core.providers());
+                        core.persist_user_providers_state(&uid_str);
+                        host.sync_all_providers();
+                    }
                     let engine = if bot_user_id != OFFICIAL_DEFAULT_BOT_USER_ID {
                         if let Some(spec) = provision_spec {
                             host.provision_or_sync_bot(spec)
@@ -3507,7 +3613,7 @@ impl AppShell {
                             host.engine_for_bot(Some(bot_user_id))
                         }
                     } else {
-                        host.core_engine()
+                        core
                     };
 
                     let (system_prompt, profile_delta) =
@@ -3686,25 +3792,209 @@ impl AppShell {
                         if !shell.is_authenticated || shell.session_sync.auth_generation != auth_gen {
                             return;
                         }
-                        shell.sidebar.update(cx, |sb, sb_cx| {
-                            sb.set_typing(chat_id, None);
-                            sb_cx.notify();
-                        });
-                        shell.stage.update(cx, |st, st_cx| {
-                            if st.active_chat_id == Some(chat_id) {
-                                st.set_bot_activity("idle", None);
-                                st_cx.notify();
-                            }
-                        });
-                        shell
-                            .window_runtime
-                            .enqueue_toast(format!("Local Fabushi error: {err}"), 3400);
+                        shell.apply_local_fabushi_turn_error_to_shell(
+                            chat_id,
+                            bot_user_id,
+                            &bot_display_name_err,
+                            &err,
+                            cx,
+                        );
                         cx.notify();
                     });
                 }
             }
         })
         .detach();
+    }
+
+    /// Strips ANSI CSI/OSC escape sequences (e.g. `\x1b[31m...\x1b[0m`) so terminal color
+    /// codes never leak into inline chat error cards.
+    fn strip_ansi_escape_codes(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                match chars.peek().copied() {
+                    Some('[') => {
+                        chars.next();
+                        while let Some(ch) = chars.next() {
+                            if ('@'..='~').contains(&ch) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        chars.next();
+                        while let Some(ch) = chars.next() {
+                            if ch == '\x07' {
+                                break;
+                            }
+                            if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        chars.next();
+                    }
+                    None => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Formats a local Fabushi turn failure into a structured in-chat error card, optional
+    /// `hermes:open_ai_providers` inline button, and a concise single-line toast summary (`<= 80` chars).
+    pub fn build_local_fabushi_error_card(
+        err: &str,
+        is_zh: bool,
+        needs_provider_cta: bool,
+    ) -> (String, Option<Vec<Vec<InlineKeyboardButton>>>, String) {
+        let cleaned_ansi = Self::strip_ansi_escape_codes(err);
+        let lower = cleaned_ansi.to_ascii_lowercase();
+        let is_provider_err = needs_provider_cta
+            || lower.contains("provider_error")
+            || lower.contains("needs_provider_selection")
+            || lower.contains("no ai subscription or provider configured")
+            || lower.contains("no configured provider")
+            || lower.contains("providerrouter")
+            || cleaned_ansi.contains("未检测到已配置的 AI 订阅或模型供应商")
+            || cleaned_ansi.contains("未配置可用的 AI 供应商");
+
+        let trimmed = cleaned_ansi.trim();
+        let stripped = trimmed
+            .strip_prefix("PROVIDER_ERROR:")
+            .or_else(|| trimmed.strip_prefix("provider_error:"))
+            .unwrap_or(trimmed);
+        let compact = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+        let detail: String = if compact.chars().count() > 240 {
+            let head: String = compact.chars().take(239).collect();
+            format!("{head}…")
+        } else if compact.is_empty() {
+            if is_zh {
+                "未知执行错误，请稍后重试。".to_string()
+            } else {
+                "Unknown local execution error.".to_string()
+            }
+        } else {
+            compact
+        };
+
+        let card_markdown = if is_provider_err {
+            if is_zh {
+                format!("⚠️ **未配置可用的 AI 供应商**\n\n{detail}")
+            } else {
+                format!("⚠️ **AI Provider Not Ready**\n\n{detail}")
+            }
+        } else if is_zh {
+            format!("⚠️ **本地 AI 执行失败**\n\n{detail}")
+        } else {
+            format!("⚠️ **Local AI Turn Failed**\n\n{detail}")
+        };
+
+        let keyboard = if is_provider_err {
+            Some(vec![vec![InlineKeyboardButton {
+                text: if is_zh {
+                    "⚙️ 打开 AI 供应商设置".to_string()
+                } else {
+                    "⚙️ Open AI Provider Settings".to_string()
+                },
+                button_type: InlineButtonType::Callback("hermes:open_ai_providers".to_string()),
+            }]])
+        } else {
+            None
+        };
+
+        let toast_summary = if is_provider_err {
+            if is_zh {
+                "AI 供应商未就绪，请点击消息按钮配置".to_string()
+            } else {
+                "AI provider unavailable — tap card button to configure".to_string()
+            }
+        } else if is_zh {
+            "本地 AI 执行失败，详情见会话卡片".to_string()
+        } else {
+            "Local AI turn failed — see chat message".to_string()
+        };
+
+        (card_markdown, keyboard, toast_summary)
+    }
+
+    /// Inserts a structured local Bot error card into `ConversationStage`, clears typing/activity
+    /// indicators, updates the sidebar preview, and shows only a concise non-blocking toast.
+    pub fn apply_local_fabushi_turn_error_to_shell(
+        &mut self,
+        chat_id: u64,
+        bot_user_id: i64,
+        bot_display_name: &str,
+        err: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let is_zh = self.active_lang_id().starts_with("zh");
+        let (card_text, bot_keyboard, toast_summary) =
+            Self::build_local_fabushi_error_card(err, is_zh, false);
+        let ts = format_authoritative_timestamp(Some(chrono::Utc::now().timestamp_millis()));
+        let sender_name = if bot_display_name.trim().is_empty() {
+            "Fabushi AI".to_string()
+        } else {
+            bot_display_name.trim().to_string()
+        };
+        let initials = {
+            let i = derive_initials(&sender_name);
+            if i.is_empty() {
+                "FA".to_string()
+            } else {
+                i
+            }
+        };
+        let color = peer_avatar_color(bot_user_id.max(1) as u64);
+        let local_id = self.bot_browser.next_ephemeral_local_msg_id();
+
+        self.sidebar.update(cx, |sb, sb_cx| {
+            sb.set_typing(chat_id, None);
+            if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == chat_id) {
+                d.last_message = super::shell_pts_updates::format_sidebar_preview(&card_text);
+                d.timestamp = ts.clone();
+                d.delivery_status = DialogDeliveryStatus::Read;
+            }
+            sb_cx.notify();
+        });
+        self.stage.update(cx, |st, st_cx| {
+            if st.active_chat_id == Some(chat_id) {
+                st.set_bot_activity("idle", None);
+            }
+            let model = MessageItemModel {
+                id: local_id,
+                sender_id: bot_user_id.max(0) as u64,
+                sender_name,
+                avatar_initials: initials,
+                avatar_color: color,
+                direction: MessageDirection::Incoming,
+                timestamp: ts,
+                delivery_status: DeliveryStatus::Read,
+                reply_to: None,
+                reactions: Vec::new(),
+                content: MessageContent::Text {
+                    text: card_text,
+                    is_edited: false,
+                },
+                bot_keyboard,
+                is_pinned: false,
+            };
+            if st.active_chat_id == Some(chat_id) {
+                st.add_message(model);
+            } else {
+                st.chat_histories.entry(chat_id).or_default().push(model);
+            }
+            st_cx.notify();
+        });
+        self.window_runtime.enqueue_toast(toast_summary, 3200);
+        self.schedule_current_toast_dismiss(cx);
+        cx.notify();
     }
 
     fn append_local_vault_notice(

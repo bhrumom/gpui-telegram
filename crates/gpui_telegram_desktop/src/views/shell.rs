@@ -21,14 +21,18 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_client::storage::Localstorage;
 use gpui_telegram_client::{AuthResponse, ClientConfig, StoredSession, TelegramClient};
+use gpui_telegram_core::types::ChatId;
 
+use crate::app::session::send_as_peers::SendAsKey;
 use crate::app::{preferences::{AppPreferences, ThemeMode}, TelegramApp};
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
-use crate::theme::{TdesktopThemeMode, TdesktopThemePalette};
+use crate::theme::{tg_icon, IconName, TdesktopThemeMode, TdesktopThemePalette};
+use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::app_shell::{
     build_account_record, compute_shell_palette,
     local_subscription_bridge::ShellMagpieLocalState,
+    resolve_active_target_chat_id,
     shell_theme::tdesktop_mode_for_window_appearance,
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
     ShellBotBrowserState, ShellPanelState,
@@ -83,6 +87,16 @@ pub fn nav_destination_for_shortcut_digit(key: &str) -> Option<NavDestination> {
     }
 }
 
+/// Snapshot of per-chat composer metadata taken when entering `+` / modal isolation so canceling
+/// back to the same chat restores reply/edit/attachments cleanly.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComposeIsolationSnapshot {
+    pub chat_id: Option<u64>,
+    pub replying_to: Option<(u64, String, String)>,
+    pub editing_message: Option<(u64, String)>,
+    pub attachments: Vec<PathBuf>,
+}
+
 /// Root GPUI desktop view orchestrating workspace views, session lifecycle, routing, and overlays.
 pub struct AppShell {
     pub nav_rail: Entity<NavRail>,
@@ -119,6 +133,9 @@ pub struct AppShell {
     pub bot_browser: ShellBotBrowserState,
     pub theme_state: ShellThemeVisualState,
     pub last_window_appearance: Option<WindowAppearance>,
+    pub scheduled_toast_id: Option<u64>,
+    pub last_observed_toast_chat_id: Option<u64>,
+    pub(crate) compose_isolation_snapshot: Option<ComposeIsolationSnapshot>,
 }
 
 impl AppShell {
@@ -229,6 +246,9 @@ impl AppShell {
             bot_browser: ShellBotBrowserState::new(),
             theme_state: init_theme_state,
             last_window_appearance: None,
+            scheduled_toast_id: None,
+            last_observed_toast_chat_id: None,
+            compose_isolation_snapshot: None,
         };
 
         shell_instance.overlays.is_passcode_locked = shell_instance.has_local_passcode_configured();
@@ -306,6 +326,25 @@ impl AppShell {
         vault_bootstrap: Option<PendingAuthVaultBootstrap>,
         cx: &mut Context<Self>,
     ) {
+        let prev_user_id = self.session_sync.user_id;
+        let is_user_switch = prev_user_id.is_some_and(|p| p != auth.user_id);
+        if prev_user_id != Some(auth.user_id) {
+            self.session_sync.clear_peer_and_draft_caches();
+        }
+        if is_user_switch {
+            self.client.local_store.clear_all();
+            self.rtc_talk.reset_on_logout();
+            self.overlays.clear_overlays();
+            self.window_runtime.controller.clear_all_toasts();
+            self.scheduled_toast_id = None;
+            self.last_observed_toast_chat_id = None;
+            self.compose_isolation_snapshot = None;
+            self.settings_router.update(cx, |r, rcx| {
+                if let Some(sp) = r.settings_privacy.clone() {
+                    sp.update(rcx, |sec, _| sec.clear_session_custody_state());
+                }
+            });
+        }
         let srv_url = self.client.config.server_url.clone();
         self.session_sync.begin_session(
             auth.token.clone(),
@@ -375,6 +414,17 @@ impl AppShell {
         self.coding_host.registered_for_auth_gen = None;
         self.ensure_coding_host_runtime(cx);
         self.announce_coding_host_to_server(cx);
+        if prev_user_id != Some(auth.user_id) {
+            self.bot_browser.reset_on_logout();
+            self.miniapps.reset();
+            self.computers.reset_on_logout();
+            self.magpie_local.discovered_items.clear();
+            self.magpie_local.bootstrapped_auth_generation = None;
+            self.magpie_local.legacy_keepalive_generation =
+                self.magpie_local.legacy_keepalive_generation.wrapping_add(1);
+            self.magpie_local.active_legacy_subscription_id = None;
+            self.magpie_local.active_legacy_model = None;
+        }
         self.bootstrap_local_bot_browser_and_vault_with_auth(vault_bootstrap, cx);
 
         let _ = ClientConfig::save_session(&StoredSession {
@@ -426,6 +476,10 @@ impl AppShell {
         self.client.clear_session();
         self.app.reset_session();
         self.window_runtime.clear_session_user();
+        self.window_runtime.controller.clear_all_toasts();
+        self.scheduled_toast_id = None;
+        self.last_observed_toast_chat_id = None;
+        self.compose_isolation_snapshot = None;
         self.window_runtime.set_connection_status(BannerConnectionStatus::Connecting, None);
         self.panel_state.reset();
         self.reset_conversation_views(&srv_url, None, cx);
@@ -687,15 +741,217 @@ impl AppShell {
         false
     }
 
+    /// Returns `true` when `+` Apple compose picker or any creation/contacts modal is active.
+    pub fn is_compose_or_creation_modal_active(&self, cx: &App) -> bool {
+        let sb = self.sidebar.read(cx);
+        let is_apple_compose = self.theme_state.palette.is_apple_style() && sb.is_plus_menu_open;
+        let create_bot_modal_open = self
+            .miniapps
+            .create_bot_box
+            .as_ref()
+            .is_some_and(|b| b.read(cx).is_visible);
+        let creation_dialog_open = {
+            let mc = self.modal_container.read(cx);
+            mc.is_modal_active()
+                && matches!(
+                    mc.dialog.kind,
+                    Some(
+                        ModalDialogKind::NewChannel
+                            | ModalDialogKind::NewGroup
+                            | ModalDialogKind::AddContact
+                            | ModalDialogKind::Contacts
+                    )
+                )
+        };
+        is_apple_compose
+            || sb.active_creation_modal.is_some()
+            || sb.is_contacts_modal_open
+            || create_bot_modal_open
+            || creation_dialog_open
+    }
+
+    /// Returns `true` when the bottom `CanonicalComposer` must be hidden (empty `+` compose,
+    /// creation in flight, creation/contacts modals, or unstarted bot `START` bar).
+    pub fn should_hide_composer(&self, cx: &App) -> bool {
+        let sb = self.sidebar.read(cx);
+        let is_apple_compose_mode =
+            self.theme_state.palette.is_apple_style() && sb.is_plus_menu_open;
+        let compose_has_recipients = !sb.compose_draft.selected_recipients.is_empty();
+        let compose_pending_creation = sb.compose_draft.pending_creation.is_some();
+        let contacts_open = sb.is_contacts_modal_open;
+        let creation_modal = sb.active_creation_modal.is_some();
+        let create_bot_modal_open = self
+            .miniapps
+            .create_bot_box
+            .as_ref()
+            .is_some_and(|b| b.read(cx).is_visible);
+        let creation_dialog_open = {
+            let mc = self.modal_container.read(cx);
+            mc.is_modal_active()
+                && matches!(
+                    mc.dialog.kind,
+                    Some(
+                        ModalDialogKind::NewChannel
+                            | ModalDialogKind::NewGroup
+                            | ModalDialogKind::AddContact
+                            | ModalDialogKind::Contacts
+                    )
+                )
+        };
+        let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
+        (is_apple_compose_mode && (!compose_has_recipients || compose_pending_creation))
+            || creation_modal
+            || contacts_open
+            || create_bot_modal_open
+            || creation_dialog_open
+            || show_bot_start_bar
+    }
+
+    /// Flushes the active chat's unsent draft and isolates `CanonicalComposer` for `+` / creation.
+    pub(crate) fn enter_compose_or_modal_isolation(&mut self, cx: &mut Context<Self>) {
+        if self.composer.read(cx).is_compose_isolated {
+            return;
+        }
+        let active_cid = resolve_active_target_chat_id(
+            self.stage.read(cx).active_chat_id,
+            self.sidebar.read(cx).active_chat_id,
+        );
+        if let Some(cid) = active_cid {
+            self.flush_pending_draft_for_chat(cid, cx);
+        }
+        let snapshot = {
+            let c = self.composer.read(cx);
+            ComposeIsolationSnapshot {
+                chat_id: active_cid,
+                replying_to: c.replying_to.clone(),
+                editing_message: c.editing_message.clone(),
+                attachments: c.editor.attachments.clone(),
+            }
+        };
+        self.compose_isolation_snapshot = Some(snapshot);
+        self.composer.update(cx, |c, ccx| {
+            c.reset_for_compose_picker(Some(ccx));
+            ccx.notify();
+        });
+        self.sync_compose_state_to_composer(true, cx);
+    }
+
+    pub(crate) fn clear_compose_isolation_snapshot(&mut self) {
+        self.compose_isolation_snapshot = None;
+    }
+
+    /// Finalizes exiting compose isolation after switching `stage`/`inspector` to `chat_id`,
+    /// discarding any pre-switch snapshot for the prior chat and hydrating the new chat's
+    /// send-as options, mention candidates, and miniapp/bot controls.
+    pub(crate) fn finish_compose_isolation_for_switched_chat(
+        &mut self,
+        chat_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_compose_isolation_snapshot();
+        if self.is_compose_or_creation_modal_active(cx) {
+            return;
+        }
+        let cached_send_as_list = self
+            .session_sync
+            .send_as_peers
+            .list(&SendAsKey::message(chat_id))
+            .to_vec();
+        let cached_chosen_send_as = self.session_sync.send_as_peers.chosen(chat_id);
+        let show_start_bar = self.stage.read(cx).show_bot_start_bar;
+        self.composer.update(cx, |c, ccx| {
+            c.is_compose_isolated = false;
+            c.set_send_as_options(cached_send_as_list, cached_chosen_send_as);
+            c.is_input_focused = !show_start_bar;
+            ccx.notify();
+        });
+        self.sync_composer_mention_candidates(chat_id, None, cx);
+        self.sync_compose_state_to_composer(true, cx);
+        self.sync_composer_and_inspector_miniapp_state(cx);
+    }
+
+    /// Restores the active chat's composer state (draft, reply/edit/attachments snapshot,
+    /// send-as options, mentions, bot menu) when exiting `+` / creation modals without switching
+    /// to a different chat.
+    pub(crate) fn exit_compose_or_modal_isolation(
+        &mut self,
+        restore_same_chat_draft: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.compose_isolation_snapshot.take();
+        if !self.composer.read(cx).is_compose_isolated {
+            return;
+        }
+        let active_cid = resolve_active_target_chat_id(
+            self.stage.read(cx).active_chat_id,
+            self.sidebar.read(cx).active_chat_id,
+        );
+        let saved_draft = active_cid.map(|cid| {
+            self.session_sync
+                .last_draft_text_by_chat
+                .get(&cid)
+                .cloned()
+                .or_else(|| {
+                    self.client
+                        .local_store
+                        .get_draft(ChatId(cid as i64))
+                        .map(|d| d.text)
+                })
+                .unwrap_or_default()
+        });
+        let send_as_opts = active_cid
+            .map(|cid| {
+                (
+                    self.session_sync
+                        .send_as_peers
+                        .list(&SendAsKey::message(cid))
+                        .to_vec(),
+                    self.session_sync.send_as_peers.chosen(cid),
+                )
+            })
+            .unwrap_or_default();
+        let show_start_bar = self.stage.read(cx).show_bot_start_bar;
+
+        self.composer.update(cx, |c, ccx| {
+            c.is_compose_isolated = false;
+            if restore_same_chat_draft {
+                if let Some(ref snap) = snapshot {
+                    if snap.chat_id == active_cid {
+                        c.replying_to = snap.replying_to.clone();
+                        c.editing_message = snap.editing_message.clone();
+                        c.editor.attachments = snap.attachments.clone();
+                    }
+                }
+                let draft = saved_draft.unwrap_or_default();
+                if draft.is_empty() {
+                    c.clear();
+                } else {
+                    c.set_text(draft);
+                }
+            }
+            c.set_send_as_options(send_as_opts.0, send_as_opts.1);
+            c.is_input_focused = !show_start_bar;
+            ccx.notify();
+        });
+        if let Some(cid) = active_cid {
+            self.sync_composer_mention_candidates(cid, None, cx);
+        }
+        self.sync_compose_state_to_composer(true, cx);
+        self.sync_composer_and_inspector_miniapp_state(cx);
+    }
+
     /// Syncs dynamic compose placeholder and send-disabled state onto `CanonicalComposer`
     /// while Apple/Grok compose mode is active, resetting both when leaving compose mode.
-    pub(crate) fn sync_compose_state_to_composer(
+    pub fn sync_compose_state_to_composer(
         &self,
         notify_composer: bool,
         cx: &mut Context<Self>,
     ) {
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
+        let is_isolated_mode = self.is_compose_or_creation_modal_active(cx);
+        let hide_composer = self.should_hide_composer(cx);
+        let show_bot_start_bar = self.stage.read(cx).show_bot_start_bar;
         let (placeholder_override, send_disabled) = {
             let sb = self.sidebar.read(cx);
             if pal.is_apple_style() && sb.is_plus_menu_open {
@@ -708,7 +964,58 @@ impl AppShell {
                 (None, false)
             }
         };
+        let needs_defensive_reset =
+            is_isolated_mode && !self.composer.read(cx).is_compose_isolated;
         self.composer.update(cx, |c, ccx| {
+            if needs_defensive_reset {
+                if notify_composer {
+                    c.reset_for_compose_picker(Some(ccx));
+                } else {
+                    c.clear_bot_menu_without_notify(ccx);
+                    c.clear_bot_slash_commands();
+                    c.set_hermes_slash_enabled(false);
+                    c.hermes_ac_pinned_by_button = false;
+                    c.cancel_reply_or_edit();
+                    c.set_send_as_options(Vec::new(), None);
+                    c.editor.attachments.clear();
+                    c.submitted_attachment = None;
+                    c.pending_attached_files = None;
+                    c.autocomplete.mention_rows.clear();
+                    c.autocomplete.all_mention_candidates.clear();
+                    c.autocomplete.mention_role_hints.clear();
+                    c.clear();
+                    c.clear_bot_reply_keyboard();
+                    c.is_input_focused = false;
+                    c.is_compose_isolated = true;
+                }
+            } else if is_isolated_mode {
+                if c.bot_menu_controls.is_active {
+                    if notify_composer {
+                        c.clear_bot_menu(Some(ccx));
+                    } else {
+                        c.clear_bot_menu_without_notify(ccx);
+                    }
+                }
+                if !c.bot_slash_commands.is_empty() {
+                    c.clear_bot_slash_commands();
+                }
+                if c.hermes_slash_enabled {
+                    c.set_hermes_slash_enabled(false);
+                    c.hermes_ac_pinned_by_button = false;
+                }
+                if !c.send_as_options.is_empty() || c.selected_send_as_peer_id.is_some() {
+                    c.send_as_options.clear();
+                    c.selected_send_as_peer_id = None;
+                }
+                if c.bot_keyboard.has_markup() || c.is_bot_keyboard_open {
+                    c.clear_bot_reply_keyboard();
+                }
+                if (hide_composer || send_disabled) && c.is_input_focused {
+                    c.is_input_focused = false;
+                }
+            } else if show_bot_start_bar && c.is_input_focused {
+                c.is_input_focused = false;
+            }
             c.set_compose_placeholder_override(placeholder_override);
             c.set_compose_send_disabled(send_disabled);
             if notify_composer {
@@ -717,39 +1024,190 @@ impl AppShell {
         });
     }
 
-    fn render_toast_banner(&self, text: String, pal: TdesktopThemePalette, cx: &mut Context<Self>) -> Stateful<Div> {
-        let is_apple = pal.is_apple_style();
-        let mut toast = div()
-            .id("window-toast-banner")
-            .cursor_pointer()
-            .absolute()
-            .bottom(px(pal.scaled_px(86.0)))
-            .right(px(pal.scaled_px(20.0)))
-            .px(px(pal.scaled_px(16.0)))
-            .py(px(pal.scaled_px(if is_apple { 8.0 } else { 9.0 })))
-            .border_1()
-            .shadow(pal.popover_shadows())
-            .text_size(px(pal.scaled_px(12.5)))
-            .font_weight(if is_apple { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-            .text_color(rgb(pal.text_primary))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.window_runtime.controller.dismiss_current_toast();
-                cx.notify();
-            }));
+    pub fn show_toast(
+        &mut self,
+        text: impl Into<String>,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.window_runtime.enqueue_toast(text, duration_ms);
+        self.schedule_current_toast_dismiss(cx);
+        cx.notify();
+    }
 
-        toast = if is_apple {
-            toast
-                .rounded_full()
-                .bg(TdesktopThemePalette::rgba_with_alpha(pal.menu_bg, 0.94))
-                .border_color(pal.separator_rgba())
-        } else {
-            toast
-                .rounded(px(pal.scaled_px(16.0)))
-                .bg(rgb(pal.card_bg))
-                .border_color(rgb(pal.border_fg))
+    pub fn show_chat_toast(
+        &mut self,
+        chat_id: u64,
+        text: impl Into<String>,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.window_runtime
+            .controller
+            .show_chat_toast(chat_id, text, duration_ms);
+        self.schedule_current_toast_dismiss(cx);
+        cx.notify();
+    }
+
+    /// Schedules an id-fenced async auto-dismiss timer for the current window toast if not
+    /// already scheduled. Safe to call across re-renders.
+    pub fn schedule_current_toast_dismiss(&mut self, cx: &mut Context<Self>) {
+        let Some((target_id, duration_ms, is_unset_chat_id)) = self
+            .window_runtime
+            .controller
+            .current_toast
+            .as_ref()
+            .map(|t| (t.id, t.duration_ms, t.chat_id.is_none()))
+        else {
+            self.scheduled_toast_id = None;
+            return;
         };
 
-        toast.child(text)
+        if self.scheduled_toast_id == Some(target_id) {
+            return;
+        }
+
+        let in_active_chat = self.is_authenticated
+            && self.active_panel == ActiveWorkspacePanel::Chats
+            && !(self.theme_state.palette.is_apple_style()
+                && self.sidebar.read(cx).is_plus_menu_open);
+        if is_unset_chat_id && in_active_chat {
+            if let Some(cid) = self.stage.read(cx).active_chat_id {
+                self.window_runtime
+                    .controller
+                    .stamp_current_toast_chat_id_if_unset(cid);
+            }
+        }
+
+        self.scheduled_toast_id = Some(target_id);
+        let delay = std::time::Duration::from_millis(duration_ms.max(80));
+        cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
+            app.background_executor().timer(delay).await;
+            let _ = weak_shell.update(app, |shell, cx| {
+                if shell.window_runtime.controller.dismiss_toast_if_id(target_id) {
+                    shell.scheduled_toast_id = None;
+                    shell.schedule_current_toast_dismiss(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn is_error_toast_text(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        text.contains("PROVIDER_ERROR")
+            || text.contains("Error:")
+            || text.contains("失败")
+            || text.contains("错误")
+            || lower.contains("failed")
+            || lower.contains("error")
+    }
+
+    pub fn render_toast_banner_slot(
+        &self,
+        text: String,
+        bottom_gap: f32,
+        pal: TdesktopThemePalette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let is_apple = pal.is_apple_style();
+        let is_err = Self::is_error_toast_text(&text);
+        let border_col: Rgba = if is_err {
+            TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.55)
+        } else if is_apple {
+            pal.separator_rgba()
+        } else {
+            rgb(pal.border_fg).into()
+        };
+        let card_bg: Rgba = if is_apple {
+            TdesktopThemePalette::rgba_with_alpha(pal.menu_bg, 0.96)
+        } else {
+            rgb(pal.card_bg).into()
+        };
+
+        let card = div()
+            .id("window-toast-banner")
+            .occlude()
+            .cursor_pointer()
+            .max_w(px(pal.scaled_px(480.0)))
+            .min_w(px(0.0))
+            .px(px(pal.scaled_px(14.0)))
+            .py(px(pal.scaled_px(10.0)))
+            .rounded(px(pal.scaled_px(14.0)))
+            .bg(card_bg)
+            .border_1()
+            .border_color(border_col)
+            .shadow(pal.popover_shadows())
+            .flex()
+            .items_start()
+            .gap(px(pal.scaled_px(8.0)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.window_runtime.controller.dismiss_current_toast();
+                this.schedule_current_toast_dismiss(cx);
+                cx.notify();
+            }))
+            .when(is_err, |row| {
+                row.child(
+                    div()
+                        .w(px(pal.scaled_px(18.0)))
+                        .h(px(pal.scaled_px(18.0)))
+                        .mt(px(pal.scaled_px(1.0)))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.16))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(pal.scaled_px(11.0)))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(pal.danger))
+                        .child("!"),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(pal.scaled_px(12.5)))
+                    .line_height(px(pal.scaled_px(17.5)))
+                    .font_weight(if is_apple { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(rgb(pal.text_primary))
+                    .child(text),
+            )
+            .child(
+                div()
+                    .id("window-toast-banner-close")
+                    .flex_shrink_0()
+                    .w(px(pal.scaled_px(20.0)))
+                    .h(px(pal.scaled_px(20.0)))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(pal.menu_hover_bg)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.window_runtime.controller.dismiss_current_toast();
+                        this.schedule_current_toast_dismiss(cx);
+                        cx.notify();
+                    }))
+                    .child(tg_icon(IconName::Close, pal.scaled_px(11.0), pal.text_secondary)),
+            );
+
+        div()
+            .absolute()
+            .bottom(px(bottom_gap))
+            .left(px(pal.scaled_px(16.0)))
+            .right(px(pal.scaled_px(16.0)))
+            .flex()
+            .justify_end()
+            .child(card)
+    }
+
+    fn render_toast_banner(&self, text: String, pal: TdesktopThemePalette, cx: &mut Context<Self>) -> Div {
+        self.render_toast_banner_slot(text, pal.scaled_px(24.0), pal, cx)
     }
 }
 
@@ -780,6 +1238,7 @@ impl Render for AppShell {
             self.app.sync_viewport_size(vp_w, vp_h);
         }
 
+        self.schedule_current_toast_dismiss(cx);
         let pal = self.theme_state.palette;
         let current_toast = self.window_runtime.controller.current_toast.clone();
         let update_banner = self.render_in_app_update_banner(cx);
@@ -841,6 +1300,35 @@ impl Render for AppShell {
                 pal.is_apple_style() && sb.is_plus_menu_open,
             )
         };
+        let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
+        let hide_composer = self.should_hide_composer(cx);
+        let has_blocking_overlay = contacts_open
+            || creation_modal.is_some()
+            || self.modal_container.read(cx).is_modal_active()
+            || self
+                .miniapps
+                .create_bot_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self.miniapps.pending_miniapp_confirm.is_some()
+            || self.miniapps.miniapp_tos_modal_open
+            || self
+                .miniapps
+                .bot_profile_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self.active_panel != ActiveWorkspacePanel::Chats
+            || self.overlays.is_passcode_locked
+            || self.rtc_talk.talk_mode_overlay.is_some()
+            || self.overlays.media_viewer_overlay.is_some()
+            || self.overlays.iv_viewer_overlay.is_some()
+            || self.overlays.computer_overlay.is_some()
+            || (self
+                .miniapps
+                .miniapp_overlay
+                .as_ref()
+                .is_some_and(|ov| ov.read(cx).is_open)
+                && !self.miniapps.is_miniapp_minimized);
         self.sync_compose_state_to_composer(false, cx);
 
         div()
@@ -866,12 +1354,38 @@ impl Render for AppShell {
                     .child(
                         div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
                             .bg(rgb(pal.stage_bg))
-                            .child(if is_apple_compose_mode {
-                                self.render_apple_compose_stage(cx)
-                            } else {
-                                self.stage.clone().into_any_element()
-                            })
-                            .child(self.composer.clone())
+                            .child(
+                                div()
+                                    .id("app-shell-stage-slot")
+                                    .relative()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .child(if is_apple_compose_mode {
+                                        self.render_apple_compose_stage(cx)
+                                    } else {
+                                        self.stage.clone().into_any_element()
+                                    })
+                                    .when(!has_blocking_overlay, |el| {
+                                        el.when_some(current_toast.clone(), |el, toast| {
+                                            let bottom_gap = if show_bot_start_bar {
+                                                pal.scaled_px(68.0)
+                                                    .max(52.0 + pal.scaled_px(16.0))
+                                            } else {
+                                                pal.scaled_px(16.0)
+                                            };
+                                            el.child(self.render_toast_banner_slot(
+                                                toast.text,
+                                                bottom_gap,
+                                                pal,
+                                                cx,
+                                            ))
+                                        })
+                                    }),
+                            )
+                            .when(!hide_composer, |el| el.child(self.composer.clone()))
                             .into_any_element(),
                     )
                     .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone())),
@@ -899,7 +1413,11 @@ impl Render for AppShell {
                     && self.bot_browser.last_recovery_key_notice.is_some(),
                 |el| el.child(self.render_vault_first_setup_notice_banner(cx)),
             )
-            .when_some(current_toast, |el, toast| el.child(self.render_toast_banner(toast.text, pal, cx)))
+            .when(has_blocking_overlay, |el| {
+                el.when_some(current_toast, |el, toast| {
+                    el.child(self.render_toast_banner(toast.text, pal, cx))
+                })
+            })
             .into_any_element()
     }
 }

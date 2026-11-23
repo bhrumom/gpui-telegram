@@ -111,6 +111,52 @@ impl AppShell {
         }
     }
 
+    fn mark_compose_bot_chat_started(
+        &mut self,
+        chat_id: u64,
+        recipient: &ComposeRecipientChip,
+        cx: &mut Context<Self>,
+    ) {
+        if !recipient.is_bot && !self.is_chat_bot(chat_id, cx) {
+            return;
+        }
+        self.miniapps.pending_prestart_bot = None;
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(ref un) = recipient.username {
+            let clean = un.trim().trim_start_matches('@').to_ascii_lowercase();
+            if !clean.is_empty() {
+                keys.push(clean);
+            }
+        }
+        if let Some(rc) = self.session_sync.rich_chats_by_id.get(&chat_id) {
+            if let Some(un) = rc.peer_username.as_deref().or(rc.username.as_deref()) {
+                let clean = un.trim().trim_start_matches('@').to_ascii_lowercase();
+                if !clean.is_empty() && !keys.contains(&clean) {
+                    keys.push(clean);
+                }
+            }
+        }
+        for key in keys {
+            if let Some(prof) = self.miniapps.bot_profiles_cache.get_mut(&key) {
+                prof.has_started_chat = true;
+                prof.existing_chat_id = Some(chat_id as i64);
+            }
+        }
+        if recipient.user_id > 0 {
+            for prof in self.miniapps.bot_profiles_cache.values_mut() {
+                if prof.bot.bot_user_id == recipient.user_id as i64 {
+                    prof.has_started_chat = true;
+                    prof.existing_chat_id = Some(chat_id as i64);
+                }
+            }
+        }
+        self.stage.update(cx, |st, st_cx| {
+            st.pending_bot_start = false;
+            st.show_bot_start_bar = false;
+            st_cx.notify();
+        });
+    }
+
     fn dispatch_compose_single_dm_send(
         &mut self,
         recipient: ComposeRecipientChip,
@@ -130,13 +176,15 @@ impl AppShell {
                 sb.select_dialog_from_user(cid);
                 scx.notify();
             });
-            self.sync_compose_state_to_composer(true, cx);
+            self.mark_compose_bot_chat_started(cid, &recipient, cx);
+            self.sync_selected_chat_inspector_and_stage(cid, cx);
+            self.finish_compose_isolation_for_switched_chat(cid, cx);
+            self.mark_compose_bot_chat_started(cid, &recipient, cx);
             self.composer.update(cx, |c, ccx| {
                 c.clear();
                 c.is_input_focused = true;
                 ccx.notify();
             });
-            self.sync_selected_chat_inspector_and_stage(cid, cx);
             self.append_outgoing_text(initial_message, cx);
             cx.notify();
             return;
@@ -236,8 +284,10 @@ impl AppShell {
                                 .chat_peer_user_ids
                                 .insert(cid, recipient.user_id);
                         }
-                        shell.sync_compose_state_to_composer(true, cx);
+                        shell.mark_compose_bot_chat_started(cid, &recipient, cx);
                         shell.sync_selected_chat_inspector_and_stage(cid, cx);
+                        shell.finish_compose_isolation_for_switched_chat(cid, cx);
+                        shell.mark_compose_bot_chat_started(cid, &recipient, cx);
                         shell.composer.update(cx, |c, ccx| {
                             c.clear();
                             c.is_input_focused = true;
@@ -369,8 +419,8 @@ impl AppShell {
                             sb.select_dialog_from_user(cid);
                             scx.notify();
                         });
-                        shell.sync_compose_state_to_composer(true, cx);
                         shell.sync_selected_chat_inspector_and_stage(cid, cx);
+                        shell.finish_compose_isolation_for_switched_chat(cid, cx);
                         shell.composer.update(cx, |c, ccx| {
                             c.clear();
                             c.is_input_focused = true;

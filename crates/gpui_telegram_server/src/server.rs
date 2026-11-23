@@ -4411,13 +4411,23 @@ pub(crate) async fn maybe_trigger_bot_reply_with_context(
         .flatten()
         .is_some_and(|u| u.is_bot);
     if !sender_is_bot {
+        let is_group_room = state
+            .db
+            .get_chat(chat_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.chat_type != 0 && c.chat_type != 4);
         let (preempted_nonce, floor_snapshot) = {
             let mut groups = state.multi_agent_groups.write();
             let room = groups
                 .entry(chat_id)
                 .or_insert_with(|| GroupMultiAgentRoom::new(chat_id));
             room.loop_budget.reset();
-            let preempted = room.floor.preempt_for_user_interruption();
+            let preempted = if is_group_room {
+                room.floor.preempt_for_user_interruption()
+            } else {
+                None
+            };
             (preempted, room.floor.clone())
         };
         if preempted_nonce.is_some() {

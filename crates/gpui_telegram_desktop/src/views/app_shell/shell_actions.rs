@@ -35,9 +35,6 @@ pub fn chat_dialogs_to_forward_targets(dialogs: &[DialogItemModel]) -> Vec<(u64,
 
 pub fn build_chat_profile_facts(details: &ChatDetails, lang_id: &str) -> Vec<(String, String)> {
     let mut facts = Vec::new();
-    if let Some(about) = details.about.as_deref().filter(|s| !s.trim().is_empty()) {
-        facts.push((tr_str(lang_id, "简介", "Bio").to_string(), about.to_string()));
-    }
     let kind_label = match details.chat_type {
         3 => tr_str(lang_id, "频道", "Channel"),
         2 => tr_str(lang_id, "超级群组", "Supergroup"),

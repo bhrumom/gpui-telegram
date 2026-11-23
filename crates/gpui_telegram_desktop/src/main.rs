@@ -8,6 +8,16 @@ use std::sync::Arc;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--probe-macos-permissions") {
+        let screen_preflight =
+            fabushi_remote_engine::macos_permissions::preflight_screen_capture_access();
+        let accessibility = fabushi_remote_engine::macos_permissions::is_accessibility_trusted();
+        println!(
+            "{{\"screen_preflight\":{},\"accessibility\":{}}}",
+            screen_preflight, accessibility
+        );
+        std::process::exit(0);
+    }
     if args.iter().any(|a| a == "--version" || a == "-V" || a == "-v") {
         println!("Fabushi Desktop v{}", env!("CARGO_PKG_VERSION"));
         println!("gpui_telegram_desktop {}", env!("CARGO_PKG_VERSION"));

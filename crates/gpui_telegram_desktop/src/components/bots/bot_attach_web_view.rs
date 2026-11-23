@@ -219,7 +219,12 @@ pub struct BotAttachWebView {
     pub last_webmcp_state_summary: Option<serde_json::Value>,
     pub pending_webmcp_queue: VecDeque<MiniAppWebMcpCommand>,
     pub webmcp_page_ready: bool,
-    pub(crate) launching_short_name: String,
+    pub webmcp_discovered_tools: Vec<WebMcpToolDescriptor>,
+    pub webmcp_iframe_ready: bool,
+    pub webmcp_needs_rediscover: bool,
+    pub webmcp_ready_probe_sent: bool,
+    pub(crate) webmcp_internal_seq: u64,
+    pub launching_short_name: String,
     #[cfg(target_os = "macos")]
     pub(crate) macos_webview: Option<MacOsWkWebView>,
     #[cfg(target_os = "macos")]
@@ -278,6 +283,11 @@ impl BotAttachWebView {
             last_webmcp_state_summary: None,
             pending_webmcp_queue: VecDeque::new(),
             webmcp_page_ready: false,
+            webmcp_discovered_tools: Vec::new(),
+            webmcp_iframe_ready: false,
+            webmcp_needs_rediscover: false,
+            webmcp_ready_probe_sent: false,
+            webmcp_internal_seq: 0,
             launching_short_name: String::new(),
             #[cfg(target_os = "macos")]
             macos_webview: None,
@@ -374,6 +384,10 @@ impl BotAttachWebView {
         self.is_loading = false;
         self.status_toast = None;
         self.webmcp_page_ready = false;
+        self.webmcp_iframe_ready = false;
+        self.webmcp_needs_rediscover = false;
+        self.webmcp_ready_probe_sent = false;
+        self.webmcp_discovered_tools.clear();
         self.last_webmcp_state_summary = None;
         self.launch_context = Some(ctx);
     }
@@ -389,6 +403,10 @@ impl BotAttachWebView {
         self.last_webmcp_state_summary = None;
         self.pending_webmcp_queue.clear();
         self.webmcp_page_ready = false;
+        self.webmcp_iframe_ready = false;
+        self.webmcp_needs_rediscover = false;
+        self.webmcp_ready_probe_sent = false;
+        self.webmcp_discovered_tools.clear();
         self.active_bot = None;
         self.url.clear();
         self.app_id = None;
@@ -398,6 +416,55 @@ impl BotAttachWebView {
         self.write_access_prompt_open = false;
         self.custom_popup = None;
         self.focused_input = None;
+    }
+
+    /// Clears previous Mini App runtime/WebMCP/native WebView state before starting a new `/launch`
+    /// on a reused `BotAttachWebView` overlay entity.
+    pub fn reset_for_new_launch(&mut self) {
+        self.destroy_native_webview();
+        self.active_bot = None;
+        self.launch_context = None;
+        self.app_id = None;
+        self.bot_id = 0;
+        self.bot_username.clear();
+        self.companion_chat_id = None;
+        self.source_chat_id = None;
+        self.url.clear();
+        self.disclaimer_accepted = false;
+        self.is_fullscreen = false;
+        self.last_active_ts = 0;
+        self.updated_at = 0;
+        self.ui_schema = MiniAppUiSchema::default();
+        self.cloud_storage.clear();
+        self.active_tab = 0;
+        self.menu_open = false;
+        self.confirm_close_open = false;
+        self.write_access_prompt_open = false;
+        self.allows_write_to_pm = false;
+        self.custom_popup = None;
+        self.closing_confirmation = false;
+        self.header_color_override = None;
+        self.background_color_override = None;
+        self.is_dirty = false;
+        self.status_toast = None;
+        self.copilot_prompt.clear();
+        self.copilot_last_reply = None;
+        self.focused_input = None;
+        self.cloud_key_draft.clear();
+        self.cloud_value_draft.clear();
+        self.control_mode = MiniAppControlMode::Idle;
+        self.control_status_text.clear();
+        self.active_webmcp_tool = None;
+        self.is_floating_pip = false;
+        self.pip_live_preview = true;
+        self.last_webmcp_state_summary = None;
+        self.pending_webmcp_queue.clear();
+        self.webmcp_page_ready = false;
+        self.webmcp_discovered_tools.clear();
+        self.webmcp_iframe_ready = false;
+        self.webmcp_needs_rediscover = false;
+        self.webmcp_ready_probe_sent = false;
+        self.launching_short_name.clear();
     }
 
     pub fn minimize(&mut self) {
@@ -555,7 +622,10 @@ impl BotAttachWebView {
         }
     }
 
-    pub(crate) fn current_short_name(&self) -> String {
+    pub fn current_short_name(&self) -> String {
+        if self.is_loading && !self.launching_short_name.is_empty() {
+            return self.launching_short_name.clone();
+        }
         self.active_bot
             .as_ref()
             .map(|b| b.short_name.clone())
@@ -878,8 +948,12 @@ impl BotAttachWebView {
     /// Reloads the live `WKWebView` when attached, or queues an HTTP reload action in headless mode.
     pub fn reload_webview(&mut self) {
         self.webmcp_page_ready = false;
+        self.webmcp_iframe_ready = false;
+        self.webmcp_needs_rediscover = true;
+        self.webmcp_ready_probe_sent = false;
+        self.webmcp_discovered_tools.clear();
         #[cfg(target_os = "macos")]
-        if let Some(ref wv) = self.macos_webview {
+        if let Some(ref mut wv) = self.macos_webview {
             wv.reload();
             self.is_loading = false;
             return;
@@ -960,7 +1034,17 @@ impl BotAttachWebView {
             let resolved_url = self.resolved_webview_url();
             if let Some(ref mut wv) = self.macos_webview {
                 if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
+                    let same_url = wv.loaded_url() == resolved_url;
+                    if !same_url {
+                        self.webmcp_ready_probe_sent = false;
+                    }
                     wv.load_url(&resolved_url);
+                    if same_url && !self.webmcp_page_ready && !self.webmcp_ready_probe_sent {
+                        self.webmcp_ready_probe_sent = true;
+                        wv.evaluate_js(
+                            "try{window.__GPUI_WEBMCP__&&typeof window.__GPUI_WEBMCP__.checkReady==='function'&&window.__GPUI_WEBMCP__.checkReady();}catch(_){}",
+                        );
+                    }
                 }
                 if visible {
                     let zoom = if self.is_floating_pip && !self.is_open {
@@ -1147,8 +1231,71 @@ impl BotAttachWebView {
                     self.background_color_override = (!clean.is_empty()).then(|| clean.to_string());
                 }
             }
-            "__gpui_webmcp_page_ready" | "web_app_ready" | "iframe_ready" => {
+            "web_app_ready" => {}
+            "__gpui_webmcp_page_ready" | "gpui_webmcp_ready" | "iframe_ready" => {
+                if parsed
+                    .get("host_wrapper_only")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                {
+                    return;
+                }
                 self.webmcp_page_ready = true;
+                self.webmcp_iframe_ready = true;
+                self.webmcp_ready_probe_sent = false;
+                if let Some(tools_val) = parsed.get("tools") {
+                    if let Ok(tools) =
+                        serde_json::from_value::<Vec<WebMcpToolDescriptor>>(tools_val.clone())
+                    {
+                        self.webmcp_discovered_tools = tools;
+                    }
+                }
+                if let Some(summary) = parsed.get("state_summary").filter(|v| v.is_object()) {
+                    self.last_webmcp_state_summary = Some(summary.clone());
+                }
+                let should_rediscover =
+                    self.webmcp_needs_rediscover || self.webmcp_discovered_tools.is_empty();
+                self.webmcp_needs_rediscover = false;
+                if should_rediscover
+                    && self
+                        .pending_webmcp_queue
+                        .front()
+                        .is_none_or(|c| c.operation != "discover")
+                {
+                    #[cfg(target_os = "macos")]
+                    if !MacOsWkWebView::is_headless_or_offline_test_env() {
+                        if let Some(ref wv) = self.macos_webview {
+                            self.webmcp_internal_seq = self.webmcp_internal_seq.wrapping_add(1);
+                            let req_id =
+                                format!("__gpui_internal_discover_{}", self.webmcp_internal_seq);
+                            let req_lit = serde_json::to_string(&req_id)
+                                .unwrap_or_else(|_| "\"__gpui_internal_discover_0\"".to_string());
+                            let js = format!(
+                                "(function(){{try{{if(window.__GPUI_WEBMCP__&&typeof window.__GPUI_WEBMCP__.invoke==='function'){{window.__GPUI_WEBMCP__.invoke({req_lit},'discover',null,{{}});}}}}catch(_){{}}}})();"
+                            );
+                            wv.evaluate_js(&js);
+                        }
+                    }
+                }
+                self.flush_pending_webmcp_queue();
+            }
+            "__gpui_webmcp_page_unready" | "gpui_webmcp_unready" => {
+                self.webmcp_page_ready = false;
+                self.webmcp_iframe_ready = false;
+                self.webmcp_discovered_tools.clear();
+                self.webmcp_needs_rediscover = true;
+                self.webmcp_ready_probe_sent = false;
+            }
+            "gpui_webmcp_tools_changed" => {
+                if let Some(tools_val) = parsed.get("tools") {
+                    if let Ok(tools) =
+                        serde_json::from_value::<Vec<WebMcpToolDescriptor>>(tools_val.clone())
+                    {
+                        self.webmcp_discovered_tools = tools;
+                    }
+                }
+                self.webmcp_page_ready = true;
+                self.webmcp_iframe_ready = true;
                 self.flush_pending_webmcp_queue();
             }
             "webmcp_state_update" => {
@@ -1197,8 +1344,14 @@ impl BotAttachWebView {
             }
             "webmcp_response" => {
                 if let Ok(resp) = serde_json::from_str::<MiniAppWebMcpResponse>(event_data) {
+                    if !resp.tools.is_empty() {
+                        self.webmcp_discovered_tools = resp.tools.clone();
+                    }
                     if let Some(ref summary) = resp.state_summary {
                         self.last_webmcp_state_summary = Some(summary.clone());
+                    }
+                    if resp.request_id.starts_with("__gpui_internal_discover_") {
+                        return;
                     }
                     self.active_webmcp_tool = None;
                     if resp.ok {

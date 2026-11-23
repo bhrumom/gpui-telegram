@@ -183,6 +183,13 @@ impl AppShell {
                 }));
             }
             InspectorAction::OpenEditPeer => {
+                let is_channel = active_chat.is_some_and(|cid| {
+                    self.session_sync
+                        .rich_chats_by_id
+                        .get(&cid)
+                        .is_some_and(|rc| rc.is_channel || rc.chat_type == 3)
+                        || self.sidebar.read(cx).channel_chat_ids.contains(&cid)
+                });
                 let prof = &self.inspector.read(cx).profile;
                 self.open_modal_dialog(
                     tr_str(lang, "编辑资料", "Edit Info"),
@@ -190,7 +197,7 @@ impl AppShell {
                         peer_title: prof.name.clone(),
                         peer_username: prof.username.clone(),
                         peer_bio: prof.bio.clone(),
-                        is_channel: false,
+                        is_channel,
                     },
                     420.0,
                     380.0,

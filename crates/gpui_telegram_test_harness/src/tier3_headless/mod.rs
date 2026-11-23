@@ -837,8 +837,8 @@ impl HeadlessTranscriptDriver {
                     // 6. ModalContainer text/IME routing must isolate from CanonicalComposer!
                     s.composer.update(cx, |c, _| c.set_text("Composer draft intact"));
                     s.open_modal_dialog(
-                        "New Group",
-                        gpui_telegram_desktop::views::ModalDialogKind::NewGroup,
+                        "Create Poll",
+                        gpui_telegram_desktop::views::ModalDialogKind::CreatePoll,
                         420.0,
                         380.0,
                         cx,

@@ -101,16 +101,7 @@ impl Render for ChatSidebar {
             total_dialog_unread,
         );
         if self.is_collapsed {
-            let mut rail_dialogs: Vec<&DialogItemModel> = self
-                .dialogs
-                .iter()
-                .filter(|d| !self.archived_ids.contains(&d.id) && d.is_pinned)
-                .collect();
-            rail_dialogs.extend(
-                self.dialogs
-                    .iter()
-                    .filter(|d| !self.archived_ids.contains(&d.id) && !d.is_pinned),
-            );
+            let rail_dialogs = self.collapsed_rail_dialogs();
             return render_collapsed_gemini_sidebar(
                 &nav_snapshot,
                 &rail_dialogs,

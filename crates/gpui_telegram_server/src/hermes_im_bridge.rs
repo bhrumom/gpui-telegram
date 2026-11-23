@@ -355,6 +355,107 @@ impl ServerPlatformImBridge {
         }
 
         let mapped_req = match tool_name {
+            "page_click" => {
+                let selector = args
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let widget_id = args
+                    .get("widget_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let schema: Option<MiniAppUiSchema> =
+                    serde_json::from_str(&app.ui_schema_json).ok();
+                let matches_main = selector.is_some_and(|s| {
+                    matches!(
+                        s.to_ascii_lowercase().as_str(),
+                        "#main-btn" | ".main-btn" | "main_button" | "main-button"
+                    )
+                }) || text.is_some_and(|t| {
+                    schema
+                        .as_ref()
+                        .and_then(|sc| sc.main_button.as_ref())
+                        .is_some_and(|mb| {
+                            !mb.text.trim().is_empty() && mb.text.trim().eq_ignore_ascii_case(t)
+                        })
+                });
+                let matches_secondary = selector.is_some_and(|s| {
+                    matches!(
+                        s.to_ascii_lowercase().as_str(),
+                        "#secondary-btn"
+                            | ".secondary-btn"
+                            | "secondary_button"
+                            | "secondary-button"
+                    )
+                }) || text.is_some_and(|t| {
+                    schema
+                        .as_ref()
+                        .and_then(|sc| sc.secondary_button.as_ref())
+                        .is_some_and(|sb| {
+                            !sb.text.trim().is_empty() && sb.text.trim().eq_ignore_ascii_case(t)
+                        })
+                });
+                if matches_main {
+                    MiniAppActionRequest {
+                        action_type: "main_button_click".to_string(),
+                        chat_id: Some(chat_id),
+                        ..Default::default()
+                    }
+                } else if matches_secondary {
+                    MiniAppActionRequest {
+                        action_type: "secondary_button_click".to_string(),
+                        chat_id: Some(chat_id),
+                        ..Default::default()
+                    }
+                } else if let Some(wid) =
+                    widget_id.or_else(|| selector.and_then(|s| s.strip_prefix('#')))
+                {
+                    MiniAppActionRequest {
+                        action_type: "widget_event".to_string(),
+                        widget_id: Some(wid.to_string()),
+                        value: args
+                            .get("value")
+                            .cloned()
+                            .or_else(|| text.map(|t| json!(t))),
+                        chat_id: Some(chat_id),
+                        ..Default::default()
+                    }
+                } else if let Some((wid, opt_val)) = text.and_then(|t| {
+                    schema.as_ref().and_then(|sc| {
+                        sc.widgets.iter().find_map(|w| {
+                            w.options
+                                .iter()
+                                .find(|opt| opt.trim().eq_ignore_ascii_case(t))
+                                .map(|opt| (w.id.clone(), opt.clone()))
+                        })
+                    })
+                }) {
+                    MiniAppActionRequest {
+                        action_type: "widget_event".to_string(),
+                        widget_id: Some(wid),
+                        value: Some(json!(opt_val)),
+                        chat_id: Some(chat_id),
+                        ..Default::default()
+                    }
+                } else if selector.is_none() && text.is_none() {
+                    return Err("page_click 需要提供 'selector' 或 'text' 参数".to_string());
+                } else {
+                    MiniAppActionRequest {
+                        action_type: "page_click".to_string(),
+                        widget_id: selector.or(text).map(str::to_string),
+                        value: text.or(selector).map(|s| json!(s)),
+                        chat_id: Some(chat_id),
+                        ..Default::default()
+                    }
+                }
+            }
             "page_fill" => MiniAppActionRequest {
                 action_type: "widget_event".to_string(),
                 widget_id: args
@@ -1476,7 +1577,13 @@ impl PlatformImBridge for ServerPlatformImBridge {
                         };
                         if let Some(resp) = broker
                             .dispatch_to_client(caller_uid, cmd, DEFAULT_WEBMCP_RPC_TIMEOUT)
-                            .await?
+                            .await
+                            .map_err(|rpc_err| {
+                                format!(
+                                    "小程序「{}」桌面窗口未在超时时间内响应（{rpc_err}），请确认用户已打开小程序且页面加载正常后重试",
+                                    app.title
+                                )
+                            })?
                         {
                             if !resp.ok {
                                 return Err(resp.error.unwrap_or_else(|| "WebMCP discover failed".into()));
@@ -1485,6 +1592,7 @@ impl PlatformImBridge for ServerPlatformImBridge {
                             let mut payload = json!({
                                 "success": true,
                                 "mode": "live_webmcp",
+                                "webview_connected": true,
                                 "bot_username": app.bot_username,
                                 "short_name": app.short_name,
                                 "app_title": app.title,
@@ -1516,6 +1624,11 @@ impl PlatformImBridge for ServerPlatformImBridge {
                     Ok(json!({
                         "success": true,
                         "mode": "headless_fallback",
+                        "webview_connected": false,
+                        "notice": format!(
+                            "当前没有已连接的桌面小程序 WebView，仅列出通用无头工具。如需执行「{}」页面专属工具，请提示用户在桌面端打开「{}」小程序。",
+                            app.title, app.title
+                        ),
                         "bot_username": app.bot_username,
                         "short_name": app.short_name,
                         "app_title": app.title,
@@ -1553,15 +1666,38 @@ impl PlatformImBridge for ServerPlatformImBridge {
                         };
                         if let Some(resp) = broker
                             .dispatch_to_client(caller_uid, cmd, DEFAULT_WEBMCP_RPC_TIMEOUT)
-                            .await?
+                            .await
+                            .map_err(|rpc_err| {
+                                format!(
+                                    "小程序「{}」桌面窗口未在超时时间内响应（{rpc_err}），请确认用户已打开小程序且页面加载正常后重试",
+                                    app.title
+                                )
+                            })?
                         {
                             let page_error = extract_webmcp_page_error(resp.state_summary.as_ref());
                             if !resp.ok {
+                                let registered_tools: Vec<String> = resp
+                                    .tools
+                                    .iter()
+                                    .map(|t| t.name.clone())
+                                    .filter(|n| !n.trim().is_empty())
+                                    .collect();
                                 let mut err_msg = resp
                                     .error
                                     .unwrap_or_else(|| format!("WebMCP tool '{tool}' failed"));
                                 if let Some(page_err) = page_error {
                                     err_msg.push_str(&format!("（小程序页面异常: {page_err}）"));
+                                }
+                                if !registered_tools.is_empty() {
+                                    err_msg.push_str(&format!(
+                                        " | 当前已注册工具: [{}]",
+                                        registered_tools.join(", ")
+                                    ));
+                                } else {
+                                    err_msg.push_str(&format!(
+                                        " | 请先在桌面端打开或刷新「{}」小程序窗口后重试，严禁声称操作已成功",
+                                        app.title
+                                    ));
                                 }
                                 return Err(err_msg);
                             }
@@ -1589,9 +1725,10 @@ impl PlatformImBridge for ServerPlatformImBridge {
                         }
                     }
 
-                    const HEADLESS_SUPPORTED_TOOLS: [&str; 9] = [
+                    const HEADLESS_SUPPORTED_TOOLS: [&str; 10] = [
                         "get_state",
                         "page_inspect",
+                        "page_click",
                         "page_fill",
                         "page_press_main_button",
                         "page_press_secondary_button",
@@ -1602,7 +1739,9 @@ impl PlatformImBridge for ServerPlatformImBridge {
                     ];
                     if !HEADLESS_SUPPORTED_TOOLS.contains(&tool) {
                         return Err(format!(
-                            "未注册的 WebMCP 工具: {tool}（当前没有已连接的桌面小程序 WebView，无法执行页面专属工具）"
+                            "未注册的 WebMCP 工具: {tool}（当前没有已连接的桌面小程序 WebView，请在桌面端打开「{}」小程序后重试；无头模式仅支持通用工具: {}）",
+                            app.title,
+                            HEADLESS_SUPPORTED_TOOLS.join(", ")
                         ));
                     }
 
@@ -2355,5 +2494,176 @@ mod tests {
 
         let normal_toast = json!({ "visible_toast": "已保存" });
         assert_eq!(extract_webmcp_page_error(Some(&normal_toast)), None);
+    }
+
+    #[tokio::test]
+    async fn test_headless_webmcp_discover_catalog_matches_call_tool_and_generic_error_guidance() {
+        use gpui_telegram_proto::miniapp_contracts::{MiniAppControlMode, MiniAppWebMcpResponse};
+        use tokio::sync::mpsc;
+
+        let dir = TempDir::new().expect("create tempdir");
+        let db_path = dir.path().join("webmcp_catalog_match.db");
+        let db = Arc::new(ServerDatabase::open(&db_path).expect("open db"));
+        let mut cfg = ServerConfig::default();
+        cfg.media_storage_path = dir.path().join("media").display().to_string();
+        let state = Arc::new(AppState::with_db(cfg, db.clone()));
+
+        let (alice, _, _) = state
+            .session_manager
+            .register("alice_cat", "Pass123456!", "AliceCat", None, "CLI")
+            .unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        db.create_user(&crate::db::schema::UserRecord {
+            user_id: alice.user_id,
+            username: Some("alice_cat".to_string()),
+            phone: None,
+            first_name: "AliceCat".to_string(),
+            last_name: None,
+            bio: None,
+            password_hash: None,
+            is_bot: false,
+            is_verified: false,
+            is_support: false,
+            is_scam: false,
+            is_fake: false,
+            profile_photo_file_id: None,
+            account_generation: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+        .unwrap();
+
+        let bot = db
+            .create_registered_bot(
+                alice.user_id.0 as i64,
+                "cat_bot",
+                "Cat Helper",
+                "desc",
+                "about",
+                "persona",
+                "",
+                "https://cat.example/app",
+                "[]",
+                false,
+                true,
+            )
+            .unwrap();
+        let schema_json = serde_json::json!({
+            "title": "Coffee Shop",
+            "widgets": [
+                { "id": "item_name", "kind": "TextInput", "label": "Item", "value": "Latte" }
+            ],
+            "main_button": { "text": "Place Order", "is_visible": true, "is_active": true }
+        })
+        .to_string();
+        db.create_or_upsert_mini_app_with_options(
+            bot.bot_user_id,
+            "cat_bot",
+            "shop",
+            "Coffee Shop",
+            "Order coffee",
+            "shopping",
+            "☕",
+            Some("https://cat.example/app"),
+            &schema_json,
+            true,
+            true,
+            false,
+            "",
+            "",
+            None,
+            false,
+        )
+        .unwrap();
+        let (chat_rec, _) = db
+            .ensure_companion_bot_chat_record(alice.user_id, UserId(bot.bot_user_id as u64))
+            .unwrap();
+
+        let alice_uid_str = alice.user_id.0.to_string();
+        let mut ctx = state.fabushi_core().build_tool_context_with_user(
+            "sess_cat",
+            Some(chat_rec.0),
+            None,
+            Some(&alice_uid_str),
+            1,
+            Some(ToolsetPreset::Full),
+            0,
+            Arc::new(AtomicBool::new(false)),
+        );
+        ctx.bot_id = Some(bot.bot_user_id);
+
+        // 1. Every tool returned by headless webmcp_discover must be accepted by headless webmcp_call_tool
+        let disc = HermesToolExecutor::execute("webmcp_discover", json!({}), &ctx).await;
+        assert!(disc.success);
+        let disc_v: Value = serde_json::from_str(&disc.output).unwrap();
+        let tool_names: Vec<String> = disc_v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(!tool_names.is_empty());
+
+        for tool_name in &tool_names {
+            let call_args = match tool_name.as_str() {
+                "page_click" => json!({ "text": "Place Order" }),
+                "page_fill" => json!({ "widget_id": "item_name", "value": "Cortado" }),
+                _ => json!({}),
+            };
+            let res = HermesToolExecutor::execute(
+                "webmcp_call_tool",
+                json!({ "tool_name": tool_name, "arguments": call_args }),
+                &ctx,
+            )
+            .await;
+            assert!(
+                res.success,
+                "headless catalog tool '{tool_name}' must be accepted by headless webmcp_call_tool, got {:?}",
+                res.error
+            );
+        }
+
+        // 2. Live WebView !ok with empty registered_tools and generic error (no "未注册"/"not registered")
+        // must STILL surface desktop-open/refresh guidance
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.gateway_hub.register(alice.user_id, tx);
+        let state_bg = Arc::clone(&state);
+        let responder = tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                if let WsServerFrame::Update(UpdateEvent::MiniAppWebMcpCommand(cmd)) = frame {
+                    state_bg.webmcp_broker.resolve_rpc_response(
+                        alice.user_id,
+                        MiniAppWebMcpResponse {
+                            request_id: cmd.request_id,
+                            ok: false,
+                            result: json!({}),
+                            error: Some("TypeError: cannot read properties of undefined".to_string()),
+                            tools: Vec::new(),
+                            state_summary: None,
+                            control_mode: MiniAppControlMode::AiControlling,
+                        },
+                    );
+                    break;
+                }
+            }
+        });
+
+        let generic_fail = HermesToolExecutor::execute(
+            "webmcp_call_tool",
+            json!({ "tool_name": "custom_tool", "arguments": {} }),
+            &ctx,
+        )
+        .await;
+        assert!(!generic_fail.success);
+        let err_msg = generic_fail.error.as_deref().unwrap_or("");
+        assert!(
+            err_msg.contains("TypeError: cannot read properties of undefined"),
+            "got {err_msg}"
+        );
+        assert!(
+            err_msg.contains("请先在桌面端打开或刷新「Coffee Shop」小程序窗口后重试"),
+            "missing desktop-open guidance on generic error + empty tools: {err_msg}"
+        );
+        let _ = responder.await;
     }
 }

@@ -246,6 +246,7 @@ impl AppShell {
             b.open_ai_creator();
             b_cx.notify();
         });
+        self.enter_compose_or_modal_isolation(cx);
         self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
         self.sidebar.update(cx, |s, _| {
@@ -262,6 +263,7 @@ impl AppShell {
             b.open_fabushi_creator();
             b_cx.notify();
         });
+        self.enter_compose_or_modal_isolation(cx);
         self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
         self.sidebar.update(cx, |s, _| {
@@ -278,6 +280,7 @@ impl AppShell {
             b.open_coding_agent_creator();
             b_cx.notify();
         });
+        self.enter_compose_or_modal_isolation(cx);
         self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
         self.sidebar.update(cx, |s, _| {
@@ -307,6 +310,9 @@ impl AppShell {
             });
         if closed {
             self.miniapps.create_bot_box = None;
+            if !self.is_compose_or_creation_modal_active(cx) {
+                self.exit_compose_or_modal_isolation(true, cx);
+            }
             cx.notify();
             return;
         }
@@ -352,6 +358,9 @@ impl AppShell {
                                     true,
                                     cx,
                                 );
+                                shell.finish_compose_isolation_for_switched_chat(cid, cx);
+                            } else if !shell.is_compose_or_creation_modal_active(cx) {
+                                shell.exit_compose_or_modal_isolation(true, cx);
                             }
                         }
                         Err(e) => set_bot_box_error(&box_weak, e, cx),
@@ -402,6 +411,9 @@ impl AppShell {
                                     true,
                                     cx,
                                 );
+                                shell.finish_compose_isolation_for_switched_chat(cid, cx);
+                            } else if !shell.is_compose_or_creation_modal_active(cx) {
+                                shell.exit_compose_or_modal_isolation(true, cx);
                             }
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
@@ -476,6 +488,9 @@ impl AppShell {
                                     true,
                                     cx,
                                 );
+                                shell.finish_compose_isolation_for_switched_chat(cid as u64, cx);
+                            } else if !shell.is_compose_or_creation_modal_active(cx) {
+                                shell.exit_compose_or_modal_isolation(true, cx);
                             }
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
@@ -505,6 +520,7 @@ impl AppShell {
             let fence = fence.clone();
             match act {
                 BotWebViewPendingAction::Close => {
+                    self.miniapps.bump_launch_generation();
                     self.miniapps.is_miniapp_minimized = false;
                     self.miniapps.floating_pip_status = None;
                     self.miniapps.miniapp_overlay = None;
@@ -740,7 +756,9 @@ impl AppShell {
                     bot_username,
                     short_name,
                 } => {
+                    self.miniapps.bump_launch_generation();
                     self.miniapps.is_miniapp_minimized = false;
+                    self.miniapps.floating_pip_status = None;
                     self.miniapps.miniapp_overlay = None;
                     let client = self.client.clone();
                     let lang_c = lang.clone();
@@ -800,7 +818,9 @@ impl AppShell {
                                         w_cx.notify();
                                     });
                                     if close_after {
+                                        shell.miniapps.bump_launch_generation();
                                         shell.miniapps.is_miniapp_minimized = false;
+                                        shell.miniapps.floating_pip_status = None;
                                         shell.miniapps.miniapp_overlay = None;
                                     }
                                     if let Some(cid) = refresh_companion {

@@ -1318,11 +1318,59 @@ fn is_sensitive_arg_key(key: &str) -> bool {
         || k.contains("credential")
 }
 
+fn is_internal_trace_arg_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "chat_id"
+            | "bot_username"
+            | "short_name"
+            | "bot_id"
+            | "bot_user_id"
+            | "user_id"
+            | "sender_id"
+            | "client_nonce"
+            | "query_id"
+            | "session_id"
+            | "turn_id"
+            | "request_id"
+            | "status_message"
+            | "topic_id"
+    )
+}
+
+fn unwrap_json_string_value(val: &Value) -> Option<Value> {
+    if let Some(raw) = val.as_str() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
 fn format_tool_args_preview(arguments: &Value) -> String {
     format_tool_args_preview_inner(arguments, true)
 }
 
 fn format_tool_args_preview_inner(arguments: &Value, expand_tool_name: bool) -> String {
+    if let Some(raw) = arguments.as_str() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                return format_tool_args_preview_inner(&parsed, expand_tool_name);
+            }
+            if trimmed.starts_with('{') {
+                return String::new();
+            }
+        }
+        let compact = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+        return truncate_chars(&compact, 72);
+    }
     if let Some(obj) = arguments.as_object() {
         if expand_tool_name {
             if let Some(tool_name) = obj
@@ -1332,14 +1380,17 @@ fn format_tool_args_preview_inner(arguments: &Value, expand_tool_name: bool) -> 
                 .filter(|s| !s.is_empty())
             {
                 if let Some(sub_args) = obj.get("arguments").filter(|v| !v.is_null()) {
-                    let is_empty = match sub_args {
+                    let unwrapped = unwrap_json_string_value(sub_args);
+                    let target_sub = unwrapped.as_ref().unwrap_or(sub_args);
+                    let is_empty = match target_sub {
                         Value::Object(m) => m.is_empty(),
                         Value::Array(a) => a.is_empty(),
                         Value::String(s) => s.trim().is_empty(),
+                        Value::Null => true,
                         _ => false,
                     };
                     if !is_empty {
-                        let compact_sub_args = format_tool_args_preview_inner(sub_args, false);
+                        let compact_sub_args = format_tool_args_preview_inner(target_sub, false);
                         if !compact_sub_args.is_empty() {
                             return truncate_chars(&format!("{tool_name} {compact_sub_args}"), 80);
                         }
@@ -1347,34 +1398,342 @@ fn format_tool_args_preview_inner(arguments: &Value, expand_tool_name: bool) -> 
                 }
                 return truncate_chars(tool_name, 72);
             }
-        }
-        for preferred in ["command", "path", "node_id", "query", "action", "name", "url"] {
-            if let Some(v) = obj.get(preferred).and_then(|x| x.as_str()) {
-                let single_line = v.split_whitespace().collect::<Vec<_>>().join(" ");
-                if !single_line.is_empty() {
-                    return truncate_chars(&single_line, 72);
+            if let Some(sub_args) = obj.get("arguments").filter(|v| !v.is_null()) {
+                let unwrapped = unwrap_json_string_value(sub_args);
+                let target_sub = unwrapped.as_ref().unwrap_or(sub_args);
+                let compact = format_tool_args_preview_inner(target_sub, false);
+                if !compact.is_empty() {
+                    return truncate_chars(&compact, 80);
+                }
+            }
+            for preferred in [
+                "command",
+                "path",
+                "node_id",
+                "query",
+                "reason",
+                "action",
+                "action_type",
+                "name",
+                "url",
+            ] {
+                if let Some(v) = obj.get(preferred).and_then(|x| x.as_str()) {
+                    let single_line = v.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !single_line.is_empty() {
+                        return truncate_chars(&single_line, 72);
+                    }
                 }
             }
         }
-        let parts: Vec<String> = obj
+        let mut parts: Vec<String> = Vec::new();
+        for (k, v) in obj.iter() {
+            if is_internal_trace_arg_key(k) || v.is_null() {
+                continue;
+            }
+            if is_sensitive_arg_key(k) {
+                parts.push(format!("{k}=***"));
+            } else {
+                let s = match v {
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Some(parsed) = unwrap_json_string_value(v) {
+                            let nested = format_tool_args_preview_inner(&parsed, false);
+                            if nested.is_empty() {
+                                continue;
+                            }
+                            nested
+                        } else {
+                            trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
+                        }
+                    }
+                    Value::Object(m) => {
+                        if m.is_empty() {
+                            continue;
+                        }
+                        let nested = format_tool_args_preview_inner(v, false);
+                        if nested.is_empty() {
+                            continue;
+                        }
+                        nested
+                    }
+                    Value::Array(arr) => {
+                        if arr.is_empty() {
+                            continue;
+                        }
+                        format_tool_args_preview_inner(v, false)
+                    }
+                    other => other.to_string(),
+                };
+                if !s.is_empty() {
+                    parts.push(format!("{k}={}", truncate_chars(&s, 28)));
+                }
+            }
+            if parts.len() >= 3 {
+                break;
+            }
+        }
+        return truncate_chars(&parts.join(", "), 80);
+    }
+    if let Some(arr) = arguments.as_array() {
+        if arr.is_empty() {
+            return String::new();
+        }
+        let items: Vec<String> = arr
             .iter()
             .take(3)
-            .map(|(k, v)| {
-                if is_sensitive_arg_key(k) {
-                    format!("{k}=***")
-                } else {
-                    let s = match v {
-                        Value::String(s) => s.split_whitespace().collect::<Vec<_>>().join(" "),
-                        other => other.to_string(),
-                    };
-                    format!("{k}={}", truncate_chars(&s, 28))
-                }
+            .filter_map(|item| {
+                let s = match item {
+                    Value::String(s) => s.split_whitespace().collect::<Vec<_>>().join(" "),
+                    Value::Object(_) | Value::Array(_) => format_tool_args_preview_inner(item, false),
+                    Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                (!s.is_empty()).then(|| truncate_chars(&s, 20))
             })
             .collect();
-        return truncate_chars(&parts.join(", "), 80);
+        if items.is_empty() {
+            return String::new();
+        }
+        let suffix = if arr.len() > 3 { ", …" } else { "" };
+        return truncate_chars(&format!("[{}{suffix}]", items.join(", ")), 72);
+    }
+    if arguments.is_null() {
+        return String::new();
     }
     let compact = arguments.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&compact, 72)
+}
+
+fn extract_webmcp_subtool(arguments: &Value) -> Option<String> {
+    let unwrapped = unwrap_json_string_value(arguments);
+    let target = unwrapped.as_ref().unwrap_or(arguments);
+    target
+        .as_object()
+        .and_then(|obj| obj.get("tool_name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_step_error_preview(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_prefix = trimmed
+        .strip_prefix("Error:")
+        .or_else(|| trimmed.strip_prefix("error:"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let extracted = if without_prefix.starts_with('{') {
+        serde_json::from_str::<Value>(without_prefix)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| without_prefix.to_string())
+    } else {
+        without_prefix.to_string()
+    };
+    let clean = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&clean, 96))
+    }
+}
+
+fn extract_webmcp_page_error_from_output(output: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(output.trim()).ok()?;
+    for key in ["page_error", "boot_error"] {
+        if let Some(s) = parsed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    }
+    None
+}
+
+fn contains_ascii_word(haystack: &str, word: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let wlen = word.len();
+    let mut pos = 0usize;
+    while let Some(rel) = haystack[pos..].find(word) {
+        let start = pos + rel;
+        let end = start + wlen;
+        let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let right_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        pos = start + 1;
+    }
+    false
+}
+
+fn looks_like_fabricated_webmcp_success(answer: &str) -> bool {
+    let lower = answer.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const NEGATED_FAILURE_PHRASES: &[&str] = &[
+        "没有任何错误",
+        "无任何错误",
+        "没有错误或异常",
+        "无错误或异常",
+        "没有失败或异常",
+        "无失败或异常",
+        "没有任何失败",
+        "无任何失败",
+        "没有任何异常",
+        "无任何异常",
+        "没有错误",
+        "无错误",
+        "没有失败",
+        "无失败",
+        "没有异常",
+        "无异常",
+        "without any errors",
+        "without any error",
+        "without errors",
+        "without error",
+        "no errors",
+        "no error",
+        "no failures",
+        "no failure",
+        "zero errors",
+        "0 errors",
+    ];
+    let mut ack_text = lower.clone();
+    for phrase in NEGATED_FAILURE_PHRASES {
+        if ack_text.contains(phrase) {
+            ack_text = ack_text.replace(phrase, " ");
+        }
+    }
+
+    const NEGATED_SUCCESS_PHRASES: &[&str] = &[
+        "were not completed",
+        "was not completed",
+        "wasn't completed",
+        "not been completed",
+        "not completed",
+        "did not succeed",
+        "didn't succeed",
+        "not succeeded",
+        "not successfully",
+        "not dispatched",
+        "not submitted",
+        "not done",
+        "未能完成",
+        "没有完成",
+        "未完成",
+        "没有成功",
+        "未成功",
+    ];
+    let mut success_text = lower.clone();
+    for phrase in NEGATED_SUCCESS_PHRASES {
+        if success_text.contains(phrase) {
+            success_text = success_text.replace(phrase, " ");
+        }
+    }
+
+    const ACK_KEYWORDS: &[&str] = &[
+        "失败",
+        "未注册",
+        "未成功",
+        "未能",
+        "无法",
+        "错误",
+        "异常",
+        "未打开",
+        "请打开",
+        "请先打开",
+        "未连接",
+        "超时",
+        "failed",
+        "error",
+        "not registered",
+        "unavailable",
+        "unable to",
+        "cannot",
+        "open the mini app",
+    ];
+    const SUCCESS_KEYWORDS: &[&str] = &[
+        "已在",
+        "已发起",
+        "已发送",
+        "已提交",
+        "已成功",
+        "已完成",
+        "已为您",
+        "正在向",
+        "实时传输状态",
+        "传输中",
+        "已执行",
+        "操作成功",
+        "发送成功",
+        "提交成功",
+        "执行成功",
+        "处理成功",
+        "任务完成",
+        "succeeded",
+        "completed",
+        "successfully",
+        "dispatched",
+        "submitted",
+    ];
+    let has_ack = ACK_KEYWORDS.iter().any(|k| ack_text.contains(k));
+    let has_success = SUCCESS_KEYWORDS.iter().any(|k| success_text.contains(k))
+        || contains_ascii_word(&success_text, "done");
+    has_success || !has_ack
+}
+
+fn build_webmcp_failure_guard_notice(
+    failures: &[&StepTrace],
+    companion_apps: &[MiniAppRecord],
+) -> String {
+    let mut lines = vec![
+        "⚠️ **小程序操作未完成**".to_string(),
+        "以下关键工具执行失败，未能完成实际操作（未产生有效提交）：".to_string(),
+    ];
+    let mut seen: Vec<String> = Vec::new();
+    for step in failures {
+        let target = step
+            .webmcp_subtool
+            .as_deref()
+            .unwrap_or(step.tool_name.as_str());
+        let reason = step
+            .page_error
+            .as_deref()
+            .or(step.result_preview.as_deref())
+            .or(step.raw_error.as_deref())
+            .unwrap_or("执行失败");
+        let bullet = format!("• `{target}`：{}", truncate_chars(reason, 140));
+        if !seen.contains(&bullet) {
+            seen.push(bullet.clone());
+            lines.push(bullet);
+        }
+    }
+    if let Some(app) = companion_apps.first() {
+        lines.push(format!(
+            "请先点击下方按钮打开或刷新「{}」小程序后重试。",
+            app.title
+        ));
+    } else {
+        lines.push("请先打开或刷新对应小程序窗口后重试。".to_string());
+    }
+    lines.join("\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1390,9 +1749,12 @@ struct StepTrace {
     tool_call_id: String,
     tool_name: String,
     args_preview: String,
+    webmcp_subtool: Option<String>,
     status: StepStatus,
     duration_ms: Option<u64>,
     result_preview: Option<String>,
+    raw_error: Option<String>,
+    page_error: Option<String>,
 }
 
 pub(crate) fn format_live_bot_runtime_card_section(
@@ -1520,14 +1882,22 @@ impl StreamConsumerState {
             } => {
                 self.round_answer_buf.clear();
                 let idx = self.tool_steps.len() + 1;
+                let webmcp_subtool = if tool_name == "webmcp_call_tool" {
+                    extract_webmcp_subtool(&arguments)
+                } else {
+                    None
+                };
                 self.tool_steps.push(StepTrace {
                     idx,
                     tool_call_id,
                     tool_name,
                     args_preview: format_tool_args_preview(&arguments),
+                    webmcp_subtool,
                     status: StepStatus::Running,
                     duration_ms: None,
                     result_preview: None,
+                    raw_error: None,
+                    page_error: None,
                 });
                 true
             }
@@ -1540,10 +1910,17 @@ impl StreamConsumerState {
                 ..
             } => {
                 let single_line = output.split_whitespace().collect::<Vec<_>>().join(" ");
-                let preview = if single_line.is_empty() {
+                let preview = if !success {
+                    extract_step_error_preview(&output)
+                } else if single_line.is_empty() {
                     None
                 } else {
                     Some(truncate_chars(&single_line, 96))
+                };
+                let page_err = if success && tool_name.starts_with("webmcp_") {
+                    extract_webmcp_page_error_from_output(&output)
+                } else {
+                    None
                 };
                 let step_idx = self
                     .tool_steps
@@ -1558,6 +1935,8 @@ impl StreamConsumerState {
                     step.status = if success { StepStatus::Ok } else { StepStatus::Err };
                     step.duration_ms = Some(duration_ms);
                     step.result_preview = preview;
+                    step.raw_error = (!success && !single_line.is_empty()).then_some(single_line);
+                    step.page_error = page_err;
                 }
                 true
             }
@@ -1702,7 +2081,79 @@ impl StreamConsumerState {
         line
     }
 
+    fn unresolved_critical_webmcp_failures(&self) -> Vec<&StepTrace> {
+        let has_any_webmcp_ok = self
+            .tool_steps
+            .iter()
+            .any(|s| s.tool_name.starts_with("webmcp_") && s.status == StepStatus::Ok);
+        self.tool_steps
+            .iter()
+            .filter(|step| match step.tool_name.as_str() {
+                "webmcp_call_tool" => {
+                    if step.status == StepStatus::Err {
+                        let is_readonly = matches!(
+                            step.webmcp_subtool.as_deref(),
+                            Some("get_state" | "page_inspect")
+                        );
+                        if is_readonly {
+                            return false;
+                        }
+                        let later_ok = self.tool_steps.iter().any(|s| {
+                            s.idx > step.idx
+                                && s.tool_name == "webmcp_call_tool"
+                                && s.status == StepStatus::Ok
+                                && s.webmcp_subtool == step.webmcp_subtool
+                        });
+                        !later_ok
+                    } else if step.page_error.is_some() {
+                        !self.tool_steps.iter().any(|s| {
+                            s.idx > step.idx
+                                && s.tool_name.starts_with("webmcp_")
+                                && s.status == StepStatus::Ok
+                                && s.page_error.is_none()
+                        })
+                    } else {
+                        false
+                    }
+                }
+                "invoke_miniapp_action" => {
+                    step.status == StepStatus::Err
+                        && !self.tool_steps.iter().any(|s| {
+                            s.idx > step.idx
+                                && s.tool_name == "invoke_miniapp_action"
+                                && s.status == StepStatus::Ok
+                        })
+                }
+                "webmcp_discover" => {
+                    if step.status == StepStatus::Err {
+                        !has_any_webmcp_ok
+                    } else if step.page_error.is_some() {
+                        !self.tool_steps.iter().any(|s| {
+                            s.idx > step.idx
+                                && s.tool_name.starts_with("webmcp_")
+                                && s.status == StepStatus::Ok
+                                && s.page_error.is_none()
+                        })
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     fn render(&self, is_final: bool, extra_suffix: Option<&str>) -> String {
+        self.render_with_apps(is_final, extra_suffix, &[])
+    }
+
+    fn render_with_apps(
+        &self,
+        is_final: bool,
+        extra_suffix: Option<&str>,
+        companion_apps: &[MiniAppRecord],
+    ) -> String {
         let mut sections: Vec<String> = Vec::new();
 
         if !is_final && !self.thinking_buf.trim().is_empty() {
@@ -1722,6 +2173,21 @@ impl StreamConsumerState {
         }
 
         let mut clean_answer = strip_state_patches_for_display(self.raw_answer_text());
+        let critical_failures = self.unresolved_critical_webmcp_failures();
+        if !critical_failures.is_empty() {
+            if is_final {
+                if clean_answer.trim().is_empty()
+                    || looks_like_fabricated_webmcp_success(&clean_answer)
+                {
+                    clean_answer =
+                        build_webmcp_failure_guard_notice(&critical_failures, companion_apps);
+                }
+            } else if clean_answer.trim().is_empty()
+                || looks_like_fabricated_webmcp_success(&clean_answer)
+            {
+                clean_answer = "⏳ 小程序关键工具调用未成功，正在核验结果…".to_string();
+            }
+        }
         if is_final {
             if let Some(suffix) = extra_suffix.map(str::trim).filter(|s| !s.is_empty()) {
                 if !clean_answer.is_empty() {
@@ -1963,7 +2429,8 @@ fn flush_streamed_bot_message(
         return;
     }
 
-    if is_final && !params.companion_apps.is_empty() {
+    let has_webmcp_failures = !consumer.unresolved_critical_webmcp_failures().is_empty();
+    if is_final && !params.companion_apps.is_empty() && !has_webmcp_failures {
         let patches = extract_state_patches(consumer.raw_answer_text());
         if !patches.is_empty() {
             let schema_apps: Vec<MiniAppRecord> = params
@@ -1985,7 +2452,11 @@ fn flush_streamed_bot_message(
         }
     }
 
-    let rendered = consumer.render(is_final, params.help_bot_commands_suffix.as_deref());
+    let rendered = consumer.render_with_apps(
+        is_final,
+        params.help_bot_commands_suffix.as_deref(),
+        &params.companion_apps,
+    );
     if rendered.trim().is_empty() {
         return;
     }
@@ -7764,5 +8235,376 @@ mod tests {
             &state,
             &ext_app
         ));
+    }
+
+    #[test]
+    fn test_format_tool_args_preview_strips_internal_ids_and_unwraps_nested_json() {
+        let discover_args = json!({
+            "bot_username": "fabushi_bot",
+            "chat_id": 601440062,
+            "short_name": "fabushi"
+        });
+        let disc_preview = format_tool_args_preview(&discover_args);
+        assert_eq!(disc_preview, "", "webmcp_discover should not leak internal IDs: {disc_preview}");
+
+        let nested_str_args = json!({
+            "bot_username": "fabushi_bot",
+            "chat_id": 601440062,
+            "tool_name": "fabushi_send_dharma",
+            "arguments": "{\"sutra\":\"金刚经\",\"opts\":{\"looping\":false}}"
+        });
+        let nested_preview = format_tool_args_preview(&nested_str_args);
+        assert!(nested_preview.starts_with("fabushi_send_dharma "), "got {nested_preview}");
+        assert!(nested_preview.contains("金刚经"), "got {nested_preview}");
+        assert!(!nested_preview.contains("arguments={"), "got {nested_preview}");
+        assert!(!nested_preview.contains("chat_id="), "got {nested_preview}");
+        assert!(!nested_preview.contains("bot_username="), "got {nested_preview}");
+        assert!(!nested_preview.contains('\n'), "got {nested_preview}");
+
+        let missing_tool_name = json!({
+            "bot_username": "fabushi_bot",
+            "chat_id": 601440062,
+            "arguments": { "sutra": "心经", "looping": false }
+        });
+        let unwrapped_preview = format_tool_args_preview(&missing_tool_name);
+        assert!(!unwrapped_preview.contains("arguments={"), "got {unwrapped_preview}");
+        assert!(!unwrapped_preview.contains("chat_id="), "got {unwrapped_preview}");
+        assert!(unwrapped_preview.contains("sutra=心经"), "got {unwrapped_preview}");
+
+        let computer_exec_args = json!({
+            "node_id": "n1",
+            "command": "uptime"
+        });
+        assert_eq!(format_tool_args_preview(&computer_exec_args), "uptime");
+    }
+
+    #[test]
+    fn test_stream_consumer_webmcp_failure_guard_blocks_fabricated_success_and_preserves_honest_failure() {
+        // 1. Reproduce Screenshot 1 sequence with hallucinated success text -> blocked by Failure Guard
+        let mut sc = StreamConsumerState::new();
+        for (idx, (id, tool, sub, ok, out)) in [
+            ("s1", "webmcp_call_tool", Some("fabushi_send_dharma"), false, "Error: 未注册的 WebMCP 工具: fabushi_send_dharma"),
+            ("s2", "webmcp_discover", None, true, "{\"success\":true}"),
+            ("s3", "webmcp_call_tool", Some("get_state"), true, "{\"success\":true}"),
+            ("s4", "webmcp_discover", None, true, "{\"success\":true}"),
+            ("s5", "webmcp_call_tool", Some("fabushi_send_dharma"), false, "Error: 未注册的 WebMCP 工具: fabushi_send_dharma"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let args = match sub {
+                Some(name) => json!({ "bot_username": "fabushi_bot", "chat_id": 601440062, "tool_name": name, "arguments": { "sutra": "金刚经", "looping": false } }),
+                None => json!({ "bot_username": "fabushi_bot", "chat_id": 601440062, "short_name": "fabushi" }),
+            };
+            sc.apply_event(HermesEvent::ToolStart {
+                tool_call_id: id.to_string(),
+                tool_name: tool.to_string(),
+                arguments: args,
+            });
+            sc.apply_event(HermesEvent::ToolResult {
+                tool_call_id: id.to_string(),
+                tool_name: tool.to_string(),
+                success: ok,
+                output: out.to_string(),
+                duration_ms: 100 + idx as u64,
+                inline_buttons: Vec::new(),
+                ui_actions: Vec::new(),
+            });
+        }
+        sc.apply_event(HermesEvent::Done {
+            session_id: "sess_1".to_string(),
+            turn_id: "t1".to_string(),
+            response_text: "已在「全球法布施」小程序中为行者发起《金刚经》单次法布施，实时传输状态良好。".to_string(),
+            reasoning: None,
+            iterations: 5,
+            tool_calls_count: 5,
+            usage: TokenUsage::default(),
+            buttons: Vec::new(),
+        });
+        let rendered = sc.render(true, None);
+        assert!(rendered.contains("🔧 **执行步骤 (5/5 · 2 步失败)**"), "got {rendered}");
+        assert!(rendered.contains("⚠️ **小程序操作未完成**"), "got {rendered}");
+        assert!(rendered.contains("fabushi_send_dharma"), "got {rendered}");
+        assert!(!rendered.contains("已在「全球法布施」小程序中"), "fabricated success leaked: {rendered}");
+        assert!(!rendered.contains("chat_id="), "internal chat_id leaked: {rendered}");
+        assert!(!rendered.contains("bot_username="), "internal bot_username leaked: {rendered}");
+
+        // 2. Retry-then-succeed -> preserves success text
+        let mut sc_retry = StreamConsumerState::new();
+        sc_retry.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "r1".into(),
+            tool_name: "webmcp_call_tool".into(),
+            arguments: json!({"tool_name": "fabushi_send_dharma", "arguments": {"sutra": "金刚经"}}),
+        });
+        sc_retry.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "r1".into(),
+            tool_name: "webmcp_call_tool".into(),
+            success: false,
+            output: "Error: 未注册的 WebMCP 工具: fabushi_send_dharma".into(),
+            duration_ms: 50,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        sc_retry.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "r2".into(),
+            tool_name: "webmcp_call_tool".into(),
+            arguments: json!({"tool_name": "fabushi_send_dharma", "arguments": {"sutra": "金刚经"}}),
+        });
+        sc_retry.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "r2".into(),
+            tool_name: "webmcp_call_tool".into(),
+            success: true,
+            output: "{\"success\":true}".into(),
+            duration_ms: 80,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        sc_retry.apply_event(HermesEvent::Done {
+            session_id: "sess_2".into(),
+            turn_id: "t2".into(),
+            response_text: "已在「全球法布施」小程序中发起《金刚经》。".into(),
+            reasoning: None,
+            iterations: 2,
+            tool_calls_count: 2,
+            usage: TokenUsage::default(),
+            buttons: Vec::new(),
+        });
+        let retry_rendered = sc_retry.render(true, None);
+        assert!(retry_rendered.contains("已在「全球法布施」小程序中发起《金刚经》。"), "got {retry_rendered}");
+        assert!(!retry_rendered.contains("⚠️ **小程序操作未完成**"), "got {retry_rendered}");
+
+        // 3. Honest failure reply -> preserved verbatim
+        let mut sc_honest = StreamConsumerState::new();
+        sc_honest.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "h1".into(),
+            tool_name: "webmcp_call_tool".into(),
+            arguments: json!({"tool_name": "fabushi_send_dharma", "arguments": {}}),
+        });
+        sc_honest.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "h1".into(),
+            tool_name: "webmcp_call_tool".into(),
+            success: false,
+            output: "Error: 未注册的 WebMCP 工具: fabushi_send_dharma".into(),
+            duration_ms: 30,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        sc_honest.apply_event(HermesEvent::Done {
+            session_id: "sess_3".into(),
+            turn_id: "t3".into(),
+            response_text: "操作失败：未注册的工具 fabushi_send_dharma，请先打开小程序。".into(),
+            reasoning: None,
+            iterations: 1,
+            tool_calls_count: 1,
+            usage: TokenUsage::default(),
+            buttons: Vec::new(),
+        });
+        let honest_rendered = sc_honest.render(true, None);
+        assert!(honest_rendered.contains("操作失败：未注册的工具 fabushi_send_dharma"), "got {honest_rendered}");
+        assert!(!honest_rendered.contains("⚠️ **小程序操作未完成**"), "got {honest_rendered}");
+
+        // 4. Non-WebMCP tool failure -> unaffected
+        let mut sc_non_webmcp = StreamConsumerState::new();
+        sc_non_webmcp.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "n1".into(),
+            tool_name: "computer_exec".into(),
+            arguments: json!({"node_id": "n1", "command": "ls /missing"}),
+        });
+        sc_non_webmcp.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "n1".into(),
+            tool_name: "computer_exec".into(),
+            success: false,
+            output: "No such file or directory".into(),
+            duration_ms: 20,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        sc_non_webmcp.apply_event(HermesEvent::Done {
+            session_id: "sess_4".into(),
+            turn_id: "t4".into(),
+            response_text: "已完成目录检查，目标路径不存在。".into(),
+            reasoning: None,
+            iterations: 1,
+            tool_calls_count: 1,
+            usage: TokenUsage::default(),
+            buttons: Vec::new(),
+        });
+        let non_webmcp_rendered = sc_non_webmcp.render(true, None);
+        assert!(non_webmcp_rendered.contains("已完成目录检查，目标路径不存在。"), "got {non_webmcp_rendered}");
+        assert!(!non_webmcp_rendered.contains("⚠️ **小程序操作未完成**"), "got {non_webmcp_rendered}");
+    }
+
+    #[test]
+    fn test_flush_streamed_bot_message_skips_state_patch_when_webmcp_call_tool_fails() {
+        let (_dir, state) = test_state("flush_skip_state_patch_on_webmcp_err");
+        let (user, _sess, _tok) = state
+            .session_manager
+            .register("patch_guard_u", "Pass123456!", "PatchGuard", None, "CLI")
+            .unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        state
+            .db
+            .create_user(&crate::db::schema::UserRecord {
+                user_id: user.user_id,
+                username: Some("patch_guard_u".to_string()),
+                phone: None,
+                first_name: "PatchGuard".to_string(),
+                last_name: None,
+                bio: None,
+                password_hash: None,
+                is_bot: false,
+                is_verified: false,
+                is_support: false,
+                is_scam: false,
+                is_fake: false,
+                profile_photo_file_id: None,
+                account_generation: 1,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            })
+            .unwrap();
+        let bot = state
+            .db
+            .create_registered_bot(
+                user.user_id.0 as i64,
+                "patch_guard_bot",
+                "Patch Guard Bot",
+                "desc",
+                "about",
+                "persona",
+                "",
+                "",
+                "[]",
+                false,
+                true,
+            )
+            .unwrap();
+        let schema_json = json!({
+            "title": "Dharma App",
+            "widgets": [{ "id": "sutra", "kind": "TextInput", "label": "Sutra", "value": "初始" }]
+        })
+        .to_string();
+        let app = state
+            .db
+            .create_or_upsert_mini_app_with_options(
+                bot.bot_user_id,
+                "patch_guard_bot",
+                "dharma",
+                "全球法布施",
+                "desc",
+                "tools",
+                "☸️",
+                None,
+                &schema_json,
+                true,
+                true,
+                false,
+                "",
+                "",
+                None,
+                false,
+            )
+            .unwrap();
+        let (chat, _) = state
+            .db
+            .ensure_companion_bot_chat_record(user.user_id, UserId(bot.bot_user_id as u64))
+            .unwrap();
+
+        let mut consumer = StreamConsumerState::new();
+        consumer.apply_event(HermesEvent::ToolStart {
+            tool_call_id: "w1".into(),
+            tool_name: "webmcp_call_tool".into(),
+            arguments: json!({ "tool_name": "fabushi_send_dharma", "arguments": { "sutra": "金刚经" } }),
+        });
+        consumer.apply_event(HermesEvent::ToolResult {
+            tool_call_id: "w1".into(),
+            tool_name: "webmcp_call_tool".into(),
+            success: false,
+            output: "Error: 未注册的 WebMCP 工具: fabushi_send_dharma".into(),
+            duration_ms: 42,
+            inline_buttons: Vec::new(),
+            ui_actions: Vec::new(),
+        });
+        consumer.apply_event(HermesEvent::Done {
+            session_id: "s_guard".into(),
+            turn_id: "t_guard".into(),
+            response_text: "已在「全球法布施」发起《金刚经》。\n[STATE_PATCH]{\"sutra\":\"金刚经\"}[/STATE_PATCH]".into(),
+            reasoning: None,
+            iterations: 1,
+            tool_calls_count: 1,
+            usage: TokenUsage::default(),
+            buttons: Vec::new(),
+        });
+
+        let params = BotStreamTurnParams {
+            chat_id: chat,
+            sender_id: user.user_id,
+            bot_user_id: UserId(bot.bot_user_id as u64),
+            bot_display_name: Some("Patch Guard Bot".to_string()),
+            bot_model: None,
+            prompt: "发金刚经".to_string(),
+            base_system_prompt: None,
+            explicit_model: None,
+            extra_context_sections: Vec::new(),
+            companion_apps: vec![app.clone()],
+            help_bot_commands_suffix: None,
+            floor_fence: None,
+        };
+
+        flush_streamed_bot_message(&state, &params, &mut consumer, true, false, "patch_guard");
+
+        // Verify state was NOT mutated by [STATE_PATCH]
+        let saved_state = state
+            .db
+            .get_latest_mini_app_state_for_bot_user(user.user_id.0 as i64, bot.bot_user_id)
+            .ok()
+            .flatten();
+        assert!(
+            saved_state.is_none_or(|s| !s.state_json.contains("金刚经")),
+            "failed webmcp turn must NOT apply [STATE_PATCH]"
+        );
+
+        // Verify saved bot message contains Failure Guard notice and NOT fabricated success
+        let msgs = state.db.list_messages(chat, None, 20).unwrap();
+        let bot_msg = msgs
+            .iter()
+            .rev()
+            .find(|m| m.sender_id == UserId(bot.bot_user_id as u64))
+            .expect("saved bot message");
+        let text = &bot_msg.content_json;
+        assert!(text.contains("小程序操作未完成"), "got {text}");
+        assert!(text.contains("全球法布施"), "got {text}");
+        assert!(!text.contains("已在「全球法布施」发起《金刚经》"), "got {text}");
+    }
+
+    #[test]
+    fn test_looks_like_fabricated_webmcp_success_blocks_negated_errors_and_preserves_not_completed() {
+        // Negated-error fabricated success strings MUST be blocked (return true)
+        for fabricated in [
+            "操作已成功提交（如遇错误可忽略）",
+            "操作成功，无错误。",
+            "任务完成，没有失败或异常。",
+            "发送成功！无任何错误。",
+            "Done! No error occurred.",
+            "Completed without any error.",
+        ] {
+            assert!(
+                looks_like_fabricated_webmcp_success(fabricated),
+                "expected fabricated success detection for: {fabricated}"
+            );
+        }
+
+        // Honest failure replies (including English "not completed") MUST be preserved (return false)
+        for honest in [
+            "操作失败：未注册的工具 fabushi_send_dharma，请先打开小程序。",
+            "未能完成操作，请先在桌面端打开小程序后重试。",
+            "The action was not completed due to error: tool not registered.",
+            "The Mini App action failed and was not completed.",
+        ] {
+            assert!(
+                !looks_like_fabricated_webmcp_success(honest),
+                "expected honest failure preservation for: {honest}"
+            );
+        }
     }
 }

@@ -7,6 +7,7 @@ use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::chat_sidebar::{DialogItemModel, COLLAPSED_WIDTH};
 use crate::views::nav_rail::{NavDestination, NavRail};
+use crate::views::sidebar::dialogs_row_view::{render_dialog_avatar, SidebarDialogMeta};
 
 pub use super::gemini_expanded_sidebar::*;
 
@@ -222,7 +223,7 @@ fn render_collapsed_icon_btn<V: 'static>(
 /// Renders the `64px` collapsed rail with expand toggle, new-chat/contacts shortcuts, scrollable chat avatars, add-friend & account triggers.
 pub fn render_collapsed_gemini_sidebar<V: 'static>(
     nav: &UnifiedNavSnapshot,
-    dialogs: &[&DialogItemModel],
+    dialogs: &[(&DialogItemModel, SidebarDialogMeta)],
     active_chat_id: Option<u64>,
     hovered_item: Option<&'static str>,
     hovered_dialog_id: Option<u64>,
@@ -245,6 +246,11 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
         rgb(palette.dialogs_hover_bg)
     };
     let active_ring = rgb(palette.accent);
+    let online_border = if is_apple {
+        palette.sidebar_bg_rgba()
+    } else {
+        rgb(palette.dialogs_bg)
+    };
     let avatar_grad = palette.peer_avatar_gradient(1);
 
     let on_toggle_hover = on_action.clone();
@@ -416,15 +422,10 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                 .flex_col()
                 .items_center()
                 .gap(px(8.0))
-                .children(dialogs.iter().map(|dialog| {
+                .children(dialogs.iter().map(|(dialog, meta)| {
                     let dialog_id = dialog.id;
                     let is_active = active_chat_id == Some(dialog_id);
                     let is_hovered = hovered_dialog_id == Some(dialog_id);
-                    let avatar_bg = if dialog.avatar_color == 0 {
-                        palette.peer_avatar_gradient(dialog_id as i64).0
-                    } else {
-                        dialog.avatar_color
-                    };
                     let unread_bg = if dialog.is_muted {
                         rgb(palette.muted_badge_bg)
                     } else {
@@ -432,6 +433,48 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                     };
                     let on_d_hover = on_action.clone();
                     let on_d_click = on_action.clone();
+                    let avatar = render_dialog_avatar(
+                        dialog,
+                        meta,
+                        palette,
+                        34.0,
+                        palette.dialogs_bg,
+                        online_border,
+                    )
+                    .when(dialog.unread_count > 0, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(-3.0))
+                                .right(px(-4.0))
+                                .min_w(px(16.0))
+                                .h(px(16.0))
+                                .px(px(4.0))
+                                .rounded_full()
+                                .bg(unread_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(palette.unread_badge_fg))
+                                .child(format_compact_badge(dialog.unread_count)),
+                        )
+                    })
+                    .when(dialog.unread_count == 0 && meta.is_unread_marked, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(-1.0))
+                                .right(px(-1.0))
+                                .w(px(9.0))
+                                .h(px(9.0))
+                                .rounded_full()
+                                .bg(unread_bg)
+                                .border_1()
+                                .border_color(online_border),
+                        )
+                    });
 
                     div()
                         .id(("rail-dialog-btn", dialog_id as usize))
@@ -456,55 +499,7 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                                 on_d_click(this, UnifiedSidebarAction::SelectDialog(dialog_id), cx);
                             }),
                         )
-                        .child(
-                            div()
-                                .relative()
-                                .w(px(34.0))
-                                .h(px(34.0))
-                                .rounded_full()
-                                .bg(rgb(avatar_bg))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0xFFFFFF))
-                                .child(dialog.avatar_initials.clone())
-                                .when(dialog.is_online, |el| {
-                                    el.child(
-                                        div()
-                                            .absolute()
-                                            .bottom(px(-1.0))
-                                            .right(px(-1.0))
-                                            .w(px(9.0))
-                                            .h(px(9.0))
-                                            .rounded_full()
-                                            .bg(rgb(palette.online_dot_fg))
-                                            .border_1()
-                                            .border_color(rgb(palette.dialogs_bg)),
-                                    )
-                                })
-                                .when(dialog.unread_count > 0, |el| {
-                                    el.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(-3.0))
-                                            .right(px(-4.0))
-                                            .min_w(px(16.0))
-                                            .h(px(16.0))
-                                            .px(px(4.0))
-                                            .rounded_full()
-                                            .bg(unread_bg)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(9.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(palette.unread_badge_fg))
-                                            .child(format_compact_badge(dialog.unread_count)),
-                                    )
-                                }),
-                        )
+                        .child(avatar)
                         .when(is_hovered, |el| {
                             el.child(render_floating_pill_tooltip(&dialog.peer_name, palette))
                         })

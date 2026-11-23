@@ -248,12 +248,8 @@ pub fn reset_account_conversation_views(
 }
 
 fn clear_inspector_peer(inspector: &mut ContextInspector) {
-    inspector.profile.name.clear();
-    inspector.profile.status.clear();
-    inspector.profile.avatar_initials.clear();
+    inspector.clear_peer_facts();
     inspector.profile.avatar_color = 0x2AABEE;
-    inspector.profile.facts.clear();
-    inspector.media_items.clear();
 }
 
 pub fn select_authoritative_dialog(
@@ -272,6 +268,8 @@ pub fn select_authoritative_dialog(
         return false;
     };
 
+    let is_chat_switch = stage.active_chat_id != Some(chat_id);
+
     sidebar.select_dialog(chat_id);
     sidebar.inner_widget.selected_index = Some(idx);
 
@@ -286,6 +284,18 @@ pub fn select_authoritative_dialog(
     stage.is_group_chat = dialog.folder == "Groups" || dialog.folder == "Channels";
     stage.is_saved_messages = dialog.peer_name == "Saved Messages" || dialog.peer_name == "收藏夹";
 
+    if is_chat_switch {
+        inspector.clear_peer_facts();
+    }
+    let is_bot = dialog.folder == "Bots" || sidebar.bot_ids.contains(&chat_id);
+    let is_group_or_channel = !is_bot
+        && (dialog.folder == "Groups"
+            || dialog.folder == "Channels"
+            || sidebar.group_chat_ids.contains(&chat_id)
+            || sidebar.channel_chat_ids.contains(&chat_id));
+    inspector.profile.is_bot = is_bot;
+    inspector.members.is_group_or_channel = is_group_or_channel;
+
     let avatar_initials = if dialog.avatar_initials.trim().is_empty() {
         derive_initials(&dialog.peer_name)
     } else {
@@ -295,8 +305,10 @@ pub fn select_authoritative_dialog(
     inspector.profile.status = subtitle;
     inspector.profile.avatar_initials = avatar_initials;
     inspector.profile.avatar_color = dialog.avatar_color;
-    inspector.profile.facts.clear();
-    inspector.media_items.clear();
+    if is_chat_switch {
+        inspector.profile.facts.clear();
+        inspector.media_items.clear();
+    }
     true
 }
 
@@ -1003,8 +1015,9 @@ pub fn validate_selected_send_target(
     if !is_authenticated {
         return None;
     }
-    // P0 guard: never leak a composer send into a previously selected chat while compose mode is open.
-    if sidebar.is_apple_compose_active() {
+    // P0 guard: never leak a composer send into a previously selected chat while compose mode is open,
+    // and block composer submission while an unstarted bot's START bar replaces the composer.
+    if sidebar.is_apple_compose_active() || stage.show_bot_start_bar {
         return None;
     }
     let has_token = token.is_some_and(|t| !t.trim().is_empty());

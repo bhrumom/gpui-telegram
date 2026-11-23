@@ -353,7 +353,8 @@ impl ConversationStage {
             }
             if !parts.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(parts.join("\n")));
-                self.toast_banner = Some(tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Copied to clipboard").to_string());
+                let msg = tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Copied to clipboard").to_string();
+                self.show_toast_banner(msg, cx);
             }
             self.selected_message_ids.clear();
             self.select_mode_active = false;
@@ -783,7 +784,8 @@ impl ConversationStage {
             }
             RichTextAction::CopyCode(code) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(code));
-                self.toast_banner = Some(tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Code copied").to_string());
+                let msg = tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Code copied").to_string();
+                self.show_toast_banner(msg, cx);
             }
             RichTextAction::OpenUrl(url) => self.pending_media_url = Some((url, false)),
             RichTextAction::ClickMention(m) | RichTextAction::ClickHashtag(m) | RichTextAction::ClickBotCommand(m) => {
@@ -845,7 +847,8 @@ impl ConversationStage {
             ContextMenuAction::CopyText(msg_id) => {
                 if let Some(t) = self.copy_message_text(msg_id) {
                     cx.write_to_clipboard(ClipboardItem::new_string(t));
-                    self.toast_banner = Some(tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Copied to clipboard").to_string());
+                    let msg = tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Copied to clipboard").to_string();
+                    self.show_toast_banner(msg, cx);
                 }
             }
             ContextMenuAction::Forward(msg_id) => {
@@ -930,7 +933,7 @@ impl ConversationStage {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.toast_banner = None;
+                            this.dismiss_toast_banner();
                             cx.notify();
                         }),
                     )

@@ -6934,14 +6934,207 @@ pub async fn serve_miniapp_html(
   <script>
     (function() {{
       var frame = document.getElementById('tg-app-frame');
+      if (!frame) return;
+      try {{
+        var rawHash = String(window.location.hash || '');
+        var curSrc = String(frame.getAttribute('src') || frame.src || '');
+        if (rawHash && (rawHash.indexOf('tgWebAppData=') !== -1 || rawHash.indexOf('init_data=') !== -1) && curSrc.indexOf('tgWebAppData=') === -1) {{
+          var hashBody = rawHash.charAt(0) === '#' ? rawHash.slice(1) : rawHash;
+          var sep = curSrc.indexOf('#') !== -1 ? '&' : '#';
+          frame.src = curSrc + sep + hashBody;
+        }}
+      }} catch (_) {{}}
+
+      var iframeReady = false;
+      var iframeUrl = String(frame.src || '');
+      var iframeTools = [];
+      var iframeStateSummary = null;
+      var pendingInvokes = [];
+      var pendingPromises = {{}};
+      var fallbackTimer = null;
+
+      function postBridge(eventType, data) {{
+        try {{
+          if (window.TelegramWebviewProxy && typeof window.TelegramWebviewProxy.postEvent === 'function') {{
+            window.TelegramWebviewProxy.postEvent(String(eventType || ''), JSON.stringify(data == null ? {{}} : data));
+          }}
+        }} catch (_) {{}}
+      }}
+
+      function postToParent(msg) {{
+        try {{
+          if (window.parent && window.parent !== window && typeof window.parent.postMessage === 'function') {{
+            window.parent.postMessage(msg, '*');
+          }}
+        }} catch (_) {{}}
+      }}
+
+      function settlePending(reqId, payload) {{
+        var entry = pendingPromises[reqId];
+        if (!entry) return;
+        delete pendingPromises[reqId];
+        if (entry.timer) clearTimeout(entry.timer);
+        try {{ entry.resolve(payload); }} catch (_) {{}}
+      }}
+
+      function dispatchInvokeToFrame(msg) {{
+        if (!msg || typeof msg !== 'object') return;
+        if (iframeReady && frame.contentWindow) {{
+          try {{
+            frame.contentWindow.postMessage(msg, '*');
+            return;
+          }} catch (_) {{}}
+        }}
+        pendingInvokes.push(msg);
+      }}
+
+      function flushPendingInvokes() {{
+        if (!frame.contentWindow || !pendingInvokes.length) return;
+        var batch = pendingInvokes.splice(0, pendingInvokes.length);
+        for (var i = 0; i < batch.length; i++) {{
+          try {{
+            frame.contentWindow.postMessage(batch[i], '*');
+          }} catch (_) {{}}
+        }}
+      }}
+
+      frame.addEventListener('load', function() {{
+        iframeUrl = String(frame.src || iframeUrl || '');
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        fallbackTimer = setTimeout(function() {{
+          if (!iframeReady && pendingInvokes.length && frame.contentWindow) {{
+            flushPendingInvokes();
+          }}
+        }}, 1500);
+      }});
+
+      window.__GPUI_WEBMCP_HOST_WRAPPER__ = true;
+      var prevWebMcp = window.__GPUI_WEBMCP__ || {{}};
+      window.__GPUI_WEBMCP__ = {{
+        _isHostWrapper: true,
+        _tools: prevWebMcp._tools || {{}},
+        discover: function() {{
+          return iframeTools.slice();
+        }},
+        readState: function() {{
+          return iframeStateSummary || {{
+            kind: 'iframe_host',
+            iframe_ready: iframeReady,
+            url: iframeUrl
+          }};
+        }},
+        checkReady: function() {{
+          if (iframeReady) {{
+            postBridge('__gpui_webmcp_page_ready', {{
+              url: iframeUrl,
+              in_iframe: true,
+              tools: iframeTools,
+              state_summary: iframeStateSummary
+            }});
+          }} else if (frame.contentWindow) {{
+            try {{
+              frame.contentWindow.postMessage({{ type: 'gpui_webmcp_ping_ready' }}, '*');
+            }} catch (_) {{}}
+          }}
+          return iframeReady;
+        }},
+        invoke: function(requestId, operation, toolName, args) {{
+          var reqId = String(requestId || ('wmcp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8)));
+          var op = String(operation || 'call_tool');
+          var msg = {{
+            type: 'gpui_webmcp_invoke',
+            request_id: reqId,
+            operation: op,
+            tool_name: toolName == null ? null : String(toolName),
+            arguments: args && typeof args === 'object' ? args : {{}}
+          }};
+          return new Promise(function(resolve) {{
+            var timer = setTimeout(function() {{
+              var timeoutPayload = {{
+                request_id: reqId,
+                ok: false,
+                result: {{}},
+                error: iframeReady
+                  ? ('小程序内部工具调用超时: ' + String(toolName || op))
+                  : ('小程序内嵌页面尚未就绪，无法执行工具: ' + String(toolName || op)),
+                tools: iframeTools.slice(),
+                state_summary: iframeStateSummary || {{ kind: 'iframe_host', iframe_ready: iframeReady, url: iframeUrl }},
+                control_mode: 'ai_controlling'
+              }};
+              settlePending(reqId, timeoutPayload);
+              postBridge('webmcp_response', timeoutPayload);
+            }}, 14000);
+            pendingPromises[reqId] = {{ resolve: resolve, timer: timer }};
+            dispatchInvokeToFrame(msg);
+          }});
+        }}
+      }};
+
       window.addEventListener('message', function(ev) {{
         var d = ev && ev.data;
+        if (typeof d === 'string') {{
+          try {{ d = JSON.parse(d); }} catch (_) {{ return; }}
+        }}
         if (!d || typeof d !== 'object') return;
-        if (ev.source === frame.contentWindow && d.type === 'telegram_web_app_event') {{
-          if (window.TelegramWebviewProxy && window.TelegramWebviewProxy.postEvent) {{
-            window.TelegramWebviewProxy.postEvent(d.eventType, JSON.stringify(d.eventData || {{}}));
+        if (frame.contentWindow && ev.source === frame.contentWindow) {{
+          if (d.type === 'telegram_web_app_event') {{
+            postBridge(d.eventType, d.eventData || {{}});
+            postToParent(d);
+          }} else if (d.type === 'gpui_webmcp_ready' || d.type === 'webmcp_ready') {{
+            iframeReady = true;
+            if (fallbackTimer) {{ clearTimeout(fallbackTimer); fallbackTimer = null; }}
+            if (d.url) iframeUrl = String(d.url);
+            if (Array.isArray(d.tools)) iframeTools = d.tools;
+            if (d.state_summary && typeof d.state_summary === 'object') iframeStateSummary = d.state_summary;
+            flushPendingInvokes();
+            postBridge('__gpui_webmcp_page_ready', {{
+              url: iframeUrl,
+              in_iframe: true,
+              tools: iframeTools,
+              state_summary: iframeStateSummary
+            }});
+            postToParent(d);
+          }} else if (d.type === 'gpui_webmcp_unready') {{
+            iframeReady = false;
+            iframeTools = [];
+            iframeStateSummary = null;
+            postBridge('__gpui_webmcp_page_unready', {{ url: String(d.url || iframeUrl || ''), in_iframe: true }});
+            postToParent(d);
+          }} else if (d.type === 'gpui_webmcp_tools_changed') {{
+            if (Array.isArray(d.tools)) iframeTools = d.tools;
+            postBridge('gpui_webmcp_tools_changed', {{
+              url: String(d.url || iframeUrl || ''),
+              in_iframe: true,
+              tools: iframeTools
+            }});
+            postToParent(d);
+          }} else if (d.type === 'gpui_webmcp_state_update') {{
+            var st = d.payload || d.state_summary || null;
+            if (st && typeof st === 'object') iframeStateSummary = st;
+            postBridge('webmcp_state_update', iframeStateSummary || {{}});
+            postToParent(d);
+          }} else if (d.type === 'gpui_webmcp_response') {{
+            var payload = (d.payload && typeof d.payload === 'object') ? d.payload : d;
+            var rid = String(payload.request_id || d.request_id || '');
+            if (!payload.request_id && rid) payload.request_id = rid;
+            if (payload.state_summary && typeof payload.state_summary === 'object') {{
+              iframeStateSummary = payload.state_summary;
+            }}
+            if (Array.isArray(payload.tools) && payload.tools.length) {{
+              iframeTools = payload.tools;
+            }}
+            settlePending(rid, payload);
+            postBridge('webmcp_response', payload);
+            postToParent(d);
           }}
-        }} else if (ev.source === window.parent && frame.contentWindow) {{
+          return;
+        }}
+
+        if (d.type === 'gpui_webmcp_invoke' && (ev.source === window.parent || ev.source === window)) {{
+          dispatchInvokeToFrame(d);
+          return;
+        }}
+        if (ev.source === window.parent && frame.contentWindow) {{
           frame.contentWindow.postMessage(d, '*');
         }}
       }});

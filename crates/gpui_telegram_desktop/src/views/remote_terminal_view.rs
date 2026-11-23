@@ -1606,7 +1606,7 @@ impl Render for RemoteTerminalView {
 mod tests {
     use super::*;
 
-    #[test]
+    #[std::prelude::v1::test]
     fn test_ansi_vt100_sgr_16_256_truecolor_cursor_scrollback_and_osc52() {
         let mut screen = TerminalScreen::new(40, 6);
         screen.feed_str("\x1b[31mRed\x1b[38;5;196m256\x1b[38;2;12;34;56mTC\x1b[0m\r\n");
@@ -1643,7 +1643,7 @@ mod tests {
         assert_eq!(extracted, "hello world\nsecond");
     }
 
-    #[test]
+    #[std::prelude::v1::test]
     fn test_key_encoding_and_multi_tab_session_lifecycle() {
         assert_eq!(
             encode_terminal_key("enter", false, false, false, None),

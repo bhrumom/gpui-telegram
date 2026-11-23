@@ -2,6 +2,7 @@
 //! Upstream reference: `tdesktop/Telegram/SourceFiles/history/view/controls/history_view_bot_menu_button.cpp`
 //! Upstream header: `tdesktop/Telegram/SourceFiles/history/view/controls/history_view_bot_menu_button.h`
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use crate::theme::TdesktopThemePalette;
 
@@ -101,11 +102,17 @@ impl Render for HistoryViewBotMenuButtonViewControls {
         let mut inner = div()
             .flex()
             .items_center()
+            .min_w(px(0.0))
             .gap(px(4.0))
             .child("☰");
 
         if !is_small {
-            inner = inner.child(text);
+            inner = inner.child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .child(text),
+            );
         }
 
         div()
@@ -115,13 +122,14 @@ impl Render for HistoryViewBotMenuButtonViewControls {
             .flex()
             .items_center()
             .justify_center()
-            .h(px(28.0))
-            .px(px(10.0))
+            .h(px(36.0))
+            .when(is_small, |d| d.w(px(36.0)).px(px(0.0)))
+            .when(!is_small, |d| d.max_w(px(180.0)).px(px(12.0)))
             .rounded_full()
             .bg(soft_bg)
             .border_1()
             .border_color(soft_border)
-            .text_size(px(11.5))
+            .text_size(px(12.0))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(accent))
             .hover(move |s| s.bg(soft_hover))

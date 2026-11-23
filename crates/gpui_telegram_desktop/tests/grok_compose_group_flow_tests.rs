@@ -394,3 +394,108 @@ fn open_compose_with_seed_recipient_populates_chip_and_enters_group_mode() {
     sb.move_compose_highlight(-2, 3);
     assert_eq!(sb.compose_draft.highlighted_index, 2);
 }
+
+#[test]
+fn bot_to_group_chat_switch_isolates_inspector_bio_copied_feedback_and_stage_toast() {
+    use gpui_telegram_desktop::views::drawer::inspector_tabs::{InspectorSubpage, InspectorTab};
+    use gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto;
+
+    let mut sidebar = ChatSidebar::new();
+    let mut stage = ConversationStage::new();
+    let mut inspector = ContextInspector::new();
+
+    let chats = vec![
+        ChatSummary {
+            chat_id: 101,
+            title: "全球法布施".to_string(),
+            chat_type: 4,
+            last_message: Some("Welcome".to_string()),
+            unread_count: 0,
+            is_group: Some(false),
+            is_bot: Some(true),
+            avatar_color: Some(0x8F59F9),
+            updated_at: Some(1_730_000_000_000),
+        },
+        ChatSummary {
+            chat_id: 202,
+            title: "AA 记账分账助手".to_string(),
+            chat_type: 1,
+            last_message: Some("Group created".to_string()),
+            unread_count: 0,
+            is_group: Some(true),
+            is_bot: Some(false),
+            avatar_color: Some(0x2AABEE),
+            updated_at: Some(1_730_000_001_000),
+        },
+    ];
+    apply_authoritative_chat_list(&mut sidebar, &mut stage, &mut inspector, &chats);
+
+    // 1. Select Bot chat 101 and populate Bot-specific inspector & stage state
+    assert!(select_authoritative_dialog(
+        &mut sidebar,
+        &mut stage,
+        &mut inspector,
+        101
+    ));
+    assert!(inspector.profile.is_bot);
+    assert!(!inspector.members.is_group_or_channel);
+
+    let bot_summary = FabushiBotSummaryDto {
+        bot_user_id: 777001,
+        agent_id: "fabushi".to_string(),
+        username: "fabushi_bot".to_string(),
+        display_name: "全球法布施".to_string(),
+        ..Default::default()
+    };
+    inspector.profile.bio = "全球法布施与净心禅室 AI Bot".to_string();
+    inspector.profile.username = "@fabushi_bot".to_string();
+    inspector.profile.avatar_path = Some("/tmp/fabushi.png".to_string());
+    inspector.profile.is_verified = true;
+    inspector.copied_feedback = Some("已复制: @fabushi_bot".to_string());
+    inspector.active_fabushi_bot = Some(bot_summary.clone());
+    inspector.subpage = InspectorSubpage::ComputersList;
+    inspector.active_tab = InspectorTab::Members;
+
+    stage.toast_banner = Some("Copied to clipboard".to_string());
+    stage.set_active_fabushi_bot(Some(bot_summary));
+    stage.on_agent_floor_changed(101, Some("全球法布施".to_string()), 1, 1, 50_000);
+
+    // 2. Switch to Group chat 202 -> synchronous isolation across Inspector and Stage
+    assert!(select_authoritative_dialog(
+        &mut sidebar,
+        &mut stage,
+        &mut inspector,
+        202
+    ));
+    assert_eq!(inspector.profile.name, "AA 记账分账助手");
+    assert!(inspector.profile.bio.is_empty());
+    assert!(inspector.profile.username.is_empty());
+    assert!(inspector.profile.phone.is_empty());
+    assert!(inspector.profile.avatar_path.is_none());
+    assert!(!inspector.profile.is_verified);
+    assert!(!inspector.profile.is_bot);
+    assert!(inspector.members.is_group_or_channel);
+    assert!(inspector.copied_feedback.is_none());
+    assert!(inspector.active_fabushi_bot.is_none());
+    assert_eq!(inspector.subpage, InspectorSubpage::Main);
+    assert_eq!(inspector.active_tab, InspectorTab::Profile);
+
+    assert!(stage.is_group_chat);
+    assert!(!stage.is_bot_chat);
+    assert!(stage.toast_banner.is_none());
+    assert!(stage.active_fabushi_bot.is_none());
+    assert!(stage.room_agent_states.is_empty());
+
+    // 3. Same-chat refresh preserves populated Group bio/tab/facts
+    inspector.profile.bio = "AA 分账群描述".to_string();
+    inspector.active_tab = InspectorTab::Members;
+    inspector.profile.facts = vec![("类型".to_string(), "群组".to_string())];
+    let preserved = apply_authoritative_chat_list(&mut sidebar, &mut stage, &mut inspector, &chats);
+    assert_eq!(preserved, Some(202));
+    assert_eq!(inspector.profile.bio, "AA 分账群描述");
+    assert_eq!(inspector.active_tab, InspectorTab::Members);
+    assert_eq!(
+        inspector.profile.facts,
+        vec![("类型".to_string(), "群组".to_string())]
+    );
+}

@@ -4,6 +4,7 @@
 //! until the user explicitly clicks `消息` (Message) or `打开应用` (Open App).
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -41,6 +42,8 @@ pub enum BotProfileBoxAction {
     ToggleStopAndBlock,
 }
 
+pub const BOT_PROFILE_COPIED_FEEDBACK_DURATION_MS: u64 = 2_000;
+
 pub struct BotProfileBox {
     pub is_visible: bool,
     pub profile: BotPublicProfileDto,
@@ -48,6 +51,7 @@ pub struct BotProfileBox {
     pub language_id: String,
     pub pending_actions: VecDeque<BotProfileBoxAction>,
     pub copied_feedback: Option<String>,
+    pub copied_feedback_gen: u64,
 }
 
 impl BotProfileBox {
@@ -63,12 +67,48 @@ impl BotProfileBox {
             language_id: lang_id.into(),
             pending_actions: VecDeque::new(),
             copied_feedback: None,
+            copied_feedback_gen: 0,
         }
+    }
+
+    pub fn clear_copied_feedback(&mut self) {
+        self.copied_feedback_gen = self.copied_feedback_gen.wrapping_add(1);
+        self.copied_feedback = None;
+    }
+
+    pub fn show_copied_feedback(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
+        self.show_copied_feedback_with_duration(
+            msg,
+            Duration::from_millis(BOT_PROFILE_COPIED_FEEDBACK_DURATION_MS),
+            cx,
+        );
+    }
+
+    pub fn show_copied_feedback_with_duration(
+        &mut self,
+        msg: impl Into<String>,
+        duration: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.copied_feedback_gen.wrapping_add(1);
+        self.copied_feedback_gen = generation;
+        self.copied_feedback = Some(msg.into());
+        cx.notify();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            app.background_executor().timer(duration).await;
+            let _ = weak.update(app, |this, cx| {
+                if this.copied_feedback_gen == generation {
+                    this.copied_feedback = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn set_profile(&mut self, profile: BotPublicProfileDto) {
         self.profile = profile;
-        self.copied_feedback = None;
+        self.clear_copied_feedback();
     }
 
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) {
@@ -82,10 +122,11 @@ impl BotProfileBox {
     pub fn open(&mut self, profile: BotPublicProfileDto) {
         self.profile = profile;
         self.is_visible = true;
-        self.copied_feedback = None;
+        self.clear_copied_feedback();
     }
 
     pub fn close(&mut self) {
+        self.clear_copied_feedback();
         if self.is_visible {
             self.is_visible = false;
             self.pending_actions.push_back(BotProfileBoxAction::Close);
@@ -533,9 +574,10 @@ impl Render for BotProfileBox {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
                                         share_link.clone(),
                                     ));
-                                    this.copied_feedback = Some(format!(
-                                        "{copied_link_prefix}: {share_link}"
-                                    ));
+                                    this.show_copied_feedback(
+                                        format!("{copied_link_prefix}: {share_link}"),
+                                        cx,
+                                    );
                                 },
                                 cx,
                             )),
@@ -596,9 +638,10 @@ impl Render for BotProfileBox {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 cp.clone(),
                                             ));
-                                            this.copied_feedback =
-                                                Some(format!("{copied_prefix}: {cp_fb}"));
-                                            cx.notify();
+                                            this.show_copied_feedback(
+                                                format!("{copied_prefix}: {cp_fb}"),
+                                                cx,
+                                            );
                                         }),
                                     )
                                     .child(

@@ -278,6 +278,36 @@ def run_signing_cmd_with_retry(
         time.sleep(delay)
 
 
+def detect_preferred_local_sign_identity() -> str | None:
+    """Detects a stable local macOS code-signing identity so TCC permissions survive rebuilds."""
+    if platform.system() != "Darwin" or not shutil.which("security"):
+        return None
+    try:
+        res = subprocess.run(
+            ["security", "find-identity", "-v", "-p", "codesigning"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            return None
+        identities: list[str] = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if '"' in line:
+                first = line.find('"')
+                last = line.rfind('"')
+                if last > first:
+                    identities.append(line[first + 1 : last])
+        for prefix in ("Developer ID Application:", "Apple Development:", "Fabushi Local Dev"):
+            for ident in identities:
+                if ident.startswith(prefix):
+                    return ident
+    except Exception:
+        return None
+    return None
+
+
 def codesign_bundle(
     app_dir: Path,
     sign_identity: str | None = None,
@@ -291,34 +321,25 @@ def codesign_bundle(
         return
 
     if sign_identity:
+        is_dev_id = "Developer ID Application" in sign_identity
         for subdir in ("MacOS", "Helpers"):
             bin_dir = app_dir / "Contents" / subdir
             if bin_dir.is_dir():
                 for bin_item in sorted(bin_dir.iterdir()):
                     if bin_item.is_file() and os.access(bin_item, os.X_OK):
-                        cmd = [
-                            "codesign",
-                            "--force",
-                            "--options",
-                            "runtime",
-                            "--timestamp",
-                            "--sign",
-                            sign_identity,
-                        ]
+                        cmd = ["codesign", "--force"]
+                        if is_dev_id:
+                            cmd.extend(["--options", "runtime", "--timestamp"])
+                        cmd.extend(["--sign", sign_identity])
                         if entitlements and entitlements.is_file():
                             cmd.extend(["--entitlements", str(entitlements)])
                         cmd.append(str(bin_item))
                         run_signing_cmd_with_retry(cmd)
 
-        bundle_cmd = [
-            "codesign",
-            "--force",
-            "--options",
-            "runtime",
-            "--timestamp",
-            "--sign",
-            sign_identity,
-        ]
+        bundle_cmd = ["codesign", "--force"]
+        if is_dev_id:
+            bundle_cmd.extend(["--options", "runtime", "--timestamp"])
+        bundle_cmd.extend(["--sign", sign_identity])
         if entitlements and entitlements.is_file():
             bundle_cmd.extend(["--entitlements", str(entitlements)])
         bundle_cmd.append(str(app_dir))
@@ -327,7 +348,7 @@ def codesign_bundle(
             ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_dir)],
             check=True,
         )
-        log(f"Developer ID signed & verified {app_dir.name} ({sign_identity})")
+        log(f"Signed & verified {app_dir.name} ({sign_identity})")
     else:
         try:
             helpers_dir = app_dir / "Contents" / "Helpers"
@@ -525,6 +546,10 @@ def build_macos_app_bundle(
     <string>Fabushi needs microphone access for voice messages and calls.</string>
     <key>NSCameraUsageDescription</key>
     <string>Fabushi needs camera access for video calls and media capture.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Fabushi needs Screen &amp; System Audio Recording access to stream your desktop during Remote Control.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Fabushi needs automation access to assist with remote desktop control.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Fabushi Contributors. Apache-2.0.</string>
     <key>CFBundleURLTypes</key>
@@ -1153,7 +1178,12 @@ def stop_stale_app_instances(app_name: str):
         subprocess.run(["pkill", "-f", pat], check=False, capture_output=True)
 
 
-def install_to_applications(app_dir: Path, app_name: str):
+def install_to_applications(
+    app_dir: Path,
+    app_name: str,
+    sign_identity: str | None = None,
+    entitlements: Path | None = None,
+):
     if platform.system() != "Darwin":
         log("--install-to-applications is macOS-only; skipping.")
         return
@@ -1170,7 +1200,19 @@ def install_to_applications(app_dir: Path, app_name: str):
     else:
         shutil.copytree(app_dir, target_app, symlinks=True)
 
-    codesign_bundle(target_app, sign_identity=None)
+    # Preserve existing verified signature copied via ditto so we never clobber a
+    # Developer ID / local dev certificate signature with an ad-hoc CDHash!
+    sig_ok = (
+        shutil.which("codesign") is not None
+        and subprocess.run(
+            ["codesign", "--verify", "--deep", "--strict", str(target_app)],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+    if not sig_ok:
+        codesign_bundle(target_app, sign_identity=sign_identity, entitlements=entitlements)
 
     lsregister = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
     if Path(lsregister).exists():
@@ -1273,6 +1315,10 @@ def main():
     if not entitlements_path.is_file():
         entitlements_path = None
 
+    effective_sign_identity = args.sign_identity or detect_preferred_local_sign_identity()
+    if effective_sign_identity and not args.sign_identity:
+        log(f"Auto-selected stable local signing identity: {effective_sign_identity}")
+
     app_dir = build_macos_app_bundle(
         repo_root=repo_root,
         dist_dir=dist_dir,
@@ -1281,7 +1327,7 @@ def main():
         app_name=args.app_name,
         bundle_id=args.bundle_id,
         version=version,
-        sign_identity=args.sign_identity,
+        sign_identity=effective_sign_identity,
         entitlements=entitlements_path,
         helper_bins=helper_bins,
     )
@@ -1291,7 +1337,7 @@ def main():
         app_name=args.app_name,
         bundle_id=args.bundle_id,
         version=version,
-        sign_identity=args.sign_identity,
+        sign_identity=effective_sign_identity,
     )
 
     if args.notarize and platform.system() == "Darwin":
@@ -1313,7 +1359,7 @@ def main():
         app_dir,
         dist_dir,
         "GPUI Telegram",
-        sign_identity=args.sign_identity,
+        sign_identity=effective_sign_identity,
         entitlements=entitlements_path,
     )
 
@@ -1360,7 +1406,12 @@ def main():
 
     # Step 10: Optionally install to /Applications & register with Spotlight
     if args.install_to_applications:
-        install_to_applications(app_dir, args.app_name)
+        install_to_applications(
+            app_dir,
+            args.app_name,
+            sign_identity=effective_sign_identity,
+            entitlements=entitlements_path,
+        )
 
     # Step 11: Post-packaging hygiene cleanup
     if not args.skip_clean:

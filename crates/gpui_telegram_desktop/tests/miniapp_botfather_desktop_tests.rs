@@ -20,23 +20,29 @@
 //!    attach-menu peer-type filtering (`USER`, `BOT`, `GROUP`, `BROADCAST`).
 
 use futures::FutureExt;
-use gpui::{px, App, AppContext, Application, AsyncApp, Entity, Hsla, Size};
+use gpui::{px, App, AppContext, Application, AsyncApp, Entity, Hsla, IntoElement, Size};
 use gpui_telegram_client::net::{HermesRichChatDto, PeerBotActionResult};
 use gpui_telegram_client::{AccountSessionRecord, ClientConfig, TelegramClient};
+use gpui_telegram_desktop::app::session::send_as_peers::{SendAsKey, SendAsPeer};
 use gpui_telegram_desktop::components::bots::bot_attach_web_view::{
     peer_matches_types, peer_types, peer_types_mask_from_strings, AttachBotEntry,
     BotAttachWebView, BotWebViewInputTarget, BotWebViewPendingAction,
 };
 use gpui_telegram_desktop::components::ui::chat::attach::attach_bot_webview::AttachBotWebviewChatAttach;
-use gpui_telegram_desktop::theme::{TelegramAssetSource, TdesktopThemePalette};
+use gpui_telegram_desktop::theme::{TelegramAssetSource, TdesktopThemeMode, TdesktopThemePalette};
 use gpui_telegram_desktop::views::boxes::peers::{
     BotProfileBoxAction, CreateManagedBotBoxPeers,
 };
 use gpui_telegram_desktop::views::canonical_composer::BotSlashCommandItem;
 use gpui_telegram_desktop::views::chat_sidebar::{
-    SidebarCatalogAppItem, TELEGRAM_SEARCH_CATEGORIES,
+    AddContactKind, ComposeRecipientChip, DialogDeliveryStatus, DialogItemModel,
+    SidebarCatalogAppItem, SidebarCreationModal, TELEGRAM_SEARCH_CATEGORIES,
 };
 use gpui_telegram_desktop::views::composer::attachments_drawer::ComposerAttachMiniApp;
+use gpui_telegram_desktop::views::composer::bot_keyboard::{
+    flags as kb_flags, BotKeyboardButton, BotKeyboardButtonKind,
+};
+use gpui_telegram_desktop::views::composer::composer_ui::render_text_input_strip_with_full_options;
 use gpui_telegram_desktop::views::composer::popups_ui::{
     render_attachments_drawer_with_apps, ComposerPopupAction,
 };
@@ -55,6 +61,7 @@ use gpui_telegram_desktop::views::stage::cards::{
 use gpui_telegram_desktop::views::stage::cards_interactive::InteractiveCardAction;
 use gpui_telegram_desktop::views::stage::stage_bubble::BubbleUiAction;
 use gpui_telegram_desktop::views::stage::view::controls::HistoryViewBotMenuButtonViewControls;
+use gpui_telegram_desktop::views::app_shell::shell_truth::validate_selected_send_target;
 use gpui_telegram_desktop::views::{
     AppShell, CanonicalComposer, ChatSidebar, ConversationStage, MainMenuDrawer,
 };
@@ -158,6 +165,56 @@ fn dispatch_headless_target(target: &str) -> ! {
             Runner::Async(|app| {
                 Box::pin(
                     headless_body_inline_webapp_restores_running_pip_miniapp_without_relaunch(app),
+                )
+            })
+        }
+        "test_headless_gpui_apple_composer_external_bot_menu_and_slash_coexistence" => {
+            Runner::Sync(headless_body_apple_composer_external_bot_menu_and_slash_coexistence)
+        }
+        "test_headless_gpui_plus_compose_mode_suppresses_composer_and_bot_menu" => {
+            Runner::Async(|app| {
+                Box::pin(
+                    headless_body_plus_compose_mode_suppresses_composer_and_bot_menu(app),
+                )
+            })
+        }
+        "test_headless_gpui_bot_start_bar_hides_composer_and_toast_auto_dismiss_lifecycle" => {
+            Runner::Async(|app| {
+                Box::pin(
+                    headless_body_bot_start_bar_hides_composer_and_toast_auto_dismiss_lifecycle(
+                        app,
+                    ),
+                )
+            })
+        }
+        "test_headless_gpui_composer_and_shell_window_render_tick" => {
+            Runner::Async(|app| {
+                Box::pin(headless_body_composer_and_shell_window_render_tick(app))
+            })
+        }
+        "test_headless_gpui_plus_compose_draft_preservation_and_modal_isolation" => {
+            Runner::Async(|app| {
+                Box::pin(
+                    headless_body_plus_compose_draft_preservation_and_modal_isolation(app),
+                )
+            })
+        }
+        "test_headless_gpui_plus_compose_over_unstarted_bot_and_start_bar_ime_guard" => {
+            Runner::Async(|app| {
+                Box::pin(
+                    headless_body_plus_compose_over_unstarted_bot_and_start_bar_ime_guard(app),
+                )
+            })
+        }
+        "test_headless_gpui_plus_compose_chip_remove_restores_to_bar_input" => {
+            Runner::Async(|app| {
+                Box::pin(headless_body_plus_compose_chip_remove_restores_to_bar_input(app))
+            })
+        }
+        "test_headless_gpui_plus_compose_send_to_unstarted_bot_delivers_message" => {
+            Runner::Async(|app| {
+                Box::pin(
+                    headless_body_plus_compose_send_to_unstarted_bot_delivers_message(app),
                 )
             })
         }
@@ -2941,4 +2998,2121 @@ async fn headless_body_inline_webapp_restores_running_pip_miniapp_without_relaun
     })
     .expect("assert explicit reload count");
 }
+
+#[test]
+fn test_headless_gpui_apple_composer_external_bot_menu_and_slash_coexistence() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_apple_composer_external_bot_menu_and_slash_coexistence",
+    );
+}
+
+fn headless_body_apple_composer_external_bot_menu_and_slash_coexistence(cx: &mut App) {
+    // 1. Verify Apple-style composer_ui.rs places `bot_menu_view` outside `#cmp-input-wrap`
+    //    (strictly to its left inside the 740px row) and keeps `#cmp-input-wrap` clean.
+    let composer_ui_src = include_str!("../src/views/composer/composer_ui.rs");
+    let apple_start = composer_ui_src
+        .find("if is_apple {")
+        .expect("Apple-style composer branch must exist");
+    let classic_start = composer_ui_src[apple_start..]
+        .find("let scaled_content_h =")
+        .map(|off| apple_start + off)
+        .expect("Classic branch must follow Apple branch");
+    let apple_branch = &composer_ui_src[apple_start..classic_start];
+    let apple_menu_pos = apple_branch
+        .find(".when_some(bot_menu_view")
+        .expect("Apple branch must render bot_menu_view");
+    let apple_wrap_pos = apple_branch
+        .find(".id(\"cmp-input-wrap\")")
+        .expect("Apple branch must render #cmp-input-wrap");
+    assert!(
+        apple_menu_pos < apple_wrap_pos,
+        "Apple-style bot_menu_view MUST be rendered outside and before #cmp-input-wrap"
+    );
+    let inside_apple_wrap = &apple_branch[apple_wrap_pos..];
+    assert!(
+        !inside_apple_wrap.contains("bot_menu_view"),
+        "bot_menu_view must NOT appear inside #cmp-input-wrap in Apple style"
+    );
+
+    // 2. Verify HistoryViewBotMenuButtonViewControls expanded vs `is_small` compact sizing
+    let menu_btn = cx.new(|_| {
+        let mut m = HistoryViewBotMenuButtonViewControls::new();
+        m.set_bot_menu(
+            600_005,
+            "fabushi_bot",
+            "Open App",
+            "gpui-miniapp://fabushi_bot/fabushi",
+        );
+        m
+    });
+    menu_btn.update(cx, |m, _| {
+        assert!(m.is_active);
+        assert!(!m.is_small);
+        let expanded_w = m.width_px;
+        assert!(expanded_w > 50.0);
+        assert!(m.refresh("Open App", true));
+        assert!(m.is_small);
+        assert!((m.width_px - 36.0).abs() < 0.01);
+        assert!(m.width_px < expanded_w);
+    });
+
+    // 3. Verify CanonicalComposer supports MenuButton + `/` coexistence (bot_slash_commands &
+    //    hermes_slash_enabled), `is_small` compact shrink on typing, and BotKeyboard wiring
+    for mode in [TdesktopThemeMode::Night, TdesktopThemeMode::Day] {
+        let comp = cx.new(|cx| {
+            let mut c = CanonicalComposer::new();
+            c.apply_theme(TdesktopThemePalette::build(mode, 0x0A84FF, 14, 18), "zh-CN");
+            c.sync_bot_menu_with_cx(
+                600_005,
+                "fabushi_bot".to_string(),
+                "全球法布施".to_string(),
+                "gpui-miniapp://fabushi_bot/fabushi".to_string(),
+                cx,
+            );
+            c.set_hermes_slash_enabled(true);
+            c
+        });
+
+        comp.update(cx, |c, _| {
+            assert!(c.bot_menu_controls.is_active);
+            assert!(!c.bot_menu_controls.is_small);
+            assert!(c.hermes_slash_enabled);
+            // Clicking `/` button with empty bot_slash_commands + hermes_slash_enabled opens Hermes commands
+            c.toggle_bot_commands_popup();
+            assert!(c.hermes_ac_visible);
+            assert!(!c.hermes_ac_matches.is_empty());
+            assert!(!c.bot_ac_visible);
+            c.sync_autocomplete();
+            assert!(
+                c.hermes_ac_visible,
+                "pinned Hermes slash popup must stay open when text is empty"
+            );
+
+            // Typing shrinks MenuButton to compact 36px icon; clearing expands it back
+            c.set_text("hello");
+            assert!(c.bot_menu_controls.is_small);
+            assert!((c.bot_menu_controls.width_px - 36.0).abs() < 0.01);
+            c.clear();
+            assert!(!c.bot_menu_controls.is_small);
+        });
+    }
+}
+
+#[test]
+fn test_headless_gpui_plus_compose_mode_suppresses_composer_and_bot_menu() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_plus_compose_mode_suppresses_composer_and_bot_menu",
+    );
+}
+
+async fn headless_body_plus_compose_mode_suppresses_composer_and_bot_menu(app: AsyncApp) {
+    let client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let _rt = client.runtime().enter();
+    let fabushi_cid = 9_401u64;
+
+    let fabushi_bot = BotRegistryEntry {
+        bot_user_id: 600_999,
+        owner_user_id: 100_001,
+        username: "fabushi_bot".to_string(),
+        display_name: "全球法布施".to_string(),
+        commands: vec![BotCommandSpec {
+            command: "start".to_string(),
+            description: "Start".to_string(),
+        }],
+        is_fabushi_bot: true,
+        menu_button_type: "web_app".to_string(),
+        menu_button_text: "全球法布施".to_string(),
+        menu_button_url: "gpui-miniapp://fabushi_bot/fabushi".to_string(),
+        coding_agent: None,
+        ..Default::default()
+    };
+
+    let shell = app
+        .update(|cx| {
+            let s = cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_001);
+                s.session_sync.session_token = Some("tok_plus".to_string());
+                s.miniapps.my_bots = vec![fabushi_bot.clone()];
+                s.miniapps.fabushi_bots = vec![FabushiBotSummaryDto {
+                    bot_user_id: 600_999,
+                    owner_user_id: 100_001,
+                    agent_id: "fabushi".to_string(),
+                    username: "fabushi_bot".to_string(),
+                    display_name: "全球法布施".to_string(),
+                    companion_chat_id: Some(fabushi_cid as i64),
+                    coding_agent: None,
+                    ..Default::default()
+                }];
+                s.session_sync.rich_chats_by_id.insert(
+                    fabushi_cid,
+                    HermesRichChatDto {
+                        chat_id: fabushi_cid as i64,
+                        title: "全球法布施".to_string(),
+                        is_bot: true,
+                        peer_user_id: Some(600_999),
+                        peer_username: Some("fabushi_bot".to_string()),
+                        menu_button_text: Some("全球法布施".to_string()),
+                        menu_button_url: Some("gpui-miniapp://fabushi_bot/fabushi".to_string()),
+                        has_mini_app: true,
+                        ..Default::default()
+                    },
+                );
+                s
+            });
+            s.update(cx, |sh, cx| {
+                sh.stage.update(cx, |st, _| st.active_chat_id = Some(fabushi_cid));
+                sh.sidebar.update(cx, |sb, _| sb.active_chat_id = Some(fabushi_cid));
+                sh.sync_composer_and_inspector_miniapp_state(cx);
+                sh.composer.update(cx, |c, ccx| {
+                    c.begin_reply(11, "全球法布施".to_string(), "hi".to_string());
+                    c.set_text("keep my bot draft");
+                    ccx.notify();
+                });
+                sh.handle_composer_draft_change(cx);
+            });
+            s
+        })
+        .expect("mount shell with fabushi bot");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    // 1. Enter `+` compose mode -> composer hidden when 0 recipients, bot menu/slash/draft/reply cleared
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            assert!(sh.composer.read(cx).bot_menu_controls.is_active);
+            assert!(!sh.should_hide_composer(cx));
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                scx.notify();
+            });
+        });
+    })
+    .expect("toggle plus menu on");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert!(sh.sidebar.read(cx).is_plus_menu_open);
+        assert!(
+            sh.should_hide_composer(cx),
+            "composer MUST be hidden in `+` compose mode when 0 recipients are selected"
+        );
+        let c = sh.composer.read(cx);
+        assert!(c.is_compose_isolated);
+        assert!(!c.bot_menu_controls.is_active);
+        assert!(c.bot_slash_commands.is_empty());
+        assert!(!c.hermes_slash_enabled);
+        assert!(c.replying_to.is_none());
+        assert!(c.text().is_empty());
+        assert_eq!(
+            sh.session_sync
+                .last_draft_text_by_chat
+                .get(&fabushi_cid)
+                .map(String::as_str),
+            Some("keep my bot draft"),
+            "entering `+` mode must preserve prior chat's saved draft"
+        );
+    })
+    .expect("assert plus compose isolation");
+
+    // 2. Select 1 recipient -> composer shows cleanly with zero bot menu, and typing does NOT clobber prior chat's draft
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(9_402),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x0A84FF,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+            assert!(!sh.should_hide_composer(cx));
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("hello alice in compose");
+                ccx.notify();
+            });
+        });
+    })
+    .expect("select recipient and type in compose");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert!(!sh.composer.read(cx).bot_menu_controls.is_active);
+        assert_eq!(
+            sh.session_sync
+                .last_draft_text_by_chat
+                .get(&fabushi_cid)
+                .map(String::as_str),
+            Some("keep my bot draft"),
+            "typing in `+` compose mode must NEVER overwrite prior chat's draft"
+        );
+    })
+    .expect("verify prior draft protected");
+
+    // 3. Cancel `+` mode -> observer automatically restores @fabushi_bot MenuButton, slash commands, and saved draft
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.exit_compose_mode();
+                scx.notify();
+            });
+        });
+    })
+    .expect("cancel plus mode");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert!(!sh.should_hide_composer(cx));
+        let c = sh.composer.read(cx);
+        assert!(!c.is_compose_isolated);
+        assert!(c.bot_menu_controls.is_active);
+        assert_eq!(c.bot_menu_controls.text, "全球法布施");
+        assert!(!c.bot_slash_commands.is_empty());
+        assert_eq!(c.text(), "keep my bot draft");
+
+        // 4. Opening creation modal also suppresses composer
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.open_add_contact_modal(AddContactKind::AiBot);
+                scx.notify();
+            });
+        });
+        assert!(
+            shell.read(cx).sidebar.read(cx).active_creation_modal
+                == Some(SidebarCreationModal::AddContact)
+        );
+        assert!(shell.read(cx).should_hide_composer(cx));
+    })
+    .expect("verify restore and creation modal suppression");
+}
+
+#[test]
+fn test_headless_gpui_bot_start_bar_hides_composer_and_toast_auto_dismiss_lifecycle() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_bot_start_bar_hides_composer_and_toast_auto_dismiss_lifecycle",
+    );
+}
+
+async fn headless_body_bot_start_bar_hides_composer_and_toast_auto_dismiss_lifecycle(
+    app: AsyncApp,
+) {
+    let client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let _rt = client.runtime().enter();
+    let chat_a = 9_501u64;
+    let chat_b = 9_502u64;
+
+    let shell = app
+        .update(|cx| {
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_001);
+                s.session_sync.session_token = Some("tok_toast".to_string());
+                s.stage.update(cx, |st, _| {
+                    st.active_chat_id = Some(chat_a);
+                    st.show_bot_start_bar = true;
+                });
+                s.last_observed_toast_chat_id = Some(chat_a);
+                s
+            })
+        })
+        .expect("mount shell for START bar & toast test");
+
+    // 1. Unstarted bot START bar hides composer
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert!(
+            sh.should_hide_composer(cx),
+            "composer MUST be hidden when stage.show_bot_start_bar is true"
+        );
+        shell.update(cx, |sh, cx| {
+            sh.stage.update(cx, |st, st_cx| {
+                st.show_bot_start_bar = false;
+                st_cx.notify();
+            });
+        });
+        assert!(!shell.read(cx).should_hide_composer(cx));
+    })
+    .expect("verify START bar hides composer");
+
+    // 2. Async toast auto-dismiss after duration_ms
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.show_toast("PROVIDER_ERROR: missing provider key", 120, cx);
+            let t = sh
+                .window_runtime
+                .controller
+                .current_toast
+                .as_ref()
+                .expect("toast must be active");
+            assert_eq!(t.chat_id, Some(chat_a));
+        });
+    })
+    .expect("show auto-dismiss toast");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(220))
+        .await;
+
+    app.update(|cx| {
+        assert!(
+            shell.read(cx).window_runtime.controller.current_toast.is_none(),
+            "toast must auto-dismiss after timer expires"
+        );
+    })
+    .expect("verify toast auto-dismissed");
+
+    // 3. Id-fenced non-dismissal: manually dismissing Toast 1 before timer 1 fires must NOT dismiss Toast 2
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.show_toast("Toast 1 short", 120, cx);
+            sh.show_toast("Toast 2 long", 1200, cx);
+            sh.window_runtime.controller.dismiss_current_toast();
+            sh.schedule_current_toast_dismiss(cx);
+            assert_eq!(
+                sh.window_runtime
+                    .controller
+                    .current_toast
+                    .as_ref()
+                    .map(|t| t.text.as_str()),
+                Some("Toast 2 long")
+            );
+        });
+    })
+    .expect("enqueue and manually advance toast");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(220))
+        .await;
+
+    app.update(|cx| {
+        assert_eq!(
+            shell
+                .read(cx)
+                .window_runtime
+                .controller
+                .current_toast
+                .as_ref()
+                .map(|t| t.text.as_str()),
+            Some("Toast 2 long"),
+            "stale timer from Toast 1 must NOT dismiss Toast 2"
+        );
+    })
+    .expect("verify id-fenced non-dismissal");
+
+    // 4. Chat-switch clears chat-scoped toast while preserving global toast
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.window_runtime.controller.clear_all_toasts();
+            sh.scheduled_toast_id = None;
+            sh.show_chat_toast(chat_a, "Chat A error", 4000, cx);
+            sh.window_runtime.enqueue_toast("Global system toast", 4000);
+            sh.stage.update(cx, |st, st_cx| {
+                st.active_chat_id = Some(chat_b);
+                st_cx.notify();
+            });
+        });
+    })
+    .expect("trigger chat switch from A to B");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    app.update(|cx| {
+        let cur = shell
+            .read(cx)
+            .window_runtime
+            .controller
+            .current_toast
+            .as_ref()
+            .expect("global toast should survive chat switch");
+        assert_eq!(cur.text, "Global system toast");
+        assert_eq!(cur.chat_id, None);
+    })
+    .expect("verify chat-switch cleared chat-scoped toast and preserved global toast");
+
+    // 5. Verify stage-bounded #window-toast-banner non-overlapping layout invariants in shell.rs
+    let shell_src = include_str!("../src/views/shell.rs");
+    assert!(
+        shell_src.contains("id(\"app-shell-stage-slot\")")
+            && shell_src.contains("id(\"window-toast-banner-close\")")
+            && shell_src.contains("max_w(px(pal.scaled_px(480.0)))"),
+        "shell.rs must mount bounded #window-toast-banner with close button inside #app-shell-stage-slot"
+    );
+    let slot_pos = shell_src
+        .find("id(\"app-shell-stage-slot\")")
+        .expect("stage slot must exist");
+    let composer_mount_pos = shell_src[slot_pos..]
+        .find(".when(!hide_composer, |el| el.child(self.composer.clone()))")
+        .map(|off| slot_pos + off)
+        .expect("composer must be conditional sibling below stage slot");
+    assert!(slot_pos < composer_mount_pos);
+}
+
+#[test]
+fn test_headless_gpui_composer_and_shell_window_render_tick() {
+    run_in_headless_subprocess("test_headless_gpui_composer_and_shell_window_render_tick");
+}
+
+async fn headless_body_composer_and_shell_window_render_tick(app: AsyncApp) {
+    let client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let _rt = client.runtime().enter();
+
+    // 1. Exercise CanonicalComposer + render_text_input_strip_with_full_options + BotKeyboard
+    //    element tree construction across Apple Night, Apple Day, and Classic palettes.
+    app.update(|cx| {
+        for mode in [
+            TdesktopThemeMode::Night,
+            TdesktopThemeMode::Day,
+            TdesktopThemeMode::Classic,
+        ] {
+            let pal = TdesktopThemePalette::build(mode, 0x0A84FF, 14, 18);
+            let comp = cx.new(|cx| {
+                let mut c = CanonicalComposer::new();
+                c.apply_theme(pal, "zh-CN");
+                c.sync_bot_menu_with_cx(
+                    600_005,
+                    "fabushi_bot".to_string(),
+                    "Very Long Bot Mini App Launch Label Exceeding Normal Width".to_string(),
+                    "gpui-miniapp://fabushi_bot/fabushi".to_string(),
+                    cx,
+                );
+                c.set_hermes_slash_enabled(true);
+                c.set_bot_reply_keyboard(
+                    vec![vec![BotKeyboardButton::new(
+                        "Quick Action",
+                        BotKeyboardButtonKind::Default,
+                    )]],
+                    kb_flags::RESIZE,
+                    Some("Tap a reply option".to_string()),
+                );
+                c
+            });
+
+            comp.update(cx, |c, ccx| {
+                let menu_ent = c.ensure_bot_menu_entity(ccx);
+                let _strip = render_text_input_strip_with_full_options(
+                    c.text(),
+                    0,
+                    None,
+                    None,
+                    c.is_input_focused,
+                    false,
+                    false,
+                    false,
+                    false,
+                    c.bot_keyboard.has_markup(),
+                    c.is_bot_keyboard_open,
+                    px(44.0),
+                    false,
+                    Some(menu_ent.into_any_element()),
+                    None,
+                    false,
+                    &pal,
+                    "zh-CN",
+                    ccx,
+                    |_, _, _| {},
+                );
+                let _kb = c.bot_keyboard.render_reply_keyboard(&pal, ccx, |_, _, _, _, _| {});
+                assert!(c.bot_menu_controls.is_active);
+                assert!(!c.bot_menu_controls.is_small);
+                c.set_text("hello layout");
+                assert!(c.bot_menu_controls.is_small);
+                c.clear();
+                assert!(!c.bot_menu_controls.is_small);
+            });
+        }
+    })
+    .expect("composer element tree render pass");
+
+    // 2. Exercise AppShell + `#window-toast-banner` element tree builder (`render_toast_banner_slot`)
+    //    across normal bot chat, PROVIDER_ERROR toast, `+` compose mode, and `START` bar.
+    app.update(|cx| {
+        let shell = cx.new(|cx| {
+            let mut s = AppShell::new_with_client(client.clone(), cx);
+            s.is_authenticated = true;
+            s.session_sync.user_id = Some(100_001);
+            s.session_sync.session_token = Some("tok_win".to_string());
+            let bot_cid = 9_601u64;
+            s.sidebar.update(cx, |sb, _| {
+                sb.dialogs.push(DialogItemModel {
+                    id: bot_cid,
+                    peer_name: "全球法布施".to_string(),
+                    avatar_initials: "法".to_string(),
+                    avatar_color: 0x0A84FF,
+                    last_message: String::new(),
+                    timestamp: "刚刚".to_string(),
+                    unread_count: 0,
+                    is_muted: false,
+                    is_pinned: false,
+                    is_online: true,
+                    typing_indicator: None,
+                    delivery_status: DialogDeliveryStatus::Read,
+                    folder: "Bots".to_string(),
+                });
+                sb.bot_ids.insert(bot_cid);
+                sb.select_dialog(bot_cid);
+            });
+            s.stage.update(cx, |st, _| {
+                st.set_chat(bot_cid, "全球法布施", "bot", "法", 0x0A84FF);
+            });
+            s.session_sync.rich_chats_by_id.insert(
+                bot_cid,
+                HermesRichChatDto {
+                    chat_id: bot_cid as i64,
+                    title: "全球法布施".to_string(),
+                    is_bot: true,
+                    peer_user_id: Some(600_999),
+                    peer_username: Some("fabushi_bot".to_string()),
+                    menu_button_text: Some("全球法布施".to_string()),
+                    menu_button_url: Some("gpui-miniapp://fabushi_bot/fabushi".to_string()),
+                    has_mini_app: true,
+                    ..Default::default()
+                },
+            );
+            s.sync_composer_and_inspector_miniapp_state(cx);
+            s.show_toast(
+                "PROVIDER_ERROR: https://example.invalid/v1/chat/completions failed with 401 unauthorized",
+                4000,
+                cx,
+            );
+            s
+        });
+        shell.update(cx, |sh, cx| {
+            let pal = sh.theme_state.palette;
+            let toast_text = sh
+                .window_runtime
+                .controller
+                .current_toast
+                .as_ref()
+                .map(|t| t.text.clone())
+                .expect("PROVIDER_ERROR toast must be active");
+            let _toast_el = sh.render_toast_banner_slot(toast_text, pal.scaled_px(16.0), pal, cx);
+            assert!(!sh.should_hide_composer(cx));
+
+            // `+` compose mode suppresses composer
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                scx.notify();
+            });
+            assert!(sh.should_hide_composer(cx));
+
+            // `START` bar suppresses composer & renders toast slot at 68px clearance
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.exit_compose_mode();
+                scx.notify();
+            });
+            sh.stage.update(cx, |st, st_cx| {
+                st.show_bot_start_bar = true;
+                st_cx.notify();
+            });
+            assert!(sh.should_hide_composer(cx));
+            let _start_toast_el = sh.render_toast_banner_slot(
+                "PROVIDER_ERROR: configure provider".to_string(),
+                pal.scaled_px(68.0),
+                pal,
+                cx,
+            );
+        });
+    })
+    .expect("run AppShell element builder pass");
+}
+
+#[test]
+fn test_headless_gpui_plus_compose_draft_preservation_and_modal_isolation() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_plus_compose_draft_preservation_and_modal_isolation",
+    );
+}
+
+async fn headless_body_plus_compose_draft_preservation_and_modal_isolation(app: AsyncApp) {
+    let client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let _rt = client.runtime().enter();
+    let fabushi_cid = 9_401u64;
+    let alice_cid = 9_402u64;
+    let bob_cid = 9_403u64;
+
+    let fabushi_bot = BotRegistryEntry {
+        bot_user_id: 600_999,
+        owner_user_id: 100_001,
+        username: "fabushi_bot".to_string(),
+        display_name: "全球法布施".to_string(),
+        commands: vec![
+            BotCommandSpec {
+                command: "start".to_string(),
+                description: "Start".to_string(),
+            },
+            BotCommandSpec {
+                command: "help".to_string(),
+                description: "Help".to_string(),
+            },
+        ],
+        is_fabushi_bot: true,
+        menu_button_type: "web_app".to_string(),
+        menu_button_text: "全球法布施".to_string(),
+        menu_button_url: "gpui-miniapp://fabushi_bot/fabushi".to_string(),
+        coding_agent: None,
+        ..Default::default()
+    };
+
+    let shell = app
+        .update(|cx| {
+            let s = cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_001);
+                s.session_sync.session_token = Some("tok_reg".to_string());
+                s.miniapps.my_bots = vec![fabushi_bot.clone()];
+                s.miniapps.fabushi_bots = vec![FabushiBotSummaryDto {
+                    bot_user_id: 600_999,
+                    owner_user_id: 100_001,
+                    agent_id: "fabushi".to_string(),
+                    username: "fabushi_bot".to_string(),
+                    display_name: "全球法布施".to_string(),
+                    companion_chat_id: Some(fabushi_cid as i64),
+                    coding_agent: None,
+                    ..Default::default()
+                }];
+                s.session_sync.rich_chats_by_id.insert(
+                    fabushi_cid,
+                    HermesRichChatDto {
+                        chat_id: fabushi_cid as i64,
+                        title: "全球法布施".to_string(),
+                        is_bot: true,
+                        peer_user_id: Some(600_999),
+                        peer_username: Some("fabushi_bot".to_string()),
+                        menu_button_text: Some("全球法布施".to_string()),
+                        menu_button_url: Some("gpui-miniapp://fabushi_bot/fabushi".to_string()),
+                        has_mini_app: true,
+                        ..Default::default()
+                    },
+                );
+                s.session_sync.send_as_peers.set_list(
+                    SendAsKey::message(fabushi_cid),
+                    vec![
+                        SendAsPeer {
+                            peer_id: 100_001,
+                            title: "Personal".to_string(),
+                            premium_required: false,
+                        },
+                        SendAsPeer {
+                            peer_id: 888,
+                            title: "Channel Identity".to_string(),
+                            premium_required: false,
+                        },
+                    ],
+                );
+                s.session_sync.send_as_peers.set_chosen(fabushi_cid, 888);
+                s.sidebar.update(cx, |sb, _| {
+                    sb.dialogs.push(DialogItemModel {
+                        id: fabushi_cid,
+                        peer_name: "全球法布施".to_string(),
+                        avatar_initials: "法".to_string(),
+                        avatar_color: 0x0A84FF,
+                        last_message: String::new(),
+                        timestamp: "10:00".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "Bots".to_string(),
+                    });
+                    sb.bot_ids.insert(fabushi_cid);
+                    sb.dialogs.push(DialogItemModel {
+                        id: alice_cid,
+                        peer_name: "Alice".to_string(),
+                        avatar_initials: "AL".to_string(),
+                        avatar_color: 0x27AE60,
+                        last_message: String::new(),
+                        timestamp: "09:50".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "All".to_string(),
+                    });
+                    sb.dialogs.push(DialogItemModel {
+                        id: bob_cid,
+                        peer_name: "Bob".to_string(),
+                        avatar_initials: "BO".to_string(),
+                        avatar_color: 0x9B51E0,
+                        last_message: String::new(),
+                        timestamp: "09:40".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "All".to_string(),
+                    });
+                    sb.select_dialog(fabushi_cid);
+                });
+                s.stage.update(cx, |st, _| {
+                    st.set_chat(fabushi_cid, "全球法布施", "bot", "法", 0x0A84FF);
+                });
+                s
+            });
+            s.update(cx, |sh, cx| {
+                sh.sync_composer_and_inspector_miniapp_state(cx);
+                sh.composer.update(cx, |c, ccx| {
+                    c.begin_reply(11, "全球法布施".to_string(), "hi".to_string());
+                    c.editor.attachments.push(PathBuf::from("/tmp/reg_att.txt"));
+                    c.set_send_as_options(
+                        sh.session_sync
+                            .send_as_peers
+                            .list(&SendAsKey::message(fabushi_cid))
+                            .to_vec(),
+                        Some(888),
+                    );
+                    c.set_text("keep my bot draft");
+                    ccx.notify();
+                });
+                sh.handle_composer_draft_change(cx);
+                sh.flush_pending_draft_for_chat(fabushi_cid, cx);
+            });
+            s
+        })
+        .expect("mount shell for regression tests");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    // 1a. Enter `+` with 0 recipients -> switch to Bob -> @fabushi_bot draft preserved
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter plus mode (1a)");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            assert!(sh.composer.read(cx).is_compose_isolated);
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(bob_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("switch from + (0 recipients) to Bob");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert_eq!(sh.stage.read(cx).active_chat_id, Some(bob_cid));
+        assert!(!sh.composer.read(cx).is_compose_isolated);
+        assert_eq!(
+            sh.session_sync
+                .last_draft_text_by_chat
+                .get(&fabushi_cid)
+                .map(String::as_str),
+            Some("keep my bot draft"),
+            "0-recipient + -> switch chat must preserve prior chat draft"
+        );
+    })
+    .expect("verify 1a draft preserved");
+
+    // 1b. Switch back to @fabushi_bot, enter `+`, add 1 recipient + typed text, switch to Bob -> draft preserved & no leak into Bob
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(fabushi_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("switch back to fabushi");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("keep my bot draft");
+                ccx.notify();
+            });
+            sh.flush_pending_draft_for_chat(fabushi_cid, cx);
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(alice_cid),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x27AE60,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter + with 1 recipient");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            // While isolated, async hydration setters MUST be ignored
+            sh.sync_composer_and_inspector_miniapp_state(cx);
+            sh.composer.update(cx, |c, ccx| {
+                c.set_bot_slash_commands(vec![BotSlashCommandItem {
+                    command: "leak".to_string(),
+                    description: "Should be ignored".to_string(),
+                    bot_username: "fabushi_bot".to_string(),
+                    avatar_initials: "FB".to_string(),
+                    avatar_color: 0x0A84FF,
+                }]);
+                c.set_hermes_slash_enabled(true);
+                c.set_send_as_options(
+                    vec![SendAsPeer {
+                        peer_id: 1,
+                        title: "Leak".to_string(),
+                        premium_required: false,
+                    }],
+                    Some(1),
+                );
+                c.set_bot_reply_keyboard(
+                    vec![vec![BotKeyboardButton::new("Leak", BotKeyboardButtonKind::Default)]],
+                    kb_flags::RESIZE,
+                    None,
+                );
+                assert!(!c.bot_menu_controls.is_active);
+                assert!(c.bot_slash_commands.is_empty());
+                assert!(!c.hermes_slash_enabled);
+                assert!(c.send_as_options.is_empty());
+                assert!(!c.bot_keyboard.has_markup());
+
+                c.set_text("hello alice in compose");
+                ccx.notify();
+            });
+        });
+    })
+    .expect("verify async isolation guard and type compose text");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(bob_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("switch from + (1 recipient + text) to Bob");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert_eq!(sh.stage.read(cx).active_chat_id, Some(bob_cid));
+        assert!(!sh.composer.read(cx).is_compose_isolated);
+        assert!(sh.composer.read(cx).text().is_empty());
+        assert_eq!(
+            sh.session_sync
+                .last_draft_text_by_chat
+                .get(&fabushi_cid)
+                .map(String::as_str),
+            Some("keep my bot draft"),
+            "1-recipient + compose text -> switch chat must NOT clobber prior chat draft"
+        );
+    })
+    .expect("verify 1b draft preserved");
+
+    // 1c. Commit 1 recipient to DM (`commit_single_compose_recipient_to_dm`) & `dispatch_compose_submitted_message`
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(fabushi_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("return to fabushi for 1c");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("keep my bot draft");
+                ccx.notify();
+            });
+            sh.flush_pending_draft_for_chat(fabushi_cid, cx);
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(alice_cid),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x27AE60,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter + for commit DM");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("hello alice dm");
+                c.is_input_focused = false;
+                ccx.notify();
+            });
+            assert!(sh.handle_non_char_key("enter", false, cx));
+        });
+    })
+    .expect("commit single compose recipient to DM via Enter");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert_eq!(sh.stage.read(cx).active_chat_id, Some(alice_cid));
+        assert!(!sh.composer.read(cx).is_compose_isolated);
+        assert_eq!(sh.composer.read(cx).text(), "hello alice dm");
+        assert_eq!(
+            sh.session_sync
+                .last_draft_text_by_chat
+                .get(&fabushi_cid)
+                .map(String::as_str),
+            Some("keep my bot draft"),
+            "commit_single_compose_recipient_to_dm must NOT clobber prior chat draft"
+        );
+    })
+    .expect("verify 1c commit DM");
+
+    // Also test `dispatch_compose_submitted_message` -> DirectMessage to Alice from Fabushi
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(fabushi_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("return to fabushi for dispatch_compose_submitted_message");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("keep my bot draft");
+                ccx.notify();
+            });
+            sh.flush_pending_draft_for_chat(fabushi_cid, cx);
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(alice_cid),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x27AE60,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter + for dispatch DM send");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("opening msg");
+                c.submit_primary();
+                ccx.notify();
+            });
+            sh.handle_composer_pending_actions(cx);
+            // Type follow-up text immediately in destination chat; deferred observer must NOT wipe it!
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("follow-up");
+                ccx.notify();
+            });
+        });
+    })
+    .expect("dispatch compose single DM send");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert_eq!(sh.stage.read(cx).active_chat_id, Some(alice_cid));
+        assert!(!sh.composer.read(cx).is_compose_isolated);
+        assert_eq!(
+            sh.composer.read(cx).text(),
+            "follow-up",
+            "deferred sidebar observer must not clobber follow-up text after dispatch_compose_single_dm_send"
+        );
+        assert_eq!(
+            sh.session_sync
+                .last_draft_text_by_chat
+                .get(&fabushi_cid)
+                .map(String::as_str),
+            Some("keep my bot draft")
+        );
+    })
+    .expect("verify dispatch_compose_single_dm_send preservation");
+
+    // 2a & 2b & 3: Back to @fabushi_bot with reply + attachment + send_as + bot_menu + draft
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(fabushi_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("switch to fabushi for 2a/2b/3");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            let send_as_list = vec![
+                SendAsPeer {
+                    peer_id: 100_001,
+                    title: "Personal".to_string(),
+                    premium_required: false,
+                },
+                SendAsPeer {
+                    peer_id: 888,
+                    title: "Channel Identity".to_string(),
+                    premium_required: false,
+                },
+            ];
+            sh.session_sync
+                .send_as_peers
+                .set_list(SendAsKey::message(fabushi_cid), send_as_list.clone());
+            sh.session_sync.send_as_peers.set_chosen(fabushi_cid, 888);
+            sh.composer.update(cx, |c, ccx| {
+                c.begin_reply(11, "全球法布施".to_string(), "hi".to_string());
+                c.editor.attachments.push(PathBuf::from("/tmp/reg_att.txt"));
+                c.set_send_as_options(send_as_list, Some(888));
+                c.set_text("keep my bot draft");
+                ccx.notify();
+            });
+            sh.flush_pending_draft_for_chat(fabushi_cid, cx);
+            // 2a: `+` -> creation modal -> cancel
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.open_add_contact_modal(AddContactKind::AiBot);
+                scx.notify();
+            });
+        });
+    })
+    .expect("open + -> creation modal");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.close_creation_modal();
+                sb.exit_compose_mode();
+                scx.notify();
+            });
+        });
+    })
+    .expect("cancel creation modal and +");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        let c = sh.composer.read(cx);
+        assert!(!c.is_compose_isolated);
+        assert_eq!(c.text(), "keep my bot draft");
+        assert!(c.bot_menu_controls.is_active);
+        assert!(!c.bot_slash_commands.is_empty());
+        assert_eq!(c.send_as_options.len(), 2);
+        assert_eq!(c.selected_send_as_peer_id, Some(888));
+        assert_eq!(
+            c.replying_to.as_ref().map(|r| r.0),
+            Some(11),
+            "canceling + -> modal must restore replying_to"
+        );
+        assert_eq!(
+            c.editor.attachments,
+            vec![PathBuf::from("/tmp/reg_att.txt")],
+            "canceling + -> modal must restore editor.attachments"
+        );
+    })
+    .expect("verify 2a snapshot restoration");
+
+    // 2b: Same-chat click with `stage.chat_title != dialog.peer_name`
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.stage.update(cx, |st, _| {
+                st.chat_title = "Fabushi Renamed".to_string();
+            });
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(alice_cid),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x27AE60,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter + with title mismatch");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("typed in compose mismatch");
+                ccx.notify();
+            });
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(fabushi_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("click same chat with mismatched stage title");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        let c = sh.composer.read(cx);
+        assert!(!c.is_compose_isolated);
+        assert_eq!(c.text(), "keep my bot draft");
+        assert_eq!(c.send_as_options.len(), 2);
+        assert!(c.bot_menu_controls.is_active);
+    })
+    .expect("verify 2b same-chat title mismatch restore");
+
+    // 3: Open and cancel `create_bot_box` -> restores bot menu + draft + snapshot + `is_compose_isolated == false`
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.open_fabushi_creator_modal(cx);
+            assert!(sh.composer.read(cx).is_compose_isolated);
+            assert!(sh.should_hide_composer(cx));
+            assert!(!sh.composer.read(cx).bot_menu_controls.is_active);
+            let box_ent = sh
+                .miniapps
+                .create_bot_box
+                .clone()
+                .expect("create_bot_box must be created");
+            box_ent.update(cx, |b, bcx| {
+                b.pending_close = true;
+                bcx.notify();
+            });
+        });
+    })
+    .expect("open and cancel create_bot_box");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert!(sh.miniapps.create_bot_box.is_none());
+        assert!(!sh.should_hide_composer(cx));
+        let c = sh.composer.read(cx);
+        assert!(!c.is_compose_isolated);
+        assert!(c.bot_menu_controls.is_active);
+        assert_eq!(c.text(), "keep my bot draft");
+        assert_eq!(c.replying_to.as_ref().map(|r| r.0), Some(11));
+        assert_eq!(c.editor.attachments, vec![PathBuf::from("/tmp/reg_att.txt")]);
+    })
+    .expect("verify create_bot_box cancel restoration");
+
+    // 5: `stage.show_bot_start_bar == true` blocks `insert_committed_text` & Enter submission
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.stage.update(cx, |st, st_cx| {
+                st.show_bot_start_bar = true;
+                st.messages.clear();
+                st_cx.notify();
+            });
+            sh.composer.update(cx, |c, ccx| {
+                c.clear();
+                c.is_input_focused = false;
+                ccx.notify();
+            });
+            assert!(sh.should_hide_composer(cx));
+            sh.insert_committed_text("sneaky text while START bar shown", cx);
+            let enter_handled = sh.handle_non_char_key("enter", false, cx);
+            assert!(
+                !enter_handled,
+                "Enter must NOT submit to hidden composer while START bar is active"
+            );
+            assert!(
+                sh.composer.read(cx).text().is_empty(),
+                "insert_committed_text must NOT mutate hidden composer while START bar is active"
+            );
+            assert!(!sh.composer.read(cx).is_input_focused);
+            assert!(sh.stage.read(cx).messages.is_empty());
+            sh.stage.update(cx, |st, st_cx| {
+                st.show_bot_start_bar = false;
+                st_cx.notify();
+            });
+        });
+    })
+    .expect("verify START bar input & send guard");
+
+    // 6: `commit_single_compose_recipient_to_dm` new DM async path keeps `is_compose_isolated == true`
+    //    while `create_chat` is in flight so `carry_draft` never leaks into background chat.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(fabushi_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("return to fabushi for async DM commit check");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("keep my bot draft");
+                ccx.notify();
+            });
+            sh.flush_pending_draft_for_chat(fabushi_cid, cx);
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter + for async DM commit check");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 999_888,
+                    chat_id: None,
+                    display_name: "NewContact".to_string(),
+                    username: Some("new_contact".to_string()),
+                    initials: "NC".to_string(),
+                    avatar_color: 0x2AABEE,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+            sh.composer.update(cx, |c, ccx| {
+                c.set_text("new dm carry draft");
+                c.is_input_focused = false;
+                ccx.notify();
+            });
+            assert!(sh.handle_non_char_key("enter", false, cx));
+            assert!(
+                sh.composer.read(cx).is_compose_isolated,
+                "is_compose_isolated MUST stay true while create_chat is in flight"
+            );
+            assert!(sh.sidebar.read(cx).compose_draft.pending_creation.is_some());
+        });
+    })
+    .expect("invoke commit_single_compose_recipient_to_dm for new DM");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(60))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert!(
+            sh.composer.read(cx).is_compose_isolated,
+            "is_compose_isolated must remain consistent on create_chat error in compose mode"
+        );
+        assert_eq!(
+            sh.session_sync
+                .last_draft_text_by_chat
+                .get(&fabushi_cid)
+                .map(String::as_str),
+            Some("keep my bot draft"),
+            "in-flight or failed new DM commit must NEVER leak carry_draft into background chat"
+        );
+    })
+    .expect("verify async DM commit preserves background draft");
+}
+
+#[test]
+fn test_headless_gpui_plus_compose_over_unstarted_bot_and_start_bar_ime_guard() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_plus_compose_over_unstarted_bot_and_start_bar_ime_guard",
+    );
+}
+
+async fn headless_body_plus_compose_over_unstarted_bot_and_start_bar_ime_guard(app: AsyncApp) {
+    let client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let _rt = client.runtime().enter();
+    let bot_cid = 9_501u64;
+    let alice_cid = 9_502u64;
+
+    let shell = app
+        .update(|cx| {
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_001);
+                s.session_sync.session_token = Some("tok_start_bar_compose_reg".to_string());
+                let unstarted_profile = BotPublicProfileDto {
+                    bot: BotRegistryEntry {
+                        bot_user_id: 600_777,
+                        owner_user_id: 202,
+                        username: "unstarted_bot".to_string(),
+                        display_name: "UnstartedBot".to_string(),
+                        description: "Tap START to begin".to_string(),
+                        ..Default::default()
+                    },
+                    main_app: None,
+                    apps: Vec::new(),
+                    existing_chat_id: Some(bot_cid as i64),
+                    has_started_chat: false,
+                    allows_write_to_pm: true,
+                    app_tos_accepted: true,
+                    is_blocked: false,
+                    is_muted: false,
+                };
+                s.miniapps
+                    .bot_profiles_cache
+                    .insert("unstarted_bot".to_string(), unstarted_profile);
+                s.session_sync.rich_chats_by_id.insert(
+                    bot_cid,
+                    HermesRichChatDto {
+                        chat_id: bot_cid as i64,
+                        title: "UnstartedBot".to_string(),
+                        is_bot: true,
+                        peer_user_id: Some(600_777),
+                        peer_username: Some("unstarted_bot".to_string()),
+                        ..Default::default()
+                    },
+                );
+                s.sidebar.update(cx, |sb, _| {
+                    sb.dialogs.push(DialogItemModel {
+                        id: bot_cid,
+                        peer_name: "UnstartedBot".to_string(),
+                        avatar_initials: "UB".to_string(),
+                        avatar_color: 0x0A84FF,
+                        last_message: String::new(),
+                        timestamp: "10:00".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "Bots".to_string(),
+                    });
+                    sb.bot_ids.insert(bot_cid);
+                    sb.dialogs.push(DialogItemModel {
+                        id: alice_cid,
+                        peer_name: "Alice".to_string(),
+                        avatar_initials: "AL".to_string(),
+                        avatar_color: 0x27AE60,
+                        last_message: String::new(),
+                        timestamp: "09:50".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "All".to_string(),
+                    });
+                    sb.select_dialog(bot_cid);
+                });
+                s.stage.update(cx, |st, _| {
+                    st.set_chat(bot_cid, "UnstartedBot", "bot", "UB", 0x0A84FF);
+                    st.show_bot_start_bar = true;
+                });
+                s.sync_composer_and_inspector_miniapp_state(cx);
+                s
+            })
+        })
+        .expect("mount shell on unstarted bot");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    // 1. Background unstarted bot (`!is_apple_compose_mode && stage.show_bot_start_bar == true`)
+    //    must block composer input, IME, Enter, and `validate_selected_send_target`.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            assert!(sh.should_hide_composer(cx));
+            assert!(sh.is_non_composer_text_capturing(cx));
+            assert!(
+                validate_selected_send_target(
+                    true,
+                    Some("tok"),
+                    Some(100_001),
+                    sh.sidebar.read(cx),
+                    sh.stage.read(cx),
+                )
+                .is_none(),
+                "validate_selected_send_target must block sending while START bar is active"
+            );
+            sh.insert_committed_text("blocked", cx);
+            sh.update_ime_marked_text("pre", cx);
+            sh.commit_ime_unmark_text(cx);
+            assert!(!sh.handle_non_char_key("enter", false, cx));
+            assert!(sh.composer.read(cx).text().is_empty());
+            assert!(!sh.composer.read(cx).ime_machine.is_composing());
+            assert!(sh.stage.read(cx).messages.is_empty());
+        });
+    })
+    .expect("verify initial unstarted bot blocks composer and IME");
+
+    // 2. Enter `+` compose mode over the unstarted bot (`stage.show_bot_start_bar == true` in background),
+    //    add a recipient (`should_hide_composer == false`), and focus the `+` composer.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(alice_cid),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x27AE60,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter + compose mode with recipient over unstarted bot");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            assert!(sh.theme_state.palette.is_apple_style());
+            assert!(sh.sidebar.read(cx).is_plus_menu_open);
+            assert!(sh.stage.read(cx).show_bot_start_bar);
+            assert!(!sh.should_hide_composer(cx));
+            sh.composer.update(cx, |c, ccx| {
+                c.is_input_focused = true;
+                ccx.notify();
+            });
+            // Trigger background stage notification to ensure `observe(&self.stage)` does NOT blur `+` composer!
+            sh.stage.update(cx, |_, st_cx| st_cx.notify());
+        });
+    })
+    .expect("focus + composer and notify background stage");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    // 3. Verify typing, backspace, IME mark/unmark, and Enter send all work cleanly in `+` compose mode
+    //    despite `stage.show_bot_start_bar == true` in the background.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            assert!(
+                sh.composer.read(cx).is_input_focused,
+                "background stage notify with show_bot_start_bar must NOT blur focused + composer"
+            );
+            assert!(
+                !sh.is_non_composer_text_capturing(cx),
+                "focused + composer with recipient must accept composer IME even when background stage has show_bot_start_bar"
+            );
+
+            sh.insert_committed_text("hello!", cx);
+            assert_eq!(sh.composer.read(cx).text(), "hello!");
+
+            assert!(
+                sh.handle_non_char_key("backspace", false, cx),
+                "Backspace must edit + composer over background unstarted bot"
+            );
+            assert_eq!(sh.composer.read(cx).text(), "hello");
+
+            sh.update_ime_marked_text(" world", cx);
+            assert_eq!(
+                sh.composer.read(cx).ime_machine.preedit_text(),
+                Some(" world"),
+                "IME preedit must route to + composer when focused"
+            );
+            sh.commit_ime_unmark_text(cx);
+            assert_eq!(sh.composer.read(cx).text(), "hello world");
+            assert!(!sh.composer.read(cx).ime_machine.is_composing());
+
+            // First Enter clears the IME commit fence; second Enter submits the `+` compose message.
+            assert!(
+                sh.handle_non_char_key("enter", false, cx),
+                "First Enter after unmark_text must clear IME commit fence"
+            );
+            assert_eq!(sh.composer.read(cx).text(), "hello world");
+            assert!(
+                sh.handle_non_char_key("enter", false, cx),
+                "Second Enter must submit + compose message even when background chat had show_bot_start_bar"
+            );
+        });
+    })
+    .expect("type, backspace, IME compose, and Enter submit in + compose over unstarted bot");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert_eq!(sh.stage.read(cx).active_chat_id, Some(alice_cid));
+        assert!(!sh.sidebar.read(cx).is_plus_menu_open);
+        assert!(
+            sh.stage.read(cx).messages.iter().any(|m| {
+                matches!(&m.content, MessageContent::Text { text, .. } if text == "hello world")
+            }),
+            "submitted + compose text must be dispatched to Alice DM"
+        );
+    })
+    .expect("verify + compose message delivered to Alice");
+
+    // 4. Switch back to unstarted bot (`show_bot_start_bar = true`), enter `+` and exit back to it:
+    //    `!is_apple_compose_mode && show_bot_start_bar` must re-blur composer and block input/IME/Enter/send.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.select_dialog_from_user(bot_cid);
+                scx.notify();
+            });
+        });
+    })
+    .expect("switch back to unstarted bot");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.stage.update(cx, |st, st_cx| {
+                st.show_bot_start_bar = true;
+                st.messages.clear();
+                st_cx.notify();
+            });
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.compose_draft.selected_recipients.push(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(alice_cid),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x27AE60,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+        });
+    })
+    .expect("enter + from unstarted bot");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.composer.update(cx, |c, ccx| {
+                c.is_input_focused = true;
+                ccx.notify();
+            });
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.exit_compose_mode();
+                scx.notify();
+            });
+            sh.stage.update(cx, |_, st_cx| st_cx.notify());
+        });
+    })
+    .expect("exit + back to unstarted bot");
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            assert!(!sh.sidebar.read(cx).is_plus_menu_open);
+            assert!(sh.stage.read(cx).show_bot_start_bar);
+            assert!(sh.should_hide_composer(cx));
+            assert!(sh.is_non_composer_text_capturing(cx));
+            assert!(
+                !sh.composer.read(cx).is_input_focused,
+                "exiting + back to unstarted bot must keep composer unfocused"
+            );
+            sh.insert_committed_text("should be blocked", cx);
+            sh.update_ime_marked_text("blocked_ime", cx);
+            sh.commit_ime_unmark_text(cx);
+            assert!(!sh.handle_non_char_key("enter", false, cx));
+            assert!(sh.composer.read(cx).text().is_empty());
+            assert!(!sh.composer.read(cx).ime_machine.is_composing());
+            assert!(sh.stage.read(cx).messages.is_empty());
+            assert!(
+                validate_selected_send_target(
+                    true,
+                    Some("tok"),
+                    Some(100_001),
+                    sh.sidebar.read(cx),
+                    sh.stage.read(cx),
+                )
+                .is_none(),
+                "validate_selected_send_target must remain blocked after exiting + back to unstarted bot"
+            );
+        });
+    })
+    .expect("verify exiting + back to unstarted bot blocks composer, IME, Enter, and send target");
+}
+
+#[test]
+fn test_headless_gpui_plus_compose_chip_remove_restores_to_bar_input() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_plus_compose_chip_remove_restores_to_bar_input",
+    );
+}
+
+async fn headless_body_plus_compose_chip_remove_restores_to_bar_input(app: AsyncApp) {
+    let client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let _rt = client.runtime().enter();
+    let alice_cid = 9_601u64;
+
+    let shell = app
+        .update(|cx| {
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_002);
+                s.session_sync.session_token = Some("tok_chip_remove_reg".to_string());
+                s.sidebar.update(cx, |sb, _| {
+                    sb.dialogs.push(DialogItemModel {
+                        id: alice_cid,
+                        peer_name: "Alice".to_string(),
+                        avatar_initials: "AL".to_string(),
+                        avatar_color: 0x27AE60,
+                        last_message: String::new(),
+                        timestamp: "10:00".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "All".to_string(),
+                    });
+                    sb.select_dialog(alice_cid);
+                });
+                s
+            })
+        })
+        .expect("mount shell for chip remove test");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(20))
+        .await;
+
+    // Enter `+` compose mode, select Alice chip, focus `+` composer (`is_input_focused = true`).
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.add_compose_recipient(ComposeRecipientChip {
+                    user_id: 201,
+                    chat_id: Some(alice_cid),
+                    display_name: "Alice".to_string(),
+                    username: Some("alice".to_string()),
+                    initials: "AL".to_string(),
+                    avatar_color: 0x27AE60,
+                    is_bot: false,
+                    bot_id: None,
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+            sh.sync_compose_state_to_composer(true, cx);
+            sh.composer.update(cx, |c, ccx| {
+                c.is_input_focused = true;
+                ccx.notify();
+            });
+            assert!(sh.composer.read(cx).is_input_focused);
+            assert!(!sh.should_hide_composer(cx));
+            assert!(
+                !sh.is_apple_compose_input_active(cx),
+                "while + composer is focused, To: bar should not intercept typing"
+            );
+        });
+    })
+    .expect("setup + compose with focused composer");
+
+    // Remove the last chip (`user_id = 201`) and sync compose state -> composer must lose focus
+    // so the `To:` bar immediately accepts keyboard & IME input.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            let removed = sh.sidebar.update(cx, |sb, scx| {
+                let ok = sb.remove_compose_recipient(201);
+                scx.notify();
+                ok
+            });
+            assert!(removed);
+            sh.sync_compose_state_to_composer(true, cx);
+
+            assert!(sh.should_hide_composer(cx));
+            assert!(
+                !sh.composer.read(cx).is_input_focused,
+                "removing the last chip must clear composer.is_input_focused"
+            );
+            assert!(
+                sh.is_apple_compose_input_active(cx),
+                "To: bar must immediately become active after removing the last chip"
+            );
+
+            sh.insert_committed_text("ali", cx);
+            assert_eq!(
+                sh.sidebar.read(cx).compose_recipient_query,
+                "ali",
+                "To: bar must receive typed recipient query immediately after chip removal"
+            );
+            assert!(
+                sh.handle_non_char_key("down", false, cx),
+                "To: bar must handle Down arrow navigation after chip removal"
+            );
+        });
+    })
+    .expect("verify chip removal restores To: bar keyboard & IME input");
+}
+
+#[test]
+fn test_headless_gpui_plus_compose_send_to_unstarted_bot_delivers_message() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_plus_compose_send_to_unstarted_bot_delivers_message",
+    );
+}
+
+async fn headless_body_plus_compose_send_to_unstarted_bot_delivers_message(app: AsyncApp) {
+    let client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let _rt = client.runtime().enter();
+    let bot_cid = 9_701u64;
+    let other_unstarted_bot_cid = 9_702u64;
+    let alice_cid = 9_703u64;
+
+    let shell = app
+        .update(|cx| {
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_003);
+                s.session_sync.session_token = Some("tok_plus_unstarted_bot_reg".to_string());
+
+                let unstarted_profile = BotPublicProfileDto {
+                    bot: BotRegistryEntry {
+                        bot_user_id: 600_888,
+                        owner_user_id: 202,
+                        username: "unstarted_compose_bot".to_string(),
+                        display_name: "ComposeUnstartedBot".to_string(),
+                        description: "Tap START to begin".to_string(),
+                        ..Default::default()
+                    },
+                    main_app: None,
+                    apps: Vec::new(),
+                    existing_chat_id: Some(bot_cid as i64),
+                    has_started_chat: false,
+                    allows_write_to_pm: true,
+                    app_tos_accepted: true,
+                    is_blocked: false,
+                    is_muted: false,
+                };
+                s.miniapps
+                    .bot_profiles_cache
+                    .insert("unstarted_compose_bot".to_string(), unstarted_profile);
+
+                let other_profile = BotPublicProfileDto {
+                    bot: BotRegistryEntry {
+                        bot_user_id: 600_889,
+                        owner_user_id: 202,
+                        username: "other_unstarted_bot".to_string(),
+                        display_name: "OtherUnstartedBot".to_string(),
+                        description: "Still unstarted".to_string(),
+                        ..Default::default()
+                    },
+                    main_app: None,
+                    apps: Vec::new(),
+                    existing_chat_id: Some(other_unstarted_bot_cid as i64),
+                    has_started_chat: false,
+                    allows_write_to_pm: true,
+                    app_tos_accepted: true,
+                    is_blocked: false,
+                    is_muted: false,
+                };
+                s.miniapps
+                    .bot_profiles_cache
+                    .insert("other_unstarted_bot".to_string(), other_profile);
+
+                s.session_sync.rich_chats_by_id.insert(
+                    bot_cid,
+                    HermesRichChatDto {
+                        chat_id: bot_cid as i64,
+                        title: "ComposeUnstartedBot".to_string(),
+                        is_bot: true,
+                        peer_user_id: Some(600_888),
+                        peer_username: Some("unstarted_compose_bot".to_string()),
+                        ..Default::default()
+                    },
+                );
+                s.session_sync.rich_chats_by_id.insert(
+                    other_unstarted_bot_cid,
+                    HermesRichChatDto {
+                        chat_id: other_unstarted_bot_cid as i64,
+                        title: "OtherUnstartedBot".to_string(),
+                        is_bot: true,
+                        peer_user_id: Some(600_889),
+                        peer_username: Some("other_unstarted_bot".to_string()),
+                        ..Default::default()
+                    },
+                );
+                s.sidebar.update(cx, |sb, _| {
+                    sb.dialogs.push(DialogItemModel {
+                        id: alice_cid,
+                        peer_name: "Alice".to_string(),
+                        avatar_initials: "AL".to_string(),
+                        avatar_color: 0x27AE60,
+                        last_message: String::new(),
+                        timestamp: "09:50".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "All".to_string(),
+                    });
+                    sb.dialogs.push(DialogItemModel {
+                        id: bot_cid,
+                        peer_name: "ComposeUnstartedBot".to_string(),
+                        avatar_initials: "CB".to_string(),
+                        avatar_color: 0x0A84FF,
+                        last_message: String::new(),
+                        timestamp: "10:00".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "Bots".to_string(),
+                    });
+                    sb.bot_ids.insert(bot_cid);
+                    sb.dialogs.push(DialogItemModel {
+                        id: other_unstarted_bot_cid,
+                        peer_name: "OtherUnstartedBot".to_string(),
+                        avatar_initials: "OB".to_string(),
+                        avatar_color: 0x8F59F9,
+                        last_message: String::new(),
+                        timestamp: "10:01".to_string(),
+                        unread_count: 0,
+                        is_muted: false,
+                        is_pinned: false,
+                        is_online: true,
+                        typing_indicator: None,
+                        delivery_status: DialogDeliveryStatus::Read,
+                        folder: "Bots".to_string(),
+                    });
+                    sb.bot_ids.insert(other_unstarted_bot_cid);
+                    sb.select_dialog(alice_cid);
+                });
+                s.stage.update(cx, |st, _| {
+                    st.set_chat(alice_cid, "Alice", "online", "AL", 0x27AE60);
+                });
+                s
+            })
+        })
+        .expect("mount shell for unstarted bot + compose send test");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(20))
+        .await;
+
+    // 1. Enter `+` compose mode from Alice, select the unstarted bot (`bot_cid`), focus `+` composer,
+    //    type `"hello unstarted bot"`, and submit via Enter.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.sidebar.update(cx, |sb, scx| {
+                sb.toggle_plus_menu();
+                sb.add_compose_recipient(ComposeRecipientChip {
+                    user_id: 600_888,
+                    chat_id: Some(bot_cid),
+                    display_name: "ComposeUnstartedBot".to_string(),
+                    username: Some("unstarted_compose_bot".to_string()),
+                    initials: "CB".to_string(),
+                    avatar_color: 0x0A84FF,
+                    is_bot: true,
+                    bot_id: Some("600888".to_string()),
+                    avatar_shape: None,
+                });
+                scx.notify();
+            });
+            sh.sync_compose_state_to_composer(true, cx);
+            sh.composer.update(cx, |c, ccx| {
+                c.is_input_focused = true;
+                ccx.notify();
+            });
+            sh.insert_committed_text("hello unstarted bot", cx);
+            assert_eq!(sh.composer.read(cx).text(), "hello unstarted bot");
+            assert!(
+                sh.handle_non_char_key("enter", false, cx),
+                "Enter must submit opening message in + compose mode for an unstarted bot"
+            );
+        });
+    })
+    .expect("submit opening message to unstarted bot via + compose");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert_eq!(sh.stage.read(cx).active_chat_id, Some(bot_cid));
+        assert!(!sh.sidebar.read(cx).is_plus_menu_open);
+        assert!(
+            !sh.stage.read(cx).show_bot_start_bar,
+            "dispatching opening message from + compose must clear show_bot_start_bar"
+        );
+        assert!(
+            sh.miniapps
+                .bot_profiles_cache
+                .get("unstarted_compose_bot")
+                .is_some_and(|p| p.has_started_chat),
+            "bot_profiles_cache must mark has_started_chat = true"
+        );
+        assert!(
+            sh.stage.read(cx).messages.iter().any(|m| {
+                matches!(&m.content, MessageContent::Text { text, .. } if text == "hello unstarted bot")
+            }),
+            "opening message to unstarted bot from + compose must NOT be silently dropped"
+        );
+    })
+    .expect("verify opening message delivered to unstarted bot");
+
+    // 2. Regression guard: opening a different unstarted bot directly (outside `+` compose)
+    //    must still show the `START` bar and block composer sends.
+    app.update(|cx| {
+        shell.update(cx, |sh, cx| {
+            sh.open_or_select_chat(
+                other_unstarted_bot_cid,
+                Some("OtherUnstartedBot".to_string()),
+                true,
+                cx,
+            );
+        });
+    })
+    .expect("open other unstarted bot normally");
+
+    app.background_executor()
+        .timer(std::time::Duration::from_millis(25))
+        .await;
+
+    app.update(|cx| {
+        let sh = shell.read(cx);
+        assert_eq!(sh.stage.read(cx).active_chat_id, Some(other_unstarted_bot_cid));
+        assert!(
+            sh.stage.read(cx).show_bot_start_bar,
+            "opening an unstarted bot outside + compose must still show START bar"
+        );
+        assert!(sh.should_hide_composer(cx));
+        assert!(
+            validate_selected_send_target(
+                true,
+                Some("tok"),
+                Some(100_003),
+                sh.sidebar.read(cx),
+                sh.stage.read(cx),
+            )
+            .is_none()
+        );
+    })
+    .expect("verify normal unstarted bot blocking outside + compose");
+}
+
 

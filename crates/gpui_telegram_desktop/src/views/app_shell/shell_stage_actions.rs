@@ -375,7 +375,12 @@ impl AppShell {
             .session_sync
             .last_saved_draft_by_chat
             .get(&chat_id)
-            .is_some_and(|prev| prev == &text);
+            .is_some_and(|prev| prev == &text)
+            && self
+                .session_sync
+                .last_draft_text_by_chat
+                .get(&chat_id)
+                .is_some_and(|prev| prev == &text);
         if already_saved {
             return;
         }
@@ -778,11 +783,49 @@ impl AppShell {
         .detach();
     }
 
+    /// Opens the Leave Group / Delete Chat confirmation modal for the currently active conversation.
+    pub(crate) fn open_leave_or_delete_chat_modal(&mut self, cx: &mut Context<Self>) {
+        let lang = self.active_lang_id();
+        let active_chat = resolve_active_target_chat_id(
+            self.stage.read(cx).active_chat_id,
+            self.sidebar.read(cx).active_chat_id,
+        );
+        let st_ref = self.stage.read(cx);
+        let peer_name = st_ref.chat_title.clone();
+        let is_group = st_ref.is_group_chat
+            || st_ref.chat_subtitle.contains("member")
+            || st_ref.chat_subtitle.contains("subscriber")
+            || st_ref.chat_subtitle.contains("成员")
+            || st_ref.chat_subtitle == "group"
+            || self.inspector.read(cx).members.is_group_or_channel
+            || active_chat
+                .and_then(|cid| self.session_sync.rich_chats_by_id.get(&cid))
+                .is_some_and(|rc| rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3));
+        let header = if is_group {
+            tr_str(lang, "退出群组", "Leave Group")
+        } else {
+            tr_str(lang, "删除对话", "Delete Chat")
+        };
+        self.open_modal_dialog(
+            header,
+            ModalDialogKind::LeaveOrDeleteChat { peer_name, is_group },
+            390.0,
+            230.0,
+            cx,
+        );
+    }
+
     /// Synchronizes sidebar/stage/inspector selection and asynchronously fetches authoritative chat details.
     pub fn sync_selected_chat_inspector_and_stage(&mut self, chat_id: u64, cx: &mut Context<Self>) {
         let prev_chat_id = self.stage.read(cx).active_chat_id;
-        if let Some(prev) = prev_chat_id.filter(|&p| p != chat_id) {
-            self.flush_pending_draft_for_chat(prev, cx);
+        let is_compose_isolated = self.composer.read(cx).is_compose_isolated;
+        if !is_compose_isolated {
+            if let Some(prev) = prev_chat_id.filter(|&p| p != chat_id) {
+                self.flush_pending_draft_for_chat(prev, cx);
+            }
+        }
+        if prev_chat_id != Some(chat_id) {
+            self.clear_compose_isolation_snapshot();
         }
         let mut selected = false;
         let mut max_msg_id = 0i64;
@@ -818,6 +861,9 @@ impl AppShell {
                         }
                     }
                 });
+                if selected && prev_chat_id != Some(chat_id) {
+                    st_cx.notify();
+                }
             });
         });
         if !selected {
@@ -1005,9 +1051,21 @@ impl AppShell {
                                     insp.profile.avatar_initials = init;
                                 }
                             }
-                            username = normalized_username(rc.peer_username.as_deref().or(rc.username.as_deref()));
+                            username = normalized_username(
+                                rc.peer_username
+                                    .as_deref()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .or(rc.username.as_deref()),
+                            );
                             phone = rc.peer_phone.clone().unwrap_or_default();
-                            bio = rc.peer_bio.as_deref().or(rc.about.as_deref()).unwrap_or("").trim().to_string();
+                            bio = rc
+                                .peer_bio
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| rc.about.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+                                .unwrap_or("")
+                                .to_string();
                             if rc.is_bot {
                                 if is_fabushi_owner_bot {
                                     status = tr_str(&lang, "AI 机器人 · Fabushi 智能体", "AI Bot · Fabushi Agent").to_string();
@@ -1059,11 +1117,20 @@ impl AppShell {
                                 bio = about.trim().to_string();
                             }
                         }
-                        if !bio.is_empty() {
-                            insp.profile.bio = bio;
-                        }
-                        if avatar_path.is_none() {
+                        insp.profile.bio = bio;
+                        if avatar_path.is_none() && details.is_none() {
                             avatar_path = insp.profile.avatar_path.clone();
+                        }
+                        if let Some(ref rc) = rich_chat {
+                            insp.profile.is_bot = rc.is_bot;
+                            if !rc.is_bot {
+                                insp.profile.is_verified = false;
+                            }
+                        } else {
+                            insp.profile.is_bot = rc_is_bot_flag;
+                            if !rc_is_bot_flag {
+                                insp.profile.is_verified = false;
+                            }
                         }
                         insp.sync_profile_details(username, phone, status, avatar_path, facts);
                         let inv = invites.as_ref().and_then(|v| v.first()).map(|i| i.link.clone()).unwrap_or_default();
@@ -1148,7 +1215,9 @@ impl AppShell {
                         .last_draft_text_by_chat
                         .insert(chat_id, dr.text.clone());
                     shell.sidebar.update(cx, |sb, _| sb.set_draft(chat_id, dr.text.clone()));
+                    let is_compose_isolated = shell.composer.read(cx).is_compose_isolated;
                     if shell.stage.read(cx).active_chat_id == Some(chat_id)
+                        && !is_compose_isolated
                         && !dr.text.is_empty()
                         && shell.composer.read(cx).text().is_empty()
                     {
@@ -1161,29 +1230,48 @@ impl AppShell {
                     .username
                     .clone()
                     .unwrap_or_else(|| "Me".to_string());
-                let mut send_as_list: Vec<SendAsPeer> = send_as_dto
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| SendAsPeer::new(p.peer_id, p.title, false))
-                    .collect();
-                if send_as_list.is_empty() && my_uid > 0 {
-                    send_as_list.push(SendAsPeer::new(my_uid, my_name, false));
-                }
                 let key = SendAsKey::message(chat_id);
-                shell
-                    .session_sync
-                    .send_as_peers
-                    .set_list(key, send_as_list.clone());
+                let send_as_list: Vec<SendAsPeer> = if let Some(dto_list) = send_as_dto {
+                    let mut mapped: Vec<SendAsPeer> = dto_list
+                        .into_iter()
+                        .map(|p| SendAsPeer::new(p.peer_id, p.title, false))
+                        .collect();
+                    if mapped.is_empty() && my_uid > 0 {
+                        mapped.push(SendAsPeer::new(my_uid, my_name, false));
+                    }
+                    shell
+                        .session_sync
+                        .send_as_peers
+                        .set_list(key, mapped.clone());
+                    mapped
+                } else {
+                    let existing = shell.session_sync.send_as_peers.list(&key).to_vec();
+                    if !existing.is_empty() {
+                        existing
+                    } else if my_uid > 0 {
+                        let fallback = vec![SendAsPeer::new(my_uid, my_name, false)];
+                        shell
+                            .session_sync
+                            .send_as_peers
+                            .set_list(key, fallback.clone());
+                        fallback
+                    } else {
+                        Vec::new()
+                    }
+                };
                 let chosen = shell.session_sync.send_as_peers.chosen(chat_id);
-                if shell.stage.read(cx).active_chat_id == Some(chat_id) {
+                let is_compose_isolated = shell.composer.read(cx).is_compose_isolated;
+                if shell.stage.read(cx).active_chat_id == Some(chat_id) && !is_compose_isolated {
                     shell.composer.update(cx, |c, _| {
                         c.set_send_as_options(send_as_list, chosen);
                     });
                 }
                 if is_active_chat {
-                    shell.sync_composer_and_inspector_miniapp_state(cx);
+                    if !shell.composer.read(cx).is_compose_isolated {
+                        shell.sync_composer_and_inspector_miniapp_state(cx);
+                        shell.sync_composer_mention_candidates(chat_id, members.as_deref(), cx);
+                    }
                     shell.sync_active_bot_computer_to_inspector(cx);
-                    shell.sync_composer_mention_candidates(chat_id, members.as_deref(), cx);
                     if let Some(approvals) = pending_approvals {
                         let mapped: Vec<PendingToolApproval> = approvals
                             .into_iter()
@@ -1607,16 +1695,10 @@ impl AppShell {
                 self.window_runtime.enqueue_toast(tr_str(lang, "群组或收藏夹不支持单用户屏蔽", "Blocking applies only to direct user peers"), 2200);
             }
         }
+        let leave_from_inspector = self.inspector.update(cx, |insp, _| insp.take_pending_leave_chat());
+        let delete_or_leave_chat = delete_or_leave_chat || leave_from_inspector;
         if delete_or_leave_chat {
-            let st_ref = self.stage.read(cx);
-            let peer_name = st_ref.chat_title.clone();
-            let is_group = st_ref.is_group_chat
-                || st_ref.chat_subtitle.contains("member")
-                || st_ref.chat_subtitle.contains("subscriber")
-                || st_ref.chat_subtitle == "group"
-                || active_chat.and_then(|cid| self.session_sync.rich_chats_by_id.get(&cid)).is_some_and(|rc| rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3));
-            let header = if is_group { tr_str(lang, "退出群组", "Leave Group") } else { tr_str(lang, "删除对话", "Delete Chat") };
-            self.open_modal_dialog(header, ModalDialogKind::LeaveOrDeleteChat { peer_name, is_group }, 390.0, 230.0, cx);
+            self.open_leave_or_delete_chat_modal(cx);
         }
         let bot_assist_act = self
             .stage

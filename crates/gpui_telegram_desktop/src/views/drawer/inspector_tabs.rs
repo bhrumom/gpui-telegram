@@ -249,7 +249,7 @@ impl InspectorTabsView {
                 div().cursor_pointer().p(px(10.0)).rounded(px(8.0)).bg(rgb(pal.card_bg)).hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
                     .flex().items_center().justify_between()
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _e, _w, cx| {
-                        this.copied_feedback = Some(format!("{}: {}", copied_prefix, cp));
+                        this.show_copied_feedback(format!("{}: {}", copied_prefix, cp), cx);
                         this.pending_action = Some(InspectorAction::CopyText(cp.clone()));
                         cx.notify();
                     }))
