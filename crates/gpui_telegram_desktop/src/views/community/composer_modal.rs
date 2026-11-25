@@ -11,7 +11,8 @@ use gpui_telegram_community::{validate_create_post_request, DeterministicBotResp
 use gpui_telegram_proto::community_contracts::{
     ActorKind, AutoModActionKind, CommunityActorDto, CommunityPostDto, CreatePollInputDto,
     CreatePostRequest, CreateThreadPartDto, FeedRequestDto, FeedSort, FeedTab, LinkPreviewDto,
-    PostFormat, PostMediaAttachmentDto, PostStatus, UpdatePostRequest, VerifiedTier,
+    PostFormat, PostMediaAttachmentDto, PostStatus, SubCommunityDto, UpdatePostRequest,
+    VerifiedTier,
 };
 
 use crate::i18n::tr_str;
@@ -594,6 +595,23 @@ impl CommunityWorkspace {
         .detach();
     }
 
+    fn resolve_community_for_composer(&self, slug: &str) -> Option<SubCommunityDto> {
+        let target = slug.trim();
+        if target.is_empty() {
+            return None;
+        }
+        if let Some(det) = self.state.community_detail.as_ref() {
+            if det.community.slug.eq_ignore_ascii_case(target) {
+                return Some(det.community.clone());
+            }
+        }
+        self.state
+            .communities
+            .iter()
+            .find(|cm| cm.slug.eq_ignore_ascii_case(target))
+            .cloned()
+    }
+
     /// Builds and pre-validates a [`CreatePostRequest`] from `self.state.composer`.
     pub fn build_composer_create_request(
         &self,
@@ -603,7 +621,7 @@ impl CommunityWorkspace {
         let c = &self.state.composer;
         let lang = self.language_id.as_str();
 
-        // Community bot policy guard
+        // Community bot policy guard (prefers freshest community_detail before cached list)
         if let Some(slug) = c.community_slug.as_deref() {
             let is_bot_actor = self
                 .state
@@ -611,10 +629,7 @@ impl CommunityWorkspace {
                 .is_some_and(|a| a.actor_kind.is_bot_like());
             if is_bot_actor {
                 let disallows_bots = self
-                    .state
-                    .communities
-                    .iter()
-                    .find(|cm| cm.slug.eq_ignore_ascii_case(slug))
+                    .resolve_community_for_composer(slug)
                     .is_some_and(|cm| !cm.allow_bots);
                 if disallows_bots {
                     return Err(tr_str(
@@ -732,6 +747,14 @@ impl CommunityWorkspace {
         };
 
         let thread_parts = if c.tab == ComposerFormatTab::Thread {
+            if c.thread_parts.is_empty() {
+                return Err(tr_str(
+                    lang,
+                    "串贴至少需要 2 节内容，请添加后续分节。",
+                    "A thread requires at least 2 parts. Add a follow-up segment.",
+                )
+                .to_string());
+            }
             let mut parts = Vec::new();
             for (idx, part_body) in c.thread_parts.iter().enumerate() {
                 let trimmed = part_body.trim();
@@ -979,13 +1002,10 @@ pub fn render_composer_modal(
         (ComposerFormatTab::Quote, "引用", "Quote"),
     ];
 
-    let selected_comm = c.community_slug.as_deref().and_then(|slug| {
-        ws.state
-            .communities
-            .iter()
-            .find(|cm| cm.slug.eq_ignore_ascii_case(slug))
-            .cloned()
-    });
+    let selected_comm = c
+        .community_slug
+        .as_deref()
+        .and_then(|slug| ws.resolve_community_for_composer(slug));
     let flairs = selected_comm
         .as_ref()
         .map(|cm| cm.post_flairs.clone())

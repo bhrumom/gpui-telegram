@@ -171,7 +171,10 @@ fn dispatch_headless_target(target: &str, use_underscore_exit: bool) -> ! {
         eprintln!("[community headless outer panic] {target}: {msg}");
         exit_headless_child(101, use_underscore_exit);
     }
-    exit_headless_child(0, use_underscore_exit);
+    eprintln!(
+        "[community headless error] {target}: Application::headless().run returned before async test body completed"
+    );
+    exit_headless_child(102, use_underscore_exit);
 }
 
 #[cfg(target_os = "macos")]
@@ -214,11 +217,21 @@ fn run_in_headless_subprocess(test_fn_name: &str) {
     cmd.env(CHILD_ENV, "1")
         .env(CHILD_TARGET_ENV, test_fn_name)
         .env("GPUI_TELEGRAM_CONFIG_DIR", cfg_dir.path())
-        .env("GPUI_OFFLINE_TEST", "1")
-        .arg("--exact")
-        .arg(test_fn_name)
-        .arg("--nocapture");
-    let output = cmd.output().expect("spawn community headless gpui child");
+        .env("GPUI_OFFLINE_TEST", "1");
+    #[cfg(target_os = "macos")]
+    {
+        cmd.env(CHILD_AFTER_CTORS_ENV, "1")
+            .arg("--exact")
+            .arg("__community_m4_headless_child_noop__");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        cmd.arg("--exact").arg(test_fn_name);
+    }
+    let output = cmd
+        .arg("--nocapture")
+        .output()
+        .expect("spawn community headless gpui child");
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -328,45 +341,61 @@ fn open_authenticated_shell(
     let (win, shell) = app
         .update(|cx| {
             let _rt_guard = client_for_win.runtime().enter();
-            let opened = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds(
-                        point(px(0.0), px(0.0)),
-                        size(px(width), px(height)),
-                    ))),
-                    focus: true,
-                    show: false,
-                    ..Default::default()
-                },
-                |_window, cx| {
-                    cx.new(|cx| {
-                        let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
-                        shell.apply_authenticated_session(auth_for_win.clone(), cx);
-                        shell
-                    })
-                },
-            );
-            match opened {
-                Ok(w) => {
-                    let ent = w.entity(cx).expect("AppShell entity from window");
-                    (Some(w), ent)
-                }
-                Err(err)
-                    if cfg!(target_os = "linux")
-                        && err.to_string().contains("headless mode") =>
-                {
-                    // GPUI 0.2.2's Linux `Application::headless()` uses `HeadlessClient`,
-                    // whose `open_window` unconditionally returns this error; on macOS it
-                    // opens a real offscreen window and MUST succeed.
-                    let ent = cx.new(|cx| {
-                        let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
-                        shell.apply_authenticated_session(auth_for_win.clone(), cx);
-                        shell
-                    });
-                    (None, ent)
-                }
-                Err(err) => {
-                    panic!("open headless GPUI window failed unexpectedly: {err:#}");
+            let skip_macos_ci_window = cfg!(target_os = "macos")
+                && (std::env::var("CI").as_deref() == Ok("true")
+                    || std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+                    || std::env::var("GPUI_HEADLESS_NO_WINDOW").as_deref() == Ok("1"));
+            if skip_macos_ci_window {
+                // GitHub Actions macOS Apple Silicon VMs lack a Metal GPU device, causing
+                // `gpui::MacWindow::open` -> `MetalRenderer::new` to abort with `exit(1)`.
+                // Construct the real `Entity<AppShell>` on `Application::headless()` directly.
+                let ent = cx.new(|cx| {
+                    let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
+                    shell.apply_authenticated_session(auth_for_win.clone(), cx);
+                    shell
+                });
+                (None, ent)
+            } else {
+                let opened = cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds(
+                            point(px(0.0), px(0.0)),
+                            size(px(width), px(height)),
+                        ))),
+                        focus: true,
+                        show: false,
+                        ..Default::default()
+                    },
+                    |_window, cx| {
+                        cx.new(|cx| {
+                            let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
+                            shell.apply_authenticated_session(auth_for_win.clone(), cx);
+                            shell
+                        })
+                    },
+                );
+                match opened {
+                    Ok(w) => {
+                        let ent = w.entity(cx).expect("AppShell entity from window");
+                        (Some(w), ent)
+                    }
+                    Err(err)
+                        if cfg!(target_os = "linux")
+                            && err.to_string().contains("headless mode") =>
+                    {
+                        // GPUI 0.2.2's Linux `Application::headless()` uses `HeadlessClient`,
+                        // whose `open_window` unconditionally returns this error; on local macOS
+                        // it opens a real offscreen window and MUST succeed.
+                        let ent = cx.new(|cx| {
+                            let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
+                            shell.apply_authenticated_session(auth_for_win.clone(), cx);
+                            shell
+                        });
+                        (None, ent)
+                    }
+                    Err(err) => {
+                        panic!("open headless GPUI window failed unexpectedly: {err:#}");
+                    }
                 }
             }
         })

@@ -536,6 +536,10 @@ impl CommunityWorkspace {
             .await;
             let _ = weak.update(app, |this, cx| {
                 this.state.bot_studio_test_submitting = false;
+                if !this.state.active_actor_id.is_empty() {
+                    this.facade
+                        .set_active_actor_id(Some(this.state.active_actor_id.clone()));
+                }
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(created)) => {

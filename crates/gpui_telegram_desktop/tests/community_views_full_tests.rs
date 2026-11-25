@@ -138,7 +138,10 @@ fn dispatch_headless_target(target: &str, use_underscore_exit: bool) -> ! {
         eprintln!("[community M5 headless outer panic] {target}: {msg}");
         exit_headless_child(101, use_underscore_exit);
     }
-    exit_headless_child(0, use_underscore_exit);
+    eprintln!(
+        "[community M5 headless error] {target}: Application::headless().run returned before async test body completed"
+    );
+    exit_headless_child(102, use_underscore_exit);
 }
 
 #[cfg(target_os = "macos")]
@@ -181,11 +184,21 @@ fn run_in_headless_subprocess(test_fn_name: &str) {
     cmd.env(CHILD_ENV, "1")
         .env(CHILD_TARGET_ENV, test_fn_name)
         .env("GPUI_TELEGRAM_CONFIG_DIR", cfg_dir.path())
-        .env("GPUI_OFFLINE_TEST", "1")
-        .arg("--exact")
-        .arg(test_fn_name)
-        .arg("--nocapture");
-    let output = cmd.output().expect("spawn M5 community headless gpui child");
+        .env("GPUI_OFFLINE_TEST", "1");
+    #[cfg(target_os = "macos")]
+    {
+        cmd.env(CHILD_AFTER_CTORS_ENV, "1")
+            .arg("--exact")
+            .arg("__community_m5_headless_child_noop__");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        cmd.arg("--exact").arg(test_fn_name);
+    }
+    let output = cmd
+        .arg("--nocapture")
+        .output()
+        .expect("spawn M5 community headless gpui child");
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -305,41 +318,54 @@ async fn open_community_host(
     let (win, shell) = app
         .update(|cx| {
             let _rt_guard = client_for_win.runtime().enter();
-            let opened = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds(
-                        point(px(0.0), px(0.0)),
-                        size(px(width), px(height)),
-                    ))),
-                    focus: true,
-                    show: false,
-                    ..Default::default()
-                },
-                |_window, cx| {
-                    cx.new(|cx| {
-                        let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
-                        shell.apply_authenticated_session(auth_for_win.clone(), cx);
-                        shell
-                    })
-                },
-            );
-            match opened {
-                Ok(w) => {
-                    let ent = w.entity(cx).expect("AppShell entity from window");
-                    (Some(w), ent)
+            let skip_macos_ci_window = cfg!(target_os = "macos")
+                && (std::env::var("CI").as_deref() == Ok("true")
+                    || std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+                    || std::env::var("GPUI_HEADLESS_NO_WINDOW").as_deref() == Ok("1"));
+            if skip_macos_ci_window {
+                let ent = cx.new(|cx| {
+                    let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
+                    shell.apply_authenticated_session(auth_for_win.clone(), cx);
+                    shell
+                });
+                (None, ent)
+            } else {
+                let opened = cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds(
+                            point(px(0.0), px(0.0)),
+                            size(px(width), px(height)),
+                        ))),
+                        focus: true,
+                        show: false,
+                        ..Default::default()
+                    },
+                    |_window, cx| {
+                        cx.new(|cx| {
+                            let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
+                            shell.apply_authenticated_session(auth_for_win.clone(), cx);
+                            shell
+                        })
+                    },
+                );
+                match opened {
+                    Ok(w) => {
+                        let ent = w.entity(cx).expect("AppShell entity from window");
+                        (Some(w), ent)
+                    }
+                    Err(err)
+                        if cfg!(target_os = "linux")
+                            && err.to_string().contains("headless mode") =>
+                    {
+                        let ent = cx.new(|cx| {
+                            let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
+                            shell.apply_authenticated_session(auth_for_win.clone(), cx);
+                            shell
+                        });
+                        (None, ent)
+                    }
+                    Err(err) => panic!("open headless GPUI window failed unexpectedly: {err:#}"),
                 }
-                Err(err)
-                    if cfg!(target_os = "linux")
-                        && err.to_string().contains("headless mode") =>
-                {
-                    let ent = cx.new(|cx| {
-                        let mut shell = AppShell::new_with_client(client_for_win.clone(), cx);
-                        shell.apply_authenticated_session(auth_for_win.clone(), cx);
-                        shell
-                    });
-                    (None, ent)
-                }
-                Err(err) => panic!("open headless GPUI window failed unexpectedly: {err:#}"),
             }
         })
         .expect("app update open_community_host");
@@ -436,12 +462,18 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
     }
 
     assert!(validate_automod_regex_syntax("(spam|airdrop)\\s+free").is_ok());
+    assert!(validate_automod_regex_syntax("(?i)(?:scam|phish){1,3}?").is_ok());
     assert!(validate_automod_regex_syntax("").is_ok());
     assert!(validate_automod_regex_syntax("(unclosed").is_err());
     assert!(validate_automod_regex_syntax("[unclosed").is_err());
     assert!(validate_automod_regex_syntax("trailing\\").is_err());
     assert!(validate_automod_regex_syntax("*leading").is_err());
     assert!(validate_automod_regex_syntax("?leading").is_err());
+    assert!(validate_automod_regex_syntax("a{5,2}").is_err());
+    assert!(validate_automod_regex_syntax("a{abc}").is_err());
+    assert!(validate_automod_regex_syntax("a{}").is_err());
+    assert!(validate_automod_regex_syntax("(?)").is_err());
+    assert!(validate_automod_regex_syntax("foo|?bar").is_err());
 }
 
 #[test]
@@ -808,9 +840,15 @@ async fn body_f18_composer_modal(mut app: AsyncApp) {
             .build_composer_create_request(PostStatus::Published, now_ms)
             .is_ok());
 
-        // Thread 1/N validation
+        // Thread 1/N validation (0 follow-up parts rejected; 1+ non-empty part accepted)
         w.set_composer_tab(ComposerFormatTab::Thread, cx);
         w.state.composer.body = "Part 1 of thread".to_string();
+        w.state.composer.thread_parts.clear();
+        assert!(
+            w.build_composer_create_request(PostStatus::Published, now_ms)
+                .is_err(),
+            "Thread with 0 follow-up parts must be rejected"
+        );
         w.state.composer.thread_parts = vec!["Part 2 of thread".to_string()];
         let req = w
             .build_composer_create_request(PostStatus::Published, now_ms)
@@ -1086,6 +1124,20 @@ async fn body_f19_community_page(mut app: AsyncApp) {
         .await
     );
     host.draw(&mut app);
+
+    // 5. Nonexistent c/does_not_exist renders clean not-found fallback without crashing
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage("does_not_exist_m5".to_string()), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading && st.community_detail.is_none() && st.community_error.is_some()
+        })
+        .await,
+        "Nonexistent c/ must resolve cleanly to not-found fallback"
+    );
+    host.draw(&mut app);
 }
 
 // ============================================================================
@@ -1267,6 +1319,70 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
         })
         .await
     );
+    // Mark all read with 0 unread stays clean no-op
+    let _ = cw.update(&mut app, |w, cx| w.mark_all_notifications_read(cx));
+    assert!(
+        pump_until(&mut app, Duration::from_secs(2), |cx| {
+            !cw.read(cx).state.notifications_loading && cw.read(cx).state.unread_notifications == 0
+        })
+        .await
+    );
+    // Jumping from a notification targeting a deleted/missing post displays toast + not-found fallback
+    let _ = host.shell.update(&mut app, |s, _| {
+        s.window_runtime.controller.current_toast = None;
+        s.window_runtime.controller.toast_queue.clear();
+    });
+    let _ = cw.update(&mut app, |w, cx| {
+        let _ = w.take_pending_actions();
+        w.open_notification_target(
+            CommunityNotificationDto {
+                notif_id: "n_deleted_target".to_string(),
+                recipient_actor_id: own_human.actor_id.clone(),
+                actor_id: target_bot.actor_id.clone(),
+                actor_handle: target_bot.handle.clone(),
+                actor_display_name: target_bot.display_name.clone(),
+                actor_kind: ActorKind::Bot,
+                kind: CommunityNotificationKind::Reply,
+                target_post_id: Some("deleted_post_does_not_exist".to_string()),
+                target_comment_id: Some("c_deleted".to_string()),
+                preview_text: "reply on deleted post".to_string(),
+                is_read: true,
+                created_at_ms: 1_700_000_002_000,
+            },
+            cx,
+        );
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading && st.detail_post.is_none() && st.detail_error.is_some()
+        })
+        .await,
+        "Deleted notification target must resolve to graceful not-found fallback"
+    );
+    assert!(
+        pump_until(&mut app, Duration::from_secs(2), |cx| {
+            let ctrl = &host.shell.read(cx).window_runtime.controller;
+            ctrl.current_toast.is_some() || !ctrl.toast_queue.is_empty()
+        })
+        .await,
+        "Deleted notification target must route graceful error toast into AppShell"
+    );
+    host.draw(&mut app);
+
+    // Nonexistent @missing_handle profile renders clean not-found fallback
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_actor_profile("missing_handle_m5_xyz".to_string(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading && st.actor_profile.is_none() && st.profile_error.is_some()
+        })
+        .await,
+        "Nonexistent @handle profile must resolve cleanly to not-found fallback"
+    );
+    host.draw(&mut app);
 
     // 3. BookmarksListsView: Custom Folders (Create/Move/Remove) + Lists CRUD + Membership + Timeline
     let _ = cw.update(&mut app, |w, cx| {

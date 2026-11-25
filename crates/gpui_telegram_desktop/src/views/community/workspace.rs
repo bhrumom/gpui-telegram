@@ -1733,12 +1733,39 @@ impl CommunityWorkspace {
                         this.state.detail_error = None;
                     }
                     Ok(Err(e)) => {
+                        let msg = e.to_string();
                         this.state.detail_post = None;
-                        this.state.detail_error = Some(e.to_string());
+                        this.state.detail_error = Some(msg.clone());
+                        if this.state.detail_focused_comment_id.take().is_some() {
+                            let lang = this.language_id.clone();
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: format!(
+                                        "{} ({msg})",
+                                        tr_str(
+                                            &lang,
+                                            "目标帖子已被删除或不可访问",
+                                            "Target post has been deleted or is unavailable",
+                                        )
+                                    ),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Err(e) => {
                         this.state.detail_post = None;
-                        this.state.detail_error = Some(e);
+                        this.state.detail_error = Some(e.clone());
+                        if this.state.detail_focused_comment_id.take().is_some() {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e,
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                     }
                 }
                 cx.notify();

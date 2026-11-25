@@ -37,7 +37,7 @@ pub fn validate_automod_regex_syntax(pattern: &str) -> Result<(), String> {
     let chars: Vec<char> = trimmed.chars().collect();
     let mut paren_depth: i32 = 0;
     let mut in_char_class = false;
-    let mut brace_open = false;
+    let mut brace_start: Option<usize> = None;
     let mut escaped = false;
     let mut prev_can_quantify = false;
 
@@ -58,6 +58,36 @@ pub fn validate_automod_regex_syntax(pattern: &str) -> Result<(), String> {
             if ch == ']' {
                 in_char_class = false;
                 prev_can_quantify = true;
+            }
+            continue;
+        }
+        if let Some(start) = brace_start {
+            if ch == '}' {
+                let inner: String = chars[start + 1..idx].iter().collect();
+                let parts: Vec<&str> = inner.split(',').collect();
+                if inner.is_empty() || parts.len() > 2 {
+                    return Err(format!("Invalid regex: malformed repetition '{{{inner}}}'"));
+                }
+                let min_v = parts[0]
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid regex: non-numeric repetition '{{{inner}}}'"))?;
+                if parts.len() == 2 && !parts[1].is_empty() {
+                    let max_v = parts[1].parse::<u32>().map_err(|_| {
+                        format!("Invalid regex: non-numeric repetition bound '{{{inner}}}'")
+                    })?;
+                    if max_v < min_v {
+                        return Err(format!(
+                            "Invalid regex: repetition min > max in '{{{inner}}}'"
+                        ));
+                    }
+                }
+                brace_start = None;
+                prev_can_quantify = false;
+                continue;
+            } else if !(ch.is_ascii_digit() || ch == ',') {
+                return Err(format!(
+                    "Invalid regex: unexpected character '{ch}' inside repetition '{{...}}'"
+                ));
             }
             continue;
         }
@@ -84,15 +114,11 @@ pub fn validate_automod_regex_syntax(pattern: &str) -> Result<(), String> {
                 if !prev_can_quantify {
                     return Err("Invalid regex: repetition quantifier '{' without target".to_string());
                 }
-                brace_open = true;
+                brace_start = Some(idx);
                 prev_can_quantify = false;
             }
             '}' => {
-                if !brace_open {
-                    return Err("Invalid regex: unmatched closing '}'".to_string());
-                }
-                brace_open = false;
-                prev_can_quantify = false;
+                return Err("Invalid regex: unmatched closing '}'".to_string());
             }
             '*' | '+' => {
                 if !prev_can_quantify {
@@ -103,6 +129,20 @@ pub fn validate_automod_regex_syntax(pattern: &str) -> Result<(), String> {
             '?' => {
                 if idx == 0 {
                     return Err("Invalid regex: leading quantifier '?'".to_string());
+                }
+                let prev = chars[idx - 1];
+                if prev == '(' {
+                    // Valid inline group modifiers: (?:...), (?i), (?m:...), (?P<name>...)
+                    match chars.get(idx + 1).copied() {
+                        Some(':' | 'P' | '-' | 'i' | 'm' | 's' | 'U' | 'x' | 'R') => {}
+                        _ => {
+                            return Err(format!(
+                                "Invalid regex: malformed group modifier '(?' at position {idx}"
+                            ));
+                        }
+                    }
+                } else if !prev_can_quantify && !matches!(prev, '*' | '+' | '}' | '?') {
+                    return Err(format!("Invalid regex: dangling quantifier '?' at position {idx}"));
                 }
                 prev_can_quantify = false;
             }
@@ -120,7 +160,7 @@ pub fn validate_automod_regex_syntax(pattern: &str) -> Result<(), String> {
     if paren_depth != 0 {
         return Err("Invalid regex: unclosed group '('".to_string());
     }
-    if brace_open {
+    if brace_start.is_some() {
         return Err("Invalid regex: unclosed repetition '{'".to_string());
     }
     Ok(())
