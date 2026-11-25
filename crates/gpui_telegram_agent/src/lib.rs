@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod community_tools;
 pub mod computer;
 pub mod fabushi_bot;
 pub mod hermes;
@@ -55,6 +56,9 @@ pub use fabushi_bot::{
 pub use acp::{
     AcpRunner, AgentTurnInput, AgentTurnOutput, HostSubagentLineage, SubagentArtifactReceipt,
     SubagentLifecycleStatus, SubagentLineage, SubagentNode, SubagentTreeNode, TextDeltaCallback,
+};
+pub use community_tools::{
+    community_tool_specs, is_community_tool, validate_community_tool_args, COMMUNITY_TOOL_NAMES,
 };
 pub use computer::{
     parse_cloud_credentials_from_prompt, redact_cloud_secrets, AgentCloudServerConfigInput,

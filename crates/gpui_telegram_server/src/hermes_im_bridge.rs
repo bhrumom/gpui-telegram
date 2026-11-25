@@ -95,6 +95,8 @@ pub struct ServerPlatformImBridge {
     search_indexer: Weak<TantivyIndexer>,
     hybrid_memory: Weak<HybridMemoryEngine>,
     webmcp_broker: Weak<MiniAppWebMcpBroker>,
+    community_search: Weak<gpui_telegram_community::CommunitySearchIndexer>,
+    community_bot_guard: Weak<gpui_telegram_community::BotLoopGuard>,
     state_weak: Arc<OnceLock<Weak<AppState>>>,
     cas: Option<Weak<CasStore>>,
 }
@@ -109,6 +111,8 @@ impl ServerPlatformImBridge {
         search_indexer: Weak<TantivyIndexer>,
         hybrid_memory: Weak<HybridMemoryEngine>,
         webmcp_broker: Weak<MiniAppWebMcpBroker>,
+        community_search: Weak<gpui_telegram_community::CommunitySearchIndexer>,
+        community_bot_guard: Weak<gpui_telegram_community::BotLoopGuard>,
         state_weak: Arc<OnceLock<Weak<AppState>>>,
     ) -> Self {
         Self {
@@ -119,6 +123,8 @@ impl ServerPlatformImBridge {
             search_indexer,
             hybrid_memory,
             webmcp_broker,
+            community_search,
+            community_bot_guard,
             state_weak,
             cas: None,
         }
@@ -1400,8 +1406,21 @@ impl PlatformImBridge for ServerPlatformImBridge {
         caller: PlatformImCaller,
     ) -> BoxFuture<'a, Result<Value, String>> {
         Box::pin(async move {
-            let caller_uid = self.resolve_caller_user(&caller)?;
             let now_ms = Utc::now().timestamp_millis();
+            if gpui_telegram_agent::is_community_tool(tool_name) {
+                let ctx = crate::routes::community::hermes_bridge::CommunityBridgeContext {
+                    db: &self.db,
+                    gateway_hub: &self.gateway_hub,
+                    community_search: &self.community_search,
+                    community_bot_guard: &self.community_bot_guard,
+                    state_weak: &self.state_weak,
+                };
+                return crate::routes::community::hermes_bridge::execute_community_im_tool(
+                    &ctx, tool_name, args, &caller, now_ms,
+                );
+            }
+
+            let caller_uid = self.resolve_caller_user(&caller)?;
 
             match tool_name {
                 "send_message" => {

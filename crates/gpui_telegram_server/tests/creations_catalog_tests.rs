@@ -397,10 +397,10 @@ async fn test_01_migration_v41_upgrade_from_v40_idempotent_and_clean_db() {
     )
     .unwrap();
 
-    // Upgrade to V42 (V41 = automation apps) via canonical run_migrations.
-    run_migrations(&conn).expect("upgrade v40 -> v42 should succeed");
+    // Upgrade to V43 (V41 = automation apps, V42 = community) via canonical run_migrations.
+    run_migrations(&conn).expect("upgrade v40 -> v43 should succeed");
 
-    // Verify v39 & v40 were NOT shifted or re-run, and v41 + v42 are recorded.
+    // Verify v39 & v40 were NOT shifted or re-run, and v41 + v42 + v43 are recorded.
     let v39_ts: i64 = conn
         .query_row("SELECT applied_at_ms FROM _schema_migrations WHERE version = 39", [], |r| r.get(0))
         .unwrap();
@@ -416,9 +416,13 @@ async fn test_01_migration_v41_upgrade_from_v40_idempotent_and_clean_db() {
     assert_eq!(v39_ts, 1_700_000_000_039);
     assert_eq!(v40_ts, 1_700_000_000_040);
     assert!(has_v41);
+    let has_v43: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = 43)", [], |r| r.get(0))
+        .unwrap();
     assert!(has_v42);
+    assert!(has_v43);
 
-    // Verify all 8 V42 tables/virtual tables and all 3 FTS5 triggers exist.
+    // Verify all 8 V43 tables/virtual tables and all 3 FTS5 triggers exist.
     for tbl in [
         "user_creations",
         "public_catalog_entries",
@@ -436,7 +440,7 @@ async fn test_01_migration_v41_upgrade_from_v40_idempotent_and_clean_db() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(exists, "missing V42 table {tbl}");
+        assert!(exists, "missing V43 table {tbl}");
     }
     for trg in ["trg_public_catalog_ai", "trg_public_catalog_au", "trg_public_catalog_ad"] {
         let exists: bool = conn
@@ -446,7 +450,7 @@ async fn test_01_migration_v41_upgrade_from_v40_idempotent_and_clean_db() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(exists, "missing V42 trigger {trg}");
+        assert!(exists, "missing V43 trigger {trg}");
     }
 
     // Zero dummy seed records on clean startup.

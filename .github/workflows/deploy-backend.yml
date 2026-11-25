@@ -10,6 +10,7 @@ on:
       - "crates/gpui_telegram_media/**"
       - "crates/gpui_telegram_webrtc/**"
       - "crates/gpui_telegram_agent/**"
+      - "crates/gpui_telegram_community/**"
       - "crates/gpui_telegram_server/**"
       - "crates/fabushi_remote_engine/**"
       - "crates/fabushi_remote_daemon/**"

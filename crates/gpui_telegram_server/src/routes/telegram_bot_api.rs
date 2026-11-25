@@ -239,7 +239,8 @@ pub(crate) fn enqueue_update_and_maybe_webhook(
     let delivery_body = Value::Object(full_update);
     tokio::spawn(async move {
         let Ok(client) = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(4))
             .build()
         else {
             return;
@@ -250,6 +251,23 @@ pub(crate) fn enqueue_update_and_maybe_webhook(
         }
         let _ = req.send().await;
     });
+}
+
+/// Enqueues a `community_mention` or `community_comment` update into `bot_api_updates` (`getUpdates`)
+/// and triggers a non-blocking webhook POST with `X-Telegram-Bot-Api-Secret-Token` if configured.
+pub fn enqueue_community_bot_update(
+    state: &Arc<AppState>,
+    target_bot_user_id: i64,
+    kind: &str,
+    payload: Value,
+) {
+    if target_bot_user_id <= 0 || target_bot_user_id == BOTFATHER_USER_ID as i64 {
+        return;
+    }
+    let Ok(Some(bot)) = state.db.get_bot_by_user_id(target_bot_user_id) else {
+        return;
+    };
+    enqueue_update_and_maybe_webhook(state, &bot, json!({ kind: payload }));
 }
 
 /// Enqueues a `message` update when a human user sends a message in a bot DM or mentions/commands a bot in a group.
@@ -935,7 +953,12 @@ async fn dispatch_bot_api_call(
         "getmyname" => handle_get_my_name(&bot),
         "setmyprivacypolicy" => handle_set_my_privacy_policy(state, &bot, params),
         "getmyprivacypolicy" => handle_get_my_privacy_policy(&bot),
-        "publishminiapp" => handle_publish_mini_app(state, &bot, params),
+        "publishminiapp" => handle_publish_mini_app(state, &bot, &params),
+        m if m.starts_with("community.") => {
+            crate::routes::community::bot_api::dispatch_community_bot_api(
+                state, &bot, m, method, &params,
+            )
+        }
         _ => bot_err(
             StatusCode::NOT_FOUND,
             404,

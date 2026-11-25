@@ -63,8 +63,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             crate::db::automation_app_store::MIGRATION_V41_AUTOMATION_APPS,
         ),
         (
-            42,
-            crate::db::creations_store::MIGRATION_V42_CREATIONS_AND_CATALOG,
+            (ALL_MIGRATIONS.len() + 4) as i64,
+            gpui_telegram_community::store::MIGRATION_V42_COMMUNITY_SQL,
+        ),
+        (
+            43,
+            crate::db::creations_store::MIGRATION_V43_CREATIONS_AND_CATALOG,
         ),
     ];
 

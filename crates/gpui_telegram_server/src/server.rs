@@ -267,6 +267,9 @@ pub struct AppState {
     pub mcp_oauth_state: Arc<crate::routes::mcp_oauth::McpOAuthRuntimeState>,
     pub remote_sessions: Arc<crate::routes::remote_assist::RemoteSessionRegistry>,
     pub mcp_sessions: Arc<crate::routes::official_mcp::McpSessionRegistry>,
+    pub community_search_indexer: Arc<gpui_telegram_community::CommunitySearchIndexer>,
+    pub community_bot_guard: Arc<gpui_telegram_community::BotLoopGuard>,
+    pub community_ticker_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for AppState {
@@ -495,6 +498,71 @@ impl AppState {
         let _ = ensure_default_ai_bot(&db);
         let _ = ensure_creator_studio_bot(&db);
 
+        // Idempotent starter Community seeding (8 communities, Humans+Bots, posts, comments, lists)
+        let seed_now_ms = Utc::now().timestamp_millis();
+        if let Err(err) = db.pool().with_transaction(|tx| {
+            gpui_telegram_community::store::ops::seed_if_empty_tx(tx, seed_now_ms)
+        }) {
+            tracing::warn!("Community seed_if_empty_tx failed: {}", err);
+        }
+
+        // Dedicated Tantivy BM25 Community search index (`<db_path>.community.idx` on disk; in_ram otherwise)
+        let community_search_indexer = if config.is_in_memory() || db.pool().path().is_none() {
+            Arc::new(
+                gpui_telegram_community::CommunitySearchIndexer::in_ram()
+                    .expect("Failed to initialize in-RAM CommunitySearchIndexer"),
+            )
+        } else {
+            let mut idx_os = std::path::PathBuf::from(config.resolve_db_path()).into_os_string();
+            idx_os.push(".community.idx");
+            let idx_path = std::path::PathBuf::from(idx_os);
+            Arc::new(
+                gpui_telegram_community::CommunitySearchIndexer::open_or_create(&idx_path)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Failed to open CommunitySearchIndexer at '{}': {}",
+                            idx_path.display(),
+                            e
+                        )
+                    }),
+            )
+        };
+        if community_search_indexer.doc_count() == 0 {
+            let posts_res = db.pool().with_reader(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT post_id FROM community_posts
+                         WHERE status = 'published' AND is_removed = 0
+                         ORDER BY created_at_ms DESC LIMIT 5000",
+                    )
+                    .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))?;
+                let ids: Vec<String> = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))?;
+                let mut posts = Vec::with_capacity(ids.len());
+                for pid in ids {
+                    if let Some(p) =
+                        gpui_telegram_community::store::ops::get_post_conn(conn, &pid, None)?
+                    {
+                        posts.push(p);
+                    }
+                }
+                Ok(posts)
+            });
+            if let Ok(posts) = posts_res {
+                if !posts.is_empty() {
+                    for p in &posts {
+                        let _ = community_search_indexer.index_post(p);
+                    }
+                    let _ = community_search_indexer.commit();
+                }
+            }
+        }
+        let community_bot_guard = Arc::new(gpui_telegram_community::BotLoopGuard::default());
+        let community_ticker_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let signaling_hub = Arc::new(crate::webrtc::signaling_hub::SignalingHub::new());
         let pts_engine = Arc::new(crate::sync::pts_engine::PtsEngine::new(db.clone()));
         let dedup = crate::messaging::dedup::MessageNonceDedup::default();
@@ -516,19 +584,19 @@ impl AppState {
             Arc::downgrade(&gateway_hub),
             self_weak.clone(),
         ));
-        let im_bridge = Arc::new(
-            crate::hermes_im_bridge::ServerPlatformImBridge::new(
-                db.clone(),
-                message_pipeline.clone(),
-                pts_engine.clone(),
-                Arc::downgrade(&gateway_hub),
-                Arc::downgrade(&search_indexer),
-                Arc::downgrade(&hybrid_memory),
-                Arc::downgrade(&webmcp_broker),
-                self_weak.clone(),
-            )
-            .with_cas(Arc::downgrade(&cas)),
-        );
+        let im_bridge = Arc::new(crate::hermes_im_bridge::ServerPlatformImBridge::new(
+            db.clone(),
+            message_pipeline.clone(),
+            pts_engine.clone(),
+            Arc::downgrade(&gateway_hub),
+            Arc::downgrade(&search_indexer),
+            Arc::downgrade(&hybrid_memory),
+            Arc::downgrade(&webmcp_broker),
+            Arc::downgrade(&community_search_indexer),
+            Arc::downgrade(&community_bot_guard),
+            self_weak.clone(),
+        )
+        .with_cas(Arc::downgrade(&cas)));
         fabushi_bots.set_platform_im_bridge(im_bridge);
         fabushi_bots.set_agentic_backend(db.clone());
         gateway_hub.set_pipeline(message_pipeline.clone(), db.clone());
@@ -790,6 +858,9 @@ impl AppState {
             mcp_oauth_state: Arc::new(crate::routes::mcp_oauth::McpOAuthRuntimeState::new()),
             remote_sessions: Arc::new(crate::routes::remote_assist::RemoteSessionRegistry::new()),
             mcp_sessions: Arc::new(crate::routes::official_mcp::McpSessionRegistry::new()),
+            community_search_indexer,
+            community_bot_guard,
+            community_ticker_started,
         }
     }
 
@@ -1043,7 +1114,42 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
 
     let _ = state.self_weak.set(Arc::downgrade(&state));
 
+    // Spawn 5s Community background scheduler ONCE per AppState, holding ONLY Weak<AppState>
+    if !state
+        .community_ticker_started
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let weak_state = Arc::downgrade(&state);
+            let mut shutdown_rx = state.gateway_hub.subscribe_shutdown();
+            rt.spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        res = shutdown_rx.changed() => {
+                            if res.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = ticker.tick() => {}
+                    }
+                    let Some(st) = weak_state.upgrade() else {
+                        break;
+                    };
+                    if st.gateway_hub.is_shutdown() {
+                        break;
+                    }
+                    crate::routes::community::run_community_background_tick(&st).await;
+                    drop(st);
+                }
+            });
+        }
+    }
+
     Router::new()
+        .merge(routes::community::router())
         // --- Public Routes ---
         .route("/health", get(health_check))
         .route("/api/v1/status", get(server_status))
@@ -1762,7 +1868,7 @@ async fn server_status() -> Json<Value> {
             "statistics", "export", "wallet_stars", "acp_durable",
             "hermes_agent", "hermes_gateway", "openai_compat", "acp_json_rpc",
             "auto_update_relay", "official_mcp_oauth21", "remote_control",
-            "remote_assist"
+            "remote_assist", "community"
         ]
     }))
 }

@@ -782,6 +782,16 @@ impl GatewayHub {
         self.publish_to_event_bus(format!("chat:{}", chat_id), &frame);
     }
 
+    /// Broadcast frame to all connected users on this process (non-blocking, auto-pruning dead
+    /// sockets via `broadcast_to_user_local`) and publish to `CrossNodeEventBus` on `system:<topic>`.
+    pub fn broadcast_all(&self, system_topic: &str, frame: WsServerFrame) {
+        let targets: Vec<UserId> = self.subscribers.read().keys().copied().collect();
+        for target in targets {
+            self.broadcast_to_user_local(target, frame.clone());
+        }
+        self.publish_to_event_bus(format!("system:{system_topic}"), &frame);
+    }
+
     /// Subscribe user to chat events
     pub fn subscribe_chat(&self, chat_id: i64, user_id: UserId) {
         self.ensure_bus_started();

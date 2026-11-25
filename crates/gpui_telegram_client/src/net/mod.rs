@@ -2,6 +2,7 @@ pub mod api_acp;
 pub mod api_auth;
 pub mod api_automation_apps;
 pub mod api_chats;
+pub mod api_community;
 pub mod api_computers;
 pub mod api_creations;
 pub mod api_e2ee;
@@ -27,6 +28,10 @@ pub use gpui_telegram_proto::creations::{
     GameLeaderboardResponse, PublicCatalogItemDto, ReviewDecision, ReviewDecisionRequest,
     SubmitGameScoreRequest, SubmitReviewRequest, SubmitReviewResponse, UpdateCreationRequest,
     UpsertCreationStateRequest, UserCreationDto, UserCreationStateDto, UserCreationStatesResponse,
+};
+pub use api_community::{
+    CommunityApiError, CommunityAuth, RegisterBotActorResult, COMMUNITY_ACTOR_HEADER,
+    HEADER_COMMUNITY_ACTOR_ID,
 };
 pub use proxy::{ClientProxyConfig, ClientProxyType, ProxyHealthReport};
 
