@@ -22,6 +22,7 @@ use gpui_telegram_desktop::views::drawer::bot_computer_inspector::{
 use gpui_telegram_desktop::views::drawer::inspector_tabs::{
     BotConfigFocusField, InspectorAction, InspectorSubpage,
 };
+use gpui_telegram_desktop::views::nav_rail::NavDestination;
 use gpui_telegram_desktop::views::settings::sections::{
     CloudFormField, SettingsComputersEvent, SettingsComputersPage, SettingsComputersSections,
 };
@@ -769,5 +770,46 @@ fn body_appshell_created_and_system_bots_computer_wiring(cx: &mut App) {
         ));
         assert_eq!(sc.read(cx).page, SettingsComputersPage::CloudForm);
         assert!(sc.read(cx).form_bind_to_current_bot);
+
+        // 6. Triggering NavDestination::RemoteComputer (avatar-adjacent computer icon) opens standalone UU Remote hub
+        // instead of the legacy blank Cloud Host overlay.
+        s.activate_nav_destination(NavDestination::RemoteComputer, cx);
+        assert!(matches!(s.active_panel, ActiveWorkspacePanel::Settings));
+        assert!(
+            s.overlays.computer_overlay.is_none(),
+            "clicking computer icon must open UU Remote hub, not legacy blank Cloud Host workbench"
+        );
+        {
+            let sr = s.settings_router.read(cx);
+            assert_eq!(sr.settings_section, SettingsSectionType::Computers);
+            assert!(sr.standalone_computers_mode);
+            let sc_view = sr.settings_computers.as_ref().expect("computers section").read(cx);
+            assert!(sc_view.standalone_mode);
+            assert_eq!(sc_view.page, SettingsComputersPage::Overview);
+        }
+
+        // 7. Clicking Terminal button on a device opens ComputerWorkbench directly on RemoteTerminal tab,
+        // and closing it leaves the standalone UU Remote hub active behind it.
+        s.handle_computer_settings_event(
+            &SettingsComputersEvent::OpenRemoteTerminal(cloud.node_id.clone()),
+            cx,
+        );
+        let term_wb = s
+            .overlays
+            .computer_overlay
+            .clone()
+            .expect("terminal workbench opened");
+        assert_eq!(term_wb.read(cx).active_tab, WorkbenchTab::RemoteTerminal);
+        s.hide_remote_computer(cx);
+        assert!(s.overlays.computer_overlay.is_none());
+        assert_eq!(
+            s.nav_rail.read(cx).active_destination,
+            NavDestination::RemoteComputer
+        );
+
+        // 8. Navigating back from standalone UU Remote Overview closes directly back to Chats.
+        s.navigate_settings_back(cx);
+        assert!(matches!(s.active_panel, ActiveWorkspacePanel::Chats));
+        assert!(!s.settings_router.read(cx).standalone_computers_mode);
     });
 }

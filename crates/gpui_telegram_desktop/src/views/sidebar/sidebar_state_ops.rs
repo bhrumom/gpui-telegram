@@ -366,7 +366,7 @@ impl ChatSidebar {
     }
 
     fn reset_creation_inputs(&mut self, modal: SidebarCreationModal) {
-        self.exit_compose_mode();
+        self.cancel_compose_mode();
         self.is_account_popover_open = false;
         self.search_focused = false;
         self.active_creation_modal = Some(modal);
@@ -392,7 +392,7 @@ impl ChatSidebar {
 
     pub fn close_creation_modal(&mut self) {
         self.active_creation_modal = None;
-        self.exit_compose_mode();
+        self.cancel_compose_mode();
         self.creation_primary_input.clear();
         self.creation_secondary_input.clear();
         self.creation_tertiary_input.clear();
@@ -513,14 +513,18 @@ impl ChatSidebar {
         self.compose_recipient_query.clear();
         self.compose_title_focused = false;
         if !was_open {
-            let preserved_pending = self.compose_draft.pending_creation.clone();
+            let next_epoch = self.compose_draft.compose_epoch.wrapping_add(1);
             self.compose_draft = ComposeDraftState {
                 is_group_mode: true,
                 menu_open: true,
-                pending_creation: preserved_pending,
+                compose_epoch: next_epoch,
                 ..ComposeDraftState::default()
             };
         } else {
+            if self.compose_draft.pending_creation.take().is_some() {
+                self.compose_draft.compose_epoch =
+                    self.compose_draft.compose_epoch.wrapping_add(1);
+            }
             self.compose_draft.is_group_mode = true;
             self.compose_draft.menu_open = true;
             self.compose_draft.highlighted_index = 0;
@@ -548,11 +552,11 @@ impl ChatSidebar {
         self.compose_recipient_query.clear();
         self.compose_title_focused = false;
 
-        let preserved_pending = self.compose_draft.pending_creation.clone();
+        let next_epoch = self.compose_draft.compose_epoch.wrapping_add(1);
         self.compose_draft = ComposeDraftState {
             is_group_mode: true,
             menu_open: true,
-            pending_creation: preserved_pending,
+            compose_epoch: next_epoch,
             ..ComposeDraftState::default()
         };
 
@@ -1384,21 +1388,21 @@ impl ChatSidebar {
                 self.standalone_active_destination = dest;
                 self.context_menu = None;
                 if dest != NavDestination::Chats {
-                    self.exit_compose_mode();
+                    self.cancel_compose_mode();
                 }
                 self.update_nav_rail(cx, |r| r.select(dest));
                 cx.notify();
             }
             UnifiedSidebarAction::SelectDialog(dialog_id) => {
                 self.is_account_popover_open = false;
-                self.exit_compose_mode();
+                self.cancel_compose_mode();
                 self.context_menu = None;
                 self.select_dialog_from_user(dialog_id);
                 cx.notify();
             }
             UnifiedSidebarAction::OpenMainMenu => {
                 self.is_account_popover_open = !self.is_account_popover_open;
-                self.exit_compose_mode();
+                self.cancel_compose_mode();
                 self.context_menu = None;
                 cx.notify();
             }

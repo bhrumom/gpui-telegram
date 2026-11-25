@@ -3051,6 +3051,10 @@ pub async fn bot_computer_get(
             }
             if let Some(m) = fallback_model {
                 profile.preferred_model = m;
+            } else if let Ok(Some(reg)) = state.db.get_bot_by_user_id(bot_id as i64) {
+                if !reg.preferred_model.trim().is_empty() {
+                    profile.preferred_model = reg.preferred_model;
+                }
             }
             let _ = bot_user;
             (StatusCode::OK, Json(profile)).into_response()
@@ -3083,34 +3087,71 @@ pub async fn bot_computer_put(
     };
 
     if owns_bot && (req.persona_prompt.is_some() || req.preferred_model.is_some()) {
-        let (_, existing_model, existing_welcome) =
+        let (existing_persona, existing_model, existing_welcome) =
             load_bot_persona_config(&state, UserId(bot_id));
-        let model_opt = if !saved.preferred_model.trim().is_empty() {
-            Some(saved.preferred_model.as_str())
+        let model_opt = if req.preferred_model.is_some() {
+            (!saved.preferred_model.trim().is_empty()).then_some(saved.preferred_model.as_str())
         } else {
             existing_model.as_deref()
         };
         let persona_opt = if req.persona_prompt.is_some() {
             Some(saved.persona_prompt.as_str())
         } else {
-            None
+            existing_persona.as_deref()
         };
-        if let Some(p) = persona_opt {
-            let _ = state.db.sync_bot_ai_persona(bot_id, p, now_ms);
-            let bot_key = bot_id.to_string();
-            if let Ok(Some(_existing_soul)) =
-                state.fabushi_core().store().kv_get("bot_soul", &bot_key)
-            {
-                let soul_payload = json!({
-                    "bot_id": bot_id,
-                    "system_prompt": p,
-                    "content": p,
-                    "updated_at_ms": now_ms,
-                });
-                if let Ok(raw) = serde_json::to_string(&soul_payload) {
-                    let _ = state.fabushi_core().store().kv_set("bot_soul", &bot_key, &raw);
+        if req.persona_prompt.is_some() {
+            let _ = state.db.sync_bot_ai_persona(bot_id, &saved.persona_prompt, now_ms);
+        }
+        let bot_key = bot_id.to_string();
+        if let Ok(Some(existing_soul_raw)) =
+            state.fabushi_core().store().kv_get("bot_soul", &bot_key)
+        {
+            let mut soul_obj = serde_json::from_str::<serde_json::Value>(&existing_soul_raw)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            soul_obj.insert("bot_id".to_string(), json!(bot_id));
+            if req.persona_prompt.is_some() {
+                soul_obj.insert("system_prompt".to_string(), json!(saved.persona_prompt));
+                soul_obj.insert("content".to_string(), json!(saved.persona_prompt));
+            }
+            if req.preferred_model.is_some() {
+                match model_opt {
+                    Some(m) => {
+                        soul_obj.insert("model".to_string(), json!(m));
+                    }
+                    None => {
+                        soul_obj.remove("model");
+                    }
                 }
             }
+            soul_obj.insert("updated_at_ms".to_string(), json!(now_ms));
+            if let Ok(raw) = serde_json::to_string(&serde_json::Value::Object(soul_obj)) {
+                let _ = state.fabushi_core().store().kv_set("bot_soul", &bot_key, &raw);
+            }
+        }
+        if req.preferred_model.is_some() {
+            let _ = state.db.update_bot_fabushi_fields(
+                bot_id as i64,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(saved.preferred_model.as_str()),
+                None,
+                None,
+                None,
+            );
+            let _ = state.fabushi_bots.update_bot(
+                bot_id as i64,
+                gpui_telegram_agent::fabushi_bot::FabushiBotPatch {
+                    preferred_model: Some(saved.preferred_model.clone()),
+                    ..Default::default()
+                },
+            );
         }
         let display_name = if !bot_user.first_name.trim().is_empty() {
             bot_user.first_name.clone()
@@ -3960,5 +4001,129 @@ mod tests {
         let exec_res: RemoteComputerCommandResult = serde_json::from_value(exec_val).unwrap();
         assert!(exec_res.ok);
         assert_eq!(exec_res.frame_data_url.as_deref(), Some(large_frame.as_str()));
+    }
+
+    #[tokio::test]
+    async fn owned_bot_computer_put_clears_preferred_model_across_persona_and_registry() {
+        let (state, _media_guard) = make_test_state();
+        let token = seed_user_and_token(&state, 4010, false, "mac-owner");
+        let app = build_router_with_state(state.clone());
+
+        let (create_st, create_val) = json_request(
+            &app,
+            "POST",
+            "/api/v1/fabushi-bots",
+            Some(&token),
+            None,
+            Some(json!({
+                "display_name": "Model Sync Bot",
+                "username": "model_sync_bot",
+                "description": "Tests model clear consistency",
+                "preferred_model": "gemini-2.5-pro"
+            })),
+        )
+        .await;
+        assert!(
+            create_st == StatusCode::CREATED || create_st == StatusCode::OK,
+            "create bot failed ({create_st}): {create_val}"
+        );
+        let bot_id = create_val["bot"]["bot_user_id"]
+            .as_u64()
+            .expect("bot.bot_user_id");
+
+        // 1. Set explicit model via PUT /api/v1/bots/{bot_id}/computer
+        let (put1_st, put1_val) = json_request(
+            &app,
+            "PUT",
+            &format!("/api/v1/bots/{bot_id}/computer"),
+            Some(&token),
+            None,
+            Some(json!(UpdateBotComputerRequest {
+                preferred_model: Some("gemini-2.5-flash".to_string()),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(put1_st, StatusCode::OK, "put1 failed: {put1_val}");
+        let p1: BotComputerProfileDto = serde_json::from_value(put1_val).expect("p1");
+        assert_eq!(p1.preferred_model, "gemini-2.5-flash");
+        let (_, kv_model1, _) = load_bot_persona_config(&state, UserId(bot_id));
+        assert_eq!(kv_model1.as_deref(), Some("gemini-2.5-flash"));
+        let reg1 = state
+            .db
+            .get_bot_by_user_id(bot_id as i64)
+            .expect("db")
+            .expect("reg");
+        assert_eq!(reg1.preferred_model, "gemini-2.5-flash");
+
+        // 2. Clear preferred_model back to "" (Follow Settings) -> must clear KV, registry, runtime, and GET!
+        let (put2_st, put2_val) = json_request(
+            &app,
+            "PUT",
+            &format!("/api/v1/bots/{bot_id}/computer"),
+            Some(&token),
+            None,
+            Some(json!(UpdateBotComputerRequest {
+                preferred_model: Some(String::new()),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(put2_st, StatusCode::OK, "put2 failed: {put2_val}");
+        let p2: BotComputerProfileDto = serde_json::from_value(put2_val).expect("p2");
+        assert!(p2.preferred_model.is_empty());
+
+        let (_, kv_model2, _) = load_bot_persona_config(&state, UserId(bot_id));
+        assert_eq!(kv_model2, None, "clearing preferred_model must clear bot_persona KV");
+
+        let reg2 = state
+            .db
+            .get_bot_by_user_id(bot_id as i64)
+            .expect("db")
+            .expect("reg");
+        assert!(
+            reg2.preferred_model.is_empty(),
+            "clearing preferred_model must clear bots_registry.preferred_model"
+        );
+
+        let (get_st, get_val) = json_request(
+            &app,
+            "GET",
+            &format!("/api/v1/bots/{bot_id}/computer"),
+            Some(&token),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(get_st, StatusCode::OK);
+        let fetched: BotComputerProfileDto = serde_json::from_value(get_val).expect("fetched");
+        assert!(
+            fetched.preferred_model.is_empty(),
+            "GET after clearing must stay empty instead of resurrecting stale model"
+        );
+
+        // 3. PATCH /api/v1/fabushi-bots/{bot_id} also syncs preferred_model into GET /computer.
+        let (patch_st, patch_val) = json_request(
+            &app,
+            "PATCH",
+            &format!("/api/v1/fabushi-bots/{bot_id}"),
+            Some(&token),
+            None,
+            Some(json!({ "preferred_model": "gemini-2.5-pro" })),
+        )
+        .await;
+        assert_eq!(patch_st, StatusCode::OK, "patch failed: {patch_val}");
+        let (get2_st, get2_val) = json_request(
+            &app,
+            "GET",
+            &format!("/api/v1/bots/{bot_id}/computer"),
+            Some(&token),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(get2_st, StatusCode::OK);
+        let fetched2: BotComputerProfileDto = serde_json::from_value(get2_val).expect("fetched2");
+        assert_eq!(fetched2.preferred_model, "gemini-2.5-pro");
     }
 }

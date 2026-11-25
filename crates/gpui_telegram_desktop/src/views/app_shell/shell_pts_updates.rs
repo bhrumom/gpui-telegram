@@ -18,7 +18,7 @@ use crate::views::app_shell::shell_settings_sync::apply_folders_to_shell;
 use crate::views::app_shell::shell_state::reconcile_stage_message_list;
 use crate::views::app_shell::shell_truth::{
     decode_inline_keyboard_json, derive_initials, overlay_rich_message_metadata,
-    proto_keyboard_to_stage, SessionRequestFence,
+    proto_keyboard_to_stage, ClientCallFence, SessionRequestFence,
 };
 use crate::views::call_overlay::TalkModeState;
 use crate::views::conversation_stage::PinnedBannerEntry;
@@ -630,28 +630,23 @@ impl AppShell {
         }
 
         if needs_http_hydrate {
-            if let (Some(token), Some(uid)) = (
-                self.session_sync.session_token.clone(),
-                self.session_sync.user_id,
-            ) {
-                let fence = SessionRequestFence {
-                    auth_generation: self.session_sync.auth_generation,
-                    request_generation: 0,
-                    token,
-                    user_id: uid,
-                };
-                let client = self.client.clone();
+            if let Some(fence) = self.capture_client_fence() {
                 let ids_clone = ids;
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    if let Ok(pins) = client.list_pinned_messages(chat_u64 as i64).await {
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    if let Ok(pins) = fence
+                        .client
+                        .list_pinned_messages_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            chat_u64 as i64,
+                        )
+                        .await
+                    {
                         let _ = weak.update(app, |shell, cx| {
-                            if !fence.matches(
-                                shell.is_authenticated,
-                                shell.session_sync.auth_generation,
-                                0,
-                                shell.session_sync.session_token.as_deref(),
-                                shell.session_sync.user_id,
-                            ) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             let entries: Vec<PinnedBannerEntry> = pins
@@ -1186,28 +1181,23 @@ impl AppShell {
                 if target_chat_u64 > 0
                     && self.stage.read(cx).active_chat_id == Some(target_chat_u64)
                 {
-                    if let (Some(token), Some(uid)) = (
-                        self.session_sync.session_token.clone(),
-                        self.session_sync.user_id,
-                    ) {
-                        let fence = SessionRequestFence {
-                            auth_generation: self.session_sync.auth_generation,
-                            request_generation: 0,
-                            token,
-                            user_id: uid,
-                        };
-                        let client = self.client.clone();
+                    if let Some(fence) = self.capture_client_fence() {
                         let lang_owned = self.active_lang_id().to_string();
                         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                            if let Ok(mems) = client.get_chat_members(target_chat_u64 as i64).await {
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
+                            }
+                            if let Ok(mems) = fence
+                                .client
+                                .get_chat_members_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    target_chat_u64 as i64,
+                                )
+                                .await
+                            {
                                 let _ = weak.update(app, |shell, cx| {
-                                    if !fence.matches(
-                                        shell.is_authenticated,
-                                        shell.session_sync.auth_generation,
-                                        0,
-                                        shell.session_sync.session_token.as_deref(),
-                                        shell.session_sync.user_id,
-                                    ) {
+                                    if !fence.is_valid(shell) {
                                         return;
                                     }
                                     if shell.stage.read(cx).active_chat_id != Some(target_chat_u64) {
@@ -1736,30 +1726,23 @@ impl AppShell {
         }
 
         if !is_outgoing && is_bot_chat && inline_kb.is_none() && server_id > 0 {
-            if let (Some(token), Some(uid)) = (
-                self.session_sync.session_token.clone(),
-                self.session_sync.user_id,
-            ) {
-                let fence = SessionRequestFence {
-                    auth_generation: self.session_sync.auth_generation,
-                    request_generation: 0,
-                    token,
-                    user_id: uid,
-                };
-                let client = self.client.clone();
+            if let Some(fence) = self.capture_client_fence() {
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    if let Ok(rich) = client
-                        .hermes_messages_history_rich(chat_u64 as i64, Some(10))
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    if let Ok(rich) = fence
+                        .client
+                        .hermes_messages_history_rich_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            chat_u64 as i64,
+                            Some(10),
+                        )
                         .await
                     {
                         let _ = weak.update(app, |shell, cx| {
-                            if !fence.matches(
-                                shell.is_authenticated,
-                                shell.session_sync.auth_generation,
-                                0,
-                                shell.session_sync.session_token.as_deref(),
-                                shell.session_sync.user_id,
-                            ) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             shell.stage.update(cx, |st, st_cx| {
@@ -1855,6 +1838,7 @@ impl AppShell {
                     });
                     self.occlude_browser_for_overlay(cx);
                     self.rtc_talk.talk_mode_overlay = Some(ov);
+                    self.reconcile_chat_scoped_toasts(cx);
                 }
                 self.sync_calls_history(cx);
             }

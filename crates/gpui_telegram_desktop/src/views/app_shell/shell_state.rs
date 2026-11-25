@@ -58,6 +58,9 @@ pub struct ShellSessionSyncState {
     pub latest_http_reaction_by_msg: HashMap<(u64, u64), (u64, Option<Vec<ReactionItem>>)>,
     pub send_as_peers: SendAsPeersSession,
     pub draft_debounce_gen: u64,
+    pub next_draft_op_gen: u64,
+    pub draft_op_gen_by_chat: HashMap<u64, u64>,
+    pub in_flight_send_draft_gen_by_chat: HashMap<u64, u64>,
     pub last_draft_text_by_chat: HashMap<u64, String>,
     pub last_saved_draft_by_chat: HashMap<u64, String>,
 }
@@ -93,6 +96,9 @@ impl ShellSessionSyncState {
             latest_http_reaction_by_msg: HashMap::new(),
             send_as_peers: SendAsPeersSession::default(),
             draft_debounce_gen: 0,
+            next_draft_op_gen: 0,
+            draft_op_gen_by_chat: HashMap::new(),
+            in_flight_send_draft_gen_by_chat: HashMap::new(),
             last_draft_text_by_chat: HashMap::new(),
             last_saved_draft_by_chat: HashMap::new(),
         }
@@ -120,6 +126,8 @@ impl ShellSessionSyncState {
         self.username = Some(username);
         self.send_as_peers = SendAsPeersSession::new(user_id);
         self.draft_debounce_gen = self.draft_debounce_gen.wrapping_add(1);
+        self.draft_op_gen_by_chat.clear();
+        self.in_flight_send_draft_gen_by_chat.clear();
     }
 
     /// Clears per-message optimistic nonce and reaction tracking maps.
@@ -138,6 +146,8 @@ impl ShellSessionSyncState {
         self.contacts_list.clear();
         self.rich_chats_by_id.clear();
         self.chat_peer_user_ids.clear();
+        self.draft_op_gen_by_chat.clear();
+        self.in_flight_send_draft_gen_by_chat.clear();
         self.last_draft_text_by_chat.clear();
         self.last_saved_draft_by_chat.clear();
     }
@@ -154,6 +164,52 @@ impl ShellSessionSyncState {
         self.send_as_peers = SendAsPeersSession::default();
         self.draft_debounce_gen = self.draft_debounce_gen.wrapping_add(1);
         self.clear_message_tracking();
+    }
+
+    pub fn draft_op_gen(&self, chat_id: u64) -> u64 {
+        self.draft_op_gen_by_chat.get(&chat_id).copied().unwrap_or(0)
+    }
+
+    fn alloc_draft_op_gen(&mut self) -> u64 {
+        let g = self.next_draft_op_gen.wrapping_add(1).max(1);
+        self.next_draft_op_gen = g;
+        g
+    }
+
+    pub fn bump_draft_op_gen_and_clear_in_flight(&mut self, chat_id: u64) -> u64 {
+        let g = self.alloc_draft_op_gen();
+        self.draft_op_gen_by_chat.insert(chat_id, g);
+        self.in_flight_send_draft_gen_by_chat.remove(&chat_id);
+        g
+    }
+
+    pub fn begin_in_flight_send_draft(&mut self, chat_id: u64) -> u64 {
+        let g = self.alloc_draft_op_gen();
+        self.draft_op_gen_by_chat.insert(chat_id, g);
+        self.in_flight_send_draft_gen_by_chat.insert(chat_id, g);
+        g
+    }
+
+    pub fn is_current_draft_op_gen(&self, chat_id: u64, op_gen: u64) -> bool {
+        self.draft_op_gen_by_chat.get(&chat_id).copied() == Some(op_gen)
+    }
+
+    pub fn has_unmodified_in_flight_send_draft(&self, chat_id: u64) -> bool {
+        self.in_flight_send_draft_gen_by_chat
+            .get(&chat_id)
+            .is_some_and(|g| self.draft_op_gen_by_chat.get(&chat_id) == Some(g))
+    }
+
+    pub fn finish_in_flight_send_draft(&mut self, chat_id: u64, send_gen: u64) -> bool {
+        let owns = self.is_current_draft_op_gen(chat_id, send_gen);
+        if self.in_flight_send_draft_gen_by_chat.get(&chat_id) == Some(&send_gen) {
+            self.in_flight_send_draft_gen_by_chat.remove(&chat_id);
+            if owns {
+                let next = self.alloc_draft_op_gen();
+                self.draft_op_gen_by_chat.insert(chat_id, next);
+            }
+        }
+        owns
     }
 }
 
@@ -433,18 +489,17 @@ impl ShellComputersState {
         self.assist_config = None;
         self.active_sessions.clear();
         self.mcp_grants.clear();
+        self.mcp_endpoint_url = None;
     }
 }
 
-/// Live local IPC host, system tray icons, and controlled-status floating window handles.
+/// Live local IPC host and system tray icons.
 #[derive(Default)]
 pub struct ShellRemoteHostRuntime {
     pub ipc_server: Option<fabushi_remote_engine::ipc::LocalIpcServer>,
     pub ipc_handler: Option<Arc<crate::views::app_shell::desktop_ipc_host::DesktopLocalIpcHandler>>,
     pub tray_mac: crate::platform::mac::tray_mac::TrayMacMac,
     pub tray_win: crate::platform::win::tray_win::TrayWinWin,
-    pub controlled_window:
-        Option<gpui::WindowHandle<crate::views::remote_controlled_window::RemoteControlledWindow>>,
     pub services_bootstrapped: bool,
     pub hub_events_started: bool,
 }

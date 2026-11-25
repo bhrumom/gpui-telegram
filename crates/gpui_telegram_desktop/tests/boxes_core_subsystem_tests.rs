@@ -318,3 +318,154 @@ fn test_share_box_recipients_and_actions() {
     assert!(sbox.is_closed);
     assert_eq!(submitted_count.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn test_proxy_to_tg_link_percent_encoding_and_modal_record_mapping() {
+    use gpui_telegram_client::ProxyEndpointRecord;
+    use gpui_telegram_core::core::deep_links::DeepLinksRouterDeepLinks;
+    use gpui_telegram_desktop::views::boxes::modal_render_security::proxy_record_to_config;
+
+    let s5_cfg = ProxyConfig {
+        id: 1,
+        proxy_type: ProxyType::Socks5,
+        host: "::1".into(),
+        port: 1080,
+        user: Some("alice&port=9999#frag".into()),
+        password: Some("p=1&a=2".into()),
+        secret: None,
+        ping_ms: Some(10),
+        state: ProxyItemState::Online,
+        is_enabled: true,
+    };
+    let s5_link = proxy_to_tg_link(&s5_cfg);
+    assert_eq!(
+        s5_link,
+        "tg://socks?server=%3A%3A1&port=1080&user=alice%26port%3D9999%23frag&pass=p%3D1%26a%3D2"
+    );
+    let parsed_s5 = DeepLinksRouterDeepLinks::parse_command(&s5_link, true);
+    assert_eq!(parsed_s5.params.get("server").map(String::as_str), Some("::1"));
+    assert_eq!(parsed_s5.params.get("port").map(String::as_str), Some("1080"));
+    assert_eq!(
+        parsed_s5.params.get("user").map(String::as_str),
+        Some("alice&port=9999#frag")
+    );
+    assert_eq!(
+        parsed_s5.params.get("pass").map(String::as_str),
+        Some("p=1&a=2")
+    );
+
+    let mt_cfg = ProxyConfig {
+        id: 2,
+        proxy_type: ProxyType::Mtproto,
+        host: "2001:db8::1".into(),
+        port: 443,
+        user: None,
+        password: None,
+        secret: Some("ee00&port=80#x".into()),
+        ping_ms: Some(20),
+        state: ProxyItemState::Online,
+        is_enabled: true,
+    };
+    let mt_link = proxy_to_tg_link(&mt_cfg);
+    assert!(!mt_link.contains("&port=80"), "mt_link={mt_link}");
+    assert!(!mt_link.contains("#x"), "mt_link={mt_link}");
+
+    let rec_s5 = ProxyEndpointRecord {
+        id: 3,
+        kind: "SOCKS5".into(),
+        host: "127.0.0.1".into(),
+        port: 1080,
+        secret_or_user: "u_legacy".into(),
+        username: Some("realuser".into()),
+        password: Some("realpass".into()),
+        ping_ms: 15,
+        enabled: true,
+    };
+    assert_eq!(
+        proxy_to_tg_link(&proxy_record_to_config(&rec_s5)),
+        "tg://socks?server=127.0.0.1&port=1080&user=realuser&pass=realpass"
+    );
+
+    let rec_s5_legacy = ProxyEndpointRecord {
+        id: 4,
+        kind: "socks5h".into(),
+        host: "127.0.0.1".into(),
+        port: 1080,
+        secret_or_user: "u_legacy".into(),
+        username: None,
+        password: None,
+        ping_ms: 15,
+        enabled: true,
+    };
+    assert_eq!(
+        proxy_to_tg_link(&proxy_record_to_config(&rec_s5_legacy)),
+        "tg://socks?server=127.0.0.1&port=1080&user=u_legacy"
+    );
+
+    let rec_mt = ProxyEndpointRecord {
+        id: 5,
+        kind: "MTProto".into(),
+        host: "mt.example.com".into(),
+        port: 443,
+        secret_or_user: "7jK-_1234567890abcdef".into(),
+        username: None,
+        password: None,
+        ping_ms: 25,
+        enabled: true,
+    };
+    assert_eq!(
+        proxy_to_tg_link(&proxy_record_to_config(&rec_mt)),
+        "tg://proxy?server=mt.example.com&port=443&secret=7jK-_1234567890abcdef"
+    );
+
+    let rec_http = ProxyEndpointRecord {
+        id: 6,
+        kind: "HTTP".into(),
+        host: "proxy.example.com".into(),
+        port: 8080,
+        secret_or_user: "httpu:httpp".into(),
+        username: Some("httpu".into()),
+        password: Some("httpp".into()),
+        ping_ms: 30,
+        enabled: true,
+    };
+    let http_link = proxy_to_tg_link(&proxy_record_to_config(&rec_http));
+    assert!(!http_link.contains("secret="), "http_link={http_link}");
+    assert!(!http_link.contains("httpu"), "http_link={http_link}");
+    assert!(!http_link.contains("httpp"), "http_link={http_link}");
+
+    let rec_direct = ProxyEndpointRecord {
+        id: 7,
+        kind: "Direct".into(),
+        host: String::new(),
+        port: 0,
+        secret_or_user: String::new(),
+        username: None,
+        password: None,
+        ping_ms: 0,
+        enabled: true,
+    };
+    assert!(proxy_to_tg_link(&proxy_record_to_config(&rec_direct)).is_empty());
+
+    let rec_s5_utf8 = ProxyEndpointRecord {
+        id: 8,
+        kind: "SOCKS5".into(),
+        host: "127.0.0.1".into(),
+        port: 1080,
+        secret_or_user: String::new(),
+        username: Some("alice_密码".into()),
+        password: Some("密码ü".into()),
+        ping_ms: 15,
+        enabled: true,
+    };
+    let s5_utf8_link = proxy_to_tg_link(&proxy_record_to_config(&rec_s5_utf8));
+    let parsed_utf8 = DeepLinksRouterDeepLinks::parse_command(&s5_utf8_link, true);
+    assert_eq!(
+        parsed_utf8.params.get("user").map(String::as_str),
+        Some("alice_密码")
+    );
+    assert_eq!(
+        parsed_utf8.params.get("pass").map(String::as_str),
+        Some("密码ü")
+    );
+}

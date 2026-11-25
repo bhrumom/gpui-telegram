@@ -6006,15 +6006,18 @@ async fn body_regression_predraw_overlay_occlusion_for_creators_miniapp_iv_compu
         .unwrap();
     }
 
-    // 2. MainMenuCommand::RemoteComputer (open_computer_workbench_live)
+    // 2. MainMenuCommand::RemoteComputer (open_computer_workbench_live -> open_remote_computers_hub)
     app.update_window(win_handle.into(), |_, window, cx| {
         arm_distill_with_ime("RemoteComputer", window, cx);
         shell_ent.update(cx, |s, scx| {
             s.handle_main_menu_command(MainMenuCommand::RemoteComputer, scx);
         });
-        assert!(shell_ent.read(cx).overlays.computer_overlay.is_some());
+        assert_eq!(shell_ent.read(cx).active_panel, ActiveWorkspacePanel::Settings);
+        assert!(shell_ent.read(cx).settings_router.read(cx).standalone_computers_mode);
         assert_predraw_occluded("RemoteComputer", window, cx);
-        window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+        shell_ent.update(cx, |s, scx| {
+            s.open_browser_workspace(scx);
+        });
         let _ = window.draw(cx);
     })
     .unwrap();

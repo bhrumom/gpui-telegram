@@ -2,7 +2,7 @@
 ; Invoked by scripts/package_windows.py with /DAppVersion, /DStageDir, /DOutDir, /DOutBaseFilename, /DIconPath
 
 #ifndef AppVersion
-  #define AppVersion "1.6.9"
+  #define AppVersion "1.6.11"
 #endif
 #ifndef StageDir
   #define StageDir "..\..\dist\windows-stage"

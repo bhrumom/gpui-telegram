@@ -17,7 +17,7 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::app_shell::shell_actions::localize_call_state;
 use crate::views::app_shell::shell_panels::{render_empty_panel_notice, render_panel_header};
 use crate::views::app_shell::shell_truth::{
-    derive_initials, format_authoritative_timestamp, peer_subtitle_for_dialog,
+    derive_initials, format_authoritative_timestamp, peer_subtitle_for_dialog, ClientCallFence,
 };
 use crate::views::app_shell::modal_container::{
     macos_modal_backdrop_rgba, macos_modal_card, macos_popover_surface, macos_primary_pill_btn,
@@ -563,7 +563,11 @@ impl AppShell {
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, _, cx| {
                                                     cx.stop_propagation();
-                                                    if is_takeover && !b_un_close.is_empty() {
+                                                    if this.is_authenticated
+                                                        && is_takeover
+                                                        && !b_un_close.is_empty()
+                                                        && !s_name_close.is_empty()
+                                                    {
                                                         this.client.send_miniapp_takeover_state(
                                                             MiniAppTakeoverEvent {
                                                                 bot_username: b_un_close.clone(),
@@ -648,6 +652,7 @@ impl AppShell {
                                                         wcx.notify();
                                                     });
                                                 }
+                                                this.reconcile_chat_scoped_toasts(cx);
                                                 if let Some(ref mut ps) =
                                                     this.miniapps.floating_pip_status
                                                 {
@@ -656,7 +661,10 @@ impl AppShell {
                                                         "用户正在手动接管小程序".to_string();
                                                     ps.active_tool = None;
                                                 }
-                                                if !b_un_take.is_empty() {
+                                                if this.is_authenticated
+                                                    && !b_un_take.is_empty()
+                                                    && !s_name_take.is_empty()
+                                                {
                                                     this.client.send_miniapp_takeover_state(
                                                         MiniAppTakeoverEvent {
                                                             bot_username: b_un_take.clone(),
@@ -707,7 +715,10 @@ impl AppShell {
                                                     ps.status_text =
                                                         "已交还控制权，AI 继续中".to_string();
                                                 }
-                                                if !b_un_fin.is_empty() {
+                                                if this.is_authenticated
+                                                    && !b_un_fin.is_empty()
+                                                    && !s_name_fin.is_empty()
+                                                {
                                                     this.client.send_miniapp_takeover_state(
                                                         MiniAppTakeoverEvent {
                                                             bot_username: b_un_fin.clone(),
@@ -750,6 +761,7 @@ impl AppShell {
                                                     wcx.notify();
                                                 });
                                             }
+                                            this.reconcile_chat_scoped_toasts(cx);
                                             cx.notify();
                                         }),
                                     )
@@ -918,6 +930,7 @@ impl AppShell {
                                                     cx.stop_propagation();
                                                     this.occlude_browser_for_overlay(cx);
                                                     this.miniapps.miniapp_tos_modal_open = true;
+                                                    this.reconcile_chat_scoped_toasts(cx);
                                                     cx.notify();
                                                 }),
                                             )
@@ -1175,15 +1188,30 @@ impl AppShell {
                                                     this.sync_compose_state_to_composer(true, cx);
                                                 }
                                                 let req = CreateChatRequest { title: click_name.clone(), chat_type: Some(serde_json::json!(0)), peer_user_id: Some(uid), ..Default::default() };
-                                                let client = this.client.clone();
-                                                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                                                    if let Ok(created) = client.create_chat(&req).await {
-                                                        let _ = weak.update(app, |s, cx| {
-                                                            s.sidebar.update(cx, |sb, _| sb.select_dialog_from_user(created.chat_id as u64));
-                                                            s.refresh_chats(cx);
-                                                        });
-                                                    }
-                                                }).detach();
+                                                if let Some(fence) = this.capture_client_fence() {
+                                                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                                                        if !fence.preflight_ui(&weak, app).await {
+                                                            return;
+                                                        }
+                                                        if let Ok(created) = fence
+                                                            .client
+                                                            .create_chat_with_token(
+                                                                &fence.token,
+                                                                fence.client_epoch,
+                                                                &req,
+                                                            )
+                                                            .await
+                                                        {
+                                                            let _ = weak.update(app, |s, cx| {
+                                                                if !fence.is_valid(s) {
+                                                                    return;
+                                                                }
+                                                                s.sidebar.update(cx, |sb, _| sb.select_dialog_from_user(created.chat_id as u64));
+                                                                s.refresh_chats(cx);
+                                                            });
+                                                        }
+                                                    }).detach();
+                                                }
                                             }
                                             cx.notify();
                                         }))
@@ -1606,7 +1634,7 @@ impl AppShell {
                                                 "Please enter a registered username or phone number",
                                             )
                                             .to_string();
-                                            this.window_runtime.enqueue_toast(msg, 2600);
+                                            this.show_non_chat_toast(msg, 2600, cx);
                                         }
                                         cx.notify();
                                     })),
@@ -2192,6 +2220,7 @@ impl AppShell {
                                 this.bot_browser.first_creation_banner_open = false;
                                 this.leave_browser_panel_if_active(cx);
                                 this.active_panel = ActiveWorkspacePanel::Settings;
+                                this.reconcile_chat_scoped_toasts(cx);
                                 this.settings_router.update(cx, |r, rcx| {
                                     r.ensure_privacy(rcx);
                                     r.navigate_to(SettingsSectionType::PrivacySecurity, true, rcx);
@@ -2608,6 +2637,12 @@ impl AppShell {
         chip: ComposeRecipientChip,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_authenticated || self.session_sync.session_token.is_none() {
+            return;
+        }
+        if self.sidebar.read(cx).compose_draft.pending_creation.is_some() {
+            return;
+        }
         self.ime.clear_preedit();
         let carry_draft = self.composer.read(cx).text().to_string();
         let existing_chat = chip
@@ -2645,7 +2680,7 @@ impl AppShell {
             // cannot leak into the background chat via `handle_composer_draft_change`.
             let seq = self.client.next_client_nonce();
             let client_nonce = format!("dm-{}-{}", chrono::Utc::now().timestamp_millis(), seq);
-            self.sidebar.update(cx, |sb, scx| {
+            let compose_epoch = self.sidebar.update(cx, |sb, scx| {
                 sb.compose_draft.menu_open = false;
                 sb.compose_draft.creation_error = None;
                 sb.compose_draft.pending_creation = Some(PendingComposeCreation {
@@ -2654,7 +2689,9 @@ impl AppShell {
                     initial_message: carry_draft.clone(),
                     client_nonce: client_nonce.clone(),
                 });
+                let epoch = sb.compose_draft.compose_epoch;
                 scx.notify();
+                epoch
             });
             self.sync_compose_state_to_composer(true, cx);
 
@@ -2668,16 +2705,58 @@ impl AppShell {
                 } else {
                     Vec::new()
                 },
-                client_nonce: Some(client_nonce),
+                client_nonce: Some(client_nonce.clone()),
                 ..Default::default()
             };
-            let client = self.client.clone();
+            let Some(fence) = self.capture_client_fence() else {
+                return;
+            };
             let chip_clone = chip.clone();
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                match client.create_chat(&req).await {
-                    Ok(created) => {
-                        let cid = created.chat_id.max(0) as u64;
-                        let _ = weak.update(app, |s, cx| {
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                let res = fence
+                    .client
+                    .create_chat_with_token(&fence.token, fence.client_epoch, &req)
+                    .await;
+                let _ = weak.update(app, |s, cx| {
+                    if !fence.is_valid(s) {
+                        return;
+                    }
+                    let (matches_pending, plus_open, epoch_matches) = {
+                        let sb = s.sidebar.read(cx);
+                        (
+                            sb.compose_draft
+                                .pending_creation
+                                .as_ref()
+                                .is_some_and(|p| p.client_nonce == client_nonce),
+                            sb.is_plus_menu_open,
+                            sb.compose_draft.compose_epoch == compose_epoch,
+                        )
+                    };
+                    if !matches_pending || !plus_open || !epoch_matches {
+                        if matches_pending {
+                            s.sidebar.update(cx, |sb, scx| {
+                                if sb
+                                    .compose_draft
+                                    .pending_creation
+                                    .as_ref()
+                                    .is_some_and(|p| p.client_nonce == client_nonce)
+                                {
+                                    sb.compose_draft.pending_creation = None;
+                                    scx.notify();
+                                }
+                            });
+                        }
+                        if res.is_ok() {
+                            s.refresh_chats(cx);
+                        }
+                        return;
+                    }
+                    match res {
+                        Ok(created) => {
+                            let cid = created.chat_id.max(0) as u64;
                             let now_label =
                                 tr_str(s.active_lang_id(), "刚刚", "Just now").to_string();
                             s.sidebar.update(cx, |sb, scx| {
@@ -2730,10 +2809,8 @@ impl AppShell {
                             });
                             s.refresh_chats(cx);
                             cx.notify();
-                        });
-                    }
-                    Err(err) => {
-                        let _ = weak.update(app, |s, cx| {
+                        }
+                        Err(err) => {
                             s.sidebar.update(cx, |sb, scx| {
                                 sb.compose_draft.pending_creation = None;
                                 sb.is_plus_menu_open = true;
@@ -2745,12 +2822,11 @@ impl AppShell {
                             s.sync_compose_state_to_composer(true, cx);
                             let prefix =
                                 tr_str(s.active_lang_id(), "无法打开对话", "Failed to open chat");
-                            s.window_runtime
-                                .enqueue_toast(format!("{prefix}: {err}"), 3200);
+                            s.show_non_chat_toast(format!("{prefix}: {err}"), 3200, cx);
                             cx.notify();
-                        });
+                        }
                     }
-                }
+                });
             })
             .detach();
         }
@@ -3376,7 +3452,7 @@ impl AppShell {
                                                     cx.stop_propagation();
                                                     this.ime.clear_preedit();
                                                     this.sidebar.update(cx, |sb, scx| {
-                                                        sb.exit_compose_mode();
+                                                        sb.cancel_compose_mode();
                                                         scx.notify();
                                                     });
                                                     this.exit_compose_or_modal_isolation(true, cx);
@@ -3870,7 +3946,7 @@ impl AppShell {
                                                             cx,
                                                         );
                                                         this.sidebar.update(cx, |sb, scx| {
-                                                            sb.exit_compose_mode();
+                                                            sb.cancel_compose_mode();
                                                             scx.notify();
                                                         });
                                                         this.enter_compose_or_modal_isolation(cx);

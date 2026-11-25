@@ -202,14 +202,6 @@ impl TrayWinWin {
                 "Show Fabushi"
             },
         );
-        self.add_action(
-            tray_action_ids::CONTROLLED_STATUS,
-            if is_zh {
-                "本机被控状态窗口"
-            } else {
-                "Controlled Status Window"
-            },
-        );
         self.actions.push(WinTrayAction {
             id: tray_action_ids::DISCONNECT_ALL.to_string(),
             title: if is_zh {

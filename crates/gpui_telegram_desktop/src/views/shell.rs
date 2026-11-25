@@ -142,6 +142,7 @@ pub struct AppShell {
     pub last_window_appearance: Option<WindowAppearance>,
     pub scheduled_toast_id: Option<u64>,
     pub last_observed_toast_chat_id: Option<u64>,
+    pub proxy_op_generation: u64,
     pub(crate) compose_isolation_snapshot: Option<ComposeIsolationSnapshot>,
 }
 
@@ -256,6 +257,7 @@ impl AppShell {
             last_window_appearance: None,
             scheduled_toast_id: None,
             last_observed_toast_chat_id: None,
+            proxy_op_generation: 0,
             compose_isolation_snapshot: None,
         };
 
@@ -274,7 +276,7 @@ impl AppShell {
             cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
                 let verify_res = client.http_client.get_me(&stored.token).await;
                 let _ = weak_shell.update(app, |shell, cx| {
-                    if shell.is_authenticated {
+                    if shell.is_authenticated || !Arc::ptr_eq(&shell.client, &client) {
                         return;
                     }
                     match verify_res {
@@ -347,13 +349,25 @@ impl AppShell {
             self.scheduled_toast_id = None;
             self.last_observed_toast_chat_id = None;
             self.compose_isolation_snapshot = None;
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.modal_container.update(cx, |m, _| {
+                m.hide_all();
+                m.dialog.pending_outcome = None;
+                m.dialog.proxies.clear();
+                m.dialog.contacts_list.clear();
+                m.dialog.forward_targets.clear();
+            });
             self.settings_router.update(cx, |r, rcx| {
+                r.close(rcx);
                 if let Some(sp) = r.settings_privacy.clone() {
                     sp.update(rcx, |sec, _| sec.clear_session_custody_state());
                 }
             });
         }
         let srv_url = self.client.config.server_url.clone();
+        self.proxy_op_generation = self.proxy_op_generation.wrapping_add(1);
+        self.sync_settings_advanced_to_active_proxy(cx);
         self.session_sync.begin_session(
             auth.token.clone(),
             auth.session_id.clone(),
@@ -371,6 +385,12 @@ impl AppShell {
             wcx.notify();
         });
         self.client.set_auth_session(auth.clone());
+        if let Some(ref handler) = self.remote_host.ipc_handler {
+            handler.set_client(self.client.clone());
+            if prev_user_id != Some(auth.user_id) {
+                handler.set_local_node_id(None);
+            }
+        }
         self.client.connect_ws();
         self.start_ws_inbound_stream(cx);
 
@@ -402,6 +422,46 @@ impl AppShell {
             );
         }
 
+        if prev_user_id != Some(auth.user_id) {
+            if let Some(bw) = self.browser_workspace.take() {
+                bw.update(cx, |w, wcx| {
+                    w.set_workspace_visible(false, wcx);
+                    w.set_occluded(true, wcx);
+                });
+            }
+            if self.active_panel == ActiveWorkspacePanel::Browser {
+                self.active_panel = ActiveWorkspacePanel::Chats;
+                self.last_handled_nav_dest = Some(NavDestination::Chats);
+            }
+            self.bot_browser.reset_on_logout();
+            self.miniapps.reset();
+            self.computers.reset_on_logout();
+            self.magpie_local.reset_on_logout();
+            if let Some(old_rt) = self.coding_host.reset_on_logout() {
+                self.client.runtime().spawn(async move {
+                    old_rt.shutdown().await;
+                });
+            }
+            self.inspector.update(cx, |insp, _| insp.clear_ai_models());
+            self.tasks_workspace.update(cx, |w, wcx| {
+                w.reset_on_logout();
+                wcx.notify();
+            });
+            self.settings_router.update(cx, |r, rcx| {
+                if let Some(ap) = r.settings_ai_providers.clone() {
+                    ap.update(rcx, |sec, sec_cx| {
+                        sec.reset_on_logout();
+                        sec_cx.notify();
+                    });
+                }
+                if let Some(sm) = r.settings_main.clone() {
+                    sm.update(rcx, |main, mcx| {
+                        main.sync_ai_providers_status(None, false);
+                        mcx.notify();
+                    });
+                }
+            });
+        }
         self.refresh_chats(cx);
         self.refresh_folders(cx);
         self.refresh_contacts(cx);
@@ -422,27 +482,6 @@ impl AppShell {
         self.coding_host.registered_for_auth_gen = None;
         self.ensure_coding_host_runtime(cx);
         self.announce_coding_host_to_server(cx);
-        if prev_user_id != Some(auth.user_id) {
-            if let Some(bw) = self.browser_workspace.take() {
-                bw.update(cx, |w, wcx| {
-                    w.set_workspace_visible(false, wcx);
-                    w.set_occluded(true, wcx);
-                });
-            }
-            if self.active_panel == ActiveWorkspacePanel::Browser {
-                self.active_panel = ActiveWorkspacePanel::Chats;
-                self.last_handled_nav_dest = Some(NavDestination::Chats);
-            }
-            self.bot_browser.reset_on_logout();
-            self.miniapps.reset();
-            self.computers.reset_on_logout();
-            self.magpie_local.discovered_items.clear();
-            self.magpie_local.bootstrapped_auth_generation = None;
-            self.magpie_local.legacy_keepalive_generation =
-                self.magpie_local.legacy_keepalive_generation.wrapping_add(1);
-            self.magpie_local.active_legacy_subscription_id = None;
-            self.magpie_local.active_legacy_model = None;
-        }
         self.bootstrap_local_bot_browser_and_vault_with_auth(vault_bootstrap, cx);
 
         let _ = ClientConfig::save_session(&StoredSession {
@@ -465,6 +504,7 @@ impl AppShell {
         let srv_url = self.client.config.server_url.clone();
 
         self.session_sync.reset_on_logout();
+        self.proxy_op_generation = self.proxy_op_generation.wrapping_add(1);
         self.is_authenticated = false;
         self.ime.clear_preedit();
         self.ime.just_committed_ime = false;
@@ -472,6 +512,15 @@ impl AppShell {
         self.overlays.clear_overlays();
         self.miniapps.reset();
         self.computers.reset_on_logout();
+        if let Some(ref handler) = self.remote_host.ipc_handler {
+            handler.set_local_node_id(None);
+        }
+        self.magpie_local.reset_on_logout();
+        self.inspector.update(cx, |insp, _| insp.clear_ai_models());
+        self.tasks_workspace.update(cx, |w, wcx| {
+            w.reset_on_logout();
+            wcx.notify();
+        });
         self.sync_remote_tray_status(cx);
         if let Some(coding_rt) = self.coding_host.reset_on_logout() {
             client.runtime().spawn(async move {
@@ -488,13 +537,30 @@ impl AppShell {
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
 
-        self.auth_wizard.update(cx, |w, wcx| { w.reset_after_logout(srv_url.clone()); wcx.notify(); });
+        let reset_client = self.client.clone();
+        self.auth_wizard.update(cx, |w, wcx| {
+            w.reset_after_logout(reset_client);
+            wcx.notify();
+        });
         self.settings_router.update(cx, |r, rcx| {
             r.close(rcx);
             if let Some(sp) = r.settings_privacy.clone() {
                 sp.update(rcx, |sec, _| sec.clear_session_custody_state());
             }
+            if let Some(ap) = r.settings_ai_providers.clone() {
+                ap.update(rcx, |sec, sec_cx| {
+                    sec.reset_on_logout();
+                    sec_cx.notify();
+                });
+            }
+            if let Some(sm) = r.settings_main.clone() {
+                sm.update(rcx, |main, mcx| {
+                    main.sync_ai_providers_status(None, false);
+                    mcx.notify();
+                });
+            }
         });
+        self.sync_settings_advanced_to_active_proxy(cx);
 
         self.client.local_store.clear_all();
         self.client.clear_session();
@@ -509,7 +575,13 @@ impl AppShell {
         self.reset_conversation_views(&srv_url, None, cx);
 
         self.main_menu_drawer.update(cx, |m, _| { m.close(); m.accounts.clear(); m.active_account_id = 0; });
-        self.modal_container.update(cx, |m, _| m.hide_all());
+        self.modal_container.update(cx, |m, _| {
+            m.hide_all();
+            m.dialog.pending_outcome = None;
+            m.dialog.proxies.clear();
+            m.dialog.contacts_list.clear();
+            m.dialog.forward_targets.clear();
+        });
         self.nav_rail.update(cx, |r, _| {
             r.is_connected = false;
             r.set_account("?", "");
@@ -570,6 +642,7 @@ impl AppShell {
         let overlay = cx.new(|_| CallOverlay::new(peer));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_talk_mode, cx);
         self.rtc_talk.talk_mode_overlay = Some(overlay);
+        self.reconcile_chat_scoped_toasts(cx);
     }
 
     pub fn hide_talk_mode(&mut self, cx: &mut Context<Self>) {
@@ -582,11 +655,17 @@ impl AppShell {
         let overlay = cx.new(|_| ComputerWorkbench::new("Dev-Workstation-01".to_string()));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_remote_computer, cx);
         self.overlays.computer_overlay = Some(overlay);
+        self.reconcile_chat_scoped_toasts(cx);
     }
 
     pub fn hide_remote_computer(&mut self, cx: &mut Context<Self>) {
         self.overlays.computer_overlay = None;
-        self.reset_nav_destination_if(&[NavDestination::RemoteComputer], cx);
+        let hub_open = self.active_panel == ActiveWorkspacePanel::Settings
+            && self.settings_router.read(cx).settings_section == SettingsSectionType::Computers
+            && self.settings_router.read(cx).standalone_computers_mode;
+        if !hub_open {
+            self.reset_nav_destination_if(&[NavDestination::RemoteComputer], cx);
+        }
     }
 
     pub fn show_media_viewer(&mut self, url: impl Into<String>, is_video: bool, cx: &mut Context<Self>) {
@@ -594,6 +673,7 @@ impl AppShell {
         let overlay = cx.new(|_| MediaViewer::new(url.into(), is_video));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, |shell, _| shell.hide_media_viewer(), cx);
         self.overlays.media_viewer_overlay = Some(overlay);
+        self.reconcile_chat_scoped_toasts(cx);
     }
 
     pub fn hide_media_viewer(&mut self) { self.overlays.media_viewer_overlay = None; }
@@ -607,7 +687,7 @@ impl AppShell {
     pub fn navigate_settings_to(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
         self.sidebar.update(cx, |sb, sb_cx| {
-            sb.exit_compose_mode();
+            sb.cancel_compose_mode();
             sb.is_account_popover_open = false;
             sb_cx.notify();
         });
@@ -623,6 +703,7 @@ impl AppShell {
         let was_outside = self.active_panel != ActiveWorkspacePanel::Settings;
         self.settings_router.update(cx, |r, rcx| r.navigate_to(target, was_outside, rcx));
         self.active_panel = ActiveWorkspacePanel::Settings;
+        self.reconcile_chat_scoped_toasts(cx);
         self.last_handled_nav_dest = Some(NavDestination::Settings);
         self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Settings));
         if was_outside {
@@ -703,6 +784,7 @@ impl AppShell {
         self.overlays.passcode_unlock_error = None;
         self.ime.clear_preedit();
         self.occlude_browser_for_overlay(cx);
+        self.reconcile_chat_scoped_toasts(cx);
         self.settings_router.update(cx, |sr, scx| {
             if let Some(ref lp) = sr.settings_local_passcode {
                 lp.update(scx, |lp, lpcx| {
@@ -877,6 +959,7 @@ impl AppShell {
             ccx.notify();
         });
         self.sync_compose_state_to_composer(true, cx);
+        self.reconcile_chat_scoped_toasts(cx);
     }
 
     pub(crate) fn clear_compose_isolation_snapshot(&mut self) {
@@ -895,6 +978,21 @@ impl AppShell {
         if self.is_compose_or_creation_modal_active(cx) {
             return;
         }
+        if !self.composer.read(cx).is_compose_isolated {
+            return;
+        }
+        let saved_draft = self
+            .session_sync
+            .last_draft_text_by_chat
+            .get(&chat_id)
+            .cloned()
+            .or_else(|| {
+                self.client
+                    .local_store
+                    .get_draft(ChatId(chat_id as i64))
+                    .map(|d| d.text)
+            })
+            .unwrap_or_default();
         let cached_send_as_list = self
             .session_sync
             .send_as_peers
@@ -904,6 +1002,16 @@ impl AppShell {
         let show_start_bar = self.stage.read(cx).show_bot_start_bar;
         self.composer.update(cx, |c, ccx| {
             c.is_compose_isolated = false;
+            if saved_draft.is_empty() {
+                c.clear();
+            } else {
+                c.set_text(saved_draft);
+            }
+            c.cancel_reply_or_edit();
+            c.editor.attachments.clear();
+            c.submitted_attachment = None;
+            c.pending_attached_files = None;
+            c.clear_bot_reply_keyboard();
             c.set_send_as_options(cached_send_as_list, cached_chosen_send_as);
             c.is_input_focused = !show_start_bar;
             ccx.notify();
@@ -958,16 +1066,20 @@ impl AppShell {
         self.composer.update(cx, |c, ccx| {
             c.is_compose_isolated = false;
             if restore_same_chat_draft {
-                if let Some(ref snap) = snapshot {
-                    if snap.chat_id == active_cid {
-                        c.replying_to = snap.replying_to.clone();
-                        c.editing_message = snap.editing_message.clone();
-                        c.editor.attachments = snap.attachments.clone();
-                        if let Some(ref kb) = snap.bot_keyboard {
-                            c.bot_keyboard = kb.clone();
-                            c.is_bot_keyboard_open = snap.is_bot_keyboard_open;
-                        }
+                c.submitted_attachment = None;
+                c.pending_attached_files = None;
+                if let Some(ref snap) = snapshot.as_ref().filter(|snap| snap.chat_id == active_cid) {
+                    c.replying_to = snap.replying_to.clone();
+                    c.editing_message = snap.editing_message.clone();
+                    c.editor.attachments = snap.attachments.clone();
+                    if let Some(ref kb) = snap.bot_keyboard {
+                        c.bot_keyboard = kb.clone();
+                        c.is_bot_keyboard_open = snap.is_bot_keyboard_open;
                     }
+                } else {
+                    c.cancel_reply_or_edit();
+                    c.editor.attachments.clear();
+                    c.clear_bot_reply_keyboard();
                 }
                 let draft = saved_draft.unwrap_or_default();
                 if draft.is_empty() {
@@ -1071,25 +1183,61 @@ impl AppShell {
         });
     }
 
+    pub fn has_blocking_overlay(&self, cx: &gpui::App) -> bool {
+        let sb = self.sidebar.read(cx);
+        sb.is_contacts_modal_open
+            || sb.active_creation_modal.is_some()
+            || self.modal_container.read(cx).is_modal_active()
+            || self
+                .miniapps
+                .create_bot_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self.miniapps.pending_miniapp_confirm.is_some()
+            || self.miniapps.miniapp_tos_modal_open
+            || self
+                .miniapps
+                .bot_profile_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self.active_panel != ActiveWorkspacePanel::Chats
+            || self.overlays.is_passcode_locked
+            || self.rtc_talk.talk_mode_overlay.is_some()
+            || self.overlays.media_viewer_overlay.is_some()
+            || self.overlays.iv_viewer_overlay.is_some()
+            || self.overlays.computer_overlay.is_some()
+            || self
+                .miniapps
+                .miniapp_overlay
+                .as_ref()
+                .is_some_and(|ov| ov.read(cx).is_open)
+    }
+
+    pub fn is_chat_visible_for_toast(&self, chat_id: u64, cx: &gpui::App) -> bool {
+        let sb = self.sidebar.read(cx);
+        self.is_authenticated
+            && !sb.is_plus_menu_open
+            && !self.is_compose_or_creation_modal_active(cx)
+            && !self.has_blocking_overlay(cx)
+            && self.stage.read(cx).active_chat_id == Some(chat_id)
+    }
+
     pub fn show_toast(
         &mut self,
         text: impl Into<String>,
         duration_ms: u64,
         cx: &mut Context<Self>,
     ) {
-        let in_active_chat = self.is_authenticated
-            && self.active_panel == ActiveWorkspacePanel::Chats
-            && !(self.theme_state.palette.is_apple_style()
-                && self.sidebar.read(cx).is_plus_menu_open);
-        if in_active_chat {
-            if let Some(cid) = self.stage.read(cx).active_chat_id {
-                self.show_chat_toast(cid, text, duration_ms, cx);
-                return;
-            }
+        if let Some(cid) = self
+            .stage
+            .read(cx)
+            .active_chat_id
+            .filter(|&cid| self.is_chat_visible_for_toast(cid, cx))
+        {
+            self.show_chat_toast(cid, text, duration_ms, cx);
+            return;
         }
-        self.window_runtime.enqueue_toast(text, duration_ms);
-        self.schedule_current_toast_dismiss(cx);
-        cx.notify();
+        self.show_non_chat_toast(text, duration_ms, cx);
     }
 
     pub fn show_chat_toast(
@@ -1099,9 +1247,25 @@ impl AppShell {
         duration_ms: u64,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_chat_visible_for_toast(chat_id, cx) {
+            return;
+        }
         self.window_runtime
             .controller
             .show_chat_toast(chat_id, text, duration_ms);
+        self.schedule_current_toast_dismiss(cx);
+        cx.notify();
+    }
+
+    pub fn show_non_chat_toast(
+        &mut self,
+        text: impl Into<String>,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.window_runtime
+            .controller
+            .show_non_chat_toast(text, duration_ms);
         self.schedule_current_toast_dismiss(cx);
         cx.notify();
     }
@@ -1124,12 +1288,13 @@ impl AppShell {
             return;
         }
 
-        let in_active_chat = self.is_authenticated
-            && self.active_panel == ActiveWorkspacePanel::Chats
-            && !(self.theme_state.palette.is_apple_style()
-                && self.sidebar.read(cx).is_plus_menu_open);
-        if is_unset_chat_id && in_active_chat {
-            if let Some(cid) = self.stage.read(cx).active_chat_id {
+        if is_unset_chat_id {
+            if let Some(cid) = self
+                .stage
+                .read(cx)
+                .active_chat_id
+                .filter(|&cid| self.is_chat_visible_for_toast(cid, cx))
+            {
                 self.window_runtime
                     .controller
                     .stamp_current_toast_chat_id_if_unset(cid);
@@ -1149,6 +1314,44 @@ impl AppShell {
             });
         })
         .detach();
+    }
+
+    pub fn reconcile_chat_scoped_toasts(&mut self, cx: &mut Context<Self>) {
+        let cur_chat_id = self.stage.read(cx).active_chat_id;
+        let mut stale_chat_ids: Vec<u64> = Vec::new();
+        if let Some(old_cid) = self.last_observed_toast_chat_id {
+            if cur_chat_id != Some(old_cid) || !self.is_chat_visible_for_toast(old_cid, cx) {
+                stale_chat_ids.push(old_cid);
+            }
+        }
+        if let Some(cid) = self
+            .window_runtime
+            .controller
+            .current_toast
+            .as_ref()
+            .and_then(|t| t.chat_id)
+        {
+            if !self.is_chat_visible_for_toast(cid, cx) && !stale_chat_ids.contains(&cid) {
+                stale_chat_ids.push(cid);
+            }
+        }
+        for t in &self.window_runtime.controller.toast_queue {
+            if let Some(cid) = t.chat_id {
+                if !self.is_chat_visible_for_toast(cid, cx) && !stale_chat_ids.contains(&cid) {
+                    stale_chat_ids.push(cid);
+                }
+            }
+        }
+        let mut cleared = false;
+        for cid in stale_chat_ids {
+            if self.window_runtime.controller.clear_toasts_for_chat(cid) {
+                cleared = true;
+            }
+        }
+        self.last_observed_toast_chat_id = cur_chat_id;
+        if cleared {
+            self.schedule_current_toast_dismiss(cx);
+        }
     }
 
     fn is_error_toast_text(text: &str) -> bool {
@@ -1380,9 +1583,15 @@ impl Render for AppShell {
             self.app.sync_viewport_size(vp_w, vp_h);
         }
 
+        self.reconcile_chat_scoped_toasts(cx);
         self.schedule_current_toast_dismiss(cx);
         let pal = self.theme_state.palette;
-        let current_toast = self.window_runtime.controller.current_toast.clone();
+        let current_toast = self
+            .window_runtime
+            .controller
+            .current_toast
+            .clone()
+            .filter(|toast| toast.chat_id.is_none_or(|cid| self.is_chat_visible_for_toast(cid, cx)));
         let update_banner = self.render_in_app_update_banner(cx);
 
         if !self.is_authenticated {
@@ -1444,33 +1653,7 @@ impl Render for AppShell {
         };
         let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
         let hide_composer = self.should_hide_composer(cx);
-        let has_blocking_overlay = contacts_open
-            || creation_modal.is_some()
-            || self.modal_container.read(cx).is_modal_active()
-            || self
-                .miniapps
-                .create_bot_box
-                .as_ref()
-                .is_some_and(|b| b.read(cx).is_visible)
-            || self.miniapps.pending_miniapp_confirm.is_some()
-            || self.miniapps.miniapp_tos_modal_open
-            || self
-                .miniapps
-                .bot_profile_box
-                .as_ref()
-                .is_some_and(|b| b.read(cx).is_visible)
-            || self.active_panel != ActiveWorkspacePanel::Chats
-            || self.overlays.is_passcode_locked
-            || self.rtc_talk.talk_mode_overlay.is_some()
-            || self.overlays.media_viewer_overlay.is_some()
-            || self.overlays.iv_viewer_overlay.is_some()
-            || self.overlays.computer_overlay.is_some()
-            || (self
-                .miniapps
-                .miniapp_overlay
-                .as_ref()
-                .is_some_and(|ov| ov.read(cx).is_open)
-                && !self.miniapps.is_miniapp_minimized);
+        let has_blocking_overlay = self.has_blocking_overlay(cx);
         self.sync_compose_state_to_composer(false, cx);
 
         div()

@@ -353,6 +353,15 @@ impl GlobalTasksWorkspace {
         s
     }
 
+    /// Clears all user-scoped Hermes Studio & Magpie state on logout or account switch.
+    pub fn reset_on_logout(&mut self) {
+        let palette = self.palette;
+        let lang = self.language_id.clone();
+        let focus_handle = self.focus_handle.clone();
+        *self = Self::new_live(palette, &lang);
+        self.focus_handle = focus_handle;
+    }
+
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) {
         self.palette = palette;
     }

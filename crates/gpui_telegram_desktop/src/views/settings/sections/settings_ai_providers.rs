@@ -274,6 +274,16 @@ impl SettingsAiProvidersSections {
         self.palette = palette;
     }
 
+    /// Clears all user-scoped Magpie provider/subscription state and form drafts on logout or account switch.
+    pub fn reset_on_logout(&mut self) {
+        let palette = self.palette;
+        let lang = self.language_id.clone();
+        let ime_controller = self.ime_controller.take();
+        *self = Self::new_live(palette, &lang);
+        self.loading = false;
+        self.ime_controller = ime_controller;
+    }
+
     pub fn set_language(&mut self, lang: &str) {
         self.language_id = lang.to_string();
     }
@@ -397,9 +407,24 @@ impl SettingsAiProvidersSections {
             }
         }
 
-        // Always synchronize active flag according to current active provider
+        // Always synchronize active flag and selected model according to current active provider
         for sa in &mut self.subscription_accounts {
-            sa.active = sa.id == state.active_provider;
+            sa.active = sa.id == state.active_provider
+                || (sa.kind == "google_vertex"
+                    && state.active_provider == "magpie_provider:google-vertex");
+            if sa.active && !state.active_model.trim().is_empty() {
+                self.selected_subscription_models
+                    .insert(sa.id.clone(), state.active_model.trim().to_string());
+            }
+        }
+        for sa in &mut self.local_discovered_subscriptions {
+            sa.active = sa.id == state.active_provider
+                || (sa.kind == "google_vertex"
+                    && state.active_provider == "magpie_provider:google-vertex");
+            if sa.active && !state.active_model.trim().is_empty() {
+                self.selected_subscription_models
+                    .insert(sa.id.clone(), state.active_model.trim().to_string());
+            }
         }
 
         self.state = Some(state);
@@ -1349,7 +1374,15 @@ impl SettingsAiProvidersSections {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _, _, cx| {
+                                                        let active_now = is_active;
+                                                        let already_active_model = this
+                                                            .state
+                                                            .as_ref()
+                                                            .is_some_and(|st| st.active_model == m_click);
                                                         this.select_subscription_model(&sid, &m_click);
+                                                        if active_now && !already_active_model {
+                                                            this.activate_subscription_action(&sid);
+                                                        }
                                                         cx.notify();
                                                     }),
                                                 )

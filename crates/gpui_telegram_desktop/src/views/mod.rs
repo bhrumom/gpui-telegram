@@ -18,7 +18,6 @@ pub mod main_menu_drawer;
 pub mod media_viewer;
 pub mod modal_boxes_suite;
 pub mod nav_rail;
-pub mod remote_controlled_window;
 pub mod remote_terminal_view;
 pub mod settings;
 pub mod settings_workspace;
@@ -42,10 +41,6 @@ pub use main_menu_drawer::{MainMenuCommand, MainMenuDrawer};
 pub use media_viewer::{MediaViewer, MediaViewerItem};
 pub use modal_boxes_suite::{ActiveModalDialog, ModalActionOutcome, ModalDialogKind};
 pub use nav_rail::NavRail;
-pub use remote_controlled_window::{
-    open_controlled_status_window, ControlledBannerVariant, ControlledSessionGroup,
-    RemoteControlledWindow, RemoteControlledWindowAction,
-};
 pub use remote_terminal_view::RemoteTerminalView;
 pub use settings_workspace::{SettingsMutation, SettingsPageId, SettingsWorkspaceView};
 pub use shell::AppShell;

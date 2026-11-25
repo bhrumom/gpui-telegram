@@ -1,8 +1,13 @@
 //! Truthful initial state, authoritative sync, and session/generation fencing (`FUS-D004`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use gpui::{AsyncApp, WeakEntity};
+use gpui_telegram_client::TelegramClient;
 
 use crate::views::chat_sidebar::{DialogDeliveryStatus, DialogItemModel};
+use crate::views::shell::AppShell;
 use crate::views::stage::cards::{
     DeliveryStatus, InlineButtonType, InlineKeyboardButton, MediaType, MessageContent,
     MessageDirection, MessageItemModel, PollOption, PollType, ReactionItem, ReplyReference,
@@ -36,6 +41,79 @@ impl SessionRequestFence {
             && self.request_generation == current_req_gen
             && current_token == Some(self.token.as_str())
             && current_user_id == Some(self.user_id)
+    }
+}
+
+#[derive(Clone)]
+pub struct ClientCallFence {
+    pub auth_generation: u64,
+    pub user_id: Option<u64>,
+    pub token: String,
+    pub session_token: Option<String>,
+    pub client: Arc<TelegramClient>,
+    pub client_epoch: u64,
+}
+
+impl ClientCallFence {
+    pub fn capture(shell: &AppShell) -> Option<Self> {
+        if !shell.is_authenticated {
+            return None;
+        }
+        let session_token = shell
+            .session_sync
+            .session_token
+            .clone()
+            .filter(|t| !t.trim().is_empty());
+        let token = shell
+            .client
+            .token()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| session_token.clone())?;
+        Some(Self {
+            auth_generation: shell.session_sync.auth_generation,
+            user_id: shell.session_sync.user_id,
+            token,
+            session_token,
+            client: shell.client.clone(),
+            client_epoch: shell.client.session_epoch(),
+        })
+    }
+
+    pub fn matches_shell(&self, shell: &AppShell) -> bool {
+        shell.is_authenticated
+            && shell.session_sync.auth_generation == self.auth_generation
+            && shell.session_sync.user_id == self.user_id
+            && Arc::ptr_eq(&shell.client, &self.client)
+            && shell.client.session_epoch() == self.client_epoch
+            && shell
+                .session_sync
+                .session_token
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                == self.session_token.as_deref()
+    }
+
+    pub fn is_valid(&self, shell: &AppShell) -> bool {
+        self.matches_shell(shell)
+            && self
+                .client
+                .ensure_pinned_session(self.client_epoch, &self.token)
+                .is_ok()
+    }
+
+    pub async fn preflight_ui(&self, weak: &WeakEntity<AppShell>, app: &mut AsyncApp) -> bool {
+        weak.update(app, |shell, _| self.matches_shell(shell))
+            .unwrap_or(false)
+            && self
+                .client
+                .ensure_pinned_session(self.client_epoch, &self.token)
+                .is_ok()
+    }
+}
+
+impl AppShell {
+    pub fn capture_client_fence(&self) -> Option<ClientCallFence> {
+        ClientCallFence::capture(self)
     }
 }
 

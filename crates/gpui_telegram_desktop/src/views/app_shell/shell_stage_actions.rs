@@ -29,7 +29,7 @@ use crate::views::app_shell::shell_theme::{
     compute_shell_palette, propagate_theme_and_locale, tdesktop_mode_to_app_theme, ShellThemeTargets,
 };
 use crate::views::app_shell::shell_truth::{
-    derive_initials, select_authoritative_dialog, SessionRequestFence,
+    derive_initials, select_authoritative_dialog, ClientCallFence,
 };
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::composer::field_autocomplete::MentionRow;
@@ -37,7 +37,7 @@ use crate::views::conversation_stage::{PinnedBannerEntry, StageAction};
 use crate::views::iv::IvViewer;
 use crate::views::media_viewer::MediaViewerItem;
 use crate::views::nav_rail::NavDestination;
-use crate::views::shell::AppShell;
+use crate::views::shell::{ActiveWorkspacePanel, AppShell};
 use crate::views::MediaViewer;
 
 fn contact_display_name(c: &ContactDto) -> String {
@@ -216,30 +216,6 @@ fn enrich_facts_with_rich_chat(
     facts
 }
 
-fn session_fence(shell: &AppShell) -> Option<SessionRequestFence> {
-    let (Some(token), Some(uid)) =
-        (shell.session_sync.session_token.clone(), shell.session_sync.user_id)
-    else {
-        return None;
-    };
-    Some(SessionRequestFence {
-        auth_generation: shell.session_sync.auth_generation,
-        request_generation: 0,
-        token,
-        user_id: uid,
-    })
-}
-
-fn fence_matches(fence: &SessionRequestFence, shell: &AppShell) -> bool {
-    fence.matches(
-        shell.is_authenticated,
-        shell.session_sync.auth_generation,
-        0,
-        shell.session_sync.session_token.as_deref(),
-        shell.session_sync.user_id,
-    )
-}
-
 fn attach_media_viewer_overlay(
     shell: &mut AppShell,
     mut viewer: MediaViewer,
@@ -260,6 +236,7 @@ fn attach_media_viewer_overlay(
     )
     .detach();
     shell.overlays.media_viewer_overlay = Some(overlay);
+    shell.reconcile_chat_scoped_toasts(cx);
 }
 
 fn toggle_chat_dialog_flag(
@@ -293,16 +270,42 @@ fn toggle_chat_dialog_flag(
         (false, true) => tr_str(lang, "已开启消息免打扰", "Notifications muted"),
         (false, false) => tr_str(lang, "已恢复消息通知", "Notifications unmuted"),
     };
-    shell.show_chat_toast(cid, toast_msg, 2000, cx);
-    let c = shell.client.clone();
-    cx.spawn(async move |_: WeakEntity<AppShell>, _: &mut AsyncApp| {
-        if is_pin {
-            let _ = c.set_chat_pinned(cid as i64, flag).await;
-        } else {
-            let _ = c.set_chat_muted(cid as i64, flag, None).await;
-        }
-    })
-    .detach();
+    if shell.active_panel == ActiveWorkspacePanel::Chats
+        && !shell.sidebar.read(cx).is_plus_menu_open
+        && shell.stage.read(cx).active_chat_id == Some(cid)
+    {
+        shell.show_chat_toast(cid, toast_msg, 2000, cx);
+    }
+    if let Some(fence) = shell.capture_client_fence() {
+        cx.spawn(async move |weak: WeakEntity<AppShell>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            if is_pin {
+                let _ = fence
+                    .client
+                    .set_chat_pinned_with_token(
+                        &fence.token,
+                        fence.client_epoch,
+                        cid as i64,
+                        flag,
+                    )
+                    .await;
+            } else {
+                let _ = fence
+                    .client
+                    .set_chat_muted_with_token(
+                        &fence.token,
+                        fence.client_epoch,
+                        cid as i64,
+                        flag,
+                        None,
+                    )
+                    .await;
+            }
+        })
+        .detach();
+    }
 }
 
 impl AppShell {
@@ -373,6 +376,9 @@ impl AppShell {
         };
         let text = self.composer.read(cx).text().to_string();
         let trimmed_empty = text.trim().is_empty();
+        if trimmed_empty && self.session_sync.has_unmodified_in_flight_send_draft(chat_id) {
+            return;
+        }
         let already_saved = self
             .session_sync
             .last_saved_draft_by_chat
@@ -386,6 +392,9 @@ impl AppShell {
         if already_saved {
             return;
         }
+        let flushed_gen = self
+            .session_sync
+            .bump_draft_op_gen_and_clear_in_flight(chat_id);
         self.session_sync
             .last_draft_text_by_chat
             .insert(chat_id, text.clone());
@@ -408,14 +417,58 @@ impl AppShell {
         );
         self.sidebar
             .update(cx, |sb, _| sb.set_draft(chat_id, text.clone()));
-        let client = self.client.clone();
-        cx.spawn(async move |_, _| {
-            let _ = client
-                .http_client
-                .save_draft(&token, chat_id as i64, &draft_dto)
-                .await;
-        })
-        .detach();
+        if let Some(fence) = self.capture_client_fence() {
+            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                let _ = fence
+                    .client
+                    .save_draft_with_token(
+                        &fence.token,
+                        fence.client_epoch,
+                        chat_id as i64,
+                        &draft_dto,
+                    )
+                    .await;
+                if trimmed_empty {
+                    let _ = weak.update(app, |shell, _| {
+                        if fence.is_valid(shell)
+                            && shell
+                                .session_sync
+                                .is_current_draft_op_gen(chat_id, flushed_gen)
+                        {
+                            shell
+                                .client
+                                .local_store
+                                .set_draft(ChatId(chat_id as i64), None);
+                        } else if fence.is_valid(shell)
+                            && !shell.session_sync.has_unmodified_in_flight_send_draft(chat_id)
+                        {
+                            let cur_text = shell
+                                .session_sync
+                                .last_draft_text_by_chat
+                                .get(&chat_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let dto = (!cur_text.trim().is_empty()).then(|| DraftDto {
+                                chat_id: chat_id as i64,
+                                text: cur_text,
+                                entities: Vec::new(),
+                                reply_to_msg_id: None,
+                                topic_id: None,
+                                date_ms: chrono::Utc::now().timestamp_millis(),
+                            });
+                            shell
+                                .client
+                                .local_store
+                                .set_draft(ChatId(chat_id as i64), dto);
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
     }
 
     /// Handles composer text changes with local draft caching and 450ms server save debouncing.
@@ -433,14 +486,19 @@ impl AppShell {
             return;
         };
         let text = self.composer.read(cx).text().to_string();
-        if self
-            .session_sync
-            .last_draft_text_by_chat
-            .get(&chat_id)
-            .is_some_and(|prev| prev == &text)
-        {
+        let prev_draft = self.session_sync.last_draft_text_by_chat.get(&chat_id);
+        if prev_draft.is_some_and(|prev| prev == &text) {
             return;
         }
+        if prev_draft.is_none() && text.trim().is_empty() {
+            self.session_sync
+                .last_draft_text_by_chat
+                .insert(chat_id, text);
+            return;
+        }
+        let op_gen = self
+            .session_sync
+            .bump_draft_op_gen_and_clear_in_flight(chat_id);
         self.session_sync
             .last_draft_text_by_chat
             .insert(chat_id, text.clone());
@@ -462,17 +520,19 @@ impl AppShell {
         self.session_sync.draft_debounce_gen =
             self.session_sync.draft_debounce_gen.wrapping_add(1);
         let debounce_gen = self.session_sync.draft_debounce_gen;
-        let auth_gen = self.session_sync.auth_generation;
-        let client = self.client.clone();
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
+        let _ = token;
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             app.background_executor()
                 .timer(std::time::Duration::from_millis(450))
                 .await;
             let should_save = weak
                 .read_with(app, |shell, _| {
-                    shell.is_authenticated
-                        && shell.session_sync.auth_generation == auth_gen
+                    fence.is_valid(shell)
                         && shell.session_sync.draft_debounce_gen == debounce_gen
+                        && shell.session_sync.is_current_draft_op_gen(chat_id, op_gen)
                         && shell
                             .session_sync
                             .last_saved_draft_by_chat
@@ -483,18 +543,51 @@ impl AppShell {
             if !should_save {
                 return;
             }
-            if client
-                .http_client
-                .save_draft(&token, chat_id as i64, &draft_dto)
+            if fence
+                .client
+                .save_draft_with_token(
+                    &fence.token,
+                    fence.client_epoch,
+                    chat_id as i64,
+                    &draft_dto,
+                )
                 .await
                 .is_ok()
             {
                 let _ = weak.update(app, |shell, _| {
-                    if shell.session_sync.auth_generation == auth_gen {
+                    if !fence.is_valid(shell) {
+                        return;
+                    }
+                    if shell.session_sync.is_current_draft_op_gen(chat_id, op_gen) {
+                        if text.trim().is_empty() {
+                            shell
+                                .client
+                                .local_store
+                                .set_draft(ChatId(chat_id as i64), None);
+                        }
                         shell
                             .session_sync
                             .last_saved_draft_by_chat
                             .insert(chat_id, text);
+                    } else if !shell.session_sync.has_unmodified_in_flight_send_draft(chat_id) {
+                        let cur_text = shell
+                            .session_sync
+                            .last_draft_text_by_chat
+                            .get(&chat_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        let dto = (!cur_text.trim().is_empty()).then(|| DraftDto {
+                            chat_id: chat_id as i64,
+                            text: cur_text,
+                            entities: Vec::new(),
+                            reply_to_msg_id: None,
+                            topic_id: None,
+                            date_ms: chrono::Utc::now().timestamp_millis(),
+                        });
+                        shell
+                            .client
+                            .local_store
+                            .set_draft(ChatId(chat_id as i64), dto);
                     }
                 });
             }
@@ -691,9 +784,6 @@ impl AppShell {
             return;
         }
 
-        let Some(fence) = session_fence(self) else {
-            return;
-        };
         let is_bot = self
             .miniapps
             .fabushi_bots
@@ -715,12 +805,26 @@ impl AppShell {
             peer_user_id: Some(user_id),
             ..Default::default()
         };
-        let client = self.client.clone();
+        let origin_chat = resolve_active_target_chat_id(
+            self.stage.read(cx).active_chat_id,
+            self.sidebar.read(cx).active_chat_id,
+        );
+        let captured_panel = self.active_panel;
+        let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
+        let Some(call_fence) = self.capture_client_fence() else {
+            return;
+        };
         let lang_owned = self.active_lang_id().to_string();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client.create_chat(&req).await;
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let res = call_fence
+                .client
+                .create_chat_with_token(&call_fence.token, call_fence.client_epoch, &req)
+                .await;
             let _ = weak.update(app, |shell, cx| {
-                if !fence_matches(&fence, shell) {
+                if !call_fence.is_valid(shell) {
                     return;
                 }
                 match res {
@@ -769,15 +873,28 @@ impl AppShell {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        shell.show_toast(
-                            format!(
-                                "{}: {}",
-                                tr_str(&lang_owned, "打开私聊失败", "Failed to open DM"),
-                                e
-                            ),
-                            2400,
-                            cx,
+                        let msg = format!(
+                            "{}: {}",
+                            tr_str(&lang_owned, "打开私聊失败", "Failed to open DM"),
+                            e
                         );
+                        let cur_active = resolve_active_target_chat_id(
+                            shell.stage.read(cx).active_chat_id,
+                            shell.sidebar.read(cx).active_chat_id,
+                        );
+                        if let Some(cid) = origin_chat {
+                            if shell.active_panel == ActiveWorkspacePanel::Chats
+                                && !shell.sidebar.read(cx).is_plus_menu_open
+                                && shell.stage.read(cx).active_chat_id == Some(cid)
+                            {
+                                shell.show_chat_toast(cid, msg, 2400, cx);
+                            }
+                        } else if shell.active_panel == captured_panel
+                            && shell.sidebar.read(cx).is_plus_menu_open == captured_plus_open
+                            && cur_active.is_none()
+                        {
+                            shell.show_non_chat_toast(msg, 2400, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -832,9 +949,6 @@ impl AppShell {
         }
         let mut selected = false;
         let mut max_msg_id = 0i64;
-        let Some(fence) = session_fence(self) else {
-            return;
-        };
         let rich_meta_opt = self.session_sync.rich_chats_by_id.get(&chat_id).cloned();
         self.sidebar.update(cx, |sb, sb_cx| {
             let dlg_flags = sb.dialogs.iter().find(|d| d.id == chat_id).map(|d| (d.is_muted, d.is_pinned));
@@ -878,13 +992,19 @@ impl AppShell {
                     self.schedule_current_toast_dismiss(cx);
                 }
             }
-            self.last_observed_toast_chat_id = Some(chat_id);
-            let cached_draft = self
-                .client
-                .local_store
-                .get_draft(ChatId(chat_id as i64))
-                .map(|d| d.text)
-                .unwrap_or_default();
+            self.reconcile_chat_scoped_toasts(cx);
+            let in_flight_send_draft = self
+                .session_sync
+                .has_unmodified_in_flight_send_draft(chat_id);
+            let cached_draft = if in_flight_send_draft {
+                String::new()
+            } else {
+                self.client
+                    .local_store
+                    .get_draft(ChatId(chat_id as i64))
+                    .map(|d| d.text)
+                    .unwrap_or_default()
+            };
             self.session_sync
                 .last_draft_text_by_chat
                 .insert(chat_id, cached_draft.clone());
@@ -895,17 +1015,19 @@ impl AppShell {
                 .to_vec();
             let cached_chosen_send_as = self.session_sync.send_as_peers.chosen(chat_id);
             self.composer.update(cx, |c, _| {
-                if cached_draft.is_empty() {
-                    c.clear();
-                } else {
-                    c.set_text(cached_draft.clone());
+                if !c.is_compose_isolated {
+                    if cached_draft.is_empty() {
+                        c.clear();
+                    } else {
+                        c.set_text(cached_draft.clone());
+                    }
+                    c.cancel_reply_or_edit();
+                    c.editor.attachments.clear();
+                    c.submitted_attachment = None;
+                    c.pending_attached_files = None;
+                    c.clear_bot_reply_keyboard();
+                    c.set_send_as_options(cached_send_as_list, cached_chosen_send_as);
                 }
-                c.cancel_reply_or_edit();
-                c.editor.attachments.clear();
-                c.submitted_attachment = None;
-                c.pending_attached_files = None;
-                c.clear_bot_reply_keyboard();
-                c.set_send_as_options(cached_send_as_list, cached_chosen_send_as);
             });
             self.sidebar
                 .update(cx, |sb, _| sb.set_draft(chat_id, cached_draft));
@@ -934,14 +1056,34 @@ impl AppShell {
         self.sync_composer_and_inspector_miniapp_state(cx);
         self.sync_active_bot_computer_to_inspector(cx);
         self.sync_fabushi_bots_to_views(cx);
-        self.sync_composer_mention_candidates(chat_id, None, cx);
+        if !self.composer.read(cx).is_compose_isolated {
+            self.sync_composer_mention_candidates(chat_id, None, cx);
+        }
+        let Some(call_fence) = self.capture_client_fence() else {
+            return;
+        };
+        let captured_draft_op_gen = self.session_sync.draft_op_gen(chat_id);
         let active_bot_id_for_approvals = self.active_chat_bot_id(cx);
         let lang = self.active_lang_id().to_string();
         let contacts = self.session_sync.contacts_list.clone();
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let details = client.get_chat(chat_id as i64).await.ok();
-            let rich_chat = client.hermes_get_chat_rich(chat_id as i64).await.ok();
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let details = call_fence
+                .client
+                .get_chat_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
+                .await
+                .ok();
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let rich_chat = call_fence
+                .client
+                .hermes
+                .get_chat_rich(&call_fence.token, chat_id as i64)
+                .await
+                .ok();
             let rc_is_bot_flag = rich_chat.as_ref().is_some_and(|rc| rc.is_bot) || sb_is_bot;
             let bot_target = if rc_is_bot_flag {
                 rich_chat
@@ -960,35 +1102,115 @@ impl AppShell {
                 None
             };
             let bot_profile = if let Some(ref target) = bot_target {
-                client.get_bot_public_profile(target).await.ok()
+                if !call_fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                call_fence
+                    .client
+                    .get_bot_public_profile_with_token(
+                        &call_fence.token,
+                        call_fence.client_epoch,
+                        target,
+                    )
+                    .await
+                    .ok()
             } else {
                 None
             };
-            let members = client.get_chat_members(chat_id as i64).await.ok();
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let members = call_fence
+                .client
+                .get_chat_members_with_token(
+                    &call_fence.token,
+                    call_fence.client_epoch,
+                    chat_id as i64,
+                )
+                .await
+                .ok();
             let approvals_bot_id = active_bot_id_for_approvals.or_else(|| {
                 rich_chat
                     .as_ref()
                     .filter(|rc| rc.is_bot)
                     .and_then(|rc| rc.peer_user_id)
             });
-            let pending_approvals = client
-                .hermes_list_approvals_for_bot(approvals_bot_id)
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let pending_approvals = call_fence
+                .client
+                .hermes
+                .list_approvals_for_bot(&call_fence.token, approvals_bot_id)
                 .await
                 .ok();
-            let invites = client.list_invites(chat_id as i64).await.ok();
-            let pins = client.list_pinned_messages(chat_id as i64).await.ok();
-            let draft = client.get_draft(chat_id as i64).await.ok().flatten();
-            let stats = client.get_channel_statistics(chat_id as i64).await.ok();
-            let send_as_dto = client
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let invites = call_fence
+                .client
+                .list_invites_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
+                .await
+                .ok();
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let pins = call_fence
+                .client
+                .list_pinned_messages_with_token(
+                    &call_fence.token,
+                    call_fence.client_epoch,
+                    chat_id as i64,
+                )
+                .await
+                .ok();
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let draft = call_fence
+                .client
+                .get_draft_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
+                .await
+                .ok()
+                .flatten();
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let stats = call_fence
+                .client
+                .get_channel_statistics_with_token(
+                    &call_fence.token,
+                    call_fence.client_epoch,
+                    chat_id as i64,
+                )
+                .await
+                .ok();
+            if !call_fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let send_as_dto = call_fence
+                .client
                 .http_client
-                .get_send_as_peers(&fence.token, chat_id as i64)
+                .get_send_as_peers(&call_fence.token, chat_id as i64)
                 .await
                 .ok();
             if max_msg_id > 0 {
-                let _ = client.mark_chat_read(chat_id as i64, max_msg_id, None).await;
+                if !call_fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                let _ = call_fence
+                    .client
+                    .mark_chat_read_with_token(
+                        &call_fence.token,
+                        call_fence.client_epoch,
+                        chat_id as i64,
+                        max_msg_id,
+                        None,
+                    )
+                    .await;
             }
             let _ = weak.update(app, |shell, cx| {
-                if !fence_matches(&fence, shell) {
+                if !call_fence.is_valid(shell) {
                     return;
                 }
                 if let Some(ref prof) = bot_profile {
@@ -1215,28 +1437,57 @@ impl AppShell {
                         st.set_pinned_entries(chat_id, entries);
                     });
                 }
-                if let Some(dr) = draft {
+                let draft_unchanged = shell.session_sync.draft_op_gen(chat_id)
+                    == captured_draft_op_gen
+                    && !shell
+                        .session_sync
+                        .has_unmodified_in_flight_send_draft(chat_id);
+                if draft_unchanged {
+                    if let Some(dr) = draft {
+                        shell
+                            .client
+                            .local_store
+                            .set_draft(ChatId(chat_id as i64), Some(dr.clone()));
+                        shell
+                            .session_sync
+                            .last_saved_draft_by_chat
+                            .insert(chat_id, dr.text.clone());
+                        shell
+                            .session_sync
+                            .last_draft_text_by_chat
+                            .insert(chat_id, dr.text.clone());
+                        shell.sidebar.update(cx, |sb, _| sb.set_draft(chat_id, dr.text.clone()));
+                        let is_compose_isolated = shell.composer.read(cx).is_compose_isolated;
+                        if shell.stage.read(cx).active_chat_id == Some(chat_id)
+                            && !is_compose_isolated
+                            && !dr.text.is_empty()
+                            && shell.composer.read(cx).text().is_empty()
+                        {
+                            shell.composer.update(cx, |c, _| c.set_text(dr.text));
+                        }
+                    }
+                } else if !shell
+                    .session_sync
+                    .has_unmodified_in_flight_send_draft(chat_id)
+                {
+                    let cur_text = shell
+                        .session_sync
+                        .last_draft_text_by_chat
+                        .get(&chat_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let dto = (!cur_text.trim().is_empty()).then(|| DraftDto {
+                        chat_id: chat_id as i64,
+                        text: cur_text,
+                        entities: Vec::new(),
+                        reply_to_msg_id: None,
+                        topic_id: None,
+                        date_ms: chrono::Utc::now().timestamp_millis(),
+                    });
                     shell
                         .client
                         .local_store
-                        .set_draft(ChatId(chat_id as i64), Some(dr.clone()));
-                    shell
-                        .session_sync
-                        .last_saved_draft_by_chat
-                        .insert(chat_id, dr.text.clone());
-                    shell
-                        .session_sync
-                        .last_draft_text_by_chat
-                        .insert(chat_id, dr.text.clone());
-                    shell.sidebar.update(cx, |sb, _| sb.set_draft(chat_id, dr.text.clone()));
-                    let is_compose_isolated = shell.composer.read(cx).is_compose_isolated;
-                    if shell.stage.read(cx).active_chat_id == Some(chat_id)
-                        && !is_compose_isolated
-                        && !dr.text.is_empty()
-                        && shell.composer.read(cx).text().is_empty()
-                    {
-                        shell.composer.update(cx, |c, _| c.set_text(dr.text));
-                    }
+                        .set_draft(ChatId(chat_id as i64), dto);
                 }
                 let my_uid = shell.session_sync.user_id.unwrap_or(0);
                 let my_name = shell
@@ -1361,7 +1612,7 @@ impl AppShell {
             || lower.starts_with("computer:")
         {
             self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::RemoteComputer));
-            self.open_computer_workbench_live(cx);
+            self.open_remote_computers_hub(cx);
             return;
         }
 
@@ -1405,17 +1656,24 @@ impl AppShell {
             || lower.starts_with("/deny")
             || lower.starts_with("hermes:")
         {
-            let client = self.client.clone();
-            let Some(fence) = session_fence(self) else {
+            let Some(call_fence) = self.capture_client_fence() else {
                 return;
             };
+            let captured_panel = self.active_panel;
+            let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                if !call_fence.preflight_ui(&weak, app).await {
+                    return;
+                }
                 let toast = if lower.starts_with("approval:") {
                     let parts: Vec<&str> = trimmed.split(':').collect();
                     let approval_id = parts.get(1).copied().unwrap_or("");
                     let dec = parts.get(2).copied().unwrap_or("approve_once");
-                    match client
-                        .hermes_decide_approval(
+                    match call_fence
+                        .client
+                        .hermes
+                        .decide_approval(
+                            &call_fence.token,
                             approval_id,
                             &HermesApprovalDecisionRequest {
                                 decision: dec.to_string(),
@@ -1429,13 +1687,18 @@ impl AppShell {
                     }
                 } else {
                     let cmd_text = trimmed.strip_prefix("hermes:").unwrap_or(&trimmed).trim().to_string();
-                    match client
-                        .hermes_run_command(&HermesCommandRequest {
-                            command: cmd_text,
-                            session_id,
-                            chat_id: active_chat.map(|id| id as i64),
-                            bot_id,
-                        })
+                    match call_fence
+                        .client
+                        .hermes
+                        .run_command(
+                            &call_fence.token,
+                            &HermesCommandRequest {
+                                command: cmd_text,
+                                session_id,
+                                chat_id: active_chat.map(|id| id as i64),
+                                bot_id,
+                            },
+                        )
                         .await
                     {
                         Ok(resp) => resp
@@ -1452,14 +1715,34 @@ impl AppShell {
                     }
                 };
                 let _ = weak.update(app, |shell, cx| {
-                    if !fence_matches(&fence, shell) {
+                    if !call_fence.is_valid(shell) {
                         return;
                     }
                     let summary: String = toast.lines().next().unwrap_or(&toast).chars().take(120).collect();
-                    shell.show_toast(summary, 3000, cx);
+                    if let Some(cid) = active_chat {
+                        if shell.active_panel == ActiveWorkspacePanel::Chats
+                            && !shell.sidebar.read(cx).is_plus_menu_open
+                            && shell.stage.read(cx).active_chat_id == Some(cid)
+                        {
+                            shell.show_chat_toast(cid, summary, 3000, cx);
+                        }
+                    } else {
+                        let cur_active = resolve_active_target_chat_id(
+                            shell.stage.read(cx).active_chat_id,
+                            shell.sidebar.read(cx).active_chat_id,
+                        );
+                        if shell.active_panel == captured_panel
+                            && cur_active.is_none()
+                            && shell.sidebar.read(cx).is_plus_menu_open == captured_plus_open
+                        {
+                            shell.show_non_chat_toast(summary, 3000, cx);
+                        }
+                    }
                     shell.refresh_tasks_and_mcp(cx);
                     if let Some(cid) = active_chat {
-                        shell.load_historical_messages(cid, cx);
+                        if shell.stage.read(cx).active_chat_id == Some(cid) {
+                            shell.load_historical_messages(cid, cx);
+                        }
                     }
                     cx.notify();
                 });
@@ -1468,7 +1751,7 @@ impl AppShell {
             return;
         }
 
-        self.append_outgoing_text(trimmed, cx);
+        self.append_non_composer_outgoing_text(trimmed, cx);
     }
 
     /// Drains pending user intents queued by `ConversationStage` and routes each to shell actions or RPCs.
@@ -1509,7 +1792,15 @@ impl AppShell {
             )
         });
         if self.stage.read(cx).more_menu_open && self.sidebar.read(cx).is_plus_menu_open {
-            self.sidebar.update(cx, |sb, sb_cx| { sb.is_plus_menu_open = false; sb_cx.notify(); });
+            self.sidebar.update(cx, |sb, sb_cx| {
+                sb.cancel_compose_mode();
+                sb_cx.notify();
+            });
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
+                self.exit_compose_or_modal_isolation(true, cx);
+            }
         }
         if call_v || call_vid {
             if self.is_active_chat_bot(cx) {
@@ -1545,7 +1836,7 @@ impl AppShell {
             cx.observe(&overlay, |shell: &mut AppShell, ov: gpui::Entity<IvViewer>, cx: &mut Context<AppShell>| {
                 let (close, share) = ov.update(cx, |v, _| (v.should_close, v.pending_share_url.take()));
                 if let Some(u) = share {
-                    shell.append_outgoing_text(u, cx);
+                    shell.append_non_composer_outgoing_text(u, cx);
                 }
                 if close {
                     shell.overlays.iv_viewer_overlay = None;
@@ -1554,6 +1845,7 @@ impl AppShell {
             })
             .detach();
             self.overlays.iv_viewer_overlay = Some(overlay);
+            self.reconcile_chat_scoped_toasts(cx);
         }
         if let Some((mid, existing)) = edit_req {
             self.composer.update(cx, |c, _| c.begin_edit(mid, existing));
@@ -1575,8 +1867,23 @@ impl AppShell {
                 self.open_modal_dialog(tr_str(lang, "置顶消息", "Pin Message"), kind, 380.0, 240.0, cx);
             } else if let Some(cid) = active_chat {
                 self.stage.update(cx, |st, _| st.toggle_pin_message(mid));
-                let c = self.client.clone();
-                cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| { let _ = c.unpin_message(cid as i64, mid as i64).await; }).detach();
+                if let Some(fence) = self.capture_client_fence() {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let _ = fence
+                            .client
+                            .unpin_message_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                cid as i64,
+                                mid as i64,
+                            )
+                            .await;
+                    })
+                    .detach();
+                }
             }
         }
         if let Some(mid) = tr_id {
@@ -1587,8 +1894,23 @@ impl AppShell {
         }
         if let Some((mid, opt)) = poll_vote {
             self.stage.update(cx, |st, _| st.vote_poll(mid, opt));
-            let c = self.client.clone();
-            cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| { let _ = c.vote_poll(mid, vec![opt as u8]).await; }).detach();
+            if let Some(fence) = self.capture_client_fence() {
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let _ = fence
+                        .client
+                        .vote_poll_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            mid,
+                            vec![opt as u8],
+                        )
+                        .await;
+                })
+                .detach();
+            }
         }
         if let Some(cid) = active_chat {
             for (mid, emoji, is_added) in react_reqs {
@@ -1599,27 +1921,88 @@ impl AppShell {
             self.rtc_talk.audio_player.set_speed(spd as f64);
             if !play {
                 let _ = self.rtc_talk.audio_player.pause();
-            } else {
+            } else if let Some(fence) = self.capture_client_fence() {
                 let key = format!("voice_{mid}");
-                let c = self.client.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    if let Ok((_, bytes, _)) = c.download_media_range(&key, 0, None).await {
-                        let _ = weak.update(app, |s, _| { let _ = s.rtc_talk.audio_player.play_wav_bytes(key, &bytes); });
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    if let Ok((_, bytes, _)) = fence
+                        .client
+                        .download_media_range_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            &key,
+                            0,
+                            None,
+                        )
+                        .await
+                    {
+                        let _ = weak.update(app, |s, _| {
+                            if !fence.is_valid(s) {
+                                return;
+                            }
+                            let _ = s.rtc_talk.audio_player.play_wav_bytes(key, &bytes);
+                        });
                     }
                 })
                 .detach();
             }
         }
         if let Some((url, name)) = dl_req {
-            let c = self.client.clone();
-            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                let _ = c.download_media_range(&url, 0, None).await;
-                let _ = weak.update(app, |s, cx| {
-                    let pfx = tr_str(s.active_lang_id(), "已保存文件", "Saved");
-                    s.show_toast(format!("{pfx}: {name}"), 2500, cx);
-                });
-            })
-            .detach();
+            if let Some(fence) = self.capture_client_fence() {
+                let origin_chat = active_chat;
+                let captured_panel = self.active_panel;
+                let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let res = fence
+                        .client
+                        .download_media_range_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            &url,
+                            0,
+                            None,
+                        )
+                        .await;
+                    let _ = weak.update(app, |s, cx| {
+                        if !fence.is_valid(s) {
+                            return;
+                        }
+                        let cur_active = resolve_active_target_chat_id(
+                            s.stage.read(cx).active_chat_id,
+                            s.sidebar.read(cx).active_chat_id,
+                        );
+                        if s.active_panel != captured_panel
+                            || cur_active != origin_chat
+                            || s.sidebar.read(cx).is_plus_menu_open != captured_plus_open
+                        {
+                            return;
+                        }
+                        let msg = if res.is_ok() {
+                            let pfx = tr_str(s.active_lang_id(), "已保存文件", "Saved");
+                            format!("{pfx}: {name}")
+                        } else {
+                            let pfx = tr_str(s.active_lang_id(), "下载失败", "Download failed");
+                            format!("{pfx}: {name}")
+                        };
+                        if let Some(cid) = origin_chat {
+                            if s.active_panel == ActiveWorkspacePanel::Chats
+                                && !s.sidebar.read(cx).is_plus_menu_open
+                                && s.stage.read(cx).active_chat_id == Some(cid)
+                            {
+                                s.show_chat_toast(cid, msg, 2500, cx);
+                            }
+                        } else {
+                            s.show_non_chat_toast(msg, 2500, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
         }
         if let Some(paths) = drops {
             self.upload_and_send_paths(paths, cx);
@@ -1646,38 +2029,76 @@ impl AppShell {
             toggle_chat_dialog_flag(self, cid, true, lang, cx);
         }
         if let (Some(ttl_secs), Some(cid)) = (set_ttl_secs, active_chat) {
-            let prev_ttl = self.session_sync.rich_chats_by_id.get(&cid).map(|rc| rc.message_ttl_seconds).unwrap_or(0);
-            if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&cid) {
-                rc.message_ttl_seconds = ttl_secs;
-            }
-            let toast_msg = if ttl_secs == 0 {
-                tr_str(lang, "已关闭自动删除消息", "Auto-delete turned off")
-            } else if ttl_secs <= 86_400 {
-                tr_str(lang, "自动删除已设为 1 天", "Auto-delete set to 1 day")
-            } else if ttl_secs <= 604_800 {
-                tr_str(lang, "自动删除已设为 1 周", "Auto-delete set to 1 week")
-            } else {
-                tr_str(lang, "自动删除已设为 1 个月", "Auto-delete set to 1 month")
-            };
-            self.show_chat_toast(cid, toast_msg, 2200, cx);
-            let c = self.client.clone();
-            let lang_owned = lang.to_string();
-            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                if c.set_chat_ttl(cid as i64, ttl_secs).await.is_err() {
+            if let Some(fence) = self.capture_client_fence() {
+                let prev_ttl = self
+                    .session_sync
+                    .rich_chats_by_id
+                    .get(&cid)
+                    .map(|rc| rc.message_ttl_seconds)
+                    .unwrap_or(0);
+                if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&cid) {
+                    rc.message_ttl_seconds = ttl_secs;
+                }
+                let lang_owned = lang.to_string();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let res = fence
+                        .client
+                        .set_chat_ttl_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            cid as i64,
+                            ttl_secs,
+                        )
+                        .await;
                     let _ = weak.update(app, |s, cx| {
-                        if let Some(rc) = s.session_sync.rich_chats_by_id.get_mut(&cid) {
-                            rc.message_ttl_seconds = prev_ttl;
+                        if !fence.is_valid(s) {
+                            return;
                         }
-                        s.stage.update(cx, |st, st_cx| {
-                            if st.active_chat_id == Some(cid) { st.message_ttl_seconds = prev_ttl; st_cx.notify(); }
-                        });
-                        if s.stage.read(cx).active_chat_id == Some(cid) {
-                            s.show_chat_toast(cid, tr_str(&lang_owned, "自动删除设置保存失败", "Failed to update auto-delete timer"), 2500, cx);
+                        let can_show_chat_toast = s.active_panel == ActiveWorkspacePanel::Chats
+                            && !s.sidebar.read(cx).is_plus_menu_open
+                            && s.stage.read(cx).active_chat_id == Some(cid);
+                        match res {
+                            Ok(_) => {
+                                if can_show_chat_toast {
+                                    let toast_msg = if ttl_secs == 0 {
+                                        tr_str(&lang_owned, "已关闭自动删除消息", "Auto-delete turned off")
+                                    } else if ttl_secs <= 86_400 {
+                                        tr_str(&lang_owned, "自动删除已设为 1 天", "Auto-delete set to 1 day")
+                                    } else if ttl_secs <= 604_800 {
+                                        tr_str(&lang_owned, "自动删除已设为 1 周", "Auto-delete set to 1 week")
+                                    } else {
+                                        tr_str(&lang_owned, "自动删除已设为 1 个月", "Auto-delete set to 1 month")
+                                    };
+                                    s.show_chat_toast(cid, toast_msg, 2200, cx);
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(rc) = s.session_sync.rich_chats_by_id.get_mut(&cid) {
+                                    rc.message_ttl_seconds = prev_ttl;
+                                }
+                                s.stage.update(cx, |st, st_cx| {
+                                    if st.active_chat_id == Some(cid) {
+                                        st.message_ttl_seconds = prev_ttl;
+                                        st_cx.notify();
+                                    }
+                                });
+                                if can_show_chat_toast {
+                                    s.show_chat_toast(
+                                        cid,
+                                        tr_str(&lang_owned, "自动删除设置保存失败", "Failed to update auto-delete timer"),
+                                        2500,
+                                        cx,
+                                    );
+                                }
+                            }
                         }
                     });
-                }
-            })
-            .detach();
+                })
+                .detach();
+            }
         }
         if toggle_block_peer {
             let prev_blocked = self.stage.read(cx).is_peer_blocked;
@@ -1688,31 +2109,96 @@ impl AppShell {
                 if let Some(rc) = active_chat.and_then(|cid| self.session_sync.rich_chats_by_id.get_mut(&cid)) {
                     rc.is_blocked = blocked_now;
                 }
-                let toast_msg = if blocked_now { tr_str(lang, "已屏蔽该用户", "User blocked") } else { tr_str(lang, "已取消屏蔽该用户", "User unblocked") };
-                self.show_toast(toast_msg, 2200, cx);
-                let c = self.client.clone();
-                let lang_owned = lang.to_string();
-                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let res = if blocked_now { c.block_user(peer_uid).await.map(|_| ()) } else { c.unblock_user(peer_uid).await.map(|_| ()) };
-                    let _ = weak.update(app, |s, cx| {
-                        if res.is_ok() {
-                            s.refresh_settings_truth(cx);
-                        } else {
-                            if let Some(rc) = active_chat.and_then(|cid| s.session_sync.rich_chats_by_id.get_mut(&cid)) {
-                                rc.is_blocked = prev_blocked;
-                            }
-                            s.stage.update(cx, |st, st_cx| {
-                                if st.active_chat_id == active_chat { st.is_peer_blocked = prev_blocked; st_cx.notify(); }
-                            });
-                            if s.stage.read(cx).active_chat_id == active_chat {
-                                s.show_toast(tr_str(&lang_owned, "屏蔽状态同步失败", "Failed to update block status"), 2500, cx);
-                            }
+                if let Some(fence) = self.capture_client_fence() {
+                    let lang_owned = lang.to_string();
+                    let captured_panel = self.active_panel;
+                    let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
                         }
-                    });
-                })
-                .detach();
+                        let res = if blocked_now {
+                            fence
+                                .client
+                                .block_user_with_token(&fence.token, fence.client_epoch, peer_uid)
+                                .await
+                                .map(|_| ())
+                        } else {
+                            fence
+                                .client
+                                .unblock_user_with_token(&fence.token, fence.client_epoch, peer_uid)
+                                .await
+                                .map(|_| ())
+                        };
+                        let _ = weak.update(app, |s, cx| {
+                            if !fence.is_valid(s) {
+                                return;
+                            }
+                            if res.is_ok() {
+                                let toast_msg = if blocked_now {
+                                    tr_str(&lang_owned, "已屏蔽该用户", "User blocked")
+                                } else {
+                                    tr_str(&lang_owned, "已取消屏蔽该用户", "User unblocked")
+                                };
+                                if let Some(cid) = active_chat {
+                                    if s.active_panel == ActiveWorkspacePanel::Chats
+                                        && !s.sidebar.read(cx).is_plus_menu_open
+                                        && s.stage.read(cx).active_chat_id == Some(cid)
+                                    {
+                                        s.show_chat_toast(cid, toast_msg, 2200, cx);
+                                    }
+                                } else if s.active_panel == captured_panel
+                                    && s.sidebar.read(cx).is_plus_menu_open == captured_plus_open
+                                    && resolve_active_target_chat_id(
+                                        s.stage.read(cx).active_chat_id,
+                                        s.sidebar.read(cx).active_chat_id,
+                                    ).is_none()
+                                {
+                                    s.show_non_chat_toast(toast_msg, 2200, cx);
+                                }
+                                s.refresh_settings_truth(cx);
+                            } else {
+                                if let Some(rc) = active_chat.and_then(|cid| s.session_sync.rich_chats_by_id.get_mut(&cid)) {
+                                    rc.is_blocked = prev_blocked;
+                                }
+                                s.stage.update(cx, |st, st_cx| {
+                                    if st.active_chat_id == active_chat { st.is_peer_blocked = prev_blocked; st_cx.notify(); }
+                                });
+                                let cur_active = resolve_active_target_chat_id(
+                                    s.stage.read(cx).active_chat_id,
+                                    s.sidebar.read(cx).active_chat_id,
+                                );
+                                let msg = tr_str(&lang_owned, "屏蔽状态同步失败", "Failed to update block status");
+                                if let Some(cid) = active_chat {
+                                    if s.active_panel == ActiveWorkspacePanel::Chats
+                                        && !s.sidebar.read(cx).is_plus_menu_open
+                                        && s.stage.read(cx).active_chat_id == Some(cid)
+                                    {
+                                        s.show_chat_toast(cid, msg, 2500, cx);
+                                    }
+                                } else if s.active_panel == captured_panel
+                                    && cur_active.is_none()
+                                    && s.sidebar.read(cx).is_plus_menu_open == captured_plus_open
+                                {
+                                    s.show_non_chat_toast(msg, 2500, cx);
+                                }
+                            }
+                        });
+                    })
+                    .detach();
+                }
             } else {
-                self.show_toast(tr_str(lang, "群组或收藏夹不支持单用户屏蔽", "Blocking applies only to direct user peers"), 2200, cx);
+                let msg = tr_str(lang, "群组或收藏夹不支持单用户屏蔽", "Blocking applies only to direct user peers");
+                if let Some(cid) = active_chat {
+                    if self.active_panel == ActiveWorkspacePanel::Chats
+                        && !self.sidebar.read(cx).is_plus_menu_open
+                        && self.stage.read(cx).active_chat_id == Some(cid)
+                    {
+                        self.show_chat_toast(cid, msg, 2200, cx);
+                    }
+                } else {
+                    self.show_non_chat_toast(msg, 2200, cx);
+                }
             }
         }
         let leave_from_inspector = self.inspector.update(cx, |insp, _| insp.take_pending_leave_chat());
@@ -1744,12 +2230,18 @@ impl AppShell {
                         ToolApprovalDecision::AllowAlways => "approve_permanent",
                         ToolApprovalDecision::Deny => "denied",
                     };
-                    if let Some(fence) = session_fence(self) {
-                        let client = self.client.clone();
+                    if let Some(fence) = self.capture_client_fence() {
                         let lang_owned = lang.to_string();
+                        let captured_panel = self.active_panel;
                         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                            let res = client
-                                .hermes_decide_approval(
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
+                            }
+                            let res = fence
+                                .client
+                                .hermes
+                                .decide_approval(
+                                    &fence.token,
                                     &approval_id,
                                     &HermesApprovalDecisionRequest {
                                         decision: dec_str.to_string(),
@@ -1758,7 +2250,7 @@ impl AppShell {
                                 )
                                 .await;
                             let _ = weak.update(app, |shell, cx| {
-                                if !fence_matches(&fence, shell) {
+                                if !fence.is_valid(shell) {
                                     return;
                                 }
                                 let msg = match res {
@@ -1773,7 +2265,18 @@ impl AppShell {
                                         e
                                     ),
                                 };
-                                shell.show_toast(msg, 2400, cx);
+                                if let Some(cid) = active_chat {
+                                    if shell.active_panel == ActiveWorkspacePanel::Chats
+                                        && !shell.sidebar.read(cx).is_plus_menu_open
+                                        && shell.stage.read(cx).active_chat_id == Some(cid)
+                                    {
+                                        shell.show_chat_toast(cid, msg, 2400, cx);
+                                    }
+                                } else if shell.active_panel == captured_panel
+                                    && shell.stage.read(cx).active_chat_id.is_none()
+                                {
+                                    shell.show_non_chat_toast(msg, 2400, cx);
+                                }
                                 shell.refresh_tasks_and_mcp(cx);
                             });
                         })

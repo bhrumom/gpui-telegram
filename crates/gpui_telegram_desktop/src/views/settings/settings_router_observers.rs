@@ -916,8 +916,18 @@ impl SettingsRouter {
              sc: Entity<SettingsComputersSections>,
              cx: &mut Context<SettingsRouter>| {
                 if let Some(ev) = sc.update(cx, |s, _| s.take_event()) {
-                    cx.emit(SettingsRouterEvent::Computers(ev));
-                    cx.notify();
+                    match ev {
+                        crate::views::settings::sections::SettingsComputersEvent::CloseRequested => {
+                            router.close(cx);
+                        }
+                        crate::views::settings::sections::SettingsComputersEvent::BackToSettings => {
+                            router.navigate_back(cx);
+                        }
+                        other => {
+                            cx.emit(SettingsRouterEvent::Computers(other));
+                            cx.notify();
+                        }
+                    }
                 }
             },
         )

@@ -43,6 +43,10 @@ use crate::views::settings::sections::settings_ai_providers::{
 pub struct ShellMagpieLocalState {
     /// Cached client-discovered local subscription bundles (secrets redacted in `Debug`).
     pub discovered_items: Vec<ClientSubscriptionSyncItem>,
+    /// Latest live `MagpieStateDto` fetched from Settings/Magpie backend for cross-view sync.
+    pub latest_state: Option<MagpieStateDto>,
+    /// Latest server-fetched subscription DTOs for cross-view model catalog sync.
+    pub server_subscriptions: Vec<SubscriptionAccountDto>,
     /// Auth generation for which automatic startup bootstrap has already been dispatched.
     pub bootstrapped_auth_generation: Option<u64>,
     /// Generation counter for cancelling stale legacy keep-alive loops.
@@ -56,6 +60,16 @@ pub struct ShellMagpieLocalState {
 impl ShellMagpieLocalState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn reset_on_logout(&mut self) {
+        self.discovered_items.clear();
+        self.latest_state = None;
+        self.server_subscriptions.clear();
+        self.bootstrapped_auth_generation = None;
+        self.legacy_keepalive_generation = self.legacy_keepalive_generation.wrapping_add(1);
+        self.active_legacy_subscription_id = None;
+        self.active_legacy_model = None;
     }
 
     pub fn cached_dtos(&self, active_provider: Option<&str>) -> Vec<SubscriptionAccountDto> {
@@ -76,6 +90,9 @@ pub fn resolve_local_home_dir() -> Option<PathBuf> {
 
 /// Runs read-only discovery of all local AI subscriptions on the user's desktop machine.
 pub fn discover_local_subscriptions_for_server(server_base_url: &str) -> Vec<ClientSubscriptionSyncItem> {
+    if std::env::var_os("GPUI_OFFLINE_TEST").is_some() {
+        return Vec::new();
+    }
     let Some(home) = resolve_local_home_dir() else {
         return Vec::new();
     };
@@ -346,6 +363,18 @@ pub struct LocalSubscriptionSyncOutcome {
     pub warning: Option<String>,
 }
 
+fn check_pinned_epoch(
+    pinned: Option<(&TelegramClient, u64)>,
+    token: &str,
+) -> Result<(), String> {
+    if let Some((client, epoch)) = pinned {
+        client
+            .ensure_pinned_session(epoch, token)
+            .map_err(|e| format!("Session changed during subscription operation: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Syncs client-discovered local subscriptions to the backend server with automatic fallback
 /// for older v1.3.0 servers that do not expose `/api/v1/hermes/magpie/subscriptions/sync`.
 pub async fn sync_local_subscriptions_to_server(
@@ -355,9 +384,54 @@ pub async fn sync_local_subscriptions_to_server(
     items: Vec<ClientSubscriptionSyncItem>,
     auto_activate: bool,
 ) -> LocalSubscriptionSyncOutcome {
+    let items_fallback = items.clone();
+    sync_local_subscriptions_to_server_inner(client, None, base_url, token, items, auto_activate)
+        .await
+        .unwrap_or_else(|e| LocalSubscriptionSyncOutcome {
+            state: None,
+            local_items: items_fallback,
+            used_legacy_fallback: false,
+            auto_activated_id: None,
+            auto_activated_label: None,
+            auto_activated_model: None,
+            warning: Some(e),
+        })
+}
+
+/// Session-epoch-pinned variant of [`sync_local_subscriptions_to_server`] enforcing
+/// `ensure_pinned_session` before every HTTP request.
+pub async fn sync_local_subscriptions_to_server_pinned(
+    client: &Arc<TelegramClient>,
+    expected_epoch: u64,
+    base_url: &str,
+    token: &str,
+    items: Vec<ClientSubscriptionSyncItem>,
+    auto_activate: bool,
+) -> Result<LocalSubscriptionSyncOutcome, String> {
+    sync_local_subscriptions_to_server_inner(
+        client,
+        Some(expected_epoch),
+        base_url,
+        token,
+        items,
+        auto_activate,
+    )
+    .await
+}
+
+async fn sync_local_subscriptions_to_server_inner(
+    client: &Arc<TelegramClient>,
+    pinned_epoch: Option<u64>,
+    base_url: &str,
+    token: &str,
+    items: Vec<ClientSubscriptionSyncItem>,
+    auto_activate: bool,
+) -> Result<LocalSubscriptionSyncOutcome, String> {
+    let pinned = pinned_epoch.map(|e| (client.as_ref(), e));
     if items.is_empty() {
+        check_pinned_epoch(pinned, token)?;
         let state = client.hermes.magpie_state(token).await.ok();
-        return LocalSubscriptionSyncOutcome {
+        return Ok(LocalSubscriptionSyncOutcome {
             state,
             local_items: items,
             used_legacy_fallback: false,
@@ -365,7 +439,7 @@ pub async fn sync_local_subscriptions_to_server(
             auto_activated_label: None,
             auto_activated_model: None,
             warning: None,
-        };
+        });
     }
 
     let http = reqwest::Client::new();
@@ -378,6 +452,7 @@ pub async fn sync_local_subscriptions_to_server(
         auto_activate,
     };
 
+    check_pinned_epoch(pinned, token)?;
     if let Ok(resp) = http
         .post(&sync_url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
@@ -389,7 +464,10 @@ pub async fn sync_local_subscriptions_to_server(
             if let Ok(parsed) = resp.json::<NativeSyncResponse>().await {
                 let state = match parsed.state {
                     Some(st) => Some(st),
-                    None => client.hermes.magpie_state(token).await.ok(),
+                    None => {
+                        check_pinned_epoch(pinned, token)?;
+                        client.hermes.magpie_state(token).await.ok()
+                    }
                 };
                 let (act_id, act_label, act_model) = state
                     .as_ref()
@@ -407,7 +485,7 @@ pub async fn sync_local_subscriptions_to_server(
                     })
                     .unwrap_or((None, None, None));
                 let _ = parsed.synced_count;
-                return LocalSubscriptionSyncOutcome {
+                return Ok(LocalSubscriptionSyncOutcome {
                     state,
                     local_items: items,
                     used_legacy_fallback: false,
@@ -415,13 +493,14 @@ pub async fn sync_local_subscriptions_to_server(
                     auto_activated_label: act_label,
                     auto_activated_model: act_model,
                     warning: None,
-                };
+                });
             }
         }
     }
 
     // Legacy v1.3.0 server fallback: inspect current state and, if no real provider is active yet,
     // refresh the best local subscription's OAuth token locally and push via `/magpie/providers`.
+    check_pinned_epoch(pinned, token)?;
     let current_state = client.hermes.magpie_state(token).await.ok();
     let needs_bootstrap = current_state.as_ref().is_none_or(|st| {
         st.needs_provider_selection
@@ -433,13 +512,15 @@ pub async fn sync_local_subscriptions_to_server(
         let candidates = pick_ordered_bootstrap_candidates(&items);
         let mut last_err: Option<String> = None;
         for cand in candidates {
+            check_pinned_epoch(pinned, token)?;
             match resolve_fresh_bearer_token(&http, &cand).await {
                 Ok(bearer) => {
+                    check_pinned_epoch(pinned, token)?;
                     let req = build_legacy_save_provider_request(&cand, bearer, None, true);
                     let chosen_model = req.default_model.clone();
                     match client.hermes.magpie_save_provider(token, &req).await {
                         Ok(saved) => {
-                            return LocalSubscriptionSyncOutcome {
+                            return Ok(LocalSubscriptionSyncOutcome {
                                 state: Some(saved.state),
                                 local_items: items,
                                 used_legacy_fallback: true,
@@ -447,7 +528,7 @@ pub async fn sync_local_subscriptions_to_server(
                                 auto_activated_label: Some(cand.account.label.clone()),
                                 auto_activated_model: chosen_model,
                                 warning: None,
-                            };
+                            });
                         }
                         Err(e) => {
                             last_err = Some(format!("save provider '{}': {e}", cand.account.id));
@@ -459,7 +540,7 @@ pub async fn sync_local_subscriptions_to_server(
                 }
             }
         }
-        return LocalSubscriptionSyncOutcome {
+        return Ok(LocalSubscriptionSyncOutcome {
             state: current_state,
             local_items: items,
             used_legacy_fallback: true,
@@ -467,10 +548,10 @@ pub async fn sync_local_subscriptions_to_server(
             auto_activated_label: None,
             auto_activated_model: None,
             warning: last_err,
-        };
+        });
     }
 
-    LocalSubscriptionSyncOutcome {
+    Ok(LocalSubscriptionSyncOutcome {
         state: current_state,
         local_items: items,
         used_legacy_fallback: true,
@@ -478,7 +559,7 @@ pub async fn sync_local_subscriptions_to_server(
         auto_activated_label: None,
         auto_activated_model: None,
         warning: None,
-    }
+    })
 }
 
 fn url_encode_segment(input: &str) -> String {
@@ -512,6 +593,50 @@ pub async fn activate_subscription_with_local_fallback(
     model: Option<&str>,
     local_items: &[ClientSubscriptionSyncItem],
 ) -> Result<SubscriptionActivationOutcome, String> {
+    activate_subscription_with_local_fallback_inner(
+        client,
+        None,
+        base_url,
+        token,
+        sub_id,
+        model,
+        local_items,
+    )
+    .await
+}
+
+/// Session-epoch-pinned variant of [`activate_subscription_with_local_fallback`].
+pub async fn activate_subscription_with_local_fallback_pinned(
+    client: &Arc<TelegramClient>,
+    expected_epoch: u64,
+    base_url: &str,
+    token: &str,
+    sub_id: &str,
+    model: Option<&str>,
+    local_items: &[ClientSubscriptionSyncItem],
+) -> Result<SubscriptionActivationOutcome, String> {
+    activate_subscription_with_local_fallback_inner(
+        client,
+        Some(expected_epoch),
+        base_url,
+        token,
+        sub_id,
+        model,
+        local_items,
+    )
+    .await
+}
+
+async fn activate_subscription_with_local_fallback_inner(
+    client: &Arc<TelegramClient>,
+    pinned_epoch: Option<u64>,
+    base_url: &str,
+    token: &str,
+    sub_id: &str,
+    model: Option<&str>,
+    local_items: &[ClientSubscriptionSyncItem],
+) -> Result<SubscriptionActivationOutcome, String> {
+    let pinned = pinned_epoch.map(|e| (client.as_ref(), e));
     let http = reqwest::Client::new();
     let act_url = format!(
         "{}/api/v1/hermes/magpie/subscriptions/{}/activate",
@@ -522,6 +647,7 @@ pub async fn activate_subscription_with_local_fallback(
         model: model.map(str::to_string),
     };
 
+    check_pinned_epoch(pinned, token)?;
     if let Ok(resp) = http
         .post(&act_url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
@@ -531,6 +657,7 @@ pub async fn activate_subscription_with_local_fallback(
     {
         if resp.status().is_success() {
             if let Ok(parsed) = resp.json::<SubscriptionActivateResponse>().await {
+                check_pinned_epoch(pinned, token)?;
                 let state = client.hermes.magpie_state(token).await.ok();
                 return Ok(SubscriptionActivationOutcome {
                     active_provider_id: parsed.active_provider_id,
@@ -543,6 +670,7 @@ pub async fn activate_subscription_with_local_fallback(
     }
 
     // Legacy fallback: find the local item (or rescan), refresh OAuth token locally, and save provider
+    check_pinned_epoch(pinned, token)?;
     let matched = local_items
         .iter()
         .find(|i| i.account.id == sub_id)
@@ -554,7 +682,9 @@ pub async fn activate_subscription_with_local_fallback(
         })
         .ok_or_else(|| format!("Subscription '{sub_id}' not found on server or local machine"))?;
 
+    check_pinned_epoch(pinned, token)?;
     let bearer = resolve_fresh_bearer_token(&http, &matched).await?;
+    check_pinned_epoch(pinned, token)?;
     let req = build_legacy_save_provider_request(&matched, bearer, model, true);
     let chosen_model = req.default_model.clone().unwrap_or_default();
     let saved = client
@@ -592,6 +722,28 @@ pub async fn fetch_live_models_catalog(
     token: &str,
     force_refresh: bool,
 ) -> Result<CompactModelsCatalog, String> {
+    fetch_live_models_catalog_inner(None, base_url, token, force_refresh).await
+}
+
+/// Session-epoch-pinned variant of [`fetch_live_models_catalog`].
+pub async fn fetch_live_models_catalog_pinned(
+    client: &TelegramClient,
+    expected_epoch: u64,
+    base_url: &str,
+    token: &str,
+    force_refresh: bool,
+) -> Result<CompactModelsCatalog, String> {
+    fetch_live_models_catalog_inner(Some((client, expected_epoch)), base_url, token, force_refresh)
+        .await
+}
+
+async fn fetch_live_models_catalog_inner(
+    pinned: Option<(&TelegramClient, u64)>,
+    base_url: &str,
+    token: &str,
+    force_refresh: bool,
+) -> Result<CompactModelsCatalog, String> {
+    check_pinned_epoch(pinned, token)?;
     let http = reqwest::Client::new();
     let cache_path = local_models_dev_cache_path();
 
@@ -627,6 +779,10 @@ pub async fn fetch_live_models_catalog(
     }
 
     // 2. Fallback: direct models.dev fetch with local 6h disk cache
+    if std::env::var_os("GPUI_OFFLINE_TEST").is_some() {
+        return Err("models.dev catalog fallback skipped in GPUI_OFFLINE_TEST".to_string());
+    }
+    check_pinned_epoch(pinned, token)?;
     fetch_models_dev_catalog(&http, cache_path.as_deref(), force_refresh).await
 }
 
@@ -660,9 +816,37 @@ pub async fn fetch_models_for_subscription_live(
     token: &str,
     item: &ClientSubscriptionSyncItem,
 ) -> Result<LiveModelsFetchOutcome, String> {
+    fetch_models_for_subscription_live_inner(None, base_url, token, item).await
+}
+
+/// Session-epoch-pinned variant of [`fetch_models_for_subscription_live`].
+pub async fn fetch_models_for_subscription_live_pinned(
+    client: &TelegramClient,
+    expected_epoch: u64,
+    base_url: &str,
+    token: &str,
+    item: &ClientSubscriptionSyncItem,
+) -> Result<LiveModelsFetchOutcome, String> {
+    fetch_models_for_subscription_live_inner(
+        Some((client, expected_epoch)),
+        base_url,
+        token,
+        item,
+    )
+    .await
+}
+
+async fn fetch_models_for_subscription_live_inner(
+    pinned: Option<(&TelegramClient, u64)>,
+    base_url: &str,
+    token: &str,
+    item: &ClientSubscriptionSyncItem,
+) -> Result<LiveModelsFetchOutcome, String> {
+    check_pinned_epoch(pinned, token)?;
     let http = reqwest::Client::new();
     let bearer_opt = resolve_fresh_bearer_token(&http, item).await.ok();
 
+    check_pinned_epoch(pinned, token)?;
     let upstream_models = fetch_live_upstream_models(
         &http,
         item.account.kind,
@@ -675,11 +859,12 @@ pub async fn fetch_models_for_subscription_live(
     .await
     .unwrap_or_default();
 
-    let catalog_models = fetch_live_models_catalog(base_url, token, true)
+    let catalog_models = fetch_live_models_catalog_inner(pinned, base_url, token, true)
         .await
         .map(|cat| cat.models_for_subscription(item.account.kind))
         .unwrap_or_default();
 
+    check_pinned_epoch(pinned, token)?;
     let merged = merge_discovered_models(&[&upstream_models, &catalog_models, &item.available_models]);
     if merged.is_empty() {
         return Err("未能从上游接口或 models.dev 获取到可用模型".to_string());
@@ -708,13 +893,49 @@ pub async fn refresh_legacy_provider_token_once(
     sub_id: &str,
     model_override: Option<&str>,
 ) -> Result<(), String> {
+    refresh_legacy_provider_token_once_inner(client, None, base_url, token, sub_id, model_override)
+        .await
+}
+
+/// Session-epoch-pinned variant of [`refresh_legacy_provider_token_once`].
+pub async fn refresh_legacy_provider_token_once_pinned(
+    client: &Arc<TelegramClient>,
+    expected_epoch: u64,
+    base_url: &str,
+    token: &str,
+    sub_id: &str,
+    model_override: Option<&str>,
+) -> Result<(), String> {
+    refresh_legacy_provider_token_once_inner(
+        client,
+        Some(expected_epoch),
+        base_url,
+        token,
+        sub_id,
+        model_override,
+    )
+    .await
+}
+
+async fn refresh_legacy_provider_token_once_inner(
+    client: &Arc<TelegramClient>,
+    pinned_epoch: Option<u64>,
+    base_url: &str,
+    token: &str,
+    sub_id: &str,
+    model_override: Option<&str>,
+) -> Result<(), String> {
+    let pinned = pinned_epoch.map(|e| (client.as_ref(), e));
+    check_pinned_epoch(pinned, token)?;
     let items = discover_local_subscriptions_for_server(base_url);
+    check_pinned_epoch(pinned, token)?;
     let matched = items
         .into_iter()
         .find(|i| i.account.id == sub_id)
         .ok_or_else(|| format!("Local subscription '{sub_id}' no longer present"))?;
     let http = reqwest::Client::new();
     let bearer = resolve_fresh_bearer_token(&http, &matched).await?;
+    check_pinned_epoch(pinned, token)?;
     let req = build_legacy_save_provider_request(&matched, bearer, model_override, false);
     client
         .hermes

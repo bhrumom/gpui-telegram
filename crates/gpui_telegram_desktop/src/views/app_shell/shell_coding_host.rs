@@ -1,5 +1,6 @@
 //! Local Coding Agent Host runtime lifecycle, CLI provider probing, and WS command bridge.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{AsyncApp, Context, WeakEntity};
@@ -55,16 +56,33 @@ pub fn should_accept_coding_host_command(
     true
 }
 
+/// Returns the per-account local coding host directory under `preferences_dir`.
+pub fn user_coding_host_dir(preferences_dir: &Path, user_id: u64) -> PathBuf {
+    preferences_dir
+        .join("coding_hosts")
+        .join(format!("user_{user_id}"))
+}
+
 impl AppShell {
     /// Initializes or reuses the account- and device-bound `LocalCodingHostRuntime`.
     pub fn ensure_coding_host_runtime(
         &mut self,
         _cx: &mut Context<Self>,
     ) -> Option<Arc<LocalCodingHostRuntime>> {
-        let user_id = self.session_sync.user_id?;
+        if !self.is_authenticated {
+            return None;
+        }
+        let user_id = self.session_sync.user_id.filter(|&uid| uid != 0)?;
         let device_id = self.client.device_id();
+        let host_dir = user_coding_host_dir(&self.preferences_dir, user_id);
+        let db_path = host_dir.join("coding_host_state.db");
+        let worktrees_root = host_dir.join("coding-worktrees");
         if let Some(existing) = self.coding_host.runtime.as_ref() {
-            if existing.owner_user_id() == user_id && existing.device_id() == device_id {
+            if existing.owner_user_id() == user_id
+                && existing.device_id() == device_id
+                && existing.db_path() == db_path
+                && existing.worktrees_root() == worktrees_root
+            {
                 return Some(Arc::clone(existing));
             }
         }
@@ -76,8 +94,8 @@ impl AppShell {
         let cfg = CodingHostRuntimeConfig {
             owner_user_id: user_id,
             device_id,
-            db_path: self.preferences_dir.join("coding_host_state.db"),
-            worktrees_root: self.preferences_dir.join("coding-worktrees"),
+            db_path,
+            worktrees_root,
         };
         match LocalCodingHostRuntime::new(cfg) {
             Ok(rt) => {
@@ -94,7 +112,11 @@ impl AppShell {
 
     /// Probes installed local coding CLI providers off the UI thread and updates any open bot modal.
     pub fn refresh_detected_coding_providers(&mut self, cx: &mut Context<Self>) {
+        if !self.is_authenticated || self.session_sync.user_id.is_none() {
+            return;
+        }
         let auth_gen = self.session_sync.auth_generation;
+        let owner_user_id = self.session_sync.user_id;
         let client = self.client.clone();
         let runtime_handle = client.runtime().handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -107,6 +129,7 @@ impl AppShell {
             let _ = weak.update(app, |shell, cx| {
                 if !shell.is_authenticated
                     || shell.session_sync.auth_generation != auth_gen
+                    || shell.session_sync.user_id != owner_user_id
                     || !Arc::ptr_eq(&shell.client, &client)
                 {
                     return;
@@ -135,6 +158,8 @@ impl AppShell {
         }
         let _ = self.ensure_coding_host_runtime(cx);
         let auth_gen = self.session_sync.auth_generation;
+        let owner_user_id = self.session_sync.user_id;
+        let expected_token = self.session_sync.session_token.clone();
         let client = self.client.clone();
         let runtime_handle = client.runtime().handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -157,6 +182,8 @@ impl AppShell {
             let _ = weak.update(app, |shell, cx| {
                 if !shell.is_authenticated
                     || shell.session_sync.auth_generation != auth_gen
+                    || shell.session_sync.user_id != owner_user_id
+                    || shell.session_sync.session_token.as_deref() != expected_token.as_deref()
                     || !Arc::ptr_eq(&shell.client, &client)
                 {
                     return;
@@ -207,8 +234,17 @@ impl AppShell {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CodingHostEvent>();
         let tokio_handle = self.client.runtime().handle().clone();
         let forward_client = self.client.clone();
+        let owner_user_id = coding_command_owner_user_id(&cmd);
+        let expected_token = self.session_sync.session_token.clone();
+        let runtime_for_fwd = Arc::clone(&runtime);
         tokio_handle.spawn(async move {
             while let Some(ev) = rx.recv().await {
+                if runtime_for_fwd.is_shutting_down()
+                    || forward_client.current_user_id() != Some(owner_user_id)
+                    || forward_client.token().as_deref() != expected_token.as_deref()
+                {
+                    break;
+                }
                 if let Err(err) = forward_client.send_coding_host_event(ev) {
                     eprintln!("[CodingHost] Failed forwarding CodingHostEvent over WS: {err}");
                 }

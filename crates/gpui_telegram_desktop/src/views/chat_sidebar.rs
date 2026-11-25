@@ -115,6 +115,8 @@ pub struct ComposeDraftState {
     pub custom_group_title: String,
     pub pending_creation: Option<PendingComposeCreation>,
     pub creation_error: Option<ComposeCreationError>,
+    #[serde(default)]
+    pub compose_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,7 +452,7 @@ impl ChatSidebar {
         self.hovered_rail_dialog_id = None;
         self.is_account_popover_open = false;
         if collapsed {
-            self.exit_compose_mode();
+            self.cancel_compose_mode();
             self.context_menu = None;
             self.is_resizing = false;
         }
@@ -528,7 +530,7 @@ impl ChatSidebar {
     }
 
     pub fn open_contacts_modal(&mut self) {
-        self.exit_compose_mode();
+        self.cancel_compose_mode();
         self.is_account_popover_open = false;
         self.search_focused = false;
         self.is_contacts_modal_open = true;
@@ -550,7 +552,7 @@ impl ChatSidebar {
     pub fn focus_search(&mut self) {
         self.expand_from_user_if_collapsed();
         self.search_focused = true;
-        self.exit_compose_mode();
+        self.cancel_compose_mode();
         self.is_account_popover_open = false;
         self.search_request_seq = self.search_request_seq.wrapping_add(1);
     }
@@ -616,7 +618,9 @@ impl ChatSidebar {
             self.compose_draft.highlighted_index = 0;
             self.compose_draft.menu_open = true;
             self.compose_draft.custom_group_title.clear();
+            self.compose_draft.pending_creation = None;
             self.compose_draft.creation_error = None;
+            self.compose_draft.compose_epoch = self.compose_draft.compose_epoch.wrapping_add(1);
             return;
         }
         self.is_plus_menu_open = !self.is_plus_menu_open;
@@ -627,14 +631,11 @@ impl ChatSidebar {
             self.compose_draft.highlighted_index = 0;
             self.compose_draft.menu_open = true;
             self.compose_draft.custom_group_title.clear();
+            self.compose_draft.pending_creation = None;
             self.compose_draft.creation_error = None;
+            self.compose_draft.compose_epoch = self.compose_draft.compose_epoch.wrapping_add(1);
         } else {
-            self.compose_draft.is_group_mode = false;
-            self.compose_draft.selected_recipients.clear();
-            self.compose_draft.highlighted_index = 0;
-            self.compose_draft.menu_open = false;
-            self.compose_draft.custom_group_title.clear();
-            self.compose_draft.creation_error = None;
+            self.cancel_compose_mode();
         }
     }
 
@@ -648,6 +649,14 @@ impl ChatSidebar {
         self.compose_draft.menu_open = false;
         self.compose_draft.custom_group_title.clear();
         self.compose_draft.creation_error = None;
+        self.compose_draft.compose_epoch = self.compose_draft.compose_epoch.wrapping_add(1);
+    }
+
+    /// Cancels `+` compose mode and drops any in-flight `pending_creation` nonce so late
+    /// `create_chat` responses never hijack the active chat or reopen compose mode.
+    pub fn cancel_compose_mode(&mut self) {
+        self.exit_compose_mode();
+        self.compose_draft.pending_creation = None;
     }
 
     pub fn select_folder(&mut self, folder: impl Into<String>) {
@@ -666,7 +675,7 @@ impl ChatSidebar {
     pub fn select_dialog_from_user(&mut self, id: u64) {
         self.select_dialog(id);
         if self.active_chat_id == Some(id) {
-            self.exit_compose_mode();
+            self.cancel_compose_mode();
             self.selection_revision = self.selection_revision.wrapping_add(1);
         }
     }

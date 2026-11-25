@@ -17,7 +17,6 @@ use crate::views::app_shell::shell_actions::peer_avatar_color;
 use crate::views::app_shell::shell_state::reconcile_stage_message_list;
 use crate::views::app_shell::shell_truth::{
     derive_initials, format_authoritative_timestamp, validate_selected_send_target,
-    SessionRequestFence,
 };
 use crate::views::chat_sidebar::DialogDeliveryStatus;
 use crate::views::shell::AppShell;
@@ -26,8 +25,25 @@ use crate::views::stage::cards::{
 };
 
 impl AppShell {
-    /// Appends an optimistic outgoing text message to the stage/sidebar and dispatches `send_message_rich`.
+    /// Appends an optimistic outgoing text message to the stage/sidebar and dispatches `send_message_rich`,
+    /// clearing any active composer draft for the chat.
     pub fn append_outgoing_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.append_outgoing_text_inner(text, true, cx);
+    }
+
+    /// Appends an optimistic outgoing text message triggered outside the composer text input
+    /// (e.g. ReplyKeyboard button, sticker/dice/GIF, inspector/profile bot command, `/start`),
+    /// preserving any unsent user draft in the composer and local/server draft stores.
+    pub fn append_non_composer_outgoing_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.append_outgoing_text_inner(text, false, cx);
+    }
+
+    fn append_outgoing_text_inner(
+        &mut self,
+        text: String,
+        clear_composer_draft: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.try_handle_local_vault_command(&text, cx) {
             return;
         }
@@ -47,7 +63,7 @@ impl AppShell {
         };
         let active_chat_id = target.chat_id;
         let my_user_id = target.user_id;
-        let Some(token) = self.session_sync.session_token.clone() else {
+        let Some(fence) = self.capture_client_fence() else {
             return;
         };
 
@@ -65,12 +81,6 @@ impl AppShell {
         let my_initials = derive_initials(&my_name);
         let my_color = peer_avatar_color(my_user_id);
         let now_ts = format_authoritative_timestamp(Some(chrono::Utc::now().timestamp_millis()));
-        let fence = SessionRequestFence {
-            auth_generation: self.session_sync.auth_generation,
-            request_generation: 0,
-            token: token.clone(),
-            user_id: my_user_id,
-        };
 
         self.stage.update(cx, |st, st_cx| {
             st.add_message(MessageItemModel {
@@ -111,11 +121,19 @@ impl AppShell {
             sb_cx.notify();
         });
 
-        // Clear any pending draft for this chat upon sending
-        self.session_sync.last_draft_text_by_chat.remove(&active_chat_id);
-        self.session_sync.last_saved_draft_by_chat.remove(&active_chat_id);
-        self.session_sync.draft_debounce_gen = self.session_sync.draft_debounce_gen.wrapping_add(1);
-        self.sidebar.update(cx, |sb, _| sb.set_draft(active_chat_id, String::new()));
+        // Clear any pending draft for this chat upon sending from the composer
+        if clear_composer_draft {
+            self.session_sync
+                .bump_draft_op_gen_and_clear_in_flight(active_chat_id);
+            self.session_sync
+                .last_draft_text_by_chat
+                .insert(active_chat_id, String::new());
+            self.session_sync.last_saved_draft_by_chat.remove(&active_chat_id);
+            self.session_sync.draft_debounce_gen =
+                self.session_sync.draft_debounce_gen.wrapping_add(1);
+            self.sidebar
+                .update(cx, |sb, _| sb.set_draft(active_chat_id, String::new()));
+        }
 
         let send_as_peer_id = self
             .session_sync
@@ -127,8 +145,6 @@ impl AppShell {
         let run_local_fabushi = fabushi_target.is_some() && self.can_run_local_fabushi_turn(cx);
 
         {
-            let client = self.client.clone();
-            let draft_token = token.clone();
             let http_req = RichSendMessageRequest {
                 chat_id: active_chat_id as i64,
                 text: Some(text.clone()),
@@ -149,38 +165,50 @@ impl AppShell {
                 skip_server_bot_reply: run_local_fabushi,
             };
             let sent_msg_id = msg_id;
-            let http_fence = fence.clone();
 
             cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
-                let res = client.send_message_durable(http_req).await;
-                let clear_draft = gpui_telegram_proto::contracts::DraftDto {
-                    chat_id: active_chat_id as i64,
-                    text: String::new(),
-                    entities: Vec::new(),
-                    reply_to_msg_id: None,
-                    topic_id: None,
-                    date_ms: chrono::Utc::now().timestamp_millis(),
-                };
-                client
-                    .local_store
-                    .set_draft(gpui_telegram_core::types::ChatId(active_chat_id as i64), None);
-                let _ = client
-                    .http_client
-                    .save_draft(&draft_token, active_chat_id as i64, &clear_draft)
+                if !fence.preflight_ui(&weak_shell, app).await {
+                    return;
+                }
+                let res = fence
+                    .client
+                    .send_message_durable_with_token(&fence.token, fence.client_epoch, http_req)
                     .await;
+                if clear_composer_draft
+                    && res.is_ok()
+                    && fence.preflight_ui(&weak_shell, app).await
+                {
+                    let clear_draft = gpui_telegram_proto::contracts::DraftDto {
+                        chat_id: active_chat_id as i64,
+                        text: String::new(),
+                        entities: Vec::new(),
+                        reply_to_msg_id: None,
+                        topic_id: None,
+                        date_ms: chrono::Utc::now().timestamp_millis(),
+                    };
+                    let _ = fence
+                        .client
+                        .save_draft_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            active_chat_id as i64,
+                            &clear_draft,
+                        )
+                        .await;
+                }
                 let _ = weak_shell.update(app, |shell, cx| {
-                    if !http_fence.matches(
-                        shell.is_authenticated,
-                        shell.session_sync.auth_generation,
-                        0,
-                        shell.session_sync.session_token.as_deref(),
-                        shell.session_sync.user_id,
-                    ) {
+                    if !fence.is_valid(shell) {
                         return;
                     }
                     shell.session_sync.pending_outgoing_nonces.remove(&sent_msg_id);
                     match res {
                         Ok(resp) => {
+                            if clear_composer_draft {
+                                shell
+                                    .client
+                                    .local_store
+                                    .set_draft(ChatId(active_chat_id as i64), None);
+                            }
                             let server_id = u64::try_from(resp.message_id).unwrap_or(0);
                             if server_id > 0 {
                                 shell
