@@ -35,6 +35,72 @@ impl AppShell {
             && self.tasks_workspace.read(cx).active_input != StudioInputTarget::None
     }
 
+    /// Returns `true` when an authenticated shell modal, overlay, drawer, or popover visually
+    /// occludes `BrowserWorkspace`.
+    pub fn has_browser_visual_occlusion_overlay(&self, cx: &App) -> bool {
+        let sb_occluded = {
+            let sb = self.sidebar.read(cx);
+            sb.is_contacts_modal_open
+                || sb.active_creation_modal.is_some()
+                || sb.is_account_popover_open
+        };
+        sb_occluded
+            || self.main_menu_drawer.read(cx).is_open
+            || self.modal_container.read(cx).is_modal_active()
+            || self.overlays.is_passcode_locked
+            || self.rtc_talk.talk_mode_overlay.is_some()
+            || self.overlays.media_viewer_overlay.is_some()
+            || self.overlays.iv_viewer_overlay.is_some()
+            || self.overlays.computer_overlay.is_some()
+            || self.miniapps.pending_miniapp_confirm.is_some()
+            || self.miniapps.miniapp_tos_modal_open
+            || self
+                .miniapps
+                .create_bot_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self
+                .miniapps
+                .bot_profile_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || (self
+                .miniapps
+                .miniapp_overlay
+                .as_ref()
+                .is_some_and(|ov| ov.read(cx).is_open)
+                && !self.miniapps.is_miniapp_minimized)
+    }
+
+    /// Returns `true` when any shell modal/drawer/overlay/popover/lockscreen/search blocks
+    /// keyboard or IME routing to `BrowserWorkspace` inputs and `CdpViewportSurface`.
+    pub fn has_browser_shell_blocker(&self, cx: &App) -> bool {
+        self.sidebar.read(cx).search_focused || self.has_browser_visual_occlusion_overlay(cx)
+    }
+
+    /// Returns `true` when `BrowserWorkspace` is active and has an active text input target
+    /// without an occluding shell overlay/modal/popover/lockscreen.
+    pub fn is_browser_workspace_input_active(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::Browser
+            && !self.has_browser_visual_occlusion_overlay(cx)
+            && self.browser_workspace.as_ref().is_some_and(|bw| {
+                let bw_read = bw.read(cx);
+                !bw_read.is_externally_occluded() && bw_read.has_focused_text_input()
+            })
+    }
+
+    /// Returns `true` when `BrowserWorkspace`'s `CdpViewportSurface` holds GPUI focus
+    /// and no shell modal/overlay/search/browser text input is active.
+    pub fn is_browser_cdp_viewport_focused(&self, window: &Window, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::Browser
+            && !self.has_browser_shell_blocker(cx)
+            && !self.is_browser_workspace_input_active(cx)
+            && self.browser_workspace.as_ref().is_some_and(|bw| {
+                let bw_read = bw.read(cx);
+                !bw_read.is_externally_occluded() && bw_read.is_cdp_viewport_focused(window, cx)
+            })
+    }
+
     /// Returns `true` when the `ComputerWorkbench` overlay's Remote Terminal or interactive PTY is focused.
     pub fn is_computer_workbench_input_active(&self, cx: &App) -> bool {
         self.active_computer_terminal_overlay(cx).is_some()
@@ -98,6 +164,7 @@ impl AppShell {
             || self.miniapps.create_bot_box.as_ref().is_some_and(|b| b.read(cx).is_visible)
             || self.miniapps.miniapp_overlay.as_ref().is_some_and(|w| w.read(cx).has_focused_text_input())
             || self.is_studio_input_active(cx)
+            || self.is_browser_workspace_input_active(cx)
             || self.is_settings_input_active(cx)
             || self.is_inspector_bot_input_active(cx)
             || self.is_bot_card_input_active(cx)
@@ -106,6 +173,7 @@ impl AppShell {
     }
 
     fn take_ime_preedit_commit(&mut self, cx: &mut Context<Self>) -> bool {
+        self.bot_browser.ime_preedit_input_gen = None;
         if let Some(p) = self.ime.ime_preedit.take() {
             self.insert_committed_text(&p, cx);
             true
@@ -175,6 +243,14 @@ impl AppShell {
             );
         }
         if self.is_studio_input_active(cx) { return (String::new(), pre()); }
+        if self.is_browser_workspace_input_active(cx) {
+            let txt = self
+                .browser_workspace
+                .as_ref()
+                .map(|bw| bw.read(cx).active_input_text())
+                .unwrap_or_default();
+            return (txt, pre());
+        }
         if self.is_apple_compose_input_active(cx) {
             if sb.compose_title_focused {
                 return (sb.compose_draft.custom_group_title.clone(), pre());
@@ -195,6 +271,7 @@ impl AppShell {
     /// Clears all text in the currently focused input field.
     pub fn clear_active_field(&mut self, cx: &mut Context<Self>) {
         self.ime.clear_preedit();
+        self.bot_browser.ime_preedit_input_gen = None;
         if !self.is_authenticated {
             self.auth_wizard.update(cx, |w, wcx| w.clear_active_field(wcx));
             cx.notify();
@@ -234,6 +311,10 @@ impl AppShell {
             });
         } else if self.is_settings_input_active(cx) {
             self.settings_router.update(cx, |sr, scx| { sr.clear_active_input(scx); });
+        } else if self.is_browser_workspace_input_active(cx) {
+            if let Some(bw) = self.browser_workspace.clone() {
+                bw.update(cx, |w, wcx| w.clear_active_input(wcx));
+            }
         } else if self.is_inspector_bot_input_active(cx) {
             self.inspector.update(cx, |ins, icx| { let _ = ins.clear_active_bot_input(icx); });
         } else if self.is_bot_card_input_active(cx) {
@@ -259,8 +340,19 @@ impl AppShell {
     /// Inserts sanitized committed/pasted text into the currently focused shell input target.
     pub fn insert_committed_text(&mut self, raw_text: &str, cx: &mut Context<Self>) {
         self.ime.clear_preedit();
+        self.bot_browser.ime_preedit_input_gen = None;
+        if raw_text.is_empty() {
+            cx.notify();
+            return;
+        }
         let clean = sanitize_paste_text(raw_text, false);
-        if clean.is_empty() { cx.notify(); return; }
+        if clean.is_empty()
+            && !self.is_inspector_bot_input_active(cx)
+            && !self.is_browser_workspace_input_active(cx)
+        {
+            cx.notify();
+            return;
+        }
         if !self.is_authenticated {
             self.auth_wizard.update(cx, |w, wcx| w.insert_committed_text(&clean, wcx));
             cx.notify();
@@ -335,6 +427,14 @@ impl AppShell {
                 st.insert_bot_card_text(&clean);
                 stcx.notify();
             });
+        } else if self.is_studio_input_active(cx) {
+            self.tasks_workspace.update(cx, |w, wcx| { w.apply_text_key_to_active_input("", Some(&clean)); wcx.notify(); });
+        } else if self.is_browser_workspace_input_active(cx) {
+            if let Some(bw) = self.browser_workspace.clone() {
+                bw.update(cx, |w, wcx| {
+                    w.insert_text_to_active_input(raw_text, wcx);
+                });
+            }
         } else if self.sidebar.read(cx).search_focused {
             self.sidebar.update(cx, |sb, scx| {
                 let mut q = sb.search_query.clone();
@@ -348,8 +448,6 @@ impl AppShell {
                 st.recompute_search_matches();
                 stcx.notify();
             });
-        } else if self.is_studio_input_active(cx) {
-            self.tasks_workspace.update(cx, |w, wcx| { w.apply_text_key_to_active_input("", Some(&clean)); wcx.notify(); });
         } else if !self.should_hide_composer(cx) {
             self.composer.update(cx, |c, ccx| {
                 c.is_input_focused = true;
@@ -363,6 +461,7 @@ impl AppShell {
 
     fn dismiss_pre_auth_escape(&mut self, is_shift: bool, cx: &mut Context<Self>) -> bool {
         if self.ime.ime_preedit.take().is_some() {
+            self.bot_browser.ime_preedit_input_gen = None;
             if self.is_bot_card_input_active(cx) {
                 self.stage.update(cx, |st, stcx| {
                     st.bot_assist_ime_preedit = None;
@@ -384,6 +483,30 @@ impl AppShell {
             if ok { ccx.notify(); }
             ok
         }) {
+            return true;
+        }
+        if self.miniapps.miniapp_tos_modal_open {
+            self.miniapps.miniapp_tos_modal_open = false;
+            self.ime.clear_preedit();
+            self.bot_browser.ime_preedit_input_gen = None;
+            return true;
+        }
+        if self.miniapps.bot_profile_box.as_ref().is_some_and(|b| b.read(cx).is_visible) {
+            if let Some(ref ent) = self.miniapps.bot_profile_box {
+                ent.update(cx, |b, b_cx| {
+                    b.close();
+                    b_cx.notify();
+                });
+            }
+            self.miniapps.bot_profile_box = None;
+            self.ime.clear_preedit();
+            self.bot_browser.ime_preedit_input_gen = None;
+            return true;
+        }
+        if self.miniapps.pending_miniapp_confirm.is_some() {
+            self.miniapps.pending_miniapp_confirm = None;
+            self.ime.clear_preedit();
+            self.bot_browser.ime_preedit_input_gen = None;
             return true;
         }
         if self.miniapps.create_bot_box.as_ref().is_some_and(|b| b.read(cx).is_visible) {
@@ -471,6 +594,8 @@ impl AppShell {
         }
         if self.sidebar.read(cx).is_account_popover_open || self.sidebar.read(cx).is_plus_menu_open {
             let was_plus_open = self.sidebar.read(cx).is_plus_menu_open;
+            self.ime.clear_preedit();
+            self.bot_browser.ime_preedit_input_gen = None;
             self.sidebar.update(cx, |s, scx| {
                 s.is_account_popover_open = false;
                 s.exit_compose_mode();
@@ -497,6 +622,21 @@ impl AppShell {
                 return true;
             }
             self.navigate_settings_back(cx);
+            return true;
+        }
+        if self.active_panel == ActiveWorkspacePanel::Browser {
+            if self.is_browser_workspace_input_active(cx) {
+                if let Some(bw) = self.browser_workspace.clone() {
+                    let handled = bw.update(cx, |w, wcx| w.handle_non_char_key_input("escape", false, wcx));
+                    if handled {
+                        return true;
+                    }
+                }
+            }
+            self.hide_browser_native_webview(cx);
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.nav_rail.update(cx, |r, _| { r.set_active_destination(NavDestination::Chats); });
             return true;
         }
         if matches!(self.active_panel, ActiveWorkspacePanel::Calls | ActiveWorkspacePanel::TaskCenter | ActiveWorkspacePanel::McpTools) {
@@ -575,6 +715,15 @@ impl AppShell {
         if self.dismiss_pre_auth_escape(is_shift, cx)
             || (self.is_authenticated && self.dismiss_post_auth_escape(cx))
         {
+            if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Browser {
+                let occluded = self.has_browser_visual_occlusion_overlay(cx);
+                if let Some(ref bw) = self.browser_workspace {
+                    let needs_sync = bw.read(cx).is_externally_occluded() != occluded;
+                    if needs_sync {
+                        bw.update(cx, |w, wcx| w.set_occluded(occluded, wcx));
+                    }
+                }
+            }
             cx.notify();
             return true;
         }
@@ -982,6 +1131,25 @@ impl AppShell {
             cx.notify();
             return true;
         }
+        if self.is_browser_workspace_input_active(cx) {
+            if key == "backspace" && self.ime.ime_preedit.take().is_some() {
+                cx.notify();
+                return true;
+            }
+            if key == "enter" && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed()) {
+                cx.notify();
+                return true;
+            }
+            if key == "tab" {
+                self.ime.clear_preedit();
+            }
+            if let Some(bw) = self.browser_workspace.clone() {
+                if bw.update(cx, |w, wcx| w.handle_non_char_key_input(key, is_alt, wcx)) {
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
         if self.active_panel == ActiveWorkspacePanel::Chats
             && !self.sidebar.read(cx).search_focused
             && self.sidebar.read(cx).active_creation_modal.is_none()
@@ -993,6 +1161,11 @@ impl AppShell {
             return true;
         }
         if key == "tab" {
+            if self.active_panel == ActiveWorkspacePanel::Browser
+                && !self.sidebar.read(cx).search_focused
+            {
+                return true;
+            }
             let currently_search = self.sidebar.read(cx).search_focused;
             self.sidebar.update(cx, |sb, scx| {
                 if currently_search { sb.exit_search(); } else { sb.focus_search(); }
@@ -1094,6 +1267,7 @@ impl AppShell {
         let non_composer = self.is_non_composer_text_capturing(cx);
         if new_text.is_empty() {
             self.ime.clear_preedit();
+            self.bot_browser.ime_preedit_input_gen = None;
             if let Some(ov) = self.active_computer_terminal_overlay(cx) {
                 ov.update(cx, |w, wcx| {
                     if let Some(c) = w.terminal_input.as_ref() {
@@ -1125,6 +1299,13 @@ impl AppShell {
         } else if non_composer {
             self.ime.ime_preedit = Some(new_text.to_string());
             self.ime.just_committed_ime = false;
+            self.bot_browser.ime_preedit_input_gen = if self.is_browser_workspace_input_active(cx) {
+                self.browser_workspace
+                    .as_ref()
+                    .map(|bw| bw.read(cx).active_input_generation())
+            } else {
+                None
+            };
             if let Some(ov) = self.active_computer_terminal_overlay(cx) {
                 ov.update(cx, |w, wcx| {
                     if w.is_interactive_pty_focused(wcx) {
@@ -1263,6 +1444,12 @@ impl EntityInputHandler for AppShell {
                 + px(sb_width + 82.0 + chip_offset + (char_count as f32 * 8.0).min(260.0));
             let caret_y = element_bounds.origin.y + px(if title_focused { 66.0 } else { 22.0 });
             return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))));
+        }
+        if self.is_browser_workspace_input_active(cx) {
+            let caret_x = element_bounds.origin.x
+                + px(360.0)
+                + px((char_count as f32 * 7.5).min(360.0));
+            return Some(Bounds::new(point(caret_x, element_bounds.origin.y + px(28.0)), size(px(2.0), px(18.0))));
         }
         if self.stage.read(cx).search_open {
             let caret_x = element_bounds.origin.x + px(360.0) + px((char_count as f32 * 8.0).min(280.0));

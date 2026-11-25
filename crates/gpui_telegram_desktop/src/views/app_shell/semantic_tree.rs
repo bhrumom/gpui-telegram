@@ -34,6 +34,7 @@ fn active_panel_label(panel: ActiveWorkspacePanel) -> String {
         ActiveWorkspacePanel::Calls => "Calls".to_string(),
         ActiveWorkspacePanel::TaskCenter => "TaskCenter".to_string(),
         ActiveWorkspacePanel::McpTools => "McpTools".to_string(),
+        ActiveWorkspacePanel::Browser => "Browser".to_string(),
         ActiveWorkspacePanel::Settings => "Settings".to_string(),
     }
 }
@@ -47,6 +48,7 @@ fn nav_dest_label(dest: NavDestination) -> String {
         NavDestination::McpTools => "McpTools".to_string(),
         NavDestination::TalkMode => "TalkMode".to_string(),
         NavDestination::RemoteComputer => "RemoteComputer".to_string(),
+        NavDestination::Browser => "Browser".to_string(),
         NavDestination::SavedMessages => "SavedMessages".to_string(),
         NavDestination::Settings => "Settings".to_string(),
     }

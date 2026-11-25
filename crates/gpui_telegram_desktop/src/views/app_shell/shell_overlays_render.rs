@@ -92,6 +92,7 @@ fn format_live_miniapp_telemetry(
 
 impl AppShell {
     fn close_workspace_modal_to_chats(&mut self, cx: &mut Context<Self>) {
+        self.leave_browser_panel_if_active(cx);
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
         self.nav_rail.update(cx, |r, _| {
@@ -634,6 +635,7 @@ impl AppShell {
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
+                                                this.occlude_browser_for_overlay(cx);
                                                 this.miniapps.is_miniapp_minimized = false;
                                                 if let Some(ref ov) = this.miniapps.miniapp_overlay {
                                                     ov.update(cx, |w, wcx| {
@@ -739,6 +741,7 @@ impl AppShell {
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
+                                            this.occlude_browser_for_overlay(cx);
                                             this.miniapps.is_miniapp_minimized = false;
                                             if let Some(ref ov) = this.miniapps.miniapp_overlay {
                                                 ov.update(cx, |w, wcx| {
@@ -913,6 +916,7 @@ impl AppShell {
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
+                                                    this.occlude_browser_for_overlay(cx);
                                                     this.miniapps.miniapp_tos_modal_open = true;
                                                     cx.notify();
                                                 }),
@@ -2186,6 +2190,7 @@ impl AppShell {
                             .text_color(rgb(pal.text_primary))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.bot_browser.first_creation_banner_open = false;
+                                this.leave_browser_panel_if_active(cx);
                                 this.active_panel = ActiveWorkspacePanel::Settings;
                                 this.settings_router.update(cx, |r, rcx| {
                                     r.ensure_privacy(rcx);

@@ -345,6 +345,7 @@ impl AppShell {
             .or(chat_opt)
             .unwrap_or(777000);
 
+        self.occlude_browser_for_overlay(cx);
         self.clear_non_call_overlays();
         self.main_menu_drawer.update(cx, |d, _| d.close());
         self.rtc_talk.talk_coordinator = TalkCoordinator::new();
@@ -655,6 +656,7 @@ impl AppShell {
         };
         let lang = self.active_lang_id();
         let pal = self.theme_state.palette;
+        self.occlude_browser_for_overlay(cx);
         self.clear_non_call_overlays();
         self.reset_talk_session_flags();
         self.main_menu_drawer.update(cx, |d, _| d.close());
@@ -805,6 +807,7 @@ impl AppShell {
         let Some((my_id, fence)) = self.build_session_fence() else {
             return;
         };
+        self.occlude_browser_for_overlay(cx);
         self.rtc_talk.talk_mode_overlay = None;
         self.rtc_talk.active_talk_session_is_ai = false;
         self.overlays.media_viewer_overlay = None;

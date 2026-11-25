@@ -3,6 +3,7 @@
 pub mod app_shell;
 pub mod auth;
 pub mod boxes;
+pub mod browser;
 pub mod call_overlay;
 pub mod canonical_composer;
 pub mod chat_sidebar;
@@ -27,6 +28,9 @@ pub mod stage;
 pub mod tdesktop_theme;
 
 pub use app_shell::ModalContainer;
+pub use browser::{
+    BrowserEngineKind, BrowserViewportStats, BrowserWorkspace, CdpViewportSurface,
+};
 pub use call_overlay::{CallOverlay, TalkModeState, TranscriptEntry};
 pub use canonical_composer::CanonicalComposer;
 pub use chat_sidebar::ChatSidebar;

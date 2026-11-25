@@ -18,6 +18,7 @@ gpui_telegram_server = { workspace = true }
 gpui_telegram_client = { workspace = true }
 gpui_telegram_desktop = { workspace = true }
 gpui_telegram_test_harness = { workspace = true }
+bot-browser = { workspace = true }
 fabushi_miniapp = { workspace = true, features = ["server"] }
 gpui = { workspace = true }
 
@@ -72,3 +73,23 @@ path = "tests/tier5_adversarial_hardening.rs"
 [[test]]
 name = "fabushi_external_miniapp_e2e"
 path = "tests/fabushi_external_miniapp_e2e.rs"
+
+[[test]]
+name = "browser_infra_self_test"
+path = "tests/browser_infra_self_test.rs"
+
+[[test]]
+name = "browser_tier1_features"
+path = "tests/browser_tier1_features.rs"
+
+[[test]]
+name = "browser_tier2_boundaries"
+path = "tests/browser_tier2_boundaries.rs"
+
+[[test]]
+name = "browser_tier3_cross_feature"
+path = "tests/browser_tier3_cross_feature.rs"
+
+[[test]]
+name = "browser_tier4_scenarios"
+path = "tests/browser_tier4_scenarios.rs"

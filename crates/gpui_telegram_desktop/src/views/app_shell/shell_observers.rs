@@ -228,15 +228,22 @@ impl AppShell {
     }
 
     fn observe_drawer_and_modal_entities(&self, cx: &mut Context<Self>) {
-        cx.observe(&self.main_menu_drawer, |shell, drawer, cx| {
-            let (cmd, bf, ma, upd) = drawer.update(cx, |d, _| {
+        let mut prev_drawer_open = false;
+        cx.observe(&self.main_menu_drawer, move |shell, drawer, cx| {
+            let (is_open, cmd, bf, ma, upd) = drawer.update(cx, |d, _| {
                 (
+                    d.is_open,
                     d.take_command(),
                     d.take_botfather_open(),
                     d.take_miniapps_center(),
                     d.take_trigger_update(),
                 )
             });
+            if !prev_drawer_open && is_open {
+                shell.occlude_browser_for_overlay(cx);
+                cx.notify();
+            }
+            prev_drawer_open = is_open;
             if let Some(cmd) = cmd {
                 shell.handle_main_menu_command(cmd, cx);
             }
@@ -306,21 +313,10 @@ impl AppShell {
                     )
                 });
             if menu_req {
-                shell.sidebar.update(cx, |s, s_cx| {
-                    s.is_account_popover_open = !s.is_account_popover_open;
-                    s.exit_compose_mode();
-                    s_cx.notify();
-                });
-                if shell.composer.read(cx).is_compose_isolated
-                    && !shell.is_compose_or_creation_modal_active(cx)
-                {
-                    shell.exit_compose_or_modal_isolation(true, cx);
-                } else {
-                    shell.sync_compose_state_to_composer(true, cx);
-                }
-                cx.notify();
+                shell.toggle_account_popover(cx);
             }
             if archive_req {
+                shell.leave_browser_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
                 shell.sidebar.update(cx, |sb, _| sb.is_archived_expanded = !sb.is_archived_expanded);
                 cx.notify();
@@ -331,6 +327,7 @@ impl AppShell {
                 shell.sidebar.update(cx, |_, sb_cx| sb_cx.notify());
             }
             if let Some(folder_title) = folder_req {
+                shell.leave_browser_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
                 shell.sidebar.update(cx, |sb, sb_cx| {
                     sb.select_folder(folder_title);
@@ -423,8 +420,8 @@ impl AppShell {
                 shell_dirty = true;
             }
             if open_menu {
+                shell.toggle_account_popover(cx);
                 shell.sidebar.update(cx, |s, s_cx| {
-                    s.is_account_popover_open = !s.is_account_popover_open;
                     s.is_plus_menu_open = false;
                     s.compose_recipient_query.clear();
                     s_cx.notify();
@@ -443,6 +440,26 @@ impl AppShell {
                     s.compose_recipient_query.clone(),
                 )
             };
+            if !prev_overlay_open && cur_overlay_open {
+                shell.occlude_browser_for_overlay(cx);
+                shell_dirty = true;
+            }
+            if !prev_search_focused && search_focused && shell.active_panel == ActiveWorkspacePanel::Browser {
+                shell.ime.clear_preedit();
+                shell.bot_browser.ime_preedit_input_gen = None;
+                if let Some(ref bw) = shell.browser_workspace {
+                    bw.update(cx, |w, wcx| {
+                        if w.active_input != crate::views::browser::ActiveBrowserInput::None {
+                            w.set_active_input(
+                                crate::views::browser::ActiveBrowserInput::None,
+                                None,
+                                wcx,
+                            );
+                        }
+                    });
+                }
+                shell_dirty = true;
+            }
             if sb_popup && shell.stage.read(cx).more_menu_open {
                 shell.stage.update(cx, |st, st_cx| {
                     st.more_menu_open = false;
@@ -486,6 +503,7 @@ impl AppShell {
             ) {
                 selection_changed = true;
                 if let Some(d) = selected_dialog {
+                    shell.leave_browser_panel_if_active(cx);
                     shell.active_panel = ActiveWorkspacePanel::Chats;
                     shell.last_handled_nav_dest = Some(NavDestination::Chats);
                     shell.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Chats));

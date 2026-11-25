@@ -1416,6 +1416,29 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
                 .put(routes::bots_miniapps::miniapps_storage_put)
                 .delete(routes::bots_miniapps::miniapps_storage_delete),
         )
+        // --- Automation Script App Store Routes ---
+        .route(
+            "/api/v1/automation-apps",
+            get(routes::automation_apps::automation_apps_list)
+                .post(routes::automation_apps::automation_apps_publish),
+        )
+        .route(
+            "/api/v1/automation-apps/installed",
+            get(routes::automation_apps::automation_apps_installed),
+        )
+        .route(
+            "/api/v1/automation-apps/{app_id}",
+            get(routes::automation_apps::automation_app_get),
+        )
+        .route(
+            "/api/v1/automation-apps/{app_id}/install",
+            post(routes::automation_apps::automation_app_install)
+                .delete(routes::automation_apps::automation_app_uninstall),
+        )
+        .route(
+            "/api/v1/automation-apps/{app_id}/runs",
+            post(routes::automation_apps::automation_app_record_run),
+        )
         .route("/api/v1/bots", post(routes::bots_miniapps::bots_create))
         .route("/api/v1/bots/my", get(routes::bots_miniapps::bots_my))
         .route(

@@ -970,9 +970,11 @@ dependencies = [
 name = "bot-browser"
 version = "1.6.9"
 dependencies = [
+ "aes",
  "argon2",
  "async-trait",
  "base64 0.22.1",
+ "cbc",
  "chacha20poly1305",
  "chrono",
  "data-encoding",
@@ -985,6 +987,7 @@ dependencies = [
  "image",
  "keyring",
  "parking_lot",
+ "pbkdf2",
  "reqwest",
  "rusqlite",
  "serde",
@@ -2144,6 +2147,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bot-browser",
  "chacha20poly1305",
  "chrono",
  "ed25519-dalek",
@@ -3566,6 +3570,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bot-browser",
  "chacha20poly1305",
  "chrono",
  "crossbeam-queue",

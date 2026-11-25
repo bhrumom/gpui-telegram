@@ -485,6 +485,7 @@ impl AppShell {
     fn handle_tray_action(&mut self, action_id: &str, cx: &mut Context<Self>) {
         match action_id {
             tray_action_ids::SHOW_FABUSHI | tray_action_ids::OPEN_ALIAS => {
+                self.leave_browser_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Settings;
                 self.navigate_settings_to(SettingsSectionType::Computers, cx);
                 cx.activate(true);
@@ -940,6 +941,7 @@ impl AppShell {
         })
         .detach();
 
+        self.occlude_browser_for_overlay(cx);
         self.overlays.computer_overlay = Some(overlay.clone());
         if !defer_initial_capture {
             self.handle_workbench_command(node_id, WorkbenchCommand::RefreshScreen, overlay, cx);
@@ -1690,6 +1692,7 @@ impl AppShell {
             });
             scx.notify();
         });
+        self.leave_browser_panel_if_active(cx);
         self.active_panel = ActiveWorkspacePanel::Settings;
         self.refresh_computers(cx);
         cx.notify();

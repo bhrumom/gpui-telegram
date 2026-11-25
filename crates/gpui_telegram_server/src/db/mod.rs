@@ -2,6 +2,7 @@ pub mod acp_store;
 pub mod agentic_store;
 pub mod analytics_store;
 pub mod auth_store;
+pub mod automation_app_store;
 pub mod chat_extras;
 pub mod computer_store;
 pub mod e2ee_store;

@@ -1853,6 +1853,7 @@ impl AppShell {
                         }
                         o
                     });
+                    self.occlude_browser_for_overlay(cx);
                     self.rtc_talk.talk_mode_overlay = Some(ov);
                 }
                 self.sync_calls_history(cx);

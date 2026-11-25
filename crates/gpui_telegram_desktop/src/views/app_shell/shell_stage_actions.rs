@@ -246,6 +246,7 @@ fn attach_media_viewer_overlay(
     lang: &'static str,
     cx: &mut Context<AppShell>,
 ) {
+    shell.occlude_browser_for_overlay(cx);
     viewer.apply_theme(shell.theme_state.palette, lang);
     let overlay = cx.new(|_| viewer);
     cx.observe(
@@ -326,6 +327,7 @@ impl AppShell {
             inspector: &self.inspector,
             modal_container: &self.modal_container,
             tasks_workspace: &self.tasks_workspace,
+            browser_workspace: self.browser_workspace.as_ref(),
             talk_mode_overlay: self.rtc_talk.talk_mode_overlay.as_ref(),
             computer_overlay: self.overlays.computer_overlay.as_ref(),
             media_viewer_overlay: self.overlays.media_viewer_overlay.as_ref(),
@@ -1537,6 +1539,7 @@ impl AppShell {
             attach_media_viewer_overlay(self, MediaViewer::new(url, is_vid), lang, cx);
         }
         if let Some((url, title)) = iv_url {
+            self.occlude_browser_for_overlay(cx);
             let pal = self.theme_state.palette;
             let overlay = cx.new(|_| { let mut iv = IvViewer::new(url, title); iv.apply_theme(pal, lang); iv });
             cx.observe(&overlay, |shell: &mut AppShell, ov: gpui::Entity<IvViewer>, cx: &mut Context<AppShell>| {

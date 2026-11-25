@@ -43,8 +43,9 @@ use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
 };
 use crate::views::{
-    CallOverlay, CanonicalComposer, ChatSidebar, ComputerWorkbench, ContextInspector,
-    ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer, NavRail,
+    BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, ComputerWorkbench,
+    ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer,
+    NavRail,
 };
 use crate::window::WindowSubsystemRuntime;
 
@@ -55,6 +56,7 @@ pub enum ActiveWorkspacePanel {
     Calls,
     TaskCenter,
     McpTools,
+    Browser,
     Settings,
 }
 
@@ -73,7 +75,7 @@ pub fn toggled_language_code(current: &str) -> &'static str {
     if current.starts_with("zh") { "en-US" } else { "zh-CN" }
 }
 
-/// Maps `Cmd+1..8` keystrokes to primary `NavDestination` tabs when authenticated.
+/// Maps `Cmd+1..9` keystrokes to primary `NavDestination` tabs when authenticated.
 pub fn nav_destination_for_shortcut_digit(key: &str) -> Option<NavDestination> {
     match key {
         "1" => Some(NavDestination::Chats),
@@ -84,6 +86,7 @@ pub fn nav_destination_for_shortcut_digit(key: &str) -> Option<NavDestination> {
         "6" => Some(NavDestination::TalkMode),
         "7" => Some(NavDestination::SavedMessages),
         "8" => Some(NavDestination::Settings),
+        "9" => Some(NavDestination::Browser),
         _ => None,
     }
 }
@@ -110,6 +113,7 @@ pub struct AppShell {
     pub modal_container: Entity<ModalContainer>,
     pub main_menu_drawer: Entity<MainMenuDrawer>,
     pub tasks_workspace: Entity<GlobalTasksWorkspace>,
+    pub browser_workspace: Option<Entity<BrowserWorkspace>>,
     pub auth_wizard: Entity<AuthWizardView>,
     pub settings_router: Entity<SettingsRouter>,
     pub client: Arc<TelegramClient>,
@@ -223,6 +227,7 @@ impl AppShell {
             modal_container,
             main_menu_drawer,
             tasks_workspace,
+            browser_workspace: None,
             auth_wizard,
             settings_router,
             client: client.clone(),
@@ -418,6 +423,16 @@ impl AppShell {
         self.ensure_coding_host_runtime(cx);
         self.announce_coding_host_to_server(cx);
         if prev_user_id != Some(auth.user_id) {
+            if let Some(bw) = self.browser_workspace.take() {
+                bw.update(cx, |w, wcx| {
+                    w.set_workspace_visible(false, wcx);
+                    w.set_occluded(true, wcx);
+                });
+            }
+            if self.active_panel == ActiveWorkspacePanel::Browser {
+                self.active_panel = ActiveWorkspacePanel::Chats;
+                self.last_handled_nav_dest = Some(NavDestination::Chats);
+            }
             self.bot_browser.reset_on_logout();
             self.miniapps.reset();
             self.computers.reset_on_logout();
@@ -461,6 +476,12 @@ impl AppShell {
         if let Some(coding_rt) = self.coding_host.reset_on_logout() {
             client.runtime().spawn(async move {
                 coding_rt.shutdown().await;
+            });
+        }
+        if let Some(bw) = self.browser_workspace.take() {
+            bw.update(cx, |w, wcx| {
+                w.set_workspace_visible(false, wcx);
+                w.set_occluded(true, wcx);
             });
         }
         self.bot_browser.reset_on_logout();
@@ -544,6 +565,7 @@ impl AppShell {
     }
 
     pub fn show_talk_mode(&mut self, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
         let peer = self.stage.read(cx).chat_title.clone();
         let overlay = cx.new(|_| CallOverlay::new(peer));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_talk_mode, cx);
@@ -556,6 +578,7 @@ impl AppShell {
     }
 
     pub fn show_remote_computer(&mut self, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
         let overlay = cx.new(|_| ComputerWorkbench::new("Dev-Workstation-01".to_string()));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_remote_computer, cx);
         self.overlays.computer_overlay = Some(overlay);
@@ -567,6 +590,7 @@ impl AppShell {
     }
 
     pub fn show_media_viewer(&mut self, url: impl Into<String>, is_video: bool, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
         let overlay = cx.new(|_| MediaViewer::new(url.into(), is_video));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, |shell, _| shell.hide_media_viewer(), cx);
         self.overlays.media_viewer_overlay = Some(overlay);
@@ -581,6 +605,7 @@ impl AppShell {
 
     /// Opens or navigates within the lazy `SettingsRouter` modal and dismisses conflicting popovers.
     pub fn navigate_settings_to(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
+        self.leave_browser_panel_if_active(cx);
         self.sidebar.update(cx, |sb, sb_cx| {
             sb.exit_compose_mode();
             sb.is_account_popover_open = false;
@@ -677,6 +702,7 @@ impl AppShell {
         self.overlays.passcode_unlock_input.clear();
         self.overlays.passcode_unlock_error = None;
         self.ime.clear_preedit();
+        self.occlude_browser_for_overlay(cx);
         self.settings_router.update(cx, |sr, scx| {
             if let Some(ref lp) = sr.settings_local_passcode {
                 lp.update(scx, |lp, lpcx| {
@@ -819,6 +845,7 @@ impl AppShell {
             || create_bot_modal_open
             || creation_dialog_open
             || show_bot_start_bar
+            || self.active_panel == ActiveWorkspacePanel::Browser
     }
 
     /// Flushes the active chat's unsent draft and isolates `CanonicalComposer` for `+` / creation.
@@ -1258,9 +1285,94 @@ impl Render for AppShell {
             }
         }
 
-        if self.is_authenticated && !self.focus_handle.is_focused(window) {
+        let browser_occluded = !self.is_authenticated
+            || self.active_panel != ActiveWorkspacePanel::Browser
+            || self.has_browser_visual_occlusion_overlay(cx);
+        if let Some(ref bw) = self.browser_workspace {
+            let bw_read = bw.read(cx);
+            let want_visible = self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Browser;
+            let entering_occlusion_or_leaving = (!want_visible && bw_read.is_workspace_visible())
+                || (browser_occluded && !bw_read.is_externally_occluded())
+                || (browser_occluded
+                    && bw_read.active_input != crate::views::browser::ActiveBrowserInput::None);
+            let needs_fabushi_sync = match (&bw_read.local_fabushi, &self.bot_browser.local_fabushi) {
+                (Some(cur), Some(host)) => !Arc::ptr_eq(cur, host),
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if bw_read.is_externally_occluded() != browser_occluded
+                || bw_read.is_workspace_visible() != want_visible
+                || (browser_occluded && bw_read.is_native_webview_visible())
+                || entering_occlusion_or_leaving
+                || needs_fabushi_sync
+            {
+                if entering_occlusion_or_leaving {
+                    self.ime.clear_preedit();
+                    self.bot_browser.ime_preedit_input_gen = None;
+                }
+                let fabushi_opt = self.bot_browser.local_fabushi.clone();
+                bw.update(cx, |w, wcx| {
+                    if let Some(host) = fabushi_opt {
+                        w.set_local_fabushi(host);
+                    }
+                    if entering_occlusion_or_leaving
+                        && w.active_input != crate::views::browser::ActiveBrowserInput::None
+                    {
+                        w.set_active_input(
+                            crate::views::browser::ActiveBrowserInput::None,
+                            None,
+                            wcx,
+                        );
+                    }
+                    w.set_workspace_visible(want_visible, wcx);
+                    w.set_occluded(browser_occluded, wcx);
+                });
+            }
+        }
+
+        if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Browser {
+            let has_shell_blocker = self.has_browser_shell_blocker(cx);
+            if !has_shell_blocker {
+                if let Some(bw) = self.browser_workspace.clone() {
+                    let (clear_for_cdp_focus, had_window_flag) = {
+                        let bw_read = bw.read(cx);
+                        let surf_focused = bw_read.active_engine
+                            == crate::views::browser::BrowserEngineKind::RustCdp
+                            && bw_read
+                                .cdp_surface()
+                                .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                        let newly_focused = !self.bot_browser.last_rendered_cdp_surface_focused
+                            || bw_read.last_set_active_input_had_window();
+                        let should_clear = surf_focused
+                            && bw_read.active_input
+                                != crate::views::browser::ActiveBrowserInput::None
+                            && newly_focused;
+                        (should_clear, bw_read.last_set_active_input_had_window())
+                    };
+                    if clear_for_cdp_focus {
+                        self.ime.clear_preedit();
+                        self.bot_browser.ime_preedit_input_gen = None;
+                        bw.update(cx, |w, wcx| {
+                            w.set_active_input(
+                                crate::views::browser::ActiveBrowserInput::None,
+                                None,
+                                wcx,
+                            );
+                        });
+                    } else if had_window_flag {
+                        bw.update(cx, |w, _| {
+                            w.clear_last_set_active_input_had_window();
+                        });
+                    }
+                }
+            }
+        }
+
+        let cdp_surface_focused = self.is_authenticated && self.is_browser_cdp_viewport_focused(window, cx);
+        if self.is_authenticated && !cdp_surface_focused && !self.focus_handle.is_focused(window) {
             self.focus_handle.focus(window);
         }
+        self.bot_browser.last_rendered_cdp_surface_focused = cdp_surface_focused;
         let vp = window.viewport_size();
         let (vp_w, vp_h) = (f32::from(vp.width), f32::from(vp.height));
         if (vp_w - self.overlays.last_viewport_width).abs() >= 1.0 && vp_w > 0.0 {
@@ -1381,44 +1493,53 @@ impl Render for AppShell {
             .child(
                 div().flex_1().w_full().min_h(px(0.0)).flex()
                     .child(self.sidebar.clone())
-                    .child(
-                        div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
-                            .bg(rgb(pal.stage_bg))
-                            .child(
-                                div()
-                                    .id("app-shell-stage-slot")
-                                    .relative()
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .w_full()
-                                    .flex()
-                                    .flex_col()
-                                    .child(if is_apple_compose_mode {
-                                        self.render_apple_compose_stage(cx)
-                                    } else {
-                                        self.stage.clone().into_any_element()
-                                    })
-                                    .when(!has_blocking_overlay, |el| {
-                                        el.when_some(current_toast.clone(), |el, toast| {
-                                            let bottom_gap = if show_bot_start_bar {
-                                                pal.scaled_px(68.0)
-                                                    .max(52.0 + pal.scaled_px(16.0))
-                                            } else {
-                                                pal.scaled_px(16.0)
-                                            };
-                                            el.child(self.render_toast_banner_slot(
-                                                toast.text,
-                                                bottom_gap,
-                                                pal,
-                                                cx,
-                                            ))
+                    .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
+                        if let Some(ref bw) = self.browser_workspace {
+                            row.child(bw.clone())
+                        } else {
+                            row
+                        }
+                    })
+                    .when(self.active_panel != ActiveWorkspacePanel::Browser, |row| {
+                        row.child(
+                            div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
+                                .bg(rgb(pal.stage_bg))
+                                .child(
+                                    div()
+                                        .id("app-shell-stage-slot")
+                                        .relative()
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .child(if is_apple_compose_mode {
+                                            self.render_apple_compose_stage(cx)
+                                        } else {
+                                            self.stage.clone().into_any_element()
                                         })
-                                    }),
-                            )
-                            .when(!hide_composer, |el| el.child(self.composer.clone()))
-                            .into_any_element(),
-                    )
-                    .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone())),
+                                        .when(!has_blocking_overlay, |el| {
+                                            el.when_some(current_toast.clone(), |el, toast| {
+                                                let bottom_gap = if show_bot_start_bar {
+                                                    pal.scaled_px(68.0)
+                                                        .max(52.0 + pal.scaled_px(16.0))
+                                                } else {
+                                                    pal.scaled_px(16.0)
+                                                };
+                                                el.child(self.render_toast_banner_slot(
+                                                    toast.text,
+                                                    bottom_gap,
+                                                    pal,
+                                                    cx,
+                                                ))
+                                            })
+                                        }),
+                                )
+                                .when(!hide_composer, |el| el.child(self.composer.clone()))
+                                .into_any_element(),
+                        )
+                        .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
+                    }),
             )
             .when_some(self.rtc_talk.talk_mode_overlay.clone(), |el, ov| el.child(self.render_talk_mode_overlay(ov, cx)))
             .when_some(self.overlays.media_viewer_overlay.clone(), |el, ov| el.child(self.render_media_viewer_overlay(ov)))
@@ -1474,7 +1595,7 @@ mod tests {
             ("3", Some(NavDestination::Calls)), ("4", Some(NavDestination::TaskCenter)),
             ("5", Some(NavDestination::McpTools)), ("6", Some(NavDestination::TalkMode)),
             ("7", Some(NavDestination::SavedMessages)), ("8", Some(NavDestination::Settings)),
-            ("9", None),
+            ("9", Some(NavDestination::Browser)), ("0", None),
         ] {
             assert_eq!(nav_destination_for_shortcut_digit(key), expected);
         }

@@ -26,6 +26,7 @@ impl AppShell {
         // When Apple/Grok multi-select compose is available, never fall back to the legacy
         // 0-member `NewGroup` modal; route directly into multi-select compose group mode.
         if matches!(kind, ModalDialogKind::NewGroup) && self.theme_state.palette.is_apple_style() {
+            self.leave_browser_panel_if_active(cx);
             self.active_panel = ActiveWorkspacePanel::Chats;
             self.last_handled_nav_dest = Some(NavDestination::Chats);
             self.nav_rail.update(cx, |r, r_cx| {
@@ -33,6 +34,7 @@ impl AppShell {
                 r_cx.notify();
             });
             self.ime.clear_preedit();
+            self.bot_browser.ime_preedit_input_gen = None;
             self.enter_compose_or_modal_isolation(cx);
             self.sidebar.update(cx, |sb, sb_cx| {
                 sb.open_compose_group_mode();
@@ -61,6 +63,7 @@ impl AppShell {
             st.more_menu_open = false;
             st.ttl_submenu_open = false;
         });
+        self.occlude_browser_for_overlay(cx);
         let is_connection_modal = matches!(kind, ModalDialogKind::ConnectionProxy);
         let targets = chat_dialogs_to_forward_targets(&self.sidebar.read(cx).dialogs);
         let rows = contacts_to_modal_rows(&self.session_sync.contacts_list);
@@ -135,6 +138,7 @@ impl AppShell {
             MainMenuCommand::NewFabushiBot => self.open_fabushi_creator_modal(cx),
             MainMenuCommand::NewGroup => {
                 if self.theme_state.palette.is_apple_style() {
+                    self.leave_browser_panel_if_active(cx);
                     self.active_panel = ActiveWorkspacePanel::Chats;
                     self.last_handled_nav_dest = Some(NavDestination::Chats);
                     self.nav_rail.update(cx, |r, r_cx| {
@@ -142,6 +146,7 @@ impl AppShell {
                         r_cx.notify();
                     });
                     self.ime.clear_preedit();
+                    self.bot_browser.ime_preedit_input_gen = None;
                     self.enter_compose_or_modal_isolation(cx);
                     self.sidebar.update(cx, |sb, sb_cx| {
                         sb.open_compose_group_mode();
@@ -168,11 +173,13 @@ impl AppShell {
                 self.open_modal_dialog(tr_str(lang, "联系人", "Contacts"), ModalDialogKind::Contacts, 420.0, 500.0, cx);
             }
             MainMenuCommand::Calls => {
+                self.leave_browser_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Calls;
                 self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Calls));
                 self.sync_calls_history(cx);
             }
             MainMenuCommand::SavedMessages => {
+                self.leave_browser_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::SavedMessages));
                 let target_id = self.sidebar.read(cx).saved_messages_id.or_else(|| {
@@ -185,11 +192,13 @@ impl AppShell {
                 }
             }
             MainMenuCommand::TaskCenter => {
+                self.leave_browser_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.tasks_workspace.update(cx, |w, _| w.set_tab(TasksWorkspaceTab::Tasks));
                 self.refresh_tasks_and_mcp(cx);
             }
             MainMenuCommand::McpTools => {
+                self.leave_browser_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::McpTools;
                 self.tasks_workspace.update(cx, |w, _| w.set_tab(TasksWorkspaceTab::McpTools));
                 self.refresh_tasks_and_mcp(cx);
@@ -268,6 +277,7 @@ impl AppShell {
                 if self.theme_state.palette.is_apple_style() && !enable_forum_topics {
                     // Guard against creating an empty 0-member group when multi-select compose is available.
                     let clean_title = title.trim().chars().take(72).collect::<String>();
+                    self.leave_browser_panel_if_active(cx);
                     self.active_panel = ActiveWorkspacePanel::Chats;
                     self.enter_compose_or_modal_isolation(cx);
                     self.sidebar.update(cx, |sb, sb_cx| {

@@ -45,6 +45,9 @@ impl AppShell {
             r.set_active_destination(dest);
             r_cx.notify();
         });
+        if dest != NavDestination::Browser {
+            self.hide_browser_native_webview(cx);
+        }
         match dest {
             NavDestination::Chats | NavDestination::Folders => {
                 self.active_panel = ActiveWorkspacePanel::Chats;
@@ -147,6 +150,9 @@ impl AppShell {
             NavDestination::RemoteComputer => {
                 self.open_computer_workbench_live(cx);
             }
+            NavDestination::Browser => {
+                self.open_browser_workspace(cx);
+            }
             NavDestination::TaskCenter => {
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.tasks_workspace
@@ -175,6 +181,7 @@ impl AppShell {
             NavDestination::Calls
                 | NavDestination::TalkMode
                 | NavDestination::RemoteComputer
+                | NavDestination::Browser
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
@@ -255,6 +262,17 @@ impl AppShell {
         let lang = self.active_lang_id();
         match key_lower.as_str() {
             "k" => {
+                self.ime.clear_preedit();
+                self.bot_browser.ime_preedit_input_gen = None;
+                if let Some(ref bw) = self.browser_workspace {
+                    bw.update(cx, |w, wcx| {
+                        w.set_active_input(
+                            crate::views::browser::ActiveBrowserInput::None,
+                            None,
+                            wcx,
+                        );
+                    });
+                }
                 self.sidebar.update(cx, |sb, sb_cx| {
                     sb.focus_search();
                     sb_cx.notify();
@@ -306,19 +324,7 @@ impl AppShell {
                 true
             }
             "e" => {
-                self.sidebar.update(cx, |s, s_cx| {
-                    s.is_account_popover_open = !s.is_account_popover_open;
-                    s.exit_compose_mode();
-                    s_cx.notify();
-                });
-                if self.composer.read(cx).is_compose_isolated
-                    && !self.is_compose_or_creation_modal_active(cx)
-                {
-                    self.exit_compose_or_modal_isolation(true, cx);
-                } else {
-                    self.sync_compose_state_to_composer(true, cx);
-                }
-                cx.notify();
+                self.toggle_account_popover(cx);
                 true
             }
             "j" => {
@@ -333,6 +339,7 @@ impl AppShell {
                 true
             }
             "n" => {
+                self.leave_browser_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
                 self.nav_rail.update(cx, |r, r_cx| {
@@ -340,6 +347,7 @@ impl AppShell {
                     r_cx.notify();
                 });
                 self.ime.clear_preedit();
+                self.bot_browser.ime_preedit_input_gen = None;
                 self.enter_compose_or_modal_isolation(cx);
                 self.sidebar.update(cx, |sb, sb_cx| {
                     if is_shift {
@@ -426,7 +434,7 @@ impl AppShell {
     pub fn handle_window_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.try_route_interactive_pty_key(event, cx) {
@@ -440,6 +448,11 @@ impl AppShell {
             if self.handle_shortcut_key(key, event.keystroke.modifiers.shift, cx) {
                 cx.stop_propagation();
             }
+            return;
+        }
+
+        if self.is_browser_cdp_viewport_focused(window, cx) {
+            cx.stop_propagation();
             return;
         }
 

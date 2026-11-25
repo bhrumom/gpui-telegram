@@ -181,6 +181,7 @@ fn spawn_cloud_storage_op(
 impl AppShell {
     /// Lazily initializes or updates the attached Mini-App WebView overlay entity.
     pub fn ensure_miniapp_overlay(&mut self, cx: &mut Context<Self>) -> Entity<BotAttachWebView> {
+        self.occlude_browser_for_overlay(cx);
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
         if let Some(ref existing) = self.miniapps.miniapp_overlay {
@@ -241,6 +242,7 @@ impl AppShell {
 
     /// Opens the natural-language bot and Mini-App creator modal.
     pub fn open_nl_creator_modal(&mut self, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
         let box_ent = self.ensure_create_bot_box(cx);
         box_ent.update(cx, |b, b_cx| {
             b.open_ai_creator();
@@ -258,6 +260,7 @@ impl AppShell {
 
     /// Opens the first-class Fabushi Bot creator modal (isolated workspace + Hermes agent).
     pub fn open_fabushi_creator_modal(&mut self, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
         let box_ent = self.ensure_create_bot_box(cx);
         box_ent.update(cx, |b, b_cx| {
             b.open_fabushi_creator();
@@ -275,6 +278,7 @@ impl AppShell {
 
     /// Opens the Local Coding Agent Bot creator modal and triggers provider detection.
     pub fn open_coding_agent_creator_modal(&mut self, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
         let box_ent = self.ensure_create_bot_box(cx);
         box_ent.update(cx, |b, b_cx| {
             b.open_coding_agent_creator();
@@ -689,6 +693,7 @@ impl AppShell {
                     self.open_bot_profile_popup(&bot_un, cx);
                 }
                 BotWebViewPendingAction::OpenMiniAppTos => {
+                    self.occlude_browser_for_overlay(cx);
                     self.miniapps.is_miniapp_minimized = true;
                     self.miniapps.miniapp_tos_modal_open = true;
                     cx.notify();
@@ -981,6 +986,7 @@ impl AppShell {
                     cx.notify();
                 }
                 BotWebViewPendingAction::ExpandFromFloatingPip => {
+                    self.occlude_browser_for_overlay(cx);
                     self.miniapps.is_miniapp_minimized = false;
                     overlay.update(cx, |w, wcx| {
                         w.is_floating_pip = false;
@@ -1415,6 +1421,7 @@ impl AppShell {
                     self.open_external_url_with_toast(&url, cx);
                 }
                 BotProfileBoxAction::OpenMiniAppTos => {
+                    self.occlude_browser_for_overlay(cx);
                     self.miniapps.miniapp_tos_modal_open = true;
                 }
                 BotProfileBoxAction::Report => {

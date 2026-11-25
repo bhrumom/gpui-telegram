@@ -179,6 +179,7 @@ impl AppShell {
                 }
             }
             InspectorAction::OpenMedia { url, is_video } => {
+                self.occlude_browser_for_overlay(cx);
                 let pal = self.theme_state.palette;
                 self.overlays.media_viewer_overlay = Some(cx.new(|_| {
                     let mut m = MediaViewer::new(url, is_video);
@@ -529,6 +530,7 @@ impl AppShell {
                 });
             }
             InspectorAction::OpenMiniAppTos => {
+                self.occlude_browser_for_overlay(cx);
                 self.miniapps.miniapp_tos_modal_open = true;
             }
             InspectorAction::OpenBotPrivacyPolicy(url) => {

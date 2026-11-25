@@ -261,6 +261,7 @@ fn clear_bot_composer_and_inspector(
 }
 
 fn activate_chats_workspace(shell: &mut AppShell, cx: &mut Context<AppShell>) {
+    shell.leave_browser_panel_if_active(cx);
     shell.active_panel = ActiveWorkspacePanel::Chats;
     shell.last_handled_nav_dest = Some(NavDestination::Chats);
     shell.nav_rail.update(cx, |r, r_cx| {
@@ -1261,6 +1262,7 @@ impl AppShell {
             .unwrap_or_else(|| short.clone());
         let app_id = app_opt.as_ref().map(|a| a.app_id.clone());
 
+        self.occlude_browser_for_overlay(cx);
         self.miniapps.pending_miniapp_confirm = Some(PendingMiniAppConfirm {
             bot_id,
             bot_username: bot_un,
@@ -1475,6 +1477,9 @@ impl AppShell {
             .unwrap_or((false, false));
 
         if already_matches {
+            if want_takeover {
+                self.occlude_browser_for_overlay(cx);
+            }
             if let Some(ref ov) = self.miniapps.miniapp_overlay {
                 let open_now = ov.read(cx).is_open;
                 if want_takeover {
@@ -1501,6 +1506,7 @@ impl AppShell {
         if in_flight_same_app {
             self.miniapps.pending_webmcp_commands.push_back(cmd);
             if want_takeover {
+                self.occlude_browser_for_overlay(cx);
                 self.miniapps.is_miniapp_minimized = false;
                 if let Some(ref ov) = self.miniapps.miniapp_overlay {
                     ov.update(cx, |w, wcx| {
@@ -1639,6 +1645,7 @@ impl AppShell {
         } else {
             Vec::new()
         };
+        self.occlude_browser_for_overlay(cx);
         self.miniapps.is_miniapp_minimized = false;
         self.miniapps.pending_miniapp_confirm = None;
         ov.update(cx, |w, w_cx| {
@@ -1841,8 +1848,14 @@ impl AppShell {
                             queued_cmds
                                 .extend(shell.take_matching_pending_webmcp_commands(&bot_un, &short));
                         }
-                        let stay_in_pip = shell.miniapps.is_miniapp_minimized
-                            && !queued_cmds.iter().any(|c| c.operation == "request_takeover");
+                        let takeover_requested =
+                            queued_cmds.iter().any(|c| c.operation == "request_takeover");
+                        let stay_in_pip =
+                            shell.miniapps.is_miniapp_minimized && !takeover_requested;
+                        if takeover_requested {
+                            shell.occlude_browser_for_overlay(cx);
+                            shell.miniapps.is_miniapp_minimized = false;
+                        }
                         let _ = ov_weak.update(cx, |w, w_cx| {
                             w.load_context(ctx);
                             if stay_in_pip {
@@ -1850,7 +1863,7 @@ impl AppShell {
                                 w.is_floating_pip = true;
                                 w.pip_live_preview = true;
                                 w.disclaimer_accepted = true;
-                            } else if queued_cmds.iter().any(|c| c.operation == "request_takeover") {
+                            } else if takeover_requested {
                                 w.is_open = true;
                                 w.is_floating_pip = false;
                                 w.disclaimer_accepted = true;
@@ -2304,6 +2317,7 @@ impl AppShell {
         prof: BotPublicProfileDto,
         cx: &mut Context<Self>,
     ) {
+        self.occlude_browser_for_overlay(cx);
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
         if let Some(ref existing) = self.miniapps.bot_profile_box {
