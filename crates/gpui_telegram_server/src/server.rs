@@ -493,6 +493,7 @@ impl AppState {
         let _ = db.seed_default_catalog_if_empty();
         let _ = db.seed_botfather_and_flagship_apps();
         let _ = ensure_default_ai_bot(&db);
+        let _ = ensure_creator_studio_bot(&db);
 
         let signaling_hub = Arc::new(crate::webrtc::signaling_hub::SignalingHub::new());
         let pts_engine = Arc::new(crate::sync::pts_engine::PtsEngine::new(db.clone()));
@@ -515,16 +516,19 @@ impl AppState {
             Arc::downgrade(&gateway_hub),
             self_weak.clone(),
         ));
-        let im_bridge = Arc::new(crate::hermes_im_bridge::ServerPlatformImBridge::new(
-            db.clone(),
-            message_pipeline.clone(),
-            pts_engine.clone(),
-            Arc::downgrade(&gateway_hub),
-            Arc::downgrade(&search_indexer),
-            Arc::downgrade(&hybrid_memory),
-            Arc::downgrade(&webmcp_broker),
-            self_weak.clone(),
-        ));
+        let im_bridge = Arc::new(
+            crate::hermes_im_bridge::ServerPlatformImBridge::new(
+                db.clone(),
+                message_pipeline.clone(),
+                pts_engine.clone(),
+                Arc::downgrade(&gateway_hub),
+                Arc::downgrade(&search_indexer),
+                Arc::downgrade(&hybrid_memory),
+                Arc::downgrade(&webmcp_broker),
+                self_weak.clone(),
+            )
+            .with_cas(Arc::downgrade(&cas)),
+        );
         fabushi_bots.set_platform_im_bridge(im_bridge);
         fabushi_bots.set_agentic_backend(db.clone());
         gateway_hub.set_pipeline(message_pipeline.clone(), db.clone());
@@ -1416,11 +1420,18 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
                 .put(routes::bots_miniapps::miniapps_storage_put)
                 .delete(routes::bots_miniapps::miniapps_storage_delete),
         )
-        .route("/api/v1/bots", post(routes::bots_miniapps::bots_create))
+        .route(
+            "/api/v1/bots",
+            get(routes::bots_miniapps::bots_list).post(routes::bots_miniapps::bots_create),
+        )
         .route("/api/v1/bots/my", get(routes::bots_miniapps::bots_my))
         .route(
             "/api/v1/bots/attach-menu",
             get(routes::bots_miniapps::bots_attach_menu),
+        )
+        .route(
+            "/api/v1/bots/inline-query",
+            get(routes::creator_bot::bots_inline_query),
         )
         .route(
             "/api/v1/bots/profile/{target}",
@@ -1562,6 +1573,79 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/remote/webrtc/signal",
             post(routes::remote_assist::remote_webrtc_signal),
+        )
+        // --- Cloud Creations & Moderation Review Workflow ---
+        .route(
+            "/api/v1/creations",
+            post(routes::creations::creations_create)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/v1/creations/my", get(routes::creations::creations_list_my))
+        .route("/api/v1/creations/sync", get(routes::creations::creations_sync))
+        .route(
+            "/api/v1/creations/review-queue",
+            get(routes::creations::creations_review_queue),
+        )
+        .route(
+            "/api/v1/creations/{id}",
+            get(routes::creations::creations_get)
+                .put(routes::creations::creations_update)
+                .delete(routes::creations::creations_delete)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/creations/{id}/submit-review",
+            post(routes::creations::creations_submit_review),
+        )
+        .route(
+            "/api/v1/creations/{id}/withdraw-review",
+            post(routes::creations::creations_withdraw_review),
+        )
+        .route(
+            "/api/v1/creations/{id}/unpublish",
+            post(routes::creations::creations_unpublish),
+        )
+        .route(
+            "/api/v1/creations/{id}/audit",
+            get(routes::creations::creations_audit_list),
+        )
+        .route(
+            "/api/v1/creations/{id}/review",
+            post(routes::creations::creations_review_decide),
+        )
+        // --- Public Catalog, Verticals, Recommendations, User States, Reviews & Leaderboards ---
+        .route("/api/v1/catalog", get(routes::creations::catalog_search))
+        .route("/api/v1/catalog/books", get(routes::creations::catalog_books))
+        .route("/api/v1/catalog/music", get(routes::creations::catalog_music))
+        .route("/api/v1/catalog/games", get(routes::creations::catalog_games))
+        .route(
+            "/api/v1/catalog/appstore",
+            get(routes::creations::catalog_appstore),
+        )
+        .route(
+            "/api/v1/catalog/recommend",
+            get(routes::creations::catalog_recommend),
+        )
+        .route(
+            "/api/v1/catalog/my-states",
+            get(routes::creations::catalog_my_states),
+        )
+        .route(
+            "/api/v1/catalog/{id}/state",
+            put(routes::creations::catalog_upsert_state),
+        )
+        .route(
+            "/api/v1/catalog/{id}/reviews",
+            get(routes::creations::catalog_list_reviews)
+                .post(routes::creations::catalog_upsert_review),
+        )
+        .route(
+            "/api/v1/catalog/{id}/scores",
+            post(routes::creations::catalog_submit_score),
+        )
+        .route(
+            "/api/v1/catalog/{id}/leaderboard",
+            get(routes::creations::catalog_leaderboard),
         )
         // --- WebSocket Upgrade Route ---
         .route("/api/v1/ws", get(ws_upgrade_handler))
@@ -3467,6 +3551,84 @@ pub(crate) fn ensure_default_ai_bot(db: &crate::db::ServerDatabase) -> UserId {
     bot_id
 }
 
+/// Ensures the official `@CreatorStudioBot` (UID `777_020`) exists in `users` and `bots_registry`
+/// with `is_official = 1`, `is_inline = 1`, `is_standard_bot = 0`, `owner_user_id = 0`, and all 9
+/// creator/recommendation commands BEFORE `hydrate_all_fabushi_bots` runs.
+pub(crate) fn ensure_creator_studio_bot(db: &crate::db::ServerDatabase) -> UserId {
+    let bot_uid_i64 = gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID;
+    let bot_id = UserId(bot_uid_i64 as u64);
+    let now_ms = Utc::now().timestamp_millis();
+    let username = gpui_telegram_proto::CREATOR_STUDIO_BOT_USERNAME;
+    let display_name = "Creator Studio";
+    let bio = "Official Creator Studio Bot — create cloud Books, Music & Games and discover public creations.";
+    let description = "创作图书、音乐与迷你游戏并保存到云端，支持一键提交审核上架与公开作品推荐。";
+    let about = "Official Apple-style Creative Hub & Public Recommendation Bot (@CreatorStudioBot).";
+    let persona = "You are Creator Studio, an official assistant helping users author cloud Books, Music, and Games and discover published public creations.";
+    let commands_json = serde_json::to_string(&crate::routes::creator_bot::creator_studio_commands())
+        .unwrap_or_else(|_| "[]".to_string());
+    let bot_token = crate::routes::creator_bot::CREATOR_STUDIO_BOT_TOKEN;
+
+    let _ = db.pool().with_transaction(|tx| {
+        tx.execute(
+            r#"INSERT INTO users
+               (user_id, username, phone, first_name, last_name, bio, password_hash,
+                is_bot, is_verified, is_support, is_scam, is_fake,
+                profile_photo_file_id, account_generation, created_at_ms, updated_at_ms)
+               VALUES (?1, ?2, NULL, ?3, NULL, ?4, NULL, 1, 1, 0, 0, 0, NULL, 1, ?5, ?5)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username = excluded.username,
+                 first_name = excluded.first_name,
+                 bio = excluded.bio,
+                 is_bot = 1,
+                 is_verified = 1,
+                 updated_at_ms = excluded.updated_at_ms"#,
+            rusqlite::params![bot_uid_i64, username, display_name, bio, now_ms],
+        )
+        .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))?;
+
+        tx.execute(
+            r#"INSERT INTO bots_registry
+               (bot_user_id, owner_user_id, username, display_name, bot_token,
+                description, about, ai_persona, menu_button_text, menu_button_url,
+                is_official, is_inline, allow_attach_menu, attach_peer_types_json,
+                commands_json, created_at, updated_at,
+                agent_id, avatar_shape, avatar_color, preferred_model, thinking_level,
+                approval_mode, toolset_preset, menu_button_type, is_standard_bot)
+               VALUES (?1, 0, ?2, ?3, ?4,
+                       ?5, ?6, ?7, '', '',
+                       1, 1, 0, '["users","bots","groups","channels"]',
+                       ?8, ?9, ?9,
+                       'creator_studio_bot', 'orb', 'violet', '', 'medium',
+                       'prompt', 'full', 'default', 0)
+               ON CONFLICT(bot_user_id) DO UPDATE SET
+                 username = excluded.username,
+                 display_name = excluded.display_name,
+                 description = excluded.description,
+                 about = excluded.about,
+                 is_official = 1,
+                 is_inline = 1,
+                 is_standard_bot = 0,
+                 commands_json = excluded.commands_json,
+                 updated_at = excluded.updated_at"#,
+            rusqlite::params![
+                bot_uid_i64,
+                username,
+                display_name,
+                bot_token,
+                description,
+                about,
+                persona,
+                commands_json,
+                now_ms,
+            ],
+        )
+        .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))?;
+        Ok(())
+    });
+
+    bot_id
+}
+
 pub(crate) fn hydrate_all_fabushi_bots(
     db: &crate::db::ServerDatabase,
     host: &gpui_telegram_agent::fabushi_bot::FabushiBotHost,
@@ -4777,7 +4939,29 @@ pub(crate) fn extract_message_content_text(content: &MessageContent) -> String {
         MessageContent::Poll(p) => format!("[Poll: {}]", p.question),
         MessageContent::Todo(t) => format!("[Todo: {}]", t.title),
         MessageContent::Invoice(i) => format!("[Invoice: {}]", i.title),
-        MessageContent::GenerativeCard(g) => format!("[Card: {}]", g.title),
+        MessageContent::GenerativeCard(g) => {
+            let mut parts: Vec<String> = Vec::new();
+            let title_t = g.title.trim();
+            if !title_t.is_empty() {
+                parts.push(title_t.to_string());
+            }
+            if let Some(sub) = g.subtitle.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                parts.push(sub.to_string());
+            }
+            for comp in &g.components {
+                if let gpui_telegram_proto::cards::GenerativeComponent::Text { text, .. } = comp {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+            if parts.len() <= 1 {
+                format!("[Card: {}]", g.title)
+            } else {
+                parts.join("\n")
+            }
+        }
         MessageContent::Encrypted(_) => "[Encrypted message]".to_string(),
     }
 }

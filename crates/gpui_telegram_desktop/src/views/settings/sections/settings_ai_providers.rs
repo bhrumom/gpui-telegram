@@ -218,6 +218,7 @@ pub struct SettingsAiProvidersSections {
     pub import_activate: bool,
 
     pub active_field: AiProviderField,
+    pub editor_session_gen: u64,
     pub ime_controller: Option<Entity<TextInputController>>,
     pub pending_event: Option<SettingsAiProvidersEvent>,
 }
@@ -265,6 +266,7 @@ impl SettingsAiProvidersSections {
             import_raw_draft: String::new(),
             import_activate: true,
             active_field: AiProviderField::None,
+            editor_session_gen: 0,
             ime_controller: None,
             pending_event: None,
         }
@@ -477,6 +479,7 @@ impl SettingsAiProvidersSections {
             .cloned();
         self.tab = AiProvidersTab::Overview;
         self.editor_open = true;
+        self.editor_session_gen = self.editor_session_gen.wrapping_add(1);
         self.error_message = None;
         self.probe_result = None;
         self.draft_api_key.clear();
@@ -525,6 +528,7 @@ impl SettingsAiProvidersSections {
     pub fn open_provider_editor(&mut self, prov: &MagpieProviderDto) {
         self.tab = AiProvidersTab::Overview;
         self.editor_open = true;
+        self.editor_session_gen = self.editor_session_gen.wrapping_add(1);
         self.error_message = None;
         self.probe_result = None;
         self.selected_preset_id = prov.preset_id.clone();

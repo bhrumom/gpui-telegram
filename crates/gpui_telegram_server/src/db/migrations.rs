@@ -53,13 +53,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     let extra_migrations: &[(i64, &str)] = &[
+        (39, crate::db::mcp_oauth_store::MIGRATION_V39_MCP_OAUTH),
         (
-            (ALL_MIGRATIONS.len() + 1) as i64,
-            crate::db::mcp_oauth_store::MIGRATION_V39_MCP_OAUTH,
+            40,
+            crate::db::remote_assist_store::MIGRATION_V40_REMOTE_ASSIST,
         ),
         (
-            (ALL_MIGRATIONS.len() + 2) as i64,
-            crate::db::remote_assist_store::MIGRATION_V40_REMOTE_ASSIST,
+            41,
+            crate::db::creations_store::MIGRATION_V41_CREATIONS_AND_CATALOG,
         ),
     ];
 

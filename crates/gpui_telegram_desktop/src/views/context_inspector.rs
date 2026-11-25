@@ -870,6 +870,33 @@ impl ContextInspector {
             cx.notify();
         }
     }
+
+    pub fn clear_all_bot_preedits(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        let controllers = [
+            self.add_member_search_input.clone(),
+            self.persona_input.clone(),
+            self.model_input.clone(),
+            self.coding_workspace_input.clone(),
+            self.coding_model_input.clone(),
+        ];
+        for ctrl in controllers.into_iter().flatten() {
+            if ctrl.read(cx).ime_preedit.is_some() {
+                ctrl.update(cx, |c, _| {
+                    c.ime_preedit = None;
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn blur_bot_input(&mut self) {
+        self.bot_config_focus = BotConfigFocusField::None;
+        self.add_member_search_focused = false;
+    }
 }
 
 impl Default for ContextInspector { fn default() -> Self { Self::new() } }

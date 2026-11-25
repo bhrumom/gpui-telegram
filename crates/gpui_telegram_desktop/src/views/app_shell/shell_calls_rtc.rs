@@ -345,6 +345,7 @@ impl AppShell {
             .or(chat_opt)
             .unwrap_or(777000);
 
+        self.prepare_for_media_or_call_overlay_open(cx);
         self.clear_non_call_overlays();
         self.main_menu_drawer.update(cx, |d, _| d.close());
         self.rtc_talk.talk_coordinator = TalkCoordinator::new();
@@ -461,6 +462,7 @@ impl AppShell {
                     }
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
+                        shell.clear_ime_if_below_z5_unoccluded(cx);
                         shell.reset_talk_session_flags();
                         let msg = format!(
                             "{}: {}",
@@ -655,6 +657,7 @@ impl AppShell {
         };
         let lang = self.active_lang_id();
         let pal = self.theme_state.palette;
+        self.prepare_for_media_or_call_overlay_open(cx);
         self.clear_non_call_overlays();
         self.reset_talk_session_flags();
         self.main_menu_drawer.update(cx, |d, _| d.close());
@@ -740,6 +743,7 @@ impl AppShell {
                     }
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
+                        shell.clear_ime_if_below_z5_unoccluded(cx);
                         let msg = format!(
                             "{}: {}",
                             tr_str(shell.active_lang_id(), "通话发起失败", "Call failed"),
@@ -798,6 +802,7 @@ impl AppShell {
             .detach();
         }
         self.rtc_talk.talk_mode_overlay = None;
+        self.clear_ime_if_below_z5_unoccluded(cx);
         cx.notify();
     }
 
@@ -805,6 +810,7 @@ impl AppShell {
         let Some((my_id, fence)) = self.build_session_fence() else {
             return;
         };
+        self.prepare_for_computer_overlay_open(cx);
         self.rtc_talk.talk_mode_overlay = None;
         self.rtc_talk.active_talk_session_is_ai = false;
         self.overlays.media_viewer_overlay = None;

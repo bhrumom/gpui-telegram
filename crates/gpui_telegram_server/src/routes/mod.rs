@@ -7,6 +7,8 @@ pub mod bots_miniapps;
 pub mod chat_extras;
 pub mod chat_lifecycle;
 pub mod computers;
+pub mod creations;
+pub mod creator_bot;
 pub mod devices;
 pub mod e2ee;
 pub mod hermes;

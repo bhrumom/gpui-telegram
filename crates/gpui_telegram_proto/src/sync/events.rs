@@ -183,4 +183,16 @@ pub enum UpdateEvent {
         active_tool: Option<String>,
     },
     CodingHostCommand(crate::coding_agent_contracts::CodingHostCommand),
+    UserCreationChanged {
+        creation_id: String,
+        owner_user_id: i64,
+        kind: crate::creations::CreationKind,
+        review_status: crate::creations::CreationReviewStatus,
+        cloud_revision: i64,
+    },
+    PublicCatalogChanged {
+        creation_id: String,
+        kind: crate::creations::CreationKind,
+        action: String,
+    },
 }

@@ -539,9 +539,16 @@ fn try_parse_markdown_link(rem: &str) -> Option<(&str, String, usize)> {
     }
     let close_paren = end_paren?;
     let url = after_paren[..close_paren].trim();
+    let is_tg_scheme = url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tg://"));
+    let valid_tg = is_tg_scheme
+        && url.len() > 5
+        && url.as_bytes().get(5).is_some_and(u8::is_ascii_alphanumeric)
+        && url.bytes().all(|b| b.is_ascii() && !b.is_ascii_control());
     if !(url.starts_with("http://")
         || url.starts_with("https://")
-        || url.starts_with("tg://")
+        || valid_tg
         || url.starts_with("mailto:"))
     {
         return None;
@@ -589,6 +596,52 @@ fn push_segment_coalesced(segs: &mut Vec<StyledSegment>, seg: StyledSegment) {
         }
     }
     segs.push(seg);
+}
+
+pub(crate) fn extract_bare_url_prefix(rem: &str) -> Option<&str> {
+    let is_tg_scheme = rem
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tg://"));
+    if !(rem.starts_with("https://") || rem.starts_with("http://") || is_tg_scheme) {
+        return None;
+    }
+    let end = rem
+        .find(|c: char| {
+            c.is_whitespace()
+                || (is_tg_scheme
+                    && (!c.is_ascii()
+                        || c.is_ascii_control()
+                        || matches!(c, '"' | '\'' | '`' | '<' | '>')))
+                || matches!(
+                    c,
+                    '"' | '`' | '<' | '>'
+                        | '。' | '，' | '）' | '（' | '；' | '：' | '！' | '？'
+                        | '、' | '》' | '《' | '」' | '「' | '】' | '【'
+                )
+        })
+        .unwrap_or(rem.len());
+    let raw_url = &rem[..end];
+    let trimmed = raw_url.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | ',' | '!' | '?' | ')' | ']' | '}' | '>' | ';' | ':'
+                | '"' | '\'' | '`'
+                | '。' | '，' | '）' | '；' | '：' | '！' | '？'
+                | '、' | '》' | '」' | '】'
+        )
+    });
+    if is_tg_scheme {
+        if trimmed.len() > 5
+            && trimmed.as_bytes().get(5).is_some_and(u8::is_ascii_alphanumeric)
+        {
+            Some(trimmed)
+        } else {
+            None
+        }
+    } else {
+        let clean = if trimmed.is_empty() { raw_url } else { trimmed };
+        (!clean.is_empty()).then_some(clean)
+    }
 }
 
 fn parse_inline_markdown(text: &str, spoiler_id: &mut usize) -> Vec<StyledSegment> {
@@ -667,21 +720,14 @@ fn parse_inline_markdown(text: &str, spoiler_id: &mut usize) -> Vec<StyledSegmen
                 continue;
             }
         }
-        if rem.starts_with("http://") || rem.starts_with("https://") {
-            let end = rem.find(char::is_whitespace).unwrap_or(rem.len());
-            let clean = rem[..end].trim_end_matches(|c: char| {
-                matches!(
-                    c,
-                    '.' | ',' | '!' | '?' | ')' | ';' | '。' | '，' | '）' | '；' | '：' | '！' | '？' | '、'
-                )
-            });
-            let clean_len = clean.len().max(1);
+        if let Some(url) = extract_bare_url_prefix(rem) {
+            let clean_len = url.len();
             let mut flags = InlineStyleFlags::default();
-            flags.link_url = Some(rem[..clean_len].to_string());
+            flags.link_url = Some(url.to_string());
             push_segment_coalesced(
                 &mut segs,
                 StyledSegment {
-                    text: rem[..clean_len].to_string(),
+                    text: url.to_string(),
                     flags,
                     spoiler_id: None,
                 },

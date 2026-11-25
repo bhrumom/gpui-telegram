@@ -1,6 +1,6 @@
 //! Secondary panel synchronization: folders, contacts, wallet credits, inspector, and sidebar actions.
 
-use gpui::{AppContext, AsyncApp, ClipboardItem, Context, WeakEntity};
+use gpui::{AsyncApp, ClipboardItem, Context, WeakEntity};
 use gpui_telegram_proto::miniapp_contracts::MiniAppLaunchMode;
 
 use crate::i18n::tr_str;
@@ -16,7 +16,6 @@ use crate::views::context_inspector::build_add_member_candidates;
 use crate::views::drawer::inspector_tabs::InspectorAction;
 use crate::views::shell::AppShell;
 use crate::views::sidebar::dialogs_row_view::SidebarContextAction;
-use crate::views::MediaViewer;
 
 fn session_fence(shell: &AppShell) -> Option<SessionRequestFence> {
     let (Some(token), Some(uid)) =
@@ -179,12 +178,7 @@ impl AppShell {
                 }
             }
             InspectorAction::OpenMedia { url, is_video } => {
-                let pal = self.theme_state.palette;
-                self.overlays.media_viewer_overlay = Some(cx.new(|_| {
-                    let mut m = MediaViewer::new(url, is_video);
-                    m.apply_theme(pal, lang);
-                    m
-                }));
+                self.show_media_viewer(url, is_video, cx);
             }
             InspectorAction::OpenEditPeer => {
                 let is_channel = active_chat.is_some_and(|cid| {
@@ -523,12 +517,14 @@ impl AppShell {
                 }
             }
             InspectorAction::FocusBotComposer => {
+                let focus_composer = self.can_focus_chat_composer(cx);
                 self.composer.update(cx, |c, c_cx| {
-                    c.is_input_focused = true;
+                    c.is_input_focused = focus_composer;
                     c_cx.notify();
                 });
             }
             InspectorAction::OpenMiniAppTos => {
+                self.prepare_for_lower_z_overlay_open(cx);
                 self.miniapps.miniapp_tos_modal_open = true;
             }
             InspectorAction::OpenBotPrivacyPolicy(url) => {
@@ -608,23 +604,35 @@ impl AppShell {
                         i.close();
                         icx.notify();
                     });
-                    self.enter_compose_or_modal_isolation(cx);
-                    self.composer.update(cx, |c, ccx| {
-                        c.is_input_focused = false;
-                        ccx.notify();
-                    });
-                    self.sidebar.update(cx, |sb, sb_cx| {
-                        sb.open_compose_with_seed_recipient(
-                            user_id,
-                            display_name,
-                            username,
-                            true,
-                            agent_id,
-                            avatar_color,
-                        );
-                        sb_cx.notify();
-                    });
-                    self.sync_compose_state_to_composer(true, cx);
+                    self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                    if self.theme_state.palette.is_apple_style() {
+                        self.enter_compose_or_modal_isolation(cx);
+                        self.blur_composer_and_cancel_ime(cx);
+                        self.sidebar.update(cx, |sb, sb_cx| {
+                            sb.open_compose_with_seed_recipient(
+                                user_id,
+                                display_name,
+                                username,
+                                true,
+                                agent_id,
+                                avatar_color,
+                            );
+                            sb_cx.notify();
+                        });
+                        self.sync_compose_state_to_composer(true, cx);
+                    } else {
+                        let member_seed = username
+                            .as_deref()
+                            .map(|u| format!("@{u}"))
+                            .unwrap_or_else(|| user_id.to_string());
+                        self.sidebar.update(cx, |sb, sb_cx| {
+                            sb.open_create_group_modal();
+                            sb.creation_secondary_input = member_seed;
+                            sb_cx.notify();
+                        });
+                        self.enter_compose_or_modal_isolation(cx);
+                        self.blur_composer_and_cancel_ime(cx);
+                    }
                 } else {
                     let msg = tr_str(lang, "未能识别该 Bot 信息", "Unable to resolve bot identity");
                     if let Some(cid) = active_chat {
@@ -799,6 +807,7 @@ impl AppShell {
         }) {
             self.miniapps.miniapp_overlay = None;
             self.miniapps.is_miniapp_minimized = false;
+            self.clear_ime_if_miniapp_unoccluded(cx);
         }
 
         self.stage.update(cx, |st, _| {

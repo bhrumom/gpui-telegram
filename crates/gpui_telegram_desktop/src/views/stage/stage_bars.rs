@@ -20,6 +20,7 @@ pub const APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT: f32 = 52.0;
 pub enum TopBarUiAction {
     ToggleInspector,
     ToggleSearch,
+    FocusSearch,
     SearchStep(i32),
     SearchClear,
     StartCall { video: bool },
@@ -722,6 +723,7 @@ pub fn render_stage_search_bar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let a_focus = on_action.clone();
     let a_prev = on_action.clone();
     let a_next = on_action.clone();
     let a_close = on_action;
@@ -766,6 +768,12 @@ pub fn render_stage_search_bar<V: 'static>(
         .items_center()
         .justify_between()
         .gap(px(8.0))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                a_focus(this, TopBarUiAction::FocusSearch, cx);
+            }),
+        )
         .child(
             div()
                 .flex()

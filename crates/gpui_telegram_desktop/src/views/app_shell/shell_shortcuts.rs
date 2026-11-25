@@ -1,8 +1,10 @@
 //! Keyboard shortcuts, window key dispatch, inspector toggle, language toggle, and nav switching.
 
-use gpui::{Context, KeyDownEvent, Window};
+use gpui::{ClipboardItem, Context, KeyDownEvent, Window};
 
+use crate::views::app_shell::shell_input_ime::ShellInputTarget;
 use crate::views::boxes::modal_types::ModalDialogKind;
+use crate::views::content_hub::{ContentHubInputTarget, ContentHubSection};
 use crate::views::global_tasks_workspace::TasksWorkspaceTab;
 use crate::views::nav_rail::NavDestination;
 use crate::views::settings::settings_type::SettingsSectionType;
@@ -15,6 +17,9 @@ use crate::views::tdesktop_theme::tr_str;
 impl AppShell {
     /// Synchronizes `ContextInspector` open state with `ConversationStage::is_inspector_open`.
     pub fn set_inspector_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if !open && self.is_inspector_bot_input_active(cx) {
+            self.clear_all_ime_preedits(cx);
+        }
         self.inspector.update(cx, |insp, insp_cx| {
             if open {
                 insp.open();
@@ -40,14 +45,31 @@ impl AppShell {
 
     /// Switches to a `NavDestination` panel and synchronizes `NavRail` + workspace data cleanly.
     pub fn activate_nav_destination(&mut self, dest: NavDestination, cx: &mut Context<Self>) {
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        if matches!(
+            dest,
+            NavDestination::Chats
+                | NavDestination::Folders
+                | NavDestination::SavedMessages
+                | NavDestination::Calls
+                | NavDestination::TaskCenter
+                | NavDestination::McpTools
+        ) {
+            self.cleanup_settings_panel_if_active(cx);
+        } else if dest == NavDestination::TalkMode {
+            self.stop_settings_mic_test_capture(cx);
+        }
         self.last_handled_nav_dest = Some(dest);
-        self.nav_rail.update(cx, |r, r_cx| {
+        let nav_trigger = self.nav_rail.update(cx, |r, r_cx| {
             r.set_active_destination(dest);
             r_cx.notify();
+            r.trigger_counter
         });
+        self.last_handled_nav_trigger = nav_trigger;
         match dest {
             NavDestination::Chats | NavDestination::Folders => {
                 self.active_panel = ActiveWorkspacePanel::Chats;
+                self.sync_apple_sidebar_to_active_panel(cx);
                 self.sidebar.update(cx, |sb, sb_cx| {
                     sb.exit_compose_mode();
                     sb.is_account_popover_open = false;
@@ -82,6 +104,7 @@ impl AppShell {
             }
             NavDestination::SavedMessages => {
                 self.active_panel = ActiveWorkspacePanel::Chats;
+                self.sync_apple_sidebar_to_active_panel(cx);
                 let target_saved = {
                     let sb = self.sidebar.read(cx);
                     sb.saved_messages_id.or_else(|| {
@@ -196,6 +219,7 @@ impl AppShell {
                 st.ttl_submenu_open = false;
                 st_cx.notify();
             });
+            self.sync_apple_sidebar_to_active_panel(cx);
         }
         cx.notify();
     }
@@ -221,11 +245,37 @@ impl AppShell {
         if self.is_authenticated {
             self.record_user_activity();
         }
+        let target = self.resolve_input_target(cx);
+        let publish_modal_ime_active = target == ShellInputTarget::PublishReviewModal
+            && self.is_publish_review_modal_input_active(cx);
+        let content_hub_ime_active = target == ShellInputTarget::ContentHubInput;
         match key_lower.as_str() {
             "v" => {
                 if let Some(clip_text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     self.insert_committed_text(&clip_text, cx);
                 }
+                return true;
+            }
+            "c" if publish_modal_ime_active || content_hub_ime_active => {
+                let (committed, _) = self.active_text_and_preedit(cx);
+                if !committed.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(committed));
+                }
+                return true;
+            }
+            "a" if publish_modal_ime_active || content_hub_ime_active => {
+                if publish_modal_ime_active {
+                    self.content_hub.update(cx, |h, hcx| {
+                        let _ = h.publish_modal.select_all_active_field();
+                        hcx.notify();
+                    });
+                } else {
+                    self.content_hub.update(cx, |h, hcx| {
+                        let _ = h.select_all_active_input();
+                        hcx.notify();
+                    });
+                }
+                cx.notify();
                 return true;
             }
             "backspace" | "a" | "u" => {
@@ -248,44 +298,55 @@ impl AppShell {
             _ => {}
         }
 
+        if self.is_authenticated && self.has_blocking_modal_or_fullscreen_overlay_for_shortcuts(cx) {
+            return true;
+        }
+
         if !self.is_authenticated || !self.preferences.shortcuts_enabled {
             return false;
         }
 
+        if self.sidebar.read(cx).is_account_popover_open && key_lower != "e" {
+            return true;
+        }
+
         let lang = self.active_lang_id();
         match key_lower.as_str() {
-            "k" => {
-                self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.focus_search();
-                    sb_cx.notify();
-                });
-                if self.composer.read(cx).is_compose_isolated
-                    && !self.is_compose_or_creation_modal_active(cx)
-                {
-                    self.exit_compose_or_modal_isolation(true, cx);
-                } else {
-                    self.sync_compose_state_to_composer(true, cx);
+            "k" => match self.active_panel {
+                ActiveWorkspacePanel::ContentHub(sec) => {
+                    self.clear_ime_and_blur_content_hub_for_transition(false, cx);
+                    let target = if sec == ContentHubSection::MyCreations {
+                        ContentHubInputTarget::CreationsSearch
+                    } else {
+                        ContentHubInputTarget::CatalogSearch
+                    };
+                    self.content_hub.update(cx, |h, hcx| {
+                        h.focus_input(target, hcx);
+                    });
+                    self.blur_composer_and_cancel_ime(cx);
+                    cx.notify();
+                    true
                 }
-                self.composer.update(cx, |c, c_cx| {
-                    c.is_input_focused = false;
-                    c_cx.notify();
-                });
-                cx.notify();
-                true
-            }
+                ActiveWorkspacePanel::Chats => {
+                    self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.focus_search();
+                        sb_cx.notify();
+                    });
+                    if self.composer.read(cx).is_compose_isolated
+                        && !self.is_compose_or_creation_modal_active(cx)
+                    {
+                        self.exit_compose_or_modal_isolation(true, cx);
+                    } else {
+                        self.sync_compose_state_to_composer(true, cx);
+                    }
+                    self.blur_composer_and_cancel_ime(cx);
+                    cx.notify();
+                    true
+                }
+                _ => true,
+            },
             "," if self.is_authenticated => {
-                self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.exit_compose_mode();
-                    sb.is_account_popover_open = false;
-                    sb_cx.notify();
-                });
-                if self.composer.read(cx).is_compose_isolated
-                    && !self.is_compose_or_creation_modal_active(cx)
-                {
-                    self.exit_compose_or_modal_isolation(true, cx);
-                } else {
-                    self.sync_compose_state_to_composer(true, cx);
-                }
                 self.navigate_settings_to(SettingsSectionType::Main, cx);
                 true
             }
@@ -294,22 +355,28 @@ impl AppShell {
                 true
             }
             "i" => {
-                let next_open = !self.inspector.read(cx).is_open;
-                self.set_inspector_open(next_open, cx);
+                if self.active_panel == ActiveWorkspacePanel::Chats {
+                    let next_open = !self.inspector.read(cx).is_open;
+                    self.set_inspector_open(next_open, cx);
+                }
                 true
             }
             "b" | "\\" => {
-                self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.toggle_collapsed_from_user();
-                    sb_cx.notify();
-                });
+                if self.active_panel == ActiveWorkspacePanel::Chats {
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.toggle_collapsed_from_user();
+                        sb_cx.notify();
+                    });
+                }
                 true
             }
             "e" => {
-                self.sidebar.update(cx, |s, s_cx| {
+                self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                let popover_opened = self.sidebar.update(cx, |s, s_cx| {
                     s.is_account_popover_open = !s.is_account_popover_open;
                     s.exit_compose_mode();
                     s_cx.notify();
+                    s.is_account_popover_open
                 });
                 if self.composer.read(cx).is_compose_isolated
                     && !self.is_compose_or_creation_modal_active(cx)
@@ -317,6 +384,9 @@ impl AppShell {
                     self.exit_compose_or_modal_isolation(true, cx);
                 } else {
                     self.sync_compose_state_to_composer(true, cx);
+                }
+                if popover_opened {
+                    self.blur_composer_and_cancel_ime(cx);
                 }
                 cx.notify();
                 true
@@ -333,32 +403,49 @@ impl AppShell {
                 true
             }
             "n" => {
+                self.cleanup_settings_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
-                self.nav_rail.update(cx, |r, r_cx| {
+                let nav_trigger = self.nav_rail.update(cx, |r, r_cx| {
                     r.set_active_destination(NavDestination::Chats);
                     r_cx.notify();
+                    r.trigger_counter
                 });
-                self.ime.clear_preedit();
-                self.enter_compose_or_modal_isolation(cx);
-                self.sidebar.update(cx, |sb, sb_cx| {
-                    if is_shift {
-                        sb.open_compose_group_mode();
-                    } else if !sb.is_plus_menu_open {
+                self.last_handled_nav_trigger = nav_trigger;
+                self.sync_apple_sidebar_to_active_panel(cx);
+                self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                if self.theme_state.palette.is_apple_style() {
+                    self.enter_compose_or_modal_isolation(cx);
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        if is_shift {
+                            sb.open_compose_group_mode();
+                        } else if !sb.is_plus_menu_open {
+                            sb.toggle_plus_menu();
+                        } else {
+                            sb.compose_recipient_query.clear();
+                            sb.compose_draft.menu_open = true;
+                            sb.compose_draft.highlighted_index = 0;
+                            sb.compose_title_focused = false;
+                        }
+                        sb_cx.notify();
+                    });
+                    self.blur_composer_and_cancel_ime(cx);
+                    self.sync_compose_state_to_composer(true, cx);
+                } else if is_shift {
+                    self.open_modal_dialog(
+                        tr_str(lang, "新建群组", "New Group"),
+                        ModalDialogKind::NewGroup,
+                        420.0,
+                        380.0,
+                        cx,
+                    );
+                } else {
+                    // Classic renders `render_plus_dropdown` in the sidebar without hiding/isolating Composer.
+                    self.sidebar.update(cx, |sb, sb_cx| {
                         sb.toggle_plus_menu();
-                    } else {
-                        sb.compose_recipient_query.clear();
-                        sb.compose_draft.menu_open = true;
-                        sb.compose_draft.highlighted_index = 0;
-                        sb.compose_title_focused = false;
-                    }
-                    sb_cx.notify();
-                });
-                self.composer.update(cx, |c, c_cx| {
-                    c.is_input_focused = false;
-                    c_cx.notify();
-                });
-                self.sync_compose_state_to_composer(true, cx);
+                        sb_cx.notify();
+                    });
+                }
                 cx.notify();
                 true
             }
@@ -388,7 +475,7 @@ impl AppShell {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.is_authenticated {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
             return false;
         }
         let Some(ov) = self

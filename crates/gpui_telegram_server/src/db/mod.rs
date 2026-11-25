@@ -4,6 +4,7 @@ pub mod analytics_store;
 pub mod auth_store;
 pub mod chat_extras;
 pub mod computer_store;
+pub mod creations_store;
 pub mod e2ee_store;
 pub mod mcp_oauth_store;
 pub mod migrations;
@@ -18,6 +19,7 @@ pub mod schema_parity_extra;
 pub mod social_store;
 pub mod user_vault_store;
 
+pub use creations_store::{CreationMutationResult, CreationOpError};
 pub use migrations::run_migrations;
 pub use pool::SqlitePool;
 pub use schema::*;

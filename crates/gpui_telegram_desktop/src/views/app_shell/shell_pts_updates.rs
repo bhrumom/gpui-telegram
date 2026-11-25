@@ -1497,6 +1497,29 @@ impl AppShell {
                 }
                 cx.notify();
             }
+            UpdateEvent::UserCreationChanged {
+                creation_id,
+                owner_user_id,
+                kind,
+                review_status,
+                cloud_revision,
+            } => {
+                self.handle_ws_user_creation_changed(
+                    creation_id,
+                    owner_user_id,
+                    kind,
+                    review_status,
+                    cloud_revision,
+                    cx,
+                );
+            }
+            UpdateEvent::PublicCatalogChanged {
+                creation_id,
+                kind,
+                action,
+            } => {
+                self.handle_ws_public_catalog_changed(creation_id, kind, action, cx);
+            }
             _ => {}
         }
     }
@@ -1819,6 +1842,7 @@ impl AppShell {
                 if self.rtc_talk.active_call_id.as_deref() == Some(call_id.as_str()) {
                     self.rtc_talk.active_call_id = None;
                     self.rtc_talk.talk_mode_overlay = None;
+                    self.clear_ime_if_below_z5_unoccluded(cx);
                 }
                 self.sync_calls_history(cx);
             }
@@ -1835,6 +1859,7 @@ impl AppShell {
             }
             "ringing" | "initiated" => {
                 if self.rtc_talk.talk_mode_overlay.is_none() && !call_id.is_empty() {
+                    self.prepare_for_media_or_call_overlay_open(cx);
                     self.rtc_talk.active_call_id = Some(call_id);
                     let pal = self.theme_state.palette;
                     let lang = self.active_lang_id();
@@ -1862,8 +1887,17 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Resolves deep link URLs (such as `tg://chat?id={id}`) and switches to the destination chat.
+    /// Resolves deep link URLs (such as `tg://apple/*` or `tg://chat?id={id}`) and switches to the destination.
     pub fn handle_deep_link(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return false;
+        }
+        if self.handle_apple_deep_link(url, cx) {
+            return true;
+        }
+        if crate::views::app_shell::shell_content_hub::is_apple_deep_link_candidate(url) {
+            return false;
+        }
         let link_info = crate::views::app_shell::window_session_controller_link_info::WindowSessionControllerLinkInfo::parse_deep_link(url);
         match link_info {
             crate::views::app_shell::window_session_controller_link_info::LinkInfoType::Peer(peer) => {

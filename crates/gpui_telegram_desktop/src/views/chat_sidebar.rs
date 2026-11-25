@@ -327,6 +327,7 @@ pub struct ChatSidebar {
     pub hovered_rail_dialog_id: Option<u64>,
     pub nav_rail: Option<Entity<NavRail>>,
     pub standalone_active_destination: NavDestination,
+    pub has_leading_app_sidebar: bool,
 }
 
 impl ChatSidebar {
@@ -420,6 +421,7 @@ impl ChatSidebar {
             hovered_rail_dialog_id: None,
             nav_rail: None,
             standalone_active_destination: NavDestination::Chats,
+            has_leading_app_sidebar: false,
         }
     }
 
@@ -434,6 +436,10 @@ impl ChatSidebar {
     pub fn attach_nav_rail(&mut self, nav_rail: Entity<NavRail>, cx: &mut Context<Self>) {
         self.nav_rail = Some(nav_rail.clone());
         cx.observe(&nav_rail, |_, _, cx| cx.notify()).detach();
+    }
+
+    pub fn set_has_leading_app_sidebar(&mut self, has_leading: bool) {
+        self.has_leading_app_sidebar = has_leading;
     }
 
     pub fn effective_width(&self) -> f32 {
@@ -484,7 +490,18 @@ impl ChatSidebar {
         self.is_account_popover_open = false;
         self.hovered_rail_dialog_id = None;
         self.is_contacts_modal_open = false;
+        self.contacts_search_query.clear();
         self.active_creation_modal = None;
+        self.contact_kind = AddContactKind::AiBot;
+        self.active_creation_field = CreationInputField::PrimaryName;
+        self.creation_primary_input.clear();
+        self.creation_secondary_input.clear();
+        self.creation_tertiary_input.clear();
+        self.pending_add_contact_request = None;
+        self.pending_create_group_request = None;
+        self.pending_open_new_channel = false;
+        self.active_search_category = "Chats".to_string();
+        self.active_search_tag = "all".to_string();
         self.remote_search_results.clear();
         self.catalog_mini_apps.clear();
         self.recent_mini_apps.clear();
@@ -523,6 +540,8 @@ impl ChatSidebar {
         self.selected_topic_id = None;
         self.context_menu = None;
         self.pending_context_action = None;
+        self.open_main_menu_requested = false;
+        self.standalone_active_destination = NavDestination::Chats;
         self.active_folder = "All".to_string();
         self.active_chat_id = None;
     }

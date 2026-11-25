@@ -224,6 +224,7 @@ impl CanonicalComposer {
     }
 
     pub fn select_bot_autocomplete_index(&mut self, idx: usize) {
+        self.ime_machine.on_ime_cancel();
         if let Some(cmd) = self.bot_ac_matches.get(idx).cloned() {
             let clean = cmd.command.trim().trim_start_matches('/');
             let insert = format!("/{clean} ");
@@ -243,6 +244,7 @@ impl CanonicalComposer {
     }
 
     pub fn select_hermes_autocomplete_index(&mut self, idx: usize) {
+        self.ime_machine.on_ime_cancel();
         if let Some(cmd) = self.hermes_ac_matches.get(idx).cloned() {
             let suffix = if cmd.accepts_args { " " } else { "" };
             self.replace_active_trigger_token(&format!("{}{}", cmd.slash_name, suffix));
@@ -255,6 +257,9 @@ impl CanonicalComposer {
     }
 
     pub fn handle_hermes_autocomplete_nav(&mut self, key: &str, is_shift: bool) -> bool {
+        if self.ime_machine.is_composing() && key != "escape" {
+            return false;
+        }
         if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
             let len = self.bot_ac_matches.len();
             match key {
@@ -486,85 +491,87 @@ impl CanonicalComposer {
             return;
         }
 
-        if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
-            let len = self.bot_ac_matches.len();
-            match ks.key.as_str() {
-                "up" => {
-                    self.bot_ac_selected = if self.bot_ac_selected == 0 {
-                        len.saturating_sub(1)
-                    } else {
-                        self.bot_ac_selected - 1
-                    };
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                "down" => {
-                    self.bot_ac_selected = (self.bot_ac_selected + 1) % len;
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                "tab" => {
-                    let idx = self.bot_ac_selected.min(len.saturating_sub(1));
-                    self.select_bot_autocomplete_index(idx);
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                _ => {}
-            }
-        } else if self.hermes_slash_enabled
-            && self.bot_slash_commands.is_empty()
-            && self.hermes_ac_visible
-            && !self.hermes_ac_matches.is_empty()
-        {
-            let len = self.hermes_ac_matches.len();
-            match ks.key.as_str() {
-                "up" => {
-                    self.hermes_ac_selected = if self.hermes_ac_selected == 0 {
-                        len.saturating_sub(1)
-                    } else {
-                        self.hermes_ac_selected - 1
-                    };
-                    self.autocomplete.move_selection("Up");
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                "down" => {
-                    self.hermes_ac_selected = (self.hermes_ac_selected + 1) % len;
-                    self.autocomplete.move_selection("Down");
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                "tab" => {
-                    let idx = self.hermes_ac_selected.min(len.saturating_sub(1));
-                    self.select_hermes_autocomplete_index(idx);
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                _ => {}
-            }
-        } else if self.autocomplete.is_open {
-            match ks.key.as_str() {
-                "up" | "down" => {
-                    self.autocomplete.move_selection(if ks.key == "up" { "Up" } else { "Down" });
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                "tab" => {
-                    if let Some(chosen) = self.autocomplete.choose_selected(AutocompleteChooseMethod::ByTab) {
-                        self.replace_active_trigger_token(&format!("{} ", chosen));
+        if !self.ime_machine.is_composing() {
+            if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
+                let len = self.bot_ac_matches.len();
+                match ks.key.as_str() {
+                    "up" => {
+                        self.bot_ac_selected = if self.bot_ac_selected == 0 {
+                            len.saturating_sub(1)
+                        } else {
+                            self.bot_ac_selected - 1
+                        };
                         cx.notify();
                         cx.stop_propagation();
                         return;
                     }
+                    "down" => {
+                        self.bot_ac_selected = (self.bot_ac_selected + 1) % len;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "tab" => {
+                        let idx = self.bot_ac_selected.min(len.saturating_sub(1));
+                        self.select_bot_autocomplete_index(idx);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    _ => {}
                 }
-                _ => {}
+            } else if self.hermes_slash_enabled
+                && self.bot_slash_commands.is_empty()
+                && self.hermes_ac_visible
+                && !self.hermes_ac_matches.is_empty()
+            {
+                let len = self.hermes_ac_matches.len();
+                match ks.key.as_str() {
+                    "up" => {
+                        self.hermes_ac_selected = if self.hermes_ac_selected == 0 {
+                            len.saturating_sub(1)
+                        } else {
+                            self.hermes_ac_selected - 1
+                        };
+                        self.autocomplete.move_selection("Up");
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "down" => {
+                        self.hermes_ac_selected = (self.hermes_ac_selected + 1) % len;
+                        self.autocomplete.move_selection("Down");
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "tab" => {
+                        let idx = self.hermes_ac_selected.min(len.saturating_sub(1));
+                        self.select_hermes_autocomplete_index(idx);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    _ => {}
+                }
+            } else if self.autocomplete.is_open {
+                match ks.key.as_str() {
+                    "up" | "down" => {
+                        self.autocomplete.move_selection(if ks.key == "up" { "Up" } else { "Down" });
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "tab" => {
+                        if let Some(chosen) = self.autocomplete.choose_selected(AutocompleteChooseMethod::ByTab) {
+                            self.replace_active_trigger_token(&format!("{} ", chosen));
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -573,34 +580,41 @@ impl CanonicalComposer {
             "right" => self.editor.move_right(&mut self.ime_machine, shift, alt),
             "home" => self.editor.move_home(&mut self.ime_machine, shift),
             "end" => self.editor.move_end(&mut self.ime_machine, shift),
-            "backspace" => self.editor.backspace_or_delete_sel(&mut self.ime_machine),
+            "backspace" => {
+                if self.ime_machine.is_composing() {
+                    self.ime_machine.on_ime_cancel();
+                } else {
+                    self.editor.backspace_or_delete_sel(&mut self.ime_machine);
+                }
+            }
             "delete" => self.editor.delete_forward(&mut self.ime_machine),
             "enter" => {
-                if self.bot_ac_visible && !self.bot_ac_matches.is_empty() && !shift {
-                    let idx = self.bot_ac_selected.min(self.bot_ac_matches.len().saturating_sub(1));
-                    self.select_bot_autocomplete_index(idx);
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                if self.hermes_slash_enabled
-                    && self.bot_slash_commands.is_empty()
-                    && self.hermes_ac_visible
-                    && !self.hermes_ac_matches.is_empty()
-                    && !shift
-                {
-                    let idx = self.hermes_ac_selected.min(self.hermes_ac_matches.len().saturating_sub(1));
-                    self.select_hermes_autocomplete_index(idx);
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                if self.autocomplete.is_open && !shift {
-                    if let Some(chosen) = self.autocomplete.choose_selected(AutocompleteChooseMethod::ByEnter) {
-                        self.replace_active_trigger_token(&format!("{} ", chosen));
+                if !self.ime_machine.is_composing() && !shift {
+                    if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
+                        let idx = self.bot_ac_selected.min(self.bot_ac_matches.len().saturating_sub(1));
+                        self.select_bot_autocomplete_index(idx);
                         cx.notify();
                         cx.stop_propagation();
                         return;
+                    }
+                    if self.hermes_slash_enabled
+                        && self.bot_slash_commands.is_empty()
+                        && self.hermes_ac_visible
+                        && !self.hermes_ac_matches.is_empty()
+                    {
+                        let idx = self.hermes_ac_selected.min(self.hermes_ac_matches.len().saturating_sub(1));
+                        self.select_hermes_autocomplete_index(idx);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if self.autocomplete.is_open {
+                        if let Some(chosen) = self.autocomplete.choose_selected(AutocompleteChooseMethod::ByEnter) {
+                            self.replace_active_trigger_token(&format!("{} ", chosen));
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
                     }
                 }
                 if self.handle_enter(shift) == KeyAction::SendMessage {
@@ -608,6 +622,13 @@ impl CanonicalComposer {
                 }
             }
             "escape" => {
+                if self.ime_machine.is_composing() {
+                    self.ime_machine.on_ime_cancel();
+                    self.sync_autocomplete();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 self.editor.send_options_open = false;
                 self.attachments_drawer.close();
                 self.is_emoji_picker_open = false;

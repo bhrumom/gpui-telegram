@@ -1,7 +1,14 @@
-use crate::cache::sqlite_cache::{CachedMediaEntry, SqliteClientCache};
+use crate::cache::sqlite_cache::{
+    sort_public_catalog_items, sort_user_creation_states, sort_user_creations, CachedMediaEntry,
+    SqliteClientCache, META_CREATIONS_LAST_REVISION,
+};
 use gpui_telegram_core::error::Result;
 use gpui_telegram_core::types::{ChatId, MessageId, UserId};
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
+use gpui_telegram_proto::creations::{
+    CreationKind, CreationReviewStatus, PublicCatalogItemDto, UserCreationDto,
+    UserCreationStateDto,
+};
 use gpui_telegram_proto::message::{MessageContent, MessageItem, ReactionCount};
 use gpui_telegram_proto::{PollCard, TodoCard};
 use parking_lot::RwLock;
@@ -23,6 +30,11 @@ struct LocalCacheState {
     read_outbox_max: HashMap<ChatId, MessageId>,
     media_entries: HashMap<String, CachedMediaEntry>,
     mem_media_bytes: HashMap<String, Vec<u8>>,
+    user_creations: HashMap<String, UserCreationDto>,
+    creations_last_revision: i64,
+    user_creation_states: HashMap<String, UserCreationStateDto>,
+    public_catalog: HashMap<String, (PublicCatalogItemDto, i64)>,
+    cache_meta: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -56,6 +68,14 @@ impl LocalStore {
         let chat_ttls = db.load_chat_ttls()?;
         let (read_inbox_max, read_outbox_max) = db.load_read_states()?;
         let media_entries = db.load_media_index()?;
+        let user_creations = db.load_all_user_creations()?;
+        let creations_last_revision = db.load_creations_last_revision()?;
+        let user_creation_states = db.load_user_creation_states_map()?;
+        let public_catalog = db.load_public_catalog_entries()?;
+        let mut cache_meta = HashMap::new();
+        if let Ok(Some(raw_rev)) = db.get_meta(META_CREATIONS_LAST_REVISION) {
+            cache_meta.insert(META_CREATIONS_LAST_REVISION.to_string(), raw_rev);
+        }
         let state = LocalCacheState {
             owner_scope,
             messages,
@@ -69,6 +89,11 @@ impl LocalStore {
             read_outbox_max,
             media_entries,
             mem_media_bytes: HashMap::new(),
+            user_creations,
+            creations_last_revision,
+            user_creation_states,
+            public_catalog,
+            cache_meta,
         };
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
@@ -149,6 +174,11 @@ impl LocalStore {
             guard.pinned_ids.clear();
             guard.read_inbox_max.clear();
             guard.read_outbox_max.clear();
+            guard.user_creations.clear();
+            guard.creations_last_revision = 0;
+            guard.user_creation_states.clear();
+            guard.public_catalog.clear();
+            guard.cache_meta.clear();
         }
         if let Some(db) = &self.sqlite {
             db.clear_all();
@@ -733,5 +763,311 @@ impl LocalStore {
             }
         }
         self.state.read().mem_media_bytes.get(file_id).cloned()
+    }
+}
+
+fn should_apply_creation_update(
+    existing: Option<&UserCreationDto>,
+    incoming: &UserCreationDto,
+) -> bool {
+    match existing {
+        None => true,
+        Some(prev) => {
+            incoming.cloud_revision > prev.cloud_revision
+                || (incoming.cloud_revision == prev.cloud_revision
+                    && (prev.deleted_at_ms.is_none() || incoming.deleted_at_ms.is_some()))
+        }
+    }
+}
+
+impl LocalStore {
+    pub fn get_cache_meta(&self, key: &str) -> Option<String> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(val) = db.get_meta(key) {
+                return val;
+            }
+        }
+        self.state.read().cache_meta.get(key).cloned()
+    }
+
+    pub fn set_cache_meta(&self, key: &str, value: &str) {
+        {
+            let mut guard = self.state.write();
+            guard.cache_meta.insert(key.to_string(), value.to_string());
+            if key == META_CREATIONS_LAST_REVISION {
+                guard.creations_last_revision = value.trim().parse::<i64>().unwrap_or(0).max(0);
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.set_meta(key, value);
+        }
+    }
+
+    pub fn delete_cache_meta(&self, key: &str) {
+        {
+            let mut guard = self.state.write();
+            guard.cache_meta.remove(key);
+            if key == META_CREATIONS_LAST_REVISION {
+                guard.creations_last_revision = 0;
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.delete_meta(key);
+        }
+    }
+
+    pub fn creations_last_revision(&self) -> i64 {
+        if let Some(db) = &self.sqlite {
+            if let Ok(rev) = db.creations_last_revision() {
+                return rev;
+            }
+        }
+        self.state.read().creations_last_revision
+    }
+
+    pub fn save_creations_last_revision(&self, revision: i64) {
+        let clamped = revision.max(0);
+        let next_rev = {
+            let mut guard = self.state.write();
+            guard.creations_last_revision = guard.creations_last_revision.max(clamped);
+            let next = guard.creations_last_revision;
+            guard
+                .cache_meta
+                .insert(META_CREATIONS_LAST_REVISION.to_string(), next.to_string());
+            next
+        };
+        if let Some(db) = &self.sqlite {
+            let _ = db.save_creations_last_revision(next_rev);
+            if let Ok(db_rev) = db.creations_last_revision() {
+                let mut guard = self.state.write();
+                guard.creations_last_revision = guard.creations_last_revision.max(db_rev);
+                let synced = guard.creations_last_revision;
+                guard
+                    .cache_meta
+                    .insert(META_CREATIONS_LAST_REVISION.to_string(), synced.to_string());
+            }
+        }
+    }
+
+    pub fn upsert_user_creations(&self, items: &[UserCreationDto]) {
+        if items.is_empty() {
+            return;
+        }
+        {
+            let mut guard = self.state.write();
+            for item in items {
+                let existing = guard.user_creations.get(&item.creation_id);
+                if should_apply_creation_update(existing, item) {
+                    guard
+                        .user_creations
+                        .insert(item.creation_id.clone(), item.clone());
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_user_creations(items);
+        }
+    }
+
+    pub fn apply_creations_sync_delta(
+        &self,
+        latest_revision: i64,
+        items: &[UserCreationDto],
+    ) -> i64 {
+        let mut next_rev = {
+            let mut guard = self.state.write();
+            let mut max_item_rev: i64 = 0;
+            for item in items {
+                max_item_rev = max_item_rev.max(item.cloud_revision.max(0));
+                let existing = guard.user_creations.get(&item.creation_id);
+                if should_apply_creation_update(existing, item) {
+                    guard
+                        .user_creations
+                        .insert(item.creation_id.clone(), item.clone());
+                }
+            }
+            let updated_rev = guard
+                .creations_last_revision
+                .max(latest_revision.max(0))
+                .max(max_item_rev);
+            guard.creations_last_revision = updated_rev;
+            guard.cache_meta.insert(
+                META_CREATIONS_LAST_REVISION.to_string(),
+                updated_rev.to_string(),
+            );
+            updated_rev
+        };
+        if let Some(db) = &self.sqlite {
+            if let Ok(db_rev) = db.apply_creations_sync_delta(latest_revision, items) {
+                next_rev = next_rev.max(db_rev);
+                let mut guard = self.state.write();
+                guard.creations_last_revision = guard.creations_last_revision.max(next_rev);
+                let synced = guard.creations_last_revision;
+                guard
+                    .cache_meta
+                    .insert(META_CREATIONS_LAST_REVISION.to_string(), synced.to_string());
+            }
+        }
+        next_rev
+    }
+
+    pub fn load_user_creations(
+        &self,
+        kind: Option<CreationKind>,
+        status: Option<CreationReviewStatus>,
+    ) -> Vec<UserCreationDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(items) = db.load_user_creations(kind, status) {
+                return items;
+            }
+        }
+        let guard = self.state.read();
+        let mut items: Vec<UserCreationDto> = guard
+            .user_creations
+            .values()
+            .filter(|item| item.deleted_at_ms.is_none())
+            .filter(|item| kind.map_or(true, |k| item.kind == k))
+            .filter(|item| status.map_or(true, |s| item.review_status == s))
+            .cloned()
+            .collect();
+        sort_user_creations(&mut items);
+        items
+    }
+
+    pub fn get_user_creation(&self, creation_id: &str) -> Option<UserCreationDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(found) = db.get_user_creation(creation_id) {
+                return found;
+            }
+        }
+        self.state
+            .read()
+            .user_creations
+            .get(creation_id)
+            .filter(|item| item.deleted_at_ms.is_none())
+            .cloned()
+    }
+
+    pub fn upsert_user_creation_state(&self, state: UserCreationStateDto) {
+        {
+            let mut guard = self.state.write();
+            let should_apply = guard
+                .user_creation_states
+                .get(&state.creation_id)
+                .map_or(true, |prev| state.updated_at_ms >= prev.updated_at_ms);
+            if should_apply {
+                guard
+                    .user_creation_states
+                    .insert(state.creation_id.clone(), state.clone());
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_user_creation_state(&state);
+        }
+    }
+
+    pub fn upsert_user_creation_states(&self, states: &[UserCreationStateDto]) {
+        if states.is_empty() {
+            return;
+        }
+        {
+            let mut guard = self.state.write();
+            for state in states {
+                let should_apply = guard
+                    .user_creation_states
+                    .get(&state.creation_id)
+                    .map_or(true, |prev| state.updated_at_ms >= prev.updated_at_ms);
+                if should_apply {
+                    guard
+                        .user_creation_states
+                        .insert(state.creation_id.clone(), state.clone());
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_user_creation_states(states);
+        }
+    }
+
+    pub fn load_user_creation_states(&self) -> Vec<UserCreationStateDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(items) = db.load_user_creation_states() {
+                return items;
+            }
+        }
+        let mut items: Vec<UserCreationStateDto> = self
+            .state
+            .read()
+            .user_creation_states
+            .values()
+            .cloned()
+            .collect();
+        sort_user_creation_states(&mut items);
+        items
+    }
+
+    pub fn get_user_creation_state(&self, creation_id: &str) -> Option<UserCreationStateDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(found) = db.get_user_creation_state(creation_id) {
+                return found;
+            }
+        }
+        self.state
+            .read()
+            .user_creation_states
+            .get(creation_id)
+            .cloned()
+    }
+
+    pub fn upsert_public_catalog_items(&self, items: &[PublicCatalogItemDto]) {
+        if items.is_empty() {
+            return;
+        }
+        let cached_at_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut guard = self.state.write();
+            for item in items {
+                guard
+                    .public_catalog
+                    .insert(item.creation_id.clone(), (item.clone(), cached_at_ms));
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_public_catalog_items(items, cached_at_ms);
+        }
+    }
+
+    pub fn remove_public_catalog_item(&self, creation_id: &str) -> bool {
+        let mut removed = {
+            let mut guard = self.state.write();
+            guard.public_catalog.remove(creation_id).is_some()
+        };
+        if let Some(db) = &self.sqlite {
+            if let Ok(db_removed) = db.remove_public_catalog_item(creation_id) {
+                removed = removed || db_removed;
+            }
+        }
+        removed
+    }
+
+    pub fn load_public_catalog_items(
+        &self,
+        kind: Option<CreationKind>,
+    ) -> Vec<PublicCatalogItemDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(items) = db.load_public_catalog_items(kind) {
+                return items;
+            }
+        }
+        let guard = self.state.read();
+        let mut items: Vec<PublicCatalogItemDto> = guard
+            .public_catalog
+            .values()
+            .map(|(item, _)| item)
+            .filter(|item| kind.map_or(true, |k| item.kind == k))
+            .cloned()
+            .collect();
+        sort_public_catalog_items(&mut items);
+        items
     }
 }

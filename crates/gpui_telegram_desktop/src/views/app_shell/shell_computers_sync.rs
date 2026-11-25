@@ -28,7 +28,7 @@ use crate::platform::mac::macos_permissions_drag::{
 use crate::platform::mac::tray_mac::tray_action_ids;
 use crate::views::app_shell::desktop_ipc_host::DesktopLocalIpcHandler;
 use crate::views::app_shell::shell_actions::resolve_active_target_chat_id;
-use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand};
+use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand, WorkbenchTab};
 use crate::views::drawer::inspector_tabs::{InspectorAction, InspectorSubpage};
 use crate::views::remote_controlled_window::{
     RemoteControlledWindowAction, open_controlled_status_window,
@@ -927,19 +927,42 @@ impl AppShell {
         });
 
         let nid_for_obs = node_id.clone();
+        let mut prev_term_focus: Option<(WorkbenchTab, bool, bool, Option<usize>)> = None;
         cx.observe(&overlay, move |shell, ov, cx| {
-            let (close, cmds) = ov.update(cx, |w, _| (w.should_close, w.take_commands()));
+            let (close, cmds, cur_term_focus) = ov.update(cx, |w, wcx| {
+                let (pty_focused, renaming_tab) = w
+                    .terminal_view
+                    .as_ref()
+                    .map(|t| {
+                        let tv = t.read(wcx);
+                        (tv.is_focused, tv.renaming_tab_index)
+                    })
+                    .unwrap_or((false, None));
+                let focus = (w.active_tab == WorkbenchTab::RemoteTerminal
+                    && (w.terminal_focused || pty_focused || renaming_tab.is_some()))
+                    .then_some((w.active_tab, w.terminal_focused, pty_focused, renaming_tab));
+                (w.should_close, w.take_commands(), focus)
+            });
             if close {
                 hide_drag_hud();
                 shell.hide_remote_computer(cx);
                 return;
             }
+            if shell.is_authenticated
+                && !shell.overlays.is_passcode_locked
+                && (prev_term_focus.is_some() || cur_term_focus.is_some())
+                && cur_term_focus != prev_term_focus
+            {
+                shell.clear_all_ime_preedits(cx);
+            }
+            prev_term_focus = cur_term_focus;
             for command in cmds {
                 shell.handle_workbench_command(nid_for_obs.clone(), command, ov.clone(), cx);
             }
         })
         .detach();
 
+        self.prepare_for_computer_overlay_open(cx);
         self.overlays.computer_overlay = Some(overlay.clone());
         if !defer_initial_capture {
             self.handle_workbench_command(node_id, WorkbenchCommand::RefreshScreen, overlay, cx);
@@ -1690,7 +1713,9 @@ impl AppShell {
             });
             scx.notify();
         });
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         self.active_panel = ActiveWorkspacePanel::Settings;
+        self.sync_apple_sidebar_to_active_panel(cx);
         self.refresh_computers(cx);
         cx.notify();
     }

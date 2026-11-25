@@ -35,6 +35,7 @@ pub mod shell_calls_rtc;
 pub mod shell_coding_host;
 pub mod shell_composer_actions;
 pub mod shell_computers_sync;
+pub mod shell_content_hub;
 pub mod shell_dialogs_fetch;
 pub mod shell_hermes_studio_sync;
 pub mod shell_input_ime;
@@ -125,6 +126,7 @@ pub use shell_actions::{
     shell_tasks_to_acp_entries,
 };
 pub use shell_bot_browser::ShellBotBrowserState;
+pub use shell_content_hub::ShellContentHubState;
 pub use shell_panels::{
     localized_panel_label, parse_acp_tasks, parse_mcp_servers, parse_mcp_tools,
     render_empty_panel_notice, render_panel_header, ShellAcpTaskRow, ShellMcpServerRow,

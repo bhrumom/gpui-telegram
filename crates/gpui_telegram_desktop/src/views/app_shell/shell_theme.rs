@@ -9,8 +9,9 @@ use crate::views::boxes::peers::create_managed_bot_box::CreateManagedBotBoxPeers
 use crate::views::settings::SettingsRouter;
 use crate::views::tdesktop_theme::resolve_desktop_palette;
 use crate::views::{
-    CallOverlay, CanonicalComposer, ChatSidebar, ComputerWorkbench, ContextInspector,
-    ConversationStage, GlobalTasksWorkspace, IvViewer, MainMenuDrawer, MediaViewer, NavRail,
+    AppleAppSidebar, CallOverlay, CanonicalComposer, ChatSidebar, ComputerWorkbench,
+    ContentHubWorkspace, ContextInspector, ConversationStage, GlobalTasksWorkspace, IvViewer,
+    MainMenuDrawer, MediaViewer, NavRail,
 };
 
 /// Maps persisted app preferences and optional desktop mode override into a full theme palette.
@@ -106,6 +107,8 @@ pub fn toggle_desktop_theme_mode(current: TdesktopThemeMode) -> TdesktopThemeMod
 /// Immutable slice of all desktop view entities managed by `AppShell` for dynamic theme/locale sync.
 pub struct ShellThemeTargets<'a> {
     pub nav_rail: &'a Entity<NavRail>,
+    pub apple_sidebar: &'a Entity<AppleAppSidebar>,
+    pub content_hub: &'a Entity<ContentHubWorkspace>,
     pub main_menu_drawer: &'a Entity<MainMenuDrawer>,
     pub sidebar: &'a Entity<ChatSidebar>,
     pub stage: &'a Entity<ConversationStage>,
@@ -147,6 +150,8 @@ pub fn propagate_theme_and_locale<V: 'static>(
         palette,
         lang_id,
         targets.nav_rail,
+        targets.apple_sidebar,
+        targets.content_hub,
         targets.main_menu_drawer,
         targets.sidebar,
         targets.inspector,

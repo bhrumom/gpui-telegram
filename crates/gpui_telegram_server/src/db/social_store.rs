@@ -79,8 +79,19 @@ impl ServerDatabase {
     pub fn user_can_access_media(&self, user_id: UserId, media_id: &str) -> Result<bool> {
         let Some((_, uploader, chat_opt)) = self.get_media_file(media_id)? else { return Ok(true); };
         if uploader == user_id { return Ok(true); }
-        if let Some(cid) = chat_opt { return self.is_user_in_chat(cid, user_id); }
-        Ok(false)
+        if let Some(cid) = chat_opt {
+            if self.is_user_in_chat(cid, user_id)? {
+                return Ok(true);
+            }
+        }
+        self.pool.with_reader(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM creation_public_assets WHERE media_id = ?1)",
+                params![media_id],
+                |r| r.get(0),
+            )
+            .map_db()
+        })
     }
 
     pub fn seed_default_catalog_if_empty(&self) -> Result<()> {

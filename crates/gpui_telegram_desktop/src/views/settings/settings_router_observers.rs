@@ -59,7 +59,9 @@ impl SettingsRouter {
     ) {
         cx.observe(
             ent,
-            |_, si: Entity<SettingsInformationSections>, cx: &mut Context<SettingsRouter>| {
+            |router: &mut SettingsRouter,
+             si: Entity<SettingsInformationSections>,
+             cx: &mut Context<SettingsRouter>| {
                 let (do_save, do_logout, first_name, last_name, uname, phone, bio) =
                     si.update(cx, |s, _| {
                         let save = std::mem::take(&mut s.pending_save_profile);
@@ -78,6 +80,7 @@ impl SettingsRouter {
                     cx.emit(SettingsRouterEvent::LogoutRequested);
                     return;
                 }
+                router.sync_active_input_key(cx);
                 if do_save {
                     let username = (!uname.trim().is_empty()).then_some(uname);
                     cx.emit(SettingsRouterEvent::SaveProfile {
@@ -253,6 +256,7 @@ impl SettingsRouter {
                         s.pending_vault_action.take(),
                     )
                 });
+                router.sync_active_input_key(cx);
                 if let Some(sec) = nav_sec {
                     router.navigate_to(sec, false, cx);
                 }
@@ -502,6 +506,7 @@ impl SettingsRouter {
                         },
                     )
                 });
+                router.sync_active_input_key(cx);
                 if let Some(tags_enabled) = prefs_sync {
                     router.preferences.folder_tags_enabled = tags_enabled;
                     cx.emit(SettingsRouterEvent::UpdateFolderTags(tags_enabled));
@@ -915,7 +920,9 @@ impl SettingsRouter {
             |router: &mut SettingsRouter,
              sc: Entity<SettingsComputersSections>,
              cx: &mut Context<SettingsRouter>| {
-                if let Some(ev) = sc.update(cx, |s, _| s.take_event()) {
+                let ev = sc.update(cx, |s, _| s.take_event());
+                router.sync_active_input_key(cx);
+                if let Some(ev) = ev {
                     cx.emit(SettingsRouterEvent::Computers(ev));
                     cx.notify();
                 }
@@ -931,10 +938,12 @@ impl SettingsRouter {
     ) {
         cx.observe(
             ent,
-            |_router: &mut SettingsRouter,
+            |router: &mut SettingsRouter,
              ap: Entity<SettingsAiProvidersSections>,
              cx: &mut Context<SettingsRouter>| {
-                if let Some(ev) = ap.update(cx, |s, _| s.take_event()) {
+                let ev = ap.update(cx, |s, _| s.take_event());
+                router.sync_active_input_key(cx);
+                if let Some(ev) = ev {
                     cx.emit(SettingsRouterEvent::AiProviders(ev));
                     cx.notify();
                 }
@@ -950,7 +959,9 @@ impl SettingsRouter {
             |router: &mut SettingsRouter,
              ss: Entity<SettingsSearch>,
              cx: &mut Context<SettingsRouter>| {
-                if let Some(target) = ss.update(cx, |s, _| s.take_selected_section()) {
+                let target = ss.update(cx, |s, _| s.take_selected_section());
+                router.sync_active_input_key(cx);
+                if let Some(target) = target {
                     router.navigate_to(target, false, cx);
                 }
             },

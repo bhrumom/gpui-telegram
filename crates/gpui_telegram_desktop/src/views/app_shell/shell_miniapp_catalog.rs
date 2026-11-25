@@ -261,16 +261,15 @@ fn clear_bot_composer_and_inspector(
 }
 
 fn activate_chats_workspace(shell: &mut AppShell, cx: &mut Context<AppShell>) {
+    shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
+    shell.cleanup_settings_panel_if_active(cx);
     shell.active_panel = ActiveWorkspacePanel::Chats;
-    shell.last_handled_nav_dest = Some(NavDestination::Chats);
-    shell.nav_rail.update(cx, |r, r_cx| {
-        r.set_active_destination(NavDestination::Chats);
-        r_cx.notify();
-    });
+    shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
     shell.main_menu_drawer.update(cx, |m, m_cx| {
         m.close();
         m_cx.notify();
     });
+    shell.sync_apple_sidebar_to_active_panel(cx);
 }
 
 impl AppShell {
@@ -687,6 +686,21 @@ impl AppShell {
                         ("mybots".into(), tr_str(&lang, "管理我的机器人", "Manage my bots").into()),
                         ("myapps".into(), tr_str(&lang, "管理我的小程序", "Manage my apps").into()),
                     ]
+                } else if bot_id == gpui_telegram_proto::creations::CREATOR_STUDIO_BOT_USER_ID as u64
+                    || bot_username.eq_ignore_ascii_case(
+                        gpui_telegram_proto::creations::CREATOR_STUDIO_BOT_USERNAME,
+                    )
+                {
+                    vec![
+                        ("newbook".into(), tr_str(&lang, "创作图书并保存到云端", "Create a cloud book").into()),
+                        ("newmusic".into(), tr_str(&lang, "创作音乐并保存到云端", "Create a cloud music track").into()),
+                        ("newgame".into(), tr_str(&lang, "创作小游戏并保存到云端", "Create a playable cloud game").into()),
+                        ("mycreations".into(), tr_str(&lang, "查看我的云端作品", "List my cloud creations").into()),
+                        ("editwork".into(), tr_str(&lang, "编辑已有云端作品", "Edit an existing creation").into()),
+                        ("submitwork".into(), tr_str(&lang, "提交作品审核上架", "Submit creation for review").into()),
+                        ("recommend".into(), tr_str(&lang, "推荐公开上架内容", "Recommend published creations").into()),
+                        ("help".into(), tr_str(&lang, "查看创作工作室帮助", "Creator Studio help").into()),
+                    ]
                 } else {
                     Vec::new()
                 }
@@ -875,9 +889,12 @@ impl AppShell {
                     .filter(|s| !s.trim().is_empty())
             });
         let stage_has_msgs = !self.stage.read(cx).messages.is_empty();
+        let has_composer_draft = !self.composer.read(cx).text().trim().is_empty();
         let is_prestart = prestart_opt.is_some();
         let show_start_bar = is_prestart
-            || (!stage_has_msgs && cached_profile.is_some_and(|p| !p.has_started_chat));
+            || (!stage_has_msgs
+                && !has_composer_draft
+                && cached_profile.is_some_and(|p| !p.has_started_chat));
         let desc_card = if show_start_bar || !stage_has_msgs {
             desc_text
         } else {
@@ -1171,6 +1188,12 @@ impl AppShell {
         custom_url: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if custom_url
+            .as_deref()
+            .is_some_and(|u| self.try_handle_or_swallow_apple_deep_link(u, false, cx))
+        {
+            return;
+        }
         let bot_un = bot_username.trim().trim_start_matches('@').to_string();
         let short = short_name.trim().to_string();
         if bot_un.is_empty() || short.is_empty() {
@@ -1261,6 +1284,7 @@ impl AppShell {
             .unwrap_or_else(|| short.clone());
         let app_id = app_opt.as_ref().map(|a| a.app_id.clone());
 
+        self.prepare_for_lower_z_overlay_open(cx);
         self.miniapps.pending_miniapp_confirm = Some(PendingMiniAppConfirm {
             bot_id,
             bot_username: bot_un,
@@ -1475,9 +1499,10 @@ impl AppShell {
             .unwrap_or((false, false));
 
         if already_matches {
-            if let Some(ref ov) = self.miniapps.miniapp_overlay {
+            if let Some(ov) = self.miniapps.miniapp_overlay.clone() {
                 let open_now = ov.read(cx).is_open;
                 if want_takeover {
+                    self.prepare_for_miniapp_overlay_open(cx);
                     self.miniapps.is_miniapp_minimized = false;
                 } else if !open_now {
                     self.miniapps.is_miniapp_minimized = true;
@@ -1501,6 +1526,7 @@ impl AppShell {
         if in_flight_same_app {
             self.miniapps.pending_webmcp_commands.push_back(cmd);
             if want_takeover {
+                self.prepare_for_miniapp_overlay_open(cx);
                 self.miniapps.is_miniapp_minimized = false;
                 if let Some(ref ov) = self.miniapps.miniapp_overlay {
                     ov.update(cx, |w, wcx| {
@@ -1542,6 +1568,7 @@ impl AppShell {
             cx,
         );
         if want_takeover {
+            self.prepare_for_miniapp_overlay_open(cx);
             self.miniapps.is_miniapp_minimized = false;
         } else {
             self.miniapps.is_miniapp_minimized = true;
@@ -1639,8 +1666,9 @@ impl AppShell {
         } else {
             Vec::new()
         };
-        self.miniapps.is_miniapp_minimized = false;
         self.miniapps.pending_miniapp_confirm = None;
+        self.prepare_for_miniapp_overlay_open(cx);
+        self.miniapps.is_miniapp_minimized = false;
         ov.update(cx, |w, w_cx| {
             w.is_open = true;
             w.is_floating_pip = false;
@@ -1711,6 +1739,12 @@ impl AppShell {
         force_reload: bool,
         cx: &mut Context<Self>,
     ) {
+        if custom_url
+            .as_deref()
+            .is_some_and(|u| self.try_handle_or_swallow_apple_deep_link(u, false, cx))
+        {
+            return;
+        }
         let bot_un = bot_username.trim().trim_start_matches('@').to_string();
         let short = short_name.trim().to_string();
         if bot_un.is_empty() || short.is_empty() {
@@ -1733,6 +1767,7 @@ impl AppShell {
         {
             return;
         }
+        self.prepare_for_miniapp_overlay_open(cx);
         let server_base = self.client.http_client.base_url.clone();
         let launch_gen = self.miniapps.bump_launch_generation();
         let ov = self.ensure_miniapp_overlay(cx);
@@ -1894,6 +1929,7 @@ impl AppShell {
                         shell.miniapps.miniapp_overlay = None;
                         shell.miniapps.is_miniapp_minimized = false;
                         shell.miniapps.floating_pip_status = None;
+                        shell.clear_ime_if_miniapp_unoccluded(cx);
                         shell.show_toast(
                             format!("Mini App launch failed: {}", e),
                             2600,
@@ -2031,6 +2067,9 @@ impl AppShell {
         launch_mode: MiniAppLaunchMode,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.try_handle_or_swallow_apple_deep_link(raw_uri, false, cx) {
+            return true;
+        }
         let custom_url = sanitize_webapp_custom_url(raw_uri);
         if let Some((bot_un, short_name, start_param)) = parse_miniapp_uri(raw_uri) {
             self.dispatch_miniapp_launch_target(
@@ -2103,6 +2142,9 @@ impl AppShell {
         launch_mode: MiniAppLaunchMode,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.try_handle_or_swallow_apple_deep_link(raw_uri, false, cx) {
+            return true;
+        }
         if let Some((bot_un, short_name, start_param)) = parse_miniapp_uri(raw_uri) {
             let custom_url = sanitize_webapp_custom_url(raw_uri);
             self.dispatch_miniapp_launch_target(
@@ -2158,6 +2200,9 @@ impl AppShell {
         url: &str,
         cx: &mut Context<Self>,
     ) {
+        if self.try_handle_or_swallow_apple_deep_link(url, false, cx) {
+            return;
+        }
         let active_chat = resolve_active_target_chat_id(
             self.stage.read(cx).active_chat_id,
             self.sidebar.read(cx).active_chat_id,
@@ -2304,6 +2349,7 @@ impl AppShell {
         prof: BotPublicProfileDto,
         cx: &mut Context<Self>,
     ) {
+        self.prepare_for_lower_z_overlay_open(cx);
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
         if let Some(ref existing) = self.miniapps.bot_profile_box {

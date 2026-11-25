@@ -246,13 +246,14 @@ fn attach_media_viewer_overlay(
     lang: &'static str,
     cx: &mut Context<AppShell>,
 ) {
+    shell.prepare_for_media_or_call_overlay_open(cx);
     viewer.apply_theme(shell.theme_state.palette, lang);
     let overlay = cx.new(|_| viewer);
     cx.observe(
         &overlay,
         |shell: &mut AppShell, ov: gpui::Entity<MediaViewer>, cx: &mut Context<AppShell>| {
             if ov.read(cx).should_close {
-                shell.hide_media_viewer();
+                shell.close_media_viewer(cx);
                 cx.notify();
             }
         },
@@ -319,6 +320,8 @@ impl AppShell {
         self.theme_state.palette = pal;
         let targets = ShellThemeTargets {
             nav_rail: &self.nav_rail,
+            apple_sidebar: &self.apple_sidebar,
+            content_hub: &self.content_hub,
             main_menu_drawer: &self.main_menu_drawer,
             sidebar: &self.sidebar,
             stage: &self.stage,
@@ -346,6 +349,7 @@ impl AppShell {
         wallpaper: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let was_apple = self.theme_state.palette.is_apple_style();
         self.theme_state.theme_mode = mode;
         if let Some(a) = accent {
             self.theme_state.accent_color = Some(a);
@@ -359,6 +363,23 @@ impl AppShell {
             p.appearance.theme_mode = mapped;
             p.appearance.chat_preset = mode.as_name().to_string();
         });
+        let now_apple = self.theme_state.palette.is_apple_style();
+        if was_apple && !now_apple && self.sidebar.read(cx).is_plus_menu_open {
+            if !self.has_blocking_modal_or_fullscreen_overlay_for_shortcuts(cx) {
+                self.clear_all_ime_preedits(cx);
+            }
+            self.sidebar.update(cx, |sb, sb_cx| {
+                sb.exit_compose_mode();
+                sb_cx.notify();
+            });
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
+                self.exit_compose_or_modal_isolation(true, cx);
+            } else {
+                self.sync_compose_state_to_composer(true, cx);
+            }
+        }
     }
 
     /// Flushes any pending unsaved composer draft for `chat_id` immediately (e.g. on chat switch).
@@ -837,7 +858,9 @@ impl AppShell {
         self.sidebar.update(cx, |sb, sb_cx| {
             let dlg_flags = sb.dialogs.iter().find(|d| d.id == chat_id).map(|d| (d.is_muted, d.is_pinned));
             self.stage.update(sb_cx, |st, st_cx| {
-                self.inspector.update(st_cx, |insp, _| {
+                let had_stage_focus = st.search_open || st.active_bot_card_field.is_some();
+                self.inspector.update(st_cx, |insp, insp_cx| {
+                    let had_insp_focus = insp.is_bot_input_active();
                     selected = select_authoritative_dialog(sb, st, insp, chat_id);
                     if selected {
                         if let Some((muted, pinned)) = dlg_flags {
@@ -860,9 +883,14 @@ impl AppShell {
                         {
                             insp.profile.avatar_initials = fixed_init;
                         }
+                        if had_insp_focus && !insp.is_bot_input_active() {
+                            insp_cx.notify();
+                        }
                     }
                 });
-                if selected && prev_chat_id != Some(chat_id) {
+                let stage_focus_cleared =
+                    had_stage_focus && !(st.search_open || st.active_bot_card_field.is_some());
+                if selected && (prev_chat_id != Some(chat_id) || stage_focus_cleared) {
                     st_cx.notify();
                 }
             });
@@ -1325,6 +1353,9 @@ impl AppShell {
 
     /// Dispatches Hermes inline callback commands, approvals, Talk Mode, Remote Computer, or Mini-Apps.
     pub fn execute_hermes_inline_callback(&mut self, raw_action: String, cx: &mut Context<Self>) {
+        if self.try_handle_or_swallow_apple_deep_link(&raw_action, true, cx) {
+            return;
+        }
         let trimmed = raw_action.trim().to_string();
         let lower = trimmed.to_ascii_lowercase();
         let lang = self.active_lang_id();
@@ -1373,7 +1404,11 @@ impl AppShell {
         }
 
         if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("url:") {
-            let url = trimmed.trim_start_matches("url:").to_string();
+            let url = if lower.starts_with("url:") {
+                trimmed.get(4..).unwrap_or("").trim().to_string()
+            } else {
+                trimmed.clone()
+            };
             cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
             self.show_toast(
                 format!("{}: {}", tr_str(lang, "已复制链接", "Copied URL"), url),
@@ -1478,7 +1513,7 @@ impl AppShell {
         );
         let (
             (call_v, call_vid),
-            (media_single, media_gal, iv_url),
+            (media_single, open_url_req, media_gal, iv_url),
             (edit_req, fwd_ids, del_ids, pin_req, tr_id, poll_vote, react_reqs),
             (voice_play, dl_req, drops, open_prof),
             (clear_hist, export_chat, toggle_mute, change_wallpaper, toggle_pin_chat, set_ttl_secs, toggle_block_peer, delete_or_leave_chat),
@@ -1486,7 +1521,7 @@ impl AppShell {
         ) = self.stage.update(cx, |st, _| {
             (
                 (mem::take(&mut st.pending_call_request), mem::take(&mut st.pending_video_call)),
-                (st.pending_media_url.take(), st.pending_media_viewer.take(), st.pending_iv_url.take()),
+                (st.pending_media_url.take(), st.pending_open_url.take(), st.pending_media_viewer.take(), st.pending_iv_url.take()),
                 (
                     st.pending_edit_message.take(), st.pending_forward_message_ids.take(),
                     st.pending_delete_message_ids.take(), st.pending_pin_toggle.take(),
@@ -1523,34 +1558,90 @@ impl AppShell {
                 );
             }
         }
+        if let Some(url) = open_url_req {
+            if !self.try_handle_or_swallow_apple_deep_link(&url, false, cx)
+                && !self.handle_deep_link(&url, cx)
+                && !self.launch_miniapp_from_uri(
+                    &url,
+                    active_chat,
+                    MiniAppLaunchMode::DirectLink,
+                    cx,
+                )
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+                self.show_toast(
+                    format!("{}: {}", tr_str(lang, "已复制链接", "Copied URL"), url),
+                    2400,
+                    cx,
+                );
+            }
+        }
         if let Some((items, idx)) = media_gal {
-            let mv_items = items
-                .into_iter()
-                .enumerate()
-                .map(|(i, (url, is_video, caption))| MediaViewerItem {
-                    id: i as u64 + 1, url, is_video, caption,
-                    sender_name: String::new(), date: String::new(), duration_secs: None,
-                })
-                .collect();
-            attach_media_viewer_overlay(self, MediaViewer::from_gallery(mv_items, idx), lang, cx);
+            let active_url = items
+                .get(idx)
+                .map(|(u, _, _)| u.clone())
+                .or_else(|| media_single.as_ref().map(|(u, _)| u.clone()));
+            let handled_active = active_url
+                .as_deref()
+                .is_some_and(|u| self.try_handle_or_swallow_apple_deep_link(u, false, cx));
+            if !handled_active {
+                let mut adjusted_idx = 0usize;
+                let mut mv_items = Vec::new();
+                for (orig_i, (url, is_video, caption)) in items.into_iter().enumerate() {
+                    if crate::views::app_shell::shell_content_hub::is_apple_deep_link_candidate(&url)
+                    {
+                        continue;
+                    }
+                    if orig_i == idx {
+                        adjusted_idx = mv_items.len();
+                    }
+                    mv_items.push(MediaViewerItem {
+                        id: mv_items.len() as u64 + 1,
+                        url,
+                        is_video,
+                        caption,
+                        sender_name: String::new(),
+                        date: String::new(),
+                        duration_secs: None,
+                    });
+                }
+                if !mv_items.is_empty() {
+                    attach_media_viewer_overlay(
+                        self,
+                        MediaViewer::from_gallery(mv_items, adjusted_idx),
+                        lang,
+                        cx,
+                    );
+                }
+            }
         } else if let Some((url, is_vid)) = media_single {
-            attach_media_viewer_overlay(self, MediaViewer::new(url, is_vid), lang, cx);
+            if !self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                attach_media_viewer_overlay(self, MediaViewer::new(url, is_vid), lang, cx);
+            }
         }
         if let Some((url, title)) = iv_url {
-            let pal = self.theme_state.palette;
-            let overlay = cx.new(|_| { let mut iv = IvViewer::new(url, title); iv.apply_theme(pal, lang); iv });
-            cx.observe(&overlay, |shell: &mut AppShell, ov: gpui::Entity<IvViewer>, cx: &mut Context<AppShell>| {
-                let (close, share) = ov.update(cx, |v, _| (v.should_close, v.pending_share_url.take()));
-                if let Some(u) = share {
-                    shell.append_outgoing_text(u, cx);
-                }
-                if close {
-                    shell.overlays.iv_viewer_overlay = None;
-                    cx.notify();
-                }
-            })
-            .detach();
-            self.overlays.iv_viewer_overlay = Some(overlay);
+            if !self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                self.prepare_for_media_or_call_overlay_open(cx);
+                let pal = self.theme_state.palette;
+                let overlay = cx.new(|_| { let mut iv = IvViewer::new(url, title); iv.apply_theme(pal, lang); iv });
+                cx.observe(&overlay, |shell: &mut AppShell, ov: gpui::Entity<IvViewer>, cx: &mut Context<AppShell>| {
+                    let (close, share) = ov.update(cx, |v, _| (v.should_close, v.pending_share_url.take()));
+                    if let Some(u) = share {
+                        if !shell.try_handle_or_swallow_apple_deep_link(&u, false, cx) {
+                            shell.append_outgoing_text(u, cx);
+                        }
+                    }
+                    if close {
+                        shell.overlays.iv_viewer_overlay = None;
+                        shell.clear_ime_if_below_z5_unoccluded(cx);
+                        cx.notify();
+                    }
+                })
+                .detach();
+                self.overlays.iv_viewer_overlay = Some(overlay);
+            }
         }
         if let Some((mid, existing)) = edit_req {
             self.composer.update(cx, |c, _| c.begin_edit(mid, existing));
@@ -1608,15 +1699,17 @@ impl AppShell {
             }
         }
         if let Some((url, name)) = dl_req {
-            let c = self.client.clone();
-            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                let _ = c.download_media_range(&url, 0, None).await;
-                let _ = weak.update(app, |s, cx| {
-                    let pfx = tr_str(s.active_lang_id(), "已保存文件", "Saved");
-                    s.show_toast(format!("{pfx}: {name}"), 2500, cx);
-                });
-            })
-            .detach();
+            if !self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                let c = self.client.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let _ = c.download_media_range(&url, 0, None).await;
+                    let _ = weak.update(app, |s, cx| {
+                        let pfx = tr_str(s.active_lang_id(), "已保存文件", "Saved");
+                        s.show_toast(format!("{pfx}: {name}"), 2500, cx);
+                    });
+                })
+                .detach();
+            }
         }
         if let Some(paths) = drops {
             self.upload_and_send_paths(paths, cx);

@@ -2,6 +2,7 @@ pub mod api_acp;
 pub mod api_auth;
 pub mod api_chats;
 pub mod api_computers;
+pub mod api_creations;
 pub mod api_e2ee;
 pub mod api_features;
 pub mod api_miniapps;
@@ -15,6 +16,17 @@ pub mod ws_channel;
 pub mod ws_transport;
 
 pub use api_chats::SendAsPeerDto;
+pub use api_creations::{BotInlineQueryResponse, BotInlineQueryResultDto};
+pub use gpui_telegram_proto::creations::{
+    AppStoreCatalogResponse, AppStoreMiniAppEntry, BotRecommendationItem, CatalogQueryResponse,
+    CatalogRecommendResponse, CatalogSortMode, CoverArtwork, CreateCreationRequest,
+    CreateCreationReviewRequest, CreationAuditListResponse, CreationKind, CreationListResponse,
+    CreationPayload, CreationReviewAuditDto, CreationReviewEntryDto, CreationReviewStatus,
+    CreationReviewsResponse, CreationSyncResponse, CreationVisibility, GameLeaderboardEntryDto,
+    GameLeaderboardResponse, PublicCatalogItemDto, ReviewDecision, ReviewDecisionRequest,
+    SubmitGameScoreRequest, SubmitReviewRequest, SubmitReviewResponse, UpdateCreationRequest,
+    UpsertCreationStateRequest, UserCreationDto, UserCreationStateDto, UserCreationStatesResponse,
+};
 pub use proxy::{ClientProxyConfig, ClientProxyType, ProxyHealthReport};
 
 pub use api_computers::{

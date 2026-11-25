@@ -41,6 +41,18 @@ impl DeepLinksRouterDeepLinks {
     /// Parses command string into structured DeepLinkContext.
     /// E.g. "tg://resolve?domain=telegram&post=1" -> section: "resolve", params: { domain: "telegram", post: "1" }
     pub fn parse_command(command: &str, has_session: bool) -> DeepLinkContext {
+        if let Some(apple) = super::apple_deep_link::parse_apple_deep_link(command) {
+            return super::apple_deep_link::to_deep_link_context(&apple, has_session);
+        }
+        if super::apple_deep_link::is_apple_deep_link_candidate(command) {
+            return DeepLinkContext {
+                section: "apple".to_string(),
+                path: String::new(),
+                params: HashMap::new(),
+                has_active_session: has_session,
+            };
+        }
+
         let trimmed = command
             .trim()
             .trim_start_matches("tg://")
@@ -75,6 +87,15 @@ impl DeepLinksRouterDeepLinks {
             None => (clean_path.to_ascii_lowercase(), String::new()),
         };
 
+        if section == "apple" {
+            return DeepLinkContext {
+                section: "apple".to_string(),
+                path: String::new(),
+                params: HashMap::new(),
+                has_active_session: has_session,
+            };
+        }
+
         DeepLinkContext {
             section,
             path,
@@ -87,6 +108,12 @@ impl DeepLinksRouterDeepLinks {
     pub fn dispatch(&self, ctx: &DeepLinkContext) -> (DeepLinkResult, bool) {
         if ctx.section.is_empty() {
             return (DeepLinkResult::NotFound, false);
+        }
+
+        if ctx.section.eq_ignore_ascii_case("apple")
+            && super::apple_deep_link::validate_apple_context(ctx).is_none()
+        {
+            return (DeepLinkResult::Unsupported, false);
         }
 
         let entries = match self.routes.get(&ctx.section) {
@@ -123,6 +150,10 @@ impl DeepLinksRouterDeepLinks {
         let ctx = Self::parse_command(command, has_session);
         let (result, _skip_activation) = self.dispatch(&ctx);
         matches!(result, DeepLinkResult::Handled)
+    }
+
+    pub fn parse_apple_deep_link(command: &str) -> Option<super::apple_deep_link::AppleDeepLink> {
+        super::apple_deep_link::parse_apple_deep_link(command)
     }
 
     fn execute_action(&self, action: &DeepLinkAction, ctx: &DeepLinkContext) -> DeepLinkResult {
@@ -235,6 +266,9 @@ impl DeepLinksRouterDeepLinks {
                 skip_activation: false,
             },
         );
+
+        // Apple Hub (Books, Music, Games, App Store, My Creations)
+        super::apple_deep_link::DeepLinksAppleDeepLinks::register(self);
     }
 }
 

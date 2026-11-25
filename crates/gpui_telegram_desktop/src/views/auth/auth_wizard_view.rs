@@ -147,8 +147,7 @@ impl AuthWizardView {
         self.login_step = LoginWizardStep::Start;
         self.verification_code.clear();
         self.login_error = None;
-        self.ime.clear_preedit();
-        self.ime.just_committed_ime = false;
+        self.ime.clear_ime_state();
         self.editing_server_url = false;
         self.server_url_draft = server_url;
         self.alipay_poll_generation = self.alipay_poll_generation.wrapping_add(1);
@@ -205,7 +204,7 @@ impl AuthWizardView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    this.ime.clear_preedit();
+                    this.ime.clear_ime_state();
                     this.active_login_field = field;
                     this.focus_handle.focus(window);
                     cx.notify();
@@ -263,7 +262,7 @@ impl AuthWizardView {
                                         MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             this.clear_specific_login_field(field);
-                                            this.ime.clear_preedit();
+                                            this.ime.clear_ime_state();
                                             this.active_login_field = field;
                                             this.focus_handle.focus(window);
                                             cx.stop_propagation();
@@ -447,6 +446,7 @@ impl AuthWizardView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
+                                this.ime.clear_ime_state();
                                 this.editing_server_url = false;
                                 this.server_url_draft = this.client.config.server_url.clone();
                                 cx.notify();
@@ -475,6 +475,7 @@ impl AuthWizardView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
+                        this.ime.clear_ime_state();
                         this.server_url_draft = this.client.config.server_url.clone();
                         this.editing_server_url = true;
                         cx.notify();
@@ -707,7 +708,13 @@ impl AuthWizardView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
+                            this.ime.clear_ime_state();
                             this.is_register_mode = !this.is_register_mode;
+                            if !this.is_register_mode
+                                && this.active_login_field == LoginInputField::FirstName
+                            {
+                                this.active_login_field = LoginInputField::Username;
+                            }
                             this.login_error = None;
                             cx.notify();
                         }),

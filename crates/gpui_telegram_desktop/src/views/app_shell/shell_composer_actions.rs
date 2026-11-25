@@ -180,9 +180,10 @@ impl AppShell {
             self.sync_selected_chat_inspector_and_stage(cid, cx);
             self.finish_compose_isolation_for_switched_chat(cid, cx);
             self.mark_compose_bot_chat_started(cid, &recipient, cx);
+            let focus_composer = self.can_focus_chat_composer(cx);
             self.composer.update(cx, |c, ccx| {
                 c.clear();
-                c.is_input_focused = true;
+                c.is_input_focused = focus_composer;
                 ccx.notify();
             });
             self.append_outgoing_text(initial_message, cx);
@@ -288,9 +289,10 @@ impl AppShell {
                         shell.sync_selected_chat_inspector_and_stage(cid, cx);
                         shell.finish_compose_isolation_for_switched_chat(cid, cx);
                         shell.mark_compose_bot_chat_started(cid, &recipient, cx);
+                        let focus_composer = shell.can_focus_chat_composer(cx);
                         shell.composer.update(cx, |c, ccx| {
                             c.clear();
-                            c.is_input_focused = true;
+                            c.is_input_focused = focus_composer;
                             ccx.notify();
                         });
                         shell.append_outgoing_text(initial_message, cx);
@@ -420,9 +422,10 @@ impl AppShell {
                         });
                         shell.sync_selected_chat_inspector_and_stage(cid, cx);
                         shell.finish_compose_isolation_for_switched_chat(cid, cx);
+                        let focus_composer = shell.can_focus_chat_composer(cx);
                         shell.composer.update(cx, |c, ccx| {
                             c.clear();
-                            c.is_input_focused = true;
+                            c.is_input_focused = focus_composer;
                             ccx.notify();
                         });
                         // Immediately dispatch the user's opening message into the newly created group
@@ -495,10 +498,7 @@ impl AppShell {
                 2400,
                 cx,
             );
-            self.composer.update(cx, |c, ccx| {
-                c.is_input_focused = true;
-                ccx.notify();
-            });
+            self.set_composer_focused(true, cx);
             return;
         }
         self.dispatch_compose_submitted_message(retry_text, cx);

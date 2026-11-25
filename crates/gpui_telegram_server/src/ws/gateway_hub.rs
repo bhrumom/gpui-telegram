@@ -744,6 +744,15 @@ impl GatewayHub {
         self.publish_to_event_bus(format!("user:{}", user_id.0), &frame);
     }
 
+    /// Broadcast frame to all connected authenticated users (local sockets + CrossNodeEventBus).
+    pub fn broadcast_to_all(&self, frame: WsServerFrame) {
+        let targets: Vec<UserId> = self.subscribers.read().keys().copied().collect();
+        for uid in targets {
+            self.broadcast_to_user_local(uid, frame.clone());
+        }
+        self.publish_to_event_bus("system:broadcast".to_string(), &frame);
+    }
+
     /// Broadcast frame to all subscribers of a chat (local subscribers + CrossNodeEventBus)
     pub fn broadcast_to_chat(&self, chat_id: i64, frame: WsServerFrame) {
         let targets = self.filter_and_prune_chat_subscribers(chat_id);

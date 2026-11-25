@@ -20,7 +20,12 @@ pub use media::capture::{
 };
 pub use media::audio::{
     compute_pcm_rms_level, decode_wav_pcm, encode_wav_i16, enumerate_audio_devices,
-    waveform_from_pcm_i16, AudioPlaybackEngine, DecodedAudioPcm, RecordedVoiceNote, VoiceRecorder,
+    find_lyric_index_at, midi_note_to_hz, parse_chord_symbol_to_midi, slice_pcm_to_wav_from_ms,
+    slice_wav_from_offset_ms, synthesize_music_track_wav, waveform_from_pcm_i16,
+    AudioPlaybackEngine, DecodedAudioPcm, MusicPlaybackState, MusicRepeatMode, MusicTrackEntry,
+    MusicTransportEngine, MusicTransportSnapshot, RecordedVoiceNote, SynthAdsr, SynthChord,
+    SynthInstrument, SynthLyricLine, SynthNote, SynthTrackInput, SynthWaveformKind,
+    SynthesizedTrackAudio, VoiceRecorder,
 };
 pub use waveform::{
     decode_waveform_5bit, decode_waveform_to_floats, encode_waveform_5bit,

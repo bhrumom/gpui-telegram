@@ -1,13 +1,19 @@
 use gpui_telegram_core::error::{Result, TelegramError};
 use gpui_telegram_core::types::{ChatId, MessageId};
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
+use gpui_telegram_proto::creations::{
+    CreationKind, CreationReviewStatus, PublicCatalogItemDto, UserCreationDto,
+    UserCreationStateDto,
+};
 use gpui_telegram_proto::message::{MessageItem, ReactionCount};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+pub(crate) const META_CREATIONS_LAST_REVISION: &str = "creations_last_revision";
 
 #[derive(Debug, Clone)]
 pub struct CachedMediaEntry {
@@ -186,6 +192,30 @@ const CLIENT_SCHEMA_SQL: &str = "
         distributed_at_ms INTEGER NOT NULL,
         PRIMARY KEY (chat_id, chain_id, peer_user_id, peer_device_id)
     );
+    CREATE TABLE IF NOT EXISTS user_creations_cache (
+        creation_id TEXT PRIMARY KEY,
+        cloud_revision INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        review_status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        deleted_at_ms INTEGER,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_creations_cache_kind_updated
+        ON user_creations_cache(kind, updated_at_ms DESC);
+    CREATE TABLE IF NOT EXISTS user_creation_states_cache (
+        creation_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS public_catalog_cache (
+        creation_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        cached_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_public_catalog_cache_kind_cached
+        ON public_catalog_cache(kind, cached_at_ms DESC);
 ";
 
 impl SqliteClientCache {
@@ -297,26 +327,39 @@ impl SqliteClientCache {
     }
 
     pub(crate) fn clear_all(&self) {
-        let conn = self.conn.lock();
-        let _ = conn.execute_batch(
-            "DELETE FROM messages;
-             DELETE FROM message_reactions;
-             DELETE FROM chats;
-             DELETE FROM drafts;
-             DELETE FROM read_states;
-             DELETE FROM cache_meta;
-             DELETE FROM outbox_messages;
-             DELETE FROM file_transfers;
-             DELETE FROM folders;
-             DELETE FROM chat_ttls;
-             DELETE FROM e2ee_identity;
-             DELETE FROM e2ee_signed_prekeys;
-             DELETE FROM e2ee_one_time_prekeys;
-             DELETE FROM e2ee_sessions;
-             DELETE FROM e2ee_sender_keys;
-             DELETE FROM e2ee_sender_key_history;
-             DELETE FROM e2ee_distributed_keys;",
-        );
+        let mut conn = self.conn.lock();
+        let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate) else {
+            return;
+        };
+        const TABLES: &[&str] = &[
+            "messages",
+            "message_reactions",
+            "chats",
+            "drafts",
+            "read_states",
+            "cache_meta",
+            "outbox_messages",
+            "file_transfers",
+            "folders",
+            "chat_ttls",
+            "e2ee_identity",
+            "e2ee_signed_prekeys",
+            "e2ee_one_time_prekeys",
+            "e2ee_sessions",
+            "e2ee_sender_keys",
+            "e2ee_sender_key_history",
+            "e2ee_distributed_keys",
+            "user_creations_cache",
+            "user_creation_states_cache",
+            "public_catalog_cache",
+        ];
+        for table in TABLES {
+            let sql = format!("DELETE FROM {table}");
+            if tx.execute(&sql, []).is_err() {
+                return;
+            }
+        }
+        let _ = tx.commit();
     }
 
     pub(crate) fn max_outbox_nonce(&self) -> u64 {
@@ -591,3 +634,575 @@ impl SqliteClientCache {
         Ok(entry)
     }
 }
+
+fn json_cache_err(err: serde_json::Error) -> TelegramError {
+    TelegramError::Database(format!("cache serialization error: {err}"))
+}
+
+pub(crate) fn sort_user_creations(items: &mut [UserCreationDto]) {
+    items.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.creation_id.cmp(&b.creation_id))
+    });
+}
+
+pub(crate) fn sort_user_creation_states(items: &mut [UserCreationStateDto]) {
+    items.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.creation_id.cmp(&b.creation_id))
+    });
+}
+
+pub(crate) fn sort_public_catalog_items(items: &mut [PublicCatalogItemDto]) {
+    items.sort_by(|a, b| {
+        let a_rank = a.featured_rank.unwrap_or(u32::MAX);
+        let b_rank = b.featured_rank.unwrap_or(u32::MAX);
+        a_rank
+            .cmp(&b_rank)
+            .then_with(|| b.published_at_ms.cmp(&a.published_at_ms))
+            .then_with(|| a.creation_id.cmp(&b.creation_id))
+    });
+}
+
+const UPSERT_USER_CREATION_SQL: &str = "
+    INSERT INTO user_creations_cache (
+        creation_id,
+        cloud_revision,
+        kind,
+        review_status,
+        payload_json,
+        deleted_at_ms,
+        updated_at_ms
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    ON CONFLICT(creation_id) DO UPDATE SET
+        cloud_revision = excluded.cloud_revision,
+        kind = excluded.kind,
+        review_status = excluded.review_status,
+        payload_json = excluded.payload_json,
+        deleted_at_ms = excluded.deleted_at_ms,
+        updated_at_ms = excluded.updated_at_ms
+    WHERE excluded.cloud_revision > user_creations_cache.cloud_revision
+       OR (
+            excluded.cloud_revision = user_creations_cache.cloud_revision
+            AND (user_creations_cache.deleted_at_ms IS NULL OR excluded.deleted_at_ms IS NOT NULL)
+          )
+";
+
+impl SqliteClientCache {
+    pub(crate) fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT value FROM cache_meta WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_err)
+    }
+
+    pub(crate) fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_meta(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM cache_meta WHERE key = ?1", params![key])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn load_creations_last_revision(&self) -> Result<i64> {
+        let raw = self.get_meta(META_CREATIONS_LAST_REVISION)?;
+        Ok(raw
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0))
+    }
+
+    pub(crate) fn save_creations_last_revision(&self, revision: i64) -> Result<()> {
+        let clamped = revision.max(0);
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        let prev_rev: i64 = tx
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = ?1",
+                params![META_CREATIONS_LAST_REVISION],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0);
+        let next_rev = prev_rev.max(clamped);
+        tx.execute(
+            "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?1, ?2)",
+            params![META_CREATIONS_LAST_REVISION, next_rev.to_string()],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn creations_last_revision(&self) -> Result<i64> {
+        self.load_creations_last_revision()
+    }
+
+    pub(crate) fn upsert_user_creations(&self, items: &[UserCreationDto]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        {
+            let mut stmt = tx.prepare(UPSERT_USER_CREATION_SQL).map_err(db_err)?;
+            for item in items {
+                let json = serde_json::to_string(item).map_err(json_cache_err)?;
+                stmt.execute(params![
+                    item.creation_id,
+                    item.cloud_revision,
+                    item.kind.as_str(),
+                    item.review_status.as_str(),
+                    json,
+                    item.deleted_at_ms,
+                    item.updated_at_ms
+                ])
+                .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_creations_sync_delta(
+        &self,
+        latest_revision: i64,
+        items: &[UserCreationDto],
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        let mut max_item_rev: i64 = 0;
+        {
+            let mut stmt = tx.prepare(UPSERT_USER_CREATION_SQL).map_err(db_err)?;
+            for item in items {
+                max_item_rev = max_item_rev.max(item.cloud_revision.max(0));
+                let json = serde_json::to_string(item).map_err(json_cache_err)?;
+                stmt.execute(params![
+                    item.creation_id,
+                    item.cloud_revision,
+                    item.kind.as_str(),
+                    item.review_status.as_str(),
+                    json,
+                    item.deleted_at_ms,
+                    item.updated_at_ms
+                ])
+                .map_err(db_err)?;
+            }
+        }
+        let prev_rev: i64 = tx
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = ?1",
+                params![META_CREATIONS_LAST_REVISION],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0);
+        let next_rev = prev_rev.max(latest_revision.max(0)).max(max_item_rev);
+        tx.execute(
+            "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?1, ?2)",
+            params![META_CREATIONS_LAST_REVISION, next_rev.to_string()],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(next_rev)
+    }
+
+    pub(crate) fn load_all_user_creations(&self) -> Result<HashMap<String, UserCreationDto>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM user_creations_cache")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let json = row.map_err(db_err)?;
+            if let Ok(item) = serde_json::from_str::<UserCreationDto>(&json) {
+                out.insert(item.creation_id.clone(), item);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn load_user_creations(
+        &self,
+        kind: Option<CreationKind>,
+        status: Option<CreationReviewStatus>,
+    ) -> Result<Vec<UserCreationDto>> {
+        let conn = self.conn.lock();
+        let kind_str = kind.map(CreationKind::as_str);
+        let status_str = status.map(CreationReviewStatus::as_str);
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json
+                 FROM user_creations_cache
+                 WHERE deleted_at_ms IS NULL
+                   AND (?1 IS NULL OR kind = ?1)
+                   AND (?2 IS NULL OR review_status = ?2)
+                 ORDER BY updated_at_ms DESC, creation_id ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![kind_str, status_str], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let json = row.map_err(db_err)?;
+            if let Ok(item) = serde_json::from_str::<UserCreationDto>(&json) {
+                if item.deleted_at_ms.is_none() {
+                    out.push(item);
+                }
+            }
+        }
+        sort_user_creations(&mut out);
+        Ok(out)
+    }
+
+    pub(crate) fn get_user_creation(&self, creation_id: &str) -> Result<Option<UserCreationDto>> {
+        let conn = self.conn.lock();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT payload_json FROM user_creations_cache WHERE creation_id = ?1 AND deleted_at_ms IS NULL",
+                params![creation_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(raw
+            .and_then(|json| serde_json::from_str::<UserCreationDto>(&json).ok())
+            .filter(|item| item.deleted_at_ms.is_none()))
+    }
+
+    pub(crate) fn upsert_user_creation_state(&self, state: &UserCreationStateDto) -> Result<()> {
+        let json = serde_json::to_string(state).map_err(json_cache_err)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO user_creation_states_cache (creation_id, state_json, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(creation_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                updated_at_ms = excluded.updated_at_ms
+             WHERE excluded.updated_at_ms >= user_creation_states_cache.updated_at_ms",
+            params![state.creation_id, json, state.updated_at_ms],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn upsert_user_creation_states(&self, states: &[UserCreationStateDto]) -> Result<()> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO user_creation_states_cache (creation_id, state_json, updated_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(creation_id) DO UPDATE SET
+                        state_json = excluded.state_json,
+                        updated_at_ms = excluded.updated_at_ms
+                     WHERE excluded.updated_at_ms >= user_creation_states_cache.updated_at_ms",
+                )
+                .map_err(db_err)?;
+            for state in states {
+                let json = serde_json::to_string(state).map_err(json_cache_err)?;
+                stmt.execute(params![state.creation_id, json, state.updated_at_ms])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn load_user_creation_states_map(
+        &self,
+    ) -> Result<HashMap<String, UserCreationStateDto>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT state_json FROM user_creation_states_cache")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let json = row.map_err(db_err)?;
+            if let Ok(state) = serde_json::from_str::<UserCreationStateDto>(&json) {
+                out.insert(state.creation_id.clone(), state);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn load_user_creation_states(&self) -> Result<Vec<UserCreationStateDto>> {
+        let mut items: Vec<UserCreationStateDto> =
+            self.load_user_creation_states_map()?.into_values().collect();
+        sort_user_creation_states(&mut items);
+        Ok(items)
+    }
+
+    pub(crate) fn get_user_creation_state(
+        &self,
+        creation_id: &str,
+    ) -> Result<Option<UserCreationStateDto>> {
+        let conn = self.conn.lock();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT state_json FROM user_creation_states_cache WHERE creation_id = ?1",
+                params![creation_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(raw.and_then(|json| serde_json::from_str::<UserCreationStateDto>(&json).ok()))
+    }
+
+    pub(crate) fn upsert_public_catalog_items(
+        &self,
+        items: &[PublicCatalogItemDto],
+        cached_at_ms: i64,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO public_catalog_cache (creation_id, kind, payload_json, cached_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(db_err)?;
+            for item in items {
+                let json = serde_json::to_string(item).map_err(json_cache_err)?;
+                stmt.execute(params![
+                    item.creation_id,
+                    item.kind.as_str(),
+                    json,
+                    cached_at_ms
+                ])
+                .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_public_catalog_item(&self, creation_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let deleted = conn
+            .execute(
+                "DELETE FROM public_catalog_cache WHERE creation_id = ?1",
+                params![creation_id],
+            )
+            .map_err(db_err)?;
+        Ok(deleted > 0)
+    }
+
+    pub(crate) fn load_public_catalog_entries(
+        &self,
+    ) -> Result<HashMap<String, (PublicCatalogItemDto, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT payload_json, cached_at_ms FROM public_catalog_cache")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (json, cached_at_ms) = row.map_err(db_err)?;
+            if let Ok(item) = serde_json::from_str::<PublicCatalogItemDto>(&json) {
+                out.insert(item.creation_id.clone(), (item, cached_at_ms));
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn load_public_catalog_items(
+        &self,
+        kind: Option<CreationKind>,
+    ) -> Result<Vec<PublicCatalogItemDto>> {
+        let conn = self.conn.lock();
+        let kind_str = kind.map(CreationKind::as_str);
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json
+                 FROM public_catalog_cache
+                 WHERE (?1 IS NULL OR kind = ?1)
+                 ORDER BY cached_at_ms DESC, creation_id ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![kind_str], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let json = row.map_err(db_err)?;
+            if let Ok(item) = serde_json::from_str::<PublicCatalogItemDto>(&json) {
+                out.push(item);
+            }
+        }
+        sort_public_catalog_items(&mut out);
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_telegram_proto::creations::{
+        BookChapter, BookPage, BookPayload, BookRichBlock, CoverArtwork, CreationPayload,
+        CreationVisibility,
+    };
+
+    fn test_creation(id: &str, rev: i64, deleted_at_ms: Option<i64>) -> UserCreationDto {
+        UserCreationDto {
+            creation_id: id.to_string(),
+            owner_user_id: 42,
+            creator_bot_user_id: None,
+            creator_chat_id: None,
+            kind: CreationKind::Book,
+            title: format!("Book {id} r{rev}"),
+            subtitle: String::new(),
+            summary: "Summary".to_string(),
+            author_display_name: "Author".to_string(),
+            language: "en".to_string(),
+            genres: vec!["sci-fi".to_string()],
+            tags: vec![],
+            cover: CoverArtwork::default(),
+            age_rating: "4+".to_string(),
+            payload: CreationPayload::Book(BookPayload {
+                author: "Author".to_string(),
+                series_name: None,
+                series_index: None,
+                blurb: "Blurb".to_string(),
+                estimated_read_mins: 5,
+                word_count: 100,
+                chapters: vec![BookChapter {
+                    chapter_id: "c1".to_string(),
+                    chapter_number: 1,
+                    title: "Ch 1".to_string(),
+                    subtitle: None,
+                    pages: vec![BookPage {
+                        page_number: 1,
+                        blocks: vec![BookRichBlock::Paragraph {
+                            text: "Sample paragraph content for sqlite cache unit test.".to_string(),
+                        }],
+                    }],
+                }],
+            }),
+            version: 1,
+            cloud_revision: rev,
+            review_status: CreationReviewStatus::Draft,
+            visibility: CreationVisibility::Private,
+            has_live_published_version: false,
+            published_version: None,
+            rejection_reason: None,
+            review_notes: None,
+            submitted_at_ms: None,
+            reviewed_at_ms: None,
+            published_at_ms: None,
+            created_at_ms: 100,
+            updated_at_ms: rev * 1000,
+            deleted_at_ms,
+            rating_avg: 0.0,
+            rating_count: 0,
+            engagement_count: 0,
+            save_or_install_count: 0,
+        }
+    }
+
+    #[test]
+    fn sqlite_cache_enforces_monotonic_revision_tombstone_state_guard_and_clear_all() {
+        let db = SqliteClientCache::open_in_memory().unwrap();
+        assert_eq!(db.creations_last_revision().unwrap(), 0);
+
+        db.save_creations_last_revision(7).unwrap();
+        assert_eq!(db.creations_last_revision().unwrap(), 7);
+        db.save_creations_last_revision(3).unwrap();
+        assert_eq!(db.creations_last_revision().unwrap(), 7);
+
+        let rev = db
+            .apply_creations_sync_delta(8, &[test_creation("cr_a", 8, None)])
+            .unwrap();
+        assert_eq!(rev, 8);
+        assert_eq!(db.load_user_creations(None, None).unwrap().len(), 1);
+
+        // Tombstone at rev 9, then attempt stale resurrection at rev 8 and same-rev 9 non-deleted
+        db.apply_creations_sync_delta(9, &[test_creation("cr_a", 9, Some(9_000))])
+            .unwrap();
+        assert!(db.get_user_creation("cr_a").unwrap().is_none());
+        db.upsert_user_creations(&[
+            test_creation("cr_a", 8, None),
+            test_creation("cr_a", 9, None),
+        ])
+        .unwrap();
+        assert!(db.get_user_creation("cr_a").unwrap().is_none());
+
+        // User creation state stale-timestamp guard
+        let newer_state = UserCreationStateDto {
+            creation_id: "cr_a".to_string(),
+            user_id: 42,
+            kind: CreationKind::Book,
+            in_library: true,
+            favorite: true,
+            progress_percent: 80.0,
+            state_json: serde_json::json!({"page": 8}),
+            updated_at_ms: 5_000,
+        };
+        let stale_state = UserCreationStateDto {
+            progress_percent: 10.0,
+            state_json: serde_json::json!({"page": 1}),
+            updated_at_ms: 4_000,
+            ..newer_state.clone()
+        };
+        db.upsert_user_creation_state(&newer_state).unwrap();
+        db.upsert_user_creation_state(&stale_state).unwrap();
+        let loaded = db.get_user_creation_state("cr_a").unwrap().unwrap();
+        assert_eq!(loaded.progress_percent, 80.0);
+
+        // Atomic clear_all wipes creations, states, catalog, and creations_last_revision
+        db.clear_all();
+        assert_eq!(db.creations_last_revision().unwrap(), 0);
+        assert!(db.load_all_user_creations().unwrap().is_empty());
+        assert!(db.load_user_creation_states().unwrap().is_empty());
+        assert!(db.load_public_catalog_items(None).unwrap().is_empty());
+    }
+}
+

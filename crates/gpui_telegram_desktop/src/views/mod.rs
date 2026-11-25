@@ -1,6 +1,7 @@
 //! Module definitions for `crates/gpui_telegram_desktop/src/views`
 
 pub mod app_shell;
+pub mod apple_sidebar;
 pub mod auth;
 pub mod boxes;
 pub mod call_overlay;
@@ -8,6 +9,7 @@ pub mod canonical_composer;
 pub mod chat_sidebar;
 pub mod composer;
 pub mod computer_workbench;
+pub mod content_hub;
 pub mod context_inspector;
 pub mod conversation_stage;
 pub mod drawer;
@@ -27,10 +29,12 @@ pub mod stage;
 pub mod tdesktop_theme;
 
 pub use app_shell::ModalContainer;
+pub use apple_sidebar::{AppleAppSidebar, AppleSidebarEvent, AppleSidebarSection};
 pub use call_overlay::{CallOverlay, TalkModeState, TranscriptEntry};
 pub use canonical_composer::CanonicalComposer;
 pub use chat_sidebar::ChatSidebar;
 pub use computer_workbench::{ComputerWorkbench, HostDeviceSpec};
+pub use content_hub::{ContentHubEvent, ContentHubSection, ContentHubWorkspace};
 pub use context_inspector::ContextInspector;
 pub use conversation_stage::ConversationStage;
 pub use global_tasks_workspace::GlobalTasksWorkspace;

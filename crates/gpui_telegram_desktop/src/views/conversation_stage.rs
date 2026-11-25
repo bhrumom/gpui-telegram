@@ -439,6 +439,7 @@ pub struct ConversationStage {
     pub pending_call_request: bool,
     pub pending_video_call: bool,
     pub pending_media_url: Option<(String, bool)>,
+    pub pending_open_url: Option<String>,
     pub pending_media_viewer: Option<(Vec<(String, bool, Option<String>)>, usize)>,
     pub pending_iv_url: Option<(String, String)>,
     pub pending_bot_action: Option<String>,
@@ -502,6 +503,7 @@ pub struct ConversationStage {
     pub drag_area: HistoryDragArea,
     pub focus_handle: Option<FocusHandle>,
     pub search_open: bool,
+    pub search_focus_seq: u64,
     pub search_query: String,
     pub search_match_ids: Vec<u64>,
     pub search_match_cursor: usize,
@@ -555,6 +557,7 @@ impl ConversationStage {
             pending_call_request: false,
             pending_video_call: false,
             pending_media_url: None,
+            pending_open_url: None,
             pending_media_viewer: None,
             pending_iv_url: None,
             pending_bot_action: None,
@@ -618,6 +621,7 @@ impl ConversationStage {
             drag_area: HistoryDragArea::new(),
             focus_handle: None,
             search_open: false,
+            search_focus_seq: 0,
             search_query: String::new(),
             search_match_ids: Vec::new(),
             search_match_cursor: 0,
@@ -783,6 +787,7 @@ impl ConversationStage {
         self.pending_stage_action = None;
         self.permission_dock.sync_requests(Vec::new());
         self.group_member_tiles.clear();
+        self.bot_hues_by_user_id.clear();
         self.clear_all_bot_card_drafts();
     }
 
