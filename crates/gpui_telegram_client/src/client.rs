@@ -1,5 +1,6 @@
 use crate::cache::LocalStore;
 use crate::client_dispatch::{apply_ws_frame, ClientDomainEvent};
+use crate::community_runtime::{CommunityClientFacade, LocalCommunityRuntime};
 use crate::config::ClientConfig;
 use crate::e2ee::{E2eeManager, E2eeStore};
 use crate::media_transfer::{ChunkedTransferManager, FileTransferStore};
@@ -62,6 +63,7 @@ pub struct TelegramClient {
     pub network_listener: Arc<NetworkStatusListener>,
     pub chunked_transfers: Arc<ChunkedTransferManager>,
     pub e2ee: Arc<E2eeManager>,
+    community: CommunityClientFacade,
     runtime: Arc<Runtime>,
     auth_session: Arc<RwLock<Option<AuthResponse>>>,
     auth_token: Arc<RwLock<Option<String>>>,
@@ -75,15 +77,16 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self::with_store(config, LocalStore::new())
+        Self::try_with_store(config, LocalStore::new())
+            .expect("Failed to initialize in-memory TelegramClient")
     }
 
     pub fn open_with_dir(config: ClientConfig, cache_dir: impl AsRef<Path>) -> Result<Self> {
         let store = LocalStore::open_with_dir(cache_dir)?;
-        Ok(Self::with_store(config, store))
+        Self::try_with_store(config, store)
     }
 
-    fn with_store(config: ClientConfig, local_store: LocalStore) -> Self {
+    fn try_with_store(config: ClientConfig, local_store: LocalStore) -> Result<Self> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -198,6 +201,19 @@ impl TelegramClient {
             }));
         }
 
+        let local_community = match local_store.cache_dir() {
+            Some(dir) => LocalCommunityRuntime::open_in_dir(&dir)?,
+            None => LocalCommunityRuntime::open_in_memory()?,
+        };
+        let community = CommunityClientFacade::new(
+            http_client.clone(),
+            runtime.handle().clone(),
+            Arc::clone(&auth_token),
+            Arc::clone(&auth_session),
+            Arc::clone(&session_epoch),
+            Arc::new(local_community),
+        );
+
         let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
         let persisted_max = local_store.max_outbox_nonce();
         let safe_max = (i64::MAX as u64).saturating_sub(1_000_000);
@@ -206,7 +222,7 @@ impl TelegramClient {
             .max(persisted_max.saturating_add(1))
             .min(i64::MAX as u64);
 
-        Self {
+        Ok(Self {
             config,
             local_store,
             sync_coordinator,
@@ -219,6 +235,7 @@ impl TelegramClient {
             network_listener,
             chunked_transfers,
             e2ee,
+            community,
             runtime,
             auth_session,
             auth_token,
@@ -228,7 +245,7 @@ impl TelegramClient {
             next_client_msg_offset: Arc::new(AtomicU32::new(1)),
             ws_listener_attached: Arc::new(AtomicBool::new(false)),
             session_epoch,
-        }
+        })
     }
 
     pub fn new_with_url(server_url: String) -> Self {
@@ -519,14 +536,31 @@ impl TelegramClient {
     }
 
     pub fn set_auth_session(&self, session: AuthResponse) {
-        let prev_user_id = self.current_user_id();
+        let (prev_user_id, prev_token) = {
+            let tok_guard = self.auth_token.read();
+            let sess_guard = self.auth_session.read();
+            let uid = sess_guard.as_ref().map(|s| s.user_id);
+            let tok = tok_guard
+                .clone()
+                .or_else(|| sess_guard.as_ref().map(|s| s.token.clone()));
+            (uid, tok)
+        };
         let is_user_switch =
             prev_user_id.is_some_and(|prev| prev != session.user_id && session.user_id > 0);
+        let changed = prev_user_id != Some(session.user_id)
+            || prev_token.as_deref() != Some(session.token.as_str());
         if is_user_switch {
             self.clear_session();
+        } else if changed {
+            self.bump_session_epoch();
         }
         self.local_store
             .bind_account_scope(&self.config.server_url, session.user_id);
+        self.community.bind_account_scope(
+            session.user_id,
+            &session.username,
+            session.first_name.as_deref(),
+        );
         {
             let mut tok_guard = self.auth_token.write();
             let mut sess_guard = self.auth_session.write();
@@ -534,7 +568,10 @@ impl TelegramClient {
             let cur_tok = tok_guard
                 .as_deref()
                 .or_else(|| sess_guard.as_ref().map(|s| s.token.as_str()));
-            if cur_uid != Some(session.user_id) || cur_tok != Some(session.token.as_str()) {
+            if !is_user_switch
+                && !changed
+                && (cur_uid != Some(session.user_id) || cur_tok != Some(session.token.as_str()))
+            {
                 self.bump_session_epoch();
             }
             *tok_guard = Some(session.token.clone());
@@ -613,6 +650,7 @@ impl TelegramClient {
         }
         self.outbox.clear_session_state();
         self.chunked_transfers.clear_session_state();
+        self.community.clear_session_state();
         self.e2ee.store().clear();
         self.sync_coordinator.clear();
         self.pending_events.lock().clear();
@@ -724,6 +762,10 @@ impl TelegramClient {
 
     pub fn hermes(&self) -> &HermesClient {
         &self.hermes
+    }
+
+    pub fn community(&self) -> &CommunityClientFacade {
+        &self.community
     }
 
     pub fn hermes_status(

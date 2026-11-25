@@ -7,6 +7,7 @@ pub mod client_dispatch;
 pub mod client_e2ee;
 pub mod client_features;
 pub mod client_messaging;
+pub mod community_runtime;
 pub mod config;
 pub mod e2ee;
 pub mod media_transfer;
@@ -18,7 +19,12 @@ pub mod sync;
 pub use cache::{CachedChatHistorySnapshot, CachedMediaEntry, LocalStore};
 pub use client::TelegramClient;
 pub use client_dispatch::ClientDomainEvent;
+pub use community_runtime::{
+    CommunityClientFacade, CommunityRuntimeMode, LocalCommunityRuntime, COMMUNITY_DB_FILENAME,
+    LOCAL_GUEST_ACTOR_ID, LOCAL_GUEST_USER_ID,
+};
 pub use config::{ClientConfig, ConfigSource, StoredSession};
+pub use gpui_telegram_community::{TelegramBotSyncInput, TelegramHumanSyncInput};
 pub use e2ee::{
     compute_safety_number_emojis, verify_signed_prekey, DeviceIdentityKeys, DoubleRatchetSession,
     E2eeError, E2eeManager, E2eeStore, SenderKeyState,
@@ -40,7 +46,8 @@ pub use net::{
     CallRecordDto, CallSignalRequest, ChannelStatisticsDto, ChatDetailDto, ChatDetails,
     ChatFolderDto, ChatMemberItem, ChatSummary, ChunkedUploadInitRequest,
     ChunkedUploadStatusResponse, ClientProxyConfig, ClientProxyType, CloudAuthMethod,
-    ComputerListResponse,
+    CommunityApiError, CommunityAuth, ComputerListResponse, RegisterBotActorResult,
+    COMMUNITY_ACTOR_HEADER, HEADER_COMMUNITY_ACTOR_ID,
     ComputerNodeDto, ComputerNodeKind, ComputerRunPolicy, ConnectionStatus, ContactDto,
     CreateChatPayload, CreateChatRequest, CreateChatResponse, CreatePollHttpRequest,
     DailyStatPoint, DerpClientFrame, DerpServerFrame, DiscoPayload, DraftDto,
