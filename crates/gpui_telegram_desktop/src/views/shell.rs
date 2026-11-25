@@ -510,6 +510,9 @@ impl AppShell {
         self.ime.just_committed_ime = false;
         self.rtc_talk.reset_on_logout();
         self.overlays.clear_overlays();
+        if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+            ov.update(cx, |w, _| w.close());
+        }
         self.miniapps.reset();
         self.computers.reset_on_logout();
         if let Some(ref handler) = self.remote_host.ipc_handler {
@@ -1469,6 +1472,45 @@ impl AppShell {
     fn render_toast_banner(&self, text: String, pal: TdesktopThemePalette, cx: &mut Context<Self>) -> Div {
         self.render_toast_banner_slot(text, pal.scaled_px(24.0), pal, cx)
     }
+
+    /// Returns `true` only when an unoccluded, full interactive native macOS `WKWebView`
+    /// (open Mini App host sheet or active Browser `WKWebView` viewport) should be allowed
+    /// to retain `NSWindow.firstResponder`. Floating PiP Mini Apps and all GPUI inputs/modals
+    /// return `false` so host `GPUIView` owns keyboard and IME routing.
+    pub fn should_native_webview_own_keyboard(&self, cx: &App) -> bool {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return false;
+        }
+        let miniapp_owns = !self.has_miniapp_top_modal(cx)
+            && !self.main_menu_drawer.read(cx).is_open
+            && !self.sidebar.read(cx).search_focused
+            && self
+                .miniapps
+                .miniapp_overlay
+                .as_ref()
+                .is_some_and(|ov| ov.read(cx).allows_native_webview_keyboard_focus());
+        if miniapp_owns {
+            return true;
+        }
+        self.active_panel == ActiveWorkspacePanel::Browser
+            && !self.has_browser_shell_blocker(cx)
+            && !self.is_browser_workspace_input_active(cx)
+            && self.browser_workspace.as_ref().is_some_and(|bw| {
+                let bw_read = bw.read(cx);
+                bw_read.active_engine == crate::views::browser::BrowserEngineKind::WkWebView
+                    && !bw_read.is_workspace_occluded()
+                    && !bw_read.has_focused_text_input()
+            })
+    }
+
+    /// Restores macOS `NSWindow.firstResponder` to the host `GPUIView` so GPUI keyboard/IME
+    /// input works reliably after any native `WKWebView` interaction or Floating PiP activity.
+    pub fn restore_native_host_focus(&self, window: &Window) {
+        #[cfg(target_os = "macos")]
+        crate::components::bots::restore_gpui_first_responder(window);
+        #[cfg(not(target_os = "macos"))]
+        let _ = window;
+    }
 }
 
 impl Render for AppShell {
@@ -1537,6 +1579,13 @@ impl Render for AppShell {
             let has_shell_blocker = self.has_browser_shell_blocker(cx);
             if !has_shell_blocker {
                 if let Some(bw) = self.browser_workspace.clone() {
+                    let has_native_claim = bw.read(cx).has_pending_webview_focus_claim();
+                    if has_native_claim
+                        && bw.update(cx, |w, wcx| w.consume_webview_focus_claim(wcx))
+                    {
+                        self.ime.clear_preedit();
+                        self.bot_browser.ime_preedit_input_gen = None;
+                    }
                     let (clear_for_cdp_focus, had_window_flag) = {
                         let bw_read = bw.read(cx);
                         let surf_focused = bw_read.active_engine
@@ -1575,6 +1624,9 @@ impl Render for AppShell {
         if self.is_authenticated && !cdp_surface_focused && !self.focus_handle.is_focused(window) {
             self.focus_handle.focus(window);
         }
+        if !self.should_native_webview_own_keyboard(cx) {
+            self.restore_native_host_focus(window);
+        }
         self.bot_browser.last_rendered_cdp_surface_focused = cdp_surface_focused;
         let vp = window.viewport_size();
         let (vp_w, vp_h) = (f32::from(vp.width), f32::from(vp.height));
@@ -1602,6 +1654,9 @@ impl Render for AppShell {
             };
             return div()
                 .id("app-shell-login-root")
+                .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, _| {
+                    this.restore_native_host_focus(window);
+                }))
                 .size_full()
                 .bg(rgb(login_bg))
                 .flex()
@@ -1659,6 +1714,9 @@ impl Render for AppShell {
         div()
             .id("app-shell-authenticated-root")
             .track_focus(&self.focus_handle)
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, _| {
+                this.restore_native_host_focus(window);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_window_key_down(event, window, cx);
             }))

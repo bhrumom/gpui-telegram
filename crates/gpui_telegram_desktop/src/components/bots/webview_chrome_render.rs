@@ -584,6 +584,8 @@ impl Render for BotAttachWebView {
                                                     this.is_floating_pip = true;
                                                     this.pip_live_preview = true;
                                                     this.is_open = false;
+                                                    this.focused_input = None;
+                                                    this.set_native_webview_allow_focus(false);
                                                     this.pending_actions.push_back(
                                                         BotWebViewPendingAction::SwitchToFloatingPip,
                                                     );

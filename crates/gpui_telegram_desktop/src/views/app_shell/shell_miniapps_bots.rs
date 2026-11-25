@@ -603,7 +603,9 @@ impl AppShell {
                     self.miniapps.bump_launch_generation();
                     self.miniapps.is_miniapp_minimized = false;
                     self.miniapps.floating_pip_status = None;
-                    self.miniapps.miniapp_overlay = None;
+                    if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+                        ov.update(cx, |w, _| w.close());
+                    }
                     cx.notify();
                 }
                 BotWebViewPendingAction::Minimize => {
@@ -910,7 +912,9 @@ impl AppShell {
                     self.miniapps.bump_launch_generation();
                     self.miniapps.is_miniapp_minimized = false;
                     self.miniapps.floating_pip_status = None;
-                    self.miniapps.miniapp_overlay = None;
+                    if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+                        ov.update(cx, |w, _| w.close());
+                    }
                     let Some(fence) = fence.clone() else {
                         continue;
                     };
@@ -1000,7 +1004,9 @@ impl AppShell {
                                         shell.miniapps.bump_launch_generation();
                                         shell.miniapps.is_miniapp_minimized = false;
                                         shell.miniapps.floating_pip_status = None;
-                                        shell.miniapps.miniapp_overlay = None;
+                                        if let Some(ov) = shell.miniapps.miniapp_overlay.take() {
+                                            ov.update(cx, |w, _| w.close());
+                                        }
                                     }
                                     if let Some(ref toast) = toast_opt {
                                         if let Some(cid) = source_cid {
@@ -1188,6 +1194,8 @@ impl AppShell {
                         w.is_floating_pip = true;
                         w.pip_live_preview = true;
                         w.is_open = false;
+                        w.focused_input = None;
+                        w.set_native_webview_allow_focus(false);
                         wcx.notify();
                     });
                     cx.notify();

@@ -193,20 +193,16 @@ impl AppShell {
         fullscreen_occluded_layer(overlay)
     }
 
-    /// Renders the minimized MiniApp pill, open MiniApp host sheet, confirmation/ToS modals,
-    /// `BotProfileBox`, and NL Bot creator modal.
-    pub fn render_miniapp_overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut layers = Vec::new();
-        let pal = self.theme_state.palette;
-        let lang = self.active_lang_id();
-
+    /// Returns `true` when any modal, overlay, non-Chats workspace panel, or sidebar modal
+    /// sits above the Mini App overlay and therefore occludes its native `WKWebView`.
+    pub fn has_miniapp_top_modal(&self, cx: &App) -> bool {
         let sidebar_modal_open = {
             let sb = self.sidebar.read(cx);
             sb.is_contacts_modal_open
                 || sb.active_creation_modal.is_some()
                 || sb.is_account_popover_open
         };
-        let has_top_modal = self.miniapps.pending_miniapp_confirm.is_some()
+        self.miniapps.pending_miniapp_confirm.is_some()
             || self.miniapps.miniapp_tos_modal_open
             || self
                 .miniapps
@@ -225,7 +221,17 @@ impl AppShell {
             || self.overlays.is_passcode_locked
             || self.active_panel != ActiveWorkspacePanel::Chats
             || sidebar_modal_open
-            || self.modal_container.read(cx).is_modal_active();
+            || self.modal_container.read(cx).is_modal_active()
+    }
+
+    /// Renders the minimized MiniApp pill, open MiniApp host sheet, confirmation/ToS modals,
+    /// `BotProfileBox`, and NL Bot creator modal.
+    pub fn render_miniapp_overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut layers = Vec::new();
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id();
+
+        let has_top_modal = self.has_miniapp_top_modal(cx);
 
         let mut is_live_pip = false;
         let mut pip_live_enabled = true;
@@ -243,13 +249,15 @@ impl AppShell {
             let needs_sync = ov_read.external_modal_occluding != has_top_modal
                 || (should_hide_native && ov_read.is_native_webview_visible());
             let _ = ov_read;
-            if needs_sync || needs_park_pip {
+            if needs_sync || needs_park_pip || is_live_pip {
                 ov.update(cx, |w, _| {
                     w.external_modal_occluding = has_top_modal;
                     if should_hide_native {
                         w.hide_native_webview();
                     } else if needs_park_pip {
                         w.park_native_webview_for_pip();
+                    } else if is_live_pip {
+                        w.set_native_webview_allow_focus(false);
                     }
                 });
             }
@@ -533,6 +541,12 @@ impl AppShell {
                                                                 w.is_floating_pip = true;
                                                                 w.pip_live_preview =
                                                                     !w.pip_live_preview;
+                                                                w.set_native_webview_allow_focus(
+                                                                    false,
+                                                                );
+                                                                if !w.pip_live_preview {
+                                                                    w.park_native_webview_for_pip();
+                                                                }
                                                                 wcx.notify();
                                                             });
                                                         }

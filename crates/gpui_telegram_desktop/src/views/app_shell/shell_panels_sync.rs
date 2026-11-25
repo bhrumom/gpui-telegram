@@ -923,7 +923,9 @@ impl AppShell {
             let w = ov.read(cx);
             w.companion_chat_id == Some(cid_i64) || w.source_chat_id == Some(cid_i64)
         }) {
-            self.miniapps.miniapp_overlay = None;
+            if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+                ov.update(cx, |w, _| w.close());
+            }
             self.miniapps.is_miniapp_minimized = false;
         }
 
