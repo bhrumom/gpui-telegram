@@ -63,6 +63,10 @@ pub struct ShellSessionSyncState {
     pub in_flight_send_draft_gen_by_chat: HashMap<u64, u64>,
     pub last_draft_text_by_chat: HashMap<u64, String>,
     pub last_saved_draft_by_chat: HashMap<u64, String>,
+    pub chat_list_in_flight_since: Option<std::time::Instant>,
+    pub history_in_flight_chat: Option<(u64, std::time::Instant)>,
+    pub prefetched_history_chats: HashSet<u64>,
+    pub has_connected_ws_once: bool,
 }
 
 impl Default for ShellSessionSyncState {
@@ -101,6 +105,10 @@ impl ShellSessionSyncState {
             in_flight_send_draft_gen_by_chat: HashMap::new(),
             last_draft_text_by_chat: HashMap::new(),
             last_saved_draft_by_chat: HashMap::new(),
+            chat_list_in_flight_since: None,
+            history_in_flight_chat: None,
+            prefetched_history_chats: HashSet::new(),
+            has_connected_ws_once: false,
         }
     }
 
@@ -128,6 +136,10 @@ impl ShellSessionSyncState {
         self.draft_debounce_gen = self.draft_debounce_gen.wrapping_add(1);
         self.draft_op_gen_by_chat.clear();
         self.in_flight_send_draft_gen_by_chat.clear();
+        self.chat_list_in_flight_since = None;
+        self.history_in_flight_chat = None;
+        self.prefetched_history_chats.clear();
+        self.has_connected_ws_once = false;
     }
 
     /// Clears per-message optimistic nonce and reaction tracking maps.
@@ -164,6 +176,10 @@ impl ShellSessionSyncState {
         self.send_as_peers = SendAsPeersSession::default();
         self.draft_debounce_gen = self.draft_debounce_gen.wrapping_add(1);
         self.clear_message_tracking();
+        self.chat_list_in_flight_since = None;
+        self.history_in_flight_chat = None;
+        self.prefetched_history_chats.clear();
+        self.has_connected_ws_once = false;
     }
 
     pub fn draft_op_gen(&self, chat_id: u64) -> u64 {

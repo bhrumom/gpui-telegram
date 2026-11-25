@@ -272,36 +272,127 @@ impl AppShell {
         shell_instance.refresh_settings_truth(cx);
         shell_instance.ensure_remote_host_runtime_bootstrapped(cx);
 
-        if let Some(stored) = ClientConfig::load_session() {
+        if let Some(stored) = shell_instance.load_stored_session_for_shell() {
+            let provisional_auth = AuthResponse {
+                token: stored.token.clone(),
+                session_id: stored.session_id.clone(),
+                user_id: stored.user_id,
+                username: stored.username.clone(),
+                first_name: None,
+                created_at: None,
+                expires_at: None,
+            };
+            shell_instance.apply_authenticated_session(provisional_auth, cx);
+
+            let verify_auth_gen = shell_instance.session_sync.auth_generation;
+            let verify_token = stored.token.clone();
+            let verify_user_id = stored.user_id;
+            let verify_session_id = stored.session_id.clone();
+            let verify_username = stored.username.clone();
+
             cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
-                let verify_res = client.http_client.get_me(&stored.token).await;
+                let verify_res = client.http_client.get_me(&verify_token).await;
                 let _ = weak_shell.update(app, |shell, cx| {
-                    if shell.is_authenticated || !Arc::ptr_eq(&shell.client, &client) {
+                    if !shell.is_authenticated
+                        || shell.session_sync.auth_generation != verify_auth_gen
+                        || shell.session_sync.session_token.as_deref() != Some(verify_token.as_str())
+                        || shell.session_sync.user_id != Some(verify_user_id)
+                        || !Arc::ptr_eq(&shell.client, &client)
+                    {
                         return;
                     }
                     match verify_res {
-                    Ok(me) => {
-                        let auth = AuthResponse {
-                            token: stored.token,
-                            session_id: stored.session_id,
-                            user_id: me.user_id,
-                            username: me.username.unwrap_or(stored.username),
-                            first_name: me.first_name,
-                            created_at: me.created_at,
-                            expires_at: me.expires_at,
-                        };
-                        shell.apply_authenticated_session(auth, cx);
-                    }
-                    Err(_) => {
-                        shell.client.clear_session();
-                        shell.client.local_store.clear_all();
-                        ClientConfig::clear_session();
-                        shell.auth_wizard.update(cx, |w, wcx| {
-                            w.set_login_error(Some("Saved session expired. Please sign in again.".to_string()));
-                            wcx.notify();
-                        });
-                        cx.notify();
-                    }
+                        Ok(me) => {
+                            let resolved_username = me
+                                .username
+                                .clone()
+                                .filter(|u| !u.trim().is_empty())
+                                .unwrap_or_else(|| {
+                                    shell
+                                        .session_sync
+                                        .username
+                                        .clone()
+                                        .unwrap_or_else(|| verify_username.clone())
+                                });
+                            if me.user_id > 0 && me.user_id != verify_user_id {
+                                let auth = AuthResponse {
+                                    token: verify_token,
+                                    session_id: verify_session_id,
+                                    user_id: me.user_id,
+                                    username: resolved_username,
+                                    first_name: me.first_name,
+                                    created_at: me.created_at,
+                                    expires_at: me.expires_at,
+                                };
+                                shell.apply_authenticated_session(auth, cx);
+                                return;
+                            }
+                            if let Some(ref fname) = me.first_name {
+                                if !fname.trim().is_empty() {
+                                    shell
+                                        .client
+                                        .local_store
+                                        .set_cached_user_display_name(Some(fname.trim().to_string()));
+                                }
+                            }
+                            shell.client.update_auth_profile(
+                                verify_user_id,
+                                resolved_username.clone(),
+                                me.first_name.clone(),
+                                me.created_at,
+                                me.expires_at,
+                            );
+                            shell.session_sync.username = Some(resolved_username.clone());
+                            let full_name = me
+                                .first_name
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(resolved_username.as_str())
+                                .to_string();
+                            let acc = build_account_record(
+                                verify_user_id,
+                                &full_name,
+                                &resolved_username,
+                                "",
+                                "",
+                            );
+                            shell.app.bind_authenticated_session(verify_user_id, &full_name, "");
+                            shell.window_runtime.bind_session_user(verify_user_id, &full_name, "");
+                            shell.nav_rail.update(cx, |r, _| {
+                                r.set_account(&acc.avatar_initials, &acc.display_name);
+                            });
+                            shell.main_menu_drawer.update(cx, |m, _| {
+                                m.accounts = vec![acc];
+                                m.active_account_id = verify_user_id as u32;
+                            });
+                            cx.notify();
+                        }
+                        Err(
+                            gpui_telegram_client::HttpClientError::Unauthorized(_)
+                            | gpui_telegram_client::HttpClientError::Api {
+                                status: 401 | 403,
+                                ..
+                            },
+                        ) => {
+                            shell.logout(cx);
+                            shell.auth_wizard.update(cx, |w, wcx| {
+                                w.set_login_error(Some(
+                                    "Saved session expired. Please sign in again.".to_string(),
+                                ));
+                                wcx.notify();
+                            });
+                            cx.notify();
+                        }
+                        Err(_) => {
+                            // Transient network/timeout/5xx: preserve cached workspace offline
+                            // just like Telegram Desktop instead of wiping the user's session.
+                            shell.window_runtime.set_connection_status(
+                                BannerConnectionStatus::WaitingForNetwork,
+                                None,
+                            );
+                            cx.notify();
+                        }
                     }
                 });
             })
@@ -309,6 +400,236 @@ impl AppShell {
         }
 
         shell_instance
+    }
+
+    fn session_persistence_dir_for_client(client: &TelegramClient) -> Option<PathBuf> {
+        let cache_dir = client.local_store.cache_dir()?;
+        if cache_dir.file_name().and_then(|s| s.to_str()) == Some("cache") {
+            Some(cache_dir.parent().unwrap_or(&cache_dir).to_path_buf())
+        } else {
+            Some(cache_dir)
+        }
+    }
+
+    fn load_stored_session_for_shell(&self) -> Option<StoredSession> {
+        let dir = Self::session_persistence_dir_for_client(&self.client)?;
+        let stored = ClientConfig::load_session_in_dir(&dir)?;
+        if stored.token.trim().is_empty() || stored.user_id == 0 {
+            return None;
+        }
+        if !ClientConfig::server_urls_match(&stored.server_url, &self.client.config.server_url) {
+            return None;
+        }
+        Some(stored)
+    }
+
+    fn save_stored_session_for_shell(&self, session: &StoredSession) {
+        if let Some(dir) = Self::session_persistence_dir_for_client(&self.client) {
+            let _ = ClientConfig::save_session_in_dir(&dir, session);
+        }
+    }
+
+    fn clear_stored_session_for_shell(&self) {
+        if let Some(dir) = Self::session_persistence_dir_for_client(&self.client) {
+            ClientConfig::clear_session_in_dir(&dir);
+        }
+    }
+
+    /// Triggers a single deferred redraw right after `CONNECTING_BANNER_GRACE_MS` so the
+    /// floating connecting pill appears smoothly only if the connection is still pending.
+    pub(crate) fn schedule_connecting_banner_grace_refresh(&self, cx: &mut Context<Self>) {
+        let delay = std::time::Duration::from_millis(
+            crate::views::app_shell::window_connecting_widget::CONNECTING_BANNER_GRACE_MS + 50,
+        );
+        cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
+            app.background_executor().timer(delay).await;
+            let _ = weak_shell.update(app, |shell, cx| {
+                if shell.window_runtime.connecting_widget.is_visible {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Synchronously hydrates folders, contacts, cached dialogs, rich metadata, message histories,
+    /// and optional last-active chat from SQLite-backed `LocalStore` for Frame-0 rendering.
+    /// Returns `(hydrated_dialogs, restored_active_chat_id)`.
+    fn hydrate_workspace_from_local_store(
+        &mut self,
+        user_id: u64,
+        restore_last_chat: bool,
+        cx: &mut Context<Self>,
+    ) -> (bool, Option<u64>) {
+        let cached_folders = self.client.local_store.get_folders();
+        if !cached_folders.is_empty() {
+            crate::views::app_shell::shell_settings_sync::apply_folders_to_shell(
+                self,
+                &cached_folders,
+                cx,
+            );
+        }
+
+        let cached_contacts = self.client.local_store.get_cached_contacts();
+        if !cached_contacts.is_empty() {
+            let rows =
+                crate::views::app_shell::shell_actions::contacts_to_modal_rows(&cached_contacts);
+            let contact_cids: std::collections::HashSet<u64> = cached_contacts
+                .iter()
+                .filter(|c| !c.is_bot)
+                .filter_map(|c| c.chat_id.map(|cid| cid as u64))
+                .collect();
+            self.session_sync.contacts_list = cached_contacts;
+            self.sidebar.update(cx, |sb, _| {
+                sb.contact_chat_ids = contact_cids;
+            });
+            self.modal_container
+                .update(cx, |m, _| m.dialog.sync_contacts(rows));
+        }
+
+        let cached_dialogs = self.client.local_store.get_cached_dialog_summaries();
+        if cached_dialogs.is_empty() {
+            return (false, None);
+        }
+        let cached_rich_map = self.client.local_store.get_cached_rich_chats();
+        let cached_histories = self.client.local_store.list_cached_chat_histories();
+        let last_active_chat_id = if restore_last_chat {
+            self.client.local_store.get_last_active_chat_id()
+        } else {
+            None
+        };
+        let lang_for_hydrate = self.active_lang_id().to_string();
+
+        for (&cid, rc) in &cached_rich_map {
+            self.session_sync.rich_chats_by_id.insert(cid, rc.clone());
+            if let Some(pid) = rc.peer_user_id.filter(|&pid| pid > 0) {
+                self.session_sync.chat_peer_user_ids.insert(cid, pid);
+            }
+        }
+
+        let mut restored_chat_id: Option<u64> = None;
+        self.sidebar.update(cx, |sb, sb_cx| {
+            self.stage.update(sb_cx, |st, st_cx| {
+                self.inspector.update(st_cx, |insp, insp_cx| {
+                    let _ = apply_authoritative_chat_list(sb, st, insp, &cached_dialogs);
+                    for c in &cached_dialogs {
+                        if c.is_bot.unwrap_or(false) {
+                            sb.bot_ids.insert(c.chat_id);
+                        }
+                    }
+                    for (&cid, rc) in &cached_rich_map {
+                        if rc.is_bot {
+                            sb.bot_ids.insert(cid);
+                        }
+                        if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == cid) {
+                            d.is_pinned = rc.is_pinned;
+                            d.is_muted = rc.is_muted;
+                        }
+                        if rc.is_archived {
+                            if !sb.archived_ids.contains(&cid) {
+                                sb.archived_ids.push(cid);
+                            }
+                        } else {
+                            sb.archived_ids.retain(|&x| x != cid);
+                        }
+                    }
+                    for d in &mut sb.dialogs {
+                        if d.avatar_initials.is_empty() || d.avatar_initials == "?" {
+                            let fixed = derive_initials(&d.peer_name);
+                            if !fixed.is_empty() {
+                                d.avatar_initials = fixed;
+                            }
+                        }
+                        if let Some(snap) = cached_histories.get(&d.id) {
+                            if !snap.messages.is_empty() {
+                                let models = build_cached_history_models(
+                                    &snap.messages,
+                                    &snap.rich_messages,
+                                    user_id,
+                                    &d.peer_name,
+                                    &d.avatar_initials,
+                                    d.avatar_color,
+                                );
+                                st.chat_histories.insert(d.id, models);
+                            }
+                        }
+                    }
+                    sb.recompute_folder_badges();
+
+                    if let Some(cid) = last_active_chat_id {
+                        if select_authoritative_dialog(sb, st, insp, cid) {
+                            restored_chat_id = Some(cid);
+                            if let Some(d) = sb.dialogs.iter().find(|d| d.id == cid) {
+                                st.is_muted_chat = d.is_muted;
+                                st.is_pinned_chat = d.is_pinned;
+                            }
+                            if let Some(rc) = cached_rich_map.get(&cid) {
+                                st.is_muted_chat = rc.is_muted;
+                                st.is_pinned_chat = rc.is_pinned;
+                                st.is_peer_blocked = rc.is_blocked;
+                                st.is_bot_chat = rc.is_bot;
+                                st.is_group_chat =
+                                    rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3);
+                                st.is_saved_messages = rc.chat_type == 5
+                                    || rc.kind.as_deref() == Some("saved")
+                                    || (rc.chat_type == 0
+                                        && rc.peer_user_id.is_none()
+                                        && rc.members_count <= 1
+                                        && !rc.is_bot);
+                                st.message_ttl_seconds = rc.message_ttl_seconds;
+                                if st.is_group_chat
+                                    && rc.members_count > 0
+                                    && st.chat_subtitle.trim().is_empty()
+                                {
+                                    st.chat_subtitle = if lang_for_hydrate.starts_with("zh") {
+                                        format!("{} 位成员", rc.members_count)
+                                    } else {
+                                        format!("{} members", rc.members_count)
+                                    };
+                                }
+                            }
+                            if st.messages.is_empty() && !st.show_bot_start_bar {
+                                st.is_loading_history = true;
+                            } else {
+                                st.is_loading_history = false;
+                            }
+                            let (_, media, files, links, voices) =
+                                crate::views::app_shell::shell_actions::map_stage_media_to_gallery(
+                                    &st.messages,
+                                );
+                            insp.sync_shared_content(media, files, links, voices, Vec::new());
+                            insp_cx.notify();
+                        }
+                    }
+                });
+                st_cx.notify();
+            });
+            sb_cx.notify();
+        });
+        self.overlays.last_sidebar_selection_revision = self.sidebar.read(cx).selection_revision;
+
+        if let Some(cid) = restored_chat_id {
+            let cached_draft = self
+                .client
+                .local_store
+                .get_draft(ChatId(cid as i64))
+                .map(|d| d.text)
+                .unwrap_or_default();
+            if !cached_draft.is_empty() {
+                self.session_sync
+                    .last_draft_text_by_chat
+                    .insert(cid, cached_draft.clone());
+                self.sidebar
+                    .update(cx, |sb, _| sb.set_draft(cid, cached_draft.clone()));
+                self.composer.update(cx, |c, _| {
+                    if !c.is_compose_isolated {
+                        c.set_text(cached_draft);
+                    }
+                });
+            }
+        }
+
+        (true, restored_chat_id)
     }
 
     fn reset_conversation_views(&mut self, srv_url: &str, username: Option<&str>, cx: &mut Context<Self>) {
@@ -323,7 +644,8 @@ impl AppShell {
     }
 
     /// Binds an authenticated `AuthResponse`, opens WebSocket streaming, resets peer views,
-    /// triggers initial server data syncs, and persists the session to disk.
+    /// hydrates persisted cache synchronously for Frame-0 painting, triggers parallel server
+    /// data syncs, and persists the session to disk.
     pub fn apply_authenticated_session(&mut self, auth: AuthResponse, cx: &mut Context<Self>) {
         self.apply_authenticated_session_with_vault(auth, None, cx);
     }
@@ -394,17 +716,27 @@ impl AppShell {
         self.client.connect_ws();
         self.start_ws_inbound_stream(cx);
 
+        if let Some(ref fname) = auth.first_name {
+            if !fname.trim().is_empty() {
+                self.client
+                    .local_store
+                    .set_cached_user_display_name(Some(fname.trim().to_string()));
+            }
+        }
+        let cached_display_name = self.client.local_store.get_cached_user_display_name();
         let full_name = auth
             .first_name
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .or_else(|| cached_display_name.as_deref())
             .unwrap_or(auth.username.as_str())
             .to_string();
         let acc = build_account_record(auth.user_id, &full_name, &auth.username, "", "");
         self.app.bind_authenticated_session(auth.user_id, &full_name, "");
         self.window_runtime.bind_session_user(auth.user_id, &full_name, "");
         self.window_runtime.set_connection_status(BannerConnectionStatus::Connecting, None);
+        self.schedule_connecting_banner_grace_refresh(cx);
         self.nav_rail.update(cx, |r, _| r.set_account(&acc.avatar_initials, &acc.display_name));
         self.main_menu_drawer.update(cx, |m, _| {
             m.accounts = vec![acc];
@@ -413,13 +745,17 @@ impl AppShell {
         self.session_sync.clear_message_tracking();
         self.reset_conversation_views(&srv_url, Some(&auth.username), cx);
 
-        let cached_folders = self.client.local_store.get_folders();
-        if !cached_folders.is_empty() {
-            crate::views::app_shell::shell_settings_sync::apply_folders_to_shell(
-                self,
-                &cached_folders,
-                cx,
-            );
+        let (hydrated_dialogs, restored_chat_id) =
+            self.hydrate_workspace_from_local_store(auth.user_id, prev_user_id.is_none(), cx);
+        if !hydrated_dialogs {
+            self.sidebar.update(cx, |sb, sb_cx| {
+                sb.is_loading_dialogs = true;
+                sb_cx.notify();
+            });
+            self.stage.update(cx, |st, st_cx| {
+                st.is_loading_workspace = true;
+                st_cx.notify();
+            });
         }
 
         if prev_user_id != Some(auth.user_id) {
@@ -463,6 +799,9 @@ impl AppShell {
             });
         }
         self.refresh_chats(cx);
+        if let Some(cid) = restored_chat_id {
+            self.load_historical_messages(cid, cx);
+        }
         self.refresh_folders(cx);
         self.refresh_contacts(cx);
         self.refresh_wallet(cx);
@@ -484,7 +823,7 @@ impl AppShell {
         self.announce_coding_host_to_server(cx);
         self.bootstrap_local_bot_browser_and_vault_with_auth(vault_bootstrap, cx);
 
-        let _ = ClientConfig::save_session(&StoredSession {
+        self.save_stored_session_for_shell(&StoredSession {
             server_url: srv_url,
             user_id: auth.user_id,
             username: auth.username,
@@ -590,7 +929,7 @@ impl AppShell {
             r.set_account("?", "");
             r.set_active_destination(NavDestination::Chats);
         });
-        ClientConfig::clear_session();
+        self.clear_stored_session_for_shell();
 
         if let (Some(token), Some(session_id)) = (token, session_id) {
             let http = client.http_client.clone();
@@ -1695,8 +2034,11 @@ impl Render for AppShell {
             },
         ).size_0();
 
-        let show_conn_banner = self.window_runtime.connecting_widget.is_visible;
-        let conn_banner_text = self.window_runtime.connecting_widget.status_text();
+        let show_conn_banner = self.window_runtime.connecting_widget.should_show_banner();
+        let conn_banner_text = self
+            .window_runtime
+            .connecting_widget
+            .localized_status_text(self.active_lang_id());
         let (contacts_open, creation_modal, account_popover_open, is_apple_compose_mode) = {
             let sb = self.sidebar.read(cx);
             (
@@ -1723,13 +2065,6 @@ impl Render for AppShell {
             .relative().size_full().flex().flex_col()
             .bg(rgb(pal.window_bg))
             .child(ime_canvas)
-            .when(show_conn_banner, |el| {
-                el.child(
-                    div().w_full().h(px(pal.scaled_px(26.0))).bg(rgb(pal.accent)).text_color(rgb(pal.active_button_fg))
-                        .text_size(px(pal.scaled_px(12.0))).font_weight(FontWeight::MEDIUM)
-                        .flex().items_center().justify_center().child(conn_banner_text),
-                )
-            })
             .when_some(update_banner, |el, banner| el.child(banner))
             .child(
                 div().flex_1().w_full().min_h(px(0.0)).flex()
@@ -1782,6 +2117,44 @@ impl Render for AppShell {
                         .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
                     }),
             )
+            .when(show_conn_banner && !has_blocking_overlay, |el| {
+                let pill_bg = if pal.mode.is_dark() {
+                    hsla(0.0, 0.0, 0.14, 0.92)
+                } else {
+                    hsla(0.0, 0.0, 0.12, 0.84)
+                };
+                el.child(
+                    div()
+                        .id("app-shell-connecting-pill")
+                        .absolute()
+                        .bottom(px(pal.scaled_px(14.0)))
+                        .left(px(pal.scaled_px(14.0)))
+                        .px(px(pal.scaled_px(12.0)))
+                        .py(px(pal.scaled_px(6.0)))
+                        .rounded(px(999.0))
+                        .bg(pill_bg)
+                        .border_1()
+                        .border_color(hsla(0.0, 0.0, 1.0, 0.10))
+                        .shadow_md()
+                        .flex()
+                        .items_center()
+                        .gap(px(pal.scaled_px(7.0)))
+                        .child(
+                            div()
+                                .w(px(pal.scaled_px(7.0)))
+                                .h(px(pal.scaled_px(7.0)))
+                                .rounded(px(999.0))
+                                .bg(rgb(pal.accent)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(pal.scaled_px(12.0)))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0xFFFFFF))
+                                .child(conn_banner_text),
+                        ),
+                )
+            })
             .when_some(self.rtc_talk.talk_mode_overlay.clone(), |el, ov| el.child(self.render_talk_mode_overlay(ov, cx)))
             .when_some(self.overlays.media_viewer_overlay.clone(), |el, ov| el.child(self.render_media_viewer_overlay(ov)))
             .when_some(self.overlays.iv_viewer_overlay.clone(), |el, ov| el.child(self.render_iv_viewer_overlay(ov)))

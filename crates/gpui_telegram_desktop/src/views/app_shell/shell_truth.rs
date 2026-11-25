@@ -461,10 +461,14 @@ pub fn apply_authoritative_chat_list(
         })
         .collect();
     sidebar.inner_widget.total_rows = sidebar.dialogs.len();
+    sidebar.is_loading_dialogs = false;
+    sidebar.has_synced_dialogs = true;
     sidebar.recompute_folder_badges();
 
     let valid_ids: HashSet<u64> = sidebar.dialogs.iter().map(|d| d.id).collect();
+    stage.is_loading_workspace = false;
     stage.chat_histories.retain(|id, _| valid_ids.contains(id));
+    stage.loaded_history_chats.retain(|id| valid_ids.contains(id));
     stage.chat_pinned_messages.retain(|id, _| valid_ids.contains(id));
     stage.chat_scroll_positions.retain(|id, _| valid_ids.contains(id));
 
@@ -844,7 +848,7 @@ fn message_content_preview(content: &MessageContent) -> String {
     }
 }
 
-fn resolve_reply_references(models: &mut [MessageItemModel], existing: &[MessageItemModel]) {
+pub fn resolve_reply_references(models: &mut [MessageItemModel], existing: &[MessageItemModel]) {
     let mut index: HashMap<u64, (String, String)> = existing
         .iter()
         .map(|m| (m.id, (m.sender_name.clone(), message_content_preview(&m.content))))
@@ -870,6 +874,29 @@ fn resolve_reply_references(models: &mut [MessageItemModel], existing: &[Message
             }
         }
     }
+}
+
+/// Converts a persisted `CachedChatHistorySnapshot` into stage `MessageItemModel` rows
+/// with rich sender/keyboard metadata and resolved reply references for instant 0ms hydration.
+pub fn build_cached_history_models(
+    messages: &[HistoricalMessage],
+    rich_messages: &[HermesRichMessageDto],
+    self_user_id: u64,
+    peer_name: &str,
+    peer_initials: &str,
+    peer_color: u32,
+) -> Vec<MessageItemModel> {
+    let mut models: Vec<MessageItemModel> = messages
+        .iter()
+        .map(|hm| {
+            historical_message_to_model(hm, self_user_id, peer_name, peer_initials, peer_color)
+        })
+        .collect();
+    if !rich_messages.is_empty() {
+        overlay_rich_message_metadata(&mut models, rich_messages);
+    }
+    resolve_reply_references(&mut models, &[]);
+    models
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -949,7 +976,9 @@ pub fn apply_authoritative_chat_history(
         }
     }
 
+    stage.loaded_history_chats.insert(chat_id);
     if stage.active_chat_id == Some(chat_id) {
+        stage.is_loading_history = false;
         stage.messages = reconciled.clone();
         stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
     }

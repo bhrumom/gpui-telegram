@@ -70,6 +70,7 @@ impl AppShell {
                         .filter(|c| !c.is_bot)
                         .filter_map(|c| c.chat_id.map(|cid| cid as u64))
                         .collect();
+                    shell.client.local_store.replace_cached_contacts(&list);
                     shell.session_sync.contacts_list = list;
                     shell.sidebar.update(cx, |sb, sb_cx| {
                         sb.contact_chat_ids = contact_cids;

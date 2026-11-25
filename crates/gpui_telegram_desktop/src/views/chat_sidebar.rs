@@ -329,6 +329,10 @@ pub struct ChatSidebar {
     pub hovered_rail_dialog_id: Option<u64>,
     pub nav_rail: Option<Entity<NavRail>>,
     pub standalone_active_destination: NavDestination,
+    /// True while initial authoritative dialog sync is in flight and no dialogs are rendered yet.
+    pub is_loading_dialogs: bool,
+    /// True once dialogs have been hydrated from local cache or authoritative server response.
+    pub has_synced_dialogs: bool,
 }
 
 impl ChatSidebar {
@@ -422,6 +426,8 @@ impl ChatSidebar {
             hovered_rail_dialog_id: None,
             nav_rail: None,
             standalone_active_destination: NavDestination::Chats,
+            is_loading_dialogs: false,
+            has_synced_dialogs: false,
         }
     }
 
@@ -516,6 +522,8 @@ impl ChatSidebar {
         self.group_chat_ids.clear();
         self.channel_chat_ids.clear();
         self.custom_folders.clear();
+        self.is_loading_dialogs = false;
+        self.has_synced_dialogs = false;
         self.bot_fabushi_visuals.clear();
         self.bot_grok_avatars.clear();
         self.saved_messages_id = None;

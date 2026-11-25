@@ -211,13 +211,37 @@ impl AppShell {
                             ConnectionStatus::Offline { .. } => BannerConnectionStatus::WaitingForNetwork,
                         };
                         shell.window_runtime.set_connection_status(banner, None);
+                        if matches!(
+                            banner,
+                            BannerConnectionStatus::Connecting
+                                | BannerConnectionStatus::Updating
+                                | BannerConnectionStatus::ProxyConnecting
+                        ) {
+                            shell.schedule_connecting_banner_grace_refresh(cx);
+                        }
                         if !is_connected {
                             shell.coding_host.registered_for_auth_gen = None;
                         }
                         if is_connected && !was_connected {
-                            shell.refresh_chats(cx);
+                            let is_reconnect = shell.session_sync.has_connected_ws_once;
+                            shell.session_sync.has_connected_ws_once = true;
+                            let chat_list_fresh_in_flight = shell
+                                .session_sync
+                                .chat_list_in_flight_since
+                                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3));
+                            if is_reconnect || !chat_list_fresh_in_flight {
+                                shell.refresh_chats(cx);
+                            }
                             if let Some(cid) = shell.stage.read(cx).active_chat_id {
-                                shell.load_historical_messages(cid, cx);
+                                let history_fresh_in_flight = shell
+                                    .session_sync
+                                    .history_in_flight_chat
+                                    .is_some_and(|(id, t)| {
+                                        id == cid && t.elapsed() < std::time::Duration::from_secs(3)
+                                    });
+                                if is_reconnect || !history_fresh_in_flight {
+                                    shell.load_historical_messages(cid, cx);
+                                }
                             }
                             if shell.is_authenticated
                                 && shell.coding_host.registered_for_auth_gen

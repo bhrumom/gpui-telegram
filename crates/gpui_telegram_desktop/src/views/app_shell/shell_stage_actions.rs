@@ -29,7 +29,7 @@ use crate::views::app_shell::shell_theme::{
     compute_shell_palette, propagate_theme_and_locale, tdesktop_mode_to_app_theme, ShellThemeTargets,
 };
 use crate::views::app_shell::shell_truth::{
-    derive_initials, select_authoritative_dialog, ClientCallFence,
+    build_cached_history_models, derive_initials, select_authoritative_dialog, ClientCallFence,
 };
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::composer::field_autocomplete::MentionRow;
@@ -950,13 +950,39 @@ impl AppShell {
         let mut selected = false;
         let mut max_msg_id = 0i64;
         let rich_meta_opt = self.session_sync.rich_chats_by_id.get(&chat_id).cloned();
+        let self_uid = self.session_sync.user_id.unwrap_or(0);
+        let lang_for_sync = self.active_lang_id().to_string();
+        let cached_history_snap = self.client.local_store.get_cached_chat_history(chat_id);
         self.sidebar.update(cx, |sb, sb_cx| {
-            let dlg_flags = sb.dialogs.iter().find(|d| d.id == chat_id).map(|d| (d.is_muted, d.is_pinned));
+            let dlg_info = sb
+                .dialogs
+                .iter()
+                .find(|d| d.id == chat_id)
+                .map(|d| (d.is_muted, d.is_pinned, d.peer_name.clone(), d.avatar_initials.clone(), d.avatar_color));
             self.stage.update(sb_cx, |st, st_cx| {
+                // Hydrate persisted SQLite history into `chat_histories` BEFORE `set_chat` so
+                // previously visited or prefetched chats paint with full messages on Frame 0.
+                if st.chat_histories.get(&chat_id).map_or(true, |h| h.is_empty()) {
+                    if let (Some(snap), Some((_, _, peer_name, peer_init, peer_color))) =
+                        (&cached_history_snap, &dlg_info)
+                    {
+                        if !snap.messages.is_empty() {
+                            let models = build_cached_history_models(
+                                &snap.messages,
+                                &snap.rich_messages,
+                                self_uid,
+                                peer_name,
+                                peer_init,
+                                *peer_color,
+                            );
+                            st.chat_histories.insert(chat_id, models);
+                        }
+                    }
+                }
                 self.inspector.update(st_cx, |insp, _| {
                     selected = select_authoritative_dialog(sb, st, insp, chat_id);
                     if selected {
-                        if let Some((muted, pinned)) = dlg_flags {
+                        if let Some((muted, pinned, _, _, _)) = dlg_info {
                             st.is_muted_chat = muted;
                             st.is_pinned_chat = pinned;
                         } else if let Some(ref rc) = rich_meta_opt {
@@ -965,7 +991,33 @@ impl AppShell {
                         }
                         if let Some(ref rc) = rich_meta_opt {
                             st.is_peer_blocked = rc.is_blocked;
+                            st.is_bot_chat = rc.is_bot;
+                            st.is_group_chat = rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3);
+                            st.is_saved_messages = rc.chat_type == 5
+                                || rc.kind.as_deref() == Some("saved")
+                                || (rc.chat_type == 0
+                                    && rc.peer_user_id.is_none()
+                                    && rc.members_count <= 1
+                                    && !rc.is_bot);
                             st.message_ttl_seconds = rc.message_ttl_seconds;
+                            if st.is_group_chat
+                                && rc.members_count > 0
+                                && st.chat_subtitle.trim().is_empty()
+                            {
+                                st.chat_subtitle = if lang_for_sync.starts_with("zh") {
+                                    format!("{} 位成员", rc.members_count)
+                                } else {
+                                    format!("{} members", rc.members_count)
+                                };
+                            }
+                        }
+                        if st.messages.is_empty()
+                            && !st.loaded_history_chats.contains(&chat_id)
+                            && !st.show_bot_start_bar
+                        {
+                            st.is_loading_history = true;
+                        } else {
+                            st.is_loading_history = false;
                         }
                         max_msg_id = st.messages.iter().map(|m| m.id as i64).max().unwrap_or(0);
                         let (_, media, files, links, voices) = map_stage_media_to_gallery(&st.messages);
@@ -986,6 +1038,7 @@ impl AppShell {
         if !selected {
             return;
         }
+        self.client.local_store.set_last_active_chat_id(Some(chat_id));
         if prev_chat_id != Some(chat_id) {
             if let Some(prev) = prev_chat_id {
                 if self.window_runtime.controller.clear_toasts_for_chat(prev) {
@@ -1052,7 +1105,14 @@ impl AppShell {
                     .filter(|&&id| id > 0)
                     .map(|id| id.to_string())
             });
-        self.load_historical_messages(chat_id, cx);
+        let history_fresh_in_flight = prev_chat_id == Some(chat_id)
+            && self
+                .session_sync
+                .history_in_flight_chat
+                .is_some_and(|(id, t)| id == chat_id && t.elapsed() < std::time::Duration::from_secs(3));
+        if !history_fresh_in_flight {
+            self.load_historical_messages(chat_id, cx);
+        }
         self.sync_composer_and_inspector_miniapp_state(cx);
         self.sync_active_bot_computer_to_inspector(cx);
         self.sync_fabushi_bots_to_views(cx);
@@ -1070,20 +1130,38 @@ impl AppShell {
             if !call_fence.preflight_ui(&weak, app).await {
                 return;
             }
-            let details = call_fence
-                .client
-                .get_chat_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
-                .await
-                .ok();
+            let cid_i64 = chat_id as i64;
+            let (
+                details_res,
+                rich_chat_res,
+                members_res,
+                invites_res,
+                pins_res,
+                draft_res,
+                stats_res,
+                send_as_res,
+            ) = futures::join!(
+                call_fence.client.get_chat_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.hermes.get_chat_rich(&call_fence.token, cid_i64),
+                call_fence.client.get_chat_members_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.list_invites_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.list_pinned_messages_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.get_draft_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.get_channel_statistics_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.http_client.get_send_as_peers(&call_fence.token, cid_i64),
+            );
+            let details = details_res.ok();
+            let rich_chat = rich_chat_res.ok();
+            let members = members_res.ok();
+            let invites = invites_res.ok();
+            let pins = pins_res.ok();
+            let draft = draft_res.ok().flatten();
+            let stats = stats_res.ok();
+            let send_as_dto = send_as_res.ok();
+
             if !call_fence.preflight_ui(&weak, app).await {
                 return;
             }
-            let rich_chat = call_fence
-                .client
-                .hermes
-                .get_chat_rich(&call_fence.token, chat_id as i64)
-                .await
-                .ok();
             let rc_is_bot_flag = rich_chat.as_ref().is_some_and(|rc| rc.is_bot) || sb_is_bot;
             let bot_target = if rc_is_bot_flag {
                 rich_chat
@@ -1101,114 +1179,53 @@ impl AppShell {
             } else {
                 None
             };
-            let bot_profile = if let Some(ref target) = bot_target {
-                if !call_fence.preflight_ui(&weak, app).await {
-                    return;
-                }
-                call_fence
-                    .client
-                    .get_bot_public_profile_with_token(
-                        &call_fence.token,
-                        call_fence.client_epoch,
-                        target,
-                    )
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let members = call_fence
-                .client
-                .get_chat_members_with_token(
-                    &call_fence.token,
-                    call_fence.client_epoch,
-                    chat_id as i64,
-                )
-                .await
-                .ok();
             let approvals_bot_id = active_bot_id_for_approvals.or_else(|| {
                 rich_chat
                     .as_ref()
                     .filter(|rc| rc.is_bot)
                     .and_then(|rc| rc.peer_user_id)
             });
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let pending_approvals = call_fence
-                .client
-                .hermes
-                .list_approvals_for_bot(&call_fence.token, approvals_bot_id)
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let invites = call_fence
-                .client
-                .list_invites_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let pins = call_fence
-                .client
-                .list_pinned_messages_with_token(
-                    &call_fence.token,
-                    call_fence.client_epoch,
-                    chat_id as i64,
-                )
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let draft = call_fence
-                .client
-                .get_draft_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
-                .await
-                .ok()
-                .flatten();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let stats = call_fence
-                .client
-                .get_channel_statistics_with_token(
-                    &call_fence.token,
-                    call_fence.client_epoch,
-                    chat_id as i64,
-                )
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let send_as_dto = call_fence
-                .client
-                .http_client
-                .get_send_as_peers(&call_fence.token, chat_id as i64)
-                .await
-                .ok();
-            if max_msg_id > 0 {
-                if !call_fence.preflight_ui(&weak, app).await {
-                    return;
+
+            let bot_profile_fut = async {
+                if let Some(ref target) = bot_target {
+                    call_fence
+                        .client
+                        .get_bot_public_profile_with_token(
+                            &call_fence.token,
+                            call_fence.client_epoch,
+                            target,
+                        )
+                        .await
+                        .ok()
+                } else {
+                    None
                 }
-                let _ = call_fence
+            };
+            let approvals_fut = async {
+                call_fence
                     .client
-                    .mark_chat_read_with_token(
-                        &call_fence.token,
-                        call_fence.client_epoch,
-                        chat_id as i64,
-                        max_msg_id,
-                        None,
-                    )
-                    .await;
-            }
+                    .hermes
+                    .list_approvals_for_bot(&call_fence.token, approvals_bot_id)
+                    .await
+                    .ok()
+            };
+            let mark_read_fut = async {
+                if max_msg_id > 0 {
+                    let _ = call_fence
+                        .client
+                        .mark_chat_read_with_token(
+                            &call_fence.token,
+                            call_fence.client_epoch,
+                            cid_i64,
+                            max_msg_id,
+                            None,
+                        )
+                        .await;
+                }
+            };
+            let (bot_profile, pending_approvals, _) =
+                futures::join!(bot_profile_fut, approvals_fut, mark_read_fut);
+
             let _ = weak.update(app, |shell, cx| {
                 if !call_fence.is_valid(shell) {
                     return;
@@ -1220,6 +1237,7 @@ impl AppShell {
                     }
                 }
                 if let Some(ref rc) = rich_chat {
+                    shell.client.local_store.upsert_cached_rich_chat(rc.clone());
                     shell.session_sync.rich_chats_by_id.insert(chat_id, rc.clone());
                     if let Some(pid) = rc.peer_user_id.filter(|&pid| pid > 0) {
                         shell.session_sync.chat_peer_user_ids.insert(chat_id, pid);

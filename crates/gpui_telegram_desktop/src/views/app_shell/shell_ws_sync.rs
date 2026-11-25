@@ -380,6 +380,50 @@ impl AppShell {
             sb_cx.notify();
         });
         if server_id > 0 {
+            let confirmed_text_and_sender = {
+                let st = self.stage.read(cx);
+                let found = if st.active_chat_id == Some(chat_id) {
+                    st.messages.iter().find(|m| m.id == server_id)
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    st.chat_histories
+                        .get(&chat_id)
+                        .and_then(|h| h.iter().find(|m| m.id == server_id))
+                });
+                found.and_then(|m| match &m.content {
+                    MessageContent::Text { text, .. } => Some((m.sender_id, text.clone())),
+                    _ => None,
+                })
+            };
+            if let Some((sender_id, text)) = confirmed_text_and_sender {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                self.client.local_store.upsert_cached_historical_message(
+                    chat_id,
+                    gpui_telegram_client::HistoricalMessage {
+                        message_id: server_id,
+                        sender_id,
+                        text: text.clone(),
+                        content: None,
+                        date: Some(now_ms),
+                        reply_to: None,
+                        is_outgoing: Some(true),
+                        reply_to_info: None,
+                        reactions: Vec::new(),
+                        ttl_seconds: None,
+                        expires_at_ms: None,
+                        send_as_peer_id: None,
+                        reactions_authoritative: false,
+                    },
+                );
+                self.client.local_store.update_cached_dialog_preview(
+                    chat_id,
+                    super::shell_pts_updates::format_sidebar_preview(&text),
+                    now_ms,
+                    None,
+                );
+            }
             if let Some(queued) = self.session_sync.pending_nonce_reactions.remove(&local_id) {
                 for (emoji, is_added) in queued {
                     self.dispatch_reaction_mutation(chat_id, server_id, emoji, is_added, cx);

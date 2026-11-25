@@ -146,6 +146,7 @@ impl ConversationStage {
         self.pending_bot_assist_action = None;
         self.scroll_handle.set_offset(Point::default());
         self.is_anchored_to_bottom = true;
+        self.is_loading_history = false;
         self.row_height_cache.measured_heights.clear();
         self.row_height_cache.rebuild_prefix_sums(&self.messages);
     }
@@ -267,6 +268,7 @@ impl ConversationStage {
             self.unread_anchor_msg_id = Some(message.id);
         }
 
+        self.is_loading_history = false;
         self.messages.push(message.clone());
         if let Some(cid) = self.active_chat_id {
             self.chat_histories.entry(cid).or_default().push(message);

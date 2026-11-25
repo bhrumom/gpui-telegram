@@ -870,6 +870,19 @@ impl AppShell {
                     });
                     if chat_u64 > 0 && target_id > 0 {
                         let preview_snippet = format_sidebar_preview(&text);
+                        self.client.local_store.update_cached_historical_message_text(
+                            chat_u64,
+                            target_id,
+                            text.clone(),
+                        );
+                        if is_latest_message {
+                            self.client.local_store.update_cached_dialog_preview(
+                                chat_u64,
+                                preview_snippet.clone(),
+                                chrono::Utc::now().timestamp_millis(),
+                                None,
+                            );
+                        }
                         self.sidebar.update(cx, |sb, sb_cx| {
                             if let Some(dialog) = sb.dialogs.iter_mut().find(|d| d.id == chat_u64) {
                                 let is_streaming_placeholder = dialog.last_message.is_empty()
@@ -914,6 +927,10 @@ impl AppShell {
                     self.client
                         .local_store
                         .delete_messages(ChatId(chat_u64 as i64), &tombstone.message_ids);
+                    let del_ids: Vec<u64> = ids_to_delete.iter().copied().collect();
+                    self.client
+                        .local_store
+                        .delete_cached_historical_messages(chat_u64, &del_ids);
                 }
 
                 self.stage.update(cx, |st, st_cx| {
@@ -1679,6 +1696,41 @@ impl AppShell {
             sb.recompute_folder_badges();
             sb_cx.notify();
         });
+
+        if chat_u64 > 0 && server_id > 0 {
+            let ts_ms = msg.date.timestamp_millis();
+            self.client.local_store.upsert_cached_historical_message(
+                chat_u64,
+                gpui_telegram_client::HistoricalMessage {
+                    message_id: server_id,
+                    sender_id: msg.sender_id.0,
+                    text: raw_text.clone(),
+                    content: serde_json::to_value(&msg.content).ok(),
+                    date: Some(ts_ms),
+                    reply_to: msg
+                        .reply_to
+                        .as_ref()
+                        .and_then(|r| u64::try_from(r.reply_to_msg_id.0).ok()),
+                    is_outgoing: Some(is_outgoing),
+                    reply_to_info: None,
+                    reactions: Vec::new(),
+                    ttl_seconds: msg.ttl_seconds,
+                    expires_at_ms: expires_at_opt,
+                    send_as_peer_id: None,
+                    reactions_authoritative: false,
+                },
+            );
+            self.client.local_store.update_cached_dialog_preview(
+                chat_u64,
+                sidebar_preview.clone(),
+                ts_ms,
+                if !is_current_chat && !is_outgoing {
+                    Some(1)
+                } else {
+                    None
+                },
+            );
+        }
 
         let dialog_info = self
             .sidebar
