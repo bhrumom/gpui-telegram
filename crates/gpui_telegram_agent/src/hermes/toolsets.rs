@@ -197,7 +197,7 @@ impl ToolsetId {
             Self::SessionSearch => "Full-text and CJK fallback search across past conversation sessions",
             Self::Workspace => "Workspace file checkpoint inspection and atomic turn rollback",
             Self::Voice => "Full-duplex Voice / Talk Mode coordinator state control",
-            Self::PlatformIm => "Native platform IM messaging, channels, topics, reactions, pins, polls, and MiniApps",
+            Self::PlatformIm => "Native platform IM messaging, channels, topics, reactions, pins, polls, MiniApps, and Community",
         }
     }
 }
@@ -1095,7 +1095,7 @@ impl HermesToolContext {
 
 /// Complete catalog of all 58 Hermes tools across all 28 toolsets.
 pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
-    vec![
+    let mut specs = vec![
         // 1. Core (3)
         HermesToolSpec::new(
             "toolset_list",
@@ -2873,7 +2873,9 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             ToolRiskLevel::Medium,
             false,
         ),
-    ]
+    ];
+    specs.extend(crate::community_tools::community_tool_specs());
+    specs
 }
 
 pub fn find_tool_spec(name: &str) -> Option<HermesToolSpec> {
@@ -3497,6 +3499,9 @@ fn validate_platform_im_args(spec_name: &str, args: &Value) -> Result<(), String
                 }
             }
         }
+        _ if crate::community_tools::is_community_tool(spec_name) => {
+            crate::community_tools::validate_community_tool_args(spec_name, args)?;
+        }
         _ => {}
     }
     Ok(())
@@ -3533,20 +3538,22 @@ async fn execute_platform_im_tool(
         );
     };
 
-    if let Some(ctx_chat_id) = ctx.chat_id {
-        if let Some(obj) = args.as_object_mut() {
-            if let Some(explicit_val) = obj.get("chat_id").filter(|v| !v.is_null()) {
-                if explicit_val.as_i64() != Some(ctx_chat_id) {
-                    return HermesToolResult::err(
-                        spec_name,
-                        format!(
-                            "Cross-chat target mismatch: tool context is pinned to chat {ctx_chat_id}, got {explicit_val}"
-                        ),
-                    );
+    if !crate::community_tools::is_community_tool(spec_name) {
+        if let Some(ctx_chat_id) = ctx.chat_id {
+            if let Some(obj) = args.as_object_mut() {
+                if let Some(explicit_val) = obj.get("chat_id").filter(|v| !v.is_null()) {
+                    if explicit_val.as_i64() != Some(ctx_chat_id) {
+                        return HermesToolResult::err(
+                            spec_name,
+                            format!(
+                                "Cross-chat target mismatch: tool context is pinned to chat {ctx_chat_id}, got {explicit_val}"
+                            ),
+                        );
+                    }
                 }
-            }
-            if !obj.contains_key("chat_id") || obj.get("chat_id").is_some_and(Value::is_null) {
-                obj.insert("chat_id".to_string(), json!(ctx_chat_id));
+                if !obj.contains_key("chat_id") || obj.get("chat_id").is_some_and(Value::is_null) {
+                    obj.insert("chat_id".to_string(), json!(ctx_chat_id));
+                }
             }
         }
     }

@@ -80,7 +80,9 @@ impl ServerDatabase {
         let Some((_, uploader, chat_opt)) = self.get_media_file(media_id)? else { return Ok(true); };
         if uploader == user_id { return Ok(true); }
         if let Some(cid) = chat_opt { return self.is_user_in_chat(cid, user_id); }
-        Ok(false)
+        self.pool.with_reader(|conn| {
+            gpui_telegram_community::store::ops::is_media_referenced_publicly_conn(conn, media_id)
+        })
     }
 
     pub fn seed_default_catalog_if_empty(&self) -> Result<()> {

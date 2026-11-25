@@ -65,6 +65,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             (ALL_MIGRATIONS.len() + 3) as i64,
             crate::db::automation_app_store::MIGRATION_V41_AUTOMATION_APPS,
         ),
+        (
+            (ALL_MIGRATIONS.len() + 4) as i64,
+            gpui_telegram_community::store::MIGRATION_V42_COMMUNITY_SQL,
+        ),
     ];
 
     for (idx, &migration_sql) in ALL_MIGRATIONS.iter().enumerate() {

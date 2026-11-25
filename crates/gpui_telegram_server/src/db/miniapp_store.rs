@@ -962,6 +962,134 @@ impl ServerDatabase {
         })
     }
 
+    /// Atomically inserts a new bot into `users` and `bots_registry` inside an existing transaction.
+    /// Used by `POST /api/v1/community/identities/bot` so `users` + `bots_registry` + `community_actors`
+    /// commit or roll back together.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_registered_bot_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        owner_user_id: i64,
+        username: &str,
+        display_name: &str,
+        description: &str,
+        ai_persona: &str,
+        avatar_shape: Option<&str>,
+        avatar_color: Option<&str>,
+        preferred_model: Option<&str>,
+        now_ms: i64,
+    ) -> Result<BotRegistryRecord> {
+        let clean_un = validate_bot_username(username).map_err(TelegramError::Validation)?;
+        let clean_name = display_name.trim();
+        if clean_name.is_empty() {
+            return Err(TelegramError::Validation(
+                "Bot display name cannot be empty".into(),
+            ));
+        }
+
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT user_id FROM users WHERE LOWER(username) = LOWER(?1)",
+                params![clean_un],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_db()?;
+        if existing.is_some() {
+            return Err(TelegramError::Validation(format!(
+                "Bot username @{clean_un} is already taken"
+            )));
+        }
+
+        let max_bot_id: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(user_id), 600000) FROM users WHERE user_id >= 600000 AND user_id < 700000",
+                [],
+                |r| r.get(0),
+            )
+            .map_db()?;
+        let bot_user_id = (max_bot_id + 1).max(USER_BOT_ID_START);
+        if bot_user_id > USER_BOT_ID_MAX {
+            return Err(TelegramError::Validation(
+                "Bot registry capacity reached for user-created bots".into(),
+            ));
+        }
+
+        let bot_token = generate_bot_token(bot_user_id);
+        let bio_text = description.trim();
+
+        tx.execute(
+            r#"INSERT INTO users (
+                user_id, username, phone, first_name, last_name, bio,
+                password_hash, is_bot, is_verified, is_support, is_scam, is_fake,
+                profile_photo_file_id, account_generation, created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, NULL, ?3, NULL, ?4, NULL, 1, 0, 0, 0, 0, NULL, 1, ?5, ?5)"#,
+            params![bot_user_id, clean_un, clean_name, bio_text, now_ms],
+        )
+        .map_db()?;
+
+        let derived_agent_id = derive_safe_agent_id(None, &clean_un, bot_user_id);
+        let shape = avatar_shape
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| normalize_fabushi_avatar_shape(s, &derived_agent_id))
+            .unwrap_or_else(|| default_fabushi_avatar_shape(&derived_agent_id).to_string());
+        let color = avatar_color
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| normalize_fabushi_avatar_color(s, &derived_agent_id))
+            .unwrap_or_else(|| default_fabushi_avatar_color(&derived_agent_id).to_string());
+        let model = preferred_model.map(str::trim).unwrap_or("");
+
+        tx.execute(
+            r#"INSERT INTO bots_registry (
+                bot_user_id, owner_user_id, username, display_name, bot_token,
+                description, about, ai_persona, menu_button_text, menu_button_url,
+                is_official, is_inline, allow_attach_menu, attach_peer_types_json,
+                commands_json, created_at, updated_at,
+                agent_id, avatar_shape, avatar_color,
+                preferred_model, thinking_level, approval_mode, toolset_preset,
+                menu_button_type, has_main_app, main_app_short_name,
+                privacy_policy_url, has_settings, can_join_groups,
+                webhook_url, webhook_secret_token, is_standard_bot, coding_agent_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, '', '', 0, 0, 0, '["users","bots","groups","channels"]', '[]', ?8, ?8, ?9, ?10, ?11, ?12, 'medium', 'prompt', 'full', 'default', 0, '', '', 0, 1, '', '', 0, '')"#,
+            params![
+                bot_user_id,
+                owner_user_id,
+                clean_un,
+                clean_name,
+                bot_token,
+                bio_text,
+                ai_persona.trim(),
+                now_ms,
+                derived_agent_id,
+                shape,
+                color,
+                model,
+            ],
+        )
+        .map_db()?;
+
+        tx.query_row(
+            &format!("SELECT {BOT_COLS} FROM bots_registry WHERE bot_user_id = ?1"),
+            params![bot_user_id],
+            row_to_bot,
+        )
+        .map_db()
+    }
+
+    pub(crate) fn get_bot_by_user_id_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        bot_user_id: i64,
+    ) -> Result<Option<BotRegistryRecord>> {
+        tx.query_row(
+            &format!("SELECT {BOT_COLS} FROM bots_registry WHERE bot_user_id = ?1"),
+            params![bot_user_id],
+            row_to_bot,
+        )
+        .optional()
+        .map_db()
+    }
+
     pub fn get_bot_by_token(&self, token: &str) -> Result<Option<BotRegistryRecord>> {
         let clean = token.trim();
         if clean.is_empty() {
