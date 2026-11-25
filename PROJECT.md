@@ -1,213 +1,176 @@
-# Project: Apple-Style Sidebar & Creative Content Ecosystem (`gpui-telegram`)
+# Project: Orca Pure-Rust Absorption into `gpui-telegram` (Fabushi v1.7.0)
 
-- **Authoritative Request**: `.agents/teamwork/ORIGINAL_REQUEST.md` (`## Follow-up — 2026-11-24T08:43:16Z`)
-- **Workspace Root**: `/home/antigravity/bhrumom/gpui-telegram`
-- **Build Hygiene Mandate**: `/home/antigravity/bhrumom/gpui-telegram/AGENTS.md`
-- **Survey Evidence**:
-  - `.agents/teamwork/explorer_apple_survey_1/handoff.md` (Workspace, GPUI Shell, Styling & Guardrails)
-  - `.agents/teamwork/explorer_apple_survey_2/handoff.md` (Cloud Storage, Migration V41, FTS5/CJK Catalog & Data Contracts)
-  - `.agents/teamwork/explorer_apple_survey_3/handoff.md` (Bot Subsystem, Media/Reader/Game Engines, Deep-Links & Testing)
+- **Repository**: `/home/antigravity/bhrumom/gpui-telegram` (`origin`: `https://github.com/bhrumom/gpui-telegram.git`, baseline `cc56925` / `v1.6.11`)
+- **Upstream Reference**: `https://github.com/stablyai/orca` (audited commit `e0292cf4e836e29c261d94246be4bb19abfca03a`)
+- **Authoritative Request**: `/home/antigravity/bhrumom/gpui-telegram/.agents/teamwork/ORIGINAL_REQUEST.md` (`## Follow-up — 2026-11-25T10:09:22Z`)
+- **Survey Artifacts**:
+  - `.agents/teamwork/orca_survey_spec_miner_1/orca_core_spec.md`
+  - `.agents/teamwork/orca_survey_spec_miner_2/orca_bots_and_designs_spec.md`
+  - `.agents/teamwork/orca_survey_explorer_3/gpui_telegram_survey.md`
 
 ---
 
 ## Architecture
 
-### System Overview & Data Flow
-1. **Apple-Style Primary Sidebar (`AppleAppSidebar`) + Content Hub (`ContentHubWorkspace`)**:
-   - Mounted as the leftmost pane in `AppShell::render` (`crates/gpui_telegram_desktop/src/views/shell.rs`) alongside existing Telegram views without altering `NavRail` or `ChatSidebar` contracts.
-   - Provides macOS Apple HIG grouped sidebar navigation: **Chats (消息)**, **Books (图书)**, **Music (音乐)**, **Games (游戏)**, **App Store**, plus direct sidebar & sidebar-adjacent access to **My Creations (我的创作 / 云端作品)** (both a full workspace tab AND a collapsible Quick Creations Drawer immediately beside the sidebar).
-   - Switching to any Apple section sets `AppShell::active_panel = ActiveWorkspacePanel::ContentHub(ContentHubSection)` (`Books | Music | Games | AppStore | MyCreations`), mounting `ContentHubWorkspace` cleanly without clearing `ChatSidebar` or `ConversationStage` state.
-2. **User Cloud Creations, Review/Publishing FSM & Physically Isolated Public Catalog**:
-   - Server SQLite **Migration V43** (V41 = upstream automation apps, V42 = upstream community) (`crates/gpui_telegram_server/src/db/creations_store.rs`, pinned literal version `43` in `db/migrations.rs` `extra_migrations`) stores authoritative user cloud data in `user_creations` (monotonic per-user `cloud_revision`, `expected_revision` optimistic locking, soft-delete tombstones, frozen `published_snapshot_json` live-edit isolation).
-   - **Review & Publishing FSM**: `Draft -> PendingReview -> Published | Rejected`, `PendingReview -> Draft`, `Published -> Unpublished`, `Rejected -> Draft/PendingReview`. Submission runs `validate_creation_for_review()`, logs immutable rows in `creation_review_audit`, and upon approval with `visibility == Public` atomically upserts into the physically separate `public_catalog_entries` table (trigger-synced to `public_catalog_fts` SQLite FTS5 + CJK substring/bigram search) and `creation_public_assets` (authorizing public CAS media in `user_can_access_media`). Unpublish/delete immediately removes rows from both `public_catalog_entries` and `creation_public_assets` inside one `BEGIN IMMEDIATE` transaction.
-   - **4-Layer Visibility Isolation**: Physical table separation + atomic trigger index sync + separate `PublicCatalogService` + bot tool permission boundaries guarantee `Draft`, `PendingReview`, `Rejected`, `Unpublished`, and `Unlisted` items NEVER leak into public sections or bot recommendations.
-3. **Bot Creation & Public Recommendation Engine**:
-   - 8 bot tools registered under existing `ToolsetId::PlatformIm` (preserving `ToolsetId::all().len() == 29`): `create_book`, `create_music`, `create_game`, `update_my_creation`, `list_my_creations`, `submit_creation_for_review`, `search_public_catalog`, `recommend_public_creations`.
-   - Implemented in `ServerPlatformImBridge` AND paired with a seeded official **`@CreatorStudioBot`** (`UID 777_020`, `is_official = true`, `is_inline = true`) supporting deterministic slash/NL commands (`/newbook`, `/newmusic`, `/newgame`, `/mycreations`, `/editwork`, `/submitwork`, `/recommend`) plus `GET /api/v1/bots/inline-query` & `answerInlineQuery` so both LLM-backed and offline/E2E bots work deterministically.
-   - Bot replies render `GenerativeCard` + `InlineKeyboardButton` messages carrying canonical `tg://apple/<section>/<creation_id>` deep-links routed by `AppShell::handle_apple_deep_link` straight into the target Apple section & detail/reader/player/game view.
-4. **Authentic Cross-Platform Media, Reader & Playable Game Engines**:
-   - **Apple Books**: `BookReaderView` with multi-chapter TOC, Light/Sepia/Gray/Night themes, serif/sans/mono font & scale controls, bookmarks, and cloud progress sync (`user_creation_states`).
-   - **Apple Music**: Pure-Rust `synthesize_music_track_wav()` (`gpui_telegram_media::media::audio::synth`) generating real 44.1kHz PCM/RIFF WAV + 100-bar 5-bit waveform + deterministic seekable `MusicTransportEngine` (queue, repeat, shuffle, seek, synced lyrics, best-effort OS audio sink on macOS/Linux + silent deterministic headless mode).
-   - **Apple Games / Arcade**: Pure-Rust deterministic `MiniGameRuntime` (`GridPuzzle`, `TriviaQuiz`, `InteractiveFiction`, `ArcadeDodge`/`SnakeGrid`, `CardMatch`, plus `MiniAppHtml` via `BotAttachWebView`) rendered interactively via GPUI `canvas()` + keyboard/mouse handlers with persistent cloud leaderboards (`creation_game_scores`).
-   - **Apple App Store**: Unified storefront aggregating published `App` creations, existing published `mini_apps` (`is_published = 1`), and featured published Books/Music/Games with Today hero cards, categories, ratings/reviews, and install/open/launch actions.
-5. **Client Cloud Sync & Account-Scoped Offline Mirror**:
-   - `gpui_telegram_client` provides typed `api_creations.rs` methods, WS `ClientDomainEvent::{UserCreationChanged, PublicCatalogChanged}`, and local SQLite cache tables (`user_creations_cache`, `user_creation_states_cache`, `public_catalog_cache`) automatically wiped by `LocalStore::bind_account_scope` on account/server switch.
+Absorb `stablyai/orca`'s complete **Bot Operating System**, **Multi-Agent Orchestration Runtime**, and **Agent IDE Architecture** natively in pure Rust + GPUI `0.2.2` inside `gpui-telegram` (Fabushi), with **zero** delegation to Electron/Node/JS/TS Orca runtimes and **zero** regressions to the frozen 3,441-file `tdesktop` parity ledger (`scripts/verify_ledger_closure.py`).
 
----
-
-## Feature Inventory
-Every Survey feature is assigned a Milestone (zero unassigned).
-
-| # | Feature | Description | Milestone | Source |
-|---|---------|-------------|-----------|--------|
-| F1 | Shared Creation, Catalog & Review Contracts | Strongly typed DTOs (`CreationKind`, `CreationReviewStatus`, `CreationVisibility`, `BookPayload`, `MusicPayload`, `GamePayload`, `AppStoreListingPayload`, `UserCreationDto`, `PublicCatalogItemDto`, `BotRecommendationItem`), `validate_creation_for_review()`, WS `UpdateEvent`s | M1 | survey_1/2/3 |
-| F2 | Canonical Apple Hub Deep-Link Router | Parse & route `tg://apple/<books\|music\|games\|appstore\|creations>[/<id>][?tab=...&action=...]` and `creation:open:<kind>:<id>` in `gpui_telegram_core` | M1 | survey_1/3 |
-| F3 | Pure-Rust Music Synthesizer & Seekable Transport | `synthesize_music_track_wav()` (PCM/WAV + 5-bit waveform) & cross-platform/headless-safe seekable `MusicTransportEngine` with queue/repeat/shuffle/lyrics | M1 | survey_2/3 |
-| F4 | Server Cloud Creations Store & Delta Sync (V43) | Pinned Migration V43 (`extra_migrations` `39/40/41/42/43`), 8 `STRICT` tables + FTS5 triggers, per-user monotonic `cloud_revision`, `expected_revision` 409 CAS, soft-delete tombstones, `user_can_access_media` public asset allowlist | M2 | survey_2/3 |
-| F5 | Content Review & Publishing FSM | Strict `Draft -> PendingReview -> Published \| Rejected` + `Unpublished`, live-edit frozen published snapshot isolation, immutable `creation_review_audit`, review queue & approve/reject REST APIs, WS broadcasts | M2 | survey_1/2/3 |
-| F6 | Public Catalog Search, Vertical Feeds & App Store Merge | Isolated `public_catalog_entries` + FTS5/CJK search & composite ranker, `/api/v1/catalog/{books,music,games,appstore,recommend}`, App Store merge with `mini_apps`, user states, ratings/reviews, game leaderboards | M2 | survey_2/3 |
-| F7 | Bot-Assisted Creation (`@CreatorStudioBot` & Hermes Tools) | 8 tools under `ToolsetId::PlatformIm` (29-toolset invariant preserved), `ServerPlatformImBridge` impls, official `@CreatorStudioBot` (`UID 777_020`) deterministic slash/NL creation + cloud save + review submit + interactive cards | M3 | survey_1/2/3 |
-| F8 | Bot Public Content Recommendation & Inline Query Engine | Published+public-only `search_public_catalog` / `recommend_public_creations` / `/recommend` / `GET /api/v1/bots/inline-query` / `answerInlineQuery` returning deep-linked recommendation cards with 4-layer zero-leak enforcement | M3 | survey_1/2/3 |
-| F9 | Client Cloud API, WS Events & Account-Scoped Cache | `gpui_telegram_client::net::api_creations`, WS `ClientDomainEvent` propagation, local SQLite cache tables wiped on `LocalStore::bind_account_scope` / `clear_all()` | M4 | survey_2/3 |
-| F10 | Deterministic Playable Mini-Game Runtime | Pure-Rust `MiniGameRuntime` (`GridPuzzle`, `TriviaQuiz`, `InteractiveFiction`, `ArcadeDodge`/`SnakeGrid`, `CardMatch`, `MiniAppHtml` hook) with `step(dt_ms)`, `apply_input`, scoring & achievements | M4 | survey_2/3 |
-| F11 | Apple-Style Primary Sidebar & Zero-Regression Shell Mount | `AppleAppSidebar` (`204px`/`68px`, Apple HIG vibrancy, `IconName::EXTRA` icons preserving `IconName::ALL == 64`), `ActiveWorkspacePanel::ContentHub`, `ChatSidebar` `has_leading_app_sidebar`, `shell_input_ime.rs`, `ShellThemeTargets`, `semantic_tree.rs` | M5 | survey_1/3 |
-| F12 | Sidebar-Adjacent Cloud Creations Hub & Publish Review Modal | Full `MyCreationsView` + collapsible sidebar-adjacent Quick Creations Drawer, status badges, preview/edit/submit, "推送审核上架" modal with live validation & reviewer queue panel | M5 | survey_1/2 |
-| F13 | Unified Chat-to-Hub Deep-Link Navigation | `AppShell::handle_apple_deep_link` wired to `handle_deep_link`, `handle_stage_bot_button`, `execute_hermes_inline_callback`, and `RichTextAction::OpenUrl` | M5 | survey_1/3 |
-| F14 | Apple Books Section & Embedded Book Reader | `BooksHubView` (Reading Now, Library, Book Store, My Books, 2:3 cover grid, Detail) + `BookReaderView` (TOC, Light/Sepia/Gray/Night themes, fonts/zoom, bookmarks, cloud reading progress) | M6 | survey_1/2/3 |
-| F15 | Apple Music Section & Now-Playing Transport Bar | `MusicHubView` (Home, New, Radio, Library, My Music, Charts, Lyrics) + persistent `MusicPlayerBar` wired to `MusicTransportEngine` + `synthesize_music_track_wav` | M6 | survey_1/2/3 |
-| F16 | Apple Games / Arcade Section & Interactive Game Launcher | `GamesHubView` (Discover, Arcade, Charts, Library, My Games, Hero Banner, Detail + Leaderboards) + `GameRuntimeSheet` (`MiniGameRuntime` on GPUI `canvas()` + `BotAttachWebView` fallback) | M6 | survey_1/2/3 |
-| F17 | Apple App Store Section | `AppStoreHubView` (Today/Discover hero cards, Create/Work/Play/Develop/Categories/Installed, 3-row shelves, unified Mini Apps + Bots + cross-vertical published creations, Detail + Get/Open/Launch) | M6 | survey_1/2/3 |
-| F18 | Opaque-Box 4-Tier E2E Suite & Tier 5 Adversarial Hardening | Requirement-driven Tiers 1–4 E2E suite (`TEST_INFRA_APPLE_SIDEBAR.md` -> `TEST_READY.md`) + Phase 2 Tier 5 white-box adversarial hardening + full workspace regression & ledger closure | M7 / E2E | survey_1/2/3 |
-
----
-
-## Milestones
-
-| # | Name | Scope (Features) | Dependencies | Status |
-|---|------|------------------|--------------|--------|
-| E2E | E2E Testing Track | Requirement-driven opaque-box 4-tier E2E suite (`TEST_INFRA_APPLE_SIDEBAR.md`, HTTP/WS Tiers 1–4 + GPUI headless UI E2E after M6 -> `TEST_READY.md`) | none (UI binary after M6) | PHASE_A_DONE (`5/5 PASS`, 94 tests in `tests/e2e_suite/tests/apple_sidebar_*`; Phase B pending M6) |
-| M1 | Shared Contracts, Deep-Links & Audio Synth | F1, F2, F3 (`gpui_telegram_proto`, `gpui_telegram_core`, `gpui_telegram_media`) | none | DONE (`5/5 PASS`, 404/404 crate tests + 401/401 probes, `sub_orch_m1/handoff.md`) |
-| M2 | Server Cloud Creations, Review FSM & Public Catalog | F4, F5, F6 (`gpui_telegram_server` DB, search, REST/WS routes) | M1 | DONE (`5/5 PASS`, 12/12 M2 + 48/48 lib + 140+ live probes, `sub_orch_m2/handoff.md`) |
-| M3 | Bot Creation & Public Recommendation Engine | F7, F8 (`gpui_telegram_agent` tools + `gpui_telegram_server` bridge, `@CreatorStudioBot`, inline query) | M2 | DONE (`5/5 PASS`, 82 agent + 16 M3 + 12 M2 + 48 server + 4 hermes + 999 probes + 500 fuzz, `sub_orch_m3_gen3/handoff.md`) |
-| M4 | Client Cloud Sync, Local Mirror & Mini-Game Runtime | F9, F10 (`gpui_telegram_client` net/cache + `gpui_telegram_desktop` `game_runtime.rs`) | M2 (serialized after M3) | DONE (`5/5 PASS`, 37+8+12+8+52 tests + 328 F9 probes + 18,000 F10 fuzz ops, `sub_orch_m4_gen6/handoff.md`) |
-| M5 | Apple Sidebar, Cloud Creations Hub & Shell Integration | F11, F12, F13 (`gpui_telegram_desktop` icons, `AppleAppSidebar`, `ContentHubWorkspace`, `MyCreations`, `PublishReviewModal`, `AppShell` routing/IME/deep-links) | M3, M4 | IN_PROGRESS (`c96ab87fb98f90cb0ad7b45745ea9fcc`, `sub_orch_m5_gen9` — Iter 8 Batch 1 `3/3 CLEAN/APPROVE/APPROVE`; running Batch 2 -> 5/5 Gate) |
-| M6 | Four Apple Verticals (Books, Music, Games, App Store) | F14, F15, F16, F17 (`gpui_telegram_desktop` `books_view`, `book_reader`, `music_view`, `music_player_bar`, `games_view`, `game_runtime_sheet`, `app_store_view`) | M5 | PLANNED |
-| M7 | Final Milestone: 100% E2E Pass (Tiers 1–4) + Tier 5 Hardening | F18 (Phase 1: Tiers 1–4 sequential pass; Phase 2: Tier 5 white-box adversarial hardening + full regression/ledger gate) | M6, E2E | PLANNED |
-
----
-
-## Interface Contracts
-
-### 1. Shared Proto Contracts (`crates/gpui_telegram_proto/src/creations.rs` & `sync/events.rs`)
-- **Enums** (`#[serde(rename_all = "snake_case")]`):
-  - `CreationKind`: `Book | Music | Game | App`
-  - `CreationReviewStatus`: `Draft | PendingReview | Published | Rejected | Unpublished`
-  - `CreationVisibility`: `Private | Unlisted | Public`
-  - `CatalogSortMode`: `Featured | Popular | TopRated | Newest`
-  - `ReviewDecision`: `Approve | Reject`
-- **Core Envelope (`UserCreationDto`)**:
-  - `creation_id: String` (`cr_<uuid>`), `owner_user_id: i64`, `creator_bot_user_id: Option<i64>`, `creator_chat_id: Option<i64>`, `kind: CreationKind`
-  - `title`, `subtitle`, `summary`, `author_display_name`, `language`, `genres: Vec<String>`, `tags: Vec<String>`, `cover: CoverArtwork`, `age_rating`
-  - `payload: CreationPayload` (`#[serde(tag = "kind", rename_all = "snake_case")]`: `Book(BookPayload) | Music(MusicPayload) | Game(GamePayload) | App(AppStoreListingPayload)`)
-  - `version: u32`, `cloud_revision: i64`, `review_status: CreationReviewStatus`, `visibility: CreationVisibility`, `has_live_published_version: bool`, `published_version: Option<u32>`, `rejection_reason: Option<String>`, `review_notes: Option<String>`
-  - Timestamps (`submitted_at_ms`, `reviewed_at_ms`, `published_at_ms`, `created_at_ms`, `updated_at_ms`, `deleted_at_ms`) + metrics (`rating_avg: f32`, `rating_count: u32`, `engagement_count: u64`, `save_or_install_count: u64`)
-- **Payloads**:
-  - `BookPayload`: `author`, `series_name`, `series_index`, `blurb`, `estimated_read_mins`, `word_count`, `chapters: Vec<BookChapter>` (`pages: Vec<BookPage>` with `BookRichBlock::{Heading, Paragraph, BlockQuote, Callout, Illustration, Divider}`).
-  - `MusicPayload`: `artist`, `album_title`, `release_year`, `primary_genre`, `mood_tags`, `bpm` (`30..=300`), `musical_key`, `time_signature`, `total_duration_secs`, `tracks: Vec<MusicTrack>` (`instruments`, `melody_notes`, `chord_progression`, `lyrics: Vec<SyncedLyricLine>`, `audio_media_file_id`, `waveform_5bit`).
-  - `GamePayload`: `developer`, `category`, `controls_hint`, `rules_markdown`, `engine_kind`, `supports_leaderboard`, `estimated_session_mins`, `spec: GameSpec` (`GridPuzzle | TriviaQuiz | InteractiveFiction | ArcadeDodge | SnakeGrid | CardMatch | MiniAppHtml`), `achievements: Vec<GameAchievementDef>`.
-  - `AppStoreListingPayload`: `developer_name`, `version_string`, `release_notes`, `category`, `long_description`, `screenshots`, `size_label`, `price_label`, `permissions`, `linked_miniapp`, `ui_schema_json`.
-- **Validator**: `pub fn validate_creation_for_review(creation: &UserCreationDto) -> Result<(), Vec<String>>` (enforces title/summary/author bounds, <=4 MiB payload, hex colors, no `<script`/`javascript:`, per-kind structural playability/readability checks).
-- **Realtime WS Events (`proto/src/sync/events.rs`)**:
-  - `UpdateEvent::UserCreationChanged { creation_id: String, owner_user_id: i64, kind: CreationKind, review_status: CreationReviewStatus, cloud_revision: i64 }`
-  - `UpdateEvent::PublicCatalogChanged { creation_id: String, kind: CreationKind, action: String /* published|updated|removed */ }`
-
-### 2. Deep-Link Contract (`crates/gpui_telegram_core/src/core/deep_links/`)
-- Canonical URI: `tg://apple/<books|music|games|appstore|creations>[/<creation_id>][?tab=discover|my_creations&action=open|read|play|install]`
-- Legacy/callback alias also accepted: `creation:open:<book|music|game|app>:<creation_id>`
-- Parser: `pub fn parse_apple_deep_link(uri: &str) -> Option<AppleDeepLink>` returning `{ section: AppleDeepLinkSection, creation_id: Option<String>, tab: Option<String>, action: Option<String> }`.
-
-### 3. Server REST & Bot API Contract (`gpui_telegram_server`)
-- **User Cloud Creations (Bearer auth, strict `owner_user_id` isolation)**:
-  - `POST /api/v1/creations` -> `201`/`200` `UserCreationDto`
-  - `GET /api/v1/creations/my?kind=&status=&q=` -> `{ items: Vec<UserCreationDto>, latest_revision: i64 }`
-  - `GET /api/v1/creations/sync?since_revision=N` -> `{ latest_revision: i64, items: Vec<UserCreationDto> }` (includes soft-deleted tombstones)
-  - `GET /api/v1/creations/{id}` -> owner sees draft+status; non-owner sees ONLY frozen published snapshot if `Published && (Public|Unlisted)`, else `404`/`403`
-  - `PUT /api/v1/creations/{id}` -> body `{ ..., expected_revision: Option<i64> }` (`409 revision_conflict` on stale revision; live-edit preserves frozen `published_snapshot_json` until re-approved)
-  - `DELETE /api/v1/creations/{id}` -> soft-delete tombstone + immediate atomic purge from `public_catalog_entries` & `creation_public_assets`
-  - `POST /api/v1/creations/{id}/submit-review` -> runs `validate_creation_for_review()` (`422` + `validation_errors` on failure) -> `PendingReview`
-  - `POST /api/v1/creations/{id}/withdraw-review` -> `PendingReview -> Draft`
-  - `POST /api/v1/creations/{id}/unpublish` -> `Published -> Unpublished` (immediate atomic removal from `public_catalog_entries` & `public_catalog_fts`)
-  - `GET /api/v1/creations/{id}/audit` -> `Vec<CreationReviewAuditDto>`
-- **Moderation / Review Queue (Bearer auth; supports admin `users.is_support == true` & explicit local review policy without skipping `PendingReview` or audit logging)**:
-  - `GET /api/v1/creations/review-queue?status=pending_review&kind=` -> `{ items: Vec<UserCreationDto> }`
-  - `POST /api/v1/creations/{id}/review` -> body `{ decision: "approve"|"reject", visibility: Option<"public"|"unlisted">, reason: Option<String>, notes: Option<String> }`
-- **Public Catalog & Vertical Discovery (Bearer auth; STRICTLY `public_catalog_entries` only — zero private/draft/pending/rejected/unpublished/unlisted rows)**:
-  - `GET /api/v1/catalog?kind=all|book|music|game|app&q=&genre=&sort=featured|popular|top_rated|newest&limit=&offset=`
-  - `GET /api/v1/catalog/books` | `/music` | `/games` | `/appstore` (`/appstore` aggregates published `App` creations, `mini_apps WHERE is_published = 1`, and cross-vertical featured published Books/Music/Games)
-  - `GET /api/v1/catalog/recommend?q=&kind=&genre=&limit=` -> `{ items: Vec<BotRecommendationItem> }` (each with `deep_link: "tg://apple/<section>/<creation_id>"`)
-  - `PUT /api/v1/catalog/{id}/state` & `GET /api/v1/catalog/my-states` -> per-user reading progress/bookmarks, music loved/position, game save state/achievements, app install state
-  - `POST /api/v1/catalog/{id}/reviews` & `GET /api/v1/catalog/{id}/reviews` -> ratings (`1..=5`) & written reviews (published items only)
-  - `POST /api/v1/catalog/{id}/scores` & `GET /api/v1/catalog/{id}/leaderboard` -> game high scores (published games only)
-- **Bot Creation & Recommendation Interfaces**:
-  - Hermes `ToolsetId::PlatformIm` tools (`ServerPlatformImBridge`): `create_book`, `create_music`, `create_game`, `update_my_creation`, `list_my_creations`, `submit_creation_for_review`, `search_public_catalog`, `recommend_public_creations`.
-  - Official `@CreatorStudioBot` (`UID 777_020`, `is_official = true`, `is_inline = true`): deterministic commands `/start`, `/help`, `/newbook`, `/newmusic`, `/newgame`, `/mycreations`, `/editwork`, `/submitwork`, `/recommend` + NL creation fallback, replying with rich `GenerativeCard` + `InlineKeyboardButton` deep-links.
-  - Inline Bot Query: `GET /api/v1/bots/inline-query?bot_username=&query=&kind=&limit=` + `answerInlineQuery` in `telegram_bot_api.rs` (returns ONLY published+public items).
-
-### 4. Desktop Shell & UI Integration Contract (`gpui_telegram_desktop`)
-- `ActiveWorkspacePanel::ContentHub(ContentHubSection)` where `ContentHubSection` is `Books | Music | Games | AppStore | MyCreations`.
-- Leftmost `AppleAppSidebar` (`204px` expanded / `68px` collapsed, macOS `52px` drag clearance) mounted beside `ChatSidebar` (when `Chats`) or `ContentHubWorkspace` (when `ContentHub`), plus toggleable sidebar-adjacent Quick Creations Drawer.
-- `ChatSidebar` gets opt-in `has_leading_app_sidebar: bool` (default `false` so existing standalone tests remain 100% unchanged).
-- `AppShell::handle_apple_deep_link(&mut self, uri: &str, cx: &mut Context<Self>) -> bool` wired into `handle_deep_link`, `handle_stage_bot_button`, `execute_hermes_inline_callback`, and `RichTextAction::OpenUrl`.
+```text
+Layer 0 — Pure Domain & Contracts (crates/orca_core)
+  BotSchema (22 agents), BotHome/Preamble/NO_REPLY, Memory Provenance/Protected/TidyUp/ReAddGuard,
+  BotItems (6 states + Ask cards + NeedsYou fold), LookAround, BotGroups + RequestPolicy,
+  24 Bot Templates + 13 Skills + BotPackage v1 + 5-Class Scanner + E2EE Team Share,
+  31 Event Triggers + 6-Adapter Webhooks + OneShot Waits + WatchPR,
+  Strict orca.yaml + .worktreeinclude + FolderWorkspaces + WorkspaceLayoutModel (10 tab types),
+  Orchestration DAG/Mailbox/Gates/Federation, Unified RPC + Protocol v3 + E2EE v2 HKDF-SHA256,
+  DiffAnnotation/AI Attribution, DesignMode, PluginV2 Manifest, Hibernation & ComputerUse Guards
+         │
+         ├───────────────────────────────┐
+         ▼                               ▼
+Layer 1A — Bot OS Engine           Layer 1B — Agent IDE & Orchestration Engine
+(crates/orca_bots)                 (crates/orca_ide + narrow gpui_telegram_coding adapters)
+  BotController (serialized),        SQLite OrchestrationEngine (Runs/Tasks/Dispatches/Mailbox/
+  BotHomeStore (CAS + bot.json),     Gates/Federation/Push-Wake), 22+ CLI Agent Catalog +
+  BotMemoryService (Provenance,      Event-Sourced Chat Journal + Chat<->Terminal Continuation,
+  Journal, 3AM-8AM TidyUp, 14d       4-State Agent Hook Server + ReDoS-safe JSON Rules,
+  ReAddGuard), SQLite BotItemsStore, Parallel Worktrees + FolderWorkspaces + orca.yaml Runner +
+  LookAroundEngine, SQLite           *.orca.localhost Proxy + First-Work Auto-Rename,
+  BotGroupRuntime (rollback triggers), Detached PTY Cold-Park/ACK Flow Control + 8-Check
+  Axum 127.0.0.1 BotToolRelay +      Hibernation + Multi-Account Hot-Swap + 9-Provider Usage,
+  Host OAuth 2.1 + SharedMcpPool,    ProfileState Authority + Tantivy/FTS AI Vault Search,
+  Connectors/ActsFor/AccessHost/     DiffAnnotationStore + AI Attribution, PluginHostV2,
+  SlackMirror/WebhookEngine/Waits,   MCP/Skills Sync, Safe ComputerUse/Emulator, STT Dictation,
+  Templates/Packages/E2EE Share/     Shareable Artifacts, Ephemeral VM Recipes, Hang Watchdog,
+  Cross-App Import/HandOver/ChatTree Unified RPC Dispatcher
+         │                               │
+         └───────────────┬───────────────┘
+                         ▼
+Layer 2 — Network, Server, Client & CLI (gpui_telegram_proto/server/client/cli)
+  REST /api/v1/orca/*, Webhook Ingress, Content-Free Wake WS, E2EE Relay, Telegram IM Fusion,
+  Unified RPC Endpoint, Typed OrcaClient, Agent-Ergonomic `fabushi` CLI (`--json`)
+                         │
+                         ▼
+Layer 3 — Native GPUI Desktop & Browser (gpui_telegram_desktop + bot-browser)
+  Bots Sidebar + Bot Chat Tree + Group Rooms, Bot Home (Chat/Items/UpNext/Settings) +
+  Priority-Folded "Needs You" Inbox + 10 Bot Cards + 24-Template Gallery + Hand-Over Dialog,
+  Split Anything Panes + Cmd+J Scoped Jump Palette + Chat<->Terminal Flip (Cmd+Shift+J) +
+  Orchestration/Kanban Board + Annotate AI Diff + Browser Design Mode + Usage Popover +
+  SecuritySurface Non-Themable Modals + AI Vault + Plugin V2 UI
+```
 
 ---
 
 ## Code Layout
 
-```text
-crates/gpui_telegram_core/src/core/deep_links/
-  └── apple_deep_link.rs                # M1: tg://apple/* & creation:open:* parser + router hook
-crates/gpui_telegram_proto/src/
-  ├── creations.rs                      # M1: DTOs, payloads, review FSM types, validator
-  └── sync/events.rs                    # M1: UpdateEvent::{UserCreationChanged, PublicCatalogChanged}
-crates/gpui_telegram_media/src/media/audio/
-  ├── synth.rs                          # M1: MusicTrack -> PCM/WAV + 5-bit waveform synthesizer
-  └── music_player.rs                   # M1: Cross-platform headless-safe seekable MusicTransportEngine
-crates/gpui_telegram_server/src/
-  ├── db/creations_store.rs             # M2: Migration V43 + cloud CRUD, FSM, audit, states, scores
-  ├── db/migrations.rs                  # M2: Pin extra_migrations literal 39, 40, 41
-  ├── db/social_store.rs                # M2: user_can_access_media public creation asset check
-  ├── search/catalog_index.rs           # M2: Isolated FTS5 + CJK search & recommendation ranker
-  ├── ws/gateway_hub.rs                 # M2: Add broadcast_to_all for PublicCatalogChanged WS push
-  ├── routes/creations.rs               # M2: /api/v1/creations/* & /api/v1/catalog/* Axum routes
-  ├── routes/creator_bot.rs             # M3: @CreatorStudioBot + inline query endpoint
-  ├── routes/bots_miniapps.rs           # M3: Route @CreatorStudioBot (UID 777_020)
-  ├── routes/telegram_bot_api.rs        # M3: answerInlineQuery support
-  └── hermes_im_bridge.rs               # M3: 8 PlatformIm creation & public-recommendation tools
-crates/gpui_telegram_agent/src/hermes/
-  └── toolsets.rs                       # M3: Register 8 tools inside existing ToolsetId::PlatformIm
-crates/gpui_telegram_client/src/
-  ├── net/api_creations.rs              # M4: Typed HttpClient/TelegramClient creation & catalog APIs
-  ├── cache/sqlite_cache.rs             # M4: Local mirror tables (creations, states, catalog)
-  ├── cache/local_store.rs              # M4: Account-scoped clear_all() wipe on account switch
-  └── client_dispatch.rs                # M4: ClientDomainEvent::{UserCreationChanged, PublicCatalogChanged}
-crates/gpui_telegram_desktop/
-  ├── assets/icons/                     # M5: hub_{books,music,games,appstore,creations,publish,sparkles}.svg
-  ├── src/theme/assets_embedded.rs      # M5: Add new icons ONLY in IconName::EXTRA (ALL stays 64)
-  ├── src/views/apple_sidebar.rs        # M5: Apple-style primary sidebar (`AppleAppSidebar`)
-  ├── src/views/content_hub/
-  │   ├── game_runtime.rs               # M4: Pure-Rust deterministic MiniGameRuntime
-  │   ├── mod.rs                        # M5: ContentHubWorkspace entity & shared sync state
-  │   ├── apple_primitives.rs           # M5: Apple HIG hero banners, cover cards, pills, badges
-  │   ├── creations_view.rs             # M5: My Creations workspace + sidebar-adjacent quick drawer
-  │   ├── publish_review_modal.rs       # M5: "推送审核上架" modal + reviewer queue panel
-  │   ├── books_view.rs                 # M6: Apple Books UI
-  │   ├── book_reader.rs                # M6: Embedded Apple Books reader
-  │   ├── music_view.rs                 # M6: Apple Music UI
-  │   ├── music_player_bar.rs           # M6: Persistent Apple Music Now-Playing transport bar
-  │   ├── games_view.rs                 # M6: Apple Games / Arcade UI
-  │   ├── game_runtime_sheet.rs         # M6: Interactive GPUI game canvas + BotAttachWebView launcher
-  │   └── app_store_view.rs             # M6: Apple App Store unified storefront UI
-  └── src/views/app_shell/
-      ├── shell_content_hub.rs          # M5: AppShell hub sync, deep-link & playback coordinator
-      ├── shell_input_ime.rs            # M5/M6: Register content hub & modal inputs
-      ├── shell_theme.rs                # M5: Propagate theme & locale to apple_sidebar + content_hub
-      └── semantic_tree.rs              # M5: Map ActiveWorkspacePanel::ContentHub(_)
-tests/e2e_suite/tests/
-  ├── apple_sidebar_tier1_feature.rs    # E2E: Tier 1 isolated feature coverage (>=5/feature)
-  ├── apple_sidebar_tier2_boundary.rs   # E2E: Tier 2 boundaries, security & zero-leak isolation
-  ├── apple_sidebar_tier3_cross_feature.rs # E2E: Tier 3 pairwise cross-feature interactions
-  ├── apple_sidebar_tier4_scenarios.rs  # E2E: Tier 4 real-world journeys & server restart durability
-  └── apple_sidebar_ui_e2e.rs           # E2E: Headless GPUI Apple sidebar, verticals & deep-link E2E
-```
+- **Existing Workspace Convention**: 22 Rust workspace members under `crates/*`, `tests/*`, `inherited/*` (`Cargo.toml`, Rust edition `2024`, lean profiles `debug = 0`, `strip = "debuginfo"`, `incremental = false`).
+- **Ledger Protection Invariant**: **NEVER** delete, rename, or remove symbols from existing `tdesktop` ledger-mapped `.rs` files (`scripts/verify_ledger_closure.py --ci-without-upstream --skip-cargo` MUST pass all 6 gates).
+- **Mandatory Post-Build Hygiene (`AGENTS.md`)**: Run `python3 scripts/clean_build_garbage.py` immediately after every `cargo check`, `cargo build`, or `cargo test`.
+- **New Workspace Crates & Modules**:
+  - `crates/orca_core/` — Pure domain models, parsers, scanners, crypto, templates, contracts (leaf crate; zero SQLite/network I/O)
+  - `crates/orca_bots/` — Stateful Orca Bot OS engine (SQLite WAL stores, FS homes, Axum loopback Tool Relay, OAuth 2.1, Shared MCP pool, Triggers/Webhooks, Sharing/Import/Handover)
+  - `crates/orca_ide/` — Stateful Orca Orchestration, Extended Agent Catalog, Chat Journal, Hook Server, Worktrees/`orca.yaml`/`*.orca.localhost` Proxy, PTY/Hibernation/Usage, AI Vault, Diff Annotations, Plugin V2, ComputerUse/Emulator/Dictation/Artifacts/VM/Watchdog, Unified RPC Dispatcher
+  - `crates/gpui_telegram_coding/src/driver/` — Narrow new CLI agent driver adapters (preserving existing 6 providers intact)
+  - `crates/gpui_telegram_proto/src/orca_contracts.rs` — Wire contracts for REST/WS/RPC
+  - `crates/gpui_telegram_server/src/routes/orca_*.rs` — Server HTTP/WS/Webhook/Wake/Share routes
+  - `crates/gpui_telegram_client/src/net/orca_client.rs` — Typed async Orca client
+  - `crates/gpui_telegram_cli/src/orca_commands.rs` — `fabushi` CLI Orca subcommands (`--json`)
+  - `crates/bot-browser/src/design_mode.rs` — CDP/DOM Design Mode element grabber
+  - `crates/gpui_telegram_desktop/src/views/orca/**` & `views/browser/design_mode.rs` — Native GPUI views
+  - `tests/orca_e2e/` — Opaque-box E2E test infrastructure & Tiers 1–4 (+ Tier 5 adversarial) suite
 
 ---
 
-## Hard Regression Guardrails & Workspace Mandates (NON-NEGOTIABLE)
-1. **`IconName::ALL.len() == 64`**: Add ALL new SVG icons exclusively to `IconName::EXTRA` (`assets_embedded.rs`).
-2. **`ToolsetId::all().len() == 29`**: Register all 8 new bot tools inside existing `ToolsetId::PlatformIm` (`toolsets.rs`).
-3. **`NavRail` & `NavDestination` Untouched**: Keep `NavRail::items.len() == 9`, `NAV_RAIL_WIDTH == 52.0`, and all 9 `NavDestination` variants unchanged. Preserve `shell_shortcuts.rs` & `shell.rs` assertions checked by `milestone_1_nav_calls_regression_tests` and `challenger_m3_settings_nav_stress_tests`.
-4. **`ChatSidebar` Truthful-Empty & Geometry**: Keep `DEFAULT_WIDTH == 288.0`, `COLLAPSED_WIDTH == 64.0`, `ROW_HEIGHT == 62.0`, and empty default state (`has_leading_app_sidebar` defaults to `false`).
-5. **Desktop `[lib] test = false`**: Place ALL desktop tests in `crates/gpui_telegram_desktop/tests/<suite>.rs`.
-6. **Migration V41 Safety**: Never append to `ALL_MIGRATIONS` (`schema.rs`, length 38); pin literal versions `39`, `40`, `41` in `db/migrations.rs` `extra_migrations`.
-7. **Build Hygiene (`AGENTS.md`)**: Keep `debug = 0`, `strip = "debuginfo"`, `incremental = false` in root `Cargo.toml`; NEVER create `--target-dir`; run `python3 scripts/clean_build_garbage.py` immediately after EVERY `cargo check`/`build`/`test`; use `tempfile::TempDir` for all test fixtures.
-8. **Ledger Closure Gate**: `python3 scripts/verify_ledger_closure.py --ci-without-upstream --skip-cargo` MUST pass (no `#![allow(dead_code)]`, `#![allow(unused)]`, or bare `pub use` shims in ledger-tracked files).
+## Feature Inventory
+
+Every feature discovered across Spec Miner 1 (32 rows), Spec Miner 2 (23 groups / 26 edge cases), and Explorer 3 (workspace invariants & release pipeline) is assigned a Milestone (zero unassigned).
+
+| # | Feature | Description | Milestone | Source |
+|---|---|---|---|---|
+| F01 | Bot Identity, 22-Agent Schema & CAS Avatars | `OrcaBotRecord`, 22 `BOT_AGENTS` + retired migration, `BotName` (`\p{Cc}`/<=64), slug regex, 20 mascots + 9 outfits, CAS `avatarRevision`/`Epoch`, rollback split, safe-empty `googleAccounts` | M1 | survey (SM2 §1.1, §3 #1) |
+| F02 | Bot Home Generator, Authority Preamble, First-Run & `NO_REPLY` | `SOUL.md`/`MEMORY.md`/`AGENTS.md`/`CLAUDE.md`/`bot.json`, `Tools` ahead of `SOUL.md` & 200-line fenced `MEMORY.md`, `firstRun` rules, SHA-256 delta sync + overflow guard, streaming `NO_REPLY` suppression | M1, M2 | survey (SM2 §1.2–1.3, §1.10) |
+| F03 | Host-Enforced Memory Governance, Journal, Tidy-Up & 14d Re-Add Guard | `· from:` provenance + separator defusing, silent-delete restore, `forget` + Undo, protected `Rule:`/`Prefers:`/`Decided:` & standing words, deterministic `memory/journal/YYYY-MM.md`, tool-less 3–8 AM Tidy-Up + Undo, 14-day Re-Add Guard (archive-before-remove) | M1, M2 | survey (SM2 §1.4, §3 #3–5) |
+| F04 | Event-Sourced Bot Items, Multi-Decision Ask Cards & `"Needs You"` Inbox | SQLite `items`/`item_links`/`item_events`, 6 states, owner-cancel guard (`item_closed`), snooze + early unsnooze, stale (3x planned), `--ask/--option/--recommended/--multi` cards, lineage-deduped links, `mail='owed'`, priority-folded `"Needs you"`, `items_read_only` forward-compat | M1, M2 | survey (SM2 §1.5, §3 #6; E3 §3.1) |
+| F05 | Proactive Read-Only `"Look Around"` -> `"Up Next"` | Daytime schedule presets (`every-4h/2h/twice-daily/mornings`), weekdays, sleep `dueNow`, read-only agent guard, <=5 deduped suggestions (GitHub/Linear URL norm), `linkCarriesCredential` stripper | M1, M2 | survey (SM2 §1.6, §3 #7) |
+| F06 | Multi-Bot Group Rooms, Sub-Threads, Peer Mail & Remote Bot Members | SQLite `bot_groups`/`bot_group_messages` with rollback-safe `AFTER UPDATE` triggers, sub-threads, `bot|all|mentions` reply modes, `@mention` handoffs, `BotGroupPeerScope`, `remoteMembers`/`remoteAsks`, paused-bot mail hold, 7-code request policy | M1, M2 | survey (SM2 §1.7, §3 #8) |
+| F07 | 24 Bot Templates, 13 Skills, Packages, E2EE Team Share, Import & Hand-Over | 6-category 24 templates + 13 `SKILL.md`, v1 `BotPackage` + 5-class text scanner (`secret` blocks), Curve25519+Ed25519 `share-send` E2EE team sharing, OpenClaw/Hermes/OpenBot/export zero-parser import + redaction, transactional `move->notify->restore` Hand-Over, Bot Chat Tree, 10 Bot Cards, Usage-Limit Auto-Continue | M1, M2 | survey (SM2 §1.10, §3 #12–13) |
+| F08 | Loopback Credential-Isolating Tool Relay, Host OAuth 2.1 & Shared MCP Pool | `127.0.0.1` Axum relay (Origin/Host 403 CSRF, Bearer 401/404, 429 admission, upstream 401 single refresh retry, immediate revoke abort, secret scrub), OAuth 2.1 PKCE/DCR/RFC8707/9207/7009 + SSRF guard, SHA-256 `SharedMcpProcesses` stdio pool (10s failed-start debounce) | M2 | survey (SM2 §1.8, §3 #9) |
+| F09 | External Connectors, `"Acts For"`, Access Control, Slack Mirror, Triggers, Webhooks & Waits | `actsFor` attribution (`"asked by <name> via <Bot>"`), Access Request approval/redeem (`Who Can Ask`), Slack Mirror turn-end ordering barrier, `--leave-thread` anti-injection, 31 event triggers (6 sources), 6-adapter JSON-path webhooks (200/300 hr caps, 14 states, zero-leak wire), `--once [--by]` waits, `watch-pr` 2-attempt loop, content-free Wake WS | M1, M2, M4 | survey (SM2 §1.9, §3 #10–11) |
+| F10 | Strict `orca.yaml`, `.worktreeinclude`, Folder Workspaces & Parallel Worktrees | First-class Folder Workspaces, Git worktree lineage + interrupted-removal recovery + sparse presets, strict `orca.yaml` (reject duplicate keys, >256KiB, >100 aliases, `setupTrustHash`), `.worktreeinclude` (APFS/copy, 2GiB/50k cap), Checkpoints, First-Work Auto-Rename, `*.orca.localhost` Label Proxy, Disk Space Cleanup | M1, M3 | survey (SM1 §3 #1–6; SM2 §2.6) |
+| F11 | Durable SQLite Multi-Agent Orchestration & Cross-Host Federation | `Runs`, `Tasks` DAG, `DispatchContexts`, `WorkerDispatches`, `WorkerTerminalResources`, 9-type `Mailbox` + group addressing (`@all/@idle/@agent/@worktree`), `Deliveries`, `Questions`, `DecisionGates`, idempotent `MutationReceipts`, cross-host `--on <server>` federation, push-wake (zero polling), non-guessing `Unverifiable` liveness, auto-teardown & reopen | M1, M3 | survey (SM1 §2.6, §3 #19; SM2 §2.1) |
+| F12 | Extended 22+ CLI Agents, Event-Sourced Chat Journal & Chat<->Terminal Continuation | 22+ TUI/ACP agent catalog + dynamic model/effort probing, event-sourced SQLite `AgentSessionJournal` with idempotent command receipts + queued submissions + `providerHandleChain`, bidirectional Chat<->Terminal switch (`Cmd+Shift+J`) & history fork | M3 | survey (SM1 §2.3, §3 #14–15; SM2 §2.2) |
+| F13 | 4-State Agent Status Engine, Hook Server, Screen-Anchor Rules & Safe Hibernation | Loopback `AgentHookServer` + restart-surviving `endpoint.env`, linear-time JSON screen-anchor rules, OSC 7501 facets, `sessionBoundary` suppression, live subagents, prompt-cache TTL; 8-condition background PTY hibernation + transparent `--resume` | M1, M3 | survey (SM1 §2.6, §3 #16; SM2 §2.7) |
+| F14 | Detached PTY Persistence, Cold-Park, Credit/ACK Multiplex Flow Control & Tombstones | Headless VT snapshot serialization, daemon `DaemonTransientFact` side-effect extraction, hidden view parking, round-robin credit/ACK multiplex flow control + `ack-pending-overflow` recovery snapshots, `PtyIncarnationId` + 30-day closed-tab tombstones | M1, M3 | survey (SM1 §2.4, §3 #11–13) |
+| F15 | Multi-Account Hot-Swap & 9-Provider Usage / Rate-Limit Roster | Isolated per-account runtime homes + live hot-swap (integrating `magpie_gateway`), 9-provider quota/reset tracker sorted tightest-first with 80% warning chip & usage-limit stop/auto-continue | M3, M5 | survey (SM1 §3 #18; SM2 §2.7) |
+| F16 | Domain-Partitioned ProfileState SQLite, AtomicSnapshotWriter, Keyring & AI Vault FTS | Optimistic-revision domain-partitioned SQLite ProfileState, generation-fenced `AtomicSnapshotWriter`, `openVersionedCacheDb` auto-rebuild on `SQLITE_CORRUPT`, non-destructive `ProtectedSecretPersistence`; incremental `byte_offset` + SHA-256 `prefix_hash` AI Vault search (camelCase/snake_case + typo repair + fork/handoff) | M1, M3 | survey (SM1 §2.3, §3 #17; SM2 §2.9) |
+| F17 | Annotate AI Diff, Line-Level AI Attribution, Source Control & Tasks Hub | Line-anchored persistent diff review comments tracking line shifts + single-batch `"Send to agent"`, local per-line AI-vs-Human gutter attribution (never pollutes commits), AI commit/PR drafting, multi-forge Tasks Hub (GitHub/GitLab/Linear/Jira) | M1, M3, M5 | survey (SM1 §3 #21–23; SM2 §2.3) |
+| F18 | Embedded Browser Design Mode, Safe Computer Use & Mobile Emulator | `bot-browser` Design Mode element picker (DOM + computed CSS + cropped PNG + source map -> active chat); background-delivery AX Computer Use (`treeDiff`, `system_shortcut_blocked` guard); Mobile Emulator normalized-coord/AX bridge | M1, M3, M5 | survey (SM1 §3 #24–25; SM2 §2.4, §2.9) |
+| F19 | 4-Tier Capability-Gated Plugin System V2, MCP Sync & Transactional Skills | `data`/`declarative`/`sandboxed-ui`/`trusted-worker` tiers, 16 contribution points, capability-fingerprint approval, 2s action-replacement fallback, `onError: pass|deny` hooks, `SecuritySurface` anti-spoofing, MCP server config sync, transactional skill installer | M1, M3, M5 | survey (SM1 §3 #28–29; SM2 §2.9) |
+| F20 | Unified RPC Dispatcher, Capability Protocol v3, E2EE v2 Relay/Wake, Ephemeral VMs, STT, Artifacts & Watchdog | Single typed RPC dispatcher with caller scopes & capability negotiation, transcript-bound X25519 + HKDF-SHA256 96B E2EE v2, headless `serve` mode + Ephemeral VM recipe runner/doctor, local/cloud STT dictation + GPU fallback marker, Shareable Artifacts with hidden edit tokens, sleep-aware Hang Watchdog | M1, M3, M4 | survey (SM1 §2.2, §3 #26–27, #30; SM2 §2.8–2.9) |
+| F21 | Server REST/WS/Webhook/Wake API, Telegram IM Bridge Fusion, Typed Client & `fabushi` CLI | `/api/v1/orca/*` routes, Telegram Bot/Chat fusion for Orca Bots & Decision Cards, `OrcaClient`, and full agent-ergonomic `--json` `fabushi` CLI (`bot`, `orchestration`, `webhooks`, `automations`, `worktree`, `browser`, `computer`, `artifacts`, `plugin`, `serve`, `profile`) | M4 | survey (SM1 §3 #31–32; E3 §3.3) |
+| F22 | Native GPUI Desktop UI (Bots Surface, Needs You, Split Anything, Cmd+J, Diff, Design Mode, Kanban) | Bots Sidebar + Bot Chat Tree + Group Rooms, 4-tab Bot Home + 10 Bot Cards + 24-Template Gallery + Hand-Over Dialog, Split Anything recursive panes (10 tab types + pinned boundaries), `Cmd+J` Scoped Jump Palette (`Cmd+1..6` + `Tab` chips), `Cmd+Shift+J` Chat<->Terminal flip, Orchestration/Kanban Board + Pop-out, Annotate AI Diff, Design Mode overlay, Usage Popover, `SecuritySurface` | M5 | survey (SM1 §2.5, §3 #7–10; SM2 §2.5, §4.2; E3 §3.3) |
+| F23 | Opaque-Box E2E Suite (Tiers 1–4) + Tier 5 Adversarial Hardening | Requirement-driven opaque-box E2E test infrastructure (`TEST_INFRA.md` -> `TEST_READY.md`) covering all features across Tiers 1–4, followed by white-box Tier 5 Challenger-driven adversarial hardening | E2E Track, M6 | Project Pattern Dual Track |
+| F24 | Ledger Preservation, CI/Deploy Workflows, Version `v1.7.0` Bump, Git Push & GitHub Release | Maintain 6-gate `verify_ledger_closure.py`, update `ci.yml` & `deploy-backend.yml`, bump `Cargo.toml:44` + `FabushiInstaller.swift:13` + `FabushiSetup.iss:5` to `1.7.0`, push `main`, tag `v1.7.0`, verify CI + Release `Fabushi v1.7.0` | M4, M7 | survey (E3 §1.4, §4.4; ORIGINAL_REQUEST) |
+
+---
+
+## Milestones
+
+| # | Name | Scope | Dependencies | Status |
+|---|---|---|---|---|
+| M0 (Prereq) | Devbox Linux Toolchain Readiness | Install `mold`, `protobuf-compiler`, and GPUI/PipeWire `-dev` APT libs (`.github/workflows/ci.yml:63`), verify baseline `cargo check -p gpui_telegram_proto` + `clean_build_garbage.py` | none | DONE (`b1e5d797972fa9acfac752b52bf90b12`; mold/protoc/GPUI libs + baseline check verified) |
+| M1 | `orca_core` Pure Domain, Contracts, Templates, Parsers & Security | `crates/orca_core/**`, root `Cargo.toml` (add `orca_core`). Covers F01–F10 pure contracts/parsers/crypto/scanners/templates/layout/orchestration/RPC/E2EE v2/plugin/diff/hibernation/computer-use types + unit tests | M0 | DONE (`649ff8148177741627dd79cb6f64cf47`; 19 files, 138/138 tests PASS `--offline`, 0 clippy warnings, 0 stubs) |
+| M2 | `orca_bots` Full Stateful Orca Bot Operating System | `crates/orca_bots/**`, root `Cargo.toml` (add `orca_bots`). Covers F02–F09 stateful engines: BotController, BotHomeStore, BotMemoryService (provenance, journal, 3–8 AM Tidy-Up, 14d Re-Add Guard), SQLite BotItemsStore + NeedsYou + Ask cards, LookAround, SQLite BotGroupRuntime (rollback triggers + remote bots + 7-code policy), Axum `127.0.0.1` BotToolRelay + OAuth 2.1 + SharedMcpPool, Connectors/ActsFor/AccessHost/SlackMirror/Webhooks/31 Triggers/Waits/WatchPR, Templates/Packages/E2EE Share/Import/HandOver/ChatTree | M1 | IN_PROGRESS (`80677f528972f86716b3b63e3b102102`) |
+| M3 | `orca_ide` Orchestration, Extended Agents, Worktrees, PTY/Vault/Plugins/Review | `crates/orca_ide/**`, root `Cargo.toml` (add `orca_ide`), narrow new adapters in `crates/gpui_telegram_coding/src/driver/`. Covers F10–F20 stateful engines: SQLite OrchestrationEngine + Federation, 22+ CLI Agents + Event-Sourced Chat Journal + Chat<->Terminal, 4-State Hook Server + ReDoS-safe Rules, Folder Workspaces + `orca.yaml`/`.worktreeinclude` + `*.orca.localhost` Proxy + First-Work Rename, PTY Cold-Park/ACK Flow Control + 8-Check Hibernation + Multi-Account/9-Provider Usage, ProfileState + AI Vault FTS + Diff Annotations/Attribution + PluginHostV2 + MCP/Skills Sync + ComputerUse/Emulator/STT/Artifacts/VM/Watchdog + Unified RPC Dispatcher | M2 | PLANNED |
+| M4 | Server API, Client Bridge, Telegram IM Fusion, `fabushi` CLI & CI/Deploy | `gpui_telegram_proto/src/orca_contracts.rs`, `gpui_telegram_server/src/routes/orca_*.rs`, `gpui_telegram_client/src/net/orca_client.rs`, `gpui_telegram_cli/src/orca_commands.rs`, `.github/workflows/{ci,deploy-backend}.yml`. Covers F09, F20, F21, F24 (CI/deploy updates) | M2, M3 | PLANNED |
+| M5 | Native GPUI Desktop UI Surfaces & `bot-browser` Design Mode | `crates/bot-browser/src/design_mode.rs`, `crates/gpui_telegram_desktop/src/views/orca/**`, `views/browser/design_mode.rs`, narrow wiring in `nav_rail.rs`/`shell.rs`/`shell_shortcuts.rs`. Covers F15, F17, F18, F19, F22 | M4 | PLANNED |
+| M6 | Final Milestone: E2E Suite Pass (Tiers 1–4) & Tier 5 Adversarial Hardening | Phase 1: pass 100% of `TEST_READY.md` E2E suite sequentially (Tier 1 -> Tier 2 -> Tier 3 -> Tier 4, whole-project Forensic Audit on Tier 4). Phase 2: white-box Tier 5 Challenger-driven adversarial hardening loop until zero gaps remain. Covers F23 | M5, `TEST_READY.md` | PLANNED |
+| M7 | Release `v1.7.0`, Ledger Audit, Git Push & GitHub Release Publication | Bump `Cargo.toml:44`, `scripts/macos/FabushiInstaller.swift:13`, `scripts/windows/FabushiSetup.iss:5` to `1.7.0` + `Cargo.lock`; full `verify_ledger_closure.py` (6/6 gates PASS) + full workspace tests + `clean_build_garbage.py`; push `main`; tag & push `v1.7.0`; verify `ci.yml`, `deploy-backend.yml`, `release.yml` & `Fabushi v1.7.0` release. Covers F24 | M6 | PLANNED |
+| E2E Track | Independent Opaque-Box E2E Testing Track | `TEST_INFRA.md`, `tests/orca_e2e/**`, `TEST_READY.md`. Requirement-driven opaque-box test harness & Tiers 1–4 cases covering F01–F24 (>=120 T1, >=120 T2, >=24 T3, >=12 T4, total >=276 cases) against Interface Contracts below | M0 | DONE (`0fef006d381393e69d17494b5a23fc80`; 5/5 unanimous pass; `TEST_READY.md` published — 330 T1–T4 + 23 self = 353 tests, 24/24 features, 40/40 edge cases) |
+
+---
+
+## Interface Contracts
+
+### 1. `orca_core` ↔ `orca_bots` & `orca_ide` (Pure Rust Types & Error Codes)
+- **Bot Error Codes** (`orca_core::BotErrorCode` serialized snake_case): `bot_name_taken`, `bot_not_found`, `bot_folder_not_owned`, `bot_avatar_changed`, `bot_avatar_invalid`, `invalid_argument`, `bots_disabled`, `bot_chat_not_found`, `bot_paused`, `bot_self`, `bot_request_type`, `bot_request_worker`, `not_found`, `item_closed`, `not_owner`, `items_read_only`, `items_unavailable`, `item_changed`, `question_closed`, `bot_package_newer_schema`, `bot_package_duplicate_part`, `bot_package_path_not_allowed`, `secret_blocked`, `lineage_parent_changed`, `bot_offer_already_answered`, `expired`, `not_this_host`, `full`, `granted_not_added`.
+- **IDE / Orchestration / Security Error Codes** (`orca_core::OrcaIdeErrorCode`): `unknown_task`, `unknown_dispatch`, `stale_dispatch`, `mailbox_is_local`, `server_mail_unsupported`, `tab_not_found`, `system_shortcut_blocked`, `approval_required`, `plugin_system_disabled`, `emulator_unsupported`, `emulator_input_blocked`, `wait_timeout`, `yaml_duplicate_key`, `yaml_size_exceeded`, `yaml_alias_limit`, `copy_budget_exceeded`, `hibernation_blocked`.
+- **Canonical Constants**:
+  - `BOT_AGENTS`: 22 variants (`claude`, `codex`, `grok`, `opencode`, `omp`, `pi`, `antigravity`, `cursor`, `hermes`, `copilot`, `opencode2`, `kimi`, `kiro`, `aug`, `goose`, `kilo`, `mimo-code`, `droid`, `qwen-code`, `cline`, `devin`, `codebuddy`).
+  - `BOT_MEMORY_INDEX_LINE_CAP = 200`; `READD_GUARD_DAYS = 14`; `TIDY_UP_TARGET_FACTS = 60`; `TIDY_UP_MAX_NEW_FACTS = 6`; `TIDY_UP_MAX_FILED = 20`; `BOT_MAX_MEMBERS = 200`; `BOT_MAX_CONNECTOR_WORKSPACES = 8`; `WEBHOOK_HOOK_HOURLY_CAP = 200`; `WEBHOOK_ACCOUNT_HOURLY_CAP = 300`; `ORCA_YAML_MAX_BYTES = 262_144`; `WORKTREE_INCLUDE_MAX_BYTES = 2_147_483_648`; `WORKTREE_INCLUDE_MAX_ENTRIES = 50_000`; `CLOSED_TAB_TOMBSTONE_DAYS = 30`; `RUNTIME_PROTOCOL_VERSION = 3` (min 2); `E2EE_V2_KEY_SCHEDULE_BYTES = 96`.
+
+### 2. `orca_bots` / `orca_ide` ↔ `gpui_telegram_server` & `gpui_telegram_client` (REST / WS / RPC)
+- **Unified RPC Endpoint**: `POST /api/v1/orca/rpc` (`{ "method": "<ns.op>", "params": {...}, "protocol_version": 3, "caller_scope": "...", "operation_id": "..." }`) -> `{ "ok": true, "result": ... }` or `{ "ok": false, "error": { "code": "...", "message": "..." } }`.
+- **Bot Fleet REST Routes**:
+  - `GET/POST /api/v1/orca/bots`, `GET/PATCH/DELETE /api/v1/orca/bots/{bot_id}`, `GET /api/v1/orca/bots/templates`, `POST /api/v1/orca/bots/from-template`
+  - `GET/POST /api/v1/orca/bots/{bot_id}/memory`, `POST /api/v1/orca/bots/{bot_id}/memory/forget`, `POST /api/v1/orca/bots/{bot_id}/memory/undo`, `POST /api/v1/orca/bots/{bot_id}/tidy-up`, `POST /api/v1/orca/bots/{bot_id}/tidy-up/undo`
+  - `GET/POST /api/v1/orca/bots/{bot_id}/items`, `GET/PATCH /api/v1/orca/items/{item_num}`, `POST /api/v1/orca/items/{item_num}/comment`, `POST /api/v1/orca/items/{item_num}/snooze`, `GET /api/v1/orca/needs-you`
+  - `GET/POST /api/v1/orca/bots/{bot_id}/look-around`, `GET/POST /api/v1/orca/bots/{bot_id}/up-next`
+  - `GET/POST /api/v1/orca/groups`, `POST /api/v1/orca/groups/{group_id}/threads`, `POST /api/v1/orca/groups/{group_id}/send`, `GET /api/v1/orca/groups/{group_id}/messages`
+  - `GET/POST /api/v1/orca/bots/{bot_id}/access`, `POST /api/v1/orca/bots/{bot_id}/access/decide`, `POST /api/v1/orca/bots/{bot_id}/hand-over`, `GET /api/v1/orca/bots/{bot_id}/chat-tree`
+  - `POST /api/v1/orca/bots/{bot_id}/package/export`, `POST /api/v1/orca/bots/package/import`, `POST /api/v1/orca/bots/{bot_id}/share/seal`, `POST /api/v1/orca/bots/share/open`, `GET/POST /api/v1/orca/bots/import/discover`
+- **Webhooks, Automations & Wake WS**:
+  - `GET/POST /api/v1/orca/webhooks`, `POST /api/v1/orca/webhooks/{hook_id}/ingest` (6 adapters, zero-leak event frame, 200/300 hr caps), `GET /api/v1/orca/webhooks/{hook_id}/calls`
+  - `GET/POST /api/v1/orca/automations`, `POST /api/v1/orca/automations/watch-pr`, `DELETE /api/v1/orca/automations/{id}`
+  - `GET /api/v1/orca/wake` (WebSocket: content-free wake frames, close `4409` on supersede, close `1009` on oversize)
+- **Orchestration & Agent IDE REST Routes**:
+  - `POST/GET /api/v1/orca/orchestration/runs`, `POST /api/v1/orca/orchestration/tasks`, `POST /api/v1/orca/orchestration/workers/start`, `POST /api/v1/orca/orchestration/messages`, `GET /api/v1/orca/orchestration/mailbox`, `POST /api/v1/orca/orchestration/gates`, `POST /api/v1/orca/orchestration/gates/{id}/resolve`
+  - `POST /api/v1/orca/ide/orca-yaml/parse`, `GET/POST /api/v1/orca/ide/worktrees`, `GET/POST /api/v1/orca/ide/diff-annotations`, `GET/POST /api/v1/orca/ide/vault/search`, `GET/POST /api/v1/orca/ide/plugins`, `GET/POST /api/v1/orca/ide/artifacts`, `POST /api/v1/orca/ide/computer/guard`, `GET /api/v1/orca/ide/usage`, `GET/POST /api/v1/orca/ide/hibernation/check`, `POST /api/v1/orca/ide/e2ee/handshake`
+
+### 3. `fabushi` CLI ↔ Server / Local Runtime (`--json` Contract)
+Every Orca CLI command supports `--json` (exit `0` on success with structured JSON stdout; non-zero with `{"error": {"code": "...", "message": "..."}}` on failure; exit `3` on plugin `approval_required`):
+- `fabushi bot {list, create, update, delete, templates, from-template, chats, new-chat, reply, memory-forget, memory-undo, tidy-up, item-add, item-set, item-comment, item-done, item-cancel, item-link, item-list, item-show, needs-you, look-around, suggest, group-create, group-send, group-thread, access-list, access-decide, hand-over, package-export, package-import, share-seal, share-open, import-discover, chat-tree}`
+- `fabushi orchestration {run-create, task-create, worker-start, send, check, ask, worker-done, worker-read, worker-release, gate-create, gate-resolve}`
+- `fabushi webhooks {list, create, show, calls, check}` *(NEVER prints webhook URL or secret!)*
+- `fabushi automations {list, create, edit, remove, watch-pr}`
+- `fabushi worktree {parse-yaml, include-copy, list, set, cleanup, ports}`
+- `fabushi ide {diff-annotate, diff-batch, vault-search, plugin-validate, plugin-install, computer-hotkey, artifact-share, hibernation-check, usage, serve, profile-state}`
+
+### 4. `orca_bots` Loopback Tool Relay (`127.0.0.1:0`) Contract
+- Accepts only `POST`, `GET`, `DELETE` (others -> `405`).
+- Any request with `Origin` header OR non-loopback `Host` header -> `403`.
+- Missing/invalid Bearer grant -> `401`; unauthorized bot/folder scope or revoked credential -> `404`; concurrency/rate limit exceeded -> `429`.
+- Never persists static headers or OAuth tokens inside bot home folder (`SOUL.md`/`MEMORY.md`/`bot.json`/`.mcp.json`).
+
+### 5. `gpui_telegram_desktop` ↔ `orca_bots` / `orca_ide` / `bot-browser`
+- `NavDestination::OrcaBots` & `ActiveWorkspacePanel::OrcaBots` host the Bots Sidebar, Bot Chat Tree, 4-tab Bot Home (`Chat`/`Items`/`Up Next`/`Settings`), `"Needs You"` Inbox, Group Rooms, 24-Template Gallery, and `"Hand to bot…"` Dialog.
+- `ActiveWorkspacePanel::OrcaIde` (and integrated overlays) host Split Anything panes, `Cmd+J` Scoped Jump Palette, `Cmd+Shift+J` Chat<->Terminal flip, Orchestration/Kanban Board, Annotate AI Diff + AI Attribution, Browser Design Mode (`bot-browser::design_mode::DesignModeCapture`), Usage Roster popover, and non-themable `SecuritySurface` modals.
+- Zero modifications that delete/rename any `tdesktop` ledger-mapped file or symbol.
