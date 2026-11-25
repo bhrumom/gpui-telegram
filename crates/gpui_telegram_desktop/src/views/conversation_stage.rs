@@ -1715,7 +1715,7 @@ impl Render for ConversationStage {
                         },
                     )
                     .when(
-                        self.is_bot_chat
+                        (self.is_bot_chat || self.is_group_chat)
                             && !self.bot_activity_state.is_empty()
                             && !self.bot_activity_state.eq_ignore_ascii_case("idle"),
                         |el| {

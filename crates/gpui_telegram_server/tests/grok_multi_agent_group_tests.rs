@@ -653,3 +653,181 @@ async fn server_group_workspace_bridge_and_unified_permission_dock_roundtrip() {
     );
     assert_eq!(bot_dock.pending_shared_count(), 0);
 }
+
+#[tokio::test]
+async fn group_chat_bot_reply_routing_unmentioned_mentions_slash_reply_to_and_ws_send() {
+    let (_dir, state, router) = boot_temp_server();
+    let (alice_id, alice_tok) = register_user(&router, "alice_grp_reply", "Alice").await;
+
+    // Provision two distinct AI bots in the same group
+    let (st_a, val_a) = http_json(
+        &router,
+        "POST",
+        "/api/v1/fabushi-bots",
+        Some(&alice_tok),
+        Some(json!({
+            "display_name": "Rust Architect",
+            "username": "rust_grp_bot",
+            "description": "Rust distributed systems specialist"
+        })),
+    )
+    .await;
+    assert_eq!(st_a, StatusCode::CREATED, "create bot A: {val_a}");
+    let bot_a_id = val_a["bot"]["bot_user_id"].as_u64().expect("bot_a_id");
+
+    let (st_b, val_b) = http_json(
+        &router,
+        "POST",
+        "/api/v1/fabushi-bots",
+        Some(&alice_tok),
+        Some(json!({
+            "display_name": "全球法布施",
+            "username": "dharma_grp_bot",
+            "description": "禅修与经典助手"
+        })),
+    )
+    .await;
+    assert_eq!(st_b, StatusCode::CREATED, "create bot B: {val_b}");
+    let bot_b_id = val_b["bot"]["bot_user_id"].as_u64().expect("bot_b_id");
+
+    // Create a multi-bot group chat
+    let (st_grp, val_grp) = http_json(
+        &router,
+        "POST",
+        "/api/v1/chats/create",
+        Some(&alice_tok),
+        Some(json!({
+            "title": "AI Bots War Room",
+            "chat_type": 1,
+            "member_ids": [bot_a_id, bot_b_id]
+        })),
+    )
+    .await;
+    assert_eq!(st_grp, StatusCode::CREATED, "create group: {val_grp}");
+    let chat_id = val_grp["chat_id"].as_i64().expect("chat_id");
+
+    // Helper: poll DB until a message from one of expected_senders appears after `after_msg_id`
+    async fn wait_for_bot_reply(
+        state: &Arc<AppState>,
+        chat_id: i64,
+        after_msg_id: i64,
+        expected_senders: &[u64],
+    ) -> (i64, u64) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let msgs = state
+                .db
+                .list_messages_with_topic(ChatId(chat_id), None, None, 30)
+                .unwrap_or_default();
+            if let Some(found) = msgs
+                .iter()
+                .find(|m| m.message_id.0 > after_msg_id && expected_senders.contains(&m.sender_id.0))
+            {
+                return (found.message_id.0, found.sender_id.0);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for bot reply from {:?} after msg {} in chat {}; recent msgs: {:?}",
+                expected_senders,
+                after_msg_id,
+                chat_id,
+                msgs.iter()
+                    .map(|m| (m.message_id.0, m.sender_id.0))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
+    // 1. `/start@dharma_grp_bot` must target ONLY bot B (not bot A!)
+    let (st_m1, val_m1) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/chats/{chat_id}/messages"),
+        Some(&alice_tok),
+        Some(json!({ "text": "/start@dharma_grp_bot" })),
+    )
+    .await;
+    assert_eq!(st_m1, StatusCode::CREATED, "send /start@dharma_grp_bot: {val_m1}");
+    let m1_id = val_m1["message_id"].as_i64().expect("m1_id");
+    let (bot_b_welcome_msg_id, responder_1) =
+        wait_for_bot_reply(&state, chat_id, m1_id, &[bot_b_id]).await;
+    assert_eq!(responder_1, bot_b_id);
+
+    // 2. Replying (`reply_to`) to bot B's message with `/help` must wake bot B
+    let (st_m2, val_m2) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/chats/{chat_id}/messages"),
+        Some(&alice_tok),
+        Some(json!({
+            "text": "/help",
+            "reply_to": bot_b_welcome_msg_id
+        })),
+    )
+    .await;
+    assert_eq!(st_m2, StatusCode::CREATED, "send reply_to bot B: {val_m2}");
+    let m2_id = val_m2["message_id"].as_i64().expect("m2_id");
+    let (_, responder_2) = wait_for_bot_reply(&state, chat_id, m2_id, &[bot_b_id]).await;
+    assert_eq!(responder_2, bot_b_id);
+
+    // 3. CJK-adjacent display name mention `@全球法布施 /help` wakes bot B
+    let (st_m3, val_m3) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/chats/{chat_id}/messages"),
+        Some(&alice_tok),
+        Some(json!({ "text": "@全球法布施 /help" })),
+    )
+    .await;
+    assert_eq!(st_m3, StatusCode::CREATED, "send @全球法布施 /help: {val_m3}");
+    let m3_id = val_m3["message_id"].as_i64().expect("m3_id");
+    let (_, responder_3) = wait_for_bot_reply(&state, chat_id, m3_id, &[bot_b_id]).await;
+    assert_eq!(responder_3, bot_b_id);
+
+    // 4. Multi-word display name mention `@Rust Architect /help` wakes bot A
+    let (st_m4, val_m4) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/chats/{chat_id}/messages"),
+        Some(&alice_tok),
+        Some(json!({ "text": "@Rust Architect /help" })),
+    )
+    .await;
+    assert_eq!(st_m4, StatusCode::CREATED, "send @Rust Architect /help: {val_m4}");
+    let m4_id = val_m4["message_id"].as_i64().expect("m4_id");
+    let (_, responder_4) = wait_for_bot_reply(&state, chat_id, m4_id, &[bot_a_id]).await;
+    assert_eq!(responder_4, bot_a_id);
+
+    // 5. Unmentioned general Chinese message `"你好，请介绍一下自己"` in a 2-bot group
+    //    must wake a primary bot and emit a reply (never silently ignored!)
+    let (st_m5, val_m5) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/chats/{chat_id}/messages"),
+        Some(&alice_tok),
+        Some(json!({ "text": "你好，请介绍一下自己" })),
+    )
+    .await;
+    assert_eq!(st_m5, StatusCode::CREATED, "send unmentioned greeting: {val_m5}");
+    let m5_id = val_m5["message_id"].as_i64().expect("m5_id");
+    let (after_m5_id, responder_5) =
+        wait_for_bot_reply(&state, chat_id, m5_id, &[bot_a_id, bot_b_id]).await;
+    assert!(responder_5 == bot_a_id || responder_5 == bot_b_id);
+
+    // 6. WebSocket `WsClientFrame::SendMessage` in the group must ALSO trigger bot reply!
+    let (ws_tx, _ws_rx) = tokio::sync::mpsc::unbounded_channel();
+    let ws_req = gpui_telegram_proto::ws::SendMessageRequest::new(
+        ChatId(chat_id),
+        998_877_665,
+        gpui_telegram_proto::message::MessageContent::plain_text("/start@rust_grp_bot"),
+    );
+    state.gateway_hub.handle_client_frame(
+        UserId(alice_id),
+        gpui_telegram_proto::ws::WsClientFrame::SendMessage(ws_req),
+        &ws_tx,
+    );
+    let (_, responder_ws) = wait_for_bot_reply(&state, chat_id, after_m5_id, &[bot_a_id]).await;
+    assert_eq!(responder_ws, bot_a_id);
+}
+

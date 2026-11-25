@@ -611,13 +611,36 @@ impl AppShell {
             .send_as_peers
             .chosen(chat_id)
             .or_else(|| self.composer.read(cx).selected_send_as_peer_id);
+        let mut reply_tuple: Option<(u64, String)> = None;
+        self.composer.update(cx, |c, c_cx| {
+            if let Some((rid, _sender, snippet)) = c.replying_to.take() {
+                reply_tuple = Some((rid, snippet));
+                c_cx.notify();
+            }
+        });
+        self.stage.update(cx, |st, st_cx| {
+            if let Some(pending) = st.pending_reply.take() {
+                if reply_tuple.is_none() {
+                    reply_tuple = Some((pending.message_id, pending.snippet));
+                }
+                st_cx.notify();
+            }
+        });
+        let reply_to = reply_tuple
+            .as_ref()
+            .and_then(|(rid, _)| i64::try_from(*rid).ok())
+            .filter(|&id| id > 0);
+        let quote_text = reply_tuple
+            .as_ref()
+            .map(|(_, s)| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let req = RichSendMessageRequest {
             chat_id: chat_id as i64,
             text: Some(trimmed.clone()),
             content: Some(ProtoMessageContent::plain_text(trimmed.clone())),
             entities: Vec::new(),
-            reply_to: None,
-            quote_text: None,
+            reply_to,
+            quote_text,
             topic_id: None,
             client_nonce: Some(self.client.next_client_nonce()),
             forward_from_chat_id: None,

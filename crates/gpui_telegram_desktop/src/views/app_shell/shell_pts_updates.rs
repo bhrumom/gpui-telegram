@@ -978,7 +978,9 @@ impl AppShell {
                                 sb_cx.notify();
                             });
                             self.stage.update(cx, |st, st_cx| {
-                                if st.active_chat_id == Some(target_chat_u64) && st.is_bot_chat {
+                                if st.active_chat_id == Some(target_chat_u64)
+                                    && (st.is_bot_chat || st.is_group_chat)
+                                {
                                     st.set_bot_activity("idle", None);
                                     st_cx.notify();
                                 }
@@ -1003,7 +1005,9 @@ impl AppShell {
                                     sb_cx.notify();
                                 });
                                 self.stage.update(cx, |st, st_cx| {
-                                    if st.active_chat_id == Some(target_chat_u64) && st.is_bot_chat {
+                                    if st.active_chat_id == Some(target_chat_u64)
+                                        && (st.is_bot_chat || st.is_group_chat)
+                                    {
                                         if st.bot_activity_state.eq_ignore_ascii_case("idle") {
                                             st.set_bot_activity("thinking", indicator);
                                             st_cx.notify();
@@ -1436,14 +1440,30 @@ impl AppShell {
                                 .unwrap_or_else(|| "AI 正在思考...".to_string()),
                         })
                     };
+                    let is_group_or_channel = self
+                        .session_sync
+                        .rich_chats_by_id
+                        .get(&target_chat_u64)
+                        .is_some_and(|rc| rc.is_group || rc.is_channel)
+                        || self.sidebar.read(cx).dialogs.iter().any(|d| {
+                            d.id == target_chat_u64
+                                && (d.folder.eq_ignore_ascii_case("Groups")
+                                    || d.folder.eq_ignore_ascii_case("Channels"))
+                        })
+                        || (self.stage.read(cx).active_chat_id == Some(target_chat_u64)
+                            && self.stage.read(cx).is_group_chat);
                     self.sidebar.update(cx, |sb, sb_cx| {
-                        sb.bot_ids.insert(target_chat_u64);
+                        if !is_group_or_channel {
+                            sb.bot_ids.insert(target_chat_u64);
+                        }
                         sb.set_typing(target_chat_u64, sidebar_indicator);
                         sb_cx.notify();
                     });
                     self.stage.update(cx, |st, st_cx| {
                         if st.active_chat_id == Some(target_chat_u64) {
-                            st.is_bot_chat = true;
+                            if !is_group_or_channel && !st.is_group_chat {
+                                st.is_bot_chat = true;
+                            }
                             st.set_bot_activity(&state, detail);
                             st_cx.notify();
                         }
@@ -1647,6 +1667,9 @@ impl AppShell {
                     if server_id > 0 {
                         st.message_expirations.insert(server_id, exp);
                     }
+                }
+                if !is_outgoing && st.bot_activity_state.eq_ignore_ascii_case("thinking") {
+                    st.set_bot_activity("idle", None);
                 }
                 st.add_message(model.clone());
                 st_cx.notify();

@@ -1040,6 +1040,7 @@ impl AppShell {
         }
         self.client.local_store.set_last_active_chat_id(Some(chat_id));
         if prev_chat_id != Some(chat_id) {
+            let _ = self.client.subscribe_chat(chat_id as i64);
             if let Some(prev) = prev_chat_id {
                 if self.window_runtime.controller.clear_toasts_for_chat(prev) {
                     self.schedule_current_toast_dismiss(cx);

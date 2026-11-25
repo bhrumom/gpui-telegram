@@ -196,6 +196,8 @@ impl AppShell {
                     let server_chat_id = resp.chat_id.max(0) as u64;
                     let mut selected_peer: Option<DialogItemModel> = None;
                     shell.sidebar.update(cx, |sb, sb_cx| {
+                        sb.group_chat_ids.remove(&local_dialog_id);
+                        sb.group_chat_ids.insert(server_chat_id);
                         if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == local_dialog_id) {
                             d.id = server_chat_id;
                             selected_peer = Some(d.clone());
@@ -214,9 +216,11 @@ impl AppShell {
                                 &d.avatar_initials,
                                 d.avatar_color,
                             );
+                            st.is_group_chat = true;
                             st_cx.notify();
                         });
                     }
+                    let _ = shell.client.subscribe_chat(server_chat_id as i64);
                     shell.reconcile_chat_scoped_toasts(cx);
                     if shell.stage.read(cx).active_chat_id == Some(server_chat_id) {
                         shell.load_historical_messages(server_chat_id, cx);
