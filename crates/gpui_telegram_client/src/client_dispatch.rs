@@ -4,6 +4,7 @@ use gpui_telegram_core::types::{ChatId, MessageId, PeerId, UserId, UserStatus};
 use gpui_telegram_proto::contracts::{
     CallSignalRequest, ChatFolderDto, DraftDto, ForumTopicDto, StoryDto,
 };
+use gpui_telegram_proto::creations::{CreationKind, CreationReviewStatus};
 use gpui_telegram_proto::message::{MessageItem, ReactionCount};
 use gpui_telegram_proto::miniapp_contracts::{MiniAppControlMode, MiniAppWebMcpCommand};
 use gpui_telegram_proto::sync::{ChatActionEvent, TypingEvent, UpdateEvent};
@@ -108,6 +109,18 @@ pub enum ClientDomainEvent {
         active_tool: Option<String>,
     },
     CodingHostCommand(CodingHostCommand),
+    UserCreationChanged {
+        creation_id: String,
+        owner_user_id: i64,
+        kind: CreationKind,
+        review_status: CreationReviewStatus,
+        cloud_revision: i64,
+    },
+    PublicCatalogChanged {
+        creation_id: String,
+        kind: CreationKind,
+        action: String,
+    },
     CommunityEvent {
         event_kind: String,
         community_id: Option<String>,
@@ -380,6 +393,35 @@ pub(crate) fn apply_update_event(
         UpdateEvent::CodingHostCommand(cmd) => {
             out_events.push(ClientDomainEvent::CodingHostCommand(cmd));
         }
+        UpdateEvent::UserCreationChanged {
+            creation_id,
+            owner_user_id,
+            kind,
+            review_status,
+            cloud_revision,
+        } => {
+            out_events.push(ClientDomainEvent::UserCreationChanged {
+                creation_id,
+                owner_user_id,
+                kind,
+                review_status,
+                cloud_revision,
+            });
+        }
+        UpdateEvent::PublicCatalogChanged {
+            creation_id,
+            kind,
+            action,
+        } => {
+            if action.trim().eq_ignore_ascii_case("removed") {
+                store.remove_public_catalog_item(&creation_id);
+            }
+            out_events.push(ClientDomainEvent::PublicCatalogChanged {
+                creation_id,
+                kind,
+                action,
+            });
+        }
         UpdateEvent::CommunityEvent {
             event_kind,
             community_id,
@@ -518,6 +560,47 @@ mod tests {
     }
 
     #[test]
+    fn apply_ws_frame_emits_user_creation_changed_without_advancing_cursor() {
+        let store = LocalStore::new();
+        let sync = ClientSyncCoordinator::new();
+        store.save_creations_last_revision(3);
+        let mut events = Vec::new();
+
+        apply_ws_frame(
+            &store,
+            &sync,
+            Some(UserId(42)),
+            WsServerFrame::Update(UpdateEvent::UserCreationChanged {
+                creation_id: "cr_book_1".to_string(),
+                owner_user_id: 42,
+                kind: CreationKind::Book,
+                review_status: CreationReviewStatus::Published,
+                cloud_revision: 9,
+            }),
+            &mut events,
+        );
+
+        assert_eq!(store.creations_last_revision(), 3);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientDomainEvent::UserCreationChanged {
+                creation_id,
+                owner_user_id,
+                kind,
+                review_status,
+                cloud_revision,
+            } => {
+                assert_eq!(creation_id, "cr_book_1");
+                assert_eq!(*owner_user_id, 42);
+                assert_eq!(*kind, CreationKind::Book);
+                assert_eq!(*review_status, CreationReviewStatus::Published);
+                assert_eq!(*cloud_revision, 9);
+            }
+            other => panic!("expected UserCreationChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_ws_frame_dispatches_community_event_update_and_pts_push() {
         let store = LocalStore::new();
         let sync = ClientSyncCoordinator::new();
@@ -583,6 +666,74 @@ mod tests {
                 assert_eq!(event_kind, "future_v99_event");
             }
             other => panic!("expected forward-compatible CommunityEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_ws_frame_emits_public_catalog_changed_and_evicts_on_removed() {
+        use gpui_telegram_proto::creations::{CoverArtwork, PublicCatalogItemDto};
+        use gpui_telegram_proto::sync::PtsUpdate;
+
+        let store = LocalStore::new();
+        let sync = ClientSyncCoordinator::new();
+        store.upsert_public_catalog_items(&[PublicCatalogItemDto {
+            creation_id: "cr_game_7".to_string(),
+            owner_user_id: 10,
+            kind: CreationKind::Game,
+            title: "Star Maze".to_string(),
+            subtitle: String::new(),
+            summary: "Puzzle".to_string(),
+            author_display_name: "Alice".to_string(),
+            language: "en".to_string(),
+            genres: vec!["puzzle".to_string()],
+            tags: vec![],
+            cover: CoverArtwork::default(),
+            age_rating: "4+".to_string(),
+            published_version: 1,
+            published_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            rating_avg: 4.5,
+            rating_count: 2,
+            engagement_count: 10,
+            save_or_install_count: 5,
+            featured_rank: Some(1),
+            deep_link: "tg://apple/games/cr_game_7".to_string(),
+            payload: None,
+        }]);
+        assert_eq!(store.load_public_catalog_items(Some(CreationKind::Game)).len(), 1);
+
+        let mut events = Vec::new();
+        apply_ws_frame(
+            &store,
+            &sync,
+            Some(UserId(10)),
+            WsServerFrame::PtsPush(PtsUpdate {
+                chat_id: ChatId(1),
+                pts: 1,
+                pts_count: 1,
+                event: UpdateEvent::PublicCatalogChanged {
+                    creation_id: "cr_game_7".to_string(),
+                    kind: CreationKind::Game,
+                    action: "removed".to_string(),
+                },
+                timestamp_ms: 1_000,
+            }),
+            &mut events,
+        );
+
+        assert!(store.load_public_catalog_items(Some(CreationKind::Game)).is_empty());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientDomainEvent::PublicCatalogChanged {
+                creation_id,
+                kind,
+                action,
+            } => {
+                assert_eq!(creation_id, "cr_game_7");
+                assert_eq!(*kind, CreationKind::Game);
+                assert_eq!(action, "removed");
+            }
+            other => panic!("expected PublicCatalogChanged, got {other:?}"),
         }
     }
 

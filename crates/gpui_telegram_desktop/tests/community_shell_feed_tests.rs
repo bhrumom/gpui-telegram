@@ -37,6 +37,8 @@ use gpui_telegram_desktop::views::shell::{
 };
 use gpui_telegram_desktop::views::sidebar::gemini_unified_sidebar::UnifiedSidebarAction;
 use gpui_telegram_desktop::views::stage::entities_render::RichTextAction;
+use gpui_telegram_desktop::views::apple_sidebar::AppleSidebarSection;
+use gpui_telegram_desktop::views::content_hub::{ContentHubInputTarget, ContentHubSection};
 use gpui_telegram_desktop::views::{MainMenuCommand, TdesktopThemeMode};
 use gpui_telegram_proto::community_contracts::{
     ActorFilter, ActorKind, ActorProfileResponse, AlgoPreferencesDto, AlgoPreset,
@@ -131,6 +133,9 @@ fn dispatch_headless_target(target: &str, use_underscore_exit: bool) -> ! {
                     body_r7_composer_ime_carryover_nav_sync_and_load_more_supersede(app),
                 )
             }
+        }
+        "test_community_apple_sidebar_content_hub_coordination" => {
+            |app| Box::pin(body_apple_sidebar_content_hub_coordination(app))
         }
         other => {
             eprintln!("unknown community M4 headless gpui test target: {other}");
@@ -2678,7 +2683,11 @@ async fn body_r4_bidirectional_focus_and_compose_cleanup(mut app: AsyncApp) {
             // Enter Cmd+N compose / plus-menu mode in Chats
             assert!(s.handle_shortcut_key("n", false, cx));
             assert!(s.sidebar.read(cx).is_plus_menu_open);
-            assert!(s.composer.read(cx).is_compose_isolated);
+            assert_eq!(
+                s.composer.read(cx).is_compose_isolated,
+                s.theme_state.palette.is_apple_style(),
+                "F15-R3-D2 ({mode:?}): Apple Cmd+N isolates composer; Classic preserves C1-I7-6 non-isolation"
+            );
             if s.theme_state.palette.is_apple_style() {
                 s.sidebar.update(cx, |sb, scx| {
                     sb.compose_recipient_query = "alice".to_string();
@@ -3075,7 +3084,8 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
     });
     host.draw(&mut app);
 
-    // 4b. MediaViewer with sidebar.search_focused + "mv_search_pre"
+    // 4b. Fullscreen Z #3 MediaViewer is ShellInputTarget::Absorbed (upstream C1-I6-3:
+    //     zero phantom ime_preedit, occluded QuickPostBody blurs immediately, 1-Esc dismiss)
     let _ = shell.update(&mut app, |s, cx| {
         s.show_media_viewer("https://cdn.example/r5_occlusion.png", false, cx);
         assert!(s.overlays.media_viewer_overlay.is_some());
@@ -3087,7 +3097,10 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
     let _ = shell.update(&mut app, |s, cx| {
         s.update_ime_marked_text("mv_search_pre", cx);
         assert!(s.sidebar.read(cx).search_focused);
-        assert_eq!(s.ime.ime_preedit.as_deref(), Some("mv_search_pre"));
+        assert!(
+            s.ime.ime_preedit.is_none(),
+            "C1-I6-3: Z #3 MediaViewer absorbs IME with zero phantom preedit"
+        );
         assert!(s.community_ime_preedit_input_gen.is_none());
     });
     let _ = cw.update(&mut app, |w, cx| {
@@ -3100,21 +3113,14 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
             s.sidebar.read(cx).search_focused,
             "F16-R4-D1: occluded QuickPostBody focus must preserve sidebar.search_focused under MediaViewer"
         );
-        assert_eq!(
-            s.ime.ime_preedit.as_deref(),
-            Some("mv_search_pre"),
-            "F16-R4-D1: occluded QuickPostBody focus must preserve MediaViewer search preedit"
-        );
+        assert!(s.ime.ime_preedit.is_none());
         assert_eq!(
             cw.read(cx).state.active_input,
             ActiveCommunityInput::None,
             "F16-R4-D1: occluded QuickPostBody focus under MediaViewer must blur immediately"
         );
         assert!(!s.is_community_input_active(cx));
-        // Esc #1 clears preedit, Esc #2 dismisses MediaViewer
-        assert!(s.handle_non_char_key("escape", false, cx));
-        assert!(s.ime.ime_preedit.is_none());
-        assert!(s.overlays.media_viewer_overlay.is_some());
+        // 1st Escape immediately dismisses MediaViewer (no phantom preedit step)
         assert!(s.handle_non_char_key("escape", false, cx));
         assert!(s.overlays.media_viewer_overlay.is_none());
         assert_eq!(
@@ -3123,6 +3129,50 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
             "F16-R4-D1: dismissing MediaViewer must NOT trigger delayed QuickPostBody focus hijack"
         );
         assert!(!s.is_community_input_active(cx));
+    });
+    host.draw(&mut app);
+
+    // 4c. Z #14 PublishReviewModal over Community preserves live modal CJK preedit & blurs Community
+    let _ = shell.update(&mut app, |s, cx| {
+        s.sidebar.update(cx, |sb, scx| {
+            sb.exit_search();
+            scx.notify();
+        });
+        s.open_reviewer_queue_modal(cx);
+        assert!(s.is_publish_review_modal_active(cx));
+    });
+    host.draw(&mut app);
+    let _ = shell.update(&mut app, |s, cx| {
+        s.content_hub.update(cx, |h, hcx| {
+            h.publish_modal.focused_field = Some(
+                gpui_telegram_desktop::views::content_hub::publish_review_modal::PublishModalField::ReviewNotes,
+            );
+            hcx.notify();
+        });
+        s.update_ime_marked_text("pub_pre", cx);
+        assert_eq!(s.ime.ime_preedit.as_deref(), Some("pub_pre"));
+        assert!(s.community_ime_preedit_input_gen.is_none());
+    });
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.focus_input(ActiveCommunityInput::QuickPostBody);
+        cx.notify();
+    });
+    host.draw(&mut app);
+    let _ = shell.update(&mut app, |s, cx| {
+        assert_eq!(
+            s.ime.ime_preedit.as_deref(),
+            Some("pub_pre"),
+            "F16-R4-D1: occluded QuickPostBody focus must preserve PublishReviewModal CJK preedit"
+        );
+        assert_eq!(cw.read(cx).state.active_input, ActiveCommunityInput::None);
+        assert!(!s.is_community_input_active(cx));
+        // Esc #1 clears modal preedit, Esc #2 closes PublishReviewModal
+        assert!(s.handle_non_char_key("escape", false, cx));
+        assert!(s.ime.ime_preedit.is_none());
+        assert!(s.is_publish_review_modal_active(cx));
+        assert!(s.handle_non_char_key("escape", false, cx));
+        assert!(!s.is_publish_review_modal_active(cx));
+        assert_eq!(cw.read(cx).state.active_input, ActiveCommunityInput::None);
     });
 }
 
@@ -3571,7 +3621,9 @@ async fn body_r7_composer_ime_carryover_nav_sync_and_load_more_supersede(mut app
         assert!(s.handle_shortcut_key("6", false, cx));
         assert!(s.rtc_talk.talk_mode_overlay.is_some());
         assert_eq!(s.nav_rail.read(cx).active_destination, NavDestination::TalkMode);
-        assert!(s.handle_non_char_key("escape", false, cx));
+        // Closing TalkMode directly (e.g. hangup/close button) while standalone RemoteComputer hub
+        // remains active must restore NavDestination::RemoteComputer (R6-REV1-D1).
+        s.hide_talk_mode(cx);
         assert!(s.rtc_talk.talk_mode_overlay.is_none());
         assert_eq!(
             s.nav_rail.read(cx).active_destination,
@@ -3579,6 +3631,16 @@ async fn body_r7_composer_ime_carryover_nav_sync_and_load_more_supersede(mut app
             "R6-REV1-D1: dismissing TalkMode from standalone RemoteComputer hub must restore RemoteComputer"
         );
         assert_eq!(s.last_handled_nav_dest, Some(NavDestination::RemoteComputer));
+        // Upstream Z-order: when Settings (Z #9) sits visually above TalkMode (Z #2),
+        // Esc #1 closes Settings (Z #9) and Esc #2 closes TalkMode (Z #2).
+        assert!(s.handle_shortcut_key("6", false, cx));
+        assert!(s.rtc_talk.talk_mode_overlay.is_some());
+        assert!(s.handle_non_char_key("escape", false, cx));
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::Chats);
+        assert!(s.rtc_talk.talk_mode_overlay.is_some());
+        assert!(s.handle_non_char_key("escape", false, cx));
+        assert!(s.rtc_talk.talk_mode_overlay.is_none());
+        assert_eq!(s.nav_rail.read(cx).active_destination, NavDestination::Chats);
     });
     host.draw(&mut app);
     body_r7_part2_call_failure_and_nav_sync(&host, &shell, &mut app).await;
@@ -3912,3 +3974,94 @@ async fn body_r7_part3_load_more_and_notif_supersede(
         .await
     );
 }
+
+#[test]
+fn test_community_apple_sidebar_content_hub_coordination() {
+    run_in_headless_subprocess("test_community_apple_sidebar_content_hub_coordination");
+}
+
+async fn body_apple_sidebar_content_hub_coordination(mut app: AsyncApp) {
+    let host = open_authenticated_shell(&mut app, 1440.0, 900.0, 701, "hub_user");
+    let shell = host.shell.clone();
+
+    // 1. Switch Chats -> ContentHub(Books) -> AppleSidebarSection::Community -> ContentHub(MyCreations) -> Chats
+    let _ = shell.update(&mut app, |s, cx| {
+        s.select_apple_sidebar_section(AppleSidebarSection::Books, cx);
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::ContentHub(ContentHubSection::Books));
+        assert_eq!(s.apple_sidebar.read(cx).active_section, AppleSidebarSection::Books);
+        assert_eq!(s.inspect_state(cx).window.active_panel, "ContentHub(Books)");
+
+        // Focus CatalogSearch and verify plain Cmd+C stays in ContentHub while Cmd+Shift+C opens Community
+        s.content_hub.update(cx, |h, hcx| {
+            h.focus_input(ContentHubInputTarget::CatalogSearch, hcx);
+        });
+        s.insert_committed_text("rustbook", cx);
+        assert!(s.is_content_hub_input_active(cx));
+        assert!(s.handle_shortcut_key("c", false, cx));
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::ContentHub(ContentHubSection::Books));
+
+        assert!(s.handle_shortcut_key("c", true, cx));
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::Community);
+        assert_eq!(s.apple_sidebar.read(cx).active_section, AppleSidebarSection::Community);
+        assert_eq!(s.nav_rail.read(cx).active_destination, NavDestination::Community);
+        assert_eq!(s.inspect_state(cx).window.active_panel, "Community");
+        assert_eq!(s.content_hub.read(cx).active_input, ContentHubInputTarget::None);
+    });
+    host.draw(&mut app);
+
+    // 2. Focus Community input, then switch via AppleSidebarSection::Books -> blurs Community cleanly
+    let _ = shell.update(&mut app, |s, cx| {
+        let cw = s.community_workspace().cloned().expect("mounted");
+        cw.update(cx, |w, wcx| {
+            w.state.focus_input(ActiveCommunityInput::QuickPostBody);
+            wcx.notify();
+        });
+        assert!(s.is_community_input_active(cx));
+
+        s.apple_sidebar.update(cx, |sb, scx| {
+            sb.select_section(AppleSidebarSection::Books, scx);
+        });
+    });
+    host.draw(&mut app);
+
+    let _ = shell.update(&mut app, |s, cx| {
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::ContentHub(ContentHubSection::Books));
+        assert_eq!(s.apple_sidebar.read(cx).active_section, AppleSidebarSection::Books);
+        let cw = s.community_workspace().cloned().expect("mounted");
+        assert_eq!(cw.read(cx).state.active_input, ActiveCommunityInput::None);
+
+        // Click AppleSidebarSection::Community directly from Books
+        s.apple_sidebar.update(cx, |sb, scx| {
+            sb.select_section(AppleSidebarSection::Community, scx);
+        });
+    });
+    host.draw(&mut app);
+
+    // 3. Unread badge sync onto AppleAppSidebar + MyCreations + logout reset
+    let _ = shell.update(&mut app, |s, cx| {
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::Community);
+        assert_eq!(s.apple_sidebar.read(cx).active_section, AppleSidebarSection::Community);
+
+        s.set_community_unread_badge(7, cx);
+        assert_eq!(s.apple_sidebar.read(cx).community_unread_count, 7);
+
+        s.select_apple_sidebar_section(AppleSidebarSection::MyCreations, cx);
+        assert_eq!(
+            s.active_panel,
+            ActiveWorkspacePanel::ContentHub(ContentHubSection::MyCreations)
+        );
+        assert_eq!(s.apple_sidebar.read(cx).active_section, AppleSidebarSection::MyCreations);
+        assert_eq!(s.inspect_state(cx).window.active_panel, "ContentHub(MyCreations)");
+
+        s.select_apple_sidebar_section(AppleSidebarSection::Chats, cx);
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::Chats);
+        assert_eq!(s.apple_sidebar.read(cx).active_section, AppleSidebarSection::Chats);
+        assert_eq!(s.apple_sidebar.read(cx).community_unread_count, 7);
+
+        s.logout(cx);
+        assert_eq!(s.apple_sidebar.read(cx).community_unread_count, 0);
+        assert_eq!(s.apple_sidebar.read(cx).active_section, AppleSidebarSection::Chats);
+        assert!(s.community_workspace().is_none());
+    });
+}
+

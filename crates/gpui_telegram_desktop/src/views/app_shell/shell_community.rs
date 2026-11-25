@@ -17,6 +17,7 @@ use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::community::{
     ActiveCommunityInput, CommunityWorkspace, CommunityWorkspaceAction,
 };
+use crate::views::content_hub::ContentHubInputTarget;
 use crate::views::nav_rail::NavDestination;
 use crate::views::shell::{ActiveWorkspacePanel, AppShell};
 
@@ -27,17 +28,15 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Entity<CommunityWorkspace> {
         self.leave_browser_panel_if_active(cx);
+        self.cleanup_settings_panel_if_active(cx);
         let was_outside = self.active_panel != ActiveWorkspacePanel::Community;
         if was_outside {
-            self.ime.clear_preedit();
+            self.clear_ime_and_blur_content_hub_for_transition(true, cx);
             self.community_ime_preedit_input_gen = None;
         }
         self.active_panel = ActiveWorkspacePanel::Community;
-        self.last_handled_nav_dest = Some(NavDestination::Community);
-        self.nav_rail.update(cx, |r, rcx| {
-            r.set_active_destination(NavDestination::Community);
-            rcx.notify();
-        });
+        self.sync_nav_rail_destination_silent(NavDestination::Community, cx);
+        self.sync_apple_sidebar_to_active_panel(cx);
         self.sidebar.update(cx, |sb, scx| {
             sb.cancel_compose_mode();
             sb.is_account_popover_open = false;
@@ -128,9 +127,16 @@ impl AppShell {
                                     scx.notify();
                                 });
                             }
+                            if shell.content_hub.read(cx).active_input
+                                == ContentHubInputTarget::QuickDrawerSearch
+                            {
+                                shell.content_hub.update(cx, |h, hcx| {
+                                    h.blur_input();
+                                    hcx.notify();
+                                });
+                            }
                             if !preedit_matches {
-                                shell.ime.clear_preedit();
-                                shell.community_ime_preedit_input_gen = None;
+                                shell.clear_all_ime_preedits(cx);
                             }
                             cx.notify();
                         } else {
@@ -143,7 +149,9 @@ impl AppShell {
                             cx.notify();
                         }
                     } else if shell.community_ime_preedit_input_gen.is_some()
-                        || (community_unoccluded && !shell.sidebar.read(cx).search_focused)
+                        || (community_unoccluded
+                            && !shell.sidebar.read(cx).search_focused
+                            && !shell.content_hub.read(cx).has_focused_input(false))
                     {
                         shell.ime.clear_preedit();
                         shell.community_ime_preedit_input_gen = None;
@@ -185,10 +193,14 @@ impl AppShell {
     }
 
     /// Occludes `CommunityWorkspace` when a shell modal/drawer/overlay/popover opens on top of it,
-    /// immediately clearing any stale IME preedit and blurring Community inputs.
+    /// blurring Community inputs and clearing stale IME preedit iff Community or base workspace owns it.
     pub fn occlude_community_for_overlay(&mut self, cx: &mut Context<Self>) {
         if self.active_panel == ActiveWorkspacePanel::Community {
-            self.ime.clear_preedit();
+            if self.community_ime_preedit_input_gen.is_some()
+                || self.is_base_workspace_unoccluded(cx)
+            {
+                self.ime.clear_preedit();
+            }
             self.community_ime_preedit_input_gen = None;
             if let Some(cw) = self.community_workspace.clone() {
                 cw.update(cx, |w, wcx| {
@@ -198,11 +210,17 @@ impl AppShell {
         }
     }
 
-    /// Updates the `NavDestination::Community` unread badge across NavRail, Expanded Sidebar & Collapsed Rail.
+    /// Updates the `NavDestination::Community` unread badge across AppleAppSidebar, NavRail, Expanded Sidebar & Collapsed Rail.
     pub fn set_community_unread_badge(&mut self, count: u32, cx: &mut Context<Self>) {
         self.nav_rail.update(cx, |r, rcx| {
             r.set_unread(NavDestination::Community, count);
             rcx.notify();
+        });
+        self.apple_sidebar.update(cx, |sb, scx| {
+            if sb.community_unread_count != count {
+                sb.set_community_unread(count);
+                scx.notify();
+            }
         });
         self.sidebar.update(cx, |_, scx| scx.notify());
         cx.notify();
@@ -622,8 +640,10 @@ impl AppShell {
                 self.leave_community_panel_if_active(cx);
                 if let Some(cid) = existing_cid {
                     self.open_or_select_chat(cid, title_hint, is_bot, cx);
+                    self.sync_apple_sidebar_to_active_panel(cx);
                 } else {
                     self.open_or_select_chat(uid, title_hint.clone(), is_bot, cx);
+                    self.sync_apple_sidebar_to_active_panel(cx);
                     if let Some(fence) = self.capture_client_fence() {
                         let req = CreateChatRequest {
                             title: title_hint.clone().unwrap_or_else(|| format!("User {uid}")),
@@ -646,6 +666,7 @@ impl AppShell {
                                         if fence.is_valid(shell) {
                                             shell.session_sync.chat_peer_user_ids.insert(cid, uid);
                                             shell.open_or_select_chat(cid, title_hint, is_bot, cx);
+                                            shell.sync_apple_sidebar_to_active_panel(cx);
                                         }
                                     });
                                 }

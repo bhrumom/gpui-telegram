@@ -2622,37 +2622,48 @@ pub fn ensure_companion_bot_dm_with_welcome(
         let reg_opt = state.db.get_bot_by_user_id(bot_user_id.0 as i64).ok().flatten();
         let is_standard = reg_opt.as_ref().is_some_and(|r| r.is_standard_bot);
         if !is_standard {
-            let (welcome_text, kb) = if bot_user_id.0 == BOTFATHER_USER_ID {
-                (build_botfather_welcome_text(), build_botfather_welcome_keyboard())
-            } else if let Some(reg) = reg_opt {
-                if let Some(cfg) = reg.coding_agent_config() {
-                    build_coding_agent_status_card_and_kb(state, &reg, &cfg)
-                } else {
-                    let apps = state
-                        .db
-                        .list_mini_apps_for_bot(bot_user_id.0 as i64)
-                        .unwrap_or_default();
-                    build_companion_bot_welcome_text_and_keyboard(
-                        &reg.display_name,
-                        &reg.username,
-                        &reg.description,
-                        &apps,
-                    )
-                }
+            if bot_user_id.0 == gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID as u64 {
+                let welcome = crate::routes::creator_bot::build_creator_studio_welcome_reply();
+                let _ = crate::routes::creator_bot::send_creator_bot_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_user_id,
+                    welcome,
+                    None,
+                );
             } else {
-                let user = state.db.get_user(bot_user_id).ok().flatten();
-                let title = user
-                    .as_ref()
-                    .map(|u| u.first_name.as_str())
-                    .unwrap_or("AI Assistant");
-                let uname = user
-                    .as_ref()
-                    .and_then(|u| u.username.as_deref())
-                    .unwrap_or("bot");
-                let bio = user.as_ref().and_then(|u| u.bio.as_deref()).unwrap_or("");
-                build_companion_bot_welcome_text_and_keyboard(title, uname, bio, &[])
-            };
-            let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome_text, kb);
+                let (welcome_text, kb) = if bot_user_id.0 == BOTFATHER_USER_ID {
+                    (build_botfather_welcome_text(), build_botfather_welcome_keyboard())
+                } else if let Some(reg) = reg_opt {
+                    if let Some(cfg) = reg.coding_agent_config() {
+                        build_coding_agent_status_card_and_kb(state, &reg, &cfg)
+                    } else {
+                        let apps = state
+                            .db
+                            .list_mini_apps_for_bot(bot_user_id.0 as i64)
+                            .unwrap_or_default();
+                        build_companion_bot_welcome_text_and_keyboard(
+                            &reg.display_name,
+                            &reg.username,
+                            &reg.description,
+                            &apps,
+                        )
+                    }
+                } else {
+                    let user = state.db.get_user(bot_user_id).ok().flatten();
+                    let title = user
+                        .as_ref()
+                        .map(|u| u.first_name.as_str())
+                        .unwrap_or("AI Assistant");
+                    let uname = user
+                        .as_ref()
+                        .and_then(|u| u.username.as_deref())
+                        .unwrap_or("bot");
+                    let bio = user.as_ref().and_then(|u| u.bio.as_deref()).unwrap_or("");
+                    build_companion_bot_welcome_text_and_keyboard(title, uname, bio, &[])
+                };
+                let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome_text, kb);
+            }
         }
     }
 
@@ -2785,6 +2796,25 @@ pub(crate) async fn handle_ai_bot_reply_with_options(
         let (reply, kb) = handle_botfather_message(state, chat_id, sender_id, text).await;
         if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
             let _ = send_bot_chat_reply_in_topic(state, chat_id, bot_user_id, &reply, kb, topic_id);
+        }
+        typing_guard.finish();
+        return;
+    }
+    if bot_user_id.0 == gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID as u64 {
+        let typing_guard =
+            crate::routes::hermes::BotTypingGuard::start(Arc::clone(state), chat_id, bot_user_id);
+        let reply = crate::routes::creator_bot::handle_creator_studio_message(
+            state, chat_id, sender_id, text,
+        )
+        .await;
+        if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+            let _ = crate::routes::creator_bot::send_creator_bot_reply_in_topic(
+                state,
+                chat_id,
+                bot_user_id,
+                reply,
+                topic_id,
+            );
         }
         typing_guard.finish();
         return;
@@ -5371,6 +5401,33 @@ pub async fn miniapps_installed(auth: AuthBearer, State(state): State<Arc<AppSta
             (
                 StatusCode::OK,
                 Json(json!({ "apps": apps, "total": apps.len() })),
+            )
+                .into_response()
+        }
+        Err(e) => map_telegram_err(e),
+    }
+}
+
+/// GET /api/v1/bots
+pub async fn bots_list(auth: AuthBearer, State(state): State<Arc<AppState>>) -> Response {
+    let is_admin = crate::routes::hermes::caller_is_admin(&state, auth.user_id);
+    let uid = auth.user_id.0 as i64;
+    match state.db.list_all_bots() {
+        Ok(records) => {
+            let bots: Vec<BotRegistryEntry> = records
+                .iter()
+                .filter(|b| {
+                    is_admin
+                        || b.is_official
+                        || b.owner_user_id == uid
+                        || state.db.bot_has_published_miniapp(b.bot_user_id)
+                        || state.db.user_has_dm_with_bot(uid, b.bot_user_id)
+                })
+                .map(|b| bot_record_to_entry_for_viewer(&state, b, uid))
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({ "bots": bots, "total": bots.len() })),
             )
                 .into_response()
         }

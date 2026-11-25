@@ -106,6 +106,8 @@ impl PtsEngine {
             UpdateEvent::MiniAppWebMcpCommand(_) => "miniapp_webmcp_command",
             UpdateEvent::MiniAppControlStatus { .. } => "miniapp_control_status",
             UpdateEvent::CodingHostCommand(_) => "coding_host_command",
+            UpdateEvent::UserCreationChanged { .. } => "user_creation_changed",
+            UpdateEvent::PublicCatalogChanged { .. } => "public_catalog_changed",
             UpdateEvent::CommunityEvent { .. } => "community_event",
         };
 

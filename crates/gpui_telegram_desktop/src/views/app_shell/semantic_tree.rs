@@ -37,6 +37,7 @@ fn active_panel_label(panel: ActiveWorkspacePanel) -> String {
         ActiveWorkspacePanel::Browser => "Browser".to_string(),
         ActiveWorkspacePanel::Community => "Community".to_string(),
         ActiveWorkspacePanel::Settings => "Settings".to_string(),
+        ActiveWorkspacePanel::ContentHub(section) => format!("ContentHub({section:?})"),
     }
 }
 
@@ -77,6 +78,11 @@ impl AppShell {
             Some(SemanticModalNode {
                 modal_id: title.clone(),
                 title,
+            })
+        } else if self.content_hub.read(cx).is_publish_review_modal_open() {
+            Some(SemanticModalNode {
+                modal_id: "publish_review_modal".to_string(),
+                title: "Publish & Review".to_string(),
             })
         } else {
             None
@@ -163,9 +169,20 @@ impl AppShell {
                         let insp_entity = self.inspector.clone();
                         sb_entity.update(cx, |sb, sb_cx| {
                             st_entity.update(sb_cx, |st, st_cx| {
-                                insp_entity.update(st_cx, |insp, _| {
+                                let had_stage_focus =
+                                    st.search_open || st.active_bot_card_field.is_some();
+                                insp_entity.update(st_cx, |insp, insp_cx| {
+                                    let had_insp_focus = insp.is_bot_input_active();
                                     let _ = select_authoritative_dialog(sb, st, insp, *chat_id);
+                                    if had_insp_focus && !insp.is_bot_input_active() {
+                                        insp_cx.notify();
+                                    }
                                 });
+                                if had_stage_focus
+                                    && !(st.search_open || st.active_bot_card_field.is_some())
+                                {
+                                    st_cx.notify();
+                                }
                             });
                         });
                         self.reconcile_chat_scoped_toasts(cx);
@@ -263,8 +280,12 @@ impl AppShell {
                     )
                 } else {
                     let title = trimmed.to_string();
-                    self.modal_container.update(cx, |m: &mut ModalContainer, _| {
+                    self.modal_container.update(cx, |m: &mut ModalContainer, mcx| {
+                        let was_active = m.is_modal_active();
                         let _ = m.show_modal(title.clone(), 420.0, 320.0, LayerStackOption::Normal);
+                        if m.is_modal_active() != was_active {
+                            mcx.notify();
+                        }
                     });
                     self.reconcile_chat_scoped_toasts(cx);
                     (
@@ -276,8 +297,12 @@ impl AppShell {
                 }
             }
             SemanticAction::CloseModal => {
-                self.modal_container.update(cx, |m: &mut ModalContainer, _| {
+                self.modal_container.update(cx, |m: &mut ModalContainer, mcx| {
+                    let was_active = m.is_modal_active();
                     m.hide_all();
+                    if m.is_modal_active() != was_active {
+                        mcx.notify();
+                    }
                 });
                 ("CloseModal", true, None, json!({ "open": false }))
             }

@@ -126,8 +126,7 @@ impl AuthWizardView {
         self.is_authenticating = false;
         self.login_error = None;
         self.password_input.zeroize();
-        self.ime.clear_preedit();
-        self.ime.just_committed_ime = false;
+        self.ime.clear_ime_state();
         cx.emit(AuthWizardEvent::Authenticated(auth));
         cx.notify();
     }
@@ -495,7 +494,7 @@ impl AuthWizardView {
         self.pending_vault_bootstrap = None;
         self.auth_wizard_tab = tab;
         self.login_error = None;
-        self.ime.clear_preedit();
+        self.ime.clear_ime_state();
         match tab {
             AuthWizardTab::PasswordLogin => self.active_login_field = LoginInputField::Username,
             AuthWizardTab::AlipayQr => self.start_alipay_flow(cx),
@@ -507,6 +506,7 @@ impl AuthWizardView {
     pub fn apply_custom_server_url(&mut self, cx: &mut Context<Self>) {
         let raw = self.server_url_draft.trim().to_string();
         if raw.is_empty() {
+            self.ime.clear_ime_state();
             self.editing_server_url = false;
             cx.notify();
             return;
@@ -537,6 +537,7 @@ impl AuthWizardView {
         self.is_sending_email_code = false;
         self.email_code_cooldown = 0;
         self.server_url_draft = normalized.clone();
+        self.ime.clear_ime_state();
         self.editing_server_url = false;
         self.login_error = None;
         cx.emit(AuthWizardEvent::ServerUrlApplied(normalized.clone()));
@@ -829,6 +830,7 @@ impl AuthWizardView {
                     Ok(resp) => {
                         wizard.email_code_cooldown =
                             if resp.cooldown_seconds > 0 { resp.cooldown_seconds } else { 60 };
+                        wizard.ime.clear_ime_state();
                         wizard.email_cooldown_generation =
                             wizard.email_cooldown_generation.wrapping_add(1);
                         let cd_gen = wizard.email_cooldown_generation;
@@ -1056,7 +1058,7 @@ impl AuthWizardView {
     }
 
     pub fn clear_active_field(&mut self, cx: &mut Context<Self>) {
-        self.ime.clear_preedit();
+        self.ime.clear_ime_state();
         if self.editing_server_url {
             self.server_url_draft.clear();
             cx.notify();
@@ -1072,7 +1074,7 @@ impl AuthWizardView {
     }
 
     pub fn insert_committed_text(&mut self, raw_text: &str, cx: &mut Context<Self>) {
-        self.ime.clear_preedit();
+        self.ime.clear_ime_state();
         let clean = sanitize_paste_text(raw_text, false);
         if clean.is_empty() {
             cx.notify();
@@ -1130,13 +1132,14 @@ impl AuthWizardView {
     ) -> bool {
         if key == "escape" {
             if self.editing_server_url {
-                self.ime.clear_preedit();
+                self.ime.clear_ime_state();
                 self.editing_server_url = false;
                 self.server_url_draft = self.client.config.server_url.clone();
                 cx.notify();
                 return true;
             }
             if self.ime.ime_preedit.take().is_some() {
+                self.ime.clear_commit_fence();
                 cx.notify();
                 return true;
             }
@@ -1146,7 +1149,8 @@ impl AuthWizardView {
         if self.editing_server_url {
             match key {
                 "enter" => {
-                    if let Some(p) = self.ime.ime_preedit.take() {
+                    if let Some(p) = self.ime.ime_preedit.take().filter(|s| !s.is_empty()) {
+                        self.ime.clear_commit_fence();
                         self.server_url_draft.push_str(&sanitize_paste_text(&p, false));
                         cx.notify();
                     } else if self.ime.take_just_committed() {
@@ -1160,6 +1164,7 @@ impl AuthWizardView {
                     if self.ime.ime_preedit.take().is_none() {
                         Self::delete_token(&mut self.server_url_draft, is_alt);
                     }
+                    self.ime.clear_commit_fence();
                     cx.notify();
                     return true;
                 }
@@ -1173,7 +1178,7 @@ impl AuthWizardView {
         match self.login_step {
             LoginWizardStep::Start => match key {
                 "enter" => {
-                    if let Some(p) = self.ime.ime_preedit.take() {
+                    if let Some(p) = self.ime.ime_preedit.take().filter(|s| !s.is_empty()) {
                         self.insert_committed_text(&p, cx);
                     } else if self.ime.take_just_committed() {
                         cx.notify();
@@ -1189,7 +1194,7 @@ impl AuthWizardView {
                     true
                 }
                 "tab" => {
-                    self.ime.clear_preedit();
+                    self.ime.clear_ime_state();
                     self.active_login_field = next_login_field(
                         self.auth_wizard_tab,
                         self.active_login_field,
@@ -1203,6 +1208,7 @@ impl AuthWizardView {
                         let field = self.active_login_field;
                         Self::delete_token(self.login_field_mut(field), is_alt);
                     }
+                    self.ime.clear_commit_fence();
                     cx.notify();
                     true
                 }
@@ -1211,6 +1217,7 @@ impl AuthWizardView {
             LoginWizardStep::Phone => match key {
                 "enter" => {
                     if !self.phone_number.trim().is_empty() {
+                        self.ime.clear_ime_state();
                         self.login_step = LoginWizardStep::Code;
                         self.login_error = None;
                     }
@@ -1342,11 +1349,12 @@ impl EntityInputHandler for AuthWizardView {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.ime.just_committed_ime = true;
         if let Some(p) = self.ime.ime_preedit.take().filter(|s| !s.is_empty()) {
             self.insert_committed_text(&p, cx);
+            self.ime.mark_ime_committed();
             return;
         }
+        self.ime.clear_ime_state();
         cx.notify();
     }
 
@@ -1359,7 +1367,9 @@ impl EntityInputHandler for AuthWizardView {
     ) {
         let was_composing = self.ime.has_preedit();
         self.insert_committed_text(text, cx);
-        self.ime.just_committed_ime = was_composing;
+        if was_composing {
+            self.ime.mark_ime_committed();
+        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -1372,6 +1382,7 @@ impl EntityInputHandler for AuthWizardView {
     ) {
         if let Some(committed) = self.ime.handle_replace_and_mark(new_text) {
             self.insert_committed_text(&committed, cx);
+            self.ime.mark_ime_committed();
         } else {
             cx.notify();
         }

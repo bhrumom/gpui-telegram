@@ -127,6 +127,7 @@ impl Render for ChatSidebar {
             &nav_snapshot,
             is_plus_open || creation_modal.is_some(),
             self.hovered_rail_item,
+            self.has_leading_app_sidebar,
             &palette,
             &lang_id,
             cx,

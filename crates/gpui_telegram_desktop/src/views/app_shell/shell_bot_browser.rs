@@ -5137,16 +5137,14 @@ impl AppShell {
     /// Opens or focuses the built-in `BrowserWorkspace` panel and wires shared `BrowserSessionRegistry`.
     pub fn open_browser_workspace(&mut self, cx: &mut Context<Self>) -> Entity<BrowserWorkspace> {
         self.leave_community_panel_if_active(cx);
+        self.cleanup_settings_panel_if_active(cx);
         let was_outside = self.active_panel != ActiveWorkspacePanel::Browser;
         if was_outside {
-            self.ime.clear_preedit();
+            self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         }
         self.active_panel = ActiveWorkspacePanel::Browser;
-        self.last_handled_nav_dest = Some(NavDestination::Browser);
-        self.nav_rail.update(cx, |r, rcx| {
-            r.set_active_destination(NavDestination::Browser);
-            rcx.notify();
-        });
+        self.sync_nav_rail_destination_silent(NavDestination::Browser, cx);
+        self.sync_apple_sidebar_to_active_panel(cx);
         self.sidebar.update(cx, |sb, scx| {
             if sb.search_focused {
                 sb.search_focused = false;

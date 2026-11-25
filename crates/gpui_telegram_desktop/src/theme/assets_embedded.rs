@@ -123,6 +123,13 @@ define_icons! {
     }
     extra {
         ArrowUp => "arrow_up.svg",
+        HubBooks => "hub_books.svg",
+        HubMusic => "hub_music.svg",
+        HubGames => "hub_games.svg",
+        HubAppStore => "hub_appstore.svg",
+        HubCreations => "hub_creations.svg",
+        HubPublish => "hub_publish.svg",
+        HubSparkles => "hub_sparkles.svg",
         CommunityGlobe => "community_globe.svg",
         UpvoteArrow => "community_upvote.svg",
         DownvoteArrow => "community_downvote.svg",

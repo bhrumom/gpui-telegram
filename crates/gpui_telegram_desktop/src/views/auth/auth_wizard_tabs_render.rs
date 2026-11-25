@@ -580,6 +580,7 @@ impl AuthWizardView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
+                                    this.ime.clear_ime_state();
                                     this.login_step = LoginWizardStep::Start;
                                     cx.notify();
                                 }),
@@ -604,6 +605,7 @@ impl AuthWizardView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
+                                    this.ime.clear_ime_state();
                                     this.login_step = LoginWizardStep::Code;
                                     cx.notify();
                                 }),
@@ -655,6 +657,7 @@ impl AuthWizardView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
+                            this.ime.clear_ime_state();
                             this.login_step = LoginWizardStep::Start;
                             this.switch_auth_tab(AuthWizardTab::AlipayQr, cx);
                         }),
@@ -670,6 +673,7 @@ impl AuthWizardView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
+                            this.ime.clear_ime_state();
                             this.login_step = LoginWizardStep::Phone;
                             cx.notify();
                         }),
@@ -792,6 +796,7 @@ impl AuthWizardView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
+                            this.ime.clear_ime_state();
                             this.login_step = LoginWizardStep::Phone;
                             cx.notify();
                         }),

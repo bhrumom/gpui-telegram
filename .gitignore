@@ -30,3 +30,4 @@ Thumbs.db
 /artifacts/
 /dist/
 /crates/gpui_telegram_server/data/
+__pycache__/

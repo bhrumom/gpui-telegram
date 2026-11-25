@@ -177,6 +177,7 @@ impl ImeSafetyMachine {
     pub fn insert_text(&mut self, text: &str) {
         if !self.is_composing() {
             self.just_committed = false;
+            self.last_commit_at = None;
             if matches!(self.state, ImeState::Committed { .. }) {
                 self.state = ImeState::Idle;
             }
@@ -206,6 +207,7 @@ impl ImeSafetyMachine {
         self.cursor_index = 0;
         self.state = ImeState::Idle;
         self.just_committed = false;
+        self.last_commit_at = None;
     }
 
     pub fn text(&self) -> &str {

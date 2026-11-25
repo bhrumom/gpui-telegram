@@ -109,6 +109,17 @@ impl TextInputController {
         self.ime_preedit = None;
     }
 
+    pub fn clear_commit_fence(&mut self) {
+        self.just_committed_ime = false;
+        self.last_ime_commit_at = None;
+    }
+
+    pub fn clear_ime_state(&mut self) {
+        self.ime_preedit = None;
+        self.just_committed_ime = false;
+        self.last_ime_commit_at = None;
+    }
+
     /// Marks that an IME composition was just committed right now, starting the short trailing-Enter
     /// guard window so Space-committed CJK text does not swallow a later intentional Enter send.
     pub fn mark_ime_committed(&mut self) {
@@ -150,12 +161,14 @@ impl TextInputController {
         if new_text.is_empty() {
             let committed = self.ime_preedit.take().filter(|p| !p.is_empty());
             if committed.is_some() {
-                self.just_committed_ime = true;
+                self.mark_ime_committed();
+            } else {
+                self.clear_commit_fence();
             }
             committed
         } else {
             self.ime_preedit = Some(new_text.to_string());
-            self.just_committed_ime = false;
+            self.clear_commit_fence();
             None
         }
     }

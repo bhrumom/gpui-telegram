@@ -35,7 +35,7 @@ use crate::views::app_shell::{
     resolve_active_target_chat_id,
     shell_theme::tdesktop_mode_for_window_appearance,
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
-    ShellBotBrowserState, ShellPanelState,
+    ShellBotBrowserState, ShellContentHubState, ShellPanelState,
 };
 use crate::views::composer::BotKeyboard;
 use crate::views::nav_rail::NavDestination;
@@ -43,9 +43,10 @@ use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
 };
 use crate::views::{
-    BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, CommunityWorkspace,
-    ComputerWorkbench, ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer,
-    MediaViewer, NavRail,
+    AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
+    CommunityWorkspace, ComputerWorkbench, ContentHubSection, ContentHubWorkspace,
+    ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer,
+    NavRail,
 };
 use crate::window::WindowSubsystemRuntime;
 
@@ -59,6 +60,7 @@ pub enum ActiveWorkspacePanel {
     Browser,
     Community,
     Settings,
+    ContentHub(ContentHubSection),
 }
 
 /// Cycles the 4 built-in Telegram Desktop theme palettes (`Night -> Tinted -> Day -> Classic`).
@@ -107,6 +109,8 @@ pub(crate) struct ComposeIsolationSnapshot {
 /// Root GPUI desktop view orchestrating workspace views, session lifecycle, routing, and overlays.
 pub struct AppShell {
     pub nav_rail: Entity<NavRail>,
+    pub apple_sidebar: Entity<AppleAppSidebar>,
+    pub content_hub: Entity<ContentHubWorkspace>,
     pub sidebar: Entity<ChatSidebar>,
     pub stage: Entity<ConversationStage>,
     pub composer: Entity<CanonicalComposer>,
@@ -127,6 +131,7 @@ pub struct AppShell {
     pub app: TelegramApp,
     pub window_runtime: WindowSubsystemRuntime,
     pub panel_state: ShellPanelState,
+    pub content_hub_state: ShellContentHubState,
     pub is_authenticated: bool,
     pub active_panel: ActiveWorkspacePanel,
     pub last_handled_nav_dest: Option<NavDestination>,
@@ -148,6 +153,9 @@ pub struct AppShell {
     pub last_observed_toast_chat_id: Option<u64>,
     pub proxy_op_generation: u64,
     pub(crate) compose_isolation_snapshot: Option<ComposeIsolationSnapshot>,
+    pub(crate) prev_composer_focused: std::cell::Cell<bool>,
+    pub(crate) last_ime_modal_snapshot:
+        Option<(crate::views::boxes::modal_types::ActiveTextField, Option<ModalDialogKind>)>,
 }
 
 impl AppShell {
@@ -201,6 +209,7 @@ impl AppShell {
         });
         sidebar.update(cx, |sb, sb_cx| {
             sb.attach_nav_rail(nav_rail.clone(), sb_cx);
+            sb.set_has_leading_app_sidebar(true);
             sb.set_collapsed(preferences.appearance.sidebar_collapsed);
             sb.folder_tags_enabled = preferences.folder_tags_enabled;
             sb.set_notification_badge_rules(
@@ -209,6 +218,8 @@ impl AppShell {
             );
         });
 
+        let apple_sidebar = cx.new(|_| AppleAppSidebar::new(init_palette, init_lang));
+        let content_hub = cx.new(|_| ContentHubWorkspace::new(init_palette, init_lang));
         let main_menu_drawer = cx.new(|_| {
             let mut m = MainMenuDrawer::new(Vec::new(), 0);
             m.set_palette(init_palette);
@@ -225,6 +236,8 @@ impl AppShell {
 
         let mut shell_instance = Self {
             nav_rail,
+            apple_sidebar,
+            content_hub,
             sidebar,
             stage,
             composer,
@@ -245,6 +258,7 @@ impl AppShell {
             app: TelegramApp::new(),
             window_runtime: WindowSubsystemRuntime::new(),
             panel_state: ShellPanelState::default(),
+            content_hub_state: ShellContentHubState::new(),
             is_authenticated: false,
             active_panel: ActiveWorkspacePanel::Chats,
             last_handled_nav_dest: Some(NavDestination::Chats),
@@ -266,6 +280,8 @@ impl AppShell {
             last_observed_toast_chat_id: None,
             proxy_op_generation: 0,
             compose_isolation_snapshot: None,
+            prev_composer_focused: std::cell::Cell::new(false),
+            last_ime_modal_snapshot: None,
         };
 
         shell_instance.overlays.is_passcode_locked = shell_instance.has_local_passcode_configured();
@@ -639,15 +655,194 @@ impl AppShell {
         (true, restored_chat_id)
     }
 
-    fn reset_conversation_views(&mut self, srv_url: &str, username: Option<&str>, cx: &mut Context<Self>) {
+    pub(crate) fn reset_conversation_views(&mut self, srv_url: &str, username: Option<&str>, cx: &mut Context<Self>) {
         self.sidebar.update(cx, |sb, sb_cx| {
+            let had_sb_tracked = sb.search_focused
+                || sb.is_plus_menu_open
+                || sb.is_contacts_modal_open
+                || sb.active_creation_modal.is_some()
+                || sb.is_account_popover_open
+                || !sb.compose_recipient_query.is_empty();
             self.stage.update(sb_cx, |st, st_cx| {
-                self.inspector.update(st_cx, |insp, _| {
+                let had_st_tracked = st.search_open || st.active_bot_card_field.is_some();
+                self.inspector.update(st_cx, |insp, insp_cx| {
+                    let had_insp_tracked = insp.is_bot_input_active();
                     reset_account_conversation_views(sb, st, insp, srv_url, username);
+                    sb.contacts_search_query.clear();
+                    sb.creation_primary_input.clear();
+                    sb.creation_secondary_input.clear();
+                    sb.creation_tertiary_input.clear();
+                    sb.pending_add_contact_request = None;
+                    sb.pending_create_group_request = None;
+                    sb.pending_open_new_channel = false;
+                    if had_insp_tracked {
+                        insp_cx.notify();
+                    }
                 });
+                if had_st_tracked {
+                    st_cx.notify();
+                }
             });
+            if had_sb_tracked {
+                sb_cx.notify();
+            }
         });
         self.overlays.last_sidebar_selection_revision = self.sidebar.read(cx).selection_revision;
+    }
+
+    /// Resets all account/chat-scoped state on `CanonicalComposer` (draft, IME, undo/redo,
+    /// reply/edit, attachments, bot menu/commands/keyboard, send-as, mentions, isolation, focus)
+    /// across logout / account-switch boundaries while preserving theme/locale/editor prefs.
+    pub(crate) fn reset_composer_for_account_boundary(&mut self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |c, ccx| {
+            let had_state = c.is_input_focused
+                || c.is_compose_isolated
+                || c.ime_machine.is_composing_or_committed()
+                || !c.text().is_empty()
+                || c.replying_to.is_some()
+                || c.editing_message.is_some()
+                || !c.editor.attachments.is_empty()
+                || !c.editor.undo_stack.is_empty()
+                || !c.editor.redo_stack.is_empty()
+                || c.bot_keyboard.has_markup()
+                || c.is_bot_keyboard_open
+                || !c.send_as_options.is_empty()
+                || c.selected_send_as_peer_id.is_some()
+                || c.bot_menu_controls.is_active
+                || !c.bot_slash_commands.is_empty()
+                || c.hermes_slash_enabled
+                || !c.attach_mini_apps.is_empty()
+                || !c.autocomplete.all_mention_candidates.is_empty()
+                || c.compose_placeholder_override.is_some()
+                || c.compose_send_disabled
+                || c.is_emoji_picker_open
+                || c.is_formatting_open
+                || c.attachments_drawer.is_open
+                || c.submitted_message.is_some()
+                || c.submitted_attachment.is_some()
+                || c.pending_attached_files.is_some()
+                || c.pending_launch_miniapp.is_some()
+                || c.pending_bot_keyboard_press.is_some();
+
+            c.is_compose_isolated = false; // MUST precede set_send_as_options!
+            c.is_input_focused = false;
+            c.ime_machine.on_ime_cancel();
+            c.clear();
+            c.cancel_reply_or_edit();
+            c.editor.selection_anchor = None;
+            c.editor.undo_stack.clear();
+            c.editor.redo_stack.clear();
+            c.editor.attachments.clear();
+            c.editor.send_options_open = false;
+            c.editor.send_silent = false;
+            c.editor.scheduled_at_secs = None;
+            c.editor.selector_search_focused = false;
+            c.submitted_message = None;
+            c.submitted_attachment = None;
+            c.pending_send_silent = None;
+            c.pending_schedule_message = None;
+            c.pending_edit_commit = None;
+            c.pending_attached_files = None;
+            c.pending_send_sticker_emoji = None;
+            c.pending_send_dice = None;
+            c.pending_send_gif = None;
+            c.pending_open_poll_modal = false;
+            c.pending_open_location_modal = false;
+            c.pending_open_contact_modal = false;
+            c.pending_launch_miniapp = None;
+            c.pending_bot_keyboard_press = None;
+            c.clear_bot_menu(Some(ccx));
+            c.clear_bot_slash_commands();
+            c.set_hermes_slash_enabled(false);
+            c.hermes_ac_pinned_by_button = false;
+            c.bot_ac_pinned_by_button = false;
+            c.set_attach_mini_apps(Vec::new(), 0);
+            c.clear_bot_reply_keyboard();
+            c.set_send_as_options(Vec::new(), None);
+            c.set_compose_placeholder_override(None);
+            c.set_compose_send_disabled(false);
+            c.autocomplete.mention_rows.clear();
+            c.autocomplete.all_mention_candidates.clear();
+            c.autocomplete.mention_role_hints.clear();
+            c.tabbed_selector.search_query.clear();
+            c.attachments_drawer.close();
+            c.is_emoji_picker_open = false;
+            c.is_formatting_open = false;
+            c.formatting_bar.is_visible = false;
+            c.context_ref_hint_open = false;
+            c.voice_gesture.cancel();
+            c.voice_gesture.waveform_samples.clear();
+            c.sync_autocomplete();
+            if had_state {
+                ccx.notify();
+            }
+        });
+        self.prev_composer_focused.set(false);
+    }
+
+    pub(crate) fn reset_tasks_workspace_for_account_boundary(&mut self, cx: &mut Context<Self>) {
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id().to_string();
+        self.tasks_workspace.update(cx, |w, wcx| {
+            let fh = w.focus_handle.take();
+            *w = GlobalTasksWorkspace::new_live(pal, &lang);
+            w.focus_handle = fh;
+            wcx.notify();
+        });
+    }
+
+    /// Resets all account-scoped state on `NavRail` (badges, archive badge/visibility,
+    /// custom folders, connection status, identity labels, active destination, and pending
+    /// action flags) without touching `nav_rail.rs`, while preserving theme palette and locale.
+    pub(crate) fn reset_nav_rail_for_logout_or_account_switch(&mut self, cx: &mut Context<Self>) {
+        let cur_trigger = self.nav_rail.update(cx, |r, rcx| {
+            for item in &mut r.items {
+                item.unread_badge = 0;
+            }
+            r.archive_unread_count = 0;
+            r.show_archive_in_rail = false;
+            r.is_connected = false;
+            r.set_folders(Vec::new());
+            r.active_folder_id = None;
+            r.logout_requested = false;
+            r.menu_open_requested = false;
+            r.archive_open_requested = false;
+            r.theme_toggle_requested = false;
+            r.selected_folder_requested = None;
+            r.set_account("?", "");
+            r.set_active_destination(NavDestination::Chats);
+            rcx.notify();
+            r.trigger_counter
+        });
+        self.last_handled_nav_dest = Some(NavDestination::Chats);
+        self.last_handled_nav_trigger = cur_trigger;
+    }
+
+    /// Stops any active Settings microphone test capture and silently resets `SettingsRouter`
+    /// back to `Main` whenever transitioning `self.active_panel` away from `Settings`.
+    pub(crate) fn cleanup_settings_panel_if_active(&mut self, cx: &mut Context<Self>) {
+        if self.active_panel == ActiveWorkspacePanel::Settings {
+            self.stop_settings_mic_test_capture(cx);
+            self.settings_router.update(cx, |r, rcx| r.close_silent(rcx));
+        }
+    }
+
+    /// Programmatically syncs `NavRail` to `dest` and updates BOTH `last_handled_nav_dest` and
+    /// `last_handled_nav_trigger` so `observe_nav_rail_entity` never fires a stale panel bounce.
+    pub(crate) fn sync_nav_rail_destination_silent(
+        &mut self,
+        dest: NavDestination,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_handled_nav_dest = Some(dest);
+        let nav_trigger = self.nav_rail.update(cx, |r, rcx| {
+            if r.active_destination != dest {
+                r.set_active_destination(dest);
+                rcx.notify();
+            }
+            r.trigger_counter
+        });
+        self.last_handled_nav_trigger = nav_trigger;
     }
 
     /// Binds an authenticated `AuthResponse`, opens WebSocket streaming, resets peer views,
@@ -669,33 +864,48 @@ impl AppShell {
         let is_user_switch = prev_user_id.is_some_and(|p| p != auth.user_id);
         if prev_user_id != Some(auth.user_id) {
             self.session_sync.clear_peer_and_draft_caches();
+            self.bot_browser.reset_on_logout();
+            if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+                ov.update(cx, |w, _| w.close());
+            }
+            self.miniapps.reset();
+            self.computers.reset_on_logout();
+            self.magpie_local.discovered_items.clear();
+            self.magpie_local.bootstrapped_auth_generation = None;
+            self.magpie_local.legacy_keepalive_generation =
+                self.magpie_local.legacy_keepalive_generation.wrapping_add(1);
+            self.magpie_local.active_legacy_subscription_id = None;
+            self.magpie_local.active_legacy_model = None;
+            self.community_workspace = None;
+            self.community_pending_share = None;
+            self.community_ime_preedit_input_gen = None;
+            self.reset_nav_rail_for_logout_or_account_switch(cx);
         }
         if is_user_switch {
             self.client.local_store.clear_all();
             self.rtc_talk.reset_on_logout();
             self.overlays.clear_overlays();
+            self.sync_remote_tray_status(cx);
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.reset_content_hub_for_logout_or_account_switch(cx);
             self.window_runtime.controller.clear_all_toasts();
             self.scheduled_toast_id = None;
             self.last_observed_toast_chat_id = None;
             self.compose_isolation_snapshot = None;
-            self.active_panel = ActiveWorkspacePanel::Chats;
-            self.last_handled_nav_dest = Some(NavDestination::Chats);
-            self.nav_rail.update(cx, |r, _| {
-                r.set_unread(NavDestination::Community, 0);
-                r.set_active_destination(NavDestination::Chats);
-            });
-            self.modal_container.update(cx, |m, _| {
-                m.hide_all();
-                m.dialog.pending_outcome = None;
-                m.dialog.proxies.clear();
-                m.dialog.contacts_list.clear();
-                m.dialog.forward_targets.clear();
-            });
-            self.settings_router.update(cx, |r, rcx| {
-                r.close(rcx);
-                if let Some(sp) = r.settings_privacy.clone() {
-                    sp.update(rcx, |sec, _| sec.clear_session_custody_state());
+            self.reset_composer_for_account_boundary(cx);
+            self.reset_tasks_workspace_for_account_boundary(cx);
+            self.main_menu_drawer.update(cx, |m, _| m.close());
+            self.modal_container.update(cx, |m, mcx| {
+                let was_active = m.is_modal_active();
+                m.reset_for_logout_or_account_switch();
+                if was_active {
+                    mcx.notify();
                 }
+            });
+            self.stop_settings_mic_test_capture(cx);
+            self.settings_router.update(cx, |r, rcx| {
+                r.reset_for_logout_or_account_switch(rcx);
             });
         }
         let srv_url = self.client.config.server_url.clone();
@@ -708,8 +918,8 @@ impl AppShell {
             auth.username.clone(),
         );
         self.is_authenticated = true;
-        self.ime.clear_preedit();
-        self.ime.just_committed_ime = false;
+        self.clear_all_ime_preedits(cx);
+        self.ime.clear_commit_fence();
         self.panel_state.reset();
         self.auth_wizard.update(cx, |w, wcx| {
             w.is_authenticated = true;
@@ -755,6 +965,13 @@ impl AppShell {
         });
         self.session_sync.clear_message_tracking();
         self.reset_conversation_views(&srv_url, Some(&auth.username), cx);
+        if self.overlays.is_passcode_locked {
+            self.blur_composer_and_cancel_ime(cx);
+        }
+        let init_comp_focused = self.composer.read(cx).is_input_focused
+            && self.is_chats_inline_unoccluded(cx)
+            && !self.should_hide_composer(cx);
+        self.prev_composer_focused.set(init_comp_focused);
 
         let (hydrated_dialogs, restored_chat_id) =
             self.hydrate_workspace_from_local_store(auth.user_id, prev_user_id.is_none(), cx);
@@ -779,16 +996,13 @@ impl AppShell {
             self.community_workspace = None;
             self.community_pending_share = None;
             self.community_ime_preedit_input_gen = None;
-            self.nav_rail.update(cx, |r, _| {
-                r.set_unread(NavDestination::Community, 0);
-                r.set_active_destination(NavDestination::Chats);
-            });
             if matches!(
                 self.active_panel,
                 ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
             ) {
                 self.active_panel = ActiveWorkspacePanel::Chats;
-                self.last_handled_nav_dest = Some(NavDestination::Chats);
+                self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
+                self.sync_apple_sidebar_to_active_panel(cx);
             }
             self.bot_browser.reset_on_logout();
             self.miniapps.reset();
@@ -829,6 +1043,7 @@ impl AppShell {
         self.refresh_settings_truth(cx);
         self.refresh_tasks_and_mcp(cx);
         self.refresh_hermes_commands(cx);
+        self.refresh_content_hub_on_login(cx);
         self.register_current_host_and_start_relay(cx);
         if let Some(prev_rt) = self.coding_host.runtime.as_ref() {
             if prev_rt.owner_user_id() != auth.user_id {
@@ -866,8 +1081,8 @@ impl AppShell {
         self.session_sync.reset_on_logout();
         self.proxy_op_generation = self.proxy_op_generation.wrapping_add(1);
         self.is_authenticated = false;
-        self.ime.clear_preedit();
-        self.ime.just_committed_ime = false;
+        self.clear_all_ime_preedits(cx);
+        self.ime.clear_commit_fence();
         self.rtc_talk.reset_on_logout();
         self.overlays.clear_overlays();
         if let Some(ov) = self.miniapps.miniapp_overlay.take() {
@@ -902,29 +1117,22 @@ impl AppShell {
         self.bot_browser.reset_on_logout();
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
+        self.reset_content_hub_for_logout_or_account_switch(cx);
 
         let reset_client = self.client.clone();
         self.auth_wizard.update(cx, |w, wcx| {
             w.reset_after_logout(reset_client);
             wcx.notify();
         });
+        self.stop_settings_mic_test_capture(cx);
         self.settings_router.update(cx, |r, rcx| {
-            r.close(rcx);
-            if let Some(sp) = r.settings_privacy.clone() {
-                sp.update(rcx, |sec, _| sec.clear_session_custody_state());
-            }
             if let Some(ap) = r.settings_ai_providers.clone() {
                 ap.update(rcx, |sec, sec_cx| {
                     sec.reset_on_logout();
                     sec_cx.notify();
                 });
             }
-            if let Some(sm) = r.settings_main.clone() {
-                sm.update(rcx, |main, mcx| {
-                    main.sync_ai_providers_status(None, false);
-                    mcx.notify();
-                });
-            }
+            r.reset_for_logout_or_account_switch(rcx);
         });
         self.sync_settings_advanced_to_active_proxy(cx);
 
@@ -938,22 +1146,24 @@ impl AppShell {
         self.compose_isolation_snapshot = None;
         self.window_runtime.set_connection_status(BannerConnectionStatus::Connecting, None);
         self.panel_state.reset();
+        self.magpie_local.discovered_items.clear();
+        self.magpie_local.bootstrapped_auth_generation = None;
+        self.magpie_local.legacy_keepalive_generation =
+            self.magpie_local.legacy_keepalive_generation.wrapping_add(1);
+        self.magpie_local.active_legacy_subscription_id = None;
+        self.magpie_local.active_legacy_model = None;
         self.reset_conversation_views(&srv_url, None, cx);
-
+        self.reset_composer_for_account_boundary(cx);
+        self.reset_tasks_workspace_for_account_boundary(cx);
         self.main_menu_drawer.update(cx, |m, _| { m.close(); m.accounts.clear(); m.active_account_id = 0; });
-        self.modal_container.update(cx, |m, _| {
-            m.hide_all();
-            m.dialog.pending_outcome = None;
-            m.dialog.proxies.clear();
-            m.dialog.contacts_list.clear();
-            m.dialog.forward_targets.clear();
+        self.modal_container.update(cx, |m, mcx| {
+            let was_active = m.is_modal_active();
+            m.reset_for_logout_or_account_switch();
+            if was_active {
+                mcx.notify();
+            }
         });
-        self.nav_rail.update(cx, |r, _| {
-            r.is_connected = false;
-            r.set_account("?", "");
-            r.set_unread(NavDestination::Community, 0);
-            r.set_active_destination(NavDestination::Chats);
-        });
+        self.reset_nav_rail_for_logout_or_account_switch(cx);
         self.clear_stored_session_for_shell();
 
         if let (Some(token), Some(session_id)) = (token, session_id) {
@@ -996,7 +1206,9 @@ impl AppShell {
 
     pub(crate) fn nav_destination_for_active_panel(&self, cx: &App) -> NavDestination {
         match self.active_panel {
-            ActiveWorkspacePanel::Chats => NavDestination::Chats,
+            ActiveWorkspacePanel::Chats | ActiveWorkspacePanel::ContentHub(_) => {
+                NavDestination::Chats
+            }
             ActiveWorkspacePanel::Calls => NavDestination::Calls,
             ActiveWorkspacePanel::TaskCenter => NavDestination::TaskCenter,
             ActiveWorkspacePanel::McpTools => NavDestination::McpTools,
@@ -1021,22 +1233,24 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let restored = self.nav_destination_for_active_panel(cx);
-        let did_reset = self.nav_rail.update(cx, |r, rcx| {
+        let (did_reset, nav_trigger) = self.nav_rail.update(cx, |r, rcx| {
             if matching.contains(&r.active_destination) {
                 r.set_active_destination(restored);
                 rcx.notify();
-                true
+                (true, r.trigger_counter)
             } else {
-                false
+                (false, r.trigger_counter)
             }
         });
         if did_reset {
             self.last_handled_nav_dest = Some(restored);
+            self.last_handled_nav_trigger = nav_trigger;
         }
     }
 
     pub fn show_talk_mode(&mut self, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
+        self.prepare_for_media_or_call_overlay_open(cx);
         let peer = self.stage.read(cx).chat_title.clone();
         let overlay = cx.new(|_| CallOverlay::new(peer));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_talk_mode, cx);
@@ -1046,11 +1260,13 @@ impl AppShell {
 
     pub fn hide_talk_mode(&mut self, cx: &mut Context<Self>) {
         self.rtc_talk.talk_mode_overlay = None;
+        self.clear_ime_if_below_z5_unoccluded(cx);
         self.reset_nav_destination_if(&[NavDestination::TalkMode, NavDestination::Calls], cx);
     }
 
     pub fn show_remote_computer(&mut self, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
+        self.prepare_for_computer_overlay_open(cx);
         let overlay = cx.new(|_| ComputerWorkbench::new("Dev-Workstation-01".to_string()));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_remote_computer, cx);
         self.overlays.computer_overlay = Some(overlay);
@@ -1058,6 +1274,9 @@ impl AppShell {
     }
 
     pub fn hide_remote_computer(&mut self, cx: &mut Context<Self>) {
+        if !self.overlays.is_passcode_locked {
+            self.clear_all_ime_preedits(cx);
+        }
         self.overlays.computer_overlay = None;
         let hub_open = self.active_panel == ActiveWorkspacePanel::Settings
             && self.settings_router.read(cx).settings_section == SettingsSectionType::Computers
@@ -1068,15 +1287,33 @@ impl AppShell {
     }
 
     pub fn show_media_viewer(&mut self, url: impl Into<String>, is_video: bool, cx: &mut Context<Self>) {
+        let url = url.into();
+        if self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+            return;
+        }
         self.occlude_browser_for_overlay(cx);
-        self.occlude_community_for_overlay(cx);
-        let overlay = cx.new(|_| MediaViewer::new(url.into(), is_video));
-        self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, |shell, _| shell.hide_media_viewer(), cx);
+        self.prepare_for_media_or_call_overlay_open(cx);
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id();
+        let overlay = cx.new(|_| {
+            let mut m = MediaViewer::new(url, is_video);
+            m.apply_theme(pal, lang);
+            m
+        });
+        self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::close_media_viewer, cx);
         self.overlays.media_viewer_overlay = Some(overlay);
         self.reconcile_chat_scoped_toasts(cx);
     }
 
-    pub fn hide_media_viewer(&mut self) { self.overlays.media_viewer_overlay = None; }
+    pub fn hide_media_viewer(&mut self) {
+        self.ime.clear_ime_state();
+        self.overlays.media_viewer_overlay = None;
+    }
+
+    pub(crate) fn close_media_viewer(&mut self, cx: &mut Context<Self>) {
+        self.overlays.media_viewer_overlay = None;
+        self.clear_ime_if_below_z5_unoccluded(cx);
+    }
 
     /// Returns the active section currently displayed inside `SettingsRouter`.
     pub fn current_settings_section(&self, cx: &App) -> SettingsSectionType {
@@ -1087,6 +1324,9 @@ impl AppShell {
     pub fn navigate_settings_to(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
         self.leave_community_panel_if_active(cx);
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        let was_outside = self.active_panel != ActiveWorkspacePanel::Settings;
+        self.active_panel = ActiveWorkspacePanel::Settings;
         self.sidebar.update(cx, |sb, sb_cx| {
             sb.cancel_compose_mode();
             sb.is_account_popover_open = false;
@@ -1101,12 +1341,10 @@ impl AppShell {
         }
         self.stage.update(cx, |st, st_cx| { st.more_menu_open = false; st.ttl_submenu_open = false; st_cx.notify(); });
 
-        let was_outside = self.active_panel != ActiveWorkspacePanel::Settings;
         self.settings_router.update(cx, |r, rcx| r.navigate_to(target, was_outside, rcx));
-        self.active_panel = ActiveWorkspacePanel::Settings;
+        self.sync_nav_rail_destination_silent(NavDestination::Settings, cx);
+        self.sync_apple_sidebar_to_active_panel(cx);
         self.reconcile_chat_scoped_toasts(cx);
-        self.last_handled_nav_dest = Some(NavDestination::Settings);
-        self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Settings));
         if was_outside {
             self.refresh_settings_truth(cx);
         }
@@ -1115,6 +1353,11 @@ impl AppShell {
 
     /// Navigates back one step inside `SettingsRouter`, closing Settings when already at root.
     pub fn navigate_settings_back(&mut self, cx: &mut Context<Self>) {
+        if self.is_settings_unoccluded(cx) {
+            self.clear_all_ime_preedits(cx);
+        } else {
+            self.settings_router.update(cx, |sr, scx| sr.clear_all_preedits(scx));
+        }
         if !self.settings_router.update(cx, |r, rcx| r.navigate_back(rcx)) {
             self.close_settings(cx);
         } else {
@@ -1124,17 +1367,30 @@ impl AppShell {
 
     /// Closes the Settings modal, restores `ActiveWorkspacePanel::Chats`, and resets `SettingsRouter`.
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if self.is_settings_unoccluded(cx) {
+            self.clear_all_ime_preedits(cx);
+        } else {
+            self.settings_router.update(cx, |sr, scx| sr.clear_all_preedits(scx));
+        }
         self.stop_settings_mic_test_capture(cx);
         let was_in_settings = self.active_panel == ActiveWorkspacePanel::Settings;
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
-        self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Chats));
+        let nav_trigger = self.nav_rail.update(cx, |r, rcx| {
+            if r.active_destination != NavDestination::Chats {
+                r.set_active_destination(NavDestination::Chats);
+                rcx.notify();
+            }
+            r.trigger_counter
+        });
+        self.last_handled_nav_trigger = nav_trigger;
+        self.sync_apple_sidebar_to_active_panel(cx);
         let needs_router_close = {
             let r = self.settings_router.read(cx);
             r.settings_section != SettingsSectionType::Main || !r.settings_stack.is_empty()
         };
         if needs_router_close {
-            self.settings_router.update(cx, |r, rcx| r.close(rcx));
+            self.settings_router.update(cx, |r, rcx| r.close_silent(rcx));
         }
         if was_in_settings || needs_router_close {
             cx.notify();
@@ -1183,8 +1439,10 @@ impl AppShell {
         self.overlays.is_passcode_locked = true;
         self.overlays.passcode_unlock_input.clear();
         self.overlays.passcode_unlock_error = None;
-        self.ime.clear_preedit();
+        self.clear_ime_and_blur_content_hub_for_transition(false, cx);
+        self.blur_composer_and_cancel_ime(cx);
         self.occlude_browser_for_overlay(cx);
+        self.occlude_community_for_overlay(cx);
         self.reconcile_chat_scoped_toasts(cx);
         self.settings_router.update(cx, |sr, scx| {
             if let Some(ref lp) = sr.settings_local_passcode {
@@ -1204,6 +1462,7 @@ impl AppShell {
             self.overlays.is_passcode_locked = false;
             self.overlays.passcode_unlock_input.clear();
             self.overlays.passcode_unlock_error = None;
+            self.clear_all_ime_preedits(cx);
             cx.notify();
             return true;
         };
@@ -1211,6 +1470,7 @@ impl AppShell {
             self.overlays.is_passcode_locked = false;
             self.overlays.passcode_unlock_input.clear();
             self.overlays.passcode_unlock_error = None;
+            self.clear_all_ime_preedits(cx);
             self.record_user_activity();
             self.settings_router.update(cx, |sr, scx| {
                 if let Some(ref lp) = sr.settings_local_passcode {
@@ -1330,8 +1590,11 @@ impl AppShell {
             || show_bot_start_bar
             || matches!(
                 self.active_panel,
-                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                ActiveWorkspacePanel::Browser
+                    | ActiveWorkspacePanel::Community
+                    | ActiveWorkspacePanel::ContentHub(_)
             )
+            || self.is_publish_review_modal_active(cx)
     }
 
     /// Flushes the active chat's unsent draft and isolates `CanonicalComposer` for `+` / creation.
@@ -1370,6 +1633,254 @@ impl AppShell {
         self.compose_isolation_snapshot = None;
     }
 
+    pub(crate) fn has_blocking_fullscreen_overlay(&self, cx: &App) -> bool {
+        self.overlays.computer_overlay.is_some()
+            || self.rtc_talk.talk_mode_overlay.is_some()
+            || self.overlays.media_viewer_overlay.is_some()
+            || self.overlays.iv_viewer_overlay.is_some()
+            || (self
+                .miniapps
+                .miniapp_overlay
+                .as_ref()
+                .is_some_and(|ov| ov.read(cx).is_open)
+                && !self.miniapps.is_miniapp_minimized)
+    }
+
+    /// Returns `true` when no strictly higher-Z layer (Z #15..#17: `ComputerWorkbench`,
+    /// `PasscodeLock`, `AuthWizard`) occludes `PublishReviewModal` (Z #14).
+    pub(crate) fn is_publish_review_modal_unoccluded(&self, _cx: &App) -> bool {
+        self.is_authenticated
+            && !self.overlays.is_passcode_locked
+            && self.overlays.computer_overlay.is_none()
+    }
+
+    /// Returns `true` when no strictly higher-Z overlay (Z #17..#14: `AuthWizard`,
+    /// `PasscodeLock`, `ComputerWorkbench`, `PublishReviewModal`) occludes `ModalContainer` (Z #13).
+    pub(crate) fn is_modal_container_unoccluded(&self, cx: &App) -> bool {
+        self.is_publish_review_modal_unoccluded(cx) && !self.is_publish_review_modal_active(cx)
+    }
+
+    /// Returns `true` when no strictly higher-Z layer (Z #17..#13) occludes `AccountPopover` (Z #12).
+    pub(crate) fn is_account_popover_unoccluded(&self, cx: &App) -> bool {
+        self.is_modal_container_unoccluded(cx) && !self.modal_container.read(cx).is_modal_active()
+    }
+
+    /// Returns `true` when `TaskCenter` / `McpTools` (`StudioInput`, Z #10..#11) is active
+    /// and NOT occluded by Z #12..#17 (`AccountPopover`, `ModalContainer`, `PublishReviewModal`,
+    /// `ComputerWorkbench`, `PasscodeLock`, `AuthWizard`).
+    pub(crate) fn is_tasks_workspace_unoccluded(&self, cx: &App) -> bool {
+        self.is_account_popover_unoccluded(cx)
+            && !self.sidebar.read(cx).is_account_popover_open
+            && matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::McpTools | ActiveWorkspacePanel::TaskCenter
+            )
+    }
+
+    /// Returns `true` when `Settings` (Z #9) is the active workspace panel and NOT occluded
+    /// by any strictly higher-Z layer (Z #17..#12: `AuthWizard`, `PasscodeLock`,
+    /// `ComputerWorkbench`, `PublishReviewModal`, `ModalContainer`, `AccountPopover`).
+    pub(crate) fn is_settings_unoccluded(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::Settings
+            && self.is_account_popover_unoccluded(cx)
+            && !self.sidebar.read(cx).is_account_popover_open
+    }
+
+    /// Returns `true` when no strictly higher-Z layer (Z #17..#8) occludes `CreationModal` (Z #7)
+    /// or `ContactsModal` (Z #6).
+    pub(crate) fn is_sidebar_modal_unoccluded(&self, cx: &App) -> bool {
+        self.is_account_popover_unoccluded(cx)
+            && !self.sidebar.read(cx).is_account_popover_open
+            && !matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::McpTools
+                    | ActiveWorkspacePanel::TaskCenter
+                    | ActiveWorkspacePanel::Settings
+                    | ActiveWorkspacePanel::Calls
+            )
+    }
+
+    /// Returns `true` when the Z #1 base workspace (`Chats` or `ContentHub`) is authenticated
+    /// and NOT occluded by any higher-Z layer (Z #2..#17).
+    pub(crate) fn is_base_workspace_unoccluded(&self, cx: &App) -> bool {
+        if !self.is_sidebar_modal_unoccluded(cx) || self.has_blocking_fullscreen_overlay(cx) {
+            return false;
+        }
+        let sb = self.sidebar.read(cx);
+        !sb.is_contacts_modal_open
+            && sb.active_creation_modal.is_none()
+            && !self
+                .miniapps
+                .create_bot_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            && self.miniapps.pending_miniapp_confirm.is_none()
+            && !self.miniapps.miniapp_tos_modal_open
+            && !self
+                .miniapps
+                .bot_profile_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+    }
+
+    /// Returns `true` when the inline `Chats` workspace (Z #1) is authenticated, active, and
+    /// NOT occluded by any higher-Z layer (Z #17..#2).
+    pub(crate) fn is_chats_inline_unoccluded(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::Chats && self.is_base_workspace_unoccluded(cx)
+    }
+
+    /// Clears all shell/child IME preedits iff no higher-Z modal/panel/lockscreen (Z #6..#17)
+    /// sits above the Z #5 MiniApp/Bot overlay stack.
+    pub(crate) fn clear_ime_if_no_tier2_to_5_overlay(&mut self, cx: &mut Context<Self>) {
+        let sb = self.sidebar.read(cx);
+        let sidebar_modal_open = sb.is_contacts_modal_open || sb.active_creation_modal.is_some();
+        if self.is_sidebar_modal_unoccluded(cx) && !sidebar_modal_open {
+            self.clear_all_ime_preedits(cx);
+        }
+    }
+
+    /// Returns `true` when no strictly higher-Z overlay (Z #5b..#17) occludes `MiniAppOverlay` (Z #5a).
+    pub(crate) fn is_miniapp_overlay_unoccluded(&self, cx: &App) -> bool {
+        let sb = self.sidebar.read(cx);
+        let sidebar_modal_open = sb.is_contacts_modal_open || sb.active_creation_modal.is_some();
+        let above_z5a = self
+            .miniapps
+            .create_bot_box
+            .as_ref()
+            .is_some_and(|b| b.read(cx).is_visible)
+            || self.miniapps.pending_miniapp_confirm.is_some()
+            || self.miniapps.miniapp_tos_modal_open
+            || self
+                .miniapps
+                .bot_profile_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible);
+        self.is_sidebar_modal_unoccluded(cx) && !sidebar_modal_open && !above_z5a
+    }
+
+    /// Clears IME preedits iff `MiniAppOverlay` (Z #5a) is unoccluded by Z #5b..#17.
+    pub(crate) fn clear_ime_if_miniapp_unoccluded(&mut self, cx: &mut Context<Self>) {
+        if self.is_miniapp_overlay_unoccluded(cx) {
+            self.clear_all_ime_preedits(cx);
+        }
+    }
+
+    /// Prepares shell input state when opening/restoring `MiniAppOverlay` (Z #5a) without
+    /// wiping active higher-Z IME (`CreateManagedBotBox` Z #5b or Z #6..#17).
+    pub(crate) fn prepare_for_miniapp_overlay_open(&mut self, cx: &mut Context<Self>) {
+        self.clear_ime_if_miniapp_unoccluded(cx);
+        self.blur_composer_and_cancel_ime(cx);
+        self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
+    }
+
+    /// Clears IME preedits iff `CreateManagedBotBox` (Z #5b) is unoccluded by Z #5c..#17.
+    pub(crate) fn clear_ime_if_create_bot_box_unoccluded(&mut self, cx: &mut Context<Self>) {
+        let above_z5b = self.miniapps.pending_miniapp_confirm.is_some()
+            || self.miniapps.miniapp_tos_modal_open
+            || self
+                .miniapps
+                .bot_profile_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible);
+        if !above_z5b {
+            self.clear_ime_if_no_tier2_to_5_overlay(cx);
+        }
+    }
+
+    /// Clears all shell/child IME preedits iff no higher-Z modal/panel/MiniApp-input/lockscreen
+    /// (Z #5a/5b..#17) sits above the Z #2..#4 (`TalkMode`/`MediaViewer`/`IvViewer`) layer.
+    pub(crate) fn clear_ime_if_below_z5_unoccluded(&mut self, cx: &mut Context<Self>) {
+        let create_bot_visible = self
+            .miniapps
+            .create_bot_box
+            .as_ref()
+            .is_some_and(|b| b.read(cx).is_visible);
+        let miniapp_input_focused = !self.miniapps.is_miniapp_minimized
+            && self
+                .miniapps
+                .miniapp_overlay
+                .as_ref()
+                .is_some_and(|w| {
+                    let ov = w.read(cx);
+                    ov.is_open && ov.has_focused_text_input()
+                });
+        if !create_bot_visible && !miniapp_input_focused {
+            self.clear_ime_if_no_tier2_to_5_overlay(cx);
+        }
+    }
+
+    /// Blurs `CanonicalComposer` and cancels any active `ime_machine` composition,
+    /// notifying `self.composer` iff `is_input_focused` or `ime_machine.is_composing()` changed.
+    pub(crate) fn blur_composer_and_cancel_ime(&mut self, cx: &mut Context<Self>) -> bool {
+        self.composer.update(cx, |c, ccx| {
+            let mut changed = false;
+            if c.ime_machine.is_composing() {
+                c.ime_machine.on_ime_cancel();
+                c.sync_autocomplete();
+                changed = true;
+            }
+            if c.is_input_focused {
+                c.is_input_focused = false;
+                changed = true;
+            }
+            if changed {
+                ccx.notify();
+            }
+            changed
+        })
+    }
+
+    fn blur_content_hub_if_focused(&mut self, cx: &mut Context<Self>) {
+        self.content_hub.update(cx, |h, hcx| {
+            if h.active_input != crate::views::content_hub::ContentHubInputTarget::None {
+                h.blur_input();
+                hcx.notify();
+            }
+        });
+    }
+
+    pub(crate) fn blur_community_if_focused(&mut self, cx: &mut Context<Self>) {
+        self.community_ime_preedit_input_gen = None;
+        if let Some(cw) = self.community_workspace.clone() {
+            if cw.read(cx).has_focused_text_input() {
+                cw.update(cx, |w, wcx| w.blur_active_input(wcx));
+            }
+        }
+    }
+
+    /// Prepares shell input state when opening `ComputerWorkbench` (Z #15, below `PasscodeLock`
+    /// and above `PublishReviewModal`/`ModalContainer`).
+    pub(crate) fn prepare_for_computer_overlay_open(&mut self, cx: &mut Context<Self>) {
+        if !self.overlays.is_passcode_locked {
+            self.clear_all_ime_preedits(cx);
+        }
+        self.blur_composer_and_cancel_ime(cx);
+        self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
+    }
+
+    /// Prepares shell input state when opening/restoring a Z #5 MiniApp/Bot overlay
+    /// (`MiniApp`, `PendingMiniAppConfirm`, `BotProfileBox`, `MiniAppToS`).
+    pub(crate) fn prepare_for_lower_z_overlay_open(&mut self, cx: &mut Context<Self>) {
+        self.clear_ime_if_no_tier2_to_5_overlay(cx);
+        self.blur_composer_and_cancel_ime(cx);
+        self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
+    }
+
+    /// Prepares shell input state when opening a Z #2..#4 overlay (`TalkMode`, `MediaViewer`, `IvViewer`).
+    pub(crate) fn prepare_for_media_or_call_overlay_open(&mut self, cx: &mut Context<Self>) {
+        self.clear_ime_if_below_z5_unoccluded(cx);
+        self.blur_composer_and_cancel_ime(cx);
+        self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
+    }
+
+    pub(crate) fn can_focus_chat_composer(&self, cx: &App) -> bool {
+        self.is_chats_inline_unoccluded(cx) && !self.is_non_composer_text_capturing(cx)
+    }
+
     /// Finalizes exiting compose isolation after switching `stage`/`inspector` to `chat_id`,
     /// discarding any pre-switch snapshot for the prior chat and hydrating the new chat's
     /// send-as options, mention candidates, and miniapp/bot controls.
@@ -1403,8 +1914,7 @@ impl AppShell {
             .list(&SendAsKey::message(chat_id))
             .to_vec();
         let cached_chosen_send_as = self.session_sync.send_as_peers.chosen(chat_id);
-        let show_start_bar = self.stage.read(cx).show_bot_start_bar;
-        let hide_composer = self.should_hide_composer(cx);
+        let focus_composer = self.can_focus_chat_composer(cx);
         self.composer.update(cx, |c, ccx| {
             c.is_compose_isolated = false;
             if saved_draft.is_empty() {
@@ -1418,7 +1928,7 @@ impl AppShell {
             c.pending_attached_files = None;
             c.clear_bot_reply_keyboard();
             c.set_send_as_options(cached_send_as_list, cached_chosen_send_as);
-            c.is_input_focused = !show_start_bar && !hide_composer;
+            c.is_input_focused = focus_composer;
             ccx.notify();
         });
         self.sync_composer_mention_candidates(chat_id, None, cx);
@@ -1466,8 +1976,7 @@ impl AppShell {
                 )
             })
             .unwrap_or_default();
-        let show_start_bar = self.stage.read(cx).show_bot_start_bar;
-        let hide_composer = self.should_hide_composer(cx);
+        let focus_composer = self.can_focus_chat_composer(cx);
 
         self.composer.update(cx, |c, ccx| {
             c.is_compose_isolated = false;
@@ -1495,7 +2004,7 @@ impl AppShell {
                 }
             }
             c.set_send_as_options(send_as_opts.0, send_as_opts.1);
-            c.is_input_focused = !show_start_bar && !hide_composer;
+            c.is_input_focused = focus_composer;
             ccx.notify();
         });
         if let Some(cid) = active_cid {
@@ -1517,6 +2026,8 @@ impl AppShell {
         let is_isolated_mode = self.is_compose_or_creation_modal_active(cx);
         let hide_composer = self.should_hide_composer(cx);
         let show_bot_start_bar = self.stage.read(cx).show_bot_start_bar;
+        let chats_unoccluded = self.is_chats_inline_unoccluded(cx);
+        let cannot_focus = hide_composer || show_bot_start_bar || !chats_unoccluded;
         let (placeholder_override, send_disabled) = {
             let sb = self.sidebar.read(cx);
             if pal.is_apple_style() && sb.is_plus_menu_open {
@@ -1548,10 +2059,15 @@ impl AppShell {
                     c.autocomplete.mention_rows.clear();
                     c.autocomplete.all_mention_candidates.clear();
                     c.autocomplete.mention_role_hints.clear();
+                    if c.ime_machine.is_composing() {
+                        c.ime_machine.on_ime_cancel();
+                        c.sync_autocomplete();
+                    }
                     c.clear();
                     c.clear_bot_reply_keyboard();
                     c.is_input_focused = false;
                     c.is_compose_isolated = true;
+                    self.prev_composer_focused.set(false);
                 }
             } else if is_isolated_mode {
                 if c.bot_menu_controls.is_active {
@@ -1575,11 +2091,27 @@ impl AppShell {
                 if c.bot_keyboard.has_markup() || c.is_bot_keyboard_open {
                     c.clear_bot_reply_keyboard();
                 }
-                if (hide_composer || send_disabled) && c.is_input_focused {
+                if (hide_composer || send_disabled || !chats_unoccluded)
+                    && (c.is_input_focused || c.ime_machine.is_composing())
+                {
+                    if c.ime_machine.is_composing() {
+                        c.ime_machine.on_ime_cancel();
+                        c.sync_autocomplete();
+                    }
                     c.is_input_focused = false;
+                    if !notify_composer {
+                        self.prev_composer_focused.set(false);
+                    }
                 }
-            } else if (hide_composer || show_bot_start_bar) && c.is_input_focused {
+            } else if cannot_focus && (c.is_input_focused || c.ime_machine.is_composing()) {
+                if c.ime_machine.is_composing() {
+                    c.ime_machine.on_ime_cancel();
+                    c.sync_autocomplete();
+                }
                 c.is_input_focused = false;
+                if !notify_composer {
+                    self.prev_composer_focused.set(false);
+                }
             }
             c.set_compose_placeholder_override(placeholder_override);
             c.set_compose_send_disabled(send_disabled);
@@ -1612,11 +2144,13 @@ impl AppShell {
             || self.overlays.media_viewer_overlay.is_some()
             || self.overlays.iv_viewer_overlay.is_some()
             || self.overlays.computer_overlay.is_some()
-            || self
+            || self.is_publish_review_modal_active(cx)
+            || (self
                 .miniapps
                 .miniapp_overlay
                 .as_ref()
                 .is_some_and(|ov| ov.read(cx).is_open)
+                && !self.miniapps.is_miniapp_minimized)
     }
 
     pub fn is_chat_visible_for_toast(&self, chat_id: u64, cx: &gpui::App) -> bool {
@@ -2135,7 +2669,37 @@ impl Render for AppShell {
         };
         let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
         let hide_composer = self.should_hide_composer(cx);
-        let has_blocking_overlay = self.has_blocking_overlay(cx);
+        let in_content_hub = matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_));
+        let quick_drawer_open = self.content_hub.read(cx).quick_drawer_open;
+        let publish_review_modal_open = self.is_publish_review_modal_active(cx);
+        let has_blocking_overlay = contacts_open
+            || creation_modal.is_some()
+            || self.modal_container.read(cx).is_modal_active()
+            || publish_review_modal_open
+            || self
+                .miniapps
+                .create_bot_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self.miniapps.pending_miniapp_confirm.is_some()
+            || self.miniapps.miniapp_tos_modal_open
+            || self
+                .miniapps
+                .bot_profile_box
+                .as_ref()
+                .is_some_and(|b| b.read(cx).is_visible)
+            || self.active_panel != ActiveWorkspacePanel::Chats
+            || self.overlays.is_passcode_locked
+            || self.rtc_talk.talk_mode_overlay.is_some()
+            || self.overlays.media_viewer_overlay.is_some()
+            || self.overlays.iv_viewer_overlay.is_some()
+            || self.overlays.computer_overlay.is_some()
+            || (self
+                .miniapps
+                .miniapp_overlay
+                .as_ref()
+                .is_some_and(|ov| ov.read(cx).is_open)
+                && !self.miniapps.is_miniapp_minimized);
         self.sync_compose_state_to_composer(false, cx);
 
         div()
@@ -2153,65 +2717,82 @@ impl Render for AppShell {
             .when_some(update_banner, |el, banner| el.child(banner))
             .child(
                 div().flex_1().w_full().min_h(px(0.0)).flex()
-                    .child(self.sidebar.clone())
-                    .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
-                        if let Some(ref bw) = self.browser_workspace {
-                            row.child(bw.clone())
-                        } else {
-                            row
-                        }
+                    .child(self.apple_sidebar.clone())
+                    .when(quick_drawer_open, |el| {
+                        el.child(self.render_quick_creations_drawer_pane(cx))
                     })
-                    .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
-                        if let Some(ref cw) = self.community_workspace {
-                            row.child(cw.clone())
-                        } else {
-                            row
-                        }
-                    })
-                    .when(
-                        !matches!(
-                            self.active_panel,
-                            ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
-                        ),
-                        |row| {
-                        row.child(
-                            div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
-                                .bg(rgb(pal.stage_bg))
-                                .child(
-                                    div()
-                                        .id("app-shell-stage-slot")
-                                        .relative()
-                                        .flex_1()
-                                        .min_h(px(0.0))
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .child(if is_apple_compose_mode {
-                                            self.render_apple_compose_stage(cx)
-                                        } else {
-                                            self.stage.clone().into_any_element()
-                                        })
-                                        .when(!has_blocking_overlay, |el| {
-                                            el.when_some(current_toast.clone(), |el, toast| {
-                                                let bottom_gap = if show_bot_start_bar {
-                                                    pal.scaled_px(68.0)
-                                                        .max(52.0 + pal.scaled_px(16.0))
-                                                } else {
-                                                    pal.scaled_px(16.0)
-                                                };
-                                                el.child(self.render_toast_banner_slot(
-                                                    toast.text,
-                                                    bottom_gap,
-                                                    pal,
-                                                    cx,
-                                                ))
-                                            })
-                                        }),
-                                )
-                                .when(!hide_composer, |el| el.child(self.composer.clone()))
-                                .into_any_element(),
+                    .when(in_content_hub, |el| {
+                        el.child(
+                            div()
+                                .id("app-shell-content-hub-slot")
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h_full()
+                                .overflow_hidden()
+                                .child(self.content_hub.clone()),
                         )
-                        .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
+                    })
+                    .when(!in_content_hub, |el| {
+                        el.child(self.sidebar.clone())
+                        .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
+                            if let Some(ref bw) = self.browser_workspace {
+                                row.child(bw.clone())
+                            } else {
+                                row
+                            }
+                        })
+                        .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
+                            if let Some(ref cw) = self.community_workspace {
+                                row.child(cw.clone())
+                            } else {
+                                row
+                            }
+                        })
+                        .when(
+                            !matches!(
+                                self.active_panel,
+                                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                            ),
+                            |row| {
+                            row.child(
+                                div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
+                                    .bg(rgb(pal.stage_bg))
+                                    .child(
+                                        div()
+                                            .id("app-shell-stage-slot")
+                                            .relative()
+                                            .flex_1()
+                                            .min_h(px(0.0))
+                                            .w_full()
+                                            .flex()
+                                            .flex_col()
+                                            .child(if is_apple_compose_mode {
+                                                self.render_apple_compose_stage(cx)
+                                            } else {
+                                                self.stage.clone().into_any_element()
+                                            })
+                                            .when(!has_blocking_overlay, |el| {
+                                                el.when_some(current_toast.clone(), |el, toast| {
+                                                    let bottom_gap = if show_bot_start_bar {
+                                                        pal.scaled_px(68.0)
+                                                            .max(52.0 + pal.scaled_px(16.0))
+                                                    } else {
+                                                        pal.scaled_px(16.0)
+                                                    };
+                                                    el.child(self.render_toast_banner_slot(
+                                                        toast.text,
+                                                        bottom_gap,
+                                                        pal,
+                                                        cx,
+                                                    ))
+                                                })
+                                            }),
+                                    )
+                                    .when(!hide_composer, |el| el.child(self.composer.clone()))
+                                    .into_any_element(),
+                            )
+                            .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
+                        })
                     }),
             )
             .when(show_conn_banner && !has_blocking_overlay, |el| {
@@ -2264,6 +2845,9 @@ impl Render for AppShell {
             .when(self.active_panel == ActiveWorkspacePanel::McpTools, |el| el.child(self.render_mcp_tools_modal_overlay(cx)))
             .when(account_popover_open, |el| el.child(self.render_account_popover_overlay(cx)))
             .child(self.modal_container.clone())
+            .when(publish_review_modal_open, |el| {
+                el.child(self.render_publish_review_modal_overlay(cx))
+            })
             .when_some(self.overlays.computer_overlay.clone(), |el, ov| el.child(self.render_remote_computer_overlay(ov)))
             .when(self.overlays.is_passcode_locked, |el| el.child(self.render_passcode_lock_overlay(cx)))
             .when_some(

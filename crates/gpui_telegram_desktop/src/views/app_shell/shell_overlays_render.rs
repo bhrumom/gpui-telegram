@@ -92,13 +92,21 @@ fn format_live_miniapp_telemetry(
 
 impl AppShell {
     fn close_workspace_modal_to_chats(&mut self, cx: &mut Context<Self>) {
+        self.clear_all_ime_preedits(cx);
+        self.cleanup_settings_panel_if_active(cx);
         self.leave_browser_panel_if_active(cx);
         self.leave_community_panel_if_active(cx);
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
-        self.nav_rail.update(cx, |r, _| {
-            r.set_active_destination(NavDestination::Chats);
+        let nav_trigger = self.nav_rail.update(cx, |r, rcx| {
+            if r.active_destination != NavDestination::Chats {
+                r.set_active_destination(NavDestination::Chats);
+                rcx.notify();
+            }
+            r.trigger_counter
         });
+        self.last_handled_nav_trigger = nav_trigger;
+        self.sync_apple_sidebar_to_active_panel(cx);
         cx.notify();
     }
 
@@ -220,7 +228,14 @@ impl AppShell {
             || self.overlays.iv_viewer_overlay.is_some()
             || self.overlays.computer_overlay.is_some()
             || self.overlays.is_passcode_locked
-            || self.active_panel != ActiveWorkspacePanel::Chats
+            || matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Calls
+                    | ActiveWorkspacePanel::TaskCenter
+                    | ActiveWorkspacePanel::McpTools
+                    | ActiveWorkspacePanel::Settings
+            )
+            || self.is_publish_review_modal_active(cx)
             || sidebar_modal_open
             || self.modal_container.read(cx).is_modal_active()
     }
@@ -238,14 +253,15 @@ impl AppShell {
         let mut pip_live_enabled = true;
         if let Some(ref ov) = self.miniapps.miniapp_overlay {
             let ov_read = ov.read(cx);
-            let is_bg_pip = ov_read.is_floating_pip && !ov_read.is_open;
+            let effective_open = ov_read.is_open && !self.miniapps.is_miniapp_minimized;
+            let is_bg_pip = ov_read.is_floating_pip && !effective_open;
             pip_live_enabled = ov_read.pip_live_preview;
             is_live_pip = is_bg_pip
                 && ov_read.pip_live_preview
                 && !has_top_modal
                 && ov_read.disclaimer_accepted;
             let should_hide_native =
-                (!ov_read.is_open && !is_bg_pip) || (ov_read.is_open && has_top_modal);
+                (!effective_open && !is_bg_pip) || (effective_open && has_top_modal);
             let needs_park_pip = is_bg_pip && !is_live_pip && ov_read.disclaimer_accepted;
             let needs_sync = ov_read.external_modal_occluding != has_top_modal
                 || (should_hide_native && ov_read.is_native_webview_visible());
@@ -283,12 +299,13 @@ impl AppShell {
             .miniapps
             .miniapp_overlay
             .as_ref()
-            .is_some_and(|ov| ov.read(cx).is_open);
+            .is_some_and(|ov| ov.read(cx).is_open && !self.miniapps.is_miniapp_minimized);
         let overlay_floating_pip = self
             .miniapps
             .miniapp_overlay
             .as_ref()
-            .is_some_and(|ov| ov.read(cx).is_floating_pip && !ov.read(cx).is_open);
+            .is_some_and(|ov| ov.read(cx).is_floating_pip)
+            && !overlay_open;
         let pip_active = !overlay_open
             && (self.miniapps.is_miniapp_minimized
                 || overlay_floating_pip
@@ -603,6 +620,7 @@ impl AppShell {
                                                     {
                                                         ov.update(cx, |w, _| w.close());
                                                     }
+                                                    this.clear_ime_if_miniapp_unoccluded(cx);
                                                     cx.notify();
                                                 }),
                                             )
@@ -655,6 +673,7 @@ impl AppShell {
                                             cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
                                                 this.occlude_browser_for_overlay(cx);
+                                                this.prepare_for_miniapp_overlay_open(cx);
                                                 this.miniapps.is_miniapp_minimized = false;
                                                 if let Some(ref ov) = this.miniapps.miniapp_overlay {
                                                     ov.update(cx, |w, wcx| {
@@ -768,6 +787,7 @@ impl AppShell {
                                         cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.occlude_browser_for_overlay(cx);
+                                            this.prepare_for_miniapp_overlay_open(cx);
                                             this.miniapps.is_miniapp_minimized = false;
                                             if let Some(ref ov) = this.miniapps.miniapp_overlay {
                                                 ov.update(cx, |w, wcx| {
@@ -786,7 +806,12 @@ impl AppShell {
                     .into_any_element(),
             );
         }
-        if let Some(overlay) = self.miniapps.miniapp_overlay.clone().filter(|ov| ov.read(cx).is_open) {
+        if let Some(overlay) = self
+            .miniapps
+            .miniapp_overlay
+            .clone()
+            .filter(|ov| ov.read(cx).is_open && !self.miniapps.is_miniapp_minimized)
+        {
             layers.push(
                 div()
                     .id("miniapp-overlay-host")
@@ -802,6 +827,7 @@ impl AppShell {
             layers.push(
                 modal_backdrop_shell("create-managed-bot-backdrop", macos_modal_backdrop_rgba(pal))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.clear_ime_if_create_bot_box_unoccluded(cx);
                         this.miniapps.create_bot_box = None;
                         if !this.is_compose_or_creation_modal_active(cx) {
                             this.exit_compose_or_modal_isolation(true, cx);
@@ -944,6 +970,7 @@ impl AppShell {
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
                                                     this.occlude_browser_for_overlay(cx);
+                                                    this.prepare_for_lower_z_overlay_open(cx);
                                                     this.miniapps.miniapp_tos_modal_open = true;
                                                     this.reconcile_chat_scoped_toasts(cx);
                                                     cx.notify();
@@ -1221,7 +1248,15 @@ impl AppShell {
                                                                 if !fence.is_valid(s) {
                                                                     return;
                                                                 }
-                                                                s.sidebar.update(cx, |sb, _| sb.select_dialog_from_user(created.chat_id as u64));
+                                                                s.sidebar.update(cx, |sb, sb_cx| {
+                                                                    let was_compose = sb.is_plus_menu_open
+                                                                        || !sb.compose_recipient_query.is_empty()
+                                                                        || sb.compose_title_focused;
+                                                                    sb.select_dialog_from_user(created.chat_id as u64);
+                                                                    if was_compose {
+                                                                        sb_cx.notify();
+                                                                    }
+                                                                });
                                                                 s.refresh_chats(cx);
                                                             });
                                                         }
@@ -1321,6 +1356,9 @@ impl AppShell {
                     div().w_full().px(px(pal.scaled_px(12.0))).py(px(pal.scaled_px(9.5))).rounded(px(pal.scaled_px(10.0))).bg(rgb(pal.input_bg))
                         .border_1().border_color(if focused { rgb(pal.accent).into() } else { pal.separator_rgba() }).cursor_text()
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                            if this.sidebar.read(cx).active_creation_field != field {
+                                this.clear_all_ime_preedits(cx);
+                            }
                             this.sidebar.update(cx, |sb, scx| { sb.active_creation_field = field; scx.notify(); });
                             cx.notify();
                         }))
@@ -1346,6 +1384,9 @@ impl AppShell {
                 .justify_center()
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    if this.sidebar.read(cx).contact_kind != kind {
+                        this.clear_all_ime_preedits(cx);
+                    }
                     this.sidebar.update(cx, |sb, scx| { sb.contact_kind = kind; scx.notify(); });
                     cx.notify();
                 }))
@@ -2234,15 +2275,13 @@ impl AppShell {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(pal.text_primary))
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_ime_and_blur_content_hub_for_transition(true, cx);
                                 this.bot_browser.first_creation_banner_open = false;
                                 this.leave_browser_panel_if_active(cx);
                                 this.leave_community_panel_if_active(cx);
                                 this.active_panel = ActiveWorkspacePanel::Settings;
-                                this.last_handled_nav_dest = Some(NavDestination::Settings);
-                                this.nav_rail.update(cx, |r, rcx| {
-                                    r.set_active_destination(NavDestination::Settings);
-                                    rcx.notify();
-                                });
+                                this.sync_nav_rail_destination_silent(NavDestination::Settings, cx);
+                                this.sync_apple_sidebar_to_active_panel(cx);
                                 this.reconcile_chat_scoped_toasts(cx);
                                 this.settings_router.update(cx, |r, rcx| {
                                     r.ensure_privacy(rcx);
@@ -2643,7 +2682,7 @@ impl AppShell {
         rec: AppleComposeRecipient,
         cx: &mut Context<Self>,
     ) {
-        self.ime.clear_preedit();
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         self.sidebar.update(cx, |sb, scx| {
             sb.compose_title_focused = false;
             sb.add_compose_recipient(rec.into_chip());
@@ -2666,7 +2705,7 @@ impl AppShell {
         if self.sidebar.read(cx).compose_draft.pending_creation.is_some() {
             return;
         }
-        self.ime.clear_preedit();
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         let carry_draft = self.composer.read(cx).text().to_string();
         let existing_chat = chip
             .chat_id
@@ -2689,12 +2728,12 @@ impl AppShell {
                 self.exit_compose_or_modal_isolation(true, cx);
             } else {
                 self.finish_compose_isolation_for_switched_chat(cid, cx);
-                let show_start_bar = self.stage.read(cx).show_bot_start_bar;
+                let focus_composer = self.can_focus_chat_composer(cx);
                 self.composer.update(cx, |c, ccx| {
                     if !carry_draft.trim().is_empty() {
                         c.set_text(carry_draft);
                     }
-                    c.is_input_focused = !show_start_bar;
+                    c.is_input_focused = focus_composer;
                     ccx.notify();
                 });
             }
@@ -2822,12 +2861,12 @@ impl AppShell {
                             });
                             s.sync_selected_chat_inspector_and_stage(cid, cx);
                             s.finish_compose_isolation_for_switched_chat(cid, cx);
-                            let show_start_bar = s.stage.read(cx).show_bot_start_bar;
+                            let focus_composer = s.can_focus_chat_composer(cx);
                             s.composer.update(cx, |c, ccx| {
                                 if !carry_draft.trim().is_empty() {
                                     c.set_text(carry_draft);
                                 }
-                                c.is_input_focused = !show_start_bar;
+                                c.is_input_focused = focus_composer;
                                 ccx.notify();
                             });
                             s.refresh_chats(cx);
@@ -2857,7 +2896,7 @@ impl AppShell {
     }
 
     pub(crate) fn open_add_friend_from_compose_query(&mut self, cx: &mut Context<Self>) {
-        self.ime.clear_preedit();
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         self.enter_compose_or_modal_isolation(cx);
         let raw_q = self.sidebar.read(cx).compose_recipient_query.trim().to_string();
         self.sidebar.update(cx, |sb, scx| {
@@ -2872,6 +2911,41 @@ impl AppShell {
             scx.notify();
         });
         self.sync_compose_state_to_composer(true, cx);
+        cx.notify();
+    }
+
+    /// Focuses the Apple Compose `To:` field, clearing IME preedits and blurring Content Hub inputs.
+    pub fn focus_apple_compose_to_field(&mut self, cx: &mut Context<Self>) {
+        if self.is_chats_inline_unoccluded(cx) {
+            self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        }
+        self.sidebar.update(cx, |sb, scx| {
+            sb.search_focused = false;
+            sb.compose_title_focused = false;
+            sb.compose_draft.menu_open = true;
+            scx.notify();
+        });
+        self.composer.update(cx, |c, ccx| {
+            c.is_input_focused = false;
+            ccx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Focuses the Apple Compose `Group name:` field, clearing IME preedits and blurring Content Hub inputs.
+    pub fn focus_apple_compose_title_field(&mut self, cx: &mut Context<Self>) {
+        if self.is_chats_inline_unoccluded(cx) {
+            self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        }
+        self.sidebar.update(cx, |sb, scx| {
+            sb.search_focused = false;
+            sb.compose_title_focused = true;
+            scx.notify();
+        });
+        self.composer.update(cx, |c, ccx| {
+            c.is_input_focused = false;
+            ccx.notify();
+        });
         cx.notify();
     }
 
@@ -2891,7 +2965,7 @@ impl AppShell {
             creation_error,
             has_bot_chip,
             bot_notice_dismissed,
-            title_focused,
+            sb_title_focused,
         ) = {
             let sb = self.sidebar.read(cx);
             (
@@ -2910,13 +2984,14 @@ impl AppShell {
             )
         };
         let compose_focused = self.is_apple_compose_input_active(cx);
-        let to_bar_focused = compose_focused && !title_focused;
+        let to_bar_focused = compose_focused && !sb_title_focused;
+        let title_focused = compose_focused && sb_title_focused;
         let preedit = if to_bar_focused {
             self.ime.ime_preedit.clone()
         } else {
             None
         };
-        let title_preedit = if compose_focused && title_focused {
+        let title_preedit = if title_focused {
             self.ime.ime_preedit.clone()
         } else {
             None
@@ -3248,17 +3323,7 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.sidebar.update(cx, |sb, scx| {
-                                        sb.search_focused = false;
-                                        sb.compose_title_focused = false;
-                                        sb.compose_draft.menu_open = true;
-                                        scx.notify();
-                                    });
-                                    this.composer.update(cx, |c, ccx| {
-                                        c.is_input_focused = false;
-                                        ccx.notify();
-                                    });
-                                    cx.notify();
+                                    this.focus_apple_compose_to_field(cx);
                                 }),
                             )
                             .child(
@@ -3316,6 +3381,9 @@ impl AppShell {
                                                         MouseButton::Left,
                                                         cx.listener(move |this, _, _, cx| {
                                                             cx.stop_propagation();
+                                                            this.clear_ime_and_blur_content_hub_for_transition(
+                                                                true, cx,
+                                                            );
                                                             let became_empty = this.sidebar.update(cx, |sb, scx| {
                                                                 sb.remove_compose_recipient(uid);
                                                                 let empty = sb.compose_draft.selected_recipients.is_empty();
@@ -3329,10 +3397,7 @@ impl AppShell {
                                                                 empty
                                                             });
                                                             if became_empty {
-                                                                this.composer.update(cx, |c, ccx| {
-                                                                    c.is_input_focused = false;
-                                                                    ccx.notify();
-                                                                });
+                                                                this.blur_composer_and_cancel_ime(cx);
                                                             }
                                                             this.sync_compose_state_to_composer(
                                                                 true, cx,
@@ -3473,7 +3538,9 @@ impl AppShell {
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
-                                                    this.ime.clear_preedit();
+                                                    this.clear_ime_and_blur_content_hub_for_transition(
+                                                        true, cx,
+                                                    );
                                                     this.sidebar.update(cx, |sb, scx| {
                                                         sb.cancel_compose_mode();
                                                         scx.notify();
@@ -3537,16 +3604,7 @@ impl AppShell {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.sidebar.update(cx, |sb, scx| {
-                                            sb.search_focused = false;
-                                            sb.compose_title_focused = true;
-                                            scx.notify();
-                                        });
-                                        this.composer.update(cx, |c, ccx| {
-                                            c.is_input_focused = false;
-                                            ccx.notify();
-                                        });
-                                        cx.notify();
+                                        this.focus_apple_compose_title_field(cx);
                                     }),
                                 )
                                 .child(tg_icon(
@@ -3774,11 +3832,18 @@ impl AppShell {
                                                     sb.compose_draft.creation_error = None;
                                                     scx.notify();
                                                 });
+                                                let focus_composer = this.is_authenticated
+                                                    && this.active_panel == ActiveWorkspacePanel::Chats
+                                                    && !this.should_hide_composer(cx)
+                                                    && !this.overlays.is_passcode_locked
+                                                    && !this.is_content_hub_input_active(cx)
+                                                    && !this.modal_container.read(cx).is_modal_active()
+                                                    && !this.has_blocking_fullscreen_overlay(cx);
                                                 this.composer.update(cx, |c, ccx| {
                                                     if !draft.trim().is_empty() {
                                                         c.set_text(draft);
                                                     }
-                                                    c.is_input_focused = true;
+                                                    c.is_input_focused = focus_composer;
                                                     ccx.notify();
                                                 });
                                                 this.sync_compose_state_to_composer(true, cx);
@@ -3829,6 +3894,11 @@ impl AppShell {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
+                            if this.sidebar.read(cx).compose_title_focused
+                                && !this.is_content_hub_input_active(cx)
+                            {
+                                this.clear_all_ime_preedits(cx);
+                            }
                             this.sidebar.update(cx, |sb, scx| {
                                 sb.compose_title_focused = false;
                                 sb.compose_draft.menu_open = false;
@@ -3877,7 +3947,9 @@ impl AppShell {
                                                     MouseButton::Left,
                                                     cx.listener(|this, _, _, cx| {
                                                         cx.stop_propagation();
-                                                        this.ime.clear_preedit();
+                                                        this.clear_ime_and_blur_content_hub_for_transition(
+                                                            true, cx,
+                                                        );
                                                         this.enter_compose_or_modal_isolation(cx);
                                                         this.sidebar.update(cx, |sb, scx| {
                                                             sb.open_add_contact_modal(
@@ -3903,7 +3975,9 @@ impl AppShell {
                                                     MouseButton::Left,
                                                     cx.listener(|this, _, _, cx| {
                                                         cx.stop_propagation();
-                                                        this.ime.clear_preedit();
+                                                        this.clear_ime_and_blur_content_hub_for_transition(
+                                                            true, cx,
+                                                        );
                                                         this.enter_compose_or_modal_isolation(cx);
                                                         this.sidebar.update(cx, |sb, scx| {
                                                             sb.open_add_contact_modal(
@@ -3930,7 +4004,9 @@ impl AppShell {
                                                         MouseButton::Left,
                                                         cx.listener(|this, _, _, cx| {
                                                             cx.stop_propagation();
-                                                            this.ime.clear_preedit();
+                                                            this.clear_ime_and_blur_content_hub_for_transition(
+                                                                true, cx,
+                                                            );
                                                             this.enter_compose_or_modal_isolation(cx);
                                                             this.sidebar.update(cx, |sb, scx| {
                                                                 sb.open_compose_group_mode();
@@ -3955,7 +4031,9 @@ impl AppShell {
                                                     MouseButton::Left,
                                                     cx.listener(|this, _, _, cx| {
                                                         cx.stop_propagation();
-                                                        this.ime.clear_preedit();
+                                                        this.clear_ime_and_blur_content_hub_for_transition(
+                                                            true, cx,
+                                                        );
                                                         let title = tr_str(
                                                             this.active_lang_id(),
                                                             "新建频道",

@@ -353,6 +353,7 @@ impl AppShell {
             .unwrap_or(777000);
 
         self.occlude_browser_for_overlay(cx);
+        self.prepare_for_media_or_call_overlay_open(cx);
         self.clear_non_call_overlays();
         self.main_menu_drawer.update(cx, |d, _| d.close());
         self.rtc_talk.talk_coordinator = TalkCoordinator::new();
@@ -477,6 +478,7 @@ impl AppShell {
                     }
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
+                        shell.clear_ime_if_below_z5_unoccluded(cx);
                         shell.reset_talk_session_flags();
                         shell.reset_nav_destination_if(
                             &[NavDestination::TalkMode, NavDestination::Calls],
@@ -693,6 +695,7 @@ impl AppShell {
         let lang = self.active_lang_id();
         let pal = self.theme_state.palette;
         self.occlude_browser_for_overlay(cx);
+        self.prepare_for_media_or_call_overlay_open(cx);
         self.clear_non_call_overlays();
         self.reset_talk_session_flags();
         self.main_menu_drawer.update(cx, |d, _| d.close());
@@ -805,6 +808,7 @@ impl AppShell {
                     }
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
+                        shell.clear_ime_if_below_z5_unoccluded(cx);
                         shell.reset_nav_destination_if(
                             &[NavDestination::TalkMode, NavDestination::Calls],
                             cx,
@@ -878,6 +882,7 @@ impl AppShell {
             }
         }
         self.rtc_talk.talk_mode_overlay = None;
+        self.clear_ime_if_below_z5_unoccluded(cx);
         self.reset_nav_destination_if(&[NavDestination::TalkMode, NavDestination::Calls], cx);
         cx.notify();
     }

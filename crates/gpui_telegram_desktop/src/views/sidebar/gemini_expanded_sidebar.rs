@@ -18,6 +18,7 @@ pub fn render_expanded_gemini_top_bar<V: 'static>(
     _nav: &UnifiedNavSnapshot,
     is_plus_active: bool,
     hovered_item: Option<&'static str>,
+    has_leading_app_sidebar: bool,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
@@ -41,7 +42,7 @@ pub fn render_expanded_gemini_top_bar<V: 'static>(
     let on_compose_hover = on_action.clone();
     let on_plus_click = on_action;
 
-    let left_clearance = if cfg!(target_os = "macos") {
+    let left_clearance = if cfg!(target_os = "macos") && !has_leading_app_sidebar {
         76.0
     } else {
         12.0

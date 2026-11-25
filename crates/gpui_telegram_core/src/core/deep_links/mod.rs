@@ -15,6 +15,13 @@ pub use deep_links_router::DeepLinksRouterDeepLinks;
 pub mod deep_links_settings;
 pub use deep_links_settings::DeepLinksSettingsDeepLinks;
 
+pub mod apple_deep_link;
+pub use apple_deep_link::{
+    format_apple_deep_link, parse_apple_deep_link, AppleDeepLink, AppleDeepLinkSection,
+    DeepLinksAppleDeepLinks, MAX_APPLE_CREATION_ID_LEN, MAX_APPLE_DEEP_LINK_LEN,
+    MAX_APPLE_QUERY_SLUG_LEN,
+};
+
 pub mod deep_links_types;
 pub use deep_links_types::{
     DeepLinkAction, DeepLinkContext, DeepLinkEntry, DeepLinkResult,

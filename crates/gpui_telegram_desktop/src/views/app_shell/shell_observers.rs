@@ -18,12 +18,23 @@ use crate::views::app_shell::shell_theme::toggle_desktop_theme_mode;
 use crate::views::app_shell::shell_truth::ClientCallFence;
 use crate::views::app_shell::window_connecting_widget::ConnectionStatus as BannerConnectionStatus;
 use crate::views::auth::AuthWizardEvent;
-use crate::views::boxes::modal_types::ModalDialogKind;
-use crate::views::chat_sidebar::CategorizedSearchResult;
+use crate::views::boxes::modal_types::{ActiveTextField, ModalDialogKind};
+use crate::views::chat_sidebar::{
+    AddContactKind, CategorizedSearchResult, CreationInputField, SidebarCreationModal,
+};
 use crate::views::composer::bot_keyboard::BotKeyboardButtonKind;
+use crate::views::content_hub::ContentHubInputTarget;
+use crate::views::drawer::inspector_tabs::{
+    BotConfigFocusField, InspectorAction, InspectorSubpage, InspectorTab,
+};
+use crate::views::global_tasks_workspace::StudioInputTarget;
 use crate::views::nav_rail::NavDestination;
 use crate::views::settings::{settings_type::SettingsSectionType, SettingsRouterEvent};
 use crate::views::shell::{toggled_language_code, ActiveWorkspacePanel, AppShell};
+
+fn other_input_owns_ime(shell: &AppShell, cx: &gpui::App) -> bool {
+    shell.has_active_non_composer_ime_owner(cx)
+}
 
 impl AppShell {
     fn spawn_authed_shell_fut<R: 'static, Fut: Future<Output = R> + 'static>(
@@ -84,8 +95,161 @@ impl AppShell {
     pub(crate) fn wire_workspace_observers(&self, cx: &mut Context<Self>) {
         cx.subscribe(&self.auth_wizard, |shell, _, ev, cx| shell.handle_auth_wizard_event(ev, cx))
             .detach();
+        let mut prev_auth_target = {
+            let w = self.auth_wizard.read(cx);
+            (
+                w.editing_server_url,
+                w.login_step,
+                w.auth_wizard_tab,
+                w.active_login_field,
+            )
+        };
+        cx.observe(&self.auth_wizard, move |shell, wizard, cx| {
+            let cur_target = {
+                let w = wizard.read(cx);
+                (
+                    w.editing_server_url,
+                    w.login_step,
+                    w.auth_wizard_tab,
+                    w.active_login_field,
+                )
+            };
+            if !shell.is_authenticated && cur_target != prev_auth_target {
+                let wizard_dirty = {
+                    let w = wizard.read(cx);
+                    w.ime.ime_preedit.is_some()
+                        || w.ime.just_committed_ime
+                        || w.ime.last_ime_commit_at.is_some()
+                };
+                if wizard_dirty {
+                    wizard.update(cx, |w, wcx| {
+                        w.ime.clear_ime_state();
+                        wcx.notify();
+                    });
+                }
+                let shell_dirty = shell.ime.ime_preedit.is_some()
+                    || shell.ime.just_committed_ime
+                    || shell.ime.last_ime_commit_at.is_some();
+                if shell_dirty {
+                    shell.ime.clear_ime_state();
+                    cx.notify();
+                }
+            }
+            prev_auth_target = cur_target;
+        })
+        .detach();
         cx.subscribe(&self.settings_router, |shell, _, ev, cx| {
             shell.handle_settings_router_event(ev, cx);
+        })
+        .detach();
+        cx.subscribe(&self.apple_sidebar, |shell, _, ev, cx| {
+            shell.handle_apple_sidebar_event(ev, cx);
+        })
+        .detach();
+        cx.subscribe(&self.content_hub, |shell, _, ev, cx| {
+            shell.handle_content_hub_event(ev, cx);
+        })
+        .detach();
+        let (mut prev_pub_open, mut prev_pub_field, mut prev_pub_queue, mut prev_hub_input) = {
+            let h = self.content_hub.read(cx);
+            (
+                h.publish_modal.is_open,
+                h.publish_modal.focused_field,
+                h.publish_modal.is_showing_reviewer_queue(),
+                h.active_input,
+            )
+        };
+        cx.observe(&self.content_hub, move |shell, hub, cx| {
+            let in_hub_panel = matches!(shell.active_panel, ActiveWorkspacePanel::ContentHub(_));
+            let (
+                cur_pub_open,
+                cur_pub_field,
+                cur_pub_queue,
+                cur_hub_input,
+                pub_close_pending_clear,
+                cur_pub_owns_preedit,
+                cur_hub_owns_preedit,
+            ) = hub.update(cx, |h, _| {
+                let eff_hub = if h.has_focused_input(in_hub_panel) {
+                    h.active_input
+                } else {
+                    ContentHubInputTarget::None
+                };
+                let pending_clear = if prev_pub_open && !h.publish_modal.is_open {
+                    std::mem::take(&mut h.publish_modal.pending_close_ime_clear)
+                } else {
+                    false
+                };
+                let pub_owns_pre = h.publish_modal.is_open
+                    && h.publish_modal.focused_field.is_some_and(|f| {
+                        h.publish_modal
+                            .field(f)
+                            .ime_preedit
+                            .as_deref()
+                            .is_some_and(|p| !p.is_empty())
+                    });
+                let hub_owns_pre = match eff_hub {
+                    ContentHubInputTarget::CreationsSearch => h
+                        .creations_search
+                        .ime_preedit
+                        .as_deref()
+                        .is_some_and(|p| !p.is_empty()),
+                    ContentHubInputTarget::CatalogSearch => h
+                        .catalog_search
+                        .ime_preedit
+                        .as_deref()
+                        .is_some_and(|p| !p.is_empty()),
+                    ContentHubInputTarget::QuickDrawerSearch => h
+                        .quick_drawer_search
+                        .ime_preedit
+                        .as_deref()
+                        .is_some_and(|p| !p.is_empty()),
+                    ContentHubInputTarget::None => false,
+                };
+                (
+                    h.publish_modal.is_open,
+                    h.publish_modal.focused_field,
+                    h.publish_modal.is_showing_reviewer_queue(),
+                    eff_hub,
+                    pending_clear,
+                    pub_owns_pre,
+                    hub_owns_pre,
+                )
+            });
+            let pub_opening_or_switched = (!prev_pub_open && cur_pub_open)
+                || (cur_pub_open
+                    && (cur_pub_field != prev_pub_field || cur_pub_queue != prev_pub_queue));
+            let pub_closing_with_clear = prev_pub_open && !cur_pub_open && pub_close_pending_clear;
+            let pub_changed = pub_opening_or_switched || pub_closing_with_clear;
+            if pub_changed && shell.is_publish_review_modal_unoccluded(cx) {
+                if pub_opening_or_switched {
+                    shell.blur_community_if_focused(cx);
+                }
+                if !(pub_opening_or_switched && cur_pub_owns_preedit) {
+                    shell.clear_all_ime_preedits(cx);
+                }
+            } else if !pub_changed
+                && cur_hub_input != prev_hub_input
+                && shell.is_base_workspace_unoccluded(cx)
+            {
+                if cur_hub_input != ContentHubInputTarget::None {
+                    shell.blur_community_if_focused(cx);
+                }
+                if !cur_hub_owns_preedit {
+                    let should_clear = shell.is_content_hub_input_active(cx)
+                        || (cur_hub_input == ContentHubInputTarget::None
+                            && prev_hub_input != ContentHubInputTarget::None
+                            && !other_input_owns_ime(shell, cx));
+                    if should_clear {
+                        shell.clear_all_ime_preedits(cx);
+                    }
+                }
+            }
+            prev_pub_open = cur_pub_open;
+            prev_pub_field = cur_pub_field;
+            prev_pub_queue = cur_pub_queue;
+            prev_hub_input = cur_hub_input;
+            cx.notify();
         })
         .detach();
 
@@ -307,11 +471,13 @@ impl AppShell {
         .detach();
         let mut prev_creation_dialog_open = false;
         let mut prev_modal_active = false;
+        let mut prev_modal_active_field = ActiveTextField::Primary;
+        let mut prev_modal_kind: Option<ModalDialogKind> = None;
         cx.observe(&self.modal_container, move |shell, modal, cx| {
             if let Some(outcome) = modal.update(cx, |m, _| m.take_outcome()) {
                 shell.handle_modal_outcome(outcome, cx);
             }
-            let (cur_modal_active, cur_creation_dialog_open) = {
+            let (cur_modal_active, cur_creation_dialog_open, cur_modal_active_field, cur_modal_kind) = {
                 let mc = modal.read(cx);
                 let active = mc.is_modal_active();
                 let creation = active
@@ -324,11 +490,64 @@ impl AppShell {
                                 | ModalDialogKind::Contacts
                         )
                     );
-                (active, creation)
+                (active, creation, mc.dialog.active_field, mc.dialog.kind.clone())
             };
+            let cur_modal_owns_ime = shell.last_ime_modal_snapshot.as_ref().is_some_and(|(f, k)| {
+                *f == cur_modal_active_field && *k == cur_modal_kind
+            });
             if !prev_modal_active && cur_modal_active {
+                if shell.is_modal_container_unoccluded(cx) && !cur_modal_owns_ime {
+                    shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                } else {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        if h.active_input != ContentHubInputTarget::None {
+                            h.blur_input();
+                            hcx.notify();
+                        }
+                    });
+                }
+                shell.sidebar.update(cx, |sb, scx| {
+                    if sb.search_focused {
+                        sb.search_focused = false;
+                        scx.notify();
+                    }
+                });
+                shell.stage.update(cx, |st, stcx| {
+                    let mut changed = false;
+                    if st.active_bot_card_field.is_some() {
+                        st.blur_bot_card_input();
+                        changed = true;
+                    }
+                    if st.search_open {
+                        st.search_open = false;
+                        changed = true;
+                    }
+                    if changed {
+                        stcx.notify();
+                    }
+                });
+                shell.inspector.update(cx, |ins, icx| {
+                    if ins.is_bot_input_active() {
+                        ins.blur_bot_input();
+                        icx.notify();
+                    }
+                });
+                shell.blur_composer_and_cancel_ime(cx);
+                shell.blur_community_if_focused(cx);
                 shell.reconcile_chat_scoped_toasts(cx);
+            } else if prev_modal_active && !cur_modal_active && shell.is_modal_container_unoccluded(cx) {
+                shell.clear_all_ime_preedits(cx);
+            } else if prev_modal_active
+                && cur_modal_active
+                && (cur_modal_active_field != prev_modal_active_field || cur_modal_kind != prev_modal_kind)
+                && shell.is_modal_container_unoccluded(cx)
+                && !cur_modal_owns_ime
+            {
+                shell.clear_all_ime_preedits(cx);
             }
+            prev_modal_active = cur_modal_active;
+            prev_modal_active_field = cur_modal_active_field;
+            prev_modal_kind = cur_modal_kind;
             if !prev_creation_dialog_open && cur_creation_dialog_open {
                 shell.enter_compose_or_modal_isolation(cx);
             } else if prev_creation_dialog_open
@@ -340,12 +559,23 @@ impl AppShell {
             if !cur_modal_active {
                 shell.community_pending_share = None;
             }
-            prev_modal_active = cur_modal_active;
             prev_creation_dialog_open = cur_creation_dialog_open;
         })
         .detach();
-        cx.observe(&self.tasks_workspace, |shell, tw, cx| {
-            if let Some(act) = tw.update(cx, |w, _| w.take_action()) {
+        let mut prev_studio_input = self.tasks_workspace.read(cx).active_input;
+        let mut prev_studio_tab = self.tasks_workspace.read(cx).tab;
+        cx.observe(&self.tasks_workspace, move |shell, tw, cx| {
+            let (cur_input, cur_tab, act) =
+                tw.update(cx, |w, _| (w.active_input, w.tab, w.take_action()));
+            if shell.is_tasks_workspace_unoccluded(cx)
+                && (cur_input != prev_studio_input
+                    || (prev_studio_input != StudioInputTarget::None && cur_tab != prev_studio_tab))
+            {
+                shell.clear_all_ime_preedits(cx);
+            }
+            prev_studio_input = cur_input;
+            prev_studio_tab = cur_tab;
+            if let Some(act) = act {
                 shell.handle_tasks_workspace_action(act, cx);
             }
         })
@@ -371,18 +601,22 @@ impl AppShell {
                 });
             if menu_req {
                 shell.toggle_account_popover(cx);
+                if shell.sidebar.read(cx).is_account_popover_open && shell.is_account_popover_unoccluded(cx) {
+                    shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                    shell.blur_composer_and_cancel_ime(cx);
+                    shell.blur_community_if_focused(cx);
+                }
+                cx.notify();
             }
             if archive_req {
+                shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                shell.cleanup_settings_panel_if_active(cx);
                 shell.leave_browser_panel_if_active(cx);
                 shell.leave_community_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
-                shell.last_handled_nav_dest = Some(NavDestination::Chats);
-                shell.last_handled_nav_trigger = trigger;
+                shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
                 dest = NavDestination::Chats;
-                rail.update(cx, |r, rcx| {
-                    r.set_active_destination(NavDestination::Chats);
-                    rcx.notify();
-                });
+                shell.sync_apple_sidebar_to_active_panel(cx);
                 shell.sidebar.update(cx, |sb, _| sb.is_archived_expanded = !sb.is_archived_expanded);
                 cx.notify();
             }
@@ -392,16 +626,14 @@ impl AppShell {
                 shell.sidebar.update(cx, |_, sb_cx| sb_cx.notify());
             }
             if let Some(folder_title) = folder_req {
+                shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                shell.cleanup_settings_panel_if_active(cx);
                 shell.leave_browser_panel_if_active(cx);
                 shell.leave_community_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
-                shell.last_handled_nav_dest = Some(NavDestination::Chats);
-                shell.last_handled_nav_trigger = trigger;
+                shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
                 dest = NavDestination::Chats;
-                rail.update(cx, |r, rcx| {
-                    r.set_active_destination(NavDestination::Chats);
-                    rcx.notify();
-                });
+                shell.sync_apple_sidebar_to_active_panel(cx);
                 shell.sidebar.update(cx, |sb, sb_cx| {
                     sb.select_folder(folder_title);
                     sb_cx.notify();
@@ -428,7 +660,15 @@ impl AppShell {
     fn observe_sidebar_entity(&self, cx: &mut Context<Self>) {
         let mut prev_overlay_open = false;
         let mut prev_search_focused = false;
+        let mut prev_contacts_modal_open = false;
+        let mut prev_creation_key: Option<(
+            SidebarCreationModal,
+            AddContactKind,
+            CreationInputField,
+        )> = None;
+        let mut prev_account_popover_open = false;
         let mut prev_compose_open = false;
+        let mut prev_compose_title_focused = false;
         let mut prev_compose_or_modal = false;
         let mut prev_compose_query = String::new();
         cx.observe(&self.sidebar, move |shell, sb, cx| {
@@ -496,7 +736,16 @@ impl AppShell {
                 shell.toggle_account_popover(cx);
                 shell_dirty = true;
             }
-            let (sb_popup, cur_overlay_open, mut cur_compose_open, cur_compose_query) = {
+            let (
+                sb_popup,
+                cur_overlay_open,
+                contacts_modal_open,
+                account_popover_open,
+                mut cur_compose_open,
+                cur_compose_title_focused,
+                cur_compose_query,
+                cur_creation_key,
+            ) = {
                 let s = shell.sidebar.read(cx);
                 let overlay_open = s.is_contacts_modal_open
                     || s.active_creation_modal.is_some()
@@ -504,30 +753,42 @@ impl AppShell {
                 (
                     s.is_plus_menu_open || overlay_open,
                     overlay_open,
+                    s.is_contacts_modal_open,
+                    s.is_account_popover_open,
                     s.is_plus_menu_open,
+                    s.compose_title_focused,
                     s.compose_recipient_query.clone(),
+                    s.active_creation_modal
+                        .map(|m| (m, s.contact_kind, s.active_creation_field)),
                 )
             };
             if !prev_overlay_open && cur_overlay_open {
                 shell.occlude_browser_for_overlay(cx);
+                shell.blur_community_if_focused(cx);
                 shell_dirty = true;
             }
             if !prev_compose_open && cur_compose_open {
                 if shell.theme_state.palette.is_apple_style()
                     && shell.active_panel != ActiveWorkspacePanel::Chats
                 {
+                    shell.cleanup_settings_panel_if_active(cx);
                     shell.leave_browser_panel_if_active(cx);
                     shell.leave_community_panel_if_active(cx);
-                    shell.ime.clear_preedit();
+                    shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
                     shell.bot_browser.ime_preedit_input_gen = None;
                     shell.community_ime_preedit_input_gen = None;
                     shell.active_panel = ActiveWorkspacePanel::Chats;
-                    shell.last_handled_nav_dest = Some(NavDestination::Chats);
-                    shell.nav_rail.update(cx, |r, _| {
-                        r.set_active_destination(NavDestination::Chats);
-                    });
+                    shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
+                    shell.sync_apple_sidebar_to_active_panel(cx);
                 } else {
                     shell.occlude_browser_for_overlay(cx);
+                    if !shell.theme_state.palette.is_apple_style() {
+                        if shell.is_base_workspace_unoccluded(cx) {
+                            shell.occlude_community_for_overlay(cx);
+                        } else {
+                            shell.blur_community_if_focused(cx);
+                        }
+                    }
                 }
                 shell_dirty = true;
             } else if cur_compose_open
@@ -574,6 +835,15 @@ impl AppShell {
                         w.blur_active_input(wcx);
                     });
                 }
+                if shell.is_base_workspace_unoccluded(cx)
+                    && shell.content_hub.read(cx).active_input
+                        == ContentHubInputTarget::QuickDrawerSearch
+                {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        h.blur_input();
+                        hcx.notify();
+                    });
+                }
                 shell_dirty = true;
             }
             if sb_popup && shell.stage.read(cx).more_menu_open {
@@ -593,8 +863,107 @@ impl AppShell {
                 shell.handle_sidebar_context_action(action, cx);
                 shell_dirty = true;
             }
-            if search_focused || has_creation_modal {
-                shell.composer.update(cx, |c, _| c.is_input_focused = false);
+            let chats_unoccluded = shell.is_chats_inline_unoccluded(cx);
+            let account_popover_unoccluded = shell.is_account_popover_unoccluded(cx);
+            let sidebar_modal_unoccluded = shell.is_sidebar_modal_unoccluded(cx);
+            let prev_creation_modal_open = prev_creation_key.is_some();
+            let contacts_opening = !prev_contacts_modal_open && contacts_modal_open;
+            let creation_opening = !prev_creation_modal_open && has_creation_modal;
+            let account_popover_opening = !prev_account_popover_open && account_popover_open;
+            let search_opening = !prev_search_focused && search_focused;
+            let apple_compose_opening = !prev_compose_open
+                && cur_compose_open
+                && shell.theme_state.palette.is_apple_style();
+            let apple_compose_field_switched = chats_unoccluded
+                && prev_compose_open
+                && cur_compose_open
+                && shell.theme_state.palette.is_apple_style()
+                && cur_compose_title_focused != prev_compose_title_focused;
+            let creation_modal_closing_unoccluded =
+                prev_creation_modal_open && !has_creation_modal && sidebar_modal_unoccluded;
+            let contacts_modal_closing_unoccluded = prev_contacts_modal_open
+                && !contacts_modal_open
+                && sidebar_modal_unoccluded
+                && !has_creation_modal;
+            let creation_field_switched = prev_creation_key.is_some()
+                && cur_creation_key.is_some()
+                && sidebar_modal_unoccluded
+                && cur_creation_key != prev_creation_key;
+            let inline_or_popover_closing = (account_popover_unoccluded
+                && prev_account_popover_open
+                && !account_popover_open)
+                || (chats_unoccluded
+                    && ((prev_compose_open && !cur_compose_open)
+                        || (prev_search_focused && !search_focused)));
+
+            let global_modal_opening =
+                sidebar_modal_unoccluded && (contacts_opening || creation_opening);
+            let global_popover_opening = account_popover_unoccluded && account_popover_opening;
+            let global_overlay_active =
+                sidebar_modal_unoccluded && (has_creation_modal || contacts_modal_open);
+            let inline_chats_opening = chats_unoccluded && (search_opening || apple_compose_opening);
+            let sidebar_takes_focus =
+                global_overlay_active || global_popover_opening || inline_chats_opening;
+            let mut cleared_search_for_overlay = false;
+            if sidebar_takes_focus {
+                shell.blur_composer_and_cancel_ime(cx);
+                let should_blur_hub = if global_overlay_active || global_popover_opening {
+                    shell.content_hub.read(cx).active_input != ContentHubInputTarget::None
+                } else {
+                    shell.content_hub.read(cx).active_input
+                        == ContentHubInputTarget::QuickDrawerSearch
+                };
+                if should_blur_hub {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        h.blur_input();
+                        hcx.notify();
+                    });
+                    shell.clear_all_ime_preedits(cx);
+                    shell_dirty = true;
+                }
+                if (global_modal_opening || global_popover_opening) && search_focused {
+                    shell.sidebar.update(cx, |s, scx| {
+                        if s.search_focused {
+                            s.search_focused = false;
+                            scx.notify();
+                        }
+                    });
+                    cleared_search_for_overlay = true;
+                }
+            }
+            let sidebar_opening =
+                global_modal_opening || global_popover_opening || inline_chats_opening;
+            if sidebar_opening {
+                shell.stage.update(cx, |st, stcx| {
+                    let mut changed = false;
+                    if st.active_bot_card_field.is_some() {
+                        st.blur_bot_card_input();
+                        changed = true;
+                    }
+                    if st.search_open {
+                        st.search_open = false;
+                        changed = true;
+                    }
+                    if changed {
+                        stcx.notify();
+                    }
+                });
+                shell.inspector.update(cx, |ins, icx| {
+                    if ins.is_bot_input_active() {
+                        ins.blur_bot_input();
+                        icx.notify();
+                    }
+                });
+            }
+            if sidebar_opening
+                || creation_modal_closing_unoccluded
+                || contacts_modal_closing_unoccluded
+                || creation_field_switched
+                || apple_compose_field_switched
+                || (inline_or_popover_closing && !other_input_owns_ime(shell, cx))
+            {
+                shell.clear_all_ime_preedits(cx);
+                shell_dirty = true;
             }
             if let Some(req) = pending_contact {
                 shell.dispatch_add_contact(req, cx);
@@ -619,11 +988,21 @@ impl AppShell {
             ) {
                 selection_changed = true;
                 if let Some(d) = selected_dialog {
+                    shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                    shell.cleanup_settings_panel_if_active(cx);
                     shell.leave_browser_panel_if_active(cx);
                     shell.leave_community_panel_if_active(cx);
                     shell.active_panel = ActiveWorkspacePanel::Chats;
                     shell.last_handled_nav_dest = Some(NavDestination::Chats);
-                    shell.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Chats));
+                    let nav_trigger = shell.nav_rail.update(cx, |r, rcx| {
+                        if r.active_destination != NavDestination::Chats {
+                            r.set_active_destination(NavDestination::Chats);
+                            rcx.notify();
+                        }
+                        r.trigger_counter
+                    });
+                    shell.last_handled_nav_trigger = nav_trigger;
+                    shell.sync_apple_sidebar_to_active_panel(cx);
                     let (cur_active_id, cur_title) = {
                         let st = shell.stage.read(cx);
                         (st.active_chat_id, st.chat_title.clone())
@@ -668,16 +1047,26 @@ impl AppShell {
                 || prev_overlay_open
                 || search_focused != prev_search_focused
                 || cur_compose_open != prev_compose_open
+                || cur_compose_title_focused != prev_compose_title_focused
                 || cur_compose_or_modal != prev_compose_or_modal
                 || cur_compose_query != prev_compose_query
             {
                 shell_dirty = true;
             }
             prev_overlay_open = cur_overlay_open;
-            prev_search_focused = search_focused;
+            prev_search_focused = if cleared_search_for_overlay {
+                false
+            } else {
+                search_focused
+            };
+            prev_contacts_modal_open = contacts_modal_open;
+            prev_creation_key = cur_creation_key;
+            prev_account_popover_open = account_popover_open;
             prev_compose_open = cur_compose_open;
+            prev_compose_title_focused = cur_compose_title_focused;
             prev_compose_or_modal = cur_compose_or_modal;
             prev_compose_query = cur_compose_query;
+            shell.sync_apple_sidebar_badges(cx);
             if shell_dirty {
                 cx.notify();
             }
@@ -718,17 +1107,98 @@ impl AppShell {
     }
 
     fn observe_stage_composer_inspector_entities(&self, cx: &mut Context<Self>) {
-        cx.observe(&self.stage, |shell, st, cx| {
-            let (bot_start_clicked, bot_assist_act, card_input_active, cur_chat_id, show_bot_start_bar) =
-                st.update(cx, |s, _| {
-                    (
-                        std::mem::take(&mut s.pending_bot_start),
-                        s.pending_bot_assist_action.take(),
-                        s.active_bot_card_field.is_some(),
-                        s.active_chat_id,
-                        s.show_bot_start_bar,
-                    )
+        let mut prev_stage_search_open = false;
+        let mut prev_stage_search_focus_seq = 0u64;
+        let mut prev_card_field: Option<(String, crate::views::stage::cards::BotAssistLoginField)> =
+            None;
+        cx.observe(&self.stage, move |shell, st, cx| {
+            let (
+                bot_start_clicked,
+                bot_assist_act,
+                cur_card_field,
+                cur_chat_id,
+                show_bot_start_bar,
+                stage_search_open,
+                stage_search_focus_seq,
+            ) = st.update(cx, |s, _| {
+                (
+                    std::mem::take(&mut s.pending_bot_start),
+                    s.pending_bot_assist_action.take(),
+                    s.active_bot_card_field.clone(),
+                    s.active_chat_id,
+                    s.show_bot_start_bar,
+                    s.search_open,
+                    s.search_focus_seq,
+                )
+            });
+            let chats_unoccluded = shell.is_chats_inline_unoccluded(cx);
+            let prev_card_active = prev_card_field.is_some();
+            let card_input_active = cur_card_field.is_some();
+            let stage_search_focused_now = (!prev_stage_search_open && stage_search_open)
+                || (stage_search_open && stage_search_focus_seq != prev_stage_search_focus_seq);
+            let card_input_opening = !prev_card_active && card_input_active;
+            let card_field_switched =
+                prev_card_active && card_input_active && cur_card_field != prev_card_field;
+            let stage_input_closing = (prev_stage_search_open && !stage_search_open)
+                || (prev_card_active && !card_input_active);
+            let mut blurred_card_for_search = false;
+            let mut blurred_search_for_card = false;
+            if chats_unoccluded && (stage_search_focused_now || card_input_opening) {
+                if shell.content_hub.read(cx).active_input
+                    == ContentHubInputTarget::QuickDrawerSearch
+                {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        h.blur_input();
+                        hcx.notify();
+                    });
+                }
+                shell.clear_all_ime_preedits(cx);
+            } else if chats_unoccluded && card_field_switched {
+                shell.clear_all_ime_preedits(cx);
+            } else if chats_unoccluded
+                && stage_input_closing
+                && !other_input_owns_ime(shell, cx)
+            {
+                shell.clear_all_ime_preedits(cx);
+            }
+            if chats_unoccluded && (stage_search_focused_now || card_input_opening) {
+                shell.sidebar.update(cx, |sb, scx| {
+                    if sb.search_focused {
+                        sb.search_focused = false;
+                        scx.notify();
+                    }
                 });
+                shell.inspector.update(cx, |ins, icx| {
+                    if ins.is_bot_input_active() {
+                        ins.blur_bot_input();
+                        icx.notify();
+                    }
+                });
+                if stage_search_focused_now && card_input_active {
+                    st.update(cx, |s, stcx| {
+                        s.blur_bot_card_input();
+                        stcx.notify();
+                    });
+                    blurred_card_for_search = true;
+                } else if card_input_opening && stage_search_open {
+                    st.update(cx, |s, stcx| {
+                        s.search_open = false;
+                        stcx.notify();
+                    });
+                    blurred_search_for_card = true;
+                }
+            }
+            prev_stage_search_open = if blurred_search_for_card {
+                false
+            } else {
+                stage_search_open
+            };
+            prev_stage_search_focus_seq = stage_search_focus_seq;
+            prev_card_field = if blurred_card_for_search {
+                None
+            } else {
+                cur_card_field
+            };
             if let Some(old_cid) = shell.last_observed_toast_chat_id {
                 if cur_chat_id != Some(old_cid) {
                     shell.composer.update(cx, |c, _| c.clear_bot_reply_keyboard());
@@ -737,8 +1207,10 @@ impl AppShell {
             shell.reconcile_chat_scoped_toasts(cx);
             let is_apple_compose_mode = shell.theme_state.palette.is_apple_style()
                 && shell.sidebar.read(cx).is_plus_menu_open;
-            if card_input_active || (!is_apple_compose_mode && show_bot_start_bar) {
-                shell.composer.update(cx, |c, _| c.is_input_focused = false);
+            if (chats_unoccluded && (card_input_opening || stage_search_focused_now))
+                || (!is_apple_compose_mode && show_bot_start_bar)
+            {
+                shell.blur_composer_and_cancel_ime(cx);
             }
             if bot_start_clicked {
                 shell.materialize_prestart_bot_and_start(cx);
@@ -757,7 +1229,7 @@ impl AppShell {
             cx.notify();
         })
         .detach();
-        cx.observe(&self.composer, |shell, comp, cx| {
+        cx.observe(&self.composer, move |shell, comp, cx| {
             let (att_opt, focused, launch_miniapp, kb_press, selected_send_as, comp_isolated) =
                 comp.update(cx, |c, _| {
                     (
@@ -770,11 +1242,55 @@ impl AppShell {
                     )
                 });
             let is_compose_or_modal = shell.is_compose_or_creation_modal_active(cx);
-            if focused {
-                shell.sidebar.update(cx, |sb, _| sb.search_focused = false);
-                if shell.stage.read(cx).active_bot_card_field.is_some() {
-                    shell.stage.update(cx, |st, _| st.blur_bot_card_input());
+            let composer_focus_active = focused
+                && shell.is_chats_inline_unoccluded(cx)
+                && !shell.should_hide_composer(cx);
+            let was_focused = shell.prev_composer_focused.get();
+            let composer_rising_edge = !was_focused && composer_focus_active;
+            let composer_falling_edge = was_focused && !composer_focus_active;
+            shell.prev_composer_focused.set(composer_focus_active);
+            if composer_rising_edge {
+                shell.sidebar.update(cx, |sb, scx| {
+                    if sb.search_focused {
+                        sb.search_focused = false;
+                        scx.notify();
+                    }
+                });
+                shell.stage.update(cx, |st, stcx| {
+                    let mut changed = false;
+                    if st.active_bot_card_field.is_some() {
+                        st.blur_bot_card_input();
+                        changed = true;
+                    }
+                    if st.search_open {
+                        st.search_open = false;
+                        changed = true;
+                    }
+                    if changed {
+                        stcx.notify();
+                    }
+                });
+                shell.inspector.update(cx, |ins, icx| {
+                    if ins.is_bot_input_active() {
+                        ins.blur_bot_input();
+                        icx.notify();
+                    }
+                });
+                if shell.content_hub.read(cx).active_input
+                    == ContentHubInputTarget::QuickDrawerSearch
+                {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        h.blur_input();
+                        hcx.notify();
+                    });
                 }
+                shell.clear_all_ime_preedits(cx);
+            } else if composer_falling_edge && comp.read(cx).ime_machine.is_composing() {
+                comp.update(cx, |c, ccx| {
+                    c.ime_machine.on_ime_cancel();
+                    c.sync_autocomplete();
+                    ccx.notify();
+                });
             }
             if !is_compose_or_modal && !comp_isolated {
                 if let (Some(chat_id), Some(pid)) = (shell.stage.read(cx).active_chat_id, selected_send_as) {
@@ -793,28 +1309,48 @@ impl AppShell {
                 if !is_compose_or_modal && !comp_isolated {
                     match btn.kind {
                         BotKeyboardButtonKind::WebApp(url) => {
-                            shell.launch_miniapp_from_composer(0, "", "", &url, cx);
+                            if !shell.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                                shell.launch_miniapp_from_composer(0, "", "", &url, cx);
+                            }
                         }
                         BotKeyboardButtonKind::Url(url) => {
-                            let chat_opt = shell.stage.read(cx).active_chat_id;
-                            if !shell.launch_miniapp_from_uri(
-                                &url,
-                                chat_opt,
-                                MiniAppLaunchMode::InlineKeyboard,
-                                cx,
-                            ) {
-                                shell.enqueue_localized_toast("已触发链接按钮", "Link triggered", 1800, cx);
+                            if !shell.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                                let chat_opt = shell.stage.read(cx).active_chat_id;
+                                if !shell.launch_miniapp_from_uri(
+                                    &url,
+                                    chat_opt,
+                                    MiniAppLaunchMode::InlineKeyboard,
+                                    cx,
+                                ) {
+                                    shell.enqueue_localized_toast(
+                                        "已触发链接按钮",
+                                        "Link triggered",
+                                        1800,
+                                        cx,
+                                    );
+                                }
+                            }
+                        }
+                        BotKeyboardButtonKind::Callback(bytes) => {
+                            let handled_apple = match std::str::from_utf8(&bytes) {
+                                Ok(s) => shell.try_handle_or_swallow_apple_deep_link(s, true, cx),
+                                Err(_) => crate::views::app_shell::shell_content_hub::is_apple_deep_link_candidate(
+                                    &String::from_utf8_lossy(&bytes),
+                                ),
+                            };
+                            if !handled_apple && !btn.text.trim().is_empty() {
+                                shell.append_outgoing_text(btn.text, cx);
                             }
                         }
                         BotKeyboardButtonKind::SwitchInline { query, .. } => {
+                            let focus_composer = shell.can_focus_chat_composer(cx);
                             shell.composer.update(cx, |c, ccx| {
                                 c.set_text(query);
-                                c.is_input_focused = true;
+                                c.is_input_focused = focus_composer;
                                 ccx.notify();
                             });
                         }
                         BotKeyboardButtonKind::Default
-                        | BotKeyboardButtonKind::Callback(_)
                         | BotKeyboardButtonKind::RequestPhone
                         | BotKeyboardButtonKind::RequestLocation
                         | BotKeyboardButtonKind::RequestPoll
@@ -833,17 +1369,90 @@ impl AppShell {
             cx.notify();
         })
         .detach();
-        cx.observe(&self.inspector, |shell, insp, cx| {
-            let (is_open, media_open, action, leave_chat) = insp.update(cx, |i, _| {
+        let mut prev_bot_focus: Option<(
+            InspectorTab,
+            InspectorSubpage,
+            BotConfigFocusField,
+            bool,
+            u64,
+        )> = None;
+        cx.observe(&self.inspector, move |shell, insp, cx| {
+            let (is_open, cur_bot_focus, media_open, action, leave_chat) = insp.update(cx, |i, _| {
+                let focus = i.is_bot_input_active().then_some((
+                    i.active_tab,
+                    i.subpage,
+                    i.bot_config_focus,
+                    i.is_add_member_search_active(),
+                    i.profile.bot_id,
+                ));
                 (
                     i.is_open,
+                    focus,
                     i.pending_media_open.take(),
                     i.take_action(),
                     i.take_pending_leave_chat(),
                 )
             });
+            let chats_unoccluded = shell.is_chats_inline_unoccluded(cx);
+            let prev_bot_active = prev_bot_focus.is_some();
+            let cur_bot_active = cur_bot_focus.is_some();
+            let bot_input_opening = !prev_bot_active && cur_bot_active;
+            let bot_input_switched =
+                prev_bot_active && cur_bot_active && cur_bot_focus != prev_bot_focus;
+            if chats_unoccluded && bot_input_opening {
+                if shell.content_hub.read(cx).active_input
+                    == ContentHubInputTarget::QuickDrawerSearch
+                {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        h.blur_input();
+                        hcx.notify();
+                    });
+                }
+                shell.clear_all_ime_preedits(cx);
+            } else if chats_unoccluded && bot_input_switched {
+                shell.clear_all_ime_preedits(cx);
+            } else if chats_unoccluded
+                && prev_bot_active
+                && !cur_bot_active
+                && !other_input_owns_ime(shell, cx)
+            {
+                shell.clear_all_ime_preedits(cx);
+            }
+            if chats_unoccluded && bot_input_opening {
+                shell.blur_composer_and_cancel_ime(cx);
+                shell.sidebar.update(cx, |sb, scx| {
+                    if sb.search_focused {
+                        sb.search_focused = false;
+                        scx.notify();
+                    }
+                });
+                shell.stage.update(cx, |st, stcx| {
+                    let mut changed = false;
+                    if st.active_bot_card_field.is_some() {
+                        st.blur_bot_card_input();
+                        changed = true;
+                    }
+                    if st.search_open {
+                        st.search_open = false;
+                        changed = true;
+                    }
+                    if changed {
+                        stcx.notify();
+                    }
+                });
+            }
+            prev_bot_focus = cur_bot_focus;
+            let skip_dup_media_open = matches!(
+                (&media_open, &action),
+                (
+                    Some((u1, v1)),
+                    Some(InspectorAction::OpenMedia { url: u2, is_video: v2 })
+                ) if u1 == u2 && v1 == v2
+            );
             if let Some((url, is_video)) = media_open {
-                shell.show_media_viewer(url, is_video, cx);
+                if !skip_dup_media_open {
+                    shell.show_media_viewer(url, is_video, cx);
+                }
             }
             if let Some(act) = action {
                 shell.handle_inspector_action(act, cx);
@@ -904,9 +1513,37 @@ impl AppShell {
                 self.computers.reset_on_logout();
                 self.session_sync.ws_stream_started = false;
                 self.coding_host.registered_for_auth_gen = None;
-                self.sidebar.update(cx, |sb, _| sb.configure_for_cloud_workspace(url));
-                self.stage.update(cx, |st, _| st.configure_for_cloud_workspace(url, None));
-                self.inspector.update(cx, |insp, _| insp.configure_for_cloud_workspace(url));
+                self.active_panel = ActiveWorkspacePanel::Chats;
+                self.panel_state.reset();
+                self.window_runtime.controller.clear_all_toasts();
+                self.scheduled_toast_id = None;
+                self.last_observed_toast_chat_id = None;
+                self.compose_isolation_snapshot = None;
+                self.reset_conversation_views(url, None, cx);
+                self.reset_composer_for_account_boundary(cx);
+                self.reset_tasks_workspace_for_account_boundary(cx);
+                self.community_workspace = None;
+                self.community_pending_share = None;
+                self.community_ime_preedit_input_gen = None;
+                self.reset_content_hub_for_logout_or_account_switch(cx);
+                self.reset_nav_rail_for_logout_or_account_switch(cx);
+                self.main_menu_drawer.update(cx, |m, _| {
+                    m.close();
+                    m.accounts.clear();
+                    m.active_account_id = 0;
+                });
+                self.modal_container.update(cx, |m, mcx| {
+                    let was_active = m.is_modal_active();
+                    m.reset_for_logout_or_account_switch();
+                    if was_active {
+                        mcx.notify();
+                    }
+                });
+                self.clear_all_ime_preedits(cx);
+                self.stop_settings_mic_test_capture(cx);
+                self.settings_router.update(cx, |r, rcx| {
+                    r.reset_for_logout_or_account_switch(rcx);
+                });
                 self.spawn_ws_status_observer(cx);
                 self.sync_settings_advanced_to_active_proxy(cx);
                 cx.notify();
@@ -1426,7 +2063,17 @@ impl AppShell {
             SettingsRouterEvent::Computers(ev) => self.handle_computer_settings_event(ev, cx),
             SettingsRouterEvent::AiProviders(ev) => self.handle_ai_providers_settings_event(ev, cx),
             SettingsRouterEvent::VaultCustody(act) => self.handle_settings_vault_action(act, cx),
+            SettingsRouterEvent::ActiveInputFieldChanged => {
+                if self.is_settings_unoccluded(cx) {
+                    self.clear_all_ime_preedits(cx);
+                }
+            }
             SettingsRouterEvent::Navigated(sec) => {
+                if self.is_settings_unoccluded(cx) {
+                    self.clear_all_ime_preedits(cx);
+                } else {
+                    self.settings_router.update(cx, |sr, scx| sr.clear_all_preedits(scx));
+                }
                 if *sec != SettingsSectionType::Calls {
                     self.stop_settings_mic_test_capture(cx);
                 }
