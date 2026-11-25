@@ -11,7 +11,49 @@ use crate::views::boxes::passcode_box::{PasscodeBox, PasscodeMode};
 use crate::views::modal_boxes_suite::ActiveModalDialog;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_telegram_client::ProxyEndpointRecord;
+use gpui_telegram_client::{ClientProxyConfig, ProxyEndpointRecord};
+
+pub fn proxy_record_to_config(p: &ProxyEndpointRecord) -> ProxyConfig {
+    let kind_lower = p.kind.trim().to_ascii_lowercase();
+    let proxy_type = match kind_lower.as_str() {
+        "socks5" | "socks5h" => ProxyType::Socks5,
+        "mtproto" => ProxyType::Mtproto,
+        "direct" | "none" => ProxyType::None,
+        _ => ProxyType::Web,
+    };
+    let (user, password, secret) = match proxy_type {
+        ProxyType::Socks5 => {
+            let effective_user = p
+                .username
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    let s = p.secret_or_user.trim();
+                    (!s.is_empty()).then(|| s.to_string())
+                });
+            let effective_pass = p.password.clone().filter(|s| !s.is_empty());
+            (effective_user, effective_pass, None)
+        }
+        ProxyType::Mtproto => {
+            let sec = (!p.secret_or_user.trim().is_empty())
+                .then(|| p.secret_or_user.trim().to_string());
+            (None, None, sec)
+        }
+        ProxyType::Web | ProxyType::None => (None, None, None),
+    };
+    ProxyConfig {
+        id: p.id,
+        proxy_type,
+        host: p.host.clone(),
+        port: p.port,
+        user,
+        password,
+        secret,
+        ping_ms: Some(p.ping_ms),
+        state: ProxyItemState::Online,
+        is_enabled: p.enabled,
+    }
+}
 
 pub fn render_connection_proxy<V: 'static>(
     dlg: &ActiveModalDialog,
@@ -82,26 +124,7 @@ pub fn render_connection_proxy<V: 'static>(
             } else {
                 el.children(dlg.proxies.iter().cloned().map(|p| {
                     let pid = p.id;
-                    let cfg = ProxyConfig {
-                        id: p.id,
-                        proxy_type: match p.kind.to_ascii_lowercase().as_str() {
-                            "socks5" => ProxyType::Socks5,
-                            "mtproto" => ProxyType::Mtproto,
-                            _ => ProxyType::Web,
-                        },
-                        host: p.host.clone(),
-                        port: p.port,
-                        user: None,
-                        password: None,
-                        secret: if p.secret_or_user.is_empty() {
-                            None
-                        } else {
-                            Some(p.secret_or_user.clone())
-                        },
-                        ping_ms: Some(p.ping_ms),
-                        state: ProxyItemState::Online,
-                        is_enabled: p.enabled,
-                    };
+                    let cfg = proxy_record_to_config(&p);
                     let tg_link = proxy_to_tg_link(&cfg);
                     div()
                         .px(px(10.0))
@@ -238,7 +261,18 @@ pub fn render_connection_proxy<V: 'static>(
                             MouseButton::Left,
                             cx.listener(move |this, _e, _w, cx| {
                                 let d = access(this);
-                                let host = d.primary_input.trim().to_string();
+                                let raw_trimmed = d.primary_input.trim();
+                                let host = if raw_trimmed.starts_with('[')
+                                    && raw_trimmed.ends_with(']')
+                                    && raw_trimmed.len() >= 2
+                                    && raw_trimmed[1..raw_trimmed.len() - 1]
+                                        .parse::<std::net::Ipv6Addr>()
+                                        .is_ok()
+                                {
+                                    raw_trimmed[1..raw_trimmed.len() - 1].to_string()
+                                } else {
+                                    raw_trimmed.to_string()
+                                };
                                 let port_val = d.secondary_input.trim().parse::<u16>();
                                 let Some(port) = port_val.ok().filter(|&p| p > 0) else {
                                     d.validation_error = Some(
@@ -255,16 +289,15 @@ pub fn render_connection_proxy<V: 'static>(
                                     return;
                                 }
                                 let next_id = d.proxies.iter().map(|p| p.id).max().unwrap_or(0) + 1;
-                                let (username, password) = if let Some((u, p)) =
-                                    d.tertiary_input.split_once(':')
-                                {
+                                let is_mtproto = d.new_proxy_kind.eq_ignore_ascii_case("MTProto");
+                                let (username, password) = if is_mtproto {
+                                    (None, None)
+                                } else if let Some((u, p)) = d.tertiary_input.split_once(':') {
                                     (
                                         (!u.trim().is_empty()).then(|| u.trim().to_string()),
                                         (!p.is_empty()).then(|| p.to_string()),
                                     )
-                                } else if !d.tertiary_input.trim().is_empty()
-                                    && !d.new_proxy_kind.eq_ignore_ascii_case("MTProto")
-                                {
+                                } else if !d.tertiary_input.trim().is_empty() {
                                     (Some(d.tertiary_input.trim().to_string()), None)
                                 } else {
                                     (None, None)
@@ -280,6 +313,11 @@ pub fn render_connection_proxy<V: 'static>(
                                     ping_ms: 0,
                                     enabled: true,
                                 };
+                                if let Err(err) = ClientProxyConfig::validate_record(&rec) {
+                                    d.validation_error = Some(err.to_string());
+                                    cx.notify();
+                                    return;
+                                }
                                 for p in &mut d.proxies {
                                     p.enabled = false;
                                 }

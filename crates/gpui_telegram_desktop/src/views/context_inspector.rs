@@ -181,6 +181,7 @@ pub struct ContextInspector {
     pub language_id: String,
     pub computers: Vec<ComputerNodeDto>,
     pub bot_computer_profile: Option<BotComputerProfileDto>,
+    pub ai_models: InspectorAiModelCatalog,
     pub bot_config_focus: BotConfigFocusField,
     pub bot_draft_persona: String,
     pub bot_draft_model: String,
@@ -234,6 +235,7 @@ impl ContextInspector {
             language_id: "en".to_string(),
             computers: Vec::new(),
             bot_computer_profile: None,
+            ai_models: InspectorAiModelCatalog::default(),
             bot_config_focus: BotConfigFocusField::None,
             bot_draft_persona: String::new(),
             bot_draft_model: String::new(),
@@ -407,7 +409,9 @@ impl ContextInspector {
     }
 
     pub fn clear_peer(&mut self) { self.is_open = false; self.active_tab = InspectorTab::Profile; self.clear_peer_facts(); }
-    pub fn configure_for_cloud_workspace(&mut self, _server_url: &str) { self.clear_peer(); }
+    pub fn configure_for_cloud_workspace(&mut self, _server_url: &str) { self.clear_peer(); self.clear_ai_models(); }
+    pub fn sync_ai_models(&mut self, catalog: InspectorAiModelCatalog) { self.ai_models = catalog; }
+    pub fn clear_ai_models(&mut self) { self.ai_models = InspectorAiModelCatalog::default(); }
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) { self.palette = palette; }
     pub fn set_language(&mut self, lang: impl Into<String>) { self.language_id = lang.into(); }
     pub fn take_action(&mut self) -> Option<InspectorAction> { self.pending_action.take() }
@@ -626,6 +630,27 @@ impl ContextInspector {
         self.computers = computers;
     }
 
+    /// Resolves the bot's explicit per-bot preferred model override (empty/`None` means follow Settings).
+    pub fn effective_bot_preferred_model(&self) -> Option<String> {
+        if let Some(ref p) = self.bot_computer_profile {
+            let trimmed = p.preferred_model.trim();
+            if !trimmed.is_empty() {
+                return (!InspectorAiModelCatalog::is_placeholder_model(trimmed))
+                    .then(|| trimmed.to_string());
+            }
+            // Non-zero updated_at_ms means the profile was explicitly saved with an empty override
+            // ("Follow Settings"), so do not resurrect a stale value from a cached summary.
+            if p.updated_at_ms > 0 {
+                return None;
+            }
+        }
+        self.active_fabushi_bot
+            .as_ref()
+            .map(|b| b.preferred_model.trim())
+            .filter(|s| !InspectorAiModelCatalog::is_placeholder_model(s))
+            .map(ToString::to_string)
+    }
+
     pub fn sync_bot_computer_profile(&mut self, profile: Option<BotComputerProfileDto>) {
         let same_bot = self
             .bot_computer_profile
@@ -637,32 +662,34 @@ impl ContextInspector {
         if !editing_now {
             if let Some(p) = profile {
                 self.bot_draft_persona = p.persona_prompt;
-                self.bot_draft_model = p.preferred_model;
+                self.bot_draft_model = self.effective_bot_preferred_model().unwrap_or_default();
                 self.bot_draft_approval_mode = p.approval_mode;
                 self.bot_draft_allow_cross_device = p.allow_cross_device_control;
                 self.bot_draft_allow_cloud_self_config = p.allow_cloud_self_config;
             } else {
                 self.bot_draft_persona = self.profile.bot_persona_prompt.clone();
-                if self.bot_draft_model.is_empty() {
-                    self.bot_draft_model = "gpt-5.4".to_string();
-                }
+                self.bot_draft_model = self.effective_bot_preferred_model().unwrap_or_default();
             }
         }
     }
 
     pub fn open_bot_config_editor(&mut self, cx: &mut Context<Self>) {
         self.ensure_bot_inputs(cx);
+        if let Some(ref ctrl) = self.persona_input {
+            ctrl.update(cx, |c, _| c.clear_preedit());
+        }
+        if let Some(ref ctrl) = self.model_input {
+            ctrl.update(cx, |c, _| c.clear_preedit());
+        }
         if let Some(ref p) = self.bot_computer_profile {
             self.bot_draft_persona = p.persona_prompt.clone();
-            self.bot_draft_model = p.preferred_model.clone();
+            self.bot_draft_model = self.effective_bot_preferred_model().unwrap_or_default();
             self.bot_draft_approval_mode = p.approval_mode;
             self.bot_draft_allow_cross_device = p.allow_cross_device_control;
             self.bot_draft_allow_cloud_self_config = p.allow_cloud_self_config;
         } else {
             self.bot_draft_persona = self.profile.bot_persona_prompt.clone();
-            if self.bot_draft_model.is_empty() {
-                self.bot_draft_model = "gpt-5.4".to_string();
-            }
+            self.bot_draft_model = self.effective_bot_preferred_model().unwrap_or_default();
         }
         self.subpage = InspectorSubpage::BotConfigEditor;
         self.bot_config_focus = BotConfigFocusField::Persona;

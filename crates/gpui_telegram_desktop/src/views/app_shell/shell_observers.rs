@@ -15,6 +15,7 @@ use gpui_telegram_proto::miniapp_contracts::MiniAppLaunchMode;
 use crate::i18n::tr_str;
 use crate::views::app_shell::shell_state::should_switch_to_chats_on_sidebar_selection;
 use crate::views::app_shell::shell_theme::toggle_desktop_theme_mode;
+use crate::views::app_shell::shell_truth::ClientCallFence;
 use crate::views::app_shell::window_connecting_widget::ConnectionStatus as BannerConnectionStatus;
 use crate::views::auth::AuthWizardEvent;
 use crate::views::boxes::modal_types::ModalDialogKind;
@@ -25,15 +26,26 @@ use crate::views::settings::{settings_type::SettingsSectionType, SettingsRouterE
 use crate::views::shell::{toggled_language_code, ActiveWorkspacePanel, AppShell};
 
 impl AppShell {
-    fn spawn_shell_fut<R: 'static, Fut: Future<Output = R> + 'static>(
+    fn spawn_authed_shell_fut<R: 'static, Fut: Future<Output = R> + 'static>(
         &self,
         cx: &mut Context<Self>,
-        fut: Fut,
+        build_fut: impl FnOnce(ClientCallFence) -> Fut + 'static,
         apply: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
     ) {
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let out = fut.await;
-            let _ = weak.update(app, |shell, cx| apply(shell, out, cx));
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let out = build_fut(fence.clone()).await;
+            let _ = weak.update(app, |shell, cx| {
+                if !fence.is_valid(shell) {
+                    return;
+                }
+                apply(shell, out, cx);
+            });
         })
         .detach();
     }
@@ -55,6 +67,17 @@ impl AppShell {
     ) {
         let msg = tr_str(self.active_lang_id(), zh, en);
         self.show_toast(msg, duration_ms, cx);
+    }
+
+    pub fn enqueue_localized_non_chat_toast(
+        &mut self,
+        zh: &'static str,
+        en: &'static str,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let msg = tr_str(self.active_lang_id(), zh, en);
+        self.show_non_chat_toast(msg, duration_ms, cx);
     }
 
     /// Wires all child view subscriptions, entity observers, and the WS status monitor.
@@ -252,13 +275,15 @@ impl AppShell {
         })
         .detach();
         let mut prev_creation_dialog_open = false;
+        let mut prev_modal_active = false;
         cx.observe(&self.modal_container, move |shell, modal, cx| {
             if let Some(outcome) = modal.update(cx, |m, _| m.take_outcome()) {
                 shell.handle_modal_outcome(outcome, cx);
             }
-            let cur_creation_dialog_open = {
+            let (cur_modal_active, cur_creation_dialog_open) = {
                 let mc = modal.read(cx);
-                mc.is_modal_active()
+                let active = mc.is_modal_active();
+                let creation = active
                     && matches!(
                         mc.dialog.kind,
                         Some(
@@ -267,8 +292,12 @@ impl AppShell {
                                 | ModalDialogKind::AddContact
                                 | ModalDialogKind::Contacts
                         )
-                    )
+                    );
+                (active, creation)
             };
+            if !prev_modal_active && cur_modal_active {
+                shell.reconcile_chat_scoped_toasts(cx);
+            }
             if !prev_creation_dialog_open && cur_creation_dialog_open {
                 shell.enter_compose_or_modal_isolation(cx);
             } else if prev_creation_dialog_open
@@ -277,6 +306,7 @@ impl AppShell {
             {
                 shell.exit_compose_or_modal_isolation(true, cx);
             }
+            prev_modal_active = cur_modal_active;
             prev_creation_dialog_open = cur_creation_dialog_open;
         })
         .detach();
@@ -308,7 +338,7 @@ impl AppShell {
             if menu_req {
                 shell.sidebar.update(cx, |s, s_cx| {
                     s.is_account_popover_open = !s.is_account_popover_open;
-                    s.exit_compose_mode();
+                    s.cancel_compose_mode();
                     s_cx.notify();
                 });
                 if shell.composer.read(cx).is_compose_isolated
@@ -425,10 +455,16 @@ impl AppShell {
             if open_menu {
                 shell.sidebar.update(cx, |s, s_cx| {
                     s.is_account_popover_open = !s.is_account_popover_open;
-                    s.is_plus_menu_open = false;
-                    s.compose_recipient_query.clear();
+                    s.cancel_compose_mode();
                     s_cx.notify();
                 });
+                if shell.composer.read(cx).is_compose_isolated
+                    && !shell.is_compose_or_creation_modal_active(cx)
+                {
+                    shell.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    shell.sync_compose_state_to_composer(true, cx);
+                }
                 shell_dirty = true;
             }
             let (sb_popup, cur_overlay_open, cur_compose_open, cur_compose_query) = {
@@ -596,13 +632,10 @@ impl AppShell {
                 });
             if let Some(old_cid) = shell.last_observed_toast_chat_id {
                 if cur_chat_id != Some(old_cid) {
-                    if shell.window_runtime.controller.clear_toasts_for_chat(old_cid) {
-                        shell.schedule_current_toast_dismiss(cx);
-                    }
                     shell.composer.update(cx, |c, _| c.clear_bot_reply_keyboard());
                 }
             }
-            shell.last_observed_toast_chat_id = cur_chat_id;
+            shell.reconcile_chat_scoped_toasts(cx);
             let is_apple_compose_mode = shell.theme_state.palette.is_apple_style()
                 && shell.sidebar.read(cx).is_plus_menu_open;
             if card_input_active || (!is_apple_compose_mode && show_bot_start_bar) {
@@ -688,7 +721,7 @@ impl AppShell {
                         | BotKeyboardButtonKind::RequestPoll
                         | BotKeyboardButtonKind::Buy => {
                             if !btn.text.trim().is_empty() {
-                                shell.append_outgoing_text(btn.text, cx);
+                                shell.append_non_composer_outgoing_text(btn.text, cx);
                             }
                         }
                     }
@@ -732,30 +765,55 @@ impl AppShell {
                 let vault_bootstrap = self
                     .auth_wizard
                     .update(cx, |w, _| w.take_pending_vault_bootstrap());
+                if self.is_authenticated {
+                    drop(vault_bootstrap);
+                    return;
+                }
                 self.apply_authenticated_session_with_vault(auth.clone(), vault_bootstrap, cx);
             }
             AuthWizardEvent::ServerUrlApplied(url) => {
-                let cache_dir = self.client.local_store.cache_dir().map(|p| p.to_path_buf());
+                self.proxy_op_generation = self.proxy_op_generation.wrapping_add(1);
+                let wizard_client = self.auth_wizard.read(cx).client.clone();
+                let reuse_wizard_client = !Arc::ptr_eq(&wizard_client, &self.client)
+                    && wizard_client.config.server_url == *url;
                 self.client.local_store.clear_all();
-                let mut new_cfg = self.client.config.clone();
-                new_cfg.server_url = url.clone();
-                let next_client = Arc::new(match cache_dir {
-                    Some(dir) => TelegramClient::open_with_dir(new_cfg.clone(), dir)
-                        .unwrap_or_else(|_| TelegramClient::new(new_cfg)),
-                    None => TelegramClient::new(new_cfg),
-                });
-                next_client.ws_transport.set_max_reconnect_attempts(next_client.config.max_reconnect_attempts);
+                self.client.clear_session();
+                let next_client = if reuse_wizard_client {
+                    wizard_client
+                } else {
+                    let cache_dir = self.client.local_store.cache_dir().map(|p| p.to_path_buf());
+                    let mut new_cfg = self.client.config.clone();
+                    new_cfg.server_url = url.clone();
+                    Arc::new(match cache_dir {
+                        Some(dir) => TelegramClient::open_with_dir(new_cfg.clone(), dir)
+                            .unwrap_or_else(|_| TelegramClient::new(new_cfg)),
+                        None => TelegramClient::new(new_cfg),
+                    })
+                };
+                next_client
+                    .ws_transport
+                    .set_max_reconnect_attempts(next_client.config.max_reconnect_attempts);
                 self.client = next_client;
+                if let Some(ref handler) = self.remote_host.ipc_handler {
+                    handler.set_client(self.client.clone());
+                    handler.set_local_node_id(None);
+                }
+                let client_for_wizard = self.client.clone();
+                self.auth_wizard.update(cx, |w, _| {
+                    w.sync_client_for_server_url(client_for_wizard, url.clone());
+                });
+                self.computers.reset_on_logout();
                 self.session_sync.ws_stream_started = false;
                 self.coding_host.registered_for_auth_gen = None;
                 self.sidebar.update(cx, |sb, _| sb.configure_for_cloud_workspace(url));
                 self.stage.update(cx, |st, _| st.configure_for_cloud_workspace(url, None));
                 self.inspector.update(cx, |insp, _| insp.configure_for_cloud_workspace(url));
                 self.spawn_ws_status_observer(cx);
+                self.sync_settings_advanced_to_active_proxy(cx);
                 cx.notify();
             }
             AuthWizardEvent::Toast { message, duration_ms } => {
-                self.show_toast(message.clone(), *duration_ms, cx);
+                self.show_non_chat_toast(message.clone(), *duration_ms, cx);
             }
             AuthWizardEvent::ToggleTheme => {
                 let next = toggle_desktop_theme_mode(self.theme_state.theme_mode);
@@ -791,7 +849,7 @@ impl AppShell {
             }
             SettingsRouterEvent::CopyClipboard(txt) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(txt.clone()));
-                self.enqueue_localized_toast("已复制到剪贴板", "Copied to clipboard", 1800, cx);
+                self.enqueue_localized_non_chat_toast("已复制到剪贴板", "Copied to clipboard", 1800, cx);
             }
             SettingsRouterEvent::UpdateInterfaceScale(pct) => {
                 let pct = *pct;
@@ -831,37 +889,61 @@ impl AppShell {
                 });
             }
             SettingsRouterEvent::SaveProfile { first_name, last_name, username, phone, bio } => {
-                let c = self.client.clone();
                 let req = ProtoUpdateProfileRequest {
                     first_name: Some(first_name.clone()), last_name: Some(last_name.clone()),
                     username: username.clone(), phone: Some(phone.clone()), bio: Some(bio.clone()),
                     avatar_media_id: None, emoji_status: None,
                 };
-                self.spawn_shell_fut(cx, async move { c.update_profile(&req).await }, |s, res, cx| match res {
+                self.spawn_authed_shell_fut(
+                    cx,
+                    move |fence| async move {
+                        fence
+                            .client
+                            .update_profile_with_token(&fence.token, fence.client_epoch, &req)
+                            .await
+                    },
+                    |s, res, cx| match res {
                     Ok(_) => {
                         let msg = tr_str(s.active_lang_id(), "个人资料已保存", "Profile saved").to_string();
                         let info = s.settings_router.update(cx, |r, rcx| r.ensure_information(rcx));
                         info.update(cx, |is, icx| { is.status_message = Some(msg.clone()); icx.notify(); });
-                        s.window_runtime.enqueue_toast(msg, 2200);
+                        s.show_non_chat_toast(msg, 2200, cx);
                         s.refresh_settings_truth(cx);
                     }
-                    Err(e) => { s.window_runtime.enqueue_toast(format!("Save failed: {e}"), 2600); cx.notify(); }
+                    Err(e) => { s.show_non_chat_toast(format!("Save failed: {e}"), 2600, cx); cx.notify(); }
                 });
             }
             SettingsRouterEvent::TwoFactorMutation(pw_opt) => {
-                let (c, pw_opt) = (self.client.clone(), pw_opt.clone());
+                let pw_opt = pw_opt.clone();
                 let enabled = pw_opt.is_some();
-                let fut = async move {
-                    match pw_opt {
-                        Some(pw) => c.set_2fa(&TwoFactorSetRequest {
-                            current_password: None, new_password: pw, hint: None, recovery_email: None,
-                        }).await.is_ok(),
-                        None => c.disable_2fa(None).await.is_ok(),
-                    }
-                };
-                self.spawn_shell_fut(cx, fut, move |s, ok, cx| {
+                self.spawn_authed_shell_fut(
+                    cx,
+                    move |fence| async move {
+                        match pw_opt {
+                            Some(pw) => fence
+                                .client
+                                .set_2fa_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    &TwoFactorSetRequest {
+                                        current_password: None,
+                                        new_password: pw,
+                                        hint: None,
+                                        recovery_email: None,
+                                    },
+                                )
+                                .await
+                                .is_ok(),
+                            None => fence
+                                .client
+                                .disable_2fa_with_token(&fence.token, fence.client_epoch, None)
+                                .await
+                                .is_ok(),
+                        }
+                    },
+                    move |s, ok, cx| {
                     if !ok {
-                        s.enqueue_localized_toast("两步验证操作失败", "Failed to update 2FA", 2400, cx);
+                        s.enqueue_localized_non_chat_toast("两步验证操作失败", "Failed to update 2FA", 2400, cx);
                         return;
                     }
                     let pe = s.settings_router.update(cx, |r, rcx| r.ensure_privacy(rcx));
@@ -871,28 +953,51 @@ impl AppShell {
                     } else {
                         ("两步验证已关闭", "Two-Step Verification disabled")
                     };
-                    s.enqueue_localized_toast(zh, en, 2200, cx);
+                    s.enqueue_localized_non_chat_toast(zh, en, 2200, cx);
                 });
             }
             SettingsRouterEvent::PushUserSettings => self.push_user_settings_to_backend(cx),
             SettingsRouterEvent::RevokeSession(sid) => {
-                let (c, sid) = (self.client.clone(), sid.clone());
-                self.spawn_shell_fut(cx, async move { let _ = c.revoke_session(&sid).await; }, |s, _, cx| {
-                    s.enqueue_localized_toast("已注销该设备会话", "Session terminated", 2000, cx);
+                let sid = sid.clone();
+                self.spawn_authed_shell_fut(
+                    cx,
+                    move |fence| async move {
+                        let _ = fence
+                            .client
+                            .revoke_session_with_token(&fence.token, fence.client_epoch, &sid)
+                            .await;
+                    },
+                    |s, _, cx| {
+                    s.enqueue_localized_non_chat_toast("已注销该设备会话", "Session terminated", 2000, cx);
                     s.refresh_settings_truth(cx);
                 });
             }
             SettingsRouterEvent::RevokeOtherSessions => {
-                let c = self.client.clone();
-                self.spawn_shell_fut(cx, async move { let _ = c.revoke_other_sessions().await; }, |s, _, cx| {
-                    s.enqueue_localized_toast("已注销所有其他设备", "Terminated all other sessions", 2200, cx);
+                self.spawn_authed_shell_fut(
+                    cx,
+                    |fence| async move {
+                        let _ = fence
+                            .client
+                            .revoke_other_sessions_with_token(&fence.token, fence.client_epoch)
+                            .await;
+                    },
+                    |s, _, cx| {
+                    s.enqueue_localized_non_chat_toast("已注销所有其他设备", "Terminated all other sessions", 2200, cx);
                     s.refresh_settings_truth(cx);
                 });
             }
             SettingsRouterEvent::UnblockPeer { user_id, .. } => {
-                let (c, uid) = (self.client.clone(), *user_id);
-                self.spawn_shell_fut(cx, async move { let _ = c.unblock_user(uid).await; }, |s, _, cx| {
-                    s.enqueue_localized_toast("已取消屏蔽该用户", "User unblocked", 2000, cx);
+                let uid = *user_id;
+                self.spawn_authed_shell_fut(
+                    cx,
+                    move |fence| async move {
+                        let _ = fence
+                            .client
+                            .unblock_user_with_token(&fence.token, fence.client_epoch, uid)
+                            .await;
+                    },
+                    |s, _, cx| {
+                    s.enqueue_localized_non_chat_toast("已取消屏蔽该用户", "User unblocked", 2000, cx);
                     s.refresh_chats(cx);
                 });
             }
@@ -903,7 +1008,7 @@ impl AppShell {
                     self.overlays.passcode_unlock_error = None;
                     self.update_preferences(cx, |p| p.local_passcode_hash = None);
                     self.push_user_settings_to_backend(cx);
-                    self.enqueue_localized_toast("本地密码锁已关闭", "Local passcode disabled", 2000, cx);
+                    self.enqueue_localized_non_chat_toast("本地密码锁已关闭", "Local passcode disabled", 2000, cx);
                 } else {
                     self.update_preferences(cx, |p| {
                         p.local_passcode_hash = hash.clone();
@@ -949,12 +1054,22 @@ impl AppShell {
                         st_cx.notify();
                     });
                 }
-                if self.is_authenticated && self.session_sync.session_token.is_some() {
-                    let c = self.client.clone();
+                if let Some(fence) = self.capture_client_fence() {
                     let ids = direct_chat_ids.clone();
-                    cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                         for cid in ids {
-                            let _ = c.set_chat_ttl(cid as i64, ttl_secs).await;
+                            if !fence.preflight_ui(&weak, app).await {
+                                break;
+                            }
+                            let _ = fence
+                                .client
+                                .set_chat_ttl_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    cid as i64,
+                                    ttl_secs,
+                                )
+                                .await;
                         }
                     })
                     .detach();
@@ -967,7 +1082,7 @@ impl AppShell {
                         direct_chat_ids.len()
                     )
                 };
-                self.window_runtime.enqueue_toast(msg, 2200);
+                self.show_non_chat_toast(msg, 2200, cx);
                 cx.notify();
             }
             SettingsRouterEvent::UpdateNotificationPrefs {
@@ -1023,18 +1138,35 @@ impl AppShell {
                 self.update_preferences(cx, |p| p.folder_tags_enabled = *on);
             }
             SettingsRouterEvent::CreateFolder { id, title } => {
-                let c = self.client.clone();
                 let dto = ChatFolderDto {
                     id: *id as i64, title: title.clone(),
                     include_contacts: true, include_non_contacts: true,
                     include_groups: true, include_channels: true, include_bots: true,
                     ..Default::default()
                 };
-                self.spawn_shell_fut(cx, async move { let _ = c.save_folder(&dto).await; }, |s, _, cx| s.refresh_folders(cx));
+                self.spawn_authed_shell_fut(
+                    cx,
+                    move |fence| async move {
+                        let _ = fence
+                            .client
+                            .save_folder_with_token(&fence.token, fence.client_epoch, &dto)
+                            .await;
+                    },
+                    |s, _, cx| s.refresh_folders(cx),
+                );
             }
             SettingsRouterEvent::DeleteFolder(fid) => {
-                let (c, fid) = (self.client.clone(), *fid as i64);
-                self.spawn_shell_fut(cx, async move { let _ = c.delete_folder(fid).await; }, |s, _, cx| s.refresh_folders(cx));
+                let fid = *fid as i64;
+                self.spawn_authed_shell_fut(
+                    cx,
+                    move |fence| async move {
+                        let _ = fence
+                            .client
+                            .delete_folder_with_token(&fence.token, fence.client_epoch, fid)
+                            .await;
+                    },
+                    |s, _, cx| s.refresh_folders(cx),
+                );
             }
             SettingsRouterEvent::UpdateAdvancedPrefs {
                 ask_download_path, opengl_enabled, native_window_frame, tray_icon_enabled, auto_update_enabled,
@@ -1071,7 +1203,7 @@ impl AppShell {
                         start_ok = self.rtc_talk.voice_recorder.start().is_ok();
                     }
                     if !start_ok && !self.rtc_talk.voice_recorder.is_recording() {
-                        self.enqueue_localized_toast(
+                        self.enqueue_localized_non_chat_toast(
                             "当前环境未检测到可用麦克风输入流",
                             "Microphone capture unavailable in current environment",
                             2200,
@@ -1133,13 +1265,21 @@ impl AppShell {
                 if !self.is_authenticated || self.session_sync.session_token.is_none() {
                     return;
                 }
-                let (c, amount) = (self.client.clone(), i64::from(*amount));
-                self.spawn_shell_fut(cx, async move { c.wallet_topup(amount).await }, |s, res, cx| {
+                let amount = i64::from(*amount);
+                self.spawn_authed_shell_fut(
+                    cx,
+                    move |fence| async move {
+                        fence
+                            .client
+                            .wallet_topup_with_token(&fence.token, fence.client_epoch, amount)
+                            .await
+                    },
+                    |s, res, cx| {
                     match res {
-                        Ok(_) => s.enqueue_localized_toast("星币充值已到账", "Stars top-up completed", 2200, cx),
+                        Ok(_) => s.enqueue_localized_non_chat_toast("星币充值已到账", "Stars top-up completed", 2200, cx),
                         Err(e) => {
                             let pfx = tr_str(s.active_lang_id(), "星币充值失败", "Top-up failed");
-                            s.window_runtime.enqueue_toast(format!("{pfx}: {e}"), 2600);
+                            s.show_non_chat_toast(format!("{pfx}: {e}"), 2600, cx);
                             cx.notify();
                         }
                     }
@@ -1147,7 +1287,7 @@ impl AppShell {
                 });
             }
             SettingsRouterEvent::WithdrawStars => {
-                self.enqueue_localized_toast(
+                self.enqueue_localized_non_chat_toast(
                     "已提交创作者收益提现申请",
                     "Creator TON withdrawal requested",
                     2200,
@@ -1161,16 +1301,16 @@ impl AppShell {
                 } else {
                     format!("Telegram Premium ({months} mo) activated")
                 };
-                self.window_runtime.enqueue_toast(msg, 2200);
+                self.show_non_chat_toast(msg, 2200, cx);
                 cx.notify();
             }
             SettingsRouterEvent::UpdatePasskeysPrefs(names) => {
                 self.update_preferences(cx, |p| p.passkey_names = names.clone());
-                self.enqueue_localized_toast("通行密钥设置已保存", "Passkeys updated", 1800, cx);
+                self.enqueue_localized_non_chat_toast("通行密钥设置已保存", "Passkeys updated", 1800, cx);
             }
             SettingsRouterEvent::UpdateWebsitesPrefs(domains) => {
                 self.update_preferences(cx, |p| p.connected_website_domains = domains.clone());
-                self.enqueue_localized_toast("已更新授权网站列表", "Connected websites updated", 1800, cx);
+                self.enqueue_localized_non_chat_toast("已更新授权网站列表", "Connected websites updated", 1800, cx);
             }
             SettingsRouterEvent::UpdateShortcutsPrefs { enabled, filter } => {
                 self.update_preferences(cx, |p| {

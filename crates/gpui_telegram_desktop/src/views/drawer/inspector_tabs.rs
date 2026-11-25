@@ -3,9 +3,13 @@
 use crate::i18n::tr_str;
 use crate::theme::assets::{IconName, tg_icon};
 use crate::theme::palette::TdesktopThemePalette;
+use crate::views::settings::sections::settings_ai_providers::{
+    SubscriptionAccountDto, sub_dto_to_account_dto,
+};
 use crate::views::ContextInspector;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_client::net::hermes_client::MagpieStateDto;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,9 +127,288 @@ pub enum InspectorAction {
     OpenMiniAppTos,
     OpenBotPrivacyPolicy(String),
     OpenBotSettings(u64),
+    OpenAiProvidersSettings,
     OpenAddBotToGroup(u64),
     ReportBot(u64),
     ToggleBlockBot(u64),
+}
+
+/// Live AI provider & model catalog synchronized from Settings (`MagpieStateDto` + discovered subscriptions).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorAiModelCatalog {
+    /// Active provider ID in Settings (empty when no provider is configured/selected).
+    pub active_provider_id: String,
+    /// Human-readable active provider name in Settings.
+    pub active_provider_name: String,
+    /// Currently active model in Settings (empty when none configured).
+    pub active_model: String,
+    /// Whether Settings currently requires selecting/configuring a provider.
+    pub needs_provider_selection: bool,
+    /// True once at least one Settings/Magpie snapshot has been synced.
+    pub synced: bool,
+    /// Real models available on the currently active Settings provider/subscription.
+    pub active_provider_models: Vec<String>,
+    /// Routing groups (`group/<id>`) configured in Settings.
+    pub routing_group_models: Vec<String>,
+}
+
+impl InspectorAiModelCatalog {
+    /// Returns `true` for empty or sentinel placeholder model strings that mean "inherit Settings default".
+    pub fn is_placeholder_model(model: &str) -> bool {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "default"
+                | "默认"
+                | "默认模型"
+                | "auto"
+                | "hermes-local-v1"
+                | "local_hermes/hermes-local-v1"
+        )
+    }
+
+    fn is_usable_model(model: &str, allow_local_hermes: bool) -> bool {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if allow_local_hermes {
+            !matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "default" | "默认" | "默认模型" | "auto"
+            )
+        } else {
+            !Self::is_placeholder_model(trimmed)
+        }
+    }
+
+    /// Builds a live model catalog directly from Settings' `MagpieStateDto` and subscription DTOs.
+    pub fn from_magpie_state(
+        state: &MagpieStateDto,
+        server_subs: &[SubscriptionAccountDto],
+        local_subs: &[SubscriptionAccountDto],
+    ) -> Self {
+        let mut merged_subs: Vec<SubscriptionAccountDto> = if !server_subs.is_empty() {
+            server_subs.to_vec()
+        } else {
+            state
+                .subscriptions
+                .iter()
+                .map(sub_dto_to_account_dto)
+                .collect()
+        };
+
+        for local in local_subs {
+            if let Some(existing) = merged_subs.iter_mut().find(|s| s.id == local.id) {
+                if !local.models.is_empty() {
+                    let mut combined = local.models.clone();
+                    for m in &existing.models {
+                        if !combined.iter().any(|c| c.eq_ignore_ascii_case(m)) {
+                            combined.push(m.clone());
+                        }
+                    }
+                    existing.models = combined;
+                }
+            } else {
+                merged_subs.push(local.clone());
+            }
+        }
+
+        let active_pid_raw = state.active_provider.trim();
+        let active_sub = if state.needs_provider_selection {
+            None
+        } else {
+            merged_subs
+                .iter()
+                .find(|sub| {
+                    !active_pid_raw.is_empty()
+                        && (sub.id == active_pid_raw
+                            || (sub.kind == "google_vertex"
+                                && active_pid_raw == "magpie_provider:google-vertex"))
+                })
+                .or_else(|| {
+                    active_pid_raw
+                        .is_empty()
+                        .then(|| merged_subs.iter().find(|sub| sub.active))
+                        .flatten()
+                })
+        };
+
+        let active_prov = if state.needs_provider_selection {
+            None
+        } else {
+            state
+                .providers
+                .iter()
+                .find(|p| !active_pid_raw.is_empty() && p.provider_id == active_pid_raw)
+                .or_else(|| state.providers.iter().find(|p| p.is_active))
+        };
+
+        let allow_local = active_pid_raw == "local_hermes"
+            && state.allow_local_fallback
+            && !state.needs_provider_selection;
+
+        let active_provider_id = if state.needs_provider_selection {
+            String::new()
+        } else if !active_pid_raw.is_empty() {
+            active_pid_raw.to_string()
+        } else if let Some(sub) = active_sub {
+            sub.id.clone()
+        } else if let Some(prov) = active_prov {
+            prov.provider_id.clone()
+        } else {
+            String::new()
+        };
+
+        let active_provider_name = if state.needs_provider_selection {
+            String::new()
+        } else if let Some(sub) = active_sub {
+            sub.label
+                .strip_prefix("Magpie ")
+                .unwrap_or(&sub.label)
+                .trim_end_matches(" (Magpie)")
+                .trim()
+                .to_string()
+        } else if let Some(prov) = active_prov.filter(|p| !p.name.trim().is_empty()) {
+            prov.name.trim().to_string()
+        } else if !active_provider_id.is_empty() && active_provider_id != "local_hermes" {
+            active_provider_id.clone()
+        } else {
+            String::new()
+        };
+
+        let active_model = if state.needs_provider_selection {
+            String::new()
+        } else if Self::is_usable_model(&state.active_model, allow_local) {
+            state.active_model.trim().to_string()
+        } else if let Some(m) = active_prov
+            .map(|p| p.default_model.trim())
+            .filter(|m| Self::is_usable_model(m, allow_local))
+        {
+            m.to_string()
+        } else if let Some(m) = active_sub
+            .and_then(|s| s.models.iter().find(|m| Self::is_usable_model(m, allow_local)))
+        {
+            m.trim().to_string()
+        } else {
+            String::new()
+        };
+
+        let mut active_provider_models: Vec<String> = Vec::new();
+        let mut push_active_model = |candidate: &str| {
+            let trimmed = candidate.trim();
+            if Self::is_usable_model(trimmed, allow_local)
+                && !active_provider_models
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+            {
+                active_provider_models.push(trimmed.to_string());
+            }
+        };
+
+        if !state.needs_provider_selection {
+            push_active_model(&active_model);
+            if let Some(sub) = active_sub {
+                for m in &sub.models {
+                    push_active_model(m);
+                }
+            }
+            if let Some(prov) = active_prov {
+                push_active_model(&prov.default_model);
+                for m in &prov.models {
+                    push_active_model(m);
+                }
+                let preset_key = prov
+                    .preset_id
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(prov.provider_id.as_str());
+                if let Some(preset) = state.presets.iter().find(|pr| pr.id == preset_key) {
+                    if let Some(reg_id) = prov.region_id.as_deref() {
+                        if let Some(reg) = preset.regions.iter().find(|r| r.id == reg_id) {
+                            for m in &reg.models {
+                                push_active_model(m);
+                            }
+                        }
+                    }
+                    push_active_model(&preset.default_model);
+                    for m in &preset.suggested_models {
+                        push_active_model(m);
+                    }
+                }
+            }
+        }
+
+        let mut routing_group_models: Vec<String> = Vec::new();
+        for group in &state.routing_groups {
+            let gid = group.id.trim();
+            if !gid.is_empty() {
+                let target = format!("group/{gid}");
+                if !routing_group_models
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&target))
+                {
+                    routing_group_models.push(target);
+                }
+            }
+        }
+
+        Self {
+            active_provider_id,
+            active_provider_name,
+            active_model,
+            needs_provider_selection: state.needs_provider_selection,
+            synced: true,
+            active_provider_models,
+            routing_group_models,
+        }
+    }
+
+    /// Returns all real selectable model IDs from Settings (active provider models followed by routing groups).
+    pub fn selectable_models(&self) -> Vec<String> {
+        let mut out = self.active_provider_models.clone();
+        for g in &self.routing_group_models {
+            if !out.iter().any(|existing| existing.eq_ignore_ascii_case(g)) {
+                out.push(g.clone());
+            }
+        }
+        out
+    }
+
+    /// Human-readable summary of the active Settings provider & model (e.g. `"Google Vertex AI · gemini-2.5-pro"`).
+    pub fn active_summary(&self) -> Option<String> {
+        if self.needs_provider_selection {
+            return None;
+        }
+        if !self.active_provider_name.is_empty() && !self.active_model.is_empty() {
+            Some(format!("{} · {}", self.active_provider_name, self.active_model))
+        } else if !self.active_model.is_empty() {
+            Some(self.active_model.clone())
+        } else if !self.active_provider_name.is_empty() {
+            Some(self.active_provider_name.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` when `model` is empty (follows Settings) or matches a real model available in Settings.
+    pub fn is_model_consistent_with_settings(&self, model: &str) -> bool {
+        let trimmed = model.trim();
+        if trimmed.is_empty() || !self.synced {
+            return true;
+        }
+        if self.needs_provider_selection {
+            return false;
+        }
+        let selectable = self.selectable_models();
+        if selectable.is_empty() {
+            return self.active_model.is_empty() || self.active_model.eq_ignore_ascii_case(trimmed);
+        }
+        selectable.iter().any(|m| m.eq_ignore_ascii_case(trimmed))
+    }
 }
 
 pub struct ProfileTabModel {

@@ -28,11 +28,10 @@ use crate::platform::mac::macos_permissions_drag::{
 use crate::platform::mac::tray_mac::tray_action_ids;
 use crate::views::app_shell::desktop_ipc_host::DesktopLocalIpcHandler;
 use crate::views::app_shell::shell_actions::resolve_active_target_chat_id;
-use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand};
+use crate::views::app_shell::shell_truth::ClientCallFence;
+use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand, WorkbenchTab};
 use crate::views::drawer::inspector_tabs::{InspectorAction, InspectorSubpage};
-use crate::views::remote_controlled_window::{
-    RemoteControlledWindowAction, open_controlled_status_window,
-};
+use crate::views::nav_rail::NavDestination;
 use crate::views::remote_terminal_view::RemoteTerminalAction;
 use crate::views::settings::sections::SettingsComputersEvent;
 use crate::views::settings::settings_type::SettingsSectionType;
@@ -50,33 +49,53 @@ where
         .map_err(|e| format!("tokio task join error: {e}"))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 struct ComputerAuthFence {
-    auth_generation: u64,
+    call: ClientCallFence,
     relay_generation: u64,
 }
 
+impl ComputerAuthFence {
+    fn client(&self) -> &Arc<TelegramClient> {
+        &self.call.client
+    }
+
+    fn token(&self) -> &str {
+        &self.call.token
+    }
+
+    fn client_epoch(&self) -> u64 {
+        self.call.client_epoch
+    }
+
+    async fn preflight_ui(&self, weak: &WeakEntity<AppShell>, app: &mut AsyncApp) -> bool {
+        weak.update(app, |shell, _| shell.computer_fence_matches(self))
+            .unwrap_or(false)
+    }
+}
+
 impl AppShell {
-    fn enqueue_computer_toast(&mut self, zh: &str, en: &str, duration_ms: u64) {
+    fn enqueue_computer_toast(
+        &mut self,
+        zh: &str,
+        en: &str,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
         let lang = self.active_lang_id().to_string();
-        self.window_runtime.enqueue_toast(tr_str(&lang, zh, en), duration_ms);
+        self.show_non_chat_toast(tr_str(&lang, zh, en), duration_ms, cx);
     }
 
     fn computer_fence(&self) -> Option<ComputerAuthFence> {
-        if !self.is_authenticated || self.session_sync.session_token.is_none() {
-            return None;
-        }
+        let call = self.capture_client_fence()?;
         Some(ComputerAuthFence {
-            auth_generation: self.session_sync.auth_generation,
+            call,
             relay_generation: self.computers.relay_generation,
         })
     }
 
-    fn computer_fence_matches(&self, fence: ComputerAuthFence) -> bool {
-        self.is_authenticated
-            && self.session_sync.session_token.is_some()
-            && self.session_sync.auth_generation == fence.auth_generation
-            && self.computers.relay_generation == fence.relay_generation
+    fn computer_fence_matches(&self, fence: &ComputerAuthFence) -> bool {
+        self.computers.relay_generation == fence.relay_generation && fence.call.is_valid(self)
     }
 
     /// Collects unique AI Bot `(bot_id, display_name)` pairs known to this workspace.
@@ -187,9 +206,18 @@ impl AppShell {
             icx.notify();
         });
 
+        let account_label = {
+            let nav_name = self.nav_rail.read(cx).account_name.trim().to_string();
+            if !nav_name.is_empty() {
+                nav_name
+            } else {
+                self.session_sync.username.clone().unwrap_or_default()
+            }
+        };
         let sr_computers_opt = self.settings_router.read(cx).settings_computers.clone();
         if let Some(sc_ent) = sr_computers_opt {
             sc_ent.update(cx, |sc, sc_cx| {
+                sc.sync_account_label(account_label.clone());
                 sc.sync_computers(nodes.clone());
                 sc.sync_known_bots(bots, active_bot_id);
                 sc.sync_tailnet_status(tailnet_status.clone());
@@ -198,14 +226,6 @@ impl AppShell {
                 sc.sync_mcp_grants(mcp_url.clone(), mcp_grants.clone());
                 sc.sync_cli_status(cli_status.clone());
                 sc_cx.notify();
-            });
-        }
-
-        if let Some(win) = self.remote_host.controlled_window {
-            let sessions_for_win = active_sessions.clone();
-            let _ = win.update(cx, |view, _, vcx| {
-                view.set_sessions(sessions_for_win);
-                vcx.notify();
             });
         }
 
@@ -342,66 +362,43 @@ impl AppShell {
         );
     }
 
-    pub fn open_or_focus_controlled_status_window(&mut self, cx: &mut Context<Self>) {
-        if let Some(existing) = self.remote_host.controlled_window {
-            let sessions = self.combined_remote_sessions();
-            let updated = existing
-                .update(cx, |view, window, vcx| {
-                    view.set_sessions(sessions);
-                    window.activate_window();
-                    vcx.notify();
-                })
-                .is_ok();
-            if updated {
-                return;
-            }
-            self.remote_host.controlled_window = None;
-        }
-
-        let hub = shared_remote_engine().hub.clone();
-        let sessions = self.combined_remote_sessions();
-        let lang = self.active_lang_id().to_string();
-        let mode = self.theme_state.theme_mode;
-        if let Ok(Some(handle)) = open_controlled_status_window(hub, sessions, lang, mode, cx) {
-            self.remote_host.controlled_window = Some(handle);
-            if let Ok(ent) = handle.update(cx, |_, _, vcx| vcx.entity()) {
-                cx.observe(&ent, |shell, view, cx| {
-                    let actions = view.update(cx, |v, _| v.take_actions());
-                    for act in actions {
-                        match act {
-                            RemoteControlledWindowAction::DisconnectAll { .. } => {
-                                shell.disconnect_all_remote_control(cx);
-                            }
-                            RemoteControlledWindowAction::DisconnectSession {
-                                session_id, ..
-                            } => {
-                                shell.disconnect_remote_session(session_id, cx);
-                            }
-                            RemoteControlledWindowAction::CloseRequested => {
-                                shell.remote_host.controlled_window = None;
-                            }
-                            RemoteControlledWindowAction::ToggleCollapse(_) => {}
-                        }
-                    }
-                })
-                .detach();
-            }
-        }
-    }
-
     pub fn disconnect_all_remote_control(&mut self, cx: &mut Context<Self>) {
         let local_count = shared_remote_engine().hub.disconnect_all();
         self.computers.active_sessions.clear();
         self.sync_computers_to_views(cx);
 
-        let client = self.client.clone();
+        let Some(fence) = self.computer_fence() else {
+            self.enqueue_computer_toast(
+                if local_count > 0 {
+                    "已立即断开所有远程控制与 AI MCP 会话"
+                } else {
+                    "已触发全局远控抢占保护"
+                },
+                "Disconnected all remote control sessions",
+                2200,
+                cx,
+            );
+            cx.notify();
+            return;
+        };
+
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let c = client.clone();
-            let _ = run_on_tokio(&client, async move {
-                c.disconnect_all_remote_sessions_async().await.ok()
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let c = fence.client().clone();
+            let tok = fence.token().to_string();
+            let epoch = fence.client_epoch();
+            let _ = run_on_tokio(&c.clone(), async move {
+                c.disconnect_all_remote_sessions_with_token(&tok, epoch)
+                    .await
+                    .ok()
             })
             .await;
             let _ = weak.update(app, |shell, cx| {
+                if !shell.computer_fence_matches(&fence) {
+                    return;
+                }
                 shell.enqueue_computer_toast(
                     if local_count > 0 {
                         "已立即断开所有远程控制与 AI MCP 会话"
@@ -410,6 +407,7 @@ impl AppShell {
                     },
                     "Disconnected all remote control sessions",
                     2200,
+                    cx,
                 );
                 shell.sync_computers_to_views(cx);
                 cx.notify();
@@ -425,16 +423,25 @@ impl AppShell {
             .retain(|s| s.session_id != session_id);
         self.sync_computers_to_views(cx);
 
-        if self.is_authenticated {
-            let client = self.client.clone();
+        if let Some(fence) = self.computer_fence() {
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                let c = client.clone();
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                let c = fence.client().clone();
+                let tok = fence.token().to_string();
+                let epoch = fence.client_epoch();
                 let sid = session_id.clone();
-                let _ = run_on_tokio(&client, async move {
-                    c.disconnect_remote_session_async(&sid).await.ok()
+                let _ = run_on_tokio(&c.clone(), async move {
+                    c.disconnect_remote_session_with_token(&tok, epoch, &sid)
+                        .await
+                        .ok()
                 })
                 .await;
                 let _ = weak.update(app, |shell, cx| {
+                    if !shell.computer_fence_matches(&fence) {
+                        return;
+                    }
                     shell.sync_computers_to_views(cx);
                     cx.notify();
                 });
@@ -450,20 +457,33 @@ impl AppShell {
             self.sync_computers_to_views(cx);
             return;
         };
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let c = client.clone();
-            let (assist_res, sessions_res, grants_res) = run_on_tokio(&client, async move {
-                let assist = c.get_remote_assist_info_async().await.map_err(|e| e.to_string());
-                let sess = c.list_remote_sessions_async().await.map_err(|e| e.to_string());
-                let grants = c.list_mcp_grants_async().await.map_err(|e| e.to_string());
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let c = fence.client().clone();
+            let tok = fence.token().to_string();
+            let epoch = fence.client_epoch();
+            let (assist_res, sessions_res, grants_res) = run_on_tokio(&c.clone(), async move {
+                let assist = c
+                    .get_remote_assist_info_with_token(&tok, epoch)
+                    .await
+                    .map_err(|e| e.to_string());
+                let sess = c
+                    .list_remote_sessions_with_token(&tok, epoch)
+                    .await
+                    .map_err(|e| e.to_string());
+                let grants = c
+                    .list_mcp_grants_with_token(&tok, epoch)
+                    .await
+                    .map_err(|e| e.to_string());
                 (assist, sess, grants)
             })
             .await
             .unwrap_or_else(|e| (Err(e.clone()), Err(e.clone()), Err(e)));
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.computer_fence_matches(fence) {
+                if !shell.computer_fence_matches(&fence) {
                     return;
                 }
                 if let Ok(cfg) = assist_res {
@@ -482,47 +502,67 @@ impl AppShell {
         .detach();
     }
 
-    fn handle_tray_action(&mut self, action_id: &str, cx: &mut Context<Self>) {
+    pub fn handle_tray_action(&mut self, action_id: &str, cx: &mut Context<Self>) {
         match action_id {
             tray_action_ids::SHOW_FABUSHI | tray_action_ids::OPEN_ALIAS => {
-                self.active_panel = ActiveWorkspacePanel::Settings;
-                self.navigate_settings_to(SettingsSectionType::Computers, cx);
-                cx.activate(true);
-            }
-            tray_action_ids::CONTROLLED_STATUS => {
-                self.open_or_focus_controlled_status_window(cx);
+                self.open_remote_computers_hub(cx);
                 cx.activate(true);
             }
             tray_action_ids::DISCONNECT_ALL => {
                 self.disconnect_all_remote_control(cx);
             }
             tray_action_ids::TOGGLE_ALLOW_REMOTE => {
-                let next = !self
+                let prev = self
                     .computers
                     .assist_config
                     .as_ref()
                     .map_or(true, |c| c.allow_assist);
+                let next = !prev;
                 if let Some(cfg) = self.computers.assist_config.as_mut() {
                     cfg.allow_assist = next;
                 }
-                self.sync_remote_tray_status(cx);
-                if self.is_authenticated {
-                    let client = self.client.clone();
+                self.sync_computers_to_views(cx);
+                if let Some(fence) = self.computer_fence() {
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                        let c = client.clone();
-                        if let Ok(Ok(cfg)) =
-                            run_on_tokio(&client, async move {
-                                c.set_remote_assist_allow_async(next)
-                                    .await
-                                    .map_err(|e| e.to_string())
-                            })
-                            .await
-                        {
-                            let _ = weak.update(app, |shell, cx| {
-                                shell.computers.assist_config = Some(cfg);
-                                shell.sync_computers_to_views(cx);
-                            });
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
                         }
+                        let c = fence.client().clone();
+                        let tok = fence.token().to_string();
+                        let epoch = fence.client_epoch();
+                        let res = run_on_tokio(&c.clone(), async move {
+                            c.set_remote_assist_allow_with_token(&tok, epoch, next)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .and_then(|inner| inner);
+                        let _ = weak.update(app, |shell, cx| {
+                            if !shell.computer_fence_matches(&fence) {
+                                return;
+                            }
+                            match res {
+                                Ok(cfg) => {
+                                    shell.computers.assist_config = Some(cfg);
+                                    shell.sync_computers_to_views(cx);
+                                }
+                                Err(e) => {
+                                    if let Some(cfg) = shell.computers.assist_config.as_mut() {
+                                        if cfg.allow_assist == next {
+                                            cfg.allow_assist = prev;
+                                        }
+                                    }
+                                    shell.sync_computers_to_views(cx);
+                                    let pfx = tr_str(
+                                        shell.active_lang_id(),
+                                        "切换允许远控状态失败",
+                                        "Failed to update remote assist setting",
+                                    );
+                                    shell.show_non_chat_toast(format!("{pfx}: {e}"), 2400, cx);
+                                }
+                            }
+                            cx.notify();
+                        });
                     })
                     .detach();
                 }
@@ -535,6 +575,7 @@ impl AppShell {
                         "已复制设备协助码与验证码",
                         "Copied Assist ID & code",
                         2000,
+                        cx,
                     );
                 } else {
                     self.refresh_remote_assist_and_grants(cx);
@@ -569,9 +610,6 @@ impl AppShell {
                         let current_sessions = shell.combined_remote_sessions();
                         let count = current_sessions.len();
                         if count != last_count {
-                            if last_count == 0 && count > 0 {
-                                shell.open_or_focus_controlled_status_window(cx);
-                            }
                             last_count = count;
                             shell.sync_remote_tray_status(cx);
                             shell.sync_computers_to_views(cx);
@@ -628,19 +666,41 @@ impl AppShell {
         self.computers.relay_loop_started = true;
         self.client.bind_persistent_identity_dir(&self.preferences_dir);
         self.client.start_tailnet_mesh();
-        let client = self.client.clone();
-
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let reg_client = client.clone();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let reg_client = fence.client().clone();
+            let reg_token = fence.token().to_string();
+            let reg_epoch = fence.client_epoch();
             let (reg_res, list_res, tailnet_st, tailnet_waiting, assist_res, sess_res, grants_res) =
-                run_on_tokio(&client, async move {
-                    let reg = reg_client.register_current_host_computer_async().await;
-                    let list = reg_client.list_computers_async().await;
-                    let ts = reg_client.tailnet_status();
-                    let waiting = reg_client.tailnet_pending_approvals();
-                    let assist = reg_client.get_remote_assist_info_async().await.ok();
-                    let sess = reg_client.list_remote_sessions_async().await.ok();
-                    let grants = reg_client.list_mcp_grants_async().await.ok();
+                run_on_tokio(&reg_client.clone(), async move {
+                    let reg = reg_client
+                        .register_current_host_computer_with_token(&reg_token, reg_epoch)
+                        .await;
+                    let list = reg_client
+                        .list_computers_with_token(&reg_token, reg_epoch)
+                        .await;
+                    let (ts, waiting) = if reg_client.is_same_session_epoch(reg_epoch) {
+                        (
+                            Some(reg_client.tailnet_status()),
+                            reg_client.tailnet_pending_approvals(),
+                        )
+                    } else {
+                        (None, Vec::new())
+                    };
+                    let assist = reg_client
+                        .get_remote_assist_info_with_token(&reg_token, reg_epoch)
+                        .await
+                        .ok();
+                    let sess = reg_client
+                        .list_remote_sessions_with_token(&reg_token, reg_epoch)
+                        .await
+                        .ok();
+                    let grants = reg_client
+                        .list_mcp_grants_with_token(&reg_token, reg_epoch)
+                        .await
+                        .ok();
                     (reg, list, ts, waiting, assist, sess, grants)
                 })
                 .await
@@ -648,7 +708,7 @@ impl AppShell {
                     (
                         reg.map_err(|e| e.to_string()),
                         list.map_err(|e| e.to_string()),
-                        Some(ts),
+                        ts,
                         waiting,
                         assist,
                         sess,
@@ -661,7 +721,7 @@ impl AppShell {
 
             let keep = weak
                 .update(app, |shell, cx| {
-                    if !shell.computer_fence_matches(fence) {
+                    if !shell.computer_fence_matches(&fence) {
                         return false;
                     }
                     if let Ok(node) = reg_res {
@@ -700,26 +760,43 @@ impl AppShell {
                     .await;
                 tick_count = tick_count.wrapping_add(1);
 
-                let still_valid = weak
-                    .update(app, |shell, _| shell.computer_fence_matches(fence))
-                    .unwrap_or(false);
-                if !still_valid {
+                if !fence.preflight_ui(&weak, app).await {
                     break;
                 }
 
                 let do_heartbeat = tick_count % 10 == 0;
-                let poll_client = client.clone();
+                let poll_client = fence.client().clone();
+                let poll_token = fence.token().to_string();
+                let poll_epoch = fence.client_epoch();
                 let (relay_res, list_res, tailnet_st, tailnet_waiting, sess_res) =
-                    run_on_tokio(&client, async move {
+                    run_on_tokio(&poll_client.clone(), async move {
                         if do_heartbeat {
-                            let _ = poll_client.register_current_host_computer_async().await;
+                            let _ = poll_client
+                                .register_current_host_computer_with_token(&poll_token, poll_epoch)
+                                .await;
                         }
-                        let relay = poll_client.process_ready_local_computer_commands_async().await;
-                        let list = poll_client.list_computers_async().await;
-                        let ts = poll_client.tailnet_status();
-                        let waiting = poll_client.tailnet_pending_approvals();
+                        let relay = poll_client
+                            .process_ready_local_computer_commands_with_token(
+                                &poll_token,
+                                poll_epoch,
+                            )
+                            .await;
+                        let list = poll_client
+                            .list_computers_with_token(&poll_token, poll_epoch)
+                            .await;
+                        let (ts, waiting) = if poll_client.is_same_session_epoch(poll_epoch) {
+                            (
+                                Some(poll_client.tailnet_status()),
+                                poll_client.tailnet_pending_approvals(),
+                            )
+                        } else {
+                            (None, Vec::new())
+                        };
                         let sess = if tick_count % 3 == 0 {
-                            poll_client.list_remote_sessions_async().await.ok()
+                            poll_client
+                                .list_remote_sessions_with_token(&poll_token, poll_epoch)
+                                .await
+                                .ok()
                         } else {
                             None
                         };
@@ -730,7 +807,7 @@ impl AppShell {
                         (
                             r.map_err(|e| e.to_string()),
                             l.map_err(|e| e.to_string()),
-                            Some(ts),
+                            ts,
                             waiting,
                             sess,
                         )
@@ -739,7 +816,7 @@ impl AppShell {
 
                 let cont = weak
                     .update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) {
+                        if !shell.computer_fence_matches(&fence) {
                             return false;
                         }
                         if let Ok(list) = list_res {
@@ -774,19 +851,29 @@ impl AppShell {
         let Some(fence) = self.computer_fence() else {
             return;
         };
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let c = client.clone();
-            let (res, ts, waiting) = run_on_tokio(&client, async move {
-                let list = c.list_computers_async().await.map_err(|e| e.to_string());
-                let ts = c.tailnet_status();
-                let waiting = c.tailnet_pending_approvals();
-                (list, Some(ts), waiting)
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let c = fence.client().clone();
+            let tok = fence.token().to_string();
+            let epoch = fence.client_epoch();
+            let (res, ts, waiting) = run_on_tokio(&c.clone(), async move {
+                let list = c
+                    .list_computers_with_token(&tok, epoch)
+                    .await
+                    .map_err(|e| e.to_string());
+                let (ts, waiting) = if c.is_same_session_epoch(epoch) {
+                    (Some(c.tailnet_status()), c.tailnet_pending_approvals())
+                } else {
+                    (None, Vec::new())
+                };
+                (list, ts, waiting)
             })
             .await
             .unwrap_or_else(|e| (Err(e), None, Vec::new()));
             let _ = weak.update(app, |shell, cx| {
-                if !shell.computer_fence_matches(fence) {
+                if !shell.computer_fence_matches(&fence) {
                     return;
                 }
                 if let Some(ts) = ts {
@@ -806,9 +893,11 @@ impl AppShell {
         .detach();
     }
 
-    /// Ensures the active Inspector AI Bot gets its computer inventory and `BotComputerProfileDto`.
+    /// Ensures the active Inspector AI Bot gets its computer inventory, `BotComputerProfileDto`,
+    /// and live Settings AI model catalog.
     pub fn sync_active_bot_computer_to_inspector(&mut self, cx: &mut Context<Self>) {
         self.sync_computers_to_views(cx);
+        self.sync_cached_ai_models_to_inspector(cx);
         let Some(bot_id) = self.effective_inspector_bot_id(cx) else {
             return;
         };
@@ -818,16 +907,22 @@ impl AppShell {
         if self.computers.computers.is_empty() {
             self.refresh_computers(cx);
         }
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let c = client.clone();
-            let res = run_on_tokio(&client, async move {
-                c.get_bot_computer_profile_async(bot_id).await.map_err(|e| e.to_string())
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let c = fence.client().clone();
+            let tok = fence.token().to_string();
+            let epoch = fence.client_epoch();
+            let res = run_on_tokio(&c.clone(), async move {
+                c.get_bot_computer_profile_with_token(&tok, epoch, bot_id)
+                    .await
+                    .map_err(|e| e.to_string())
             })
             .await
             .and_then(|inner| inner);
             let _ = weak.update(app, |shell, cx| {
-                if !shell.computer_fence_matches(fence) {
+                if !shell.computer_fence_matches(&fence) {
                     return;
                 }
                 if let Ok(profile) = res {
@@ -845,8 +940,18 @@ impl AppShell {
         .detach();
     }
 
-    /// Opens the interactive `ComputerWorkbench` overlay bound to `node_id`.
+    /// Opens the interactive `ComputerWorkbench` overlay bound to `node_id` on the Desktop tab.
     pub fn open_remote_workbench_for_node(&mut self, node_id: String, cx: &mut Context<Self>) {
+        self.open_remote_workbench_for_node_with_tab(node_id, WorkbenchTab::DesktopScreen, cx);
+    }
+
+    /// Opens the interactive `ComputerWorkbench` overlay bound to `node_id` on `initial_tab`.
+    pub fn open_remote_workbench_for_node_with_tab(
+        &mut self,
+        node_id: String,
+        initial_tab: WorkbenchTab,
+        cx: &mut Context<Self>,
+    ) {
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
         let node_opt = self
@@ -881,13 +986,14 @@ impl AppShell {
         } else {
             None
         };
-        let defer_initial_capture = initial_local_perm_snap.as_ref().is_some_and(|snap| {
-            should_defer_local_capture_for_permissions(
-                is_local_node,
-                cfg!(target_os = "macos"),
-                snap.screen_state,
-            )
-        });
+        let defer_initial_capture = initial_tab == WorkbenchTab::DesktopScreen
+            && initial_local_perm_snap.as_ref().is_some_and(|snap| {
+                should_defer_local_capture_for_permissions(
+                    is_local_node,
+                    cfg!(target_os = "macos"),
+                    snap.screen_state,
+                )
+            });
 
         let overlay = cx.new(|wcx| {
             let mut wb = ComputerWorkbench::new_live(fallback_name, pal, &lang);
@@ -898,6 +1004,14 @@ impl AppShell {
             }
             if peer_opt.is_some() {
                 wb.sync_tailnet_peer_state(peer_opt.as_ref());
+            }
+            wb.active_tab = initial_tab;
+            if initial_tab == WorkbenchTab::RemoteTerminal {
+                wb.terminal_focused = true;
+                wb.ensure_terminal_view(wcx);
+                if let Some(term) = wb.terminal_view.as_ref() {
+                    term.update(wcx, |t, _| t.is_focused = true);
+                }
             }
             if defer_initial_capture {
                 if let Some(ref snap) = initial_local_perm_snap {
@@ -941,8 +1055,17 @@ impl AppShell {
         .detach();
 
         self.overlays.computer_overlay = Some(overlay.clone());
-        if !defer_initial_capture {
+        self.reconcile_chat_scoped_toasts(cx);
+        if initial_tab == WorkbenchTab::DesktopScreen && !defer_initial_capture {
             self.handle_workbench_command(node_id, WorkbenchCommand::RefreshScreen, overlay, cx);
+        } else if initial_tab == WorkbenchTab::RemoteTerminal {
+            let cwd = overlay.read(cx).remote_cwd.clone();
+            self.handle_workbench_command(
+                node_id,
+                WorkbenchCommand::ListFiles { path: cwd },
+                overlay,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -1186,15 +1309,22 @@ impl AppShell {
         };
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let c = client.clone();
-            let res = run_on_tokio(&client, async move {
-                c.execute_remote_computer_op_async(&req).await.map_err(|e| e.to_string())
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let c = fence.client().clone();
+            let tok = fence.token().to_string();
+            let epoch = fence.client_epoch();
+            let res = run_on_tokio(&c.clone(), async move {
+                c.execute_remote_computer_op_with_token(&tok, epoch, &req)
+                    .await
+                    .map_err(|e| e.to_string())
             })
             .await
             .and_then(|inner| inner);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.computer_fence_matches(fence) {
+                if !shell.computer_fence_matches(&fence) {
                     return;
                 }
                 match res {
@@ -1466,6 +1596,7 @@ impl AppShell {
                             shell.refresh_computers(cx);
                         }
                         if out.ok
+                            && shell.overlays.computer_overlay.as_ref() == Some(&overlay)
                             && matches!(
                                 cmd,
                                 WorkbenchCommand::SendGuiClick { .. }
@@ -1476,12 +1607,16 @@ impl AppShell {
                         {
                             let nid_refresh = node_id.clone();
                             let ov_refresh = overlay.clone();
+                            let fence_refresh = fence.clone();
                             cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
                                 app.background_executor()
                                     .timer(Duration::from_millis(260))
                                     .await;
                                 let _ = weak_shell.update(app, |shell, cx| {
-                                    if shell.overlays.computer_overlay.is_some() {
+                                    if shell.computer_fence_matches(&fence_refresh)
+                                        && shell.overlays.computer_overlay.as_ref()
+                                            == Some(&ov_refresh)
+                                    {
                                         shell.handle_workbench_command(
                                             nid_refresh,
                                             WorkbenchCommand::RefreshScreen,
@@ -1566,9 +1701,10 @@ impl AppShell {
                     fallback_bot_id
                 };
                 if let Some(bid) = resolved_bot {
+                    let trimmed_model = preferred_model.trim().to_string();
                     let req = UpdateBotComputerRequest {
                         persona_prompt: Some(persona_prompt),
-                        preferred_model: Some(preferred_model),
+                        preferred_model: Some(trimmed_model),
                         approval_mode: Some(approval_mode),
                         allow_cross_device_control: Some(allow_cross_device_control),
                         allow_cloud_self_config: Some(allow_cloud_self_config),
@@ -1596,34 +1732,81 @@ impl AppShell {
             self.stage.read(cx).active_chat_id,
             self.sidebar.read(cx).active_chat_id,
         );
-        let client = self.client.clone();
+        let captured_panel = self.active_panel;
+        let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let c = client.clone();
-            let res = run_on_tokio(&client, async move {
-                c.update_bot_computer_profile_async(bot_id, &req).await.map_err(|e| e.to_string())
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let c = fence.client().clone();
+            let tok = fence.token().to_string();
+            let epoch = fence.client_epoch();
+            let res = run_on_tokio(&c.clone(), async move {
+                c.update_bot_computer_profile_with_token(&tok, epoch, bot_id, &req)
+                    .await
+                    .map_err(|e| e.to_string())
             })
             .await
             .and_then(|inner| inner);
             let _ = weak.update(app, |shell, cx| {
-                if !shell.computer_fence_matches(fence) {
+                if !shell.computer_fence_matches(&fence) {
                     return;
                 }
+                let cur_stage_cid = shell.stage.read(cx).active_chat_id;
+                let cur_active = resolve_active_target_chat_id(
+                    cur_stage_cid,
+                    shell.sidebar.read(cx).active_chat_id,
+                );
+                let still_in_target_context = match target_cid {
+                    Some(cid) => cur_stage_cid == Some(cid),
+                    None => {
+                        shell.active_panel == captured_panel
+                            && cur_active.is_none()
+                            && shell.sidebar.read(cx).is_plus_menu_open == captured_plus_open
+                    }
+                };
                 match res {
                     Ok(profile) => {
                         shell.computers.bot_profiles.insert(bot_id, profile.clone());
-                        let still_in_target_chat = target_cid
-                            .is_none_or(|cid| shell.stage.read(cx).active_chat_id == Some(cid));
-                        if still_in_target_chat {
-                            shell.inspector.update(cx, |insp, icx| {
+                        for fb in &mut shell.miniapps.fabushi_bots {
+                            if fb.bot_user_id == bot_id as i64 {
+                                fb.preferred_model = profile.preferred_model.clone();
                                 if !profile.persona_prompt.is_empty() {
-                                    insp.profile.bot_persona_prompt =
-                                        profile.persona_prompt.clone();
+                                    fb.description = profile.persona_prompt.clone();
                                 }
-                                insp.sync_bot_computer_profile(Some(profile));
-                                if return_to_main_subpage {
-                                    insp.subpage = InspectorSubpage::Main;
+                            }
+                        }
+                        for cached in shell.miniapps.bot_profiles_cache.values_mut() {
+                            if cached.bot.bot_user_id == bot_id as i64 {
+                                cached.bot.preferred_model = profile.preferred_model.clone();
+                                if !profile.persona_prompt.is_empty() {
+                                    cached.bot.ai_persona = profile.persona_prompt.clone();
                                 }
-                                icx.notify();
+                            }
+                        }
+                        if still_in_target_context {
+                            shell.inspector.update(cx, |insp, icx| {
+                                if insp.profile.is_bot
+                                    && (insp.profile.bot_id == 0 || insp.profile.bot_id == bot_id)
+                                {
+                                    if !profile.persona_prompt.is_empty() {
+                                        insp.profile.bot_persona_prompt =
+                                            profile.persona_prompt.clone();
+                                    }
+                                    if let Some(ref mut fab) = insp.active_fabushi_bot {
+                                        if fab.bot_user_id == bot_id as i64 {
+                                            fab.preferred_model = profile.preferred_model.clone();
+                                            if !profile.persona_prompt.is_empty() {
+                                                fab.description = profile.persona_prompt.clone();
+                                            }
+                                        }
+                                    }
+                                    insp.sync_bot_computer_profile(Some(profile));
+                                    if return_to_main_subpage {
+                                        insp.subpage = InspectorSubpage::Main;
+                                    }
+                                    icx.notify();
+                                }
                             });
                         }
                         let msg = tr_str(
@@ -1632,11 +1815,11 @@ impl AppShell {
                             "Bot computer configuration saved",
                         );
                         if let Some(cid) = target_cid {
-                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                            if cur_stage_cid == Some(cid) {
                                 shell.show_chat_toast(cid, msg, 2000, cx);
                             }
-                        } else {
-                            shell.show_toast(msg, 2000, cx);
+                        } else if still_in_target_context {
+                            shell.show_non_chat_toast(msg, 2000, cx);
                         }
                         shell.refresh_computers(cx);
                     }
@@ -1648,11 +1831,11 @@ impl AppShell {
                         );
                         let msg = format!("{pfx}: {e}");
                         if let Some(cid) = target_cid {
-                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                            if cur_stage_cid == Some(cid) {
                                 shell.show_chat_toast(cid, msg, 2600, cx);
                             }
-                        } else {
-                            shell.show_toast(msg, 2600, cx);
+                        } else if still_in_target_context {
+                            shell.show_non_chat_toast(msg, 2600, cx);
                         }
                         cx.notify();
                     }
@@ -1662,23 +1845,86 @@ impl AppShell {
         .detach();
     }
 
+    /// Opens the standalone NetEase UU Remote-style Remote Computers hub (triggered from
+    /// the computer icon beside the user avatar, main menu, tray, or `/computer`).
+    pub fn open_remote_computers_hub(&mut self, cx: &mut Context<Self>) {
+        self.rtc_talk.talk_mode_overlay = None;
+        self.rtc_talk.active_talk_session_is_ai = false;
+        self.overlays.media_viewer_overlay = None;
+        self.overlays.iv_viewer_overlay = None;
+        self.overlays.computer_overlay = None;
+        self.main_menu_drawer.update(cx, |d, _| d.close());
+        self.sidebar.update(cx, |sb, sb_cx| {
+            sb.cancel_compose_mode();
+            sb.is_account_popover_open = false;
+            sb_cx.notify();
+        });
+        if self.composer.read(cx).is_compose_isolated
+            && !self.is_compose_or_creation_modal_active(cx)
+        {
+            self.exit_compose_or_modal_isolation(true, cx);
+        } else {
+            self.sync_compose_state_to_composer(true, cx);
+        }
+        self.stage.update(cx, |st, st_cx| {
+            st.more_menu_open = false;
+            st.ttl_submenu_open = false;
+            st_cx.notify();
+        });
+        if cfg!(target_os = "macos") {
+            request_permissions_refresh(false);
+        }
+        self.settings_router.update(cx, |sr, scx| {
+            sr.standalone_computers_mode = true;
+            sr.navigate_to(SettingsSectionType::Computers, true, scx);
+            let sc = sr.ensure_computers(scx);
+            sc.update(scx, |view, vcx| {
+                view.standalone_mode = true;
+                view.open_overview();
+                vcx.notify();
+            });
+            scx.notify();
+        });
+        self.active_panel = ActiveWorkspacePanel::Settings;
+        self.reconcile_chat_scoped_toasts(cx);
+        self.last_handled_nav_dest = Some(NavDestination::RemoteComputer);
+        self.nav_rail
+            .update(cx, |r, _| r.set_active_destination(NavDestination::RemoteComputer));
+        self.sync_computers_to_views(cx);
+        self.refresh_computers(cx);
+        self.refresh_remote_assist_and_grants(cx);
+        cx.notify();
+    }
+
     fn open_computers_settings_page(
         &mut self,
         detail_node_id: Option<String>,
         create_cloud_for_bot: Option<Option<u64>>,
         cx: &mut Context<Self>,
     ) {
-        let nodes = self.computers.computers.clone();
-        let tailnet_status = self.computers.tailnet_status.clone();
-        let bots = self.known_bots_for_computers(cx);
-        let active_bot_id = self.effective_inspector_bot_id(cx);
+        self.sidebar.update(cx, |sb, sb_cx| {
+            sb.cancel_compose_mode();
+            sb.is_account_popover_open = false;
+            sb_cx.notify();
+        });
+        if self.composer.read(cx).is_compose_isolated
+            && !self.is_compose_or_creation_modal_active(cx)
+        {
+            self.exit_compose_or_modal_isolation(true, cx);
+        } else {
+            self.sync_compose_state_to_composer(true, cx);
+        }
+        self.stage.update(cx, |st, st_cx| {
+            st.more_menu_open = false;
+            st.ttl_submenu_open = false;
+            st_cx.notify();
+        });
         self.settings_router.update(cx, |sr, scx| {
+            sr.standalone_computers_mode = false;
             sr.navigate_to(SettingsSectionType::Computers, true, scx);
             let sc = sr.ensure_computers(scx);
             sc.update(scx, |view, vcx| {
-                view.sync_computers(nodes);
-                view.sync_known_bots(bots, active_bot_id);
-                view.sync_tailnet_status(tailnet_status);
+                view.standalone_mode = false;
                 if let Some(nid) = detail_node_id {
                     view.open_detail(&nid);
                 } else if let Some(bot_opt) = create_cloud_for_bot {
@@ -1691,7 +1937,10 @@ impl AppShell {
             scx.notify();
         });
         self.active_panel = ActiveWorkspacePanel::Settings;
+        self.reconcile_chat_scoped_toasts(cx);
+        self.sync_computers_to_views(cx);
         self.refresh_computers(cx);
+        self.refresh_remote_assist_and_grants(cx);
         cx.notify();
     }
 
@@ -1715,21 +1964,35 @@ impl AppShell {
             SettingsComputersEvent::OpenRemoteWorkbench(node_id) => {
                 self.open_remote_workbench_for_node(node_id.clone(), cx);
             }
+            SettingsComputersEvent::OpenRemoteTerminal(node_id) => {
+                self.open_remote_workbench_for_node_with_tab(
+                    node_id.clone(),
+                    WorkbenchTab::RemoteTerminal,
+                    cx,
+                );
+            }
+            SettingsComputersEvent::CloseRequested | SettingsComputersEvent::BackToSettings => {}
             SettingsComputersEvent::SaveCloudServer(req) => {
                 let Some(fence) = self.computer_fence() else {
                     return;
                 };
-                let client = self.client.clone();
                 let req = req.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.upsert_cloud_computer_async(&req).await.map_err(|e| e.to_string())
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.upsert_cloud_computer_with_token(&tok, epoch, &req)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|inner| inner);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) {
+                        if !shell.computer_fence_matches(&fence) {
                             return;
                         }
                         match res {
@@ -1755,6 +2018,7 @@ impl AppShell {
                                     "云服务器已保存到云端",
                                     "Cloud server saved",
                                     2200,
+                                    cx,
                                 );
                                 shell.refresh_computers(cx);
                             }
@@ -1771,7 +2035,7 @@ impl AppShell {
                                         sc_cx.notify();
                                     });
                                 }
-                                shell.window_runtime.enqueue_toast(err_msg, 2800);
+                                shell.show_non_chat_toast(err_msg, 2800, cx);
                                 cx.notify();
                             }
                         }
@@ -1783,18 +2047,24 @@ impl AppShell {
                 let Some(fence) = self.computer_fence() else {
                     return;
                 };
-                let client = self.client.clone();
                 let nid = node_id.clone();
                 let req = req.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.update_computer_policy_async(&nid, &req).await.map_err(|e| e.to_string())
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.update_computer_policy_with_token(&tok, epoch, &nid, &req)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|inner| inner);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) {
+                        if !shell.computer_fence_matches(&fence) {
                             return;
                         }
                         match res {
@@ -1814,12 +2084,13 @@ impl AppShell {
                                     "电脑权限与策略已更新",
                                     "Computer authorization policy updated",
                                     1800,
+                                    cx,
                                 );
                                 cx.notify();
                             }
                             Err(e) => {
                                 let pfx = tr_str(shell.active_lang_id(), "策略更新失败", "Policy update failed");
-                                shell.window_runtime.enqueue_toast(format!("{pfx}: {e}"), 2400);
+                                shell.show_non_chat_toast(format!("{pfx}: {e}"), 2400, cx);
                                 cx.notify();
                             }
                         }
@@ -1831,18 +2102,24 @@ impl AppShell {
                 let Some(fence) = self.computer_fence() else {
                     return;
                 };
-                let client = self.client.clone();
                 let nid = node_id.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
                     let nid_task = nid.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.delete_computer_async(&nid_task).await.map_err(|e| e.to_string())
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.delete_computer_with_token(&tok, epoch, &nid_task)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|inner| inner);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) {
+                        if !shell.computer_fence_matches(&fence) {
                             return;
                         }
                         let is_local = shell
@@ -1868,12 +2145,14 @@ impl AppShell {
                                         "离线设备已移除",
                                         "Device removed",
                                         2000,
+                                        cx,
                                     );
                                 } else {
                                     shell.enqueue_computer_toast(
                                         "云服务器已删除",
                                         "Cloud server deleted",
                                         2000,
+                                        cx,
                                     );
                                 }
                                 cx.notify();
@@ -1892,7 +2171,7 @@ impl AppShell {
                                         "Failed to delete cloud server",
                                     )
                                 };
-                                shell.window_runtime.enqueue_toast(format!("{pfx}: {e}"), 2600);
+                                shell.show_non_chat_toast(format!("{pfx}: {e}"), 2600, cx);
                                 cx.notify();
                             }
                         }
@@ -1904,7 +2183,6 @@ impl AppShell {
                 let Some(fence) = self.computer_fence() else {
                     return;
                 };
-                let client = self.client.clone();
                 let nid = node_id.clone();
                 let is_local = self
                     .computers
@@ -1918,8 +2196,13 @@ impl AppShell {
                     .clone()
                     .unwrap_or_else(|| "Desktop".to_string());
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
-                    let res = run_on_tokio(&client, async move {
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
+                    let res = run_on_tokio(&c.clone(), async move {
                         if is_local {
                             let req = RemoteComputerCommandRequest {
                                 node_id: nid,
@@ -1928,11 +2211,11 @@ impl AppShell {
                                 caller_label,
                                 operation: RemoteComputerOp::TestConnection,
                             };
-                            c.execute_remote_computer_op_async(&req)
+                            c.execute_remote_computer_op_with_token(&tok, epoch, &req)
                                 .await
                                 .map_err(|e| e.to_string())
                         } else {
-                            c.test_computer_connection_async(&nid)
+                            c.test_computer_connection_with_token(&tok, epoch, &nid)
                                 .await
                                 .map_err(|e| e.to_string())
                         }
@@ -1940,7 +2223,7 @@ impl AppShell {
                     .await
                     .and_then(|inner| inner);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) {
+                        if !shell.computer_fence_matches(&fence) {
                             return;
                         }
                         let msg = match res {
@@ -1968,7 +2251,7 @@ impl AppShell {
                                 sc_cx.notify();
                             });
                         }
-                        shell.window_runtime.enqueue_toast(msg, 2400);
+                        shell.show_non_chat_toast(msg, 2400, cx);
                         shell.refresh_computers(cx);
                     });
                 })
@@ -1979,23 +2262,29 @@ impl AppShell {
             }
             SettingsComputersEvent::ResetAssistTempCode => {
                 let Some(fence) = self.computer_fence() else { return; };
-                let client = self.client.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.reset_remote_assist_code_async().await.map_err(|e| e.to_string())
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.reset_remote_assist_code_with_token(&tok, epoch)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|x| x);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) { return; }
+                        if !shell.computer_fence_matches(&fence) { return; }
                         match res {
                             Ok(cfg) => {
                                 shell.computers.assist_config = Some(cfg);
-                                shell.enqueue_computer_toast("已生成新临时验证码", "Temporary assist code rotated", 2000);
+                                shell.enqueue_computer_toast("已生成新临时验证码", "Temporary assist code rotated", 2000, cx);
                             }
                             Err(e) => {
-                                shell.window_runtime.enqueue_toast(format!("Assist reset failed: {e}"), 2400);
+                                shell.show_non_chat_toast(format!("Assist reset failed: {e}"), 2400, cx);
                             }
                         }
                         shell.sync_computers_to_views(cx);
@@ -2005,24 +2294,30 @@ impl AppShell {
             }
             SettingsComputersEvent::SetAssistCustomCode(code) => {
                 let Some(fence) = self.computer_fence() else { return; };
-                let client = self.client.clone();
                 let code = code.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.set_remote_assist_code_async(&code).await.map_err(|e| e.to_string())
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.set_remote_assist_code_with_token(&tok, epoch, &code)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|x| x);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) { return; }
+                        if !shell.computer_fence_matches(&fence) { return; }
                         match res {
                             Ok(cfg) => {
                                 shell.computers.assist_config = Some(cfg);
-                                shell.enqueue_computer_toast("已保存自定义协助验证码", "Custom assist code saved", 2000);
+                                shell.enqueue_computer_toast("已保存自定义协助验证码", "Custom assist code saved", 2000, cx);
                             }
                             Err(e) => {
-                                shell.window_runtime.enqueue_toast(format!("Failed: {e}"), 2400);
+                                shell.show_non_chat_toast(format!("Failed: {e}"), 2400, cx);
                             }
                         }
                         shell.sync_computers_to_views(cx);
@@ -2033,47 +2328,71 @@ impl AppShell {
             SettingsComputersEvent::SetAssistAllow(allow) => {
                 let Some(fence) = self.computer_fence() else { return; };
                 let allow = *allow;
-                let client = self.client.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.set_remote_assist_allow_async(allow).await.map_err(|e| e.to_string())
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.set_remote_assist_allow_with_token(&tok, epoch, allow)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|x| x);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) { return; }
-                        if let Ok(cfg) = res {
-                            shell.computers.assist_config = Some(cfg);
+                        if !shell.computer_fence_matches(&fence) { return; }
+                        match res {
+                            Ok(cfg) => {
+                                shell.computers.assist_config = Some(cfg);
+                                shell.sync_computers_to_views(cx);
+                            }
+                            Err(e) => {
+                                shell.sync_computers_to_views(cx);
+                                let pfx = tr_str(
+                                    shell.active_lang_id(),
+                                    "切换允许远控状态失败",
+                                    "Failed to update remote assist setting",
+                                );
+                                shell.show_non_chat_toast(format!("{pfx}: {e}"), 2400, cx);
+                            }
                         }
-                        shell.sync_computers_to_views(cx);
+                        cx.notify();
                     });
                 })
                 .detach();
             }
             SettingsComputersEvent::CopyAssistInvite { invite_text } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(invite_text.clone()));
-                self.enqueue_computer_toast("已复制远程协助邀请", "Copied remote assist invite", 2000);
+                self.enqueue_computer_toast("已复制远程协助邀请", "Copied remote assist invite", 2000, cx);
             }
             SettingsComputersEvent::StartAssistConnect(req) => {
                 let Some(fence) = self.computer_fence() else { return; };
-                let client = self.client.clone();
                 let mut req = req.clone();
                 if req.requester_device_id.is_none() {
-                    req.requester_device_id = Some(client.device_id());
+                    req.requester_device_id = Some(self.client.device_id());
                 }
                 if req.requester_platform.is_none() {
                     req.requester_platform = Some(std::env::consts::OS.to_string());
                 }
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.start_remote_assist_async(&req).await.map_err(|e| e.to_string())
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.start_remote_assist_with_token(&tok, epoch, &req)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|x| x);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) { return; }
+                        if !shell.computer_fence_matches(&fence) { return; }
                         match res {
                             Ok(started) => {
                                 shell.open_remote_workbench_for_node(started.target_node_id, cx);
@@ -2085,15 +2404,12 @@ impl AppShell {
                                         sc_cx.notify();
                                     });
                                 }
-                                shell.window_runtime.enqueue_toast(format!("Assist failed: {e}"), 2400);
+                                shell.show_non_chat_toast(format!("Assist failed: {e}"), 2400, cx);
                             }
                         }
                     });
                 })
                 .detach();
-            }
-            SettingsComputersEvent::OpenControlledStatusWindow => {
-                self.open_or_focus_controlled_status_window(cx);
             }
             SettingsComputersEvent::DisconnectAllRemoteControl => {
                 self.disconnect_all_remote_control(cx);
@@ -2103,26 +2419,32 @@ impl AppShell {
             }
             SettingsComputersEvent::RevokeMcpGrant(family_id) => {
                 let Some(fence) = self.computer_fence() else { return; };
-                let client = self.client.clone();
                 let fid = family_id.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let c = client.clone();
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let c = fence.client().clone();
+                    let tok = fence.token().to_string();
+                    let epoch = fence.client_epoch();
                     let fid_req = fid.clone();
-                    let res = run_on_tokio(&client, async move {
-                        c.revoke_mcp_grant_async(&fid_req).await.map_err(|e| e.to_string())
+                    let res = run_on_tokio(&c.clone(), async move {
+                        c.revoke_mcp_grant_with_token(&tok, epoch, &fid_req)
+                            .await
+                            .map_err(|e| e.to_string())
                     })
                     .await
                     .and_then(|x| x);
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.computer_fence_matches(fence) { return; }
+                        if !shell.computer_fence_matches(&fence) { return; }
                         match res {
                             Ok(()) => {
                                 shell.computers.mcp_grants.retain(|g| g.family_id != fid);
-                                shell.enqueue_computer_toast("已吊销该 AI MCP 授权", "MCP OAuth grant revoked", 2000);
+                                shell.enqueue_computer_toast("已吊销该 AI MCP 授权", "MCP OAuth grant revoked", 2000, cx);
                                 shell.sync_computers_to_views(cx);
                             }
                             Err(e) => {
-                                shell.window_runtime.enqueue_toast(format!("Revoke failed: {e}"), 2400);
+                                shell.show_non_chat_toast(format!("Revoke failed: {e}"), 2400, cx);
                             }
                         }
                     });
@@ -2134,12 +2456,13 @@ impl AppShell {
                 config_json,
             } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(config_json.clone()));
-                self.window_runtime.enqueue_toast(
+                self.show_non_chat_toast(
                     format!(
                         "{} {client_name}",
                         tr_str(self.active_lang_id(), "已复制 MCP 配置:", "Copied MCP config for")
                     ),
                     2200,
+                    cx,
                 );
             }
             SettingsComputersEvent::RefreshCliStatus => {
@@ -2161,7 +2484,7 @@ impl AppShell {
                         sc_cx.notify();
                     });
                 }
-                self.window_runtime.enqueue_toast(msg, 2400);
+                self.show_non_chat_toast(msg, 2400, cx);
                 self.sync_computers_to_views(cx);
             }
         }
@@ -2182,36 +2505,48 @@ impl AppShell {
             .retain(|p| p.command_id != command_id);
         cx.notify();
 
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let c = client.clone();
-            let res = run_on_tokio(&client, async move {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let c = fence.client().clone();
+            let tok = fence.token().to_string();
+            let epoch = fence.client_epoch();
+            let res = run_on_tokio(&c.clone(), async move {
                 let is_p2p = command_id.starts_with("p2p:");
                 let decision = if is_p2p {
-                    match c.decide_tailnet_approval_async(&command_id, approved).await {
+                    match c.decide_tailnet_approval_with_token(&tok, epoch, &command_id, approved) {
                         Some(Ok(())) => Ok(()),
                         Some(Err(e)) => Err(e),
                         None => Err("Pending P2P approval expired or not found".to_string()),
                     }
                 } else {
-                    c.approve_computer_command_async(&command_id, approved)
+                    c.approve_computer_command_with_token(&tok, epoch, &command_id, approved)
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 };
                 if !is_p2p && decision.is_ok() && approved {
-                    let _ = c.process_ready_local_computer_commands_async().await;
+                    let _ = c
+                        .process_ready_local_computer_commands_with_token(&tok, epoch)
+                        .await;
                 }
-                let list = c.list_computers_async().await.map_err(|e| e.to_string());
-                let ts = Some(c.tailnet_status());
-                let waiting = c.tailnet_pending_approvals();
+                let list = c
+                    .list_computers_with_token(&tok, epoch)
+                    .await
+                    .map_err(|e| e.to_string());
+                let (ts, waiting) = if c.is_same_session_epoch(epoch) {
+                    (Some(c.tailnet_status()), c.tailnet_pending_approvals())
+                } else {
+                    (None, Vec::new())
+                };
                 (decision, list, ts, waiting)
             })
             .await
             .unwrap_or_else(|e| (Err(e.clone()), Err(e), None, Vec::new()));
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.computer_fence_matches(fence) {
+                if !shell.computer_fence_matches(&fence) {
                     return;
                 }
                 match res.0 {
@@ -2229,19 +2564,21 @@ impl AppShell {
                                 "已允许远程指令并立即执行",
                                 "Approved remote command",
                                 2000,
+                                cx,
                             );
                         } else {
                             shell.enqueue_computer_toast(
                                 "已拒绝远程执行请求",
                                 "Denied remote command",
                                 1800,
+                                cx,
                             );
                         }
                         cx.notify();
                     }
                     Err(e) => {
                         let pfx = tr_str(shell.active_lang_id(), "审批操作失败", "Approval failed");
-                        shell.window_runtime.enqueue_toast(format!("{pfx}: {e}"), 2400);
+                        shell.show_non_chat_toast(format!("{pfx}: {e}"), 2400, cx);
                         shell.refresh_computers(cx);
                     }
                 }

@@ -9,7 +9,7 @@ use gpui_telegram_proto::contracts::auth::UserPrivacySettingsDto;
 use gpui_telegram_proto::contracts::chats::ChatFolderDto;
 
 use crate::i18n::tr_str;
-use crate::views::app_shell::shell_truth::SessionRequestFence;
+use crate::views::app_shell::shell_truth::ClientCallFence;
 use crate::views::boxes::edit_privacy_box::PrivacyRuleOption;
 use crate::views::nav_rail::NavFolderItem;
 use crate::views::settings::sections::settings_active_sessions::SessionRowData;
@@ -224,9 +224,10 @@ impl AppShell {
             });
         });
         let lang = self.active_lang_id();
-        self.window_runtime.enqueue_toast(
+        self.show_non_chat_toast(
             tr_str(lang, "本地缓存已清理", "Local media cache cleared"),
             2200,
+            cx,
         );
         cx.notify();
     }
@@ -284,11 +285,18 @@ impl AppShell {
             accept_calls: sc.map_or(true, |s| s.accept_calls),
             is_premium,
         };
-        let client = self.client.clone();
-        cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-            let _ = client.save_my_settings(&dto).await;
-        })
-        .detach();
+        if let Some(fence) = self.capture_client_fence() {
+            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                let _ = fence
+                    .client
+                    .save_my_settings_with_token(&fence.token, fence.client_epoch, &dto)
+                    .await;
+            })
+            .detach();
+        }
     }
 
     /// Applies an updated privacy rule option to settings sections and syncs to backend.
@@ -341,9 +349,10 @@ impl AppShell {
         });
         self.push_user_settings_to_backend(cx);
         let lang = self.active_lang_id();
-        self.window_runtime.enqueue_toast(
+        self.show_non_chat_toast(
             tr_str(lang, "隐私规则已保存", "Privacy rule updated"),
             2000,
+            cx,
         );
         cx.notify();
     }
@@ -359,39 +368,90 @@ impl AppShell {
             });
         });
 
-        let (Some(token), Some(uid)) =
-            (self.session_sync.session_token.clone(), self.session_sync.user_id)
-        else {
+        let Some(fence) = self.capture_client_fence() else {
             return;
         };
-        let fence = SessionRequestFence {
-            auth_generation: self.session_sync.auth_generation,
-            request_generation: 0,
-            token,
-            user_id: uid,
-        };
-        let tok_magpie = fence.token.clone();
-        let client = self.client.clone();
+        let start_proxy_op_gen = self.proxy_op_generation;
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let me_res = client.get_my_profile().await.ok();
-            let sessions_res = client.list_sessions().await.ok();
-            let twofa_res = client.get_2fa_status().await.ok();
-            let blocked_res = client.list_blocked_users().await.ok();
-            let my_settings_res = client.get_my_settings().await.ok();
-            let folders_res = client.list_folders().await.ok();
-            let proxies_res = client.list_proxies().await.ok();
-            let bal_res = client.wallet_balance().await.ok();
-            let txs_res = client.wallet_transactions().await.unwrap_or_default();
-            let magpie_res = client.hermes.magpie_state(&tok_magpie).await.ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let me_res = fence
+                .client
+                .get_my_profile_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let sessions_res = fence
+                .client
+                .list_sessions_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let twofa_res = fence
+                .client
+                .get_2fa_status_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let blocked_res = fence
+                .client
+                .list_blocked_users_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let my_settings_res = fence
+                .client
+                .get_my_settings_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let folders_res = fence
+                .client
+                .list_folders_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let proxies_res = fence
+                .client
+                .list_proxies_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let bal_res = fence
+                .client
+                .wallet_balance_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let txs_res = fence
+                .client
+                .wallet_transactions_with_token(&fence.token, fence.client_epoch)
+                .await
+                .unwrap_or_default();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let magpie_res = fence.client.hermes.magpie_state(&fence.token).await.ok();
 
             let _ = weak.update(app, |shell, cx| {
-                if !fence.matches(
-                    shell.is_authenticated,
-                    shell.session_sync.auth_generation,
-                    0,
-                    shell.session_sync.session_token.as_deref(),
-                    shell.session_sync.user_id,
-                ) {
+                if !fence.is_valid(shell) {
                     return;
                 }
 
@@ -634,22 +694,24 @@ impl AppShell {
                     });
                 }
 
-                if let Some(proxies) = proxies_res {
-                    let active_proxy = proxies
-                        .iter()
-                        .find(|p| p.enabled && !p.kind.eq_ignore_ascii_case("Direct"))
-                        .or_else(|| proxies.iter().find(|p| p.enabled));
-                    shell.settings_router.update(cx, |sr, scx| {
-                        let sa = sr.ensure_advanced(scx);
-                        sa.update(scx, |sa, sa_cx| {
-                            if let Some(p) = active_proxy {
-                                sa.sync_proxy(&p.kind, &p.host, p.port, p.enabled);
-                            } else {
-                                sa.sync_proxy("Direct", "", 1080, false);
-                            }
-                            sa_cx.notify();
+                if shell.proxy_op_generation == start_proxy_op_gen {
+                    if let Some(proxies) = proxies_res {
+                        let active_proxy = proxies
+                            .iter()
+                            .find(|p| p.enabled && !p.kind.eq_ignore_ascii_case("Direct"))
+                            .or_else(|| proxies.iter().find(|p| p.enabled));
+                        shell.settings_router.update(cx, |sr, scx| {
+                            let sa = sr.ensure_advanced(scx);
+                            sa.update(scx, |sa, sa_cx| {
+                                if let Some(p) = active_proxy {
+                                    sa.sync_proxy(&p.kind, &p.host, p.port, p.enabled);
+                                } else {
+                                    sa.sync_proxy("Direct", "", 1080, false);
+                                }
+                                sa_cx.notify();
+                            });
                         });
-                    });
+                    }
                 }
 
                 if let Some(folders) = folders_res {
@@ -689,14 +751,14 @@ impl AppShell {
                 if let Some(ek) = self.bot_browser.last_recovery_key_notice.clone() {
                     cx.write_to_clipboard(ClipboardItem::new_string(ek.as_str().to_string()));
                     self.bot_browser.first_creation_banner_open = false;
-                    self.enqueue_localized_toast(
+                    self.enqueue_localized_non_chat_toast(
                         "已复制恢复密钥，请妥善离线保存",
                         "Copied Emergency Kit — store it offline safely",
                         2800,
                         cx,
                     );
                 } else {
-                    self.enqueue_localized_toast(
+                    self.enqueue_localized_non_chat_toast(
                         "恢复密钥仅在首次创建保险库时本地生成展示",
                         "Emergency Kit is only shown locally during initial vault creation",
                         2800,

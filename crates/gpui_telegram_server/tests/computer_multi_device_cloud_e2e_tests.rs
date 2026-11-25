@@ -407,7 +407,13 @@ async fn poll_bot_reply_text(
             .expect("get_chat_messages");
         if let Some(reply) = msgs
             .iter()
-            .filter(|m| m.sender_id == bot_id && m.message_id > after_msg_id)
+            .filter(|m| {
+                m.sender_id == bot_id
+                    && m.message_id > after_msg_id
+                    && !m.text.trim().is_empty()
+                    && !m.text.contains("⏳")
+                    && !m.text.contains("💭 **思考过程**")
+            })
             .max_by_key(|m| m.message_id)
         {
             return reply.text.clone();
@@ -430,12 +436,29 @@ fn build_rt() -> tokio::runtime::Runtime {
 struct BgPollerGuard {
     stop_flag: Arc<AtomicBool>,
     saw_expected_bot: Arc<AtomicBool>,
+    saw_notify: Arc<tokio::sync::Notify>,
     task: JoinHandle<()>,
 }
 
 impl BgPollerGuard {
+    async fn wait_for_expected_bot(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let notified = self.saw_notify.notified();
+            if self.saw_expected_bot.load(Ordering::SeqCst) {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return self.saw_expected_bot.load(Ordering::SeqCst);
+            };
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.saw_expected_bot.load(Ordering::SeqCst);
+            }
+        }
+    }
+
     async fn stop(self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        self.stop_flag.store(true, Ordering::SeqCst);
         self.task.abort();
         tokio::task::yield_now().await;
     }
@@ -443,7 +466,7 @@ impl BgPollerGuard {
 
 impl Drop for BgPollerGuard {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        self.stop_flag.store(true, Ordering::SeqCst);
         self.task.abort();
     }
 }
@@ -456,9 +479,11 @@ fn spawn_weak_device_poller(
     let stop_bg = Arc::clone(&stop_flag);
     let saw_expected_bot = Arc::new(AtomicBool::new(false));
     let saw_bg = Arc::clone(&saw_expected_bot);
+    let saw_notify = Arc::new(tokio::sync::Notify::new());
+    let saw_notify_bg = Arc::clone(&saw_notify);
     let weak_client = Arc::downgrade(client);
     let task = tokio::spawn(async move {
-        while !stop_bg.load(Ordering::Relaxed) {
+        while !stop_bg.load(Ordering::SeqCst) {
             let Some(strong) = weak_client.upgrade() else {
                 break;
             };
@@ -466,7 +491,8 @@ fn spawn_weak_device_poller(
             drop(strong);
             if let (Ok(done), Some(bid)) = (res, expected_bot_id) {
                 if done.iter().any(|c| c.caller_bot_id == Some(bid)) {
-                    saw_bg.store(true, Ordering::Relaxed);
+                    saw_bg.store(true, Ordering::SeqCst);
+                    saw_notify_bg.notify_waiters();
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -475,6 +501,7 @@ fn spawn_weak_device_poller(
     BgPollerGuard {
         stop_flag,
         saw_expected_bot,
+        saw_notify,
         task,
     }
 }
@@ -920,7 +947,7 @@ fn e2e_scenario_b_per_bot_config_and_cross_device_bot_remote_exec() {
             "expected bot_1 reply to include real command output from Device B, got: {reply_text}"
         );
         assert!(
-            bg_poller.saw_expected_bot.load(Ordering::Relaxed),
+            bg_poller.wait_for_expected_bot(Duration::from_secs(5)).await,
             "Device B poller must have observed caller_bot_id == Some({})",
             bot_1.user_id
         );

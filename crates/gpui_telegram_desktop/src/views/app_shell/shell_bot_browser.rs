@@ -58,12 +58,13 @@ use crate::views::app_shell::local_subscription_bridge::{
 };
 use crate::views::app_shell::shell_actions::{peer_avatar_color, resolve_active_target_chat_id};
 use crate::views::app_shell::shell_settings_sync::format_ms_human;
+use crate::views::app_shell::shell_truth::ClientCallFence;
 use crate::views::app_shell::shell_state::reconcile_stage_message_list;
 use crate::views::app_shell::shell_truth::{derive_initials, format_authoritative_timestamp};
 use crate::views::auth::PendingAuthVaultBootstrap;
 use crate::views::chat_sidebar::DialogDeliveryStatus;
 use crate::views::settings::sections::{PendingDeviceSyncRow, VaultCustodyStatus};
-use crate::views::shell::AppShell;
+use crate::views::shell::{ActiveWorkspacePanel, AppShell};
 use crate::views::stage::cards::{
     BotAssistCardAction, DeliveryStatus, InlineButtonType, InlineKeyboardButton, MessageContent,
     MessageDirection, MessageItemModel, ServiceType, BOT_ASSIST_LOCAL_MSG_ID_BASE,
@@ -576,6 +577,55 @@ pub async fn seal_and_put_vault_item(
     plaintext: &[u8],
     known_latest_rev: &mut i64,
 ) -> Result<i64, String> {
+    seal_and_put_vault_item_with_session(
+        client,
+        None,
+        key,
+        user_id,
+        category,
+        item_key,
+        plaintext,
+        known_latest_rev,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn seal_and_put_vault_item_pinned(
+    client: &gpui_telegram_client::TelegramClient,
+    token: &str,
+    expected_epoch: u64,
+    key: &UnlockedUserVaultKey,
+    user_id: u64,
+    category: UserVaultCategory,
+    item_key: &str,
+    plaintext: &[u8],
+    known_latest_rev: &mut i64,
+) -> Result<i64, String> {
+    seal_and_put_vault_item_with_session(
+        client,
+        Some((token, expected_epoch)),
+        key,
+        user_id,
+        category,
+        item_key,
+        plaintext,
+        known_latest_rev,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seal_and_put_vault_item_with_session(
+    client: &gpui_telegram_client::TelegramClient,
+    pinned: Option<(&str, u64)>,
+    key: &UnlockedUserVaultKey,
+    user_id: u64,
+    category: UserVaultCategory,
+    item_key: &str,
+    plaintext: &[u8],
+    known_latest_rev: &mut i64,
+) -> Result<i64, String> {
     for attempt in 0..4 {
         let predicted_rev = (*known_latest_rev).max(0) + 1;
         let blob = key
@@ -591,10 +641,19 @@ pub async fn seal_and_put_vault_item(
             ciphertext_b64: blob.ciphertext_b64,
             deleted: false,
         };
-        let resp = client
-            .put_user_vault_item(category.as_str(), item_key, &req)
-            .await
-            .map_err(|e| format!("Vault upload failed ({}/{item_key}): {e}", category.as_str()))?;
+        let resp = match pinned {
+            Some((tok, epoch)) => {
+                client
+                    .put_user_vault_item_with_token(tok, epoch, category.as_str(), item_key, &req)
+                    .await
+            }
+            None => {
+                client
+                    .put_user_vault_item(category.as_str(), item_key, &req)
+                    .await
+            }
+        }
+        .map_err(|e| format!("Vault upload failed ({}/{item_key}): {e}", category.as_str()))?;
         *known_latest_rev = resp.revision;
         if resp.revision == predicted_rev {
             return Ok(resp.revision);
@@ -615,10 +674,64 @@ pub async fn pull_and_apply_user_vault_items(
     profiles_root: &Path,
     since_revision: i64,
 ) -> Result<VaultPullReport, String> {
-    let pulled = client
-        .pull_user_vault_items(Some(since_revision), None)
-        .await
-        .map_err(|e| format!("Failed pulling user vault items: {e}"))?;
+    pull_and_apply_user_vault_items_with_session(
+        client,
+        None,
+        key,
+        user_id,
+        vault,
+        profiles_root,
+        since_revision,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn pull_and_apply_user_vault_items_pinned(
+    client: &gpui_telegram_client::TelegramClient,
+    token: &str,
+    expected_epoch: u64,
+    key: &UnlockedUserVaultKey,
+    user_id: u64,
+    vault: &CredentialVault,
+    profiles_root: &Path,
+    since_revision: i64,
+) -> Result<VaultPullReport, String> {
+    pull_and_apply_user_vault_items_with_session(
+        client,
+        Some((token, expected_epoch)),
+        key,
+        user_id,
+        vault,
+        profiles_root,
+        since_revision,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_and_apply_user_vault_items_with_session(
+    client: &gpui_telegram_client::TelegramClient,
+    pinned: Option<(&str, u64)>,
+    key: &UnlockedUserVaultKey,
+    user_id: u64,
+    vault: &CredentialVault,
+    profiles_root: &Path,
+    since_revision: i64,
+) -> Result<VaultPullReport, String> {
+    let pulled = match pinned {
+        Some((tok, epoch)) => {
+            client
+                .pull_user_vault_items_with_token(tok, epoch, Some(since_revision), None)
+                .await
+        }
+        None => {
+            client
+                .pull_user_vault_items(Some(since_revision), None)
+                .await
+        }
+    }
+    .map_err(|e| format!("Failed pulling user vault items: {e}"))?;
 
     let mut report = VaultPullReport {
         latest_revision: pulled.latest_revision.max(since_revision),
@@ -706,6 +819,55 @@ pub async fn push_all_local_vault_items(
     ai_bundle: Option<&AiOauthVaultBundle>,
     known_latest_rev: &mut i64,
 ) -> Result<VaultPushReport, String> {
+    push_all_local_vault_items_with_session(
+        client,
+        None,
+        key,
+        user_id,
+        vault,
+        profiles_root,
+        ai_bundle,
+        known_latest_rev,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn push_all_local_vault_items_pinned(
+    client: &gpui_telegram_client::TelegramClient,
+    token: &str,
+    expected_epoch: u64,
+    key: &UnlockedUserVaultKey,
+    user_id: u64,
+    vault: &CredentialVault,
+    profiles_root: &Path,
+    ai_bundle: Option<&AiOauthVaultBundle>,
+    known_latest_rev: &mut i64,
+) -> Result<VaultPushReport, String> {
+    push_all_local_vault_items_with_session(
+        client,
+        Some((token, expected_epoch)),
+        key,
+        user_id,
+        vault,
+        profiles_root,
+        ai_bundle,
+        known_latest_rev,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_all_local_vault_items_with_session(
+    client: &gpui_telegram_client::TelegramClient,
+    pinned: Option<(&str, u64)>,
+    key: &UnlockedUserVaultKey,
+    user_id: u64,
+    vault: &CredentialVault,
+    profiles_root: &Path,
+    ai_bundle: Option<&AiOauthVaultBundle>,
+    known_latest_rev: &mut i64,
+) -> Result<VaultPushReport, String> {
     let mut report = VaultPushReport {
         latest_revision: *known_latest_rev,
         ..Default::default()
@@ -719,8 +881,9 @@ pub async fn push_all_local_vault_items(
             serde_json::to_vec(&cred)
                 .map_err(|e| format!("Failed serializing credential payload: {e}"))?,
         );
-        seal_and_put_vault_item(
+        seal_and_put_vault_item_with_session(
             client,
+            pinned,
             key,
             user_id,
             UserVaultCategory::Password,
@@ -736,8 +899,9 @@ pub async fn push_all_local_vault_items(
         if let Ok(packed) =
             BrowserProfileSnapshot::pack_storage_dir(&dir_path, None, MAX_PROFILE_BUNDLE_BYTES)
         {
-            seal_and_put_vault_item(
+            seal_and_put_vault_item_with_session(
                 client,
+                pinned,
                 key,
                 user_id,
                 UserVaultCategory::BrowserCookie,
@@ -754,8 +918,9 @@ pub async fn push_all_local_vault_items(
         let bytes = bundle
             .to_json_bytes()
             .map_err(|e| format!("Failed serializing AI OAuth bundle: {e}"))?;
-        seal_and_put_vault_item(
+        seal_and_put_vault_item_with_session(
             client,
+            pinned,
             key,
             user_id,
             UserVaultCategory::AiOauth,
@@ -850,9 +1015,13 @@ fn export_unmigrated_local_credentials_if_any(user_browser_dir: &Path) -> Vec<Va
 }
 
 async fn fetch_pending_device_sync_rows(
-    client: &gpui_telegram_client::TelegramClient,
+    fence: &ClientCallFence,
 ) -> Vec<PendingDeviceSyncRow> {
-    match client.device_sync_pending().await {
+    match fence
+        .client
+        .device_sync_pending_with_token(&fence.token, fence.client_epoch)
+        .await
+    {
         Ok(resp) => resp
             .items
             .into_iter()
@@ -885,7 +1054,7 @@ struct UnlockedVaultRuntimeBundle {
 
 #[allow(clippy::too_many_arguments)]
 async fn finalize_unlocked_vault_runtime(
-    client: &gpui_telegram_client::TelegramClient,
+    fence: &ClientCallFence,
     user_id: u64,
     user_browser_dir: &Path,
     fabushi_dir: &Path,
@@ -900,6 +1069,10 @@ async fn finalize_unlocked_vault_runtime(
     is_first_creation: bool,
     pull_from_cloud: bool,
 ) -> Result<UnlockedVaultRuntimeBundle, String> {
+    fence
+        .client
+        .ensure_pinned_session(fence.client_epoch, &fence.token)
+        .map_err(|e| format!("Session changed before vault finalize: {e}"))?;
     let vault_db_path = user_browser_dir.join("vault.db");
     let profiles_root = user_browser_dir.join("profiles");
     let user_browser_dir_owned = user_browser_dir.to_path_buf();
@@ -940,9 +1113,16 @@ async fn finalize_unlocked_vault_runtime(
     .await
     .map_err(|e| format!("vault open task join error: {e}"))??;
 
+    fence
+        .client
+        .ensure_pinned_session(fence.client_epoch, &fence.token)
+        .map_err(|e| format!("Session changed during vault open: {e}"))?;
+
     let mut pull_report = if pull_from_cloud {
-        pull_and_apply_user_vault_items(
-            client,
+        pull_and_apply_user_vault_items_pinned(
+            &fence.client,
+            &fence.token,
+            fence.client_epoch,
             &unlocked_key,
             user_id,
             &vault,
@@ -975,8 +1155,10 @@ async fn finalize_unlocked_vault_runtime(
             None
         };
         let mut known_rev = pull_report.latest_revision;
-        if let Ok(push_r) = push_all_local_vault_items(
-            client,
+        if let Ok(push_r) = push_all_local_vault_items_pinned(
+            &fence.client,
+            &fence.token,
+            fence.client_epoch,
             &unlocked_key,
             user_id,
             &vault,
@@ -996,7 +1178,7 @@ async fn finalize_unlocked_vault_runtime(
         .unwrap_or_default();
 
     let pending_approvals = if pull_from_cloud {
-        fetch_pending_device_sync_rows(client).await
+        fetch_pending_device_sync_rows(fence).await
     } else {
         Vec::new()
     };
@@ -1016,7 +1198,7 @@ async fn finalize_unlocked_vault_runtime(
 }
 
 async fn execute_silent_split_key_upgrade(
-    client: &gpui_telegram_client::TelegramClient,
+    fence: &ClientCallFence,
     user_id: u64,
     unlocked_key: &UnlockedUserVaultKey,
     existing_envelope: Option<&UserVaultKeyEnvelope>,
@@ -1047,8 +1229,9 @@ async fn execute_silent_split_key_upgrade(
             )
             .map_err(|e| format!("Failed rewrapping vault root key to split_key_v2: {e}"))?;
             let dto = user_vault_envelope_to_proto(&new_env);
-            client
-                .put_user_vault_envelope(&dto)
+            fence
+                .client
+                .put_user_vault_envelope_with_token(&fence.token, fence.client_epoch, &dto)
                 .await
                 .map_err(|e| format!("Failed uploading upgraded split_key_v2 envelope: {e}"))?;
         }
@@ -1074,7 +1257,10 @@ async fn execute_silent_split_key_upgrade(
             p_cost: params_copy.p_cost,
         },
     };
-    let upgrade_res = client.upgrade_split_key(&req).await;
+    let upgrade_res = fence
+        .client
+        .upgrade_split_key_with_token(&fence.token, fence.client_epoch, &req)
+        .await;
     req.old_password.zeroize();
     req.auth_verifier_b64.zeroize();
     upgrade_res
@@ -1228,8 +1414,19 @@ impl AppShell {
                         .then(|| fb.avatar_shape.clone()),
                     avatar_color: (!fb.avatar_color.trim().is_empty())
                         .then(|| fb.avatar_color.clone()),
-                    preferred_model: (!fb.preferred_model.trim().is_empty())
-                        .then(|| fb.preferred_model.clone()),
+                    preferred_model: {
+                        let comp_prof = self.computers.bot_profiles.get(&(fb.bot_user_id.max(0) as u64));
+                        let raw = match comp_prof {
+                            Some(p) if !p.preferred_model.trim().is_empty() => p.preferred_model.trim(),
+                            Some(p) if p.updated_at_ms > 0 => "",
+                            _ => fb.preferred_model.trim(),
+                        };
+                        (!raw.is_empty()
+                            && !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(
+                                raw,
+                            ))
+                        .then(|| raw.to_string())
+                    },
                     thinking_level: (!fb.thinking_level.trim().is_empty())
                         .then(|| fb.thinking_level.clone()),
                     approval_mode: (!fb.approval_mode.trim().is_empty())
@@ -1282,8 +1479,20 @@ impl AppShell {
                         .then(|| prof.bot.avatar_shape.clone()),
                     avatar_color: (!prof.bot.avatar_color.trim().is_empty())
                         .then(|| prof.bot.avatar_color.clone()),
-                    preferred_model: (!prof.bot.preferred_model.trim().is_empty())
-                        .then(|| prof.bot.preferred_model.clone()),
+                    preferred_model: {
+                        let comp_prof =
+                            self.computers.bot_profiles.get(&(prof.bot.bot_user_id.max(0) as u64));
+                        let raw = match comp_prof {
+                            Some(p) if !p.preferred_model.trim().is_empty() => p.preferred_model.trim(),
+                            Some(p) if p.updated_at_ms > 0 => "",
+                            _ => prof.bot.preferred_model.trim(),
+                        };
+                        (!raw.is_empty()
+                            && !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(
+                                raw,
+                            ))
+                        .then(|| raw.to_string())
+                    },
                     thinking_level: (!prof.bot.thinking_level.trim().is_empty())
                         .then(|| prof.bot.thinking_level.clone()),
                     approval_mode: (!prof.bot.approval_mode.trim().is_empty())
@@ -1390,7 +1599,6 @@ impl AppShell {
         let Some(user_id) = self.session_sync.user_id else {
             return;
         };
-        let auth_gen = self.session_sync.auth_generation;
         self.bot_browser.vault_bootstrap_generation =
             self.bot_browser.vault_bootstrap_generation.wrapping_add(1);
         self.bot_browser.device_sync_poll_generation =
@@ -1405,7 +1613,9 @@ impl AppShell {
         let user_browser_dir = user_bot_browser_dir(&prefs_dir, user_id);
         let fabushi_dir = user_local_fabushi_dir(&prefs_dir, user_id);
         let cached_subs = self.magpie_local.discovered_items.clone();
-        let client = self.client.clone();
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let base_url = self.client.http_client.base_url.clone();
         let runtime = self.client.runtime().clone();
 
@@ -1427,8 +1637,13 @@ impl AppShell {
         }
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let outcome_res = runtime
                 .spawn(async move {
+                    let fence = fence_task;
                     let is_new_reg = matches!(
                         auth_bootstrap.as_ref(),
                         Some(PendingAuthVaultBootstrap::SplitKeyV2 {
@@ -1449,7 +1664,14 @@ impl AppShell {
                         };
 
                     if let Some(unlocked_key) = keyring_key.take() {
-                        let cloud_env_res = client.get_user_vault_envelope().await;
+                        let cloud_env_res = fence
+                            .client
+                            .get_user_vault_envelope_with_token(&fence.token, fence.client_epoch)
+                            .await;
+                        fence
+                            .client
+                            .ensure_pinned_session(fence.client_epoch, &fence.token)
+                            .map_err(|e| format!("Session changed during vault bootstrap: {e}"))?;
                         let server_explicitly_empty = cloud_env_res
                             .as_ref()
                             .is_ok_and(|resp| resp.envelope.is_none());
@@ -1465,7 +1687,7 @@ impl AppShell {
                             });
                             if existing_env.is_some() {
                                 let _ = execute_silent_split_key_upgrade(
-                                    &client,
+                                    &fence,
                                     user_id,
                                     &unlocked_key,
                                     existing_env.as_ref(),
@@ -1475,7 +1697,7 @@ impl AppShell {
                             }
                             let pull_from_cloud = existing_env.is_some();
                             let bundle = finalize_unlocked_vault_runtime(
-                                &client,
+                                &fence,
                                 user_id,
                                 &user_browser_dir,
                                 &fabushi_dir,
@@ -1496,7 +1718,14 @@ impl AppShell {
                     }
 
                     // Keychain did not yield an unlocked root key (or was stale on fresh server DB).
-                    let cloud_env_res = client.get_user_vault_envelope().await;
+                    let cloud_env_res = fence
+                        .client
+                        .get_user_vault_envelope_with_token(&fence.token, fence.client_epoch)
+                        .await;
+                    fence
+                        .client
+                        .ensure_pinned_session(fence.client_epoch, &fence.token)
+                        .map_err(|e| format!("Session changed during vault bootstrap: {e}"))?;
                     match cloud_env_res {
                         Ok(resp) if resp.envelope.is_none() => match &auth_bootstrap {
                             Some(PendingAuthVaultBootstrap::SplitKeyV2 {
@@ -1531,13 +1760,18 @@ impl AppShell {
                                     .map_err(|e| format!("vault init join error: {e}"))??;
 
                                 let env_dto = user_vault_envelope_to_proto(&envelope);
-                                client
-                                    .put_user_vault_envelope(&env_dto)
+                                fence
+                                    .client
+                                    .put_user_vault_envelope_with_token(
+                                        &fence.token,
+                                        fence.client_epoch,
+                                        &env_dto,
+                                    )
                                     .await
                                     .map_err(|e| format!("Failed uploading split_key_v2 envelope: {e}"))?;
 
                                 let _ = execute_silent_split_key_upgrade(
-                                    &client,
+                                    &fence,
                                     user_id,
                                     &unlocked_key,
                                     None,
@@ -1546,7 +1780,7 @@ impl AppShell {
                                 .await;
 
                                 let bundle = finalize_unlocked_vault_runtime(
-                                    &client,
+                                    &fence,
                                     user_id,
                                     &user_browser_dir,
                                     &fabushi_dir,
@@ -1585,15 +1819,20 @@ impl AppShell {
                                     .map_err(|e| format!("vault init join error: {e}"))??;
 
                                 let env_dto = user_vault_envelope_to_proto(&envelope);
-                                client
-                                    .put_user_vault_envelope(&env_dto)
+                                fence
+                                    .client
+                                    .put_user_vault_envelope_with_token(
+                                        &fence.token,
+                                        fence.client_epoch,
+                                        &env_dto,
+                                    )
                                     .await
                                     .map_err(|e| {
                                         format!("Failed uploading device_keychain_v2 envelope: {e}")
                                     })?;
 
                                 let bundle = finalize_unlocked_vault_runtime(
-                                    &client,
+                                    &fence,
                                     user_id,
                                     &user_browser_dir,
                                     &fabushi_dir,
@@ -1674,7 +1913,7 @@ impl AppShell {
                                     if let Some(unlocked_key) = split_unlock {
                                         let unlocked_arc = Arc::new(unlocked_key);
                                         let _ = execute_silent_split_key_upgrade(
-                                            &client,
+                                            &fence,
                                             user_id,
                                             &unlocked_arc,
                                             Some(&envelope),
@@ -1683,7 +1922,7 @@ impl AppShell {
                                         .await;
 
                                         let bundle = finalize_unlocked_vault_runtime(
-                                            &client,
+                                            &fence,
                                             user_id,
                                             &user_browser_dir,
                                             &fabushi_dir,
@@ -1711,7 +1950,15 @@ impl AppShell {
                                 device_name: resolve_device_display_name(),
                                 device_public_key_b64: keypair.public_key_b64(),
                             };
-                            match client.device_sync_request(&body).await {
+                            match fence
+                                .client
+                                .device_sync_request_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    &body,
+                                )
+                                .await
+                            {
                                 Ok(sync_resp) => Ok(BootstrapOutcome::AwaitingDeviceApproval {
                                     request_id: sync_resp.request_id,
                                     verification_code: sync_resp.verification_code,
@@ -1722,6 +1969,10 @@ impl AppShell {
                             }
                         }
                         Err(_) => {
+                            fence
+                                .client
+                                .ensure_pinned_session(fence.client_epoch, &fence.token)
+                                .map_err(|e| format!("Session changed during vault bootstrap: {e}"))?;
                             let (orch, host, local_subs, metas) =
                                 tokio::task::spawn_blocking(move || -> Result<_, String> {
                                     let vault = Arc::new(
@@ -1762,8 +2013,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -1801,13 +2051,14 @@ impl AppShell {
                             expires_at,
                             keypair: Some(keypair),
                         });
-                        shell.window_runtime.enqueue_toast(
+                        shell.show_non_chat_toast(
                             if lang.starts_with("zh") {
                                 format!("多端同步验证码 {verification_code}：请在已登录设备（设置 → 隐私与安全）批准或输入恢复密钥")
                             } else {
                                 format!("Device sync code {verification_code}: approve on a trusted device or unlock in Privacy & Security")
                             },
                             4500,
+                            cx,
                         );
                         shell.sync_vault_custody_to_settings(cx);
                         shell.spawn_device_sync_status_poller(request_id, cx);
@@ -1860,7 +2111,7 @@ impl AppShell {
                         shell.sync_vault_custody_to_settings(cx);
                     }
                     Err(err) => {
-                        shell.window_runtime.enqueue_toast(err, 3200);
+                        shell.show_non_chat_toast(err, 3200, cx);
                     }
                 }
                 cx.notify();
@@ -1981,12 +2232,13 @@ impl AppShell {
         let Some(user_id) = self.session_sync.user_id else {
             return;
         };
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         self.bot_browser.device_sync_poll_generation =
             self.bot_browser.device_sync_poll_generation.wrapping_add(1);
         let poll_gen = self.bot_browser.device_sync_poll_generation;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
         let prefs_dir = self.preferences_dir.clone();
         let user_browser_dir = user_bot_browser_dir(&prefs_dir, user_id);
@@ -2005,8 +2257,7 @@ impl AppShell {
 
                 let still_active = weak
                     .update(app, |shell, _| {
-                        shell.is_authenticated
-                            && shell.session_sync.auth_generation == auth_gen
+                        fence.is_valid(shell)
                             && shell.bot_browser.vault_bootstrap_generation == boot_gen
                             && shell.bot_browser.device_sync_poll_generation == poll_gen
                             && shell.bot_browser.unlocked_vault_key.is_none()
@@ -2021,9 +2272,14 @@ impl AppShell {
 
                 let status_res = runtime
                     .spawn({
-                        let client = client.clone();
+                        let fence = fence.clone();
                         let rid = request_id.clone();
-                        async move { client.device_sync_status(&rid).await }
+                        async move {
+                            fence
+                                .client
+                                .device_sync_status_with_token(&fence.token, fence.client_epoch, &rid)
+                                .await
+                        }
                     })
                     .await;
 
@@ -2044,7 +2300,7 @@ impl AppShell {
                         };
                         let keypair_opt = weak
                             .update(app, |shell, _| {
-                                if shell.session_sync.auth_generation == auth_gen
+                                if fence.is_valid(shell)
                                     && shell.bot_browser.vault_bootstrap_generation == boot_gen
                                     && shell.bot_browser.device_sync_poll_generation == poll_gen
                                 {
@@ -2071,7 +2327,7 @@ impl AppShell {
 
                         let bundle_res = runtime
                             .spawn({
-                                let client = client.clone();
+                                let fence = fence.clone();
                                 let rid = request_id.clone();
                                 let user_browser_dir = user_browser_dir.clone();
                                 let fabushi_dir = fabushi_dir.clone();
@@ -2089,7 +2345,7 @@ impl AppShell {
                                     .map_err(|e| format!("device sync unwrap join error: {e}"))??;
 
                                     finalize_unlocked_vault_runtime(
-                                        &client,
+                                        &fence,
                                         user_id,
                                         &user_browser_dir,
                                         &fabushi_dir,
@@ -2112,9 +2368,9 @@ impl AppShell {
                             .and_then(|r| r);
 
                         let _ = weak.update(app, |shell, cx| {
-                            if !shell.is_authenticated
-                                || shell.session_sync.auth_generation != auth_gen
+                            if !fence.is_valid(shell)
                                 || shell.bot_browser.vault_bootstrap_generation != boot_gen
+                                || shell.bot_browser.device_sync_poll_generation != poll_gen
                             {
                                 return;
                             }
@@ -2122,13 +2378,14 @@ impl AppShell {
                             match bundle_res {
                                 Ok(bundle) => {
                                     shell.apply_unlocked_vault_bundle_to_shell(bundle, cx);
-                                    shell.window_runtime.enqueue_toast(
+                                    shell.show_non_chat_toast(
                                         tr_str(
                                             lang,
                                             "新设备同步已批准，安全保管库已自动解锁并同步",
                                             "Device sync approved — vault unlocked & synced automatically",
                                         ),
                                         3500,
+                                        cx,
                                     );
                                 }
                                 Err(err) => {
@@ -2136,7 +2393,7 @@ impl AppShell {
                                     shell.bot_browser.vault_custody_status =
                                         VaultCustodyStatus::NeedsRecoveryKey;
                                     shell.bot_browser.vault_custody_status_note = Some(err.clone());
-                                    shell.window_runtime.enqueue_toast(err, 3500);
+                                    shell.show_non_chat_toast(err, 3500, cx);
                                     shell.sync_vault_custody_to_settings(cx);
                                 }
                             }
@@ -2147,8 +2404,7 @@ impl AppShell {
                     "denied" | "expired" | "consumed" => {
                         let status_str = resp.status.clone();
                         let _ = weak.update(app, |shell, cx| {
-                            if !shell.is_authenticated
-                                || shell.session_sync.auth_generation != auth_gen
+                            if !fence.is_valid(shell)
                                 || shell.bot_browser.vault_bootstrap_generation != boot_gen
                                 || shell.bot_browser.device_sync_poll_generation != poll_gen
                             {
@@ -2177,19 +2433,21 @@ impl AppShell {
 
     /// Fetches pending X25519 device sync approval requests and refreshes cached credential metadata.
     pub fn refresh_pending_device_sync_requests(&mut self, cx: &mut Context<Self>) {
-        if !self.is_authenticated {
+        let Some(fence) = self.capture_client_fence() else {
             return;
-        }
-        let auth_gen = self.session_sync.auth_generation;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let orch = self.bot_browser.orchestrator.clone();
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let (rows, metas_opt) = runtime
                 .spawn(async move {
-                    let rows = fetch_pending_device_sync_rows(&client).await;
+                    let rows = fetch_pending_device_sync_rows(&fence_task).await;
                     let metas_opt = if let Some(orch_ref) = orch {
                         tokio::task::spawn_blocking(move || {
                             collect_credential_metas_from_vault(orch_ref.vault())
@@ -2205,8 +2463,7 @@ impl AppShell {
                 .unwrap_or_default();
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -2224,29 +2481,42 @@ impl AppShell {
 
     /// Initiates (or retries) an X25519 Device Trust Ring sync request from Settings → Privacy & Security.
     pub fn initiate_device_sync_request_from_settings(&mut self, cx: &mut Context<Self>) {
-        if !self.is_authenticated || self.session_sync.user_id.is_none() {
+        if self.session_sync.user_id.is_none() {
             return;
         }
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let keypair = DeviceSyncKeypair::generate();
             let req_body = DeviceSyncRequestBody {
                 device_name: resolve_device_display_name(),
                 device_public_key_b64: keypair.public_key_b64(),
             };
+            let fence_task = fence.clone();
             let res = runtime
-                .spawn(async move { client.device_sync_request(&req_body).await })
+                .spawn(async move {
+                    fence_task
+                        .client
+                        .device_sync_request_with_token(
+                            &fence_task.token,
+                            fence_task.client_epoch,
+                            &req_body,
+                        )
+                        .await
+                })
                 .await
                 .map_err(|e| format!("device sync task join error: {e}"))
                 .and_then(|r| r.map_err(|e| format!("Failed creating device sync request: {e}")));
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -2283,7 +2553,7 @@ impl AppShell {
                     }
                     Err(err) => {
                         shell.bot_browser.vault_custody_status_note = Some(err.clone());
-                        shell.window_runtime.enqueue_toast(err, 3200);
+                        shell.show_non_chat_toast(err, 3200, cx);
                         shell.sync_vault_custody_to_settings(cx);
                     }
                 }
@@ -2321,22 +2591,28 @@ impl AppShell {
             self.bot_browser.unlocked_vault_key.clone(),
             self.session_sync.user_id,
         ) else {
-            self.window_runtime.enqueue_toast(
+            self.show_non_chat_toast(
                 tr_str(
                     lang,
                     "请先解锁本机保管库后再批准其他设备同步",
                     "Unlock this device's vault before approving another device",
                 ),
                 3200,
+                cx,
             );
             return;
         };
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let res = runtime
                 .spawn(async move {
                     let rid_seal = request_id.clone();
@@ -2357,11 +2633,17 @@ impl AppShell {
                         encrypted_root_key_b64: transfer.encrypted_root_key_b64,
                         nonce_b64: transfer.nonce_b64,
                     };
-                    client
-                        .device_sync_approve(&request_id, &req)
+                    fence_task
+                        .client
+                        .device_sync_approve_with_token(
+                            &fence_task.token,
+                            fence_task.client_epoch,
+                            &request_id,
+                            &req,
+                        )
                         .await
                         .map_err(|e| format!("Failed approving device sync: {e}"))?;
-                    let pending = fetch_pending_device_sync_rows(&client).await;
+                    let pending = fetch_pending_device_sync_rows(&fence_task).await;
                     Ok::<_, String>((request_id, pending))
                 })
                 .await
@@ -2369,8 +2651,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -2379,14 +2660,15 @@ impl AppShell {
                 match res {
                     Ok((_rid, pending)) => {
                         shell.bot_browser.pending_device_approvals = pending;
-                        shell.window_runtime.enqueue_toast(
+                        shell.show_non_chat_toast(
                             tr_str(lang, "已批准设备同步请求", "Approved device sync request"),
                             2800,
+                            cx,
                         );
                     }
                     Err(err) => {
                         shell.bot_browser.vault_custody_status_note = Some(err.clone());
-                        shell.window_runtime.enqueue_toast(err, 3200);
+                        shell.show_non_chat_toast(err, 3200, cx);
                     }
                 }
                 shell.sync_vault_custody_to_settings(cx);
@@ -2402,22 +2684,29 @@ impl AppShell {
         request_id: String,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_authenticated {
+        let Some(fence) = self.capture_client_fence() else {
             return;
-        }
-        let auth_gen = self.session_sync.auth_generation;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let res = runtime
                 .spawn(async move {
-                    client
-                        .device_sync_deny(&request_id)
+                    fence_task
+                        .client
+                        .device_sync_deny_with_token(
+                            &fence_task.token,
+                            fence_task.client_epoch,
+                            &request_id,
+                        )
                         .await
                         .map_err(|e| format!("Failed denying device sync: {e}"))?;
-                    let pending = fetch_pending_device_sync_rows(&client).await;
+                    let pending = fetch_pending_device_sync_rows(&fence_task).await;
                     Ok::<_, String>(pending)
                 })
                 .await
@@ -2425,8 +2714,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -2435,13 +2723,14 @@ impl AppShell {
                 match res {
                     Ok(pending) => {
                         shell.bot_browser.pending_device_approvals = pending;
-                        shell.window_runtime.enqueue_toast(
+                        shell.show_non_chat_toast(
                             tr_str(lang, "已拒绝设备同步请求", "Denied device sync request"),
                             2400,
+                            cx,
                         );
                     }
                     Err(err) => {
-                        shell.window_runtime.enqueue_toast(err, 3200);
+                        shell.show_non_chat_toast(err, 3200, cx);
                     }
                 }
                 shell.sync_vault_custody_to_settings(cx);
@@ -2469,13 +2758,18 @@ impl AppShell {
         };
         let unlocked_key = self.bot_browser.unlocked_vault_key.clone();
         let user_id_opt = self.session_sync.user_id;
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let mut known_rev = self.bot_browser.vault_sync_revision;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let res = runtime
                 .spawn(async move {
                     let orch_update = Arc::clone(&orch);
@@ -2500,8 +2794,10 @@ impl AppShell {
                         .await
                         {
                             if let Ok(bytes) = serde_json::to_vec(&record).map(Zeroizing::new) {
-                                if let Ok(rev) = seal_and_put_vault_item(
-                                    &client,
+                                if let Ok(rev) = seal_and_put_vault_item_pinned(
+                                    &fence_task.client,
+                                    &fence_task.token,
+                                    fence_task.client_epoch,
                                     &key,
                                     uid,
                                     UserVaultCategory::Password,
@@ -2523,8 +2819,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -2539,7 +2834,7 @@ impl AppShell {
                         shell.sync_vault_custody_to_settings(cx);
                     }
                     Err(err) => {
-                        shell.window_runtime.enqueue_toast(err, 3200);
+                        shell.show_non_chat_toast(err, 3200, cx);
                     }
                 }
                 cx.notify();
@@ -2558,12 +2853,17 @@ impl AppShell {
             return;
         };
         let unlocked_key = self.bot_browser.unlocked_vault_key.clone();
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let res = runtime
                 .spawn(async move {
                     let orch_del = Arc::clone(&orch);
@@ -2580,8 +2880,11 @@ impl AppShell {
 
                     let mut deleted_rev = None;
                     if unlocked_key.is_some() {
-                        if let Ok(resp) = client
-                            .delete_user_vault_item(
+                        if let Ok(resp) = fence_task
+                            .client
+                            .delete_user_vault_item_with_token(
+                                &fence_task.token,
+                                fence_task.client_epoch,
                                 USER_VAULT_CATEGORY_PASSWORD,
                                 &credential_id,
                                 None,
@@ -2598,8 +2901,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -2614,19 +2916,42 @@ impl AppShell {
                                 shell.bot_browser.vault_sync_revision.max(rev);
                         }
                         shell.sync_vault_custody_to_settings(cx);
-                        shell.window_runtime.enqueue_toast(
+                        shell.show_non_chat_toast(
                             tr_str(lang, "已从保管库移除该站点凭据", "Removed credential from vault"),
                             2400,
+                            cx,
                         );
                     }
                     Err(err) => {
-                        shell.window_runtime.enqueue_toast(err, 3200);
+                        shell.show_non_chat_toast(err, 3200, cx);
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn emit_local_vault_toast(
+        &mut self,
+        origin_chat_opt: Option<u64>,
+        text: impl Into<String>,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.into();
+        if let Some(cid) = origin_chat_opt {
+            let in_origin_chat = self.is_authenticated
+                && self.active_panel == ActiveWorkspacePanel::Chats
+                && !(self.theme_state.palette.is_apple_style()
+                    && self.sidebar.read(cx).is_plus_menu_open)
+                && self.stage.read(cx).active_chat_id == Some(cid);
+            if in_origin_chat {
+                self.show_chat_toast(cid, text, duration_ms, cx);
+            }
+        } else {
+            self.show_non_chat_toast(text, duration_ms, cx);
+        }
     }
 
     /// Intercepts `/vault-setup`, `/vault-unlock`, `/vault-recover`, `/vault-sync` strictly locally
@@ -2637,9 +2962,10 @@ impl AppShell {
         };
         let lang = self.active_lang_id();
         if !self.is_authenticated {
-            self.window_runtime.enqueue_toast(
+            self.show_non_chat_toast(
                 tr_str(lang, "请先登录后再操作安全保险库", "Sign in before running vault commands"),
                 2600,
+                cx,
             );
             return true;
         }
@@ -2653,7 +2979,7 @@ impl AppShell {
 
         match cmd {
             LocalVaultCommand::UsageError { message } => {
-                self.window_runtime.enqueue_toast(message.clone(), 2800);
+                self.emit_local_vault_toast(active_chat_opt, message.clone(), 2800, cx);
                 self.append_local_vault_notice(active_chat_opt, "vault_usage", message, cx);
                 cx.notify();
             }
@@ -2693,7 +3019,6 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let lang = self.active_lang_id();
-        let auth_gen = self.session_sync.auth_generation;
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let prefs_dir = self.preferences_dir.clone();
         let user_browser_dir = user_bot_browser_dir(&prefs_dir, user_id);
@@ -2702,15 +3027,22 @@ impl AppShell {
         let existing_fabushi = self.bot_browser.local_fabushi.clone();
         let cached_subs = self.magpie_local.discovered_items.clone();
         let base_url = self.client.http_client.base_url.clone();
-        let client = self.client.clone();
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let runtime = self.client.runtime().clone();
 
-        self.window_runtime.enqueue_toast(
+        self.emit_local_vault_toast(
+            active_chat_opt,
             tr_str(lang, "正在初始化端到端加密保险库…", "Initializing E2EE user vault…"),
             2200,
+            cx,
         );
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let setup_res = runtime
                 .spawn_blocking(move || -> Result<_, String> {
                 let vault_db_path = user_browser_dir.join("vault.db");
@@ -2805,7 +3137,12 @@ impl AppShell {
                 Ok(v) => v,
                 Err(err) => {
                     let _ = weak.update(app, |shell, cx| {
-                        shell.window_runtime.enqueue_toast(err.clone(), 3500);
+                        if !fence.is_valid(shell)
+                            || shell.bot_browser.vault_bootstrap_generation != boot_gen
+                        {
+                            return;
+                        }
+                        shell.emit_local_vault_toast(active_chat_opt, err.clone(), 3500, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_err", err, cx);
                         cx.notify();
                     });
@@ -2813,23 +3150,39 @@ impl AppShell {
                 }
             };
 
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let env_dto = user_vault_envelope_to_proto(&envelope);
+            let fence_task = fence.clone();
             let sync_res = runtime
                 .spawn({
-                    let client = client.clone();
                     let unlocked_key = Arc::clone(&unlocked_key);
                     async move {
-                        client
-                            .put_user_vault_envelope(&env_dto)
+                        fence_task
+                            .client
+                            .put_user_vault_envelope_with_token(
+                                &fence_task.token,
+                                fence_task.client_epoch,
+                                &env_dto,
+                            )
                             .await
                             .map_err(|e| format!("Failed uploading vault envelope: {e}"))?;
-                        let mut known_rev = client
-                            .pull_user_vault_items(None, None)
+                        let mut known_rev = fence_task
+                            .client
+                            .pull_user_vault_items_with_token(
+                                &fence_task.token,
+                                fence_task.client_epoch,
+                                None,
+                                None,
+                            )
                             .await
                             .map(|r| r.latest_revision)
                             .unwrap_or(0);
-                        push_all_local_vault_items(
-                            &client,
+                        push_all_local_vault_items_pinned(
+                            &fence_task.client,
+                            &fence_task.token,
+                            fence_task.client_epoch,
                             &unlocked_key,
                             user_id,
                             &vault,
@@ -2845,8 +3198,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -2894,17 +3246,19 @@ impl AppShell {
                             notice,
                             cx,
                         );
-                        shell.window_runtime.enqueue_toast(
+                        shell.emit_local_vault_toast(
+                            active_chat_opt,
                             tr_str(
                                 lang,
                                 "端到端加密保险库已启用，请保存本地显示的一次性恢复密钥",
                                 "E2EE Vault enabled — save the local one-time Recovery Key",
                             ),
                             4500,
+                            cx,
                         );
                     }
                     Err(err) => {
-                        shell.window_runtime.enqueue_toast(err.clone(), 3500);
+                        shell.emit_local_vault_toast(active_chat_opt, err.clone(), 3500, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_err", err, cx);
                     }
                 }
@@ -2923,26 +3277,37 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let lang = self.active_lang_id();
-        let auth_gen = self.session_sync.auth_generation;
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let prefs_dir = self.preferences_dir.clone();
         let user_browser_dir = user_bot_browser_dir(&prefs_dir, user_id);
         let fabushi_dir = user_local_fabushi_dir(&prefs_dir, user_id);
         let cached_subs = self.magpie_local.discovered_items.clone();
         let base_url = self.client.http_client.base_url.clone();
-        let client = self.client.clone();
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let runtime = self.client.runtime().clone();
 
-        self.window_runtime.enqueue_toast(
+        self.emit_local_vault_toast(
+            active_chat_opt,
             tr_str(lang, "正在本地解锁并解密同步数据…", "Unlocking & decrypting vault locally…"),
             2200,
+            cx,
         );
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let env_res = runtime
                 .spawn({
-                    let client = client.clone();
-                    async move { client.get_user_vault_envelope().await }
+                    let fence = fence.clone();
+                    async move {
+                        fence
+                            .client
+                            .get_user_vault_envelope_with_token(&fence.token, fence.client_epoch)
+                            .await
+                    }
                 })
                 .await
                 .map_err(|e| format!("envelope fetch task error: {e}"))
@@ -2953,13 +3318,18 @@ impl AppShell {
                     Some(env) => env,
                     None => {
                         let _ = weak.update(app, |shell, cx| {
+                            if !fence.is_valid(shell)
+                                || shell.bot_browser.vault_bootstrap_generation != boot_gen
+                            {
+                                return;
+                            }
                             let msg = tr_str(
                                 shell.active_lang_id(),
                                 "云端尚未创建加密保险库，将在下次密码或扫码登录时自动初始化，也可在「设置 → 隐私与安全」查看状态",
                                 "No cloud vault envelope found yet. It will initialize automatically on password sign-in, or inspect status in Settings → Privacy & Security.",
                             )
                             .to_string();
-                            shell.window_runtime.enqueue_toast(msg.clone(), 3200);
+                            shell.emit_local_vault_toast(active_chat_opt, msg.clone(), 3200, cx);
                             shell.append_local_vault_notice(active_chat_opt, "vault_no_env", msg, cx);
                             cx.notify();
                         });
@@ -2968,7 +3338,12 @@ impl AppShell {
                 },
                 Err(err) => {
                     let _ = weak.update(app, |shell, cx| {
-                        shell.window_runtime.enqueue_toast(err.clone(), 3200);
+                        if !fence.is_valid(shell)
+                            || shell.bot_browser.vault_bootstrap_generation != boot_gen
+                        {
+                            return;
+                        }
+                        shell.emit_local_vault_toast(active_chat_opt, err.clone(), 3200, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_err", err, cx);
                         cx.notify();
                     });
@@ -3034,8 +3409,13 @@ impl AppShell {
                 Ok(v) => v,
                 Err(err) => {
                     let _ = weak.update(app, |shell, cx| {
+                        if !fence.is_valid(shell)
+                            || shell.bot_browser.vault_bootstrap_generation != boot_gen
+                        {
+                            return;
+                        }
                         shell.bot_browser.vault_custody_status_note = Some(err.clone());
-                        shell.window_runtime.enqueue_toast(err.clone(), 3500);
+                        shell.emit_local_vault_toast(active_chat_opt, err.clone(), 3500, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_err", err, cx);
                         shell.sync_vault_custody_to_settings(cx);
                         cx.notify();
@@ -3044,14 +3424,19 @@ impl AppShell {
                 }
             };
 
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let pull_res = runtime
                 .spawn({
-                    let client = client.clone();
+                    let fence = fence.clone();
                     let unlocked_key = Arc::clone(&unlocked_key);
                     let vault = Arc::clone(&vault);
                     async move {
-                        let report = pull_and_apply_user_vault_items(
-                            &client,
+                        let report = pull_and_apply_user_vault_items_pinned(
+                            &fence.client,
+                            &fence.token,
+                            fence.client_epoch,
                             &unlocked_key,
                             user_id,
                             &vault,
@@ -3059,7 +3444,7 @@ impl AppShell {
                             0,
                         )
                         .await?;
-                        let pending = fetch_pending_device_sync_rows(&client).await;
+                        let pending = fetch_pending_device_sync_rows(&fence).await;
                         let metas = tokio::task::spawn_blocking(move || {
                             collect_credential_metas_from_vault(&vault)
                         })
@@ -3073,8 +3458,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -3133,12 +3517,12 @@ impl AppShell {
                                 report.passwords_applied, report.cookies_applied, oauth_hydrated
                             )
                         };
-                        shell.window_runtime.enqueue_toast(msg.clone(), 3500);
+                        shell.emit_local_vault_toast(active_chat_opt, msg.clone(), 3500, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_unlocked", msg, cx);
                     }
                     Err(err) => {
                         shell.bot_browser.vault_custody_status_note = Some(err.clone());
-                        shell.window_runtime.enqueue_toast(err.clone(), 3500);
+                        shell.emit_local_vault_toast(active_chat_opt, err.clone(), 3500, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_err", err, cx);
                         shell.sync_vault_custody_to_settings(cx);
                     }
@@ -3171,7 +3555,7 @@ impl AppShell {
                 )
             }
             .to_string();
-            self.window_runtime.enqueue_toast(msg.clone(), 3000);
+            self.emit_local_vault_toast(active_chat_opt, msg.clone(), 3000, cx);
             self.append_local_vault_notice(active_chat_opt, "vault_sync_locked", msg, cx);
             return;
         };
@@ -3179,14 +3563,15 @@ impl AppShell {
         let Ok(orch) = self.ensure_bot_browser_orchestrator(cx) else {
             return;
         };
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let since_rev = self.bot_browser.vault_sync_revision;
         let profiles_root = user_bot_browser_dir(&self.preferences_dir, user_id).join("profiles");
         let cached_subs = self.magpie_local.discovered_items.clone();
         let base_url = self.client.http_client.base_url.clone();
         let local_fabushi = self.bot_browser.local_fabushi.clone();
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -3199,16 +3584,21 @@ impl AppShell {
                     .unwrap_or_default()
             };
 
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let sync_res = runtime
                 .spawn({
-                    let client = client.clone();
+                    let fence = fence.clone();
                     let unlocked_key = Arc::clone(&unlocked_key);
                     let orch = Arc::clone(&orch);
                     let local_fabushi = local_fabushi.clone();
                     let subs = subs.clone();
                     async move {
-                        let pull_report = pull_and_apply_user_vault_items(
-                            &client,
+                        let pull_report = pull_and_apply_user_vault_items_pinned(
+                            &fence.client,
+                            &fence.token,
+                            fence.client_epoch,
                             &unlocked_key,
                             user_id,
                             orch.vault(),
@@ -3235,8 +3625,10 @@ impl AppShell {
                             None
                         };
                         let mut rev = pull_report.latest_revision;
-                        let push_report = push_all_local_vault_items(
-                            &client,
+                        let push_report = push_all_local_vault_items_pinned(
+                            &fence.client,
+                            &fence.token,
+                            fence.client_epoch,
                             &unlocked_key,
                             user_id,
                             orch.vault(),
@@ -3245,7 +3637,7 @@ impl AppShell {
                             &mut rev,
                         )
                         .await?;
-                        let pending = fetch_pending_device_sync_rows(&client).await;
+                        let pending = fetch_pending_device_sync_rows(&fence).await;
                         let orch_metas = Arc::clone(&orch);
                         let metas = tokio::task::spawn_blocking(move || {
                             collect_credential_metas_from_vault(orch_metas.vault())
@@ -3260,8 +3652,7 @@ impl AppShell {
                 .and_then(|r| r);
 
             let _ = weak.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.bot_browser.vault_bootstrap_generation != boot_gen
                 {
                     return;
@@ -3296,11 +3687,11 @@ impl AppShell {
                                 push_r.latest_revision
                             )
                         };
-                        shell.window_runtime.enqueue_toast(msg.clone(), 3200);
+                        shell.emit_local_vault_toast(active_chat_opt, msg.clone(), 3200, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_synced", msg, cx);
                     }
                     Err(err) => {
-                        shell.window_runtime.enqueue_toast(err.clone(), 3200);
+                        shell.emit_local_vault_toast(active_chat_opt, err.clone(), 3200, cx);
                         shell.append_local_vault_notice(active_chat_opt, "vault_err", err, cx);
                     }
                 }
@@ -3368,17 +3759,24 @@ impl AppShell {
             return;
         };
 
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let mut known_rev = self.bot_browser.vault_sync_revision;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let res = runtime
                 .spawn(async move {
-                    seal_and_put_vault_item(
-                        &client,
+                    seal_and_put_vault_item_pinned(
+                        &fence_task.client,
+                        &fence_task.token,
+                        fence_task.client_epoch,
                         &unlocked_key,
                         user_id,
                         UserVaultCategory::AiOauth,
@@ -3393,8 +3791,7 @@ impl AppShell {
                 .and_then(|r| r.ok());
             if let Some(new_rev) = res {
                 let _ = weak.update(app, |shell, _| {
-                    if shell.is_authenticated
-                        && shell.session_sync.auth_generation == auth_gen
+                    if fence.is_valid(shell)
                         && shell.bot_browser.vault_bootstrap_generation == boot_gen
                     {
                         shell.bot_browser.vault_sync_revision =
@@ -3420,13 +3817,18 @@ impl AppShell {
         ) else {
             return;
         };
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let mut known_rev = self.bot_browser.vault_sync_revision;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let res = runtime
                 .spawn(async move {
                     let record = orch
@@ -3437,8 +3839,10 @@ impl AppShell {
                         serde_json::to_vec(&record)
                             .map_err(|e| format!("serialize password payload failed: {e}"))?,
                     );
-                    let rev = seal_and_put_vault_item(
-                        &client,
+                    let rev = seal_and_put_vault_item_pinned(
+                        &fence_task.client,
+                        &fence_task.token,
+                        fence_task.client_epoch,
                         &unlocked_key,
                         user_id,
                         UserVaultCategory::Password,
@@ -3460,8 +3864,7 @@ impl AppShell {
                 .and_then(|r| r.ok());
             if let Some((new_rev, metas)) = res {
                 let _ = weak.update(app, |shell, cx| {
-                    if shell.is_authenticated
-                        && shell.session_sync.auth_generation == auth_gen
+                    if fence.is_valid(shell)
                         && shell.bot_browser.vault_bootstrap_generation == boot_gen
                     {
                         shell.bot_browser.vault_sync_revision =
@@ -3497,13 +3900,18 @@ impl AppShell {
             .as_ref()
             .map(|o| o.config().data_dir.join("profiles"))
             .unwrap_or_else(|| user_bot_browser_dir(&self.preferences_dir, user_id).join("profiles"));
-        let auth_gen = self.session_sync.auth_generation;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let boot_gen = self.bot_browser.vault_bootstrap_generation;
         let mut known_rev = self.bot_browser.vault_sync_revision;
-        let client = self.client.clone();
         let runtime = self.client.runtime().clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let fence_task = fence.clone();
             let res = runtime
                 .spawn(async move {
                     let dirs = collect_nonempty_profile_dirs(&profiles_root, session_id.as_deref());
@@ -3513,8 +3921,10 @@ impl AppShell {
                             None,
                             MAX_PROFILE_BUNDLE_BYTES,
                         ) {
-                            let _ = seal_and_put_vault_item(
-                                &client,
+                            let _ = seal_and_put_vault_item_pinned(
+                                &fence_task.client,
+                                &fence_task.token,
+                                fence_task.client_epoch,
                                 &unlocked_key,
                                 user_id,
                                 UserVaultCategory::BrowserCookie,
@@ -3531,8 +3941,7 @@ impl AppShell {
                 .ok();
             if let Some(new_rev) = res {
                 let _ = weak.update(app, |shell, _| {
-                    if shell.is_authenticated
-                        && shell.session_sync.auth_generation == auth_gen
+                    if fence.is_valid(shell)
                         && shell.bot_browser.vault_bootstrap_generation == boot_gen
                     {
                         shell.bot_browser.vault_sync_revision =
@@ -3561,7 +3970,6 @@ impl AppShell {
         let Some(user_id) = self.session_sync.user_id else {
             return;
         };
-        let auth_gen = self.session_sync.auth_generation;
         let session_id = explicit_session_id
             .unwrap_or_else(|| format!("local_chat_{chat_id}_bot_{}", target.bot_user_id));
         self.bot_browser
@@ -3583,15 +3991,30 @@ impl AppShell {
             }
         });
 
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
         let client = self.client.clone();
         let runtime = self.client.runtime().clone();
         let bot_user_id = target.bot_user_id;
         let bot_display_name = target.display_name.clone();
         let bot_display_name_err = target.display_name.clone();
         let provision_spec = target.provision_spec.clone();
+        let explicit_profile_model = self
+            .computers
+            .bot_profiles
+            .get(&(bot_user_id.max(0) as u64))
+            .map(|p| p.preferred_model.trim().to_string())
+            .filter(|m| {
+                !m.is_empty()
+                    && !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(m)
+            });
         let session_id_for_run = session_id.clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let turn_res = runtime
                 .spawn(async move {
                     let uid_str = user_id.to_string();
@@ -3604,6 +4027,15 @@ impl AppShell {
                         core.persist_user_providers_state(&uid_str);
                         host.sync_all_providers();
                     }
+                    let bot_preferred_model = provision_spec
+                        .as_ref()
+                        .and_then(|s| s.preferred_model.clone())
+                        .or(explicit_profile_model)
+                        .map(|m| m.trim().to_string())
+                        .filter(|m| {
+                            !m.is_empty()
+                                && !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(m)
+                        });
                     let engine = if bot_user_id != OFFICIAL_DEFAULT_BOT_USER_ID {
                         if let Some(spec) = provision_spec {
                             host.provision_or_sync_bot(spec)
@@ -3630,6 +4062,9 @@ impl AppShell {
                     req.user_id = Some(user_id.to_string());
                     req.source = "desktop_local_fabushi".to_string();
                     req.preset = Some(ToolsetPreset::Full);
+                    if let Some(model_override) = bot_preferred_model {
+                        req.model = Some(model_override);
+                    }
                     if !system_prompt.trim().is_empty() {
                         req.system_prompt = Some(system_prompt);
                     }
@@ -3658,7 +4093,7 @@ impl AppShell {
                     let session_for_cookies = session_id.clone();
                     let bot_name_ui = target.display_name.clone();
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.is_authenticated || shell.session_sync.auth_generation != auth_gen {
+                        if !fence.is_valid(shell) {
                             return;
                         }
                         let ts = format_authoritative_timestamp(Some(
@@ -3724,7 +4159,13 @@ impl AppShell {
                     });
 
                     // Archive non-secret final reply text to cloud history in background.
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
                     for (nonce, chunk_txt) in chunk_pairs {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
                         let req = ArchiveLocalBotReplyRequest {
                             bot_user_id,
                             text: chunk_txt,
@@ -3733,9 +4174,17 @@ impl AppShell {
                         };
                         if let Ok(Ok(archived)) = runtime
                             .spawn({
-                                let client = client.clone();
+                                let fence = fence.clone();
                                 async move {
-                                    client.archive_local_bot_reply(chat_id as i64, &req).await
+                                    fence
+                                        .client
+                                        .archive_local_bot_reply_with_token(
+                                            &fence.token,
+                                            fence.client_epoch,
+                                            chat_id as i64,
+                                            &req,
+                                        )
+                                        .await
                                 }
                             })
                             .await
@@ -3743,9 +4192,7 @@ impl AppShell {
                             let server_id = u64::try_from(archived.message_id).unwrap_or(0);
                             let pts = archived.pts;
                             let _ = weak.update(app, |shell, cx| {
-                                if !shell.is_authenticated
-                                    || shell.session_sync.auth_generation != auth_gen
-                                {
+                                if !fence.is_valid(shell) {
                                     return;
                                 }
                                 if pts > 0 {
@@ -3789,7 +4236,7 @@ impl AppShell {
                 }
                 Err(err) => {
                     let _ = weak.update(app, |shell, cx| {
-                        if !shell.is_authenticated || shell.session_sync.auth_generation != auth_gen {
+                        if !fence.is_valid(shell) {
                             return;
                         }
                         shell.apply_local_fabushi_turn_error_to_shell(
@@ -3856,20 +4303,50 @@ impl AppShell {
     ) -> (String, Option<Vec<Vec<InlineKeyboardButton>>>, String) {
         let cleaned_ansi = Self::strip_ansi_escape_codes(err);
         let lower = cleaned_ansi.to_ascii_lowercase();
-        let is_provider_err = needs_provider_cta
-            || lower.contains("provider_error")
+        let is_provider_request_marker = lower.contains("provider rate limited")
+            || lower.contains("provider upstream http")
+            || lower.contains("provider transport error")
+            || lower.contains("provider authentication error")
+            || lower.contains("provider protocol error")
+            || lower.contains("all providers exhausted")
+            || lower.contains("http 400")
+            || lower.contains("http 401")
+            || lower.contains("http 403")
+            || lower.contains("request rejected")
+            || lower.contains("authorization header")
+            || lower.contains("x-api-key")
+            || lower.contains("unauthorized")
+            || lower.contains("forbidden")
+            || lower.contains("invalid_request_error")
+            || lower.contains("authentication_error")
+            || lower.contains("status 400")
+            || lower.contains("status 401")
+            || lower.contains("status 403");
+        let is_unconfigured_provider = needs_provider_cta
             || lower.contains("needs_provider_selection")
             || lower.contains("no ai subscription or provider configured")
             || lower.contains("no configured provider")
-            || lower.contains("providerrouter")
+            || lower.contains("provider configuration error")
+            || (lower.contains("missing api key") && !is_provider_request_marker)
             || cleaned_ansi.contains("未检测到已配置的 AI 订阅或模型供应商")
             || cleaned_ansi.contains("未配置可用的 AI 供应商");
+        let is_provider_request_err = !is_unconfigured_provider
+            && (lower.contains("provider_error")
+                || lower.contains("providerrouter")
+                || is_provider_request_marker);
 
-        let trimmed = cleaned_ansi.trim();
+        let mut trimmed = cleaned_ansi.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("Internal error:")
+            .or_else(|| trimmed.strip_prefix("internal error:"))
+        {
+            trimmed = rest.trim_start();
+        }
         let stripped = trimmed
             .strip_prefix("PROVIDER_ERROR:")
             .or_else(|| trimmed.strip_prefix("provider_error:"))
-            .unwrap_or(trimmed);
+            .unwrap_or(trimmed)
+            .trim_start();
         let compact = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
         let detail: String = if compact.chars().count() > 240 {
             let head: String = compact.chars().take(239).collect();
@@ -3884,11 +4361,17 @@ impl AppShell {
             compact
         };
 
-        let card_markdown = if is_provider_err {
+        let card_markdown = if is_unconfigured_provider {
             if is_zh {
                 format!("⚠️ **未配置可用的 AI 供应商**\n\n{detail}")
             } else {
                 format!("⚠️ **AI Provider Not Ready**\n\n{detail}")
+            }
+        } else if is_provider_request_err {
+            if is_zh {
+                format!("⚠️ **AI 服务请求失败**\n\n{detail}")
+            } else {
+                format!("⚠️ **AI Provider Request Failed**\n\n{detail}")
             }
         } else if is_zh {
             format!("⚠️ **本地 AI 执行失败**\n\n{detail}")
@@ -3896,7 +4379,7 @@ impl AppShell {
             format!("⚠️ **Local AI Turn Failed**\n\n{detail}")
         };
 
-        let keyboard = if is_provider_err {
+        let keyboard = if is_unconfigured_provider {
             Some(vec![vec![InlineKeyboardButton {
                 text: if is_zh {
                     "⚙️ 打开 AI 供应商设置".to_string()
@@ -3909,11 +4392,17 @@ impl AppShell {
             None
         };
 
-        let toast_summary = if is_provider_err {
+        let toast_summary = if is_unconfigured_provider {
             if is_zh {
                 "AI 供应商未就绪，请点击消息按钮配置".to_string()
             } else {
                 "AI provider unavailable — tap card button to configure".to_string()
+            }
+        } else if is_provider_request_err {
+            if is_zh {
+                "AI 服务请求失败，详情见会话卡片".to_string()
+            } else {
+                "AI provider request failed — see chat message".to_string()
             }
         } else if is_zh {
             "本地 AI 执行失败，详情见会话卡片".to_string()
@@ -3935,8 +4424,14 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let is_zh = self.active_lang_id().starts_with("zh");
+        let needs_provider_cta = self.bot_browser.local_fabushi.as_ref().is_some_and(|host| {
+            let uid = self.session_sync.user_id.map(|id| id.to_string());
+            host.engine_for_bot((bot_user_id > 0).then_some(bot_user_id))
+                .resolve_providers(uid.as_deref())
+                .needs_provider_selection()
+        });
         let (card_text, bot_keyboard, toast_summary) =
-            Self::build_local_fabushi_error_card(err, is_zh, false);
+            Self::build_local_fabushi_error_card(err, is_zh, needs_provider_cta);
         let ts = format_authoritative_timestamp(Some(chrono::Utc::now().timestamp_millis()));
         let sender_name = if bot_display_name.trim().is_empty() {
             "Fabushi AI".to_string()
@@ -3992,7 +4487,9 @@ impl AppShell {
             }
             st_cx.notify();
         });
-        self.show_chat_toast(chat_id, toast_summary, 3200, cx);
+        if self.is_chat_visible_for_toast(chat_id, cx) {
+            self.show_chat_toast(chat_id, toast_summary, 3200, cx);
+        }
     }
 
     fn append_local_vault_notice(
@@ -4027,6 +4524,11 @@ impl AppShell {
             bot_keyboard: None,
             is_pinned: false,
         };
+        let chat_exists = self.stage.read(cx).active_chat_id == Some(chat_id)
+            || self.sidebar.read(cx).dialogs.iter().any(|d| d.id == chat_id);
+        if !chat_exists {
+            return;
+        }
         self.stage.update(cx, |st, st_cx| {
             if st.active_chat_id == Some(chat_id) {
                 st.add_message(model);
@@ -4171,6 +4673,9 @@ impl AppShell {
                 }
             }
             BotBrowserEvent::TaskWakeupTriggered(wakeup) => {
+                if !self.is_authenticated || self.session_sync.user_id.is_none() {
+                    return;
+                }
                 let lang = self.active_lang_id();
                 let msg = format!(
                     "{} ({})",
@@ -4181,40 +4686,43 @@ impl AppShell {
                     ),
                     wakeup.origin
                 );
-                let cid_opt = wakeup
+                let explicit_cid = wakeup
                     .chat_id
                     .and_then(|c| u64::try_from(c).ok())
-                    .filter(|&c| c > 0)
-                    .or_else(|| {
-                        resolve_active_target_chat_id(
-                            self.stage.read(cx).active_chat_id,
-                            self.sidebar.read(cx).active_chat_id,
-                        )
-                    });
+                    .filter(|&c| c > 0);
+                let cid_opt = explicit_cid.or_else(|| {
+                    resolve_active_target_chat_id(
+                        self.stage.read(cx).active_chat_id,
+                        self.sidebar.read(cx).active_chat_id,
+                    )
+                    .filter(|&cid| self.resolve_fabushi_bot_target(cid, cx).is_some())
+                });
                 if let Some(cid) = cid_opt {
-                    if self.stage.read(cx).active_chat_id == Some(cid) {
+                    let in_origin_chat = self.active_panel == ActiveWorkspacePanel::Chats
+                        && !(self.theme_state.palette.is_apple_style()
+                            && self.sidebar.read(cx).is_plus_menu_open)
+                        && self.stage.read(cx).active_chat_id == Some(cid);
+                    if in_origin_chat {
                         self.show_chat_toast(cid, msg, 3200, cx);
                     }
-                } else {
-                    self.show_toast(msg, 3200, cx);
-                }
-                if let Some(cid) = cid_opt {
-                    if self.can_run_local_fabushi_turn(cx) {
-                        let target = self.resolve_fabushi_bot_target(cid, cx).unwrap_or(
-                            LocalFabushiBotTarget {
-                                bot_user_id: OFFICIAL_DEFAULT_BOT_USER_ID,
-                                display_name: "Fabushi AI".to_string(),
-                                provision_spec: None,
-                            },
-                        );
-                        self.spawn_local_fabushi_turn(
-                            cid,
-                            target,
-                            Some(wakeup.session_id),
-                            "安全凭据已完成本地填充，请继续原任务".to_string(),
-                            cx,
-                        );
+                    let chat_exists = self.stage.read(cx).active_chat_id == Some(cid)
+                        || self.sidebar.read(cx).dialogs.iter().any(|d| d.id == cid);
+                    if chat_exists && self.can_run_local_fabushi_turn(cx) {
+                        if let Some(target) = self.resolve_fabushi_bot_target(cid, cx) {
+                            self.spawn_local_fabushi_turn(
+                                cid,
+                                target,
+                                Some(wakeup.session_id),
+                                "安全凭据已完成本地填充，请继续原任务".to_string(),
+                                cx,
+                            );
+                        }
                     }
+                } else if self.active_panel == ActiveWorkspacePanel::Chats
+                    && !(self.theme_state.palette.is_apple_style()
+                        && self.sidebar.read(cx).is_plus_menu_open)
+                {
+                    self.show_non_chat_toast(msg, 3200, cx);
                 }
                 cx.notify();
             }
@@ -4259,7 +4767,7 @@ impl AppShell {
                                 self.show_chat_toast(cid, err_msg, 2400, cx);
                             }
                         } else {
-                            self.show_toast(err_msg, 2400, cx);
+                            self.show_non_chat_toast(err_msg, 2400, cx);
                         }
                         cx.notify();
                         return;
@@ -4276,11 +4784,14 @@ impl AppShell {
                             self.show_chat_toast(cid, msg, 2600, cx);
                         }
                     } else {
-                        self.show_toast(msg, 2600, cx);
+                        self.show_non_chat_toast(msg, 2600, cx);
                     }
                     cx.notify();
                     return;
                 };
+                let captured_auth_gen = self.session_sync.auth_generation;
+                let captured_panel = self.active_panel;
+                let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
                 let card_id_for_ui = card_id.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     let res = runtime
@@ -4289,6 +4800,18 @@ impl AppShell {
                         .map_err(|e| BotBrowserError::Io(format!("task join error: {e}")))
                         .and_then(|inner| inner);
                     let _ = weak.update(app, |shell, cx| {
+                        if !shell.is_authenticated
+                            || shell.session_sync.auth_generation != captured_auth_gen
+                        {
+                            return;
+                        }
+                        let cur_active = resolve_active_target_chat_id(
+                            shell.stage.read(cx).active_chat_id,
+                            shell.sidebar.read(cx).active_chat_id,
+                        );
+                        let same_non_chat_context = shell.active_panel == captured_panel
+                            && cur_active.is_none()
+                            && shell.sidebar.read(cx).is_plus_menu_open == captured_plus_open;
                         match res {
                             Ok(outcome) => {
                                 let saved_cred_id = outcome.credential_id.clone();
@@ -4319,21 +4842,29 @@ impl AppShell {
                                     )
                                 };
                                 if let Some(cid) = cid_u64.filter(|&c| c != 0) {
-                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                    let in_origin_chat = shell.active_panel == ActiveWorkspacePanel::Chats
+                                        && !(shell.theme_state.palette.is_apple_style()
+                                            && shell.sidebar.read(cx).is_plus_menu_open)
+                                        && shell.stage.read(cx).active_chat_id == Some(cid);
+                                    if in_origin_chat {
                                         shell.show_chat_toast(cid, note, 2600, cx);
                                     }
-                                } else {
-                                    shell.show_toast(note, 2600, cx);
+                                } else if same_non_chat_context {
+                                    shell.show_non_chat_toast(note, 2600, cx);
                                 }
                             }
                             Err(e) => {
                                 let err_toast = format!("Vault login error: {e}");
                                 if let Some(cid) = cid_u64.filter(|&c| c != 0) {
-                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                    let in_origin_chat = shell.active_panel == ActiveWorkspacePanel::Chats
+                                        && !(shell.theme_state.palette.is_apple_style()
+                                            && shell.sidebar.read(cx).is_plus_menu_open)
+                                        && shell.stage.read(cx).active_chat_id == Some(cid);
+                                    if in_origin_chat {
                                         shell.show_chat_toast(cid, err_toast, 3200, cx);
                                     }
-                                } else {
-                                    shell.show_toast(err_toast, 3200, cx);
+                                } else if same_non_chat_context {
+                                    shell.show_non_chat_toast(err_toast, 3200, cx);
                                 }
                             }
                         }
@@ -4364,6 +4895,9 @@ impl AppShell {
                     );
                     st_cx.notify();
                 });
+                let captured_auth_gen = self.session_sync.auth_generation;
+                let captured_panel = self.active_panel;
+                let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
                 let card_id_req = card_id.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     let res = runtime
@@ -4372,6 +4906,11 @@ impl AppShell {
                         .map_err(|e| BotBrowserError::Io(format!("task join error: {e}")))
                         .and_then(|inner| inner);
                     let _ = weak.update(app, |shell, cx| {
+                        if !shell.is_authenticated
+                            || shell.session_sync.auth_generation != captured_auth_gen
+                        {
+                            return;
+                        }
                         match res {
                             Ok(outcome) => {
                                 let final_status = if outcome.approved {
@@ -4395,11 +4934,24 @@ impl AppShell {
                             Err(e) => {
                                 let err_toast = format!("Reuse approval failed: {e}");
                                 if let Some(cid) = cid_u64.filter(|&c| c != 0) {
-                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                    let in_origin_chat = shell.active_panel == ActiveWorkspacePanel::Chats
+                                        && !(shell.theme_state.palette.is_apple_style()
+                                            && shell.sidebar.read(cx).is_plus_menu_open)
+                                        && shell.stage.read(cx).active_chat_id == Some(cid);
+                                    if in_origin_chat {
                                         shell.show_chat_toast(cid, err_toast, 2800, cx);
                                     }
                                 } else {
-                                    shell.show_toast(err_toast, 2800, cx);
+                                    let cur_active = resolve_active_target_chat_id(
+                                        shell.stage.read(cx).active_chat_id,
+                                        shell.sidebar.read(cx).active_chat_id,
+                                    );
+                                    if shell.active_panel == captured_panel
+                                        && cur_active.is_none()
+                                        && shell.sidebar.read(cx).is_plus_menu_open == captured_plus_open
+                                    {
+                                        shell.show_non_chat_toast(err_toast, 2800, cx);
+                                    }
                                 }
                             }
                         }
@@ -4428,7 +4980,7 @@ impl AppShell {
                             self.show_chat_toast(cid, msg, 2200, cx);
                         }
                     } else {
-                        self.show_toast(msg, 2200, cx);
+                        self.show_non_chat_toast(msg, 2200, cx);
                     }
                     cx.notify();
                     return;
@@ -4436,6 +4988,9 @@ impl AppShell {
                 let Some(orch) = self.bot_browser.orchestrator.clone() else {
                     return;
                 };
+                let captured_auth_gen = self.session_sync.auth_generation;
+                let captured_panel = self.active_panel;
+                let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
                 let card_id_req = card_id.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     let res = runtime
@@ -4444,6 +4999,11 @@ impl AppShell {
                         .map_err(|e| BotBrowserError::Io(format!("task join error: {e}")))
                         .and_then(|inner| inner);
                     let _ = weak.update(app, |shell, cx| {
+                        if !shell.is_authenticated
+                            || shell.session_sync.auth_generation != captured_auth_gen
+                        {
+                            return;
+                        }
                         match res {
                             Ok(_) => {
                                 shell.stage.update(cx, |st, st_cx| {
@@ -4462,11 +5022,24 @@ impl AppShell {
                             Err(e) => {
                                 let err_toast = format!("Click captcha failed: {e}");
                                 if let Some(cid) = cid_u64.filter(|&c| c != 0) {
-                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                    let in_origin_chat = shell.active_panel == ActiveWorkspacePanel::Chats
+                                        && !(shell.theme_state.palette.is_apple_style()
+                                            && shell.sidebar.read(cx).is_plus_menu_open)
+                                        && shell.stage.read(cx).active_chat_id == Some(cid);
+                                    if in_origin_chat {
                                         shell.show_chat_toast(cid, err_toast, 2800, cx);
                                     }
                                 } else {
-                                    shell.show_toast(err_toast, 2800, cx);
+                                    let cur_active = resolve_active_target_chat_id(
+                                        shell.stage.read(cx).active_chat_id,
+                                        shell.sidebar.read(cx).active_chat_id,
+                                    );
+                                    if shell.active_panel == captured_panel
+                                        && cur_active.is_none()
+                                        && shell.sidebar.read(cx).is_plus_menu_open == captured_plus_open
+                                    {
+                                        shell.show_non_chat_toast(err_toast, 2800, cx);
+                                    }
                                 }
                             }
                         }

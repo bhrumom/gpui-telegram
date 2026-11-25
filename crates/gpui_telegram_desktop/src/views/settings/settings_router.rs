@@ -159,6 +159,7 @@ pub enum SettingsRouterEvent {
 pub struct SettingsRouter {
     pub settings_section: SettingsSectionType,
     pub settings_stack: Vec<SettingsSectionType>,
+    pub standalone_computers_mode: bool,
     pub palette: TdesktopThemePalette,
     pub lang_id: &'static str,
     pub is_chinese_locale: bool,
@@ -257,6 +258,7 @@ impl SettingsRouter {
         Self {
             settings_section: SettingsSectionType::Main,
             settings_stack: Vec::new(),
+            standalone_computers_mode: false,
             palette,
             lang_id,
             is_chinese_locale,
@@ -712,6 +714,9 @@ impl SettingsRouter {
         if self.settings_section == SettingsSectionType::Calls && target != SettingsSectionType::Calls {
             self.stop_mic_test_if_active(cx);
         }
+        if target != SettingsSectionType::Computers {
+            self.standalone_computers_mode = false;
+        }
         if entering_settings_modal {
             self.settings_stack.clear();
             self.settings_section = target;
@@ -734,6 +739,31 @@ impl SettingsRouter {
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) -> bool {
         if self.settings_section == SettingsSectionType::Calls {
             self.stop_mic_test_if_active(cx);
+        }
+        if self.settings_section == SettingsSectionType::Computers {
+            if let Some(ref sc) = self.settings_computers {
+                let unwound_subpage = sc.update(cx, |view, vcx| {
+                    if view.permission_modal_open {
+                        view.permission_modal_open = false;
+                        vcx.notify();
+                        return true;
+                    }
+                    if view.page != crate::views::settings::sections::SettingsComputersPage::Overview {
+                        view.open_overview();
+                        vcx.notify();
+                        return true;
+                    }
+                    false
+                });
+                if unwound_subpage {
+                    cx.notify();
+                    return true;
+                }
+            }
+            if self.standalone_computers_mode {
+                self.close(cx);
+                return false;
+            }
         }
         if let Some(prev) = self.settings_stack.pop() {
             self.settings_section = prev;
@@ -758,6 +788,7 @@ impl SettingsRouter {
     /// Resets section and navigation stack and emits `SettingsRouterEvent::CloseRequested`.
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.stop_mic_test_if_active(cx);
+        self.standalone_computers_mode = false;
         self.settings_section = SettingsSectionType::Main;
         self.settings_stack.clear();
         cx.emit(SettingsRouterEvent::CloseRequested);

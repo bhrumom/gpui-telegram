@@ -50,6 +50,7 @@ pub struct AuthWizardView {
     pub email_code_input: String,
     pub email_code_cooldown: u32,
     pub email_cooldown_generation: u64,
+    pub email_send_generation: u64,
     pub is_sending_email_code: bool,
     pub alipay_attempt_id: Option<String>,
     pub alipay_auth_url: Option<String>,
@@ -63,6 +64,7 @@ pub struct AuthWizardView {
     pub phone_number: String,
     pub verification_code: String,
     pub is_authenticated: bool,
+    pub auth_request_generation: u64,
     pub pending_vault_bootstrap: Option<PendingAuthVaultBootstrap>,
 }
 
@@ -95,6 +97,7 @@ impl AuthWizardView {
             email_code_input: String::new(),
             email_code_cooldown: 0,
             email_cooldown_generation: 0,
+            email_send_generation: 0,
             is_sending_email_code: false,
             alipay_attempt_id: None,
             alipay_auth_url: None,
@@ -108,6 +111,7 @@ impl AuthWizardView {
             phone_number: String::new(),
             verification_code: String::new(),
             is_authenticated: false,
+            auth_request_generation: 0,
             pending_vault_bootstrap: None,
         }
     }
@@ -134,12 +138,30 @@ impl AuthWizardView {
         self.is_chinese_locale = is_chinese_locale;
     }
 
-    pub fn reset_after_logout(&mut self, server_url: String) {
-        if self.client.config.server_url != server_url {
-            let mut new_cfg = self.client.config.clone();
-            new_cfg.server_url = server_url.clone();
-            self.client = Arc::new(TelegramClient::new(new_cfg));
+    pub fn sync_client_for_server_url(&mut self, client: Arc<TelegramClient>, server_url: String) {
+        if Arc::ptr_eq(&self.client, &client) && self.client.config.server_url == server_url {
+            self.editing_server_url = false;
+            self.server_url_draft = server_url;
+            return;
         }
+        self.client = client;
+        self.server_url_draft = server_url;
+        self.editing_server_url = false;
+        self.is_authenticating = false;
+        self.pending_vault_bootstrap = None;
+        self.login_error = None;
+        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+        self.alipay_poll_generation = self.alipay_poll_generation.wrapping_add(1);
+        self.email_send_generation = self.email_send_generation.wrapping_add(1);
+        self.email_cooldown_generation = self.email_cooldown_generation.wrapping_add(1);
+        self.alipay_is_loading = false;
+        self.is_sending_email_code = false;
+        self.email_code_cooldown = 0;
+    }
+
+    pub fn reset_after_logout(&mut self, client: Arc<TelegramClient>) {
+        let server_url = client.config.server_url.clone();
+        self.client = client;
         self.is_authenticated = false;
         self.is_authenticating = false;
         self.password_input.zeroize();
@@ -151,10 +173,13 @@ impl AuthWizardView {
         self.ime.just_committed_ime = false;
         self.editing_server_url = false;
         self.server_url_draft = server_url;
+        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
         self.alipay_poll_generation = self.alipay_poll_generation.wrapping_add(1);
+        self.email_send_generation = self.email_send_generation.wrapping_add(1);
         self.email_cooldown_generation = self.email_cooldown_generation.wrapping_add(1);
         self.alipay_is_loading = false;
         self.is_sending_email_code = false;
+        self.email_code_cooldown = 0;
     }
 
     pub fn set_login_error(&mut self, err: Option<String>) {

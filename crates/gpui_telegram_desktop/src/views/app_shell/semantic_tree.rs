@@ -164,6 +164,7 @@ impl AppShell {
                                 });
                             });
                         });
+                        self.reconcile_chat_scoped_toasts(cx);
                     }
                     (
                         "SelectChat",
@@ -261,6 +262,7 @@ impl AppShell {
                     self.modal_container.update(cx, |m: &mut ModalContainer, _| {
                         let _ = m.show_modal(title.clone(), 420.0, 320.0, LayerStackOption::Normal);
                     });
+                    self.reconcile_chat_scoped_toasts(cx);
                     (
                         "OpenModal",
                         true,

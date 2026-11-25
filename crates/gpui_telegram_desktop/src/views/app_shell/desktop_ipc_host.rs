@@ -21,7 +21,7 @@ use crate::app::cli_installer::detect_cli_install_status;
 
 /// Handles local JSON-RPC 2.0 requests from `fabushi` CLI and local automation clients.
 pub struct DesktopLocalIpcHandler {
-    pub client: Arc<TelegramClient>,
+    client: parking_lot::RwLock<Arc<TelegramClient>>,
     pub engine: &'static LocalRemoteEngine,
     pub local_node_id: parking_lot::RwLock<Option<String>>,
 }
@@ -33,9 +33,23 @@ impl DesktopLocalIpcHandler {
 
     pub fn with_engine(client: Arc<TelegramClient>, engine: &'static LocalRemoteEngine) -> Self {
         Self {
-            client,
+            client: parking_lot::RwLock::new(client),
             engine,
             local_node_id: parking_lot::RwLock::new(None),
+        }
+    }
+
+    pub fn client(&self) -> Arc<TelegramClient> {
+        self.client.read().clone()
+    }
+
+    pub fn set_client(&self, client: Arc<TelegramClient>) {
+        let mut guard = self.client.write();
+        let changed = !Arc::ptr_eq(&*guard, &client);
+        *guard = client;
+        drop(guard);
+        if changed {
+            *self.local_node_id.write() = None;
         }
     }
 
@@ -43,8 +57,8 @@ impl DesktopLocalIpcHandler {
         *self.local_node_id.write() = node_id;
     }
 
-    fn require_token(&self, id: &str) -> Result<String, LocalIpcResponse> {
-        self.client
+    fn require_token(&self, client: &TelegramClient, id: &str) -> Result<String, LocalIpcResponse> {
+        client
             .token()
             .filter(|t| !t.trim().is_empty())
             .ok_or_else(|| LocalIpcResponse::err(id, "unauthenticated", "desktop session not authenticated"))
@@ -70,17 +84,25 @@ impl DesktopLocalIpcHandler {
         params: &serde_json::Value,
         operation: RemoteComputerOp,
     ) -> LocalIpcResponse {
+        let client = self.client();
         let requested_node = self.target_node_id(params);
         if let Some(nid) = requested_node.as_deref() {
             if self.is_remote_target(nid) {
+                let (epoch, token) = match client.snapshot_pinned_session() {
+                    Ok(p) => p,
+                    Err(e) => return LocalIpcResponse::err(id, "unauthenticated", e.to_string()),
+                };
                 let req = RemoteComputerCommandRequest {
                     node_id: nid.to_string(),
-                    caller_device_id: Some(self.client.device_id()),
+                    caller_device_id: Some(client.device_id()),
                     caller_bot_id: None,
                     caller_label: "fabushi-cli-ipc".to_string(),
                     operation,
                 };
-                return match self.client.execute_remote_computer_op_async(&req).await {
+                return match client
+                    .execute_remote_computer_op_with_token(&token, epoch, &req)
+                    .await
+                {
                     Ok(res) => LocalIpcResponse::ok(id, serde_json::to_value(res).unwrap_or_default()),
                     Err(e) => LocalIpcResponse::err(id, "remote_exec_failed", e.to_string()),
                 };
@@ -91,17 +113,26 @@ impl DesktopLocalIpcHandler {
             .local_node_id
             .read()
             .clone()
-            .unwrap_or_else(|| format!("local:{}", self.client.device_id()));
+            .unwrap_or_else(|| format!("local:{}", client.device_id()));
         let cmd_id = format!("ipc-{}", uuid::Uuid::new_v4());
-        let sess_id = format!("cli-{}", self.client.device_id());
+        let sess_id = format!("cli-{}-{}", client.device_id(), cmd_id);
+        struct EphemeralSessionGuard<'a> {
+            hub: &'a fabushi_remote_engine::control_lease::RemoteControlHub,
+            session_id: String,
+        }
+        impl Drop for EphemeralSessionGuard<'_> {
+            fn drop(&mut self) {
+                self.hub.finish_ephemeral_session(&self.session_id);
+            }
+        }
         let registered = self.engine.hub.register_session(RemoteSessionDto {
             session_id: sess_id.clone(),
             controller_kind: RemoteControllerKind::Cli,
             controller_name: "fabushi CLI".to_string(),
             controller_platform: std::env::consts::OS.to_string(),
-            controller_id: self.client.device_id(),
+            controller_id: client.device_id(),
             target_node_id: local_nid.clone(),
-            target_device_id: self.client.device_id(),
+            target_device_id: client.device_id(),
             mode: match &operation {
                 RemoteComputerOp::TerminalOp { .. } | RemoteComputerOp::ShellExec { .. } => {
                     RemoteControlMode::Terminal
@@ -119,12 +150,16 @@ impl DesktopLocalIpcHandler {
             rtt_ms: Some(1),
             fps: None,
         });
+        let _ephemeral_guard = EphemeralSessionGuard {
+            hub: &self.engine.hub,
+            session_id: registered.session_id,
+        };
         let result = execute_local_computer_op(&local_nid, &cmd_id, &operation).await;
-        self.engine.hub.disconnect_session(&registered.session_id);
         LocalIpcResponse::ok(id, serde_json::to_value(result).unwrap_or_default())
     }
 
     async fn dispatch(&self, req: LocalIpcRequest) -> LocalIpcResponse {
+        let client = self.client();
         let id = req.id.clone();
         let method = req.method.as_str();
         let p = &req.params;
@@ -132,7 +167,7 @@ impl DesktopLocalIpcHandler {
         // Core health & echo
         match method {
             "status" => {
-                let auth = self.client.current_auth_session();
+                let auth = client.current_auth_session();
                 let cli_status = detect_cli_install_status();
                 let sessions = self.engine.hub.list_sessions();
                 let pty_sessions = self.engine.pty_mux.list_sessions();
@@ -141,10 +176,10 @@ impl DesktopLocalIpcHandler {
                     serde_json::json!({
                         "running": true,
                         "pid": std::process::id(),
-                        "authenticated": self.client.token().is_some(),
+                        "authenticated": client.token().is_some(),
                         "user_id": auth.as_ref().map(|a| a.user_id),
                         "username": auth.as_ref().map(|a| a.username.clone()),
-                        "device_id": self.client.device_id(),
+                        "device_id": client.device_id(),
                         "local_node_id": *self.local_node_id.read(),
                         "active_sessions": sessions.len(),
                         "sessions": sessions,
@@ -235,25 +270,25 @@ impl DesktopLocalIpcHandler {
                             format!("method requires HTTP fallback for explicit user_id: {method}"),
                         );
                     }
-                    let token = match self.require_token(&id) {
+                    let token = match self.require_token(&client, &id) {
                         Ok(t) => t,
                         Err(resp) => return resp,
                     };
-                    match self.client.http_client.get_me(&token).await {
+                    match client.http_client.get_me(&token).await {
                         Ok(me) => LocalIpcResponse::ok(id, serde_json::to_value(me).unwrap_or_default()),
                         Err(e) => LocalIpcResponse::err(id, "user_me_failed", e.to_string()),
                     }
                 }
                 "user.status" => {
-                    let auth = self.client.current_auth_session();
+                    let auth = client.current_auth_session();
                     LocalIpcResponse::ok(
                         id,
                         serde_json::json!({
-                            "authenticated": self.client.token().is_some(),
+                            "authenticated": client.token().is_some(),
                             "user_id": auth.as_ref().map(|a| a.user_id),
                             "username": auth.as_ref().map(|a| a.username.clone()),
-                            "server_url": self.client.config.server_url,
-                            "device_id": self.client.device_id(),
+                            "server_url": client.config.server_url,
+                            "device_id": client.device_id(),
                         }),
                     )
                 }
@@ -264,17 +299,37 @@ impl DesktopLocalIpcHandler {
         // Device domain
         if method.starts_with("device.") {
             return match method {
-                "device.list" => match self.client.list_computers_async().await {
+                "device.list" => match client.list_computers_async().await {
                     Ok(list) => LocalIpcResponse::ok(id, serde_json::to_value(list).unwrap_or_default()),
                     Err(e) => LocalIpcResponse::err(id, "device_list_failed", e.to_string()),
                 },
-                "device.current" => match self.client.register_current_host_computer_async().await {
-                    Ok(node) => {
-                        self.set_local_node_id(Some(node.node_id.clone()));
-                        LocalIpcResponse::ok(id, serde_json::to_value(node).unwrap_or_default())
+                "device.current" => {
+                    let (start_epoch, start_token) = match client.snapshot_pinned_session() {
+                        Ok(pinned) => pinned,
+                        Err(e) => {
+                            return LocalIpcResponse::err(id, "device_current_failed", e.to_string())
+                        }
+                    };
+                    match client
+                        .register_current_host_computer_with_token(&start_token, start_epoch)
+                        .await
+                    {
+                        Ok(node) => {
+                            if !Arc::ptr_eq(&self.client(), &client)
+                                || client.ensure_pinned_session(start_epoch, &start_token).is_err()
+                            {
+                                return LocalIpcResponse::err(
+                                    id,
+                                    "session_changed",
+                                    "session changed before host registration completed",
+                                );
+                            }
+                            self.set_local_node_id(Some(node.node_id.clone()));
+                            LocalIpcResponse::ok(id, serde_json::to_value(node).unwrap_or_default())
+                        }
+                        Err(e) => LocalIpcResponse::err(id, "device_current_failed", e.to_string()),
                     }
-                    Err(e) => LocalIpcResponse::err(id, "device_current_failed", e.to_string()),
-                },
+                }
                 "device.test" => self.exec_computer_op(&id, p, RemoteComputerOp::TestConnection).await,
                 "device.exec" => {
                     let cmd = p.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -310,7 +365,7 @@ impl DesktopLocalIpcHandler {
         // Cloud PC domain
         if method.starts_with("cloudpc.") {
             return match method {
-                "cloudpc.list" => match self.client.list_computers_async().await {
+                "cloudpc.list" => match client.list_computers_async().await {
                     Ok(mut list) => {
                         list.computers.retain(|c| c.kind != gpui_telegram_proto::ComputerNodeKind::LocalDevice);
                         LocalIpcResponse::ok(id, serde_json::to_value(list).unwrap_or_default())
@@ -318,7 +373,7 @@ impl DesktopLocalIpcHandler {
                     Err(e) => LocalIpcResponse::err(id, "cloudpc_list_failed", e.to_string()),
                 },
                 "cloudpc.upsert" => match serde_json::from_value::<UpsertCloudComputerRequest>(p.clone()) {
-                    Ok(req_dto) => match self.client.upsert_cloud_computer_async(&req_dto).await {
+                    Ok(req_dto) => match client.upsert_cloud_computer_async(&req_dto).await {
                         Ok(node) => LocalIpcResponse::ok(id, serde_json::to_value(node).unwrap_or_default()),
                         Err(e) => LocalIpcResponse::err(id, "cloudpc_upsert_failed", e.to_string()),
                     },
@@ -326,7 +381,7 @@ impl DesktopLocalIpcHandler {
                 },
                 "cloudpc.delete" => {
                     let node_id = p.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
-                    match self.client.delete_computer_async(node_id).await {
+                    match client.delete_computer_async(node_id).await {
                         Ok(()) => LocalIpcResponse::ok(id, serde_json::json!({ "deleted": true, "node_id": node_id })),
                         Err(e) => LocalIpcResponse::err(id, "cloudpc_delete_failed", e.to_string()),
                     }
@@ -338,30 +393,30 @@ impl DesktopLocalIpcHandler {
         // Remote Assist & Sessions domain
         if method.starts_with("assist.") {
             return match method {
-                "assist.info" | "assist.id" => match self.client.get_remote_assist_info_async().await {
+                "assist.info" | "assist.id" => match client.get_remote_assist_info_async().await {
                     Ok(info) => LocalIpcResponse::ok(id, serde_json::to_value(info).unwrap_or_default()),
                     Err(e) => LocalIpcResponse::err(id, "assist_info_failed", e.to_string()),
                 },
-                "assist.reset_code" => match self.client.reset_remote_assist_code_async().await {
+                "assist.reset_code" => match client.reset_remote_assist_code_async().await {
                     Ok(info) => LocalIpcResponse::ok(id, serde_json::to_value(info).unwrap_or_default()),
                     Err(e) => LocalIpcResponse::err(id, "assist_reset_failed", e.to_string()),
                 },
                 "assist.set_code" => {
                     let code = p.get("code").and_then(|v| v.as_str()).unwrap_or("");
-                    match self.client.set_remote_assist_code_async(code).await {
+                    match client.set_remote_assist_code_async(code).await {
                         Ok(info) => LocalIpcResponse::ok(id, serde_json::to_value(info).unwrap_or_default()),
                         Err(e) => LocalIpcResponse::err(id, "assist_set_code_failed", e.to_string()),
                     }
                 }
                 "assist.allow" => {
                     let allow = p.get("allow_assist").and_then(|v| v.as_bool()).unwrap_or(true);
-                    match self.client.set_remote_assist_allow_async(allow).await {
+                    match client.set_remote_assist_allow_async(allow).await {
                         Ok(info) => LocalIpcResponse::ok(id, serde_json::to_value(info).unwrap_or_default()),
                         Err(e) => LocalIpcResponse::err(id, "assist_allow_failed", e.to_string()),
                     }
                 }
                 "assist.start" => match serde_json::from_value::<AssistStartRequest>(p.clone()) {
-                    Ok(start_req) => match self.client.start_remote_assist_async(&start_req).await {
+                    Ok(start_req) => match client.start_remote_assist_async(&start_req).await {
                         Ok(res) => LocalIpcResponse::ok(id, serde_json::to_value(res).unwrap_or_default()),
                         Err(e) => LocalIpcResponse::err(id, "assist_start_failed", e.to_string()),
                     },
@@ -369,7 +424,7 @@ impl DesktopLocalIpcHandler {
                 },
                 "assist.sessions" => {
                     let mut combined = self.engine.hub.list_sessions();
-                    if let Ok(remote) = self.client.list_remote_sessions_async().await {
+                    if let Ok(remote) = client.list_remote_sessions_async().await {
                         for s in remote.sessions {
                             if !combined.iter().any(|x| x.session_id == s.session_id) {
                                 combined.push(s);
@@ -381,7 +436,7 @@ impl DesktopLocalIpcHandler {
                 "assist.disconnect" => {
                     let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
                     let local_removed = self.engine.hub.disconnect_session(sid);
-                    let remote_res = self.client.disconnect_remote_session_async(sid).await.is_ok();
+                    let remote_res = client.disconnect_remote_session_async(sid).await.is_ok();
                     LocalIpcResponse::ok(
                         id,
                         serde_json::json!({ "session_id": sid, "local_removed": local_removed, "remote_disconnected": remote_res }),
@@ -389,7 +444,7 @@ impl DesktopLocalIpcHandler {
                 }
                 "assist.disconnect_all" => {
                     let local_count = self.engine.hub.disconnect_all();
-                    let remote_val = self.client.disconnect_all_remote_sessions_async().await.ok();
+                    let remote_val = client.disconnect_all_remote_sessions_async().await.ok();
                     LocalIpcResponse::ok(
                         id,
                         serde_json::json!({ "local_disconnected": local_count, "remote": remote_val }),
@@ -729,19 +784,19 @@ impl DesktopLocalIpcHandler {
             if !matches!(method, "chat.list" | "msg.list" | "msg.history" | "msg.send") {
                 return LocalIpcResponse::err(id, "method_not_found", format!("unknown method: {method}"));
             }
-            let token = match self.require_token(&id) {
+            let token = match self.require_token(&client, &id) {
                 Ok(t) => t,
                 Err(resp) => return resp,
             };
             return match method {
-                "chat.list" => match self.client.http_client.get_chats(&token).await {
+                "chat.list" => match client.http_client.get_chats(&token).await {
                     Ok(chats) => LocalIpcResponse::ok(id, serde_json::json!({ "chats": chats })),
                     Err(e) => LocalIpcResponse::err(id, "chat_list_failed", e.to_string()),
                 },
                 "msg.list" | "msg.history" => {
                     let chat_id = p.get("chat_id").and_then(|v| v.as_u64()).unwrap_or(0);
                     let limit = p.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
-                    match self.client.http_client.get_chat_messages(&token, chat_id, limit).await {
+                    match client.http_client.get_chat_messages(&token, chat_id, limit).await {
                         Ok(msgs) => LocalIpcResponse::ok(id, serde_json::json!({ "messages": msgs })),
                         Err(e) => LocalIpcResponse::err(id, "msg_list_failed", e.to_string()),
                     }
@@ -758,7 +813,7 @@ impl DesktopLocalIpcHandler {
                         text,
                         reply_to,
                     };
-                    match self.client.http_client.send_message(&token, &http_req).await {
+                    match client.http_client.send_message(&token, &http_req).await {
                         Ok(sent) => LocalIpcResponse::ok(id, serde_json::to_value(sent).unwrap_or_default()),
                         Err(e) => LocalIpcResponse::err(id, "msg_send_failed", e.to_string()),
                     }
@@ -770,13 +825,13 @@ impl DesktopLocalIpcHandler {
         // MCP domain
         if method.starts_with("mcp.") {
             return match method {
-                "mcp.grants" => match self.client.list_mcp_grants_async().await {
+                "mcp.grants" => match client.list_mcp_grants_async().await {
                     Ok(resp) => LocalIpcResponse::ok(id, serde_json::to_value(resp).unwrap_or_default()),
                     Err(e) => LocalIpcResponse::err(id, "mcp_grants_failed", e.to_string()),
                 },
                 "mcp.revoke" => {
                     let family_id = p.get("family_id").and_then(|v| v.as_str()).unwrap_or("");
-                    match self.client.revoke_mcp_grant_async(family_id).await {
+                    match client.revoke_mcp_grant_async(family_id).await {
                         Ok(()) => LocalIpcResponse::ok(id, serde_json::json!({ "revoked": true, "family_id": family_id })),
                         Err(e) => LocalIpcResponse::err(id, "mcp_revoke_failed", e.to_string()),
                     }

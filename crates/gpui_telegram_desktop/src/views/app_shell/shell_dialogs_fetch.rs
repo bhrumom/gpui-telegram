@@ -17,17 +17,14 @@ use crate::views::chat_sidebar::{
     BotGrokAvatarVisual, CategorizedSearchResult, DialogItemModel, PendingAddContactRequest,
     PendingCreateGroupRequest,
 };
-use crate::views::shell::AppShell;
+use crate::views::shell::{ActiveWorkspacePanel, AppShell};
 
 impl AppShell {
     /// Dispatches `POST /api/v1/contacts/add` for adding a friend or creating an AI bot dialog.
     pub fn dispatch_add_contact(&mut self, req: PendingAddContactRequest, cx: &mut Context<Self>) {
-        let token = match self.session_sync.session_token.clone() {
-            Some(t) => t,
-            None => return,
+        let Some(fence) = self.capture_client_fence() else {
+            return;
         };
-        let auth_gen = self.session_sync.auth_generation;
-        let client = self.client.clone();
         let http_req = AddContactHttpRequest {
             first_name: req.first_name.clone(),
             last_name: req.last_name.clone(),
@@ -42,15 +39,16 @@ impl AppShell {
         let avatar_color = req.avatar_color.clone();
 
         cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client
+            if !fence.preflight_ui(&weak_shell, app).await {
+                return;
+            }
+            let res = fence
+                .client
                 .http_client
-                .add_contact_with_avatar(&token, http_req, avatar_shape, avatar_color)
+                .add_contact_with_avatar(&fence.token, http_req, avatar_shape, avatar_color)
                 .await;
             let _ = weak_shell.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
-                    || shell.session_sync.session_token.as_deref() != Some(token.as_str())
-                {
+                if !fence.is_valid(shell) {
                     return;
                 }
                 if let Ok(resp) = res {
@@ -121,7 +119,10 @@ impl AppShell {
                             st_cx.notify();
                         });
                     }
-                    shell.load_historical_messages(server_chat_id, cx);
+                    shell.reconcile_chat_scoped_toasts(cx);
+                    if shell.stage.read(cx).active_chat_id == Some(server_chat_id) {
+                        shell.load_historical_messages(server_chat_id, cx);
+                    }
                     if is_bot {
                         shell.refresh_miniapps_catalog(None, cx);
                     }
@@ -154,7 +155,7 @@ impl AppShell {
                             err
                         )
                     };
-                    shell.window_runtime.enqueue_toast(msg, 3200);
+                    shell.show_non_chat_toast(msg, 3200, cx);
                     cx.notify();
                 }
             });
@@ -168,12 +169,9 @@ impl AppShell {
         req: PendingCreateGroupRequest,
         cx: &mut Context<Self>,
     ) {
-        let token = match self.session_sync.session_token.clone() {
-            Some(t) => t,
-            None => return,
+        let Some(fence) = self.capture_client_fence() else {
+            return;
         };
-        let auth_gen = self.session_sync.auth_generation;
-        let client = self.client.clone();
         let title = req.title.clone();
         let member_ids = req.member_ids.clone();
         let member_usernames = req.member_usernames.clone();
@@ -181,15 +179,16 @@ impl AppShell {
         let local_dialog_id = req.local_dialog_id;
 
         cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client
+            if !fence.preflight_ui(&weak_shell, app).await {
+                return;
+            }
+            let res = fence
+                .client
                 .http_client
-                .create_group_with_token(&token, &title, member_ids, member_usernames, about)
+                .create_group_with_token(&fence.token, &title, member_ids, member_usernames, about)
                 .await;
             let _ = weak_shell.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
-                    || shell.session_sync.session_token.as_deref() != Some(token.as_str())
-                {
+                if !fence.is_valid(shell) {
                     return;
                 }
                 if let Ok(resp) = res {
@@ -217,7 +216,10 @@ impl AppShell {
                             st_cx.notify();
                         });
                     }
-                    shell.load_historical_messages(server_chat_id, cx);
+                    shell.reconcile_chat_scoped_toasts(cx);
+                    if shell.stage.read(cx).active_chat_id == Some(server_chat_id) {
+                        shell.load_historical_messages(server_chat_id, cx);
+                    }
                     cx.notify();
                 }
             });
@@ -238,21 +240,21 @@ impl AppShell {
             let q_opt = (!query.trim().is_empty()).then(|| query.clone());
             self.refresh_miniapps_catalog(q_opt, cx);
         }
-        let token = match self.session_sync.session_token.clone() {
-            Some(t) => t,
-            None => return,
+        let Some(fence) = self.capture_client_fence() else {
+            return;
         };
-        let auth_gen = self.session_sync.auth_generation;
-        let client = self.client.clone();
 
         cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client
+            if !fence.preflight_ui(&weak_shell, app).await {
+                return;
+            }
+            let res = fence
+                .client
                 .http_client
-                .search_global(&token, &query, &category)
+                .search_global(&fence.token, &query, &category)
                 .await;
             let _ = weak_shell.update(app, |shell, cx| {
-                if !shell.is_authenticated
-                    || shell.session_sync.auth_generation != auth_gen
+                if !fence.is_valid(shell)
                     || shell.sidebar.read(cx).search_request_seq != search_seq
                 {
                     return;
@@ -312,35 +314,34 @@ impl AppShell {
         if !self.is_authenticated {
             return;
         }
+        let Some(call_fence) = self.capture_client_fence() else {
+            return;
+        };
         self.session_sync.chat_list_request_generation =
             self.session_sync.chat_list_request_generation.wrapping_add(1);
         let fence = SessionRequestFence {
             auth_generation: self.session_sync.auth_generation,
             request_generation: self.session_sync.chat_list_request_generation,
-            token: token.clone(),
+            token,
             user_id: uid,
         };
-        let client = self.client.clone();
 
         cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client.http_client.get_chats(&token).await;
-            let rich_chats = client.hermes_list_chats_rich().await.ok();
+            if !call_fence.preflight_ui(&weak_shell, app).await {
+                return;
+            }
+            let res = call_fence.client.http_client.get_chats(&call_fence.token).await;
+            let rich_chats = if call_fence.preflight_ui(&weak_shell, app).await {
+                call_fence.client.hermes.list_chats_rich(&call_fence.token).await.ok()
+            } else {
+                return;
+            };
             let _ = weak_shell.update(app, |shell, cx| {
+                if !call_fence.is_valid(shell) {
+                    return;
+                }
                 match res {
                     Ok(chats) => {
-                        if let Some(ref rich_list) = rich_chats {
-                            for rc in rich_list {
-                                if rc.chat_id > 0 {
-                                    let cid = rc.chat_id as u64;
-                                    shell.session_sync.rich_chats_by_id.insert(cid, rc.clone());
-                                    if let Some(pid) = rc.peer_user_id {
-                                        if pid > 0 {
-                                            shell.session_sync.chat_peer_user_ids.insert(cid, pid);
-                                        }
-                                    }
-                                }
-                            }
-                        }
                         let applied = shell.sidebar.update(cx, |sb, sb_cx| {
                             let ok = shell.stage.update(sb_cx, |st, st_cx| {
                                 let applied = shell.inspector.update(st_cx, |insp, insp_cx| {
@@ -407,6 +408,20 @@ impl AppShell {
                             ok
                         });
                         if applied {
+                            shell.reconcile_chat_scoped_toasts(cx);
+                            if let Some(ref rich_list) = rich_chats {
+                                for rc in rich_list {
+                                    if rc.chat_id > 0 {
+                                        let cid = rc.chat_id as u64;
+                                        shell.session_sync.rich_chats_by_id.insert(cid, rc.clone());
+                                        if let Some(pid) = rc.peer_user_id {
+                                            if pid > 0 {
+                                                shell.session_sync.chat_peer_user_ids.insert(cid, pid);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(selected_id) = shell.sidebar.read(cx).active_chat_id {
                                 shell.sync_selected_chat_inspector_and_stage(selected_id, cx);
                             }
@@ -421,7 +436,7 @@ impl AppShell {
                             shell.session_sync.session_token.as_deref(),
                             shell.session_sync.user_id,
                         ) {
-                            shell.window_runtime.enqueue_toast(
+                            shell.show_non_chat_toast(
                                 format!(
                                     "{}: {}",
                                     tr_str(
@@ -432,6 +447,7 @@ impl AppShell {
                                     err
                                 ),
                                 3200,
+                                cx,
                             );
                         }
                     }
@@ -453,25 +469,49 @@ impl AppShell {
         if !self.is_authenticated {
             return;
         }
+        let Some(call_fence) = self.capture_client_fence() else {
+            return;
+        };
         self.session_sync.history_request_generation =
             self.session_sync.history_request_generation.wrapping_add(1);
         let fence = SessionRequestFence {
             auth_generation: self.session_sync.auth_generation,
             request_generation: self.session_sync.history_request_generation,
-            token: token.clone(),
+            token,
             user_id: uid,
         };
-        let client = self.client.clone();
 
         cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client
-                .get_chat_messages_with_token(&token, chat_id, Some(50))
+            if !call_fence.preflight_ui(&weak_shell, app).await {
+                return;
+            }
+            let res = call_fence
+                .client
+                .get_chat_messages_for_session(
+                    &call_fence.token,
+                    call_fence.client_epoch,
+                    chat_id,
+                    Some(50),
+                )
                 .await;
-            let rich_msgs = client
-                .hermes_messages_history_rich(chat_id as i64, Some(50))
-                .await
-                .ok();
+            let rich_msgs = if call_fence.preflight_ui(&weak_shell, app).await {
+                call_fence
+                    .client
+                    .hermes_messages_history_rich_with_token(
+                        &call_fence.token,
+                        call_fence.client_epoch,
+                        chat_id as i64,
+                        Some(50),
+                    )
+                    .await
+                    .ok()
+            } else {
+                return;
+            };
             let _ = weak_shell.update(app, |shell, cx| {
+                if !call_fence.is_valid(shell) {
+                    return;
+                }
                 match res {
                     Ok(msgs) => {
                         let exp_pairs: Vec<(u64, i64)> = msgs
@@ -547,8 +587,13 @@ impl AppShell {
                             shell.session_sync.history_request_generation,
                             shell.session_sync.session_token.as_deref(),
                             shell.session_sync.user_id,
-                        ) {
-                            shell.show_toast(
+                        ) && shell.active_panel == ActiveWorkspacePanel::Chats
+                            && !(shell.theme_state.palette.is_apple_style()
+                                && shell.sidebar.read(cx).is_plus_menu_open)
+                            && shell.stage.read(cx).active_chat_id == Some(chat_id)
+                        {
+                            shell.show_chat_toast(
+                                chat_id,
                                 format!(
                                     "{}: {}",
                                     tr_str(

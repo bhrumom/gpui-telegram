@@ -49,7 +49,7 @@ impl AppShell {
             NavDestination::Chats | NavDestination::Folders => {
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.exit_compose_mode();
+                    sb.cancel_compose_mode();
                     sb.is_account_popover_open = false;
                     match dest {
                         NavDestination::Chats => sb.select_folder("All"),
@@ -92,7 +92,7 @@ impl AppShell {
                 let was_isolated = self.composer.read(cx).is_compose_isolated;
                 let prev_active = self.stage.read(cx).active_chat_id;
                 self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.exit_compose_mode();
+                    sb.cancel_compose_mode();
                     sb.is_account_popover_open = false;
                     if let Some(saved_id) = target_saved {
                         sb.select_dialog(saved_id);
@@ -145,7 +145,7 @@ impl AppShell {
                 }
             }
             NavDestination::RemoteComputer => {
-                self.open_computer_workbench_live(cx);
+                self.open_remote_computers_hub(cx);
             }
             NavDestination::TaskCenter => {
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
@@ -180,7 +180,7 @@ impl AppShell {
                 | NavDestination::Settings
         ) {
             self.sidebar.update(cx, |sb, sb_cx| {
-                sb.exit_compose_mode();
+                sb.cancel_compose_mode();
                 sb.is_account_popover_open = false;
                 sb_cx.notify();
             });
@@ -197,6 +197,7 @@ impl AppShell {
                 st_cx.notify();
             });
         }
+        self.reconcile_chat_scoped_toasts(cx);
         cx.notify();
     }
 
@@ -275,7 +276,7 @@ impl AppShell {
             }
             "," if self.is_authenticated => {
                 self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.exit_compose_mode();
+                    sb.cancel_compose_mode();
                     sb.is_account_popover_open = false;
                     sb_cx.notify();
                 });
@@ -308,7 +309,7 @@ impl AppShell {
             "e" => {
                 self.sidebar.update(cx, |s, s_cx| {
                     s.is_account_popover_open = !s.is_account_popover_open;
-                    s.exit_compose_mode();
+                    s.cancel_compose_mode();
                     s_cx.notify();
                 });
                 if self.composer.read(cx).is_compose_isolated
@@ -346,7 +347,7 @@ impl AppShell {
                         sb.open_compose_group_mode();
                     } else if !sb.is_plus_menu_open {
                         sb.toggle_plus_menu();
-                    } else {
+                    } else if sb.compose_draft.pending_creation.is_none() {
                         sb.compose_recipient_query.clear();
                         sb.compose_draft.menu_open = true;
                         sb.compose_draft.highlighted_index = 0;

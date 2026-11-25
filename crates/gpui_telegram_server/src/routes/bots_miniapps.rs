@@ -5798,6 +5798,19 @@ pub async fn fabushi_bot_patch(
         },
         None,
     );
+    if req.preferred_model.is_some() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let sync_req = gpui_telegram_proto::UpdateBotComputerRequest {
+            preferred_model: Some(updated.preferred_model.clone()),
+            ..Default::default()
+        };
+        let _ = state.db.upsert_bot_computer_profile(
+            auth.user_id.0,
+            updated.bot_user_id.max(0) as u64,
+            &sync_req,
+            now_ms,
+        );
+    }
 
     let summary =
         build_fabushi_bot_summary(&state, auth.user_id.0 as i64, &updated, inst.as_deref());

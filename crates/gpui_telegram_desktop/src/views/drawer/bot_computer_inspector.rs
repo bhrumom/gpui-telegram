@@ -21,7 +21,7 @@ use crate::views::drawer::inspector_panels::{
     apple_switch_pill, muse_collapsible_header, muse_icon_row,
 };
 use crate::views::drawer::inspector_tabs::{
-    BotConfigFocusField, InspectorAction, InspectorSubpage,
+    BotConfigFocusField, InspectorAction, InspectorAiModelCatalog, InspectorSubpage,
 };
 use crate::views::ContextInspector;
 
@@ -67,6 +67,37 @@ fn format_policy_label(policy: ComputerRunPolicy, lang: &str) -> &'static str {
         policy.label_zh()
     } else {
         policy.label_en()
+    }
+}
+
+/// Formats the effective model summary displayed in the Bot Profile panel,
+/// staying consistent with live Settings AI provider state.
+pub fn format_bot_effective_model_label(inspector: &ContextInspector, lang: &str) -> String {
+    if let Some(override_model) = inspector.effective_bot_preferred_model() {
+        if inspector.ai_models.synced
+            && !inspector
+                .ai_models
+                .is_model_consistent_with_settings(&override_model)
+        {
+            if lang.starts_with("zh") {
+                return format!("{override_model} (与设置不一致)");
+            }
+            return format!("{override_model} (differs from Settings)");
+        }
+        return override_model;
+    }
+
+    if !inspector.ai_models.needs_provider_selection && !inspector.ai_models.active_model.is_empty()
+    {
+        if lang.starts_with("zh") {
+            format!("跟随设置 · {}", inspector.ai_models.active_model)
+        } else {
+            format!("Settings · {}", inspector.ai_models.active_model)
+        }
+    } else if inspector.ai_models.synced && inspector.ai_models.needs_provider_selection {
+        tr_str(lang, "未配置模型", "No Model Configured").to_string()
+    } else {
+        tr_str(lang, "跟随设置默认", "Follow Settings").to_string()
     }
 }
 
@@ -675,10 +706,7 @@ pub fn render_bot_agent_and_computer_tab(
             })
         })
         .unwrap_or_else(|| tr_str(lang, "未绑定", "Unbound").to_string());
-    let model_name = profile_dto
-        .map(|p| p.preferred_model.clone())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| tr_str(lang, "默认模型", "Default Model").to_string());
+    let model_name = format_bot_effective_model_label(inspector, lang);
     let approval_mode = profile_dto
         .map(|p| p.approval_mode)
         .unwrap_or(ComputerRunPolicy::AskEveryTime);
@@ -1674,7 +1702,54 @@ pub fn render_bot_config_editor(
         .map(|c| c.read(cx).text_and_preedit(inspector.bot_draft_model.clone()))
         .unwrap_or_else(|| (inspector.bot_draft_model.clone(), None));
 
-    let model_presets = ["gpt-5.4", "claude-sonnet-4.6", "gemini-2.5-pro", "deepseek-reasoner"];
+    let ai_models = &inspector.ai_models;
+    let model_presets = ai_models.selectable_models();
+    let draft_model_trimmed = inspector.bot_draft_model.trim().to_string();
+    let follows_settings = draft_model_trimmed.is_empty();
+    let model_mismatch = !follows_settings
+        && ai_models.synced
+        && !ai_models.is_model_consistent_with_settings(&draft_model_trimmed);
+    let model_placeholder = if !ai_models.needs_provider_selection && !ai_models.active_model.is_empty()
+    {
+        if lang.starts_with("zh") {
+            format!("留空跟随设置 ({})", ai_models.active_model)
+        } else {
+            format!("Blank to follow Settings ({})", ai_models.active_model)
+        }
+    } else {
+        tr_str(lang, "留空跟随设置默认模型", "Blank to follow Settings default").to_string()
+    };
+    let settings_model_status = if let Some(summary) = ai_models.active_summary() {
+        if lang.starts_with("zh") {
+            format!("设置当前：{summary}")
+        } else {
+            format!("Settings active: {summary}")
+        }
+    } else if ai_models.synced && ai_models.needs_provider_selection {
+        tr_str(
+            lang,
+            "设置中尚未配置可用模型，请先前往模型设置",
+            "No model configured in Settings — open Model Settings",
+        )
+        .to_string()
+    } else {
+        tr_str(
+            lang,
+            "正在同步设置中的模型列表…",
+            "Syncing available models from Settings…",
+        )
+        .to_string()
+    };
+    let follow_chip_label = if !ai_models.needs_provider_selection && !ai_models.active_model.is_empty()
+    {
+        if lang.starts_with("zh") {
+            format!("跟随设置 ({})", ai_models.active_model)
+        } else {
+            format!("Follow Settings ({})", ai_models.active_model)
+        }
+    } else {
+        tr_str(lang, "跟随设置", "Follow Settings").to_string()
+    };
     let policy_choices = [
         ComputerRunPolicy::AskEveryTime,
         ComputerRunPolicy::AllowReadOnly,
@@ -1843,13 +1918,55 @@ pub fn render_bot_config_editor(
                 .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(10.0))
+                .gap(px(8.0))
                 .child(
                     div()
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.text_primary))
-                        .child(tr_str(lang, "首选模型", "Preferred Model")),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(pal.text_primary))
+                                .child(tr_str(lang, "首选模型", "Preferred Model")),
+                        )
+                        .child(
+                            div()
+                                .id("bot-open-model-settings-btn")
+                                .cursor_pointer()
+                                .px(px(7.0))
+                                .py(px(2.5))
+                                .rounded(px(6.0))
+                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.12))
+                                .hover(|s| {
+                                    s.bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.22))
+                                })
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(pal.accent))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.bot_config_focus = BotConfigFocusField::None;
+                                        this.pending_action =
+                                            Some(InspectorAction::OpenAiProvidersSettings);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tr_str(lang, "模型设置", "Model Settings")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(if ai_models.synced && ai_models.needs_provider_selection {
+                            pal.danger
+                        } else {
+                            pal.text_secondary
+                        }))
+                        .child(settings_model_status),
                 )
                 .child(
                     div()
@@ -1864,6 +1981,8 @@ pub fn render_bot_config_editor(
                         .border_color(
                             if inspector.bot_config_focus == BotConfigFocusField::Model {
                                 rgb(pal.accent).into()
+                            } else if model_mismatch {
+                                rgb(pal.danger).into()
                             } else {
                                 pal.separator_rgba()
                             },
@@ -1881,36 +2000,129 @@ pub fn render_bot_config_editor(
                         .child(render_ime_text_preview(
                             &model_text,
                             model_preedit.as_deref(),
-                            "gpt-5.4 / claude-sonnet-4.6",
+                            &model_placeholder,
                             inspector.bot_config_focus == BotConfigFocusField::Model,
                             false,
                             pal.text_primary,
                             pal,
                         )),
                 )
+                .when(model_mismatch, |col| {
+                    let mismatch_text = if lang.starts_with("zh") {
+                        format!(
+                            "当前模型「{draft_model_trimmed}」与设置中的可用模型不一致，建议点击下方「跟随设置」或选择设置中的模型"
+                        )
+                    } else {
+                        format!(
+                            "\"{draft_model_trimmed}\" is not in your active Settings models — follow Settings or pick an available model below"
+                        )
+                    };
+                    col.child(
+                        div()
+                            .id("bot-model-mismatch-banner")
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(7.0))
+                            .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.12))
+                            .border_1()
+                            .border_color(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.45))
+                            .text_size(px(10.5))
+                            .text_color(rgb(pal.danger))
+                            .child(mismatch_text),
+                    )
+                })
                 .child(
-                    div().flex().flex_wrap().gap(px(5.0)).children(
-                        model_presets.into_iter().enumerate().map(|(i, preset)| {
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .id("bot-model-follow-settings")
+                                .cursor_pointer()
+                                .px(px(8.0))
+                                .py(px(3.5))
+                                .rounded(px(999.0))
+                                .bg(if follows_settings {
+                                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16)
+                                } else {
+                                    rgb(pal.input_bg).into()
+                                })
+                                .border_1()
+                                .border_color(if follows_settings {
+                                    rgb(pal.accent).into()
+                                } else {
+                                    pal.separator_rgba()
+                                })
+                                .hover(|s| s.bg(rgb(pal.dialogs_hover_bg)))
+                                .text_size(px(10.5))
+                                .font_weight(if follows_settings {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(rgb(if follows_settings {
+                                    pal.accent
+                                } else {
+                                    pal.text_primary
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        if let Some(ref ctrl) = this.model_input {
+                                            ctrl.update(cx, |c, _| c.clear_preedit());
+                                        }
+                                        this.bot_draft_model.clear();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(follow_chip_label),
+                        )
+                        .children(model_presets.into_iter().enumerate().map(|(i, preset)| {
+                            let selected = !follows_settings
+                                && draft_model_trimmed.eq_ignore_ascii_case(&preset);
+                            let preset_click = preset.clone();
                             div()
                                 .id(("bot-model-preset", i))
                                 .cursor_pointer()
-                                .px(px(7.0))
-                                .py(px(3.0))
-                                .rounded(px(6.0))
-                                .bg(rgb(pal.input_bg))
+                                .px(px(8.0))
+                                .py(px(3.5))
+                                .rounded(px(999.0))
+                                .bg(if selected {
+                                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16)
+                                } else {
+                                    rgb(pal.input_bg).into()
+                                })
+                                .border_1()
+                                .border_color(if selected {
+                                    rgb(pal.accent).into()
+                                } else {
+                                    pal.separator_rgba()
+                                })
                                 .hover(|s| s.bg(rgb(pal.dialogs_hover_bg)))
                                 .text_size(px(10.5))
-                                .text_color(rgb(pal.text_secondary))
+                                .font_weight(if selected {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(rgb(if selected {
+                                    pal.accent
+                                } else {
+                                    pal.text_secondary
+                                }))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
-                                        this.bot_draft_model = preset.to_string();
+                                        if let Some(ref ctrl) = this.model_input {
+                                            ctrl.update(cx, |c, _| c.clear_preedit());
+                                        }
+                                        this.bot_draft_model = preset_click.clone();
                                         cx.notify();
                                     }),
                                 )
                                 .child(preset)
-                        }),
-                    ),
+                        })),
                 ),
         )
         .child(
@@ -2025,10 +2237,19 @@ pub fn render_bot_config_editor(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         this.bot_config_focus = BotConfigFocusField::None;
+                        let cleaned_model = {
+                            let trimmed = this.bot_draft_model.trim();
+                            if InspectorAiModelCatalog::is_placeholder_model(trimmed) {
+                                String::new()
+                            } else {
+                                trimmed.to_string()
+                            }
+                        };
+                        this.bot_draft_model = cleaned_model.clone();
                         this.pending_action = Some(InspectorAction::SaveBotComputerConfig {
                             bot_id,
                             persona_prompt: this.bot_draft_persona.clone(),
-                            preferred_model: this.bot_draft_model.clone(),
+                            preferred_model: cleaned_model,
                             approval_mode: this.bot_draft_approval_mode,
                             allow_cross_device_control: this.bot_draft_allow_cross_device,
                             allow_cloud_self_config: this.bot_draft_allow_cloud_self_config,

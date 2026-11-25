@@ -400,7 +400,7 @@ impl AppShell {
                     if w.confirm_close_open { w.confirm_close_open = false; }
                     else if w.menu_open { w.menu_open = false; }
                     else if w.focused_input.is_some() { w.focused_input = None; }
-                    else { w.is_open = false; minimized = true; }
+                    else { w.minimize(); minimized = true; }
                     wcx.notify();
                 });
                 if minimized { self.miniapps.is_miniapp_minimized = true; }
@@ -424,7 +424,9 @@ impl AppShell {
     fn dismiss_post_auth_escape(&mut self, cx: &mut Context<Self>) -> bool {
         if self.sidebar.read(cx).is_contacts_modal_open {
             self.sidebar.update(cx, |sb, scx| { sb.close_contacts_modal(); scx.notify(); });
-            if !self.is_compose_or_creation_modal_active(cx) {
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
                 self.exit_compose_or_modal_isolation(true, cx);
             } else {
                 self.sync_compose_state_to_composer(true, cx);
@@ -433,7 +435,9 @@ impl AppShell {
         }
         if self.sidebar.read(cx).active_creation_modal.is_some() {
             self.sidebar.update(cx, |sb, scx| { sb.close_creation_modal(); scx.notify(); });
-            if !self.is_compose_or_creation_modal_active(cx) {
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
                 self.exit_compose_or_modal_isolation(true, cx);
             } else {
                 self.sync_compose_state_to_composer(true, cx);
@@ -454,13 +458,15 @@ impl AppShell {
                 } else if sb.compose_draft.menu_open {
                     sb.compose_draft.menu_open = false;
                 } else {
-                    sb.exit_compose_mode();
+                    sb.cancel_compose_mode();
                     exited_compose = true;
                 }
                 scx.notify();
             });
             if exited_compose {
-                if !self.is_compose_or_creation_modal_active(cx) {
+                if self.composer.read(cx).is_compose_isolated
+                    && !self.is_compose_or_creation_modal_active(cx)
+                {
                     self.exit_compose_or_modal_isolation(true, cx);
                 } else {
                     self.sync_compose_state_to_composer(true, cx);
@@ -470,13 +476,14 @@ impl AppShell {
             return true;
         }
         if self.sidebar.read(cx).is_account_popover_open || self.sidebar.read(cx).is_plus_menu_open {
-            let was_plus_open = self.sidebar.read(cx).is_plus_menu_open;
             self.sidebar.update(cx, |s, scx| {
                 s.is_account_popover_open = false;
-                s.exit_compose_mode();
+                s.cancel_compose_mode();
                 scx.notify();
             });
-            if was_plus_open && !self.is_compose_or_creation_modal_active(cx) {
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
                 self.exit_compose_or_modal_isolation(true, cx);
             } else {
                 self.sync_compose_state_to_composer(true, cx);

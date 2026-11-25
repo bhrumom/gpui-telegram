@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 pub mod tray_action_ids {
     pub const SHOW_FABUSHI: &str = "show_fabushi";
     pub const OPEN_ALIAS: &str = "open";
-    pub const CONTROLLED_STATUS: &str = "controlled_status";
     pub const DISCONNECT_ALL: &str = "disconnect_all";
     pub const TOGGLE_ALLOW_REMOTE: &str = "toggle_allow_remote";
     pub const COPY_ASSIST: &str = "copy_assist";
@@ -202,22 +201,6 @@ impl TrayMacMac {
                 "显示 Fabushi 主窗口".to_string()
             } else {
                 "Show Fabushi".to_string()
-            },
-            is_separator: false,
-            is_enabled: true,
-        });
-        self.actions.push(MacTrayAction {
-            id: tray_action_ids::CONTROLLED_STATUS.to_string(),
-            title: if self.controlled_count > 0 {
-                if is_zh {
-                    format!("本机被控状态窗口 ({})", self.controlled_count)
-                } else {
-                    format!("Controlled Status Window ({})", self.controlled_count)
-                }
-            } else if is_zh {
-                "本机被控状态窗口".to_string()
-            } else {
-                "Controlled Status Window".to_string()
             },
             is_separator: false,
             is_enabled: true,
@@ -715,10 +698,10 @@ mod tests {
             .actions
             .iter()
             .any(|a| a.id == tray_action_ids::DISCONNECT_ALL && a.is_enabled));
-        assert!(tray
+        assert!(!tray
             .actions
             .iter()
-            .any(|a| a.id == tray_action_ids::CONTROLLED_STATUS && a.is_enabled));
+            .any(|a| a.id == "controlled_status"));
         assert!(tray
             .actions
             .iter()

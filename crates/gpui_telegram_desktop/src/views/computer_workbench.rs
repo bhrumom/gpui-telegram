@@ -2401,6 +2401,10 @@ impl ComputerWorkbench {
                                 cx.listener(|this, _, _, cx| {
                                     this.active_tab = WorkbenchTab::RemoteTerminal;
                                     this.terminal_focused = true;
+                                    this.ensure_terminal_view(cx);
+                                    if let Some(term) = this.terminal_view.as_ref() {
+                                        term.update(cx, |t, _| t.is_focused = true);
+                                    }
                                     cx.notify();
                                 }),
                             ))

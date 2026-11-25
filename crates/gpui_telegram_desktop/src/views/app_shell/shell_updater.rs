@@ -113,7 +113,7 @@ impl AppShell {
                         } else {
                             format!("Fabushi v{ver} is available for one-click update")
                         };
-                        shell.window_runtime.enqueue_toast(msg, 3200);
+                        shell.show_non_chat_toast(msg, 3200, cx);
                     }
                     Ok(None) => {
                         shell.overlays.updater_state = DesktopUpdateState::UpToDate {
@@ -125,7 +125,7 @@ impl AppShell {
                             } else {
                                 format!("You're up to date (Fabushi v{CURRENT_APP_VERSION})")
                             };
-                            shell.window_runtime.enqueue_toast(msg, 2400);
+                            shell.show_non_chat_toast(msg, 2400, cx);
                         }
                     }
                     Err(err) => {
@@ -139,9 +139,7 @@ impl AppShell {
                                 "检查更新失败",
                                 "Failed to check for updates",
                             );
-                            shell
-                                .window_runtime
-                                .enqueue_toast(format!("{prefix}: {err}"), 3000);
+                            shell.show_non_chat_toast(format!("{prefix}: {err}"), 3000, cx);
                         }
                     }
                 }
@@ -251,9 +249,7 @@ impl AppShell {
                                         "更新安装失败",
                                         "Update installation failed",
                                     );
-                                    shell
-                                        .window_runtime
-                                        .enqueue_toast(format!("{prefix}: {err}"), 3400);
+                                    shell.show_non_chat_toast(format!("{prefix}: {err}"), 3400, cx);
                                     shell.sync_updater_state_to_views(cx);
                                 }
                             }
@@ -298,8 +294,7 @@ impl AppShell {
                     "无法启动更新替换程序",
                     "Failed to launch self-updater",
                 );
-                self.window_runtime
-                    .enqueue_toast(format!("{prefix}: {err}"), 3400);
+                self.show_non_chat_toast(format!("{prefix}: {err}"), 3400, cx);
                 self.sync_updater_state_to_views(cx);
             }
         }

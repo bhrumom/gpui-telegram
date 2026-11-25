@@ -10,7 +10,7 @@ use gpui_telegram_proto::miniapp_contracts::{
 use crate::components::bots::bot_attach_web_view::{BotAttachWebView, BotWebViewPendingAction};
 use crate::i18n::tr_str;
 use crate::views::app_shell::shell_actions::resolve_active_target_chat_id;
-use crate::views::app_shell::shell_truth::{proto_keyboard_to_stage, SessionRequestFence};
+use crate::views::app_shell::shell_truth::{proto_keyboard_to_stage, ClientCallFence};
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::boxes::peers::bot_profile_box::{BotProfileBox, BotProfileBoxAction};
 use crate::views::boxes::peers::create_managed_bot_box::CreateManagedBotBoxPeers;
@@ -21,25 +21,6 @@ enum CloudStorageOp {
     Refresh,
     Set { key: String, value: String },
     Delete { key: String },
-}
-
-fn current_session_fence(shell: &AppShell) -> SessionRequestFence {
-    SessionRequestFence {
-        auth_generation: shell.session_sync.auth_generation,
-        request_generation: 0,
-        token: shell.session_sync.session_token.clone().unwrap_or_default(),
-        user_id: shell.session_sync.user_id.unwrap_or(0),
-    }
-}
-
-fn fence_matches_shell(fence: &SessionRequestFence, shell: &AppShell) -> bool {
-    fence.matches(
-        shell.is_authenticated,
-        shell.session_sync.auth_generation,
-        0,
-        shell.session_sync.session_token.as_deref(),
-        shell.session_sync.user_id,
-    )
 }
 
 fn upsert_fabushi_bot_summary(shell: &mut AppShell, summary: FabushiBotSummaryDto) {
@@ -133,35 +114,66 @@ fn set_bot_box_error(
 }
 
 fn spawn_cloud_storage_op(
-    shell: &AppShell,
+    _shell: &AppShell,
     overlay: &Entity<BotAttachWebView>,
-    fence: SessionRequestFence,
+    fence: ClientCallFence,
     bot_username: String,
     short_name: String,
     op: CloudStorageOp,
     cx: &mut Context<AppShell>,
 ) {
-    let client = shell.client.clone();
     let ov_weak = overlay.downgrade();
     cx.spawn(async move |weak: WeakEntity<AppShell>, app: &mut AsyncApp| {
+        if !fence.preflight_ui(&weak, app).await {
+            return;
+        }
         let toast_after: Option<&'static str> = match op {
             CloudStorageOp::Refresh => None,
             CloudStorageOp::Set { key, value } => {
-                let _ = client
-                    .set_cloud_storage_item(&bot_username, &short_name, &key, &value)
+                let _ = fence
+                    .client
+                    .set_cloud_storage_item_with_token(
+                        &fence.token,
+                        fence.client_epoch,
+                        &bot_username,
+                        &short_name,
+                        &key,
+                        &value,
+                    )
                     .await;
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
                 Some("CloudStorage Saved")
             }
             CloudStorageOp::Delete { key } => {
-                let _ = client
-                    .delete_cloud_storage_item(&bot_username, &short_name, &key)
+                let _ = fence
+                    .client
+                    .delete_cloud_storage_item_with_token(
+                        &fence.token,
+                        fence.client_epoch,
+                        &bot_username,
+                        &short_name,
+                        &key,
+                    )
                     .await;
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
                 Some("CloudStorage Deleted")
             }
         };
-        let res = client.get_cloud_storage(&bot_username, &short_name).await;
+        let res = fence
+            .client
+            .get_cloud_storage_with_token(
+                &fence.token,
+                fence.client_epoch,
+                &bot_username,
+                &short_name,
+            )
+            .await;
         let _ = weak.update(app, |shell, cx| {
-            if !fence_matches_shell(&fence, shell) {
+            if !fence.is_valid(shell) {
                 return;
             }
             if let Ok(items) = res {
@@ -316,78 +328,111 @@ impl AppShell {
             cx.notify();
             return;
         }
-        if !self.is_authenticated || self.session_sync.session_token.is_none() {
+        if !self.is_authenticated
+            || self.session_sync.session_token.is_none()
+            || self.session_sync.user_id.is_none()
+        {
             return;
         }
-        let lang = self.active_lang_id().to_string();
-        let fence = current_session_fence(self);
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
+        let origin_box_id = box_ent.entity_id();
         if let Some(req) = fabushi_req {
-            let client = self.client.clone();
             let box_weak = box_ent.downgrade();
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                let res = client.create_fabushi_bot(&req).await;
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                let res = fence
+                    .client
+                    .create_fabushi_bot_with_token(&fence.token, fence.client_epoch, &req)
+                    .await;
                 let _ = weak.update(app, |shell, cx| {
-                    if !fence_matches_shell(&fence, shell) {
+                    if !fence.is_valid(shell) {
                         return;
                     }
+                    let modal_still_open = shell
+                        .miniapps
+                        .create_bot_box
+                        .as_ref()
+                        .is_some_and(|b| b.entity_id() == origin_box_id && b.read(cx).is_visible);
                     match res {
                         Ok(created) => {
-                            shell.miniapps.create_bot_box = None;
                             let is_coding_bot = created.bot.coding_agent.is_some();
                             upsert_fabushi_bot_summary(shell, created.bot.clone());
-                            shell.show_toast(
-                                format!(
-                                    "{} @{}",
-                                    if is_coding_bot {
-                                        tr_str(&lang, "已创建编程智能体", "Created Coding Agent Bot")
-                                    } else {
-                                        tr_str(&lang, "已创建 Fabushi 智能体", "Created Fabushi Bot")
-                                    },
-                                    created.bot.agent_id
-                                ),
-                                2800,
-                                cx,
+                            let lang = shell.active_lang_id();
+                            let toast_msg = format!(
+                                "{} @{}",
+                                if is_coding_bot {
+                                    tr_str(lang, "已创建编程智能体", "Created Coding Agent Bot")
+                                } else {
+                                    tr_str(lang, "已创建 Fabushi 智能体", "Created Fabushi Bot")
+                                },
+                                created.bot.agent_id
                             );
                             let cid = created.companion_chat_id.max(0) as u64;
                             shell.sync_fabushi_bots_to_views(cx);
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
-                            if cid > 0 {
-                                shell.open_or_select_chat(
-                                    cid,
-                                    Some(created.bot.display_name.clone()),
-                                    true,
-                                    cx,
-                                );
-                                shell.finish_compose_isolation_for_switched_chat(cid, cx);
-                            } else if !shell.is_compose_or_creation_modal_active(cx) {
-                                shell.exit_compose_or_modal_isolation(true, cx);
+                            if modal_still_open {
+                                shell.miniapps.create_bot_box = None;
+                                if cid > 0 {
+                                    shell.open_or_select_chat(
+                                        cid,
+                                        Some(created.bot.display_name.clone()),
+                                        true,
+                                        cx,
+                                    );
+                                    shell.finish_compose_isolation_for_switched_chat(cid, cx);
+                                    shell.show_chat_toast(cid, toast_msg, 2800, cx);
+                                } else {
+                                    if !shell.is_compose_or_creation_modal_active(cx) {
+                                        shell.exit_compose_or_modal_isolation(true, cx);
+                                    }
+                                    shell.show_non_chat_toast(toast_msg, 2800, cx);
+                                }
+                            } else {
+                                shell.show_non_chat_toast(toast_msg, 2800, cx);
                             }
                         }
-                        Err(e) => set_bot_box_error(&box_weak, e, cx),
+                        Err(e) => {
+                            if modal_still_open {
+                                set_bot_box_error(&box_weak, e, cx);
+                            }
+                        }
                     }
                     cx.notify();
                 });
             })
             .detach();
         } else if let Some(prompt) = nl_prompt {
-            let client = self.client.clone();
             let box_weak = box_ent.downgrade();
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                let res = client
-                    .create_from_natural_language_with_avatar(
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
+                let res = fence
+                    .client
+                    .create_from_natural_language_with_avatar_with_token(
+                        &fence.token,
+                        fence.client_epoch,
                         &prompt,
                         av_shape.clone(),
                         av_color.clone(),
                     )
                     .await;
                 let _ = weak.update(app, |shell, cx| {
-                    if !fence_matches_shell(&fence, shell) {
+                    if !fence.is_valid(shell) {
                         return;
                     }
+                    let modal_still_open = shell
+                        .miniapps
+                        .create_bot_box
+                        .as_ref()
+                        .is_some_and(|b| b.entity_id() == origin_box_id && b.read(cx).is_visible);
                     match res {
                         Ok(created) => {
-                            shell.miniapps.create_bot_box = None;
                             let summary = fabushi_summary_from_bot_registry(
                                 &created.bot,
                                 (created.companion_chat_id > 0).then_some(created.companion_chat_id),
@@ -396,50 +441,62 @@ impl AppShell {
                             );
                             upsert_fabushi_bot_summary(shell, summary);
                             shell.sync_fabushi_bots_to_views(cx);
-                            shell.show_toast(
-                                format!(
-                                    "{} @{}",
-                                    tr_str(&lang, "已创建 AI 机器人与小程序", "Created Bot & Mini App"),
-                                    created.bot.username
-                                ),
-                                2800,
-                                cx,
+                            let lang = shell.active_lang_id();
+                            let toast_msg = format!(
+                                "{} @{}",
+                                tr_str(lang, "已创建 AI 机器人与小程序", "Created Bot & Mini App"),
+                                created.bot.username
                             );
                             let cid = created.companion_chat_id.max(0) as u64;
-                            if cid > 0 {
-                                shell.open_or_select_chat(
-                                    cid,
-                                    Some(created.bot.display_name.clone()),
-                                    true,
-                                    cx,
-                                );
-                                shell.finish_compose_isolation_for_switched_chat(cid, cx);
-                            } else if !shell.is_compose_or_creation_modal_active(cx) {
-                                shell.exit_compose_or_modal_isolation(true, cx);
-                            }
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
-                            if let Some(app_entry) = created.app {
-                                shell.launch_miniapp(
-                                    &app_entry.bot_username,
-                                    &app_entry.short_name,
-                                    if cid > 0 { Some(cid) } else { None },
-                                    MiniAppLaunchMode::DirectLink,
-                                    None,
-                                    cx,
-                                );
+                            if modal_still_open {
+                                shell.miniapps.create_bot_box = None;
+                                if cid > 0 {
+                                    shell.open_or_select_chat(
+                                        cid,
+                                        Some(created.bot.display_name.clone()),
+                                        true,
+                                        cx,
+                                    );
+                                    shell.finish_compose_isolation_for_switched_chat(cid, cx);
+                                    shell.show_chat_toast(cid, toast_msg, 2800, cx);
+                                } else {
+                                    if !shell.is_compose_or_creation_modal_active(cx) {
+                                        shell.exit_compose_or_modal_isolation(true, cx);
+                                    }
+                                    shell.show_non_chat_toast(toast_msg, 2800, cx);
+                                }
+                                if let Some(app_entry) = created.app {
+                                    shell.launch_miniapp(
+                                        &app_entry.bot_username,
+                                        &app_entry.short_name,
+                                        if cid > 0 { Some(cid) } else { None },
+                                        MiniAppLaunchMode::DirectLink,
+                                        None,
+                                        cx,
+                                    );
+                                }
+                            } else {
+                                shell.show_non_chat_toast(toast_msg, 2800, cx);
                             }
                         }
-                        Err(e) => set_bot_box_error(&box_weak, e, cx),
+                        Err(e) => {
+                            if modal_still_open {
+                                set_bot_box_error(&box_weak, e, cx);
+                            }
+                        }
                     }
                     cx.notify();
                 });
             })
             .detach();
         } else if let Some((name, username, _token, _is_biz)) = creds {
-            let client = self.client.clone();
             let box_weak = box_ent.downgrade();
             cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                if !fence.preflight_ui(&weak, app).await {
+                    return;
+                }
                 let req = CreateBotRequest {
                     display_name: name,
                     username,
@@ -459,14 +516,21 @@ impl AppShell {
                     avatar_color: av_color.clone(),
                     ..Default::default()
                 };
-                let res = client.create_bot(&req).await;
+                let res = fence
+                    .client
+                    .create_bot_with_token(&fence.token, fence.client_epoch, &req)
+                    .await;
                 let _ = weak.update(app, |shell, cx| {
-                    if !fence_matches_shell(&fence, shell) {
+                    if !fence.is_valid(shell) {
                         return;
                     }
+                    let modal_still_open = shell
+                        .miniapps
+                        .create_bot_box
+                        .as_ref()
+                        .is_some_and(|b| b.entity_id() == origin_box_id && b.read(cx).is_visible);
                     match res {
                         Ok(created) => {
-                            shell.miniapps.create_bot_box = None;
                             let summary = fabushi_summary_from_bot_registry(
                                 &created.bot,
                                 created.companion_chat_id,
@@ -475,30 +539,40 @@ impl AppShell {
                             );
                             upsert_fabushi_bot_summary(shell, summary);
                             shell.sync_fabushi_bots_to_views(cx);
-                            shell.show_toast(
-                                format!(
-                                    "{} @{}",
-                                    tr_str(&lang, "已创建机器人", "Bot Created"),
-                                    created.bot.username
-                                ),
-                                2600,
-                                cx,
+                            let lang = shell.active_lang_id();
+                            let toast_msg = format!(
+                                "{} @{}",
+                                tr_str(lang, "已创建机器人", "Bot Created"),
+                                created.bot.username
                             );
-                            if let Some(cid) = created.companion_chat_id.filter(|&id| id > 0) {
-                                shell.open_or_select_chat(
-                                    cid as u64,
-                                    Some(created.bot.display_name.clone()),
-                                    true,
-                                    cx,
-                                );
-                                shell.finish_compose_isolation_for_switched_chat(cid as u64, cx);
-                            } else if !shell.is_compose_or_creation_modal_active(cx) {
-                                shell.exit_compose_or_modal_isolation(true, cx);
-                            }
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
+                            if modal_still_open {
+                                shell.miniapps.create_bot_box = None;
+                                if let Some(cid) = created.companion_chat_id.filter(|&id| id > 0) {
+                                    shell.open_or_select_chat(
+                                        cid as u64,
+                                        Some(created.bot.display_name.clone()),
+                                        true,
+                                        cx,
+                                    );
+                                    shell.finish_compose_isolation_for_switched_chat(cid as u64, cx);
+                                    shell.show_chat_toast(cid as u64, toast_msg, 2600, cx);
+                                } else {
+                                    if !shell.is_compose_or_creation_modal_active(cx) {
+                                        shell.exit_compose_or_modal_isolation(true, cx);
+                                    }
+                                    shell.show_non_chat_toast(toast_msg, 2600, cx);
+                                }
+                            } else {
+                                shell.show_non_chat_toast(toast_msg, 2600, cx);
+                            }
                         }
-                        Err(e) => set_bot_box_error(&box_weak, e, cx),
+                        Err(e) => {
+                            if modal_still_open {
+                                set_bot_box_error(&box_weak, e, cx);
+                            }
+                        }
                     }
                     cx.notify();
                 });
@@ -518,9 +592,8 @@ impl AppShell {
             return;
         }
         let lang = self.active_lang_id().to_string();
-        let fence = current_session_fence(self);
+        let fence = self.capture_client_fence();
         for act in actions {
-            let fence = fence.clone();
             match act {
                 BotWebViewPendingAction::Close => {
                     self.miniapps.bump_launch_generation();
@@ -531,6 +604,10 @@ impl AppShell {
                 }
                 BotWebViewPendingAction::Minimize => {
                     self.miniapps.is_miniapp_minimized = true;
+                    overlay.update(cx, |w, wcx| {
+                        w.minimize();
+                        wcx.notify();
+                    });
                     cx.notify();
                 }
                 BotWebViewPendingAction::Reload {
@@ -554,21 +631,33 @@ impl AppShell {
                     short_name,
                     allow_write_access,
                 } => {
-                    let client = self.client.clone();
+                    let Some(fence) = fence.clone() else {
+                        continue;
+                    };
                     let lang_c = lang.clone();
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                        let res = client
-                            .install_mini_app(&bot_username, &short_name, allow_write_access)
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let res = fence
+                            .client
+                            .install_mini_app_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                &bot_username,
+                                &short_name,
+                                allow_write_access,
+                            )
                             .await;
                         let _ = weak.update(app, |shell, cx| {
-                            if !fence_matches_shell(&fence, shell) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             if let Ok(r) = res {
                                 if let Some(toast) = r.toast {
-                                    shell.show_toast(toast, 2200, cx);
+                                    shell.show_non_chat_toast(toast, 2200, cx);
                                 } else {
-                                    shell.show_toast(
+                                    shell.show_non_chat_toast(
                                         tr_str(&lang_c, "已授权并添加到附件菜单", "Authorized and added to attach menu"),
                                         2200,
                                         cx,
@@ -586,7 +675,9 @@ impl AppShell {
                     app_id,
                     app_title: _,
                 } => {
-                    let client = self.client.clone();
+                    let Some(fence) = fence.clone() else {
+                        continue;
+                    };
                     let ov_weak = overlay.downgrade();
                     let lang_c = lang.clone();
                     let resolved_id_hint = if bot_id > 0 {
@@ -599,19 +690,36 @@ impl AppShell {
                             .unwrap_or(0)
                     };
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
                         let mut target_bot_id = resolved_id_hint;
                         if target_bot_id == 0 && !bot_username.trim().is_empty() {
-                            if let Ok(prof) = client.get_bot_public_profile(&bot_username).await {
+                            if let Ok(prof) = fence
+                                .client
+                                .get_bot_public_profile_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    &bot_username,
+                                )
+                                .await
+                            {
                                 target_bot_id = prof.bot.bot_user_id.max(0) as u64;
+                            }
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
                             }
                         }
                         if target_bot_id == 0 {
                             let _ = weak.update(app, |shell, cx| {
+                                if !fence.is_valid(shell) {
+                                    return;
+                                }
                                 let _ = ov_weak.update(cx, |w, w_cx| {
                                     w.resolve_write_access(false);
                                     w_cx.notify();
                                 });
-                                shell.show_toast(
+                                shell.show_non_chat_toast(
                                     tr_str(&lang_c, "无法解析机器人 ID", "Unable to resolve bot id"),
                                     2200,
                                     cx,
@@ -624,9 +732,17 @@ impl AppShell {
                             web_app_name: None,
                             from_attachment_menu: false,
                         };
-                        let res = client.allow_bot_send_message(target_bot_id, &req).await;
+                        let res = fence
+                            .client
+                            .allow_bot_send_message_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                target_bot_id,
+                                &req,
+                            )
+                            .await;
                         let _ = weak.update(app, |shell, cx| {
-                            if !fence_matches_shell(&fence, shell) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             match res {
@@ -652,7 +768,7 @@ impl AppShell {
                                     {
                                         shell.load_historical_messages(resp.chat_id as u64, cx);
                                     }
-                                    shell.show_toast(
+                                    shell.show_non_chat_toast(
                                         if !resp.service_text.trim().is_empty() {
                                             resp.service_text
                                         } else {
@@ -672,7 +788,7 @@ impl AppShell {
                                         w.resolve_write_access(false);
                                         w_cx.notify();
                                     });
-                                    shell.show_toast(
+                                    shell.show_non_chat_toast(
                                         format!("Allow write access failed: {}", e),
                                         2400,
                                         cx,
@@ -686,11 +802,22 @@ impl AppShell {
                 }
                 BotWebViewPendingAction::OpenBotProfile(bot_un) => {
                     self.miniapps.is_miniapp_minimized = true;
+                    overlay.update(cx, |w, wcx| {
+                        w.minimize();
+                        wcx.notify();
+                    });
                     self.open_bot_profile_popup(&bot_un, cx);
+                    self.reconcile_chat_scoped_toasts(cx);
+                    cx.notify();
                 }
                 BotWebViewPendingAction::OpenMiniAppTos => {
                     self.miniapps.is_miniapp_minimized = true;
+                    overlay.update(cx, |w, wcx| {
+                        w.minimize();
+                        wcx.notify();
+                    });
                     self.miniapps.miniapp_tos_modal_open = true;
+                    self.reconcile_chat_scoped_toasts(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::OpenTelegramLink(raw_link) => {
@@ -719,7 +846,13 @@ impl AppShell {
                             .to_string();
                         if !clean.is_empty() {
                             self.miniapps.is_miniapp_minimized = true;
+                            overlay.update(cx, |w, wcx| {
+                                w.minimize();
+                                wcx.notify();
+                            });
                             self.open_bot_profile_popup(&clean, cx);
+                            self.reconcile_chat_scoped_toasts(cx);
+                            cx.notify();
                         }
                     }
                 }
@@ -728,6 +861,10 @@ impl AppShell {
                     bot_username,
                 } => {
                     self.miniapps.is_miniapp_minimized = true;
+                    overlay.update(cx, |w, wcx| {
+                        w.minimize();
+                        wcx.notify();
+                    });
                     if companion_chat_id > 0 {
                         self.open_or_select_chat(
                             companion_chat_id as u64,
@@ -738,6 +875,7 @@ impl AppShell {
                     } else if !bot_username.trim().is_empty() {
                         self.open_bot_chat_by_username(&bot_username, cx);
                     }
+                    self.reconcile_chat_scoped_toasts(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::OpenInBrowser { path } => {
@@ -768,12 +906,25 @@ impl AppShell {
                     self.miniapps.is_miniapp_minimized = false;
                     self.miniapps.floating_pip_status = None;
                     self.miniapps.miniapp_overlay = None;
-                    let client = self.client.clone();
+                    let Some(fence) = fence.clone() else {
+                        continue;
+                    };
                     let lang_c = lang.clone();
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                        let res = client.uninstall_mini_app(&bot_username, &short_name).await;
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let res = fence
+                            .client
+                            .uninstall_mini_app_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                &bot_username,
+                                &short_name,
+                            )
+                            .await;
                         let _ = weak.update(app, |shell, cx| {
-                            if !fence_matches_shell(&fence, shell) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             match res {
@@ -781,11 +932,11 @@ impl AppShell {
                                     let msg = r.toast.unwrap_or_else(|| {
                                         tr_str(&lang_c, "已移除小程序", "Removed Mini App").to_string()
                                     });
-                                    shell.show_toast(msg, 2200, cx);
+                                    shell.show_non_chat_toast(msg, 2200, cx);
                                     shell.refresh_miniapps_catalog(None, cx);
                                 }
                                 Err(e) => {
-                                    shell.show_toast(format!("Remove error: {}", e), 2400, cx);
+                                    shell.show_non_chat_toast(format!("Remove error: {}", e), 2400, cx);
                                 }
                             }
                             cx.notify();
@@ -798,23 +949,38 @@ impl AppShell {
                     short_name,
                     req,
                 } => {
+                    let Some(fence) = fence.clone() else {
+                        continue;
+                    };
                     let is_send_data = req.action_type.eq_ignore_ascii_case("send_data");
                     let source_cid = req.chat_id.filter(|&id| id > 0).map(|id| id as u64);
-                    let client = self.client.clone();
+                    let captured_active_chat = resolve_active_target_chat_id(
+                        self.stage.read(cx).active_chat_id,
+                        self.sidebar.read(cx).active_chat_id,
+                    );
+                    let captured_panel = self.active_panel;
                     let ov_weak = overlay.downgrade();
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                        let res = client
-                            .send_mini_app_action(&bot_username, &short_name, &req)
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let res = fence
+                            .client
+                            .send_mini_app_action_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                &bot_username,
+                                &short_name,
+                                &req,
+                            )
                             .await;
                         let _ = weak.update(app, |shell, cx| {
-                            if !fence_matches_shell(&fence, shell) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             match res {
                                 Ok(resp) => {
-                                    if let Some(ref toast) = resp.toast {
-                                        shell.show_toast(toast, 2400, cx);
-                                    }
+                                    let toast_opt = resp.toast.clone();
                                     let refresh_companion = resp
                                         .companion_chat_id
                                         .filter(|&id| id > 0)
@@ -831,6 +997,32 @@ impl AppShell {
                                         shell.miniapps.floating_pip_status = None;
                                         shell.miniapps.miniapp_overlay = None;
                                     }
+                                    if let Some(ref toast) = toast_opt {
+                                        if let Some(cid) = source_cid {
+                                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                                shell.show_chat_toast(cid, toast, 2400, cx);
+                                            }
+                                        } else {
+                                            let cur_active = resolve_active_target_chat_id(
+                                                shell.stage.read(cx).active_chat_id,
+                                                shell.sidebar.read(cx).active_chat_id,
+                                            );
+                                            let overlay_open = shell
+                                                .miniapps
+                                                .miniapp_overlay
+                                                .as_ref()
+                                                .is_some_and(|ov| {
+                                                    let w = ov.read(cx);
+                                                    w.is_open && !w.is_floating_pip
+                                                });
+                                            if overlay_open
+                                                || (shell.active_panel == captured_panel
+                                                    && cur_active == captured_active_chat)
+                                            {
+                                                shell.show_non_chat_toast(toast, 2400, cx);
+                                            }
+                                        }
+                                    }
                                     if let Some(cid) = refresh_companion {
                                         if shell.stage.read(cx).active_chat_id == Some(cid) {
                                             shell.load_historical_messages(cid, cx);
@@ -839,7 +1031,9 @@ impl AppShell {
                                     }
                                     if is_send_data {
                                         if let Some(scid) = source_cid {
-                                            shell.load_historical_messages(scid, cx);
+                                            if shell.stage.read(cx).active_chat_id == Some(scid) {
+                                                shell.load_historical_messages(scid, cx);
+                                            }
                                         }
                                     }
                                 }
@@ -859,42 +1053,54 @@ impl AppShell {
                 BotWebViewPendingAction::CloudStorageRefresh {
                     bot_username,
                     short_name,
-                } => spawn_cloud_storage_op(
-                    self,
-                    overlay,
-                    fence,
-                    bot_username,
-                    short_name,
-                    CloudStorageOp::Refresh,
-                    cx,
-                ),
+                } => {
+                    if let Some(fence) = fence.clone() {
+                        spawn_cloud_storage_op(
+                            self,
+                            overlay,
+                            fence,
+                            bot_username,
+                            short_name,
+                            CloudStorageOp::Refresh,
+                            cx,
+                        );
+                    }
+                }
                 BotWebViewPendingAction::CloudStorageSet {
                     bot_username,
                     short_name,
                     key,
                     value,
-                } => spawn_cloud_storage_op(
-                    self,
-                    overlay,
-                    fence,
-                    bot_username,
-                    short_name,
-                    CloudStorageOp::Set { key, value },
-                    cx,
-                ),
+                } => {
+                    if let Some(fence) = fence.clone() {
+                        spawn_cloud_storage_op(
+                            self,
+                            overlay,
+                            fence,
+                            bot_username,
+                            short_name,
+                            CloudStorageOp::Set { key, value },
+                            cx,
+                        );
+                    }
+                }
                 BotWebViewPendingAction::CloudStorageDelete {
                     bot_username,
                     short_name,
                     key,
-                } => spawn_cloud_storage_op(
-                    self,
-                    overlay,
-                    fence,
-                    bot_username,
-                    short_name,
-                    CloudStorageOp::Delete { key },
-                    cx,
-                ),
+                } => {
+                    if let Some(fence) = fence.clone() {
+                        spawn_cloud_storage_op(
+                            self,
+                            overlay,
+                            fence,
+                            bot_username,
+                            short_name,
+                            CloudStorageOp::Delete { key },
+                            cx,
+                        );
+                    }
+                }
                 BotWebViewPendingAction::TakeoverMiniApp => {
                     let (bot_username, short_name, chat_id, bot_user_id, title) = {
                         let w = overlay.read(cx);
@@ -929,6 +1135,7 @@ impl AppShell {
                             state_snapshot: None,
                         });
                     }
+                    self.reconcile_chat_scoped_toasts(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::FinishTakeoverAndResumeAi {
@@ -987,6 +1194,7 @@ impl AppShell {
                         w.is_open = true;
                         wcx.notify();
                     });
+                    self.reconcile_chat_scoped_toasts(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::WebMcpResponseReady(resp) => {
@@ -1087,15 +1295,26 @@ impl AppShell {
                 if self.session_sync.session_token.is_none() {
                     return;
                 }
-                let fence = current_session_fence(self);
-                let client = self.client.clone();
+                let Some(fence) = self.capture_client_fence() else {
+                    return;
+                };
                 let data_for_task = trimmed.clone();
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let res = client
-                        .send_chat_callback(cid as i64, msg_id as i64, &data_for_task)
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let res = fence
+                        .client
+                        .send_chat_callback_with_token(
+                            &fence.token,
+                            fence.client_epoch,
+                            cid as i64,
+                            msg_id as i64,
+                            &data_for_task,
+                        )
                         .await;
                     let _ = weak.update(app, |shell, cx| {
-                        if !fence_matches_shell(&fence, shell) {
+                        if !fence.is_valid(shell) {
                             return;
                         }
                         match res {
@@ -1141,7 +1360,7 @@ impl AppShell {
                                         .as_ref()
                                         .map(|b| b.display_name.clone());
                                     shell.open_or_select_chat(next_cid as u64, title, true, cx);
-                                } else {
+                                } else if shell.stage.read(cx).active_chat_id == Some(cid) {
                                     shell.load_historical_messages(cid, cx);
                                 }
                                 if result.app.is_some()
@@ -1199,10 +1418,9 @@ impl AppShell {
         if bot_id == 0 {
             return;
         }
-        if !self.is_authenticated || self.session_sync.session_token.is_none() {
+        let Some(fence) = self.capture_client_fence() else {
             return;
-        }
-        let fence = current_session_fence(self);
+        };
         let currently_blocked = self
             .miniapps
             .bot_profile_box
@@ -1250,40 +1468,99 @@ impl AppShell {
             self.stage.read(cx).active_chat_id,
             self.sidebar.read(cx).active_chat_id,
         );
-        if let Some(cid) = active_chat {
-            if self.session_sync.rich_chats_by_id.get(&cid).is_some_and(|rc| rc.peer_user_id == Some(bot_id)) {
-                self.stage.update(cx, |st, st_cx| {
-                    st.is_peer_blocked = next_blocked;
-                    st_cx.notify();
-                });
+        let captured_panel = self.active_panel;
+        let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;
+        let origin_chat = active_chat.filter(|&cid| {
+            let is_group_or_channel = self
+                .session_sync
+                .rich_chats_by_id
+                .get(&cid)
+                .is_some_and(|rc| {
+                    rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3)
+                })
+                || self.sidebar.read(cx).group_chat_ids.contains(&cid)
+                || self.sidebar.read(cx).channel_chat_ids.contains(&cid);
+            if is_group_or_channel {
+                return false;
             }
+            self.session_sync
+                .rich_chats_by_id
+                .get(&cid)
+                .is_some_and(|rc| rc.peer_user_id == Some(bot_id))
+                || self.session_sync.chat_peer_user_ids.get(&cid).copied() == Some(bot_id)
+                || self.miniapps.fabushi_bots.iter().any(|fb| {
+                    fb.bot_user_id > 0
+                        && fb.bot_user_id as u64 == bot_id
+                        && fb.companion_chat_id == Some(cid as i64)
+                })
+                || self.active_chat_bot_id(cx) == Some(bot_id)
+                || self.miniapps.bot_profile_box.as_ref().is_some_and(|b| {
+                    let br = b.read(cx);
+                    br.profile.bot.bot_user_id == bot_id as i64
+                        && br.profile.existing_chat_id == Some(cid as i64)
+                })
+                || self.miniapps.bot_profiles_cache.values().any(|p| {
+                    p.bot.bot_user_id == bot_id as i64 && p.existing_chat_id == Some(cid as i64)
+                })
+        });
+        if let Some(cid) = origin_chat {
+            self.stage.update(cx, |st, st_cx| {
+                st.is_peer_blocked = next_blocked;
+                st_cx.notify();
+            });
         }
 
-        let client = self.client.clone();
         let lang_c = self.active_lang_id().to_string();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client.set_bot_blocked(bot_id, next_blocked).await;
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let res = fence
+                .client
+                .set_bot_blocked_with_token(&fence.token, fence.client_epoch, bot_id, next_blocked)
+                .await;
             let _ = weak.update(app, |shell, cx| {
-                if !fence_matches_shell(&fence, shell) {
+                if !fence.is_valid(shell) {
                     return;
                 }
+                let show_scoped_bot_toast =
+                    |shell: &mut Self, msg: String, duration_ms: u64, cx: &mut Context<Self>| {
+                        if let Some(cid) = origin_chat {
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, msg, duration_ms, cx);
+                            }
+                        } else {
+                            let cur_active = resolve_active_target_chat_id(
+                                shell.stage.read(cx).active_chat_id,
+                                shell.sidebar.read(cx).active_chat_id,
+                            );
+                            let cur_plus = shell.sidebar.read(cx).is_plus_menu_open;
+                            if shell.active_panel == captured_panel
+                                && cur_active == active_chat
+                                && cur_plus == captured_plus_open
+                            {
+                                if let Some(cid) = active_chat {
+                                    shell.show_chat_toast(cid, msg, duration_ms, cx);
+                                } else {
+                                    shell.show_non_chat_toast(msg, duration_ms, cx);
+                                }
+                            }
+                        }
+                    };
                 match res {
                     Ok(_) => {
-                        shell.enqueue_localized_toast(
-                            if next_blocked { "已停用并屏蔽此机器人" } else { "已重新启用此机器人" },
-                            if next_blocked { "Bot stopped and blocked" } else { "Bot restarted and unblocked" },
-                            2200,
-                            cx,
-                        );
+                        let msg = if next_blocked {
+                            tr_str(&lang_c, "已停用并屏蔽此机器人", "Bot stopped and blocked")
+                        } else {
+                            tr_str(&lang_c, "已重新启用此机器人", "Bot restarted and unblocked")
+                        };
+                        show_scoped_bot_toast(shell, msg.to_string(), 2200, cx);
                         shell.refresh_chats(cx);
                         shell.sync_composer_and_inspector_miniapp_state(cx);
                     }
                     Err(e) => {
-                        shell.show_toast(
-                            format!("{}: {}", tr_str(&lang_c, "操作失败", "Failed"), e),
-                            2400,
-                            cx,
-                        );
+                        let msg = format!("{}: {}", tr_str(&lang_c, "操作失败", "Failed"), e);
+                        show_scoped_bot_toast(shell, msg, 2400, cx);
                     }
                 }
                 cx.notify();
@@ -1366,11 +1643,24 @@ impl AppShell {
                         if let Some(cached) = self.miniapps.bot_profiles_cache.get_mut(&key) {
                             cached.is_muted = next_muted;
                         }
-                        let c = self.client.clone();
-                        cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                            let _ = c.set_chat_muted(cid, next_muted, None).await;
-                        })
-                        .detach();
+                        if let Some(fence) = self.capture_client_fence() {
+                            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                                if !fence.preflight_ui(&weak, app).await {
+                                    return;
+                                }
+                                let _ = fence
+                                    .client
+                                    .set_chat_muted_with_token(
+                                        &fence.token,
+                                        fence.client_epoch,
+                                        cid,
+                                        next_muted,
+                                        None,
+                                    )
+                                    .await;
+                            })
+                            .detach();
+                        }
                         self.enqueue_localized_toast(
                             if next_muted { "已静音此机器人" } else { "已开启机器人通知" },
                             if next_muted { "Bot notifications muted" } else { "Bot notifications enabled" },
@@ -1408,7 +1698,7 @@ impl AppShell {
                         cx,
                     );
                     if prof.existing_chat_id.is_some_and(|id| id > 0) {
-                        self.append_outgoing_text(cmd.to_string(), cx);
+                        self.append_non_composer_outgoing_text(cmd.to_string(), cx);
                     }
                 }
                 BotProfileBoxAction::OpenPrivacyPolicy(url) => {
@@ -1416,6 +1706,7 @@ impl AppShell {
                 }
                 BotProfileBoxAction::OpenMiniAppTos => {
                     self.miniapps.miniapp_tos_modal_open = true;
+                    self.reconcile_chat_scoped_toasts(cx);
                 }
                 BotProfileBoxAction::Report => {
                     self.enqueue_localized_toast(
