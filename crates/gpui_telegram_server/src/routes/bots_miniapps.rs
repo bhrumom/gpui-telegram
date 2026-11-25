@@ -2762,6 +2762,30 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
     topic_id: Option<TopicId>,
     floor_fence: Option<crate::routes::hermes::BotTurnFloorFence>,
 ) {
+    handle_ai_bot_reply_with_options(
+        state,
+        chat_id,
+        sender_id,
+        bot_user_id,
+        text,
+        topic_id,
+        floor_fence,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_ai_bot_reply_with_options(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    sender_id: UserId,
+    bot_user_id: UserId,
+    text: &str,
+    topic_id: Option<TopicId>,
+    floor_fence: Option<crate::routes::hermes::BotTurnFloorFence>,
+    is_explicitly_addressed: bool,
+) {
     let _ = state.self_weak.set(Arc::downgrade(state));
     if floor_fence.as_ref().is_some_and(|f| !f.is_active()) {
         return;
@@ -2827,11 +2851,24 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
         .list_cloud_storage(sender_id.0 as i64, bot_user_id.0 as i64)
         .unwrap_or_default();
 
-    let trimmed = text.trim();
-    let lower = trimmed.to_ascii_lowercase();
+    let effective_trimmed = reg_bot
+        .as_ref()
+        .map(|b| strip_leading_bot_mention(text, b))
+        .unwrap_or_else(|| text.trim());
+    let lower = effective_trimmed.to_ascii_lowercase();
+    let matches_bot_slash = |cmd: &str, bot: &BotRegistryRecord| -> bool {
+        let base = format!("/{cmd}");
+        if lower == base {
+            return true;
+        }
+        let un = bot.username.trim().trim_start_matches('@').to_ascii_lowercase();
+        let aid = bot.agent_id.trim().to_ascii_lowercase();
+        (!un.is_empty() && lower == format!("{base}@{un}"))
+            || (!aid.is_empty() && lower == format!("{base}@{aid}"))
+    };
 
     if let Some(ref b) = reg_bot {
-        if lower == "/start" {
+        if matches_bot_slash("start", b) {
             let typing_guard = crate::routes::hermes::BotTypingGuard::start(
                 Arc::clone(state),
                 chat_id,
@@ -2851,7 +2888,14 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
             welcome.push_str("\n\n");
             welcome.push_str(&live_runtime);
             if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
-                let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome, kb);
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_user_id,
+                    &welcome,
+                    kb,
+                    topic_id,
+                );
             }
             typing_guard.finish();
             return;
@@ -2891,7 +2935,7 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
     }
 
     let help_bot_commands_suffix = reg_bot.as_ref().and_then(|b| {
-        if lower == "/help" {
+        if matches_bot_slash("help", b) {
             let cmds: Vec<BotCommandSpec> =
                 serde_json::from_str(&b.commands_json).unwrap_or_default();
             let mut lines = vec![format!(
@@ -2931,6 +2975,7 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
             companion_apps: apps,
             help_bot_commands_suffix,
             floor_fence,
+            is_explicitly_addressed,
         },
     )
     .await;
@@ -3119,10 +3164,25 @@ fn strip_leading_bot_mention<'a>(raw: &'a str, reg_bot: &BotRegistryRecord) -> &
         return trimmed;
     }
     let after_at = &trimmed[1..];
+    let display = reg_bot.display_name.trim();
+    if !display.is_empty() && after_at.len() > display.len() {
+        if let Some(prefix) = after_at.get(..display.len()) {
+            if prefix.eq_ignore_ascii_case(display) {
+                let tail = &after_at[display.len()..];
+                if tail.starts_with(char::is_whitespace) {
+                    let rest = tail.trim();
+                    if !rest.is_empty() {
+                        return rest;
+                    }
+                }
+            }
+        }
+    }
     let split_idx = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
     let token = &after_at[..split_idx];
     if token.eq_ignore_ascii_case(&reg_bot.username)
         || (!reg_bot.agent_id.trim().is_empty() && token.eq_ignore_ascii_case(&reg_bot.agent_id))
+        || (!display.is_empty() && token.eq_ignore_ascii_case(display))
     {
         let rest = after_at[split_idx..].trim();
         if !rest.is_empty() {
@@ -5855,6 +5915,19 @@ pub async fn fabushi_bot_patch(
         },
         None,
     );
+    if req.preferred_model.is_some() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let sync_req = gpui_telegram_proto::UpdateBotComputerRequest {
+            preferred_model: Some(updated.preferred_model.clone()),
+            ..Default::default()
+        };
+        let _ = state.db.upsert_bot_computer_profile(
+            auth.user_id.0,
+            updated.bot_user_id.max(0) as u64,
+            &sync_req,
+            now_ms,
+        );
+    }
 
     let summary =
         build_fabushi_bot_summary(&state, auth.user_id.0 as i64, &updated, inst.as_deref());

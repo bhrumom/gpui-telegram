@@ -923,8 +923,18 @@ impl SettingsRouter {
                 let ev = sc.update(cx, |s, _| s.take_event());
                 router.sync_active_input_key(cx);
                 if let Some(ev) = ev {
-                    cx.emit(SettingsRouterEvent::Computers(ev));
-                    cx.notify();
+                    match ev {
+                        crate::views::settings::sections::SettingsComputersEvent::CloseRequested => {
+                            router.close(cx);
+                        }
+                        crate::views::settings::sections::SettingsComputersEvent::BackToSettings => {
+                            router.navigate_back(cx);
+                        }
+                        other => {
+                            cx.emit(SettingsRouterEvent::Computers(other));
+                            cx.notify();
+                        }
+                    }
                 }
             },
         )

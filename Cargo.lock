@@ -968,11 +968,13 @@ dependencies = [
 
 [[package]]
 name = "bot-browser"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
+ "aes",
  "argon2",
  "async-trait",
  "base64 0.22.1",
+ "cbc",
  "chacha20poly1305",
  "chrono",
  "data-encoding",
@@ -985,6 +987,7 @@ dependencies = [
  "image",
  "keyring",
  "parking_lot",
+ "pbkdf2",
  "reqwest",
  "rusqlite",
  "serde",
@@ -2115,7 +2118,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_magpie_gateway"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2139,11 +2142,12 @@ dependencies = [
 
 [[package]]
 name = "e2e_suite"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bot-browser",
  "chacha20poly1305",
  "chrono",
  "ed25519-dalek",
@@ -2487,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_daemon"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2504,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_engine"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3346,7 +3350,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_agent"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3382,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_cli"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -3406,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_client"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "aes",
  "argon2",
@@ -3449,7 +3453,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_coding"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3467,8 +3471,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_telegram_community"
+version = "1.6.15"
+dependencies = [
+ "chrono",
+ "gpui_telegram_core",
+ "gpui_telegram_proto",
+ "parking_lot",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tantivy",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "gpui_telegram_core"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "aes",
  "cbc",
@@ -3490,7 +3514,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_desktop"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "base64 0.22.1",
  "bot-browser",
@@ -3528,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_media"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "chrono",
  "fabushi-messaging-core",
@@ -3544,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_proto"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3560,12 +3584,13 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_server"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "argon2",
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bot-browser",
  "chacha20poly1305",
  "chrono",
  "crossbeam-queue",
@@ -3609,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_test_harness"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -3639,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_webrtc"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4711,7 +4736,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "magpie_gateway"
-version = "1.6.9"
+version = "1.6.15"
 dependencies = [
  "axum",
  "base64 0.22.1",

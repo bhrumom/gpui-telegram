@@ -3,6 +3,11 @@ pub mod bot_attach_web_view;
 pub use bot_attach_web_view::BotAttachWebView;
 #[cfg(target_os = "macos")]
 pub mod macos_wkwebview;
+#[cfg(target_os = "macos")]
+pub use macos_wkwebview::{
+    restore_gpui_first_responder, EmbeddedWkWebView, MacOsWkWebView, RecordedDomEvent,
+    WkWebViewBackend, WkWebViewConfig, WkWebViewEvent,
+};
 pub mod webview_chrome_render;
 pub mod webview_inspector_render;
 pub mod webview_widget_renderer;

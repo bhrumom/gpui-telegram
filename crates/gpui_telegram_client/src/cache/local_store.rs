@@ -1,9 +1,13 @@
 use crate::cache::sqlite_cache::{
-    sort_public_catalog_items, sort_user_creation_states, sort_user_creations, CachedMediaEntry,
-    SqliteClientCache, META_CREATIONS_LAST_REVISION,
+    sort_public_catalog_items, sort_user_creation_states, sort_user_creations,
+    CachedChatHistorySnapshot, CachedMediaEntry, SqliteClientCache, META_CREATIONS_LAST_REVISION,
 };
+use crate::net::hermes_client::{HermesRichChatDto, HermesRichMessageDto};
+use crate::net::http_client::{ChatSummary, HistoricalMessage};
 use gpui_telegram_core::error::Result;
 use gpui_telegram_core::types::{ChatId, MessageId, UserId};
+use gpui_telegram_proto::automation_apps::{AutomationAppDetail, InstalledAutomationApp};
+use gpui_telegram_proto::contracts::auth::ContactDto;
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
 use gpui_telegram_proto::creations::{
     CreationKind, CreationReviewStatus, PublicCatalogItemDto, UserCreationDto,
@@ -15,6 +19,10 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+const MAX_CACHED_HISTORY_MESSAGES_PER_CHAT: usize = 100;
+const META_KEY_LAST_ACTIVE_CHAT_ID: &str = "last_active_chat_id";
+const META_KEY_USER_DISPLAY_NAME: &str = "cached_user_display_name";
 
 #[derive(Debug, Default)]
 struct LocalCacheState {
@@ -35,12 +43,31 @@ struct LocalCacheState {
     user_creation_states: HashMap<String, UserCreationStateDto>,
     public_catalog: HashMap<String, (PublicCatalogItemDto, i64)>,
     cache_meta: HashMap<String, String>,
+    installed_automation_apps: HashMap<String, InstalledAutomationApp>,
+    cached_automation_apps: HashMap<String, AutomationAppDetail>,
+    cached_dialog_summaries: Vec<ChatSummary>,
+    cached_rich_chats: HashMap<u64, HermesRichChatDto>,
+    cached_chat_histories: HashMap<u64, CachedChatHistorySnapshot>,
+    cached_contacts: Vec<ContactDto>,
+    last_active_chat_id: Option<u64>,
+    cached_user_display_name: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct ClearHookList(Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>);
+
+impl std::fmt::Debug for ClearHookList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.0.lock().len();
+        f.debug_tuple("ClearHookList").field(&len).finish()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct LocalStore {
     state: Arc<RwLock<LocalCacheState>>,
     sqlite: Option<Arc<SqliteClientCache>>,
+    clear_hooks: ClearHookList,
 }
 
 impl LocalStore {
@@ -76,6 +103,20 @@ impl LocalStore {
         if let Ok(Some(raw_rev)) = db.get_meta(META_CREATIONS_LAST_REVISION) {
             cache_meta.insert(META_CREATIONS_LAST_REVISION.to_string(), raw_rev);
         }
+        let installed_automation_apps = db.load_installed_automation_apps()?;
+        let cached_automation_apps = db.load_cached_automation_apps()?;
+        let cached_dialog_summaries = db.load_cached_dialog_summaries().unwrap_or_default();
+        let cached_rich_chats = db.load_cached_rich_chats().unwrap_or_default();
+        let cached_chat_histories = db.load_cached_chat_histories().unwrap_or_default();
+        let cached_contacts = db.load_cached_contacts().unwrap_or_default();
+        let last_active_chat_id = db
+            .load_meta_value(META_KEY_LAST_ACTIVE_CHAT_ID)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&id| id > 0);
+        let cached_user_display_name = db
+            .load_meta_value(META_KEY_USER_DISPLAY_NAME)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let state = LocalCacheState {
             owner_scope,
             messages,
@@ -94,11 +135,24 @@ impl LocalStore {
             user_creation_states,
             public_catalog,
             cache_meta,
+            installed_automation_apps,
+            cached_automation_apps,
+            cached_dialog_summaries,
+            cached_rich_chats,
+            cached_chat_histories,
+            cached_contacts,
+            last_active_chat_id,
+            cached_user_display_name,
         };
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             sqlite: Some(db),
+            clear_hooks: ClearHookList::default(),
         })
+    }
+
+    pub(crate) fn register_clear_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.clear_hooks.0.lock().push(hook);
     }
 
     pub(crate) fn sqlite_cache(&self) -> Option<Arc<SqliteClientCache>> {
@@ -179,9 +233,22 @@ impl LocalStore {
             guard.user_creation_states.clear();
             guard.public_catalog.clear();
             guard.cache_meta.clear();
+            guard.installed_automation_apps.clear();
+            guard.cached_automation_apps.clear();
+            guard.mem_media_bytes.clear();
+            guard.cached_dialog_summaries.clear();
+            guard.cached_rich_chats.clear();
+            guard.cached_chat_histories.clear();
+            guard.cached_contacts.clear();
+            guard.last_active_chat_id = None;
+            guard.cached_user_display_name = None;
         }
         if let Some(db) = &self.sqlite {
             db.clear_all();
+        }
+        let hooks = self.clear_hooks.0.lock().clone();
+        for hook in hooks {
+            hook();
         }
     }
 
@@ -317,10 +384,14 @@ impl LocalStore {
     }
 
     pub fn clear_chat_messages(&self, chat_id: ChatId) {
+        let cid_u64 = u64::try_from(chat_id.0).ok().filter(|&id| id > 0);
         let ids: Vec<MessageId> = {
             let mut guard = self.state.write();
             guard.pinned_ids.remove(&chat_id);
             guard.message_reactions.retain(|&(cid, _), _| cid != chat_id);
+            if let Some(cid) = cid_u64 {
+                guard.cached_chat_histories.remove(&cid);
+            }
             guard
                 .messages
                 .remove(&chat_id)
@@ -334,14 +405,39 @@ impl LocalStore {
                 db.delete_message(chat_id, id);
             }
             db.clear_chat_reactions(chat_id);
+            if let Some(cid) = cid_u64 {
+                db.delete_cached_chat_history(cid);
+            }
         }
     }
 
     pub fn remove_chat(&self, chat_id: ChatId) {
         self.clear_chat_messages(chat_id);
-        let mut guard = self.state.write();
-        guard.chats.remove(&chat_id);
-        guard.drafts.remove(&chat_id);
+        let cid_u64 = u64::try_from(chat_id.0).ok().filter(|&id| id > 0);
+        let clear_last_active = {
+            let mut guard = self.state.write();
+            guard.chats.remove(&chat_id);
+            guard.drafts.remove(&chat_id);
+            if let Some(cid) = cid_u64 {
+                guard.cached_dialog_summaries.retain(|c| c.chat_id != cid);
+                guard.cached_rich_chats.remove(&cid);
+                if guard.last_active_chat_id == Some(cid) {
+                    guard.last_active_chat_id = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if let (Some(db), Some(cid)) = (&self.sqlite, cid_u64) {
+            db.delete_cached_dialog_summary(cid);
+            db.delete_cached_rich_chat(cid);
+            if clear_last_active {
+                db.save_meta_value(META_KEY_LAST_ACTIVE_CHAT_ID, None);
+            }
+        }
     }
 
     pub fn get_reactions(&self, chat_id: ChatId, message_id: MessageId) -> Option<Vec<ReactionCount>> {
@@ -763,6 +859,373 @@ impl LocalStore {
             }
         }
         self.state.read().mem_media_bytes.get(file_id).cloned()
+    }
+
+    pub fn replace_installed_automation_apps(&self, apps: Vec<InstalledAutomationApp>) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut guard = self.state.write();
+            guard.installed_automation_apps.clear();
+            for app in &apps {
+                guard
+                    .installed_automation_apps
+                    .insert(app.app_id.clone(), app.clone());
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_installed_automation_apps(&apps, now_ms);
+        }
+    }
+
+    pub fn upsert_installed_automation_app(&self, entry: InstalledAutomationApp) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.state
+            .write()
+            .installed_automation_apps
+            .insert(entry.app_id.clone(), entry.clone());
+        if let Some(db) = &self.sqlite {
+            db.upsert_installed_automation_app(&entry, now_ms);
+        }
+    }
+
+    pub fn remove_installed_automation_app(&self, app_id: &str) {
+        self.state.write().installed_automation_apps.remove(app_id);
+        if let Some(db) = &self.sqlite {
+            db.delete_installed_automation_app(app_id);
+        }
+    }
+
+    pub fn list_installed_automation_apps(&self) -> Vec<InstalledAutomationApp> {
+        let mut items: Vec<InstalledAutomationApp> = self
+            .state
+            .read()
+            .installed_automation_apps
+            .values()
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            b.installed_at_ms
+                .cmp(&a.installed_at_ms)
+                .then_with(|| a.app_id.cmp(&b.app_id))
+        });
+        items
+    }
+
+    pub fn get_installed_automation_app(&self, app_id: &str) -> Option<InstalledAutomationApp> {
+        self.state
+            .read()
+            .installed_automation_apps
+            .get(app_id)
+            .cloned()
+    }
+
+    pub fn mark_automation_app_run(&self, app_id: &str, run_at_ms: i64) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let updated = {
+            let mut guard = self.state.write();
+            if let Some(entry) = guard.installed_automation_apps.get_mut(app_id) {
+                entry.last_run_at_ms = Some(run_at_ms);
+                entry.local_run_count = entry.local_run_count.saturating_add(1);
+                Some(entry.clone())
+            } else {
+                None
+            }
+        };
+        if let (Some(db), Some(entry)) = (&self.sqlite, updated) {
+            db.upsert_installed_automation_app(&entry, now_ms);
+        }
+    }
+
+    pub fn upsert_cached_automation_app(&self, detail: AutomationAppDetail) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let updated_installed = {
+            let mut guard = self.state.write();
+            guard
+                .cached_automation_apps
+                .insert(detail.app_id.clone(), detail.clone());
+            if let Some(installed) = guard.installed_automation_apps.get_mut(&detail.app_id) {
+                installed.latest_version = detail.latest_version.clone();
+                Some(installed.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_automation_app(&detail, now_ms);
+            if let Some(entry) = updated_installed {
+                db.upsert_installed_automation_app(&entry, now_ms);
+            }
+        }
+    }
+
+    pub fn get_cached_automation_app(&self, app_id: &str) -> Option<AutomationAppDetail> {
+        self.state
+            .read()
+            .cached_automation_apps
+            .get(app_id)
+            .cloned()
+    }
+
+    pub fn list_cached_automation_apps(&self) -> Vec<AutomationAppDetail> {
+        let mut items: Vec<AutomationAppDetail> = self
+            .state
+            .read()
+            .cached_automation_apps
+            .values()
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.app_id.cmp(&b.app_id))
+        });
+        items
+    }
+
+    pub fn replace_cached_dialog_summaries(&self, chats: &[ChatSummary]) {
+        {
+            let mut guard = self.state.write();
+            guard.cached_dialog_summaries = chats.to_vec();
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_cached_dialog_summaries(chats);
+        }
+    }
+
+    pub fn get_cached_dialog_summaries(&self) -> Vec<ChatSummary> {
+        self.state.read().cached_dialog_summaries.clone()
+    }
+
+    pub fn update_cached_dialog_preview(
+        &self,
+        chat_id: u64,
+        last_message: String,
+        updated_at_ms: i64,
+        unread_delta: Option<i32>,
+    ) {
+        let updated_list = {
+            let mut guard = self.state.write();
+            if let Some(pos) = guard
+                .cached_dialog_summaries
+                .iter()
+                .position(|c| c.chat_id == chat_id)
+            {
+                let mut item = guard.cached_dialog_summaries.remove(pos);
+                item.last_message = Some(last_message);
+                item.updated_at = Some(updated_at_ms);
+                if let Some(delta) = unread_delta {
+                    if delta > 0 {
+                        item.unread_count = item.unread_count.saturating_add(delta as u32);
+                    } else if delta == 0 {
+                        item.unread_count = 0;
+                    }
+                }
+                guard.cached_dialog_summaries.insert(0, item);
+                Some(guard.cached_dialog_summaries.clone())
+            } else {
+                None
+            }
+        };
+        if let (Some(db), Some(list)) = (&self.sqlite, updated_list) {
+            db.replace_cached_dialog_summaries(&list);
+        }
+    }
+
+    pub fn replace_cached_rich_chats(&self, chats: &[HermesRichChatDto]) {
+        {
+            let mut guard = self.state.write();
+            guard.cached_rich_chats.clear();
+            for rc in chats {
+                if rc.chat_id > 0 {
+                    guard.cached_rich_chats.insert(rc.chat_id as u64, rc.clone());
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_cached_rich_chats(chats);
+        }
+    }
+
+    pub fn upsert_cached_rich_chat(&self, rc: HermesRichChatDto) {
+        if rc.chat_id <= 0 {
+            return;
+        }
+        self.state
+            .write()
+            .cached_rich_chats
+            .insert(rc.chat_id as u64, rc.clone());
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_rich_chat(&rc);
+        }
+    }
+
+    pub fn get_cached_rich_chats(&self) -> HashMap<u64, HermesRichChatDto> {
+        self.state.read().cached_rich_chats.clone()
+    }
+
+    pub fn replace_cached_chat_history(
+        &self,
+        chat_id: u64,
+        messages: &[HistoricalMessage],
+        rich_messages: &[HermesRichMessageDto],
+    ) {
+        if chat_id == 0 {
+            return;
+        }
+        let capped_msgs: Vec<HistoricalMessage> = if messages.len() > MAX_CACHED_HISTORY_MESSAGES_PER_CHAT {
+            messages[messages.len() - MAX_CACHED_HISTORY_MESSAGES_PER_CHAT..].to_vec()
+        } else {
+            messages.to_vec()
+        };
+        let keep_ids: std::collections::HashSet<i64> = capped_msgs
+            .iter()
+            .map(|m| m.message_id as i64)
+            .collect();
+        let capped_rich: Vec<HermesRichMessageDto> = rich_messages
+            .iter()
+            .filter(|r| keep_ids.contains(&r.message_id))
+            .cloned()
+            .collect();
+        let snap = CachedChatHistorySnapshot {
+            messages: capped_msgs,
+            rich_messages: capped_rich,
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        self.state
+            .write()
+            .cached_chat_histories
+            .insert(chat_id, snap.clone());
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_chat_history(chat_id, &snap);
+        }
+    }
+
+    pub fn upsert_cached_historical_message(&self, chat_id: u64, msg: HistoricalMessage) {
+        if chat_id == 0 || msg.message_id == 0 {
+            return;
+        }
+        let updated_snap = {
+            let mut guard = self.state.write();
+            let entry = guard.cached_chat_histories.entry(chat_id).or_default();
+            if let Some(existing) = entry
+                .messages
+                .iter_mut()
+                .find(|m| m.message_id == msg.message_id)
+            {
+                *existing = msg;
+            } else {
+                entry.messages.push(msg);
+                if entry.messages.len() > MAX_CACHED_HISTORY_MESSAGES_PER_CHAT {
+                    let drop_n = entry.messages.len() - MAX_CACHED_HISTORY_MESSAGES_PER_CHAT;
+                    entry.messages.drain(0..drop_n);
+                }
+            }
+            entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+            entry.clone()
+        };
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_chat_history(chat_id, &updated_snap);
+        }
+    }
+
+    pub fn update_cached_historical_message_text(
+        &self,
+        chat_id: u64,
+        message_id: u64,
+        new_text: String,
+    ) {
+        if chat_id == 0 || message_id == 0 {
+            return;
+        }
+        let updated_snap = {
+            let mut guard = self.state.write();
+            guard.cached_chat_histories.get_mut(&chat_id).and_then(|snap| {
+                let target = snap
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.message_id == message_id)?;
+                target.text = new_text;
+                snap.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                Some(snap.clone())
+            })
+        };
+        if let (Some(db), Some(snap)) = (&self.sqlite, updated_snap) {
+            db.upsert_cached_chat_history(chat_id, &snap);
+        }
+    }
+
+    pub fn delete_cached_historical_messages(&self, chat_id: u64, message_ids: &[u64]) {
+        if chat_id == 0 || message_ids.is_empty() {
+            return;
+        }
+        let updated_snap = {
+            let mut guard = self.state.write();
+            guard.cached_chat_histories.get_mut(&chat_id).and_then(|snap| {
+                let before = snap.messages.len();
+                snap.messages.retain(|m| !message_ids.contains(&m.message_id));
+                snap.rich_messages.retain(|r| {
+                    u64::try_from(r.message_id).map_or(true, |id| !message_ids.contains(&id))
+                });
+                if snap.messages.len() != before {
+                    snap.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                    Some(snap.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let (Some(db), Some(snap)) = (&self.sqlite, updated_snap) {
+            db.upsert_cached_chat_history(chat_id, &snap);
+        }
+    }
+
+    pub fn get_cached_chat_history(&self, chat_id: u64) -> Option<CachedChatHistorySnapshot> {
+        self.state.read().cached_chat_histories.get(&chat_id).cloned()
+    }
+
+    pub fn list_cached_chat_histories(&self) -> HashMap<u64, CachedChatHistorySnapshot> {
+        self.state.read().cached_chat_histories.clone()
+    }
+
+    pub fn replace_cached_contacts(&self, contacts: &[ContactDto]) {
+        {
+            let mut guard = self.state.write();
+            guard.cached_contacts = contacts.to_vec();
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_cached_contacts(contacts);
+        }
+    }
+
+    pub fn get_cached_contacts(&self) -> Vec<ContactDto> {
+        self.state.read().cached_contacts.clone()
+    }
+
+    pub fn set_last_active_chat_id(&self, chat_id: Option<u64>) {
+        let normalized = chat_id.filter(|&id| id > 0);
+        self.state.write().last_active_chat_id = normalized;
+        if let Some(db) = &self.sqlite {
+            let val = normalized.map(|id| id.to_string());
+            db.save_meta_value(META_KEY_LAST_ACTIVE_CHAT_ID, val.as_deref());
+        }
+    }
+
+    pub fn get_last_active_chat_id(&self) -> Option<u64> {
+        self.state.read().last_active_chat_id
+    }
+
+    pub fn set_cached_user_display_name(&self, name: Option<String>) {
+        let normalized = name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.state.write().cached_user_display_name = normalized.clone();
+        if let Some(db) = &self.sqlite {
+            db.save_meta_value(META_KEY_USER_DISPLAY_NAME, normalized.as_deref());
+        }
+    }
+
+    pub fn get_cached_user_display_name(&self) -> Option<String> {
+        self.state.read().cached_user_display_name.clone()
     }
 }
 

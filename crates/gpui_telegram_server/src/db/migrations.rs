@@ -59,8 +59,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             crate::db::remote_assist_store::MIGRATION_V40_REMOTE_ASSIST,
         ),
         (
-            41,
-            crate::db::creations_store::MIGRATION_V41_CREATIONS_AND_CATALOG,
+            (ALL_MIGRATIONS.len() + 3) as i64,
+            crate::db::automation_app_store::MIGRATION_V41_AUTOMATION_APPS,
+        ),
+        (
+            42,
+            crate::db::creations_store::MIGRATION_V42_CREATIONS_AND_CATALOG,
         ),
     ];
 

@@ -139,6 +139,25 @@ impl WindowController {
         let _ = self.enqueue_toast_with_chat(None, text, duration_ms);
     }
 
+    pub fn show_non_chat_toast(&mut self, text: impl Into<String>, duration_ms: u64) {
+        let id = self.next_toast_id;
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let toast = ToastNotification {
+            id,
+            text: text.into(),
+            duration_ms: if duration_ms == 0 { 3000 } else { duration_ms },
+            created_at: now_ms,
+            chat_id: None,
+            allow_chat_auto_scope: false,
+        };
+        self.next_toast_id += 1;
+        if self.current_toast.is_none() {
+            self.current_toast = Some(toast);
+        } else {
+            self.toast_queue.push_back(toast);
+        }
+    }
+
     pub fn show_chat_toast(&mut self, chat_id: u64, text: impl Into<String>, duration_ms: u64) -> u64 {
         self.enqueue_toast_with_chat(Some(chat_id), text, duration_ms)
     }

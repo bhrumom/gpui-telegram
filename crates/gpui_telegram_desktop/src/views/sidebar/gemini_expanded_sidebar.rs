@@ -421,6 +421,7 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
             nav.active_destination,
             NavDestination::TalkMode
                 | NavDestination::RemoteComputer
+                | NavDestination::Browser
                 | NavDestination::SavedMessages
         );
 
@@ -624,6 +625,17 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
                 UnifiedSidebarAction::SelectDestination(NavDestination::RemoteComputer),
             ))
             .child(render_expanded_nav_row(
+                "sidebar-nav-browser",
+                IconName::ScreenShare,
+                tr_str(lang_id, "内置浏览器", "Browser"),
+                nav.active_destination == NavDestination::Browser,
+                0,
+                palette,
+                cx,
+                on_action.clone(),
+                UnifiedSidebarAction::SelectDestination(NavDestination::Browser),
+            ))
+            .child(render_expanded_nav_row(
                 "sidebar-nav-saved",
                 IconName::SavedMessages,
                 tr_str(lang_id, "收藏夹", "Saved Messages"),
@@ -731,6 +743,11 @@ pub fn render_expanded_gemini_footer<V: 'static>(
     } else {
         NavDestination::RemoteComputer
     };
+    let browser_target = if nav.active_destination == NavDestination::Browser {
+        NavDestination::Chats
+    } else {
+        NavDestination::Browser
+    };
     let settings_target = if nav.active_destination == NavDestination::Settings {
         NavDestination::Chats
     } else {
@@ -835,6 +852,13 @@ pub fn render_expanded_gemini_footer<V: 'static>(
                     nav.active_destination == NavDestination::RemoteComputer,
                     0,
                     UnifiedSidebarAction::SelectDestination(remote_target),
+                ))
+                .child(render_dock_icon_btn(
+                    "top-action-browser",
+                    IconName::ScreenShare,
+                    nav.active_destination == NavDestination::Browser,
+                    0,
+                    UnifiedSidebarAction::SelectDestination(browser_target),
                 ))
                 .child(render_dock_icon_btn(
                     "top-action-contacts",

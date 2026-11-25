@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use fabushi_remote_engine::control_lease::RemoteControlHub;
-use fabushi_remote_engine::ipc::{LocalIpcClient, LocalIpcServer};
+use fabushi_remote_engine::ipc::{LocalIpcClient, LocalIpcHandler as _, LocalIpcServer};
+use gpui_telegram_client::net::shared_remote_engine;
 use gpui_telegram_client::{ClientConfig, TelegramClient};
 use gpui_telegram_desktop::app::cli_installer::{
     inspect_cli_status_with, install_cli_to_target, locate_bundled_fabushi_cli_from_exe,
@@ -14,10 +15,6 @@ use gpui_telegram_desktop::views::app_shell::desktop_ipc_host::DesktopLocalIpcHa
 use gpui_telegram_desktop::views::computer_workbench::{
     ComputerWorkbench, MouseControlMode, WorkbenchCommand, WorkbenchHotkeyPreset,
 };
-use gpui_telegram_desktop::views::remote_controlled_window::{
-    ControlledBannerVariant, RemoteControlledWindow, RemoteControlledWindowAction,
-    format_elapsed_hms, group_controlled_sessions, resolve_banner_variant,
-};
 use gpui_telegram_desktop::views::remote_terminal_view::{
     RemoteTerminalAction, RemoteTerminalView, TerminalScreen, encode_terminal_key,
 };
@@ -28,8 +25,9 @@ use gpui_telegram_desktop::views::settings::sections::{
 };
 use gpui_telegram_proto::remote_control_contracts::{
     AssistCodeMode, ColorSubsampling, DisplayInfoDto, FileConflictPolicy, FileTransferDirection,
-    FileTransferStatus, FileTransferTaskDto, McpOAuthGrantSummaryDto, PowerActionKind,
-    RemoteAssistConfigDto, RemoteControlMode, RemoteControllerKind, RemoteSessionDto, StreamQuality,
+    FileTransferStatus, FileTransferTaskDto, LocalIpcRequest, McpOAuthGrantSummaryDto,
+    PowerActionKind, RemoteAssistConfigDto, RemoteControlMode, RemoteControllerKind,
+    RemoteSessionDto, StreamQuality,
 };
 use gpui_telegram_proto::tailnet_contracts::TailnetRelayMode;
 
@@ -66,23 +64,23 @@ fn sample_session(
 }
 
 #[test]
-fn test_remote_controlled_window_grouping_timer_banner_and_kill_switch() {
+fn test_remote_control_hub_sessions_and_kill_switch_without_controlled_window() {
     let hub = Arc::new(RemoteControlHub::new());
-    let s1 = hub.register_session(sample_session(
+    let _s1 = hub.register_session(sample_session(
         "s-own",
         RemoteControllerKind::OwnDevice,
         "MacBook Pro",
         1_000_000,
         None,
     ));
-    let s2 = hub.register_session(sample_session(
+    let _s2 = hub.register_session(sample_session(
         "s-assist",
         RemoteControllerKind::AssistGuest,
         "Support Helper",
         1_002_000,
         None,
     ));
-    let s3 = hub.register_session(sample_session(
+    let _s3 = hub.register_session(sample_session(
         "s-ai",
         RemoteControllerKind::AiMcp,
         "Antigravity Agent",
@@ -90,54 +88,17 @@ fn test_remote_controlled_window_grouping_timer_banner_and_kill_switch() {
         Some("screen.capture"),
     ));
 
-    assert_eq!(resolve_banner_variant(&[]), ControlledBannerVariant::Idle);
-    assert_eq!(
-        resolve_banner_variant(&[s1.clone()]),
-        ControlledBannerVariant::HumanBlue
-    );
-    assert_eq!(
-        resolve_banner_variant(&[s3.clone()]),
-        ControlledBannerVariant::AiTeal
-    );
-    assert_eq!(
-        resolve_banner_variant(&[s1.clone(), s3.clone()]),
-        ControlledBannerVariant::MixedIndigo
-    );
-
-    let groups = group_controlled_sessions(&[s3, s2, s1]);
-    assert_eq!(groups.len(), 3);
-    assert_eq!(groups[0].title_zh, "本账号设备");
-    assert_eq!(groups[1].title_zh, "远程协助设备");
-    assert_eq!(groups[2].title_zh, "AI Agent (MCP)");
-
-    let mut win = RemoteControlledWindow::new_offline(hub.clone(), "zh-CN");
-    win.now_ms_override = Some(1_006_000);
-    assert_eq!(win.earliest_elapsed_hms(), "00:00:06");
-    assert_eq!(format_elapsed_hms(3_661_000), "01:01:01");
-
-    win.toggle_collapse();
-    assert!(win.collapsed_to_pill);
-
+    assert_eq!(hub.active_count(), 3);
     let token = hub.preemption_token();
     assert!(!token.is_cancelled());
 
-    win.disconnect_session("s-assist");
+    assert!(hub.disconnect_session("s-assist"));
     assert_eq!(hub.active_count(), 2);
     assert!(token.is_cancelled());
 
-    let disconnected = win.disconnect_all();
+    let disconnected = hub.disconnect_all();
     assert_eq!(disconnected, 2);
     assert_eq!(hub.active_count(), 0);
-    assert!(win.sessions.is_empty());
-
-    let actions = win.take_actions();
-    assert!(actions.iter().any(|a| matches!(
-        a,
-        RemoteControlledWindowAction::DisconnectAll {
-            disconnected_local_count: 2,
-            ..
-        }
-    )));
 }
 
 #[test]
@@ -242,6 +203,10 @@ fn test_tray_mac_and_win_remote_menu_and_assist_formatting() {
         .actions
         .iter()
         .any(|a| a.id == tray_action_ids::DISCONNECT_ALL && a.is_enabled));
+    assert!(!mac_tray
+        .actions
+        .iter()
+        .any(|a| a.id == "controlled_status"));
     assert!(mac_tray
         .actions
         .iter()
@@ -262,6 +227,10 @@ fn test_tray_mac_and_win_remote_menu_and_assist_formatting() {
         .actions
         .iter()
         .any(|a| a.id == tray_action_ids::DISCONNECT_ALL && !a.is_enabled));
+    assert!(!win_tray
+        .actions
+        .iter()
+        .any(|a| a.id == "controlled_status"));
     assert!(win_tray
         .actions
         .iter()
@@ -737,4 +706,76 @@ fn test_desktop_local_ipc_cli_contract_and_fallback() {
 
         server.shutdown();
     });
+}
+
+// [T5-29] R8-5: Concurrent DesktopLocalIpcHandler::exec_computer_op calls use unique ephemeral
+// session IDs and finish_ephemeral_session without evicting cli-<device_id> or bumping override_epoch.
+#[test]
+fn t5_29_desktop_local_ipc_concurrent_exec_preserves_cli_session_and_override_epoch() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let cfg = ClientConfig::default();
+    let client = Arc::new(TelegramClient::new(cfg));
+    let device_id = client.device_id();
+    let cli_sid = format!("cli-{device_id}");
+    let handler = DesktopLocalIpcHandler::new(client);
+    handler.set_local_node_id(Some(format!("local:{device_id}")));
+
+    let hub = &shared_remote_engine().hub;
+    let mut existing = sample_session(
+        &cli_sid,
+        RemoteControllerKind::Cli,
+        "fabushi CLI",
+        1_000_000,
+        None,
+    );
+    existing.target_device_id = device_id.clone();
+    existing.controller_id = device_id.clone();
+    hub.register_session(existing);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let epoch_before = hub.override_epoch();
+        let req1 = LocalIpcRequest {
+            jsonrpc: "2.0".into(),
+            id: "r1".into(),
+            method: "file.ls".into(),
+            params: serde_json::json!({
+                "node_id": "local",
+                "path": temp.path().to_string_lossy().to_string(),
+            }),
+        };
+        let req2 = LocalIpcRequest {
+            jsonrpc: "2.0".into(),
+            id: "r2".into(),
+            method: "file.ls".into(),
+            params: serde_json::json!({
+                "node_id": "local",
+                "path": temp.path().to_string_lossy().to_string(),
+            }),
+        };
+        let (resp1, resp2) = tokio::join!(handler.handle(req1), handler.handle(req2));
+        assert!(resp1.success, "req1 failed: {:?}", resp1.error);
+        assert!(resp2.success, "req2 failed: {:?}", resp2.error);
+        assert_eq!(
+            hub.override_epoch(),
+            epoch_before,
+            "ephemeral IPC cleanup must not bump override_epoch"
+        );
+        assert!(
+            hub.get_session(&cli_sid).is_some(),
+            "existing cli-<device_id> session must remain registered"
+        );
+        let ephemeral_prefix = format!("{cli_sid}-ipc-");
+        assert!(
+            !hub.list_sessions()
+                .iter()
+                .any(|s| s.session_id.starts_with(&ephemeral_prefix)),
+            "ephemeral IPC sessions must be cleaned up on completion"
+        );
+    });
+
+    hub.finish_ephemeral_session(&cli_sid);
 }

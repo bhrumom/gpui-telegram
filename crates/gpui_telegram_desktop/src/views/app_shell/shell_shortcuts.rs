@@ -66,12 +66,15 @@ impl AppShell {
             r.trigger_counter
         });
         self.last_handled_nav_trigger = nav_trigger;
+        if dest != NavDestination::Browser {
+            self.hide_browser_native_webview(cx);
+        }
         match dest {
             NavDestination::Chats | NavDestination::Folders => {
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.sync_apple_sidebar_to_active_panel(cx);
                 self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.exit_compose_mode();
+                    sb.cancel_compose_mode();
                     sb.is_account_popover_open = false;
                     match dest {
                         NavDestination::Chats => sb.select_folder("All"),
@@ -115,7 +118,7 @@ impl AppShell {
                 let was_isolated = self.composer.read(cx).is_compose_isolated;
                 let prev_active = self.stage.read(cx).active_chat_id;
                 self.sidebar.update(cx, |sb, sb_cx| {
-                    sb.exit_compose_mode();
+                    sb.cancel_compose_mode();
                     sb.is_account_popover_open = false;
                     if let Some(saved_id) = target_saved {
                         sb.select_dialog(saved_id);
@@ -168,7 +171,10 @@ impl AppShell {
                 }
             }
             NavDestination::RemoteComputer => {
-                self.open_computer_workbench_live(cx);
+                self.open_remote_computers_hub(cx);
+            }
+            NavDestination::Browser => {
+                self.open_browser_workspace(cx);
             }
             NavDestination::TaskCenter => {
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
@@ -198,12 +204,13 @@ impl AppShell {
             NavDestination::Calls
                 | NavDestination::TalkMode
                 | NavDestination::RemoteComputer
+                | NavDestination::Browser
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
         ) {
             self.sidebar.update(cx, |sb, sb_cx| {
-                sb.exit_compose_mode();
+                sb.cancel_compose_mode();
                 sb.is_account_popover_open = false;
                 sb_cx.notify();
             });
@@ -221,6 +228,7 @@ impl AppShell {
             });
             self.sync_apple_sidebar_to_active_panel(cx);
         }
+        self.reconcile_chat_scoped_toasts(cx);
         cx.notify();
     }
 
@@ -327,6 +335,32 @@ impl AppShell {
                     cx.notify();
                     true
                 }
+                ActiveWorkspacePanel::Browser => {
+                    self.ime.clear_preedit();
+                    self.bot_browser.ime_preedit_input_gen = None;
+                    if let Some(ref bw) = self.browser_workspace {
+                        bw.update(cx, |w, wcx| {
+                            w.set_active_input(
+                                crate::views::browser::ActiveBrowserInput::None,
+                                None,
+                                wcx,
+                            );
+                        });
+                    }
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.focus_search();
+                        sb_cx.notify();
+                    });
+                    if self.composer.read(cx).is_compose_isolated
+                        && !self.is_compose_or_creation_modal_active(cx)
+                    {
+                        self.exit_compose_or_modal_isolation(true, cx);
+                    } else {
+                        self.sync_compose_state_to_composer(true, cx);
+                    }
+                    cx.notify();
+                    true
+                }
                 ActiveWorkspacePanel::Chats => {
                     self.clear_ime_and_blur_content_hub_for_transition(true, cx);
                     self.sidebar.update(cx, |sb, sb_cx| {
@@ -361,6 +395,14 @@ impl AppShell {
                 }
                 true
             }
+            "b" if is_shift => {
+                if self.active_panel == ActiveWorkspacePanel::Browser {
+                    self.activate_nav_destination(NavDestination::Chats, cx);
+                } else {
+                    self.open_browser_workspace(cx);
+                }
+                true
+            }
             "b" | "\\" => {
                 if self.active_panel == ActiveWorkspacePanel::Chats {
                     self.sidebar.update(cx, |sb, sb_cx| {
@@ -372,20 +414,8 @@ impl AppShell {
             }
             "e" => {
                 self.clear_ime_and_blur_content_hub_for_transition(true, cx);
-                let popover_opened = self.sidebar.update(cx, |s, s_cx| {
-                    s.is_account_popover_open = !s.is_account_popover_open;
-                    s.exit_compose_mode();
-                    s_cx.notify();
-                    s.is_account_popover_open
-                });
-                if self.composer.read(cx).is_compose_isolated
-                    && !self.is_compose_or_creation_modal_active(cx)
-                {
-                    self.exit_compose_or_modal_isolation(true, cx);
-                } else {
-                    self.sync_compose_state_to_composer(true, cx);
-                }
-                if popover_opened {
+                self.toggle_account_popover(cx);
+                if self.sidebar.read(cx).is_account_popover_open {
                     self.blur_composer_and_cancel_ime(cx);
                 }
                 cx.notify();
@@ -404,6 +434,7 @@ impl AppShell {
             }
             "n" => {
                 self.cleanup_settings_panel_if_active(cx);
+                self.leave_browser_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
                 let nav_trigger = self.nav_rail.update(cx, |r, r_cx| {
@@ -414,6 +445,7 @@ impl AppShell {
                 self.last_handled_nav_trigger = nav_trigger;
                 self.sync_apple_sidebar_to_active_panel(cx);
                 self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                self.bot_browser.ime_preedit_input_gen = None;
                 if self.theme_state.palette.is_apple_style() {
                     self.enter_compose_or_modal_isolation(cx);
                     self.sidebar.update(cx, |sb, sb_cx| {
@@ -421,7 +453,7 @@ impl AppShell {
                             sb.open_compose_group_mode();
                         } else if !sb.is_plus_menu_open {
                             sb.toggle_plus_menu();
-                        } else {
+                        } else if sb.compose_draft.pending_creation.is_none() {
                             sb.compose_recipient_query.clear();
                             sb.compose_draft.menu_open = true;
                             sb.compose_draft.highlighted_index = 0;
@@ -513,7 +545,7 @@ impl AppShell {
     pub fn handle_window_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.try_route_interactive_pty_key(event, cx) {
@@ -527,6 +559,11 @@ impl AppShell {
             if self.handle_shortcut_key(key, event.keystroke.modifiers.shift, cx) {
                 cx.stop_propagation();
             }
+            return;
+        }
+
+        if self.is_browser_cdp_viewport_focused(window, cx) {
+            cx.stop_propagation();
             return;
         }
 

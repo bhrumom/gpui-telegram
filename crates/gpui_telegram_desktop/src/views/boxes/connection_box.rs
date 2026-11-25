@@ -42,23 +42,49 @@ pub struct ProxyConfig {
     pub is_enabled: bool,
 }
 
+fn percent_encode_query_component(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len() * 3);
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
 /// Encodes proxy configuration into standard Telegram `tg://` deep-link per `connection_box.cpp:L118-L154`.
 pub fn proxy_to_tg_link(proxy: &ProxyConfig) -> String {
     match proxy.proxy_type {
         ProxyType::Socks5 => {
-            let mut link = format!("tg://socks?server={}&port={}", proxy.host, proxy.port);
-            if let Some(ref u) = proxy.user {
-                link.push_str(&format!("&user={}", u));
+            let mut link = format!(
+                "tg://socks?server={}&port={}",
+                percent_encode_query_component(proxy.host.trim()),
+                proxy.port
+            );
+            if let Some(u) = proxy.user.as_deref().filter(|s| !s.is_empty()) {
+                link.push_str(&format!("&user={}", percent_encode_query_component(u)));
             }
-            if let Some(ref p) = proxy.password {
-                link.push_str(&format!("&pass={}", p));
+            if let Some(p) = proxy.password.as_deref().filter(|s| !s.is_empty()) {
+                link.push_str(&format!("&pass={}", percent_encode_query_component(p)));
             }
             link
         }
         ProxyType::Mtproto | ProxyType::Web => {
-            let mut link = format!("tg://proxy?server={}&port={}", proxy.host, proxy.port);
-            if let Some(ref s) = proxy.secret {
-                link.push_str(&format!("&secret={}", s));
+            let mut link = format!(
+                "tg://proxy?server={}&port={}",
+                percent_encode_query_component(proxy.host.trim()),
+                proxy.port
+            );
+            if let Some(s) = proxy.secret.as_deref().filter(|s| !s.trim().is_empty()) {
+                link.push_str(&format!(
+                    "&secret={}",
+                    percent_encode_query_component(s.trim())
+                ));
             }
             link
         }

@@ -96,7 +96,7 @@ pub struct GroupMultiAgentRoom {
 impl GroupMultiAgentRoom {
     pub fn new(chat_id: ChatId) -> Self {
         Self {
-            floor: gpui_telegram_agent::FloorControlQueue::new(30_000),
+            floor: gpui_telegram_agent::FloorControlQueue::new(120_000),
             loop_budget: gpui_telegram_agent::LoopBudget::new(gpui_telegram_agent::DEFAULT_MAX_LOOP_HOPS),
             workspace: gpui_telegram_agent::SharedGroupWorkspace::new(chat_id.0),
             recent_speaker_bot_user_id: None,
@@ -536,6 +536,52 @@ impl AppState {
         gateway_hub.set_signaling_hub(signaling_hub.clone());
         gateway_hub.set_webmcp_broker(webmcp_broker.clone());
         gateway_hub.set_coding_agent_broker(coding_agent_broker.clone());
+        {
+            let state_weak_ws = self_weak.clone();
+            gateway_hub.set_message_sent_handler(Arc::new(
+                move |chat_id, sender_id, msg_id, text_preview, reply_to, topic_id, date_ms| {
+                    let Some(state_bg) = state_weak_ws.get().and_then(|w| w.upgrade()) else {
+                        return;
+                    };
+                    crate::routes::telegram_bot_api::record_incoming_user_message_for_bot(
+                        &state_bg,
+                        chat_id,
+                        sender_id,
+                        msg_id,
+                        &text_preview,
+                        date_ms,
+                    );
+                    let targets = detect_target_bots_in_chat(
+                        &state_bg,
+                        chat_id,
+                        sender_id,
+                        &text_preview,
+                        reply_to,
+                    );
+                    let has_ai_target = targets.iter().any(|buid| {
+                        !state_bg
+                            .db
+                            .get_bot_by_user_id(buid.0 as i64)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|b| b.is_standard_bot)
+                    });
+                    if has_ai_target {
+                        tokio::spawn(async move {
+                            maybe_trigger_bot_reply_with_context(
+                                &state_bg,
+                                chat_id,
+                                sender_id,
+                                &text_preview,
+                                reply_to,
+                                topic_id,
+                            )
+                            .await;
+                        });
+                    }
+                },
+            ));
+        }
 
         let multi_agent_groups: Arc<RwLock<HashMap<ChatId, GroupMultiAgentRoom>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -1419,6 +1465,29 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             get(routes::bots_miniapps::miniapps_storage_get)
                 .put(routes::bots_miniapps::miniapps_storage_put)
                 .delete(routes::bots_miniapps::miniapps_storage_delete),
+        )
+        // --- Automation Script App Store Routes ---
+        .route(
+            "/api/v1/automation-apps",
+            get(routes::automation_apps::automation_apps_list)
+                .post(routes::automation_apps::automation_apps_publish),
+        )
+        .route(
+            "/api/v1/automation-apps/installed",
+            get(routes::automation_apps::automation_apps_installed),
+        )
+        .route(
+            "/api/v1/automation-apps/{app_id}",
+            get(routes::automation_apps::automation_app_get),
+        )
+        .route(
+            "/api/v1/automation-apps/{app_id}/install",
+            post(routes::automation_apps::automation_app_install)
+                .delete(routes::automation_apps::automation_app_uninstall),
+        )
+        .route(
+            "/api/v1/automation-apps/{app_id}/runs",
+            post(routes::automation_apps::automation_app_record_run),
         )
         .route(
             "/api/v1/bots",
@@ -4035,29 +4104,62 @@ pub(crate) fn extract_at_mentions(text: &str) -> Vec<String> {
     let mut i = 0;
     while i < chars.len() {
         if chars[i].1 == '@' {
-            let prev_is_ident =
-                i > 0 && (chars[i - 1].1.is_ascii_alphanumeric() || chars[i - 1].1 == '_');
+            let prev_is_slash_cmd = i > 0 && {
+                let mut k = i;
+                while k > 0 && (chars[k - 1].1.is_ascii_alphanumeric() || chars[k - 1].1 == '_') {
+                    k -= 1;
+                }
+                k < i
+                    && k > 0
+                    && chars[k - 1].1 == '/'
+                    && (k == 1 || chars[k - 2].1.is_whitespace())
+            };
+            let prev_is_ident = i > 0
+                && !prev_is_slash_cmd
+                && (chars[i - 1].1.is_ascii_alphanumeric() || chars[i - 1].1 == '_');
             if !prev_is_ident {
                 let start = i + 1;
-                let mut end = start;
-                while end < chars.len()
-                    && (chars[end].1.is_alphanumeric()
-                        || chars[end].1 == '_'
-                        || chars[end].1 == '-')
-                {
-                    end += 1;
-                }
-                if end > start {
-                    let byte_start = chars[start].0;
-                    let byte_end = if end < chars.len() {
-                        chars[end].0
+                if start < chars.len() {
+                    let rest = &text[chars[start].0..];
+                    if rest.starts_with("所有人") {
+                        out.push("所有人".to_string());
+                    }
+                    let first_is_ascii_ident = chars[start].1.is_ascii_alphanumeric()
+                        || chars[start].1 == '_'
+                        || chars[start].1 == '-';
+                    let mut end = start;
+                    if first_is_ascii_ident {
+                        while end < chars.len()
+                            && (chars[end].1.is_ascii_alphanumeric()
+                                || chars[end].1 == '_'
+                                || chars[end].1 == '-')
+                        {
+                            end += 1;
+                        }
                     } else {
-                        text.len()
-                    };
-                    out.push(text[byte_start..byte_end].to_string());
+                        while end < chars.len()
+                            && (chars[end].1.is_alphanumeric()
+                                || chars[end].1 == '_'
+                                || chars[end].1 == '-')
+                        {
+                            end += 1;
+                        }
+                    }
+                    if end > start {
+                        let byte_start = chars[start].0;
+                        let byte_end = if end < chars.len() {
+                            chars[end].0
+                        } else {
+                            text.len()
+                        };
+                        let tok = text[byte_start..byte_end].to_string();
+                        if !out.iter().any(|existing| existing == &tok) {
+                            out.push(tok);
+                        }
+                    }
+                    i = end;
+                    continue;
                 }
-                i = end;
-                continue;
             }
         }
         i += 1;
@@ -4065,9 +4167,71 @@ pub(crate) fn extract_at_mentions(text: &str) -> Vec<String> {
     out
 }
 
+pub(crate) fn text_has_at_mention_label(text: &str, label: &str) -> bool {
+    let label_lower = label.trim().trim_start_matches('@').to_lowercase();
+    if label_lower.is_empty() || !text.contains('@') {
+        return false;
+    }
+    let text_lower = text.to_lowercase();
+    let bytes = text_lower.as_bytes();
+    let label_ends_ascii = label_lower
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let mut search_from = 0usize;
+    while let Some(rel) = text_lower[search_from..].find('@') {
+        let at_idx = search_from + rel;
+        let prev_is_slash_cmd = at_idx > 0 && {
+            let mut k = at_idx;
+            while k > 0 && (bytes[k - 1].is_ascii_alphanumeric() || bytes[k - 1] == b'_') {
+                k -= 1;
+            }
+            k < at_idx
+                && k > 0
+                && bytes[k - 1] == b'/'
+                && (k == 1 || text_lower[..k - 1].chars().last().is_some_and(char::is_whitespace))
+        };
+        let prev_ident = at_idx > 0
+            && !prev_is_slash_cmd
+            && (bytes[at_idx - 1].is_ascii_alphanumeric() || bytes[at_idx - 1] == b'_');
+        if !prev_ident {
+            let after = &text_lower[at_idx + 1..];
+            if let Some(rem) = after.strip_prefix(&label_lower) {
+                if !label_ends_ascii
+                    || rem
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                {
+                    return true;
+                }
+            }
+        }
+        search_from = at_idx + 1;
+    }
+    false
+}
+
+fn is_member_bot_account(state: &AppState, uid: UserId) -> bool {
+    state
+        .db
+        .get_user(uid)
+        .ok()
+        .flatten()
+        .is_some_and(|u| u.is_bot)
+        || state
+            .db
+            .get_bot_by_user_id(uid.0 as i64)
+            .ok()
+            .flatten()
+            .is_some()
+        || state.fabushi_bots.get_by_user_id(uid.0 as i64).is_some()
+}
+
 /// Identifies ALL target AI Bots that should reply in `chat_id` (supporting Multi-Bot Shared Rooms
-/// via `@username` / `@agent_id` mentions, reply-to-bot targeting, `@all`/`@所有人`, Stage 1
-/// Grok Bot `shouldReply` relevance gating for multi-bot rooms, and 1:1 fallbacks).
+/// via `@username` / `@agent_id` / `@display_name` mentions, `/cmd@bot`, reply-to-bot targeting,
+/// `@all`/`@所有人`, Stage 1 Grok Bot `shouldReply` relevance gating with primary fallback for
+/// multi-bot rooms, and 1:1 fallbacks).
 pub(crate) fn detect_target_bots_in_chat(
     state: &AppState,
     chat_id: ChatId,
@@ -4075,6 +4239,19 @@ pub(crate) fn detect_target_bots_in_chat(
     text: &str,
     reply_to_msg_id: Option<MsgId>,
 ) -> Vec<UserId> {
+    detect_target_bots_with_addressing(state, chat_id, sender_id, text, reply_to_msg_id)
+        .into_iter()
+        .map(|(uid, _)| uid)
+        .collect()
+}
+
+pub(crate) fn detect_target_bots_with_addressing(
+    state: &AppState,
+    chat_id: ChatId,
+    sender_id: UserId,
+    text: &str,
+    reply_to_msg_id: Option<MsgId>,
+) -> Vec<(UserId, bool)> {
     let sender_is_bot = state
         .db
         .get_user(sender_id)
@@ -4092,17 +4269,17 @@ pub(crate) fn detect_target_bots_in_chat(
         }
     }
 
+    let is_group_or_channel = state
+        .db
+        .get_chat(chat_id)
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.chat_type != 0 && c.chat_type != 4);
+
     let mut bot_members: Vec<UserId> = Vec::new();
     if let Ok(members) = state.db.get_chat_members(chat_id) {
         for member_id in members {
-            if member_id != sender_id
-                && state
-                    .db
-                    .get_user(member_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|u| u.is_bot)
-            {
+            if member_id != sender_id && is_member_bot_account(state, member_id) {
                 bot_members.push(member_id);
             }
         }
@@ -4117,14 +4294,7 @@ pub(crate) fn detect_target_bots_in_chat(
 
     if let Some(rid) = reply_to_msg_id {
         if let Ok(Some(orig)) = state.db.get_message(chat_id, rid) {
-            if orig.sender_id != sender_id
-                && state
-                    .db
-                    .get_user(orig.sender_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|u| u.is_bot)
-            {
+            if orig.sender_id != sender_id && is_member_bot_account(state, orig.sender_id) {
                 push_unique(&mut explicit_targets, orig.sender_id);
             }
         }
@@ -4148,6 +4318,20 @@ pub(crate) fn detect_target_bots_in_chat(
             && !bot_members.is_empty()
         {
             for &buid in &bot_members {
+                let is_standard = state
+                    .db
+                    .get_bot_by_user_id(buid.0 as i64)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|b| b.is_standard_bot);
+                if is_standard {
+                    continue;
+                }
+                if is_group_or_channel
+                    && buid.0 == crate::db::miniapp_store::BOTFATHER_USER_ID
+                {
+                    continue;
+                }
                 push_unique(&mut explicit_targets, buid);
             }
             continue;
@@ -4160,30 +4344,81 @@ pub(crate) fn detect_target_bots_in_chat(
             }
         }
         for &buid in &bot_members {
-            let matches_user = state
-                .db
-                .get_user(buid)
-                .ok()
-                .flatten()
-                .and_then(|u| u.username)
-                .is_some_and(|un| un.eq_ignore_ascii_case(token));
-            let matches_reg = state
-                .db
-                .get_bot_by_user_id(buid.0 as i64)
-                .ok()
-                .flatten()
-                .is_some_and(|b| {
-                    b.username.eq_ignore_ascii_case(token)
-                        || b.agent_id.eq_ignore_ascii_case(token)
-                });
-            if matches_user || matches_reg {
+            let user_opt = state.db.get_user(buid).ok().flatten();
+            let reg_opt = state.db.get_bot_by_user_id(buid.0 as i64).ok().flatten();
+            let inst_opt = state.fabushi_bots.get_by_user_id(buid.0 as i64);
+            let matches_user = user_opt.as_ref().is_some_and(|u| {
+                u.username
+                    .as_deref()
+                    .is_some_and(|un| un.eq_ignore_ascii_case(token))
+                    || (!u.first_name.trim().is_empty()
+                        && u.first_name.trim().eq_ignore_ascii_case(token))
+            });
+            let matches_reg = reg_opt.as_ref().is_some_and(|b| {
+                b.username.eq_ignore_ascii_case(token)
+                    || b.agent_id.eq_ignore_ascii_case(token)
+                    || (!b.display_name.trim().is_empty()
+                        && b.display_name.trim().eq_ignore_ascii_case(token))
+            });
+            let matches_inst = inst_opt.as_ref().is_some_and(|i| {
+                let prof = i.profile();
+                let settings = i.settings();
+                i.agent_id.eq_ignore_ascii_case(token)
+                    || (!settings.username.trim().is_empty()
+                        && settings.username.trim().eq_ignore_ascii_case(token))
+                    || (!prof.name.trim().is_empty() && prof.name.trim().eq_ignore_ascii_case(token))
+            });
+            if matches_user || matches_reg || matches_inst {
+                push_unique(&mut explicit_targets, buid);
+            }
+        }
+    }
+
+    if text.contains('@') && !bot_members.is_empty() {
+        let scan_text = match handoff_idx {
+            Some(h_idx) if !explicit_targets.is_empty() => &text[..h_idx],
+            _ => text,
+        };
+        for &buid in &bot_members {
+            if explicit_targets.contains(&buid) {
+                continue;
+            }
+            let user_opt = state.db.get_user(buid).ok().flatten();
+            let reg_opt = state.db.get_bot_by_user_id(buid.0 as i64).ok().flatten();
+            let inst_opt = state.fabushi_bots.get_by_user_id(buid.0 as i64);
+            let mut labels: Vec<String> = Vec::new();
+            if let Some(ref u) = user_opt {
+                if let Some(ref un) = u.username {
+                    labels.push(un.clone());
+                }
+                if !u.first_name.trim().is_empty() {
+                    labels.push(u.first_name.clone());
+                }
+            }
+            if let Some(ref b) = reg_opt {
+                labels.push(b.username.clone());
+                labels.push(b.agent_id.clone());
+                labels.push(b.display_name.clone());
+            }
+            if let Some(ref i) = inst_opt {
+                labels.push(i.agent_id.clone());
+                labels.push(i.settings().username);
+                labels.push(i.profile().name);
+            }
+            if labels
+                .iter()
+                .any(|lbl| text_has_at_mention_label(scan_text, lbl))
+            {
                 push_unique(&mut explicit_targets, buid);
             }
         }
     }
 
     if !explicit_targets.is_empty() {
-        return explicit_targets;
+        return explicit_targets
+            .into_iter()
+            .map(|uid| (uid, true))
+            .collect();
     }
 
     if sender_is_bot {
@@ -4191,16 +4426,54 @@ pub(crate) fn detect_target_bots_in_chat(
     }
 
     if !bot_members.is_empty() {
-        if bot_members.len() == 1 {
-            return bot_members;
+        let mut ai_bot_members: Vec<UserId> = bot_members
+            .iter()
+            .copied()
+            .filter(|&buid| {
+                let is_standard = state
+                    .db
+                    .get_bot_by_user_id(buid.0 as i64)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|b| b.is_standard_bot);
+                if is_standard {
+                    return false;
+                }
+                if is_group_or_channel
+                    && buid.0 == crate::db::miniapp_store::BOTFATHER_USER_ID
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        if ai_bot_members.is_empty() && !is_group_or_channel {
+            ai_bot_members = bot_members
+                .iter()
+                .copied()
+                .filter(|&buid| {
+                    !state
+                        .db
+                        .get_bot_by_user_id(buid.0 as i64)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|b| b.is_standard_bot)
+                })
+                .collect();
+        }
+        if ai_bot_members.is_empty() {
+            return Vec::new();
+        }
+        if ai_bot_members.len() == 1 {
+            return vec![(ai_bot_members[0], false)];
         }
         if text.trim().starts_with('/') {
-            return vec![bot_members[0]];
+            return vec![(ai_bot_members[0], true)];
         }
 
         // Multi-bot group without explicit `@mention` / `@all` / reply: invoke Stage 1
         // Grok Bot `shouldReply` group wake gate so relevant specialists engage naturally
-        // while irrelevant bots stay silent (`PASS`).
+        // and general human messages deterministically wake a primary responder.
         let now_ms = Utc::now().timestamp_millis();
         let (recent_speaker_bot_user_id, remaining_loop_budget, bot_recency): (
             Option<i64>,
@@ -4210,7 +4483,7 @@ pub(crate) fn detect_target_bots_in_chat(
             let groups = state.multi_agent_groups.read();
             if let Some(room) = groups.get(&chat_id) {
                 let mut recency = HashMap::new();
-                for &buid in &bot_members {
+                for &buid in &ai_bot_members {
                     if let Some(secs) = room.seconds_since_last_reply(buid, now_ms) {
                         recency.insert(buid, secs);
                     }
@@ -4232,13 +4505,10 @@ pub(crate) fn detect_target_bots_in_chat(
             }
         };
 
-        let candidates: Vec<gpui_telegram_agent::GroupWakeBotCandidate> = bot_members
+        let candidates: Vec<gpui_telegram_agent::GroupWakeBotCandidate> = ai_bot_members
             .iter()
-            .filter_map(|&buid| {
+            .map(|&buid| {
                 let reg = state.db.get_bot_by_user_id(buid.0 as i64).ok().flatten();
-                if reg.as_ref().is_some_and(|b| b.is_standard_bot) {
-                    return None;
-                }
                 let inst = state.fabushi_bots.get_by_user_id(buid.0 as i64);
                 let user = state.db.get_user(buid).ok().flatten();
                 let profile = inst.as_ref().map(|i| i.profile());
@@ -4293,7 +4563,7 @@ pub(crate) fn detect_target_bots_in_chat(
                     }
                 }
 
-                Some(gpui_telegram_agent::GroupWakeBotCandidate {
+                gpui_telegram_agent::GroupWakeBotCandidate {
                     bot_user_id: buid.0 as i64,
                     agent_id,
                     name,
@@ -4302,7 +4572,7 @@ pub(crate) fn detect_target_bots_in_chat(
                     description,
                     skills,
                     seconds_since_last_reply: bot_recency.get(&buid).copied(),
-                })
+                }
             })
             .collect();
 
@@ -4320,11 +4590,17 @@ pub(crate) fn detect_target_bots_in_chat(
                 },
             );
             if decision.should_wake && !decision.wake_bot_user_ids.is_empty() {
+                let is_explicit = matches!(
+                    decision.reason,
+                    gpui_telegram_agent::GroupWakeReason::MentionAll
+                        | gpui_telegram_agent::GroupWakeReason::ExplicitMention
+                        | gpui_telegram_agent::GroupWakeReason::ReplyToBot
+                );
                 return decision
                     .wake_bot_user_ids
                     .into_iter()
                     .filter(|id| *id > 0)
-                    .map(|id| UserId(id as u64))
+                    .map(|id| (UserId(id as u64), is_explicit))
                     .collect();
             }
         }
@@ -4333,6 +4609,7 @@ pub(crate) fn detect_target_bots_in_chat(
 
     detect_bot_in_chat(&state.db, chat_id, sender_id, text)
         .into_iter()
+        .map(|uid| (uid, false))
         .collect()
 }
 
@@ -4603,8 +4880,9 @@ pub(crate) async fn maybe_trigger_bot_reply_with_context(
         }
     }
 
-    let targets = detect_target_bots_in_chat(state, chat_id, sender_id, text, reply_to_msg_id);
-    for bot_user_id in targets {
+    let targets =
+        detect_target_bots_with_addressing(state, chat_id, sender_id, text, reply_to_msg_id);
+    for (bot_user_id, is_explicitly_addressed) in targets {
         let prio = if sender_is_bot {
             gpui_telegram_agent::FloorPriority::TaskAssignee
         } else {
@@ -4618,6 +4896,7 @@ pub(crate) async fn maybe_trigger_bot_reply_with_context(
             text,
             topic_id,
             prio,
+            is_explicitly_addressed,
         )
         .await;
     }
@@ -4668,10 +4947,12 @@ pub(crate) async fn dispatch_bot_handoff_to_target(
         handoff_text,
         topic_id,
         gpui_telegram_agent::FloorPriority::TaskAssignee,
+        true,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_bot_turn_with_floor_and_budget(
     state: &Arc<AppState>,
     chat_id: ChatId,
@@ -4680,6 +4961,7 @@ async fn dispatch_bot_turn_with_floor_and_budget(
     text: &str,
     topic_id: Option<TopicId>,
     prio: gpui_telegram_agent::FloorPriority,
+    is_explicitly_addressed: bool,
 ) {
     if state
         .db
@@ -4705,6 +4987,26 @@ async fn dispatch_bot_turn_with_floor_and_budget(
         120,
     );
     if !tok.verify_for_scope(&vk, now_ts, &agent_key, chat_id.0, "chat:write") {
+        return;
+    }
+    let is_group_room = state
+        .db
+        .get_chat(chat_id)
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.chat_type != 0 && c.chat_type != 4);
+    if !is_group_room {
+        Box::pin(crate::routes::bots_miniapps::handle_ai_bot_reply_with_options(
+            state,
+            chat_id,
+            sender_id,
+            bot_user_id,
+            text,
+            topic_id,
+            None,
+            is_explicitly_addressed,
+        ))
+        .await;
         return;
     }
     let (hops, remaining_hops, floor_queue) = {
@@ -4748,7 +5050,7 @@ async fn dispatch_bot_turn_with_floor_and_budget(
         is_winding_down: grant.is_winding_down,
         remaining_hops,
     };
-    Box::pin(crate::routes::bots_miniapps::handle_ai_bot_reply_with_floor_fence(
+    Box::pin(crate::routes::bots_miniapps::handle_ai_bot_reply_with_options(
         state,
         chat_id,
         sender_id,
@@ -4756,6 +5058,7 @@ async fn dispatch_bot_turn_with_floor_and_budget(
         text,
         topic_id,
         Some(floor_fence),
+        is_explicitly_addressed,
     ))
     .await;
     floor_guard.release_now();
@@ -5174,6 +5477,10 @@ async fn chats_members_add(
                         if inst.bot_user_id > 0 {
                             push_uid(inst.bot_user_id as u64);
                         }
+                    } else if let Ok(Some(bot)) = state.db.get_bot_by_username(un) {
+                        if bot.bot_user_id > 0 {
+                            push_uid(bot.bot_user_id as u64);
+                        }
                     }
                 }
             }
@@ -5188,6 +5495,9 @@ async fn chats_members_add(
     }
 
     for &uid in &user_ids {
+        if uid == gpui_telegram_agent::fabushi_bot::OFFICIAL_DEFAULT_BOT_USER_ID as u64 {
+            let _ = ensure_default_ai_bot(&state.db);
+        }
         let member = crate::db::schema::ChatMemberRecord {
             chat_id: ChatId(chat_id),
             user_id: UserId(uid),

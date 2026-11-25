@@ -6,7 +6,7 @@ use gpui_telegram_core::types::{ChatId, MessageId};
 use gpui_telegram_proto::message::ReactionCount;
 use gpui_telegram_proto::ws::{ReactionRequest, WsClientFrame};
 
-use crate::views::app_shell::shell_truth::SessionRequestFence;
+use crate::views::app_shell::shell_truth::ClientCallFence;
 use crate::views::shell::AppShell;
 use crate::views::stage::cards::ReactionItem;
 
@@ -15,16 +15,6 @@ fn reaction_items_to_proto(items: &[ReactionItem]) -> Vec<ReactionCount> {
         .iter()
         .map(|r| ReactionCount::new(&r.emoji, r.count, r.user_reacted))
         .collect()
-}
-
-fn fence_matches(fence: &SessionRequestFence, shell: &AppShell) -> bool {
-    fence.matches(
-        shell.is_authenticated,
-        shell.session_sync.auth_generation,
-        0,
-        shell.session_sync.session_token.as_deref(),
-        shell.session_sync.user_id,
-    )
 }
 
 impl AppShell {
@@ -228,18 +218,21 @@ impl AppShell {
             .entry((cid, server_mid))
             .or_insert(0) += 1;
 
-        let fence = SessionRequestFence {
-            auth_generation: self.session_sync.auth_generation,
-            request_generation: 0,
-            token,
-            user_id: uid,
+        let _ = uid;
+        let Some(fence) = self.capture_client_fence() else {
+            return;
         };
-        let c = self.client.clone();
         let emoji_for_task = emoji.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
             let action = if is_added { "add" } else { "remove" };
-            let result = c
-                .react_to_message(
+            let result = fence
+                .client
+                .react_to_message_with_token(
+                    &fence.token,
+                    fence.client_epoch,
                     cid as i64,
                     server_mid as i64,
                     emoji_for_task.clone(),
@@ -262,7 +255,7 @@ impl AppShell {
                                 .collect()
                         });
                     let _ = weak.update(app, |shell, cx| {
-                        if !fence_matches(&fence, shell) {
+                        if !fence.is_valid(shell) {
                             return;
                         }
                         shell.apply_http_reaction_response_with_authority(
@@ -285,8 +278,14 @@ impl AppShell {
                             }
                     );
                     let err_text = err.to_string();
-                    if !should_rollback && c.is_connected() {
-                        let _ = c.send_ws_frame(WsClientFrame::SendReaction(
+                    if !should_rollback
+                        && fence.client.is_connected()
+                        && fence
+                            .client
+                            .ensure_pinned_session(fence.client_epoch, &fence.token)
+                            .is_ok()
+                    {
+                        let _ = fence.client.send_ws_frame(WsClientFrame::SendReaction(
                             ReactionRequest::new(
                                 ChatId(cid as i64),
                                 MessageId(server_mid as i64),
@@ -296,7 +295,7 @@ impl AppShell {
                         ));
                     }
                     let _ = weak.update(app, |shell, cx| {
-                        if !fence_matches(&fence, shell) {
+                        if !fence.is_valid(shell) {
                             return;
                         }
                         let remaining = shell.decrement_in_flight_reaction(cid, server_mid);

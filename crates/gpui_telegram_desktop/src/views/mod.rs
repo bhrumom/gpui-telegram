@@ -4,6 +4,7 @@ pub mod app_shell;
 pub mod apple_sidebar;
 pub mod auth;
 pub mod boxes;
+pub mod browser;
 pub mod call_overlay;
 pub mod canonical_composer;
 pub mod chat_sidebar;
@@ -19,7 +20,6 @@ pub mod main_menu_drawer;
 pub mod media_viewer;
 pub mod modal_boxes_suite;
 pub mod nav_rail;
-pub mod remote_controlled_window;
 pub mod remote_terminal_view;
 pub mod settings;
 pub mod settings_workspace;
@@ -30,6 +30,9 @@ pub mod tdesktop_theme;
 
 pub use app_shell::ModalContainer;
 pub use apple_sidebar::{AppleAppSidebar, AppleSidebarEvent, AppleSidebarSection};
+pub use browser::{
+    BrowserEngineKind, BrowserViewportStats, BrowserWorkspace, CdpViewportSurface,
+};
 pub use call_overlay::{CallOverlay, TalkModeState, TranscriptEntry};
 pub use canonical_composer::CanonicalComposer;
 pub use chat_sidebar::ChatSidebar;
@@ -42,10 +45,6 @@ pub use main_menu_drawer::{MainMenuCommand, MainMenuDrawer};
 pub use media_viewer::{MediaViewer, MediaViewerItem};
 pub use modal_boxes_suite::{ActiveModalDialog, ModalActionOutcome, ModalDialogKind};
 pub use nav_rail::NavRail;
-pub use remote_controlled_window::{
-    open_controlled_status_window, ControlledBannerVariant, ControlledSessionGroup,
-    RemoteControlledWindow, RemoteControlledWindowAction,
-};
 pub use remote_terminal_view::RemoteTerminalView;
 pub use settings_workspace::{SettingsMutation, SettingsPageId, SettingsWorkspaceView};
 pub use shell::AppShell;

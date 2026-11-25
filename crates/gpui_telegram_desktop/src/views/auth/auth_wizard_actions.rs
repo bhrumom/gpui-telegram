@@ -68,13 +68,41 @@ impl AuthWizardView {
         }
     }
 
-    fn apply_auth_result(
+    fn is_auth_request_current(
+        &self,
+        req_gen: u64,
+        expected_client: &std::sync::Arc<gpui_telegram_client::TelegramClient>,
+        expected_server_url: &str,
+        expected_client_epoch: u64,
+    ) -> bool {
+        !self.is_authenticated
+            && self.auth_request_generation == req_gen
+            && std::sync::Arc::ptr_eq(&self.client, expected_client)
+            && self.client.config.server_url == expected_server_url
+            && self.client.is_same_session_epoch(expected_client_epoch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_auth_result_fenced(
         &mut self,
+        req_gen: u64,
+        expected_client: &std::sync::Arc<gpui_telegram_client::TelegramClient>,
+        expected_server_url: &str,
+        expected_client_epoch: u64,
         res: Result<AuthResponse, HttpClientError>,
         pending_bootstrap: Option<PendingAuthVaultBootstrap>,
         err_msg: impl FnOnce(HttpClientError) -> String,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_auth_request_current(
+            req_gen,
+            expected_client,
+            expected_server_url,
+            expected_client_epoch,
+        ) {
+            drop(pending_bootstrap);
+            return;
+        }
         self.is_authenticating = false;
         match res {
             Ok(auth) => {
@@ -91,6 +119,9 @@ impl AuthWizardView {
     }
 
     pub(super) fn emit_authenticated(&mut self, auth: AuthResponse, cx: &mut Context<Self>) {
+        if self.is_authenticated {
+            return;
+        }
         self.is_authenticated = true;
         self.is_authenticating = false;
         self.login_error = None;
@@ -112,17 +143,49 @@ impl AuthWizardView {
             cx.notify();
             return;
         }
+        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+        let req_gen = self.auth_request_generation;
         self.is_authenticating = true;
         self.login_error = None;
         self.pending_vault_bootstrap = None;
         cx.notify();
 
         let client = self.client.clone();
+        let expected_server_url = client.config.server_url.clone();
+        let expected_client_epoch = client.session_epoch();
         cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
+            let still_current = weak_wizard
+                .update(app, |w, _| {
+                    w.is_auth_request_current(
+                        req_gen,
+                        &client,
+                        &expected_server_url,
+                        expected_client_epoch,
+                    )
+                })
+                .unwrap_or(false);
+            if !still_current {
+                drop(password);
+                return;
+            }
             let (res, pending_bootstrap) = match client.http_client.get_auth_kdf_params(&username).await {
                 Ok(kdf_resp) if kdf_resp.auth_version == 2 => {
                     let kdf_params = proto_kdf_to_bot(kdf_resp.kdf_params);
                     let salt_b64 = kdf_resp.auth_salt_b64.clone();
+                    let still_current = weak_wizard
+                        .update(app, |w, _| {
+                            w.is_auth_request_current(
+                                req_gen,
+                                &client,
+                                &expected_server_url,
+                                expected_client_epoch,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !still_current {
+                        drop(password);
+                        return;
+                    }
                     let pw_for_kdf = password.clone();
                     drop(password);
                     let derive_res = client
@@ -133,6 +196,19 @@ impl AuthWizardView {
                         .await;
                     match derive_res {
                         Ok(Ok(bundle)) => {
+                            let still_current = weak_wizard
+                                .update(app, |w, _| {
+                                    w.is_auth_request_current(
+                                        req_gen,
+                                        &client,
+                                        &expected_server_url,
+                                        expected_client_epoch,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !still_current {
+                                return;
+                            }
                             let req = SplitKeyLoginRequest {
                                 username,
                                 password: String::new(),
@@ -170,6 +246,20 @@ impl AuthWizardView {
                     }
                 }
                 Ok(_) => {
+                    let still_current = weak_wizard
+                        .update(app, |w, _| {
+                            w.is_auth_request_current(
+                                req_gen,
+                                &client,
+                                &expected_server_url,
+                                expected_client_epoch,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !still_current {
+                        drop(password);
+                        return;
+                    }
                     let req = LoginRequest {
                         username,
                         password: password.as_str().to_string(),
@@ -177,6 +267,20 @@ impl AuthWizardView {
                     };
                     let login_res = client.http_client.login(&req).await;
                     if login_res.is_ok() {
+                        let still_current = weak_wizard
+                            .update(app, |w, _| {
+                                w.is_auth_request_current(
+                                    req_gen,
+                                    &client,
+                                    &expected_server_url,
+                                    expected_client_epoch,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if !still_current {
+                            drop(password);
+                            return;
+                        }
                         let fresh_salt = generate_split_key_salt_b64();
                         let upgrade_params = preferred_split_key_kdf_params();
                         let pw_for_kdf = password.clone();
@@ -206,6 +310,20 @@ impl AuthWizardView {
                     }
                 }
                 Err(HttpClientError::Api { status: 404 | 405, .. }) => {
+                    let still_current = weak_wizard
+                        .update(app, |w, _| {
+                            w.is_auth_request_current(
+                                req_gen,
+                                &client,
+                                &expected_server_url,
+                                expected_client_epoch,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !still_current {
+                        drop(password);
+                        return;
+                    }
                     let req = LoginRequest {
                         username,
                         password: password.as_str().to_string(),
@@ -220,7 +338,11 @@ impl AuthWizardView {
                 }
             };
             let _ = weak_wizard.update(app, |wizard, cx| {
-                wizard.apply_auth_result(
+                wizard.apply_auth_result_fenced(
+                    req_gen,
+                    &client,
+                    &expected_server_url,
+                    expected_client_epoch,
                     res,
                     pending_bootstrap,
                     |err| match err {
@@ -249,13 +371,31 @@ impl AuthWizardView {
             cx.notify();
             return;
         }
+        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+        let req_gen = self.auth_request_generation;
         self.is_authenticating = true;
         self.login_error = None;
         self.pending_vault_bootstrap = None;
         cx.notify();
 
         let client = self.client.clone();
+        let expected_server_url = client.config.server_url.clone();
+        let expected_client_epoch = client.session_epoch();
         cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
+            let still_current = weak_wizard
+                .update(app, |w, _| {
+                    w.is_auth_request_current(
+                        req_gen,
+                        &client,
+                        &expected_server_url,
+                        expected_client_epoch,
+                    )
+                })
+                .unwrap_or(false);
+            if !still_current {
+                drop(password);
+                return;
+            }
             let salt_b64 = generate_split_key_salt_b64();
             let kdf_params = preferred_split_key_kdf_params();
             let derive_res = client
@@ -268,6 +408,19 @@ impl AuthWizardView {
                 .await;
             let (res, pending_bootstrap) = match derive_res {
                 Ok(Ok(bundle)) => {
+                    let still_current = weak_wizard
+                        .update(app, |w, _| {
+                            w.is_auth_request_current(
+                                req_gen,
+                                &client,
+                                &expected_server_url,
+                                expected_client_epoch,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !still_current {
+                        return;
+                    }
                     let req = SplitKeyRegisterRequest {
                         username: username.clone(),
                         password: None,
@@ -310,7 +463,11 @@ impl AuthWizardView {
                 ),
             };
             let _ = weak_wizard.update(app, |wizard, cx| {
-                wizard.apply_auth_result(
+                wizard.apply_auth_result_fenced(
+                    req_gen,
+                    &client,
+                    &expected_server_url,
+                    expected_client_epoch,
                     res,
                     pending_bootstrap,
                     |err| match err {
@@ -330,6 +487,11 @@ impl AuthWizardView {
         if self.auth_wizard_tab == tab {
             return;
         }
+        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+        self.email_send_generation = self.email_send_generation.wrapping_add(1);
+        self.is_authenticating = false;
+        self.is_sending_email_code = false;
+        self.pending_vault_bootstrap = None;
         self.auth_wizard_tab = tab;
         self.login_error = None;
         self.ime.clear_ime_state();
@@ -353,13 +515,27 @@ impl AuthWizardView {
             .unwrap_or_else(|_| ClientConfig::normalize_url(&raw));
         let cache_dir = self.client.local_store.cache_dir().map(|p| p.to_path_buf());
         self.client.local_store.clear_all();
+        self.client.clear_session();
         let mut new_cfg = self.client.config.clone();
         new_cfg.server_url = normalized.clone();
-        self.client = Arc::new(match cache_dir {
+        let next_client = Arc::new(match cache_dir {
             Some(dir) => TelegramClient::open_with_dir(new_cfg.clone(), dir)
                 .unwrap_or_else(|_| TelegramClient::new(new_cfg)),
             None => TelegramClient::new(new_cfg),
         });
+        next_client
+            .ws_transport
+            .set_max_reconnect_attempts(next_client.config.max_reconnect_attempts);
+        self.client = next_client;
+        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+        self.alipay_poll_generation = self.alipay_poll_generation.wrapping_add(1);
+        self.email_send_generation = self.email_send_generation.wrapping_add(1);
+        self.email_cooldown_generation = self.email_cooldown_generation.wrapping_add(1);
+        self.is_authenticating = false;
+        self.pending_vault_bootstrap = None;
+        self.alipay_is_loading = false;
+        self.is_sending_email_code = false;
+        self.email_code_cooldown = 0;
         self.server_url_draft = normalized.clone();
         self.ime.clear_ime_state();
         self.editing_server_url = false;
@@ -425,13 +601,29 @@ impl AuthWizardView {
         let poll_gen = self.alipay_poll_generation;
 
         let client = self.client.clone();
+        let expected_epoch = client.session_epoch();
         cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
+            let start_ok = weak_wizard
+                .update(app, |wizard, _| {
+                    !wizard.is_authenticated
+                        && wizard.alipay_poll_generation == poll_gen
+                        && wizard.auth_wizard_tab == AuthWizardTab::AlipayQr
+                        && std::sync::Arc::ptr_eq(&wizard.client, &client)
+                        && wizard.client.is_same_session_epoch(expected_epoch)
+                })
+                .unwrap_or(false);
+            if !start_ok {
+                return;
+            }
             let start_res = client.http_client.alipay_start().await;
             let mut launched_attempt_id: Option<String> = None;
             let ok = weak_wizard
                 .update(app, |wizard, cx| {
-                    if wizard.alipay_poll_generation != poll_gen
+                    if wizard.is_authenticated
+                        || wizard.alipay_poll_generation != poll_gen
                         || wizard.auth_wizard_tab != AuthWizardTab::AlipayQr
+                        || !std::sync::Arc::ptr_eq(&wizard.client, &client)
+                        || !wizard.client.is_same_session_epoch(expected_epoch)
                     {
                         return false;
                     }
@@ -472,6 +664,8 @@ impl AuthWizardView {
                                 w.alipay_poll_generation == poll_gen
                                     && w.auth_wizard_tab == AuthWizardTab::AlipayQr
                                     && !w.is_authenticated
+                                    && std::sync::Arc::ptr_eq(&w.client, &client)
+                                    && w.client.is_same_session_epoch(expected_epoch)
                                     && w.alipay_attempt_id.as_deref() == Some(&att_id)
                             })
                             .unwrap_or(false);
@@ -482,8 +676,11 @@ impl AuthWizardView {
                         let poll_res = client.http_client.alipay_poll(&att_id).await;
                         let done = weak_wizard
                             .update(app, |wizard, cx| {
-                                if wizard.alipay_poll_generation != poll_gen
+                                if wizard.is_authenticated
+                                    || wizard.alipay_poll_generation != poll_gen
                                     || wizard.auth_wizard_tab != AuthWizardTab::AlipayQr
+                                    || !std::sync::Arc::ptr_eq(&wizard.client, &client)
+                                    || !wizard.client.is_same_session_epoch(expected_epoch)
                                 {
                                     return true;
                                 }
@@ -542,19 +739,43 @@ impl AuthWizardView {
         cx.notify();
 
         let client = self.client.clone();
+        let expected_epoch = client.session_epoch();
+        let poll_gen = self.alipay_poll_generation;
         cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
+            let still_valid = weak_wizard
+                .update(app, |wizard, _| {
+                    !wizard.is_authenticated
+                        && wizard.alipay_poll_generation == poll_gen
+                        && std::sync::Arc::ptr_eq(&wizard.client, &client)
+                        && wizard.client.is_same_session_epoch(expected_epoch)
+                        && wizard.alipay_attempt_id.as_deref() == Some(&attempt_id)
+                })
+                .unwrap_or(false);
+            if !still_valid {
+                return;
+            }
             let sim_res = client.http_client.alipay_simulate_scan(&attempt_id).await;
-            let _ = weak_wizard.update(app, |wizard, cx| match sim_res {
-                Ok(_) => {
-                    wizard.alipay_status_text = wizard.loc(
-                        "模拟授权成功，正在同步会话...",
-                        "Authorization approved, completing login...",
-                    );
-                    cx.notify();
+            let _ = weak_wizard.update(app, |wizard, cx| {
+                if wizard.is_authenticated
+                    || wizard.alipay_poll_generation != poll_gen
+                    || !std::sync::Arc::ptr_eq(&wizard.client, &client)
+                    || !wizard.client.is_same_session_epoch(expected_epoch)
+                    || wizard.alipay_attempt_id.as_deref() != Some(&attempt_id)
+                {
+                    return;
                 }
-                Err(err) => {
-                    wizard.login_error = Some(format!("模拟授权失败: {}", err));
-                    cx.notify();
+                match sim_res {
+                    Ok(_) => {
+                        wizard.alipay_status_text = wizard.loc(
+                            "模拟授权成功，正在同步会话...",
+                            "Authorization approved, completing login...",
+                        );
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        wizard.login_error = Some(format!("模拟授权失败: {}", err));
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -575,20 +796,44 @@ impl AuthWizardView {
 
         self.is_sending_email_code = true;
         self.login_error = None;
-        self.email_cooldown_generation += 1;
-        let cd_gen = self.email_cooldown_generation;
+        self.email_send_generation = self.email_send_generation.wrapping_add(1);
+        let send_gen = self.email_send_generation;
         cx.notify();
 
         let client = self.client.clone();
+        let expected_epoch = client.session_epoch();
         cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
+            let still_valid = weak_wizard
+                .update(app, |wizard, _| {
+                    !wizard.is_authenticated
+                        && wizard.email_send_generation == send_gen
+                        && wizard.auth_wizard_tab == AuthWizardTab::EmailRegister
+                        && std::sync::Arc::ptr_eq(&wizard.client, &client)
+                        && wizard.client.is_same_session_epoch(expected_epoch)
+                })
+                .unwrap_or(false);
+            if !still_valid {
+                return;
+            }
             let res = client.http_client.email_send_code(&email).await;
             let _ = weak_wizard.update(app, |wizard, cx| {
+                if wizard.is_authenticated
+                    || wizard.email_send_generation != send_gen
+                    || wizard.auth_wizard_tab != AuthWizardTab::EmailRegister
+                    || !std::sync::Arc::ptr_eq(&wizard.client, &client)
+                    || !wizard.client.is_same_session_epoch(expected_epoch)
+                {
+                    return;
+                }
                 wizard.is_sending_email_code = false;
                 match res {
                     Ok(resp) => {
                         wizard.email_code_cooldown =
                             if resp.cooldown_seconds > 0 { resp.cooldown_seconds } else { 60 };
                         wizard.ime.clear_ime_state();
+                        wizard.email_cooldown_generation =
+                            wizard.email_cooldown_generation.wrapping_add(1);
+                        let cd_gen = wizard.email_cooldown_generation;
                         wizard.active_login_field = LoginInputField::EmailCode;
                         wizard.login_error = None;
                         cx.emit(AuthWizardEvent::Toast {
@@ -612,7 +857,11 @@ impl AuthWizardView {
                                     .await;
                                 let should_continue = weak_timer
                                     .update(timer_app, |s, s_cx| {
-                                        if s.email_cooldown_generation != cd_gen {
+                                        if s.is_authenticated
+                                            || s.email_cooldown_generation != cd_gen
+                                            || !std::sync::Arc::ptr_eq(&s.client, &timer_client)
+                                            || !s.client.is_same_session_epoch(expected_epoch)
+                                        {
                                             return false;
                                         }
                                         if s.email_code_cooldown > 0 {
@@ -665,13 +914,31 @@ impl AuthWizardView {
             self.login_error =
                 Some(self.loc("用户名和密码不能为空", "Username and password cannot be empty"));
         } else {
+            self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+            let req_gen = self.auth_request_generation;
             self.is_authenticating = true;
             self.login_error = None;
             self.pending_vault_bootstrap = None;
             cx.notify();
 
             let client = self.client.clone();
+            let expected_server_url = client.config.server_url.clone();
+            let expected_client_epoch = client.session_epoch();
             cx.spawn(async move |weak_wizard: WeakEntity<Self>, app: &mut AsyncApp| {
+                let still_current = weak_wizard
+                    .update(app, |w, _| {
+                        w.is_auth_request_current(
+                            req_gen,
+                            &client,
+                            &expected_server_url,
+                            expected_client_epoch,
+                        )
+                    })
+                    .unwrap_or(false);
+                if !still_current {
+                    drop(password);
+                    return;
+                }
                 let salt_b64 = generate_split_key_salt_b64();
                 let kdf_params = preferred_split_key_kdf_params();
                 let derive_res = client
@@ -684,6 +951,19 @@ impl AuthWizardView {
                     .await;
                 let (res, pending_bootstrap) = match derive_res {
                     Ok(Ok(bundle)) => {
+                        let still_current = weak_wizard
+                            .update(app, |w, _| {
+                                w.is_auth_request_current(
+                                    req_gen,
+                                    &client,
+                                    &expected_server_url,
+                                    expected_client_epoch,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if !still_current {
+                            return;
+                        }
                         let req = SplitKeyEmailRegisterRequest {
                             email,
                             code,
@@ -727,7 +1007,11 @@ impl AuthWizardView {
                     ),
                 };
                 let _ = weak_wizard.update(app, |wizard, cx| {
-                    wizard.apply_auth_result(
+                    wizard.apply_auth_result_fenced(
+                        req_gen,
+                        &client,
+                        &expected_server_url,
+                        expected_client_epoch,
                         res,
                         pending_bootstrap,
                         |err| match err {

@@ -6,6 +6,7 @@
 //! LLM routing (ChatCompletions, CodexResponses, AnthropicMessages, LocalHermes),
 //! `/moa`, all 61 slash commands, trajectory export/redaction, cron/heartbeat, and ACP.
 
+pub mod browser_session;
 pub mod commands;
 pub mod context;
 pub mod memory;
@@ -27,10 +28,19 @@ use crate::multi_agent::GroupWorkspaceBridge;
 use crate::talk::TalkCoordinator;
 use crate::tasks::CronRoutine;
 use chrono::Utc;
+use bot_browser::backend::BrowserSessionBackend;
+use bot_browser::script_app::{
+    AutomationScriptApp, ScriptAppMetadata, ScriptReplayReport, VaultSecretResolver,
+};
+use bot_browser::types::BotBrowserError;
+pub use browser_session::{
+    forward_events_to_mpsc, BrowserAutomationEvent, BrowserAutomationSession,
+    BrowserSessionConfig, BrowserSessionRegistry, StepGateInfo, TakeoverOutcome,
+};
 use commands::{
-    CommandBranchInfo, CommandDescriptor, CommandExecutionOutcome, CommandHost, CommandModelInfo,
-    CommandProviderInfo, CommandSkillInfo, CommandToolsetInfo, CommandUiEffect, InlineActionButton,
-    SlashCommandParser, SlashCommandRegistry,
+    CommandBranchInfo, CommandDescriptor, CommandDistilledScriptResult, CommandExecutionOutcome,
+    CommandHost, CommandModelInfo, CommandProviderInfo, CommandSkillInfo, CommandToolsetInfo,
+    CommandUiEffect, InlineActionButton, SlashCommandParser, SlashCommandRegistry,
 };
 use context::{
     AssembledPrompt, CompressionConfig, ContextCompressor, ContextMessage, ContextRefResolver,
@@ -56,12 +66,12 @@ use state_db::{
     CronJobRecord, HermesStateStore, KanbanCardPatch, MessageRecord, RecordCronRunRequest,
     SessionListFilter, SessionPatch, SessionRecord,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tools_agentic::LocalAgenticStore;
 use tools_file::{FileCheckpointManager, RollbackReport, TodoStore};
 use tools_terminal::{ProcessRegistry, TerminalBackendConfig};
@@ -717,6 +727,18 @@ impl HermesStateBridge for ToolContextBridge {
                         .ok_or_else(|| "Missing required 'name'".to_string())?;
                     let deleted = self.skills.skill_delete(name).map_err(|e| e.to_string())?;
                     Ok(json!({ "name": name, "deleted": deleted }))
+                }
+                "save_distilled_browser_script" => {
+                    let app_val = args
+                        .get("app")
+                        .ok_or_else(|| "Missing required 'app'".to_string())?;
+                    let app: bot_browser::AutomationScriptApp =
+                        serde_json::from_value(app_val.clone()).map_err(|e| e.to_string())?;
+                    let doc = self
+                        .skills
+                        .save_distilled_browser_script_skill(&app)
+                        .map_err(|e| e.to_string())?;
+                    serde_json::to_value(doc).map_err(|e| e.to_string())
                 }
                 other => Err(format!("Unsupported skill action '{other}'")),
             }
@@ -2077,6 +2099,44 @@ impl CommandHost for EngineCommandHost<'_> {
         ))
     }
 
+    fn distill_browser_script(
+        &mut self,
+        name: Option<&str>,
+    ) -> std::result::Result<CommandDistilledScriptResult, String> {
+        let app_name = name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Distilled Browser Workflow")
+            .to_string();
+        let meta = ScriptAppMetadata {
+            name: app_name,
+            description: format!("Distilled from browser session `{}`", self.session_id),
+            category: "automation".to_string(),
+            ..Default::default()
+        };
+        let app = self
+            .engine
+            .distill_browser_script(&self.session_id, meta)
+            .map_err(|e| e.to_string())?;
+        let app_json = serde_json::to_string(&app).map_err(|e| e.to_string())?;
+        let summary = format!(
+            "Distilled browser trace from `{}` into AutomationScriptApp `{}` (`{}`) with {} step(s) and {} parameter(s).",
+            self.session_id,
+            app.name,
+            app.slug,
+            app.steps.len(),
+            app.parameters.len(),
+        );
+        Ok(CommandDistilledScriptResult {
+            app_id: app.app_id,
+            slug: app.slug,
+            name: app.name,
+            step_count: app.steps.len(),
+            summary,
+            app_json,
+        })
+    }
+
     fn mcp_action(&mut self, action: &str, arg: Option<&str>) -> std::result::Result<String, String> {
         self.ensure_bot_config_allowed()?;
         match action {
@@ -3190,6 +3250,7 @@ struct HermesEngineInner {
     computer_broker: Arc<Mutex<ComputerLeaseBroker>>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
     bot_browser: RwLock<Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>>>,
+    browser_sessions: RwLock<Arc<BrowserSessionRegistry>>,
     todos: Arc<Mutex<TodoStore>>,
     agentic_store: Arc<Mutex<LocalAgenticStore>>,
     commands: SlashCommandRegistry,
@@ -3359,6 +3420,7 @@ impl HermesEngine {
             computer_broker: Arc::new(Mutex::new(ComputerLeaseBroker::new())),
             computer_provider: RwLock::new(None),
             bot_browser: RwLock::new(None),
+            browser_sessions: RwLock::new(Arc::new(BrowserSessionRegistry::new())),
             todos: Arc::new(Mutex::new(TodoStore::new())),
             agentic_store: Arc::new(Mutex::new(LocalAgenticStore::new())),
             commands: SlashCommandRegistry::new(),
@@ -3621,6 +3683,8 @@ impl HermesEngine {
         &self,
         orchestrator: Arc<bot_browser::orchestrator::BotBrowserOrchestrator>,
     ) {
+        self.browser_registry()
+            .set_orchestrator(Arc::clone(&orchestrator));
         if let Ok(mut guard) = self.inner.bot_browser.write() {
             *guard = Some(orchestrator);
         }
@@ -3634,6 +3698,62 @@ impl HermesEngine {
             .read()
             .ok()
             .and_then(|g| g.clone())
+    }
+
+    pub fn browser_registry(&self) -> Arc<BrowserSessionRegistry> {
+        self.inner
+            .browser_sessions
+            .read()
+            .map(|g| Arc::clone(&*g))
+            .unwrap_or_else(|e| Arc::clone(&*e.into_inner()))
+    }
+
+    pub fn set_browser_registry(&self, registry: Arc<BrowserSessionRegistry>) {
+        if let Some(orch) = self.bot_browser() {
+            registry.set_orchestrator(orch);
+        }
+        if let Ok(mut guard) = self.inner.browser_sessions.write() {
+            *guard = registry;
+        }
+    }
+
+    pub fn register_browser_session(
+        &self,
+        session_id: impl Into<String>,
+        backend: Arc<dyn BrowserSessionBackend>,
+    ) -> Arc<BrowserAutomationSession> {
+        self.browser_registry().register_backend(session_id, backend)
+    }
+
+    pub fn unregister_browser_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<BrowserAutomationSession>> {
+        self.browser_registry().unregister_backend(session_id)
+    }
+
+    pub fn subscribe_browser_events(&self) -> broadcast::Receiver<BrowserAutomationEvent> {
+        self.browser_registry().subscribe()
+    }
+
+    pub fn distill_browser_script(
+        &self,
+        session_id: &str,
+        meta: ScriptAppMetadata,
+    ) -> std::result::Result<AutomationScriptApp, BotBrowserError> {
+        self.browser_registry().distill_script(session_id, meta)
+    }
+
+    pub async fn replay_browser_script(
+        &self,
+        session_id: &str,
+        app: &AutomationScriptApp,
+        params: &BTreeMap<String, String>,
+        vault_resolver: Option<&dyn VaultSecretResolver>,
+    ) -> std::result::Result<ScriptReplayReport, BotBrowserError> {
+        self.browser_registry()
+            .replay_script(session_id, app, params, vault_resolver)
+            .await
     }
 
     pub fn todos(&self) -> &Arc<Mutex<TodoStore>> {
@@ -3993,6 +4113,7 @@ impl HermesEngine {
         ctx.computer_broker = Arc::clone(&self.inner.computer_broker);
         ctx.computer_provider = self.computer_provider();
         ctx.bot_browser = self.bot_browser();
+        ctx.browser_sessions = Some(self.browser_registry());
         ctx.todos = Arc::clone(&self.inner.todos);
         ctx.agentic_store = Arc::clone(&self.inner.agentic_store);
         ctx.caller_depth = caller_depth;
@@ -4342,9 +4463,7 @@ impl HermesEngine {
         }
 
         if let Some(err) = error_msg {
-            if response_text.is_empty() {
-                return Err(TelegramError::Internal(err));
-            }
+            return Err(TelegramError::Internal(err));
         }
 
         Ok(HermesTurnResult {
@@ -4859,6 +4978,12 @@ impl HermesEngine {
             while let Some(ev) = sub_rx.recv().await {
                 match &ev {
                     HermesEvent::ToolStart { .. } => step_used_tools = true,
+                    HermesEvent::Error { .. } => {
+                        recorded.push(ev.clone());
+                        let _ = tx.send(ev).await;
+                        self.update_session_settings(session_id, |s| s.active_goal = None);
+                        return;
+                    }
                     HermesEvent::Done {
                         response_text,
                         usage,
@@ -4996,19 +5121,21 @@ impl HermesEngine {
             .count()
             .max(1) as u64;
 
-        let tool_ctx = self.build_tool_context_scoped(
-            session_id,
-            req.chat_id.or(sess.chat_id),
-            req.bot_id.as_deref().or(sess.bot_id.as_deref()),
-            req.user_id.as_deref(),
-            turn_index,
-            req.preset,
-            req.caller_depth,
-            Arc::clone(&cancel_flag),
-            req.caller_allowed_chat_ids.clone(),
-            req.caller_is_admin,
-            req.caller_owns_bot.unwrap_or(true) || req.caller_is_admin,
-        );
+        let tool_ctx = self
+            .build_tool_context_scoped(
+                session_id,
+                req.chat_id.or(sess.chat_id),
+                req.bot_id.as_deref().or(sess.bot_id.as_deref()),
+                req.user_id.as_deref(),
+                turn_index,
+                req.preset,
+                req.caller_depth,
+                Arc::clone(&cancel_flag),
+                req.caller_allowed_chat_ids.clone(),
+                req.caller_is_admin,
+                req.caller_owns_bot.unwrap_or(true) || req.caller_is_admin,
+            )
+            .with_browser_turn_scope();
 
         let mut active_specs = HermesToolExecutor::list_specs(&tool_ctx);
         if let Some(ref adaptive_ids) = req.adaptive_toolsets {
@@ -7819,5 +7946,138 @@ mod tests {
         );
         assert!(fallback_assembled.tier3_volatile.content.contains("Runtime: Fabushi Bot"));
         assert!(!fallback_assembled.tier3_volatile.content.contains("hermes-local-v1"));
+    }
+
+    #[tokio::test]
+    async fn test_goal_loop_aborts_immediately_on_provider_error_and_run_turn_returns_err() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = TempDir::new().expect("temp dir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+
+        let srv = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let hits_req = Arc::clone(&hits_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    hits_req.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"error":{"message":"Upstream model rejected request","type":"invalid_request_error"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HermesEngineConfig {
+            workspace_root: dir.path().to_path_buf(),
+            data_dir: Some(dir.path().join(".hermes_data")),
+            default_model: "mock-model".into(),
+            ..Default::default()
+        };
+        let engine = HermesEngine::new(cfg).expect("init HermesEngine");
+        engine.providers().set_allow_local_fallback(false);
+        engine.providers().set_offline_rule_bot_allowed(false);
+
+        // 0. Unconfigured provider on /goal must also abort on step 1 and return Err.
+        let uncfg_err = engine
+            .run_turn(
+                HermesTurnRequest::new("/goal Verify unconfigured abort")
+                    .with_chat_bot(403, "bot_goal_uncfg")
+                    .with_session("s_goal_uncfg"),
+            )
+            .await
+            .expect_err("unconfigured /goal run_turn must return Err");
+        assert!(
+            uncfg_err.to_string().contains("PROVIDER_ERROR:"),
+            "unexpected unconfigured error: {uncfg_err}"
+        );
+
+        engine
+            .providers()
+            .register_provider(providers::ProviderConfig::openai_compatible(
+                "mock_err",
+                "Mock Err",
+                format!("http://{addr}/v1"),
+                "mock-model",
+                "sk-mock",
+            ));
+        engine
+            .providers()
+            .set_active("mock_err", Some("mock-model"))
+            .expect("set active");
+
+        // 1. run_turn_stream on /goal must abort after step 1 with Error and emit zero Done events.
+        let mut rx = engine
+            .run_turn_stream(
+                HermesTurnRequest::new("/goal Verify system health")
+                    .with_chat_bot(404, "bot_goal_err")
+                    .with_session("s_goal_err_stream"),
+            )
+            .await
+            .expect("start stream");
+        let mut events = Vec::new();
+        while let Some(ev) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("stream timeout")
+        {
+            events.push(ev);
+        }
+        let goal_progress_count = events
+            .iter()
+            .filter(|e| matches!(e, HermesEvent::GoalProgress { .. }))
+            .count();
+        assert_eq!(
+            goal_progress_count, 1,
+            "run_goal_loop must abort after step 1 on PROVIDER_ERROR, got events={events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, HermesEvent::Error { code, .. } if code == "PROVIDER_ERROR")),
+            "expected PROVIDER_ERROR event: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, HermesEvent::Done { .. })),
+            "must NOT emit HermesEvent::Done after PROVIDER_ERROR: {events:?}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "must NOT execute remaining goal steps 2..=8 after step 1 PROVIDER_ERROR"
+        );
+
+        // 2. run_turn on /goal must return Err(TelegramError::Internal("PROVIDER_ERROR: ...")), never Ok("Goal loop finished...").
+        let hits_before = hits.load(Ordering::SeqCst);
+        let res = engine
+            .run_turn(
+                HermesTurnRequest::new("/goal Verify system health")
+                    .with_chat_bot(404, "bot_goal_err")
+                    .with_session("s_goal_err_turn"),
+            )
+            .await;
+        let err = res.expect_err("/goal run_turn must return Err on PROVIDER_ERROR");
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("PROVIDER_ERROR:") && err_str.contains("400"),
+            "unexpected error string: {err_str}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst) - hits_before,
+            1,
+            "run_turn /goal must abort after 1 provider attempt on 400"
+        );
+
+        srv.abort();
     }
 }

@@ -10,48 +10,30 @@ use crate::views::app_shell::shell_actions::{
     resolve_active_target_chat_id,
 };
 use crate::views::app_shell::shell_settings_sync::{apply_folders_to_shell, apply_wallet_to_shell};
-use crate::views::app_shell::shell_truth::{derive_initials, SessionRequestFence};
+use crate::views::app_shell::shell_truth::{derive_initials, ClientCallFence};
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::context_inspector::build_add_member_candidates;
 use crate::views::drawer::inspector_tabs::InspectorAction;
 use crate::views::shell::AppShell;
 use crate::views::sidebar::dialogs_row_view::SidebarContextAction;
 
-fn session_fence(shell: &AppShell) -> Option<SessionRequestFence> {
-    let (Some(token), Some(uid)) =
-        (shell.session_sync.session_token.clone(), shell.session_sync.user_id)
-    else {
-        return None;
-    };
-    Some(SessionRequestFence {
-        auth_generation: shell.session_sync.auth_generation,
-        request_generation: 0,
-        token,
-        user_id: uid,
-    })
-}
-
-fn fence_matches(fence: &SessionRequestFence, shell: &AppShell) -> bool {
-    fence.matches(
-        shell.is_authenticated,
-        shell.session_sync.auth_generation,
-        0,
-        shell.session_sync.session_token.as_deref(),
-        shell.session_sync.user_id,
-    )
-}
-
 impl AppShell {
     /// Fetches chat folders from backend and updates navigation rail and folder settings.
     pub fn refresh_folders(&mut self, cx: &mut Context<Self>) {
-        let Some(fence) = session_fence(self) else {
+        let Some(fence) = self.capture_client_fence() else {
             return;
         };
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            if let Ok(folders) = client.list_folders().await {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            if let Ok(folders) = fence
+                .client
+                .list_folders_with_token(&fence.token, fence.client_epoch)
+                .await
+            {
                 let _ = weak.update(app, |shell, cx| {
-                    if !fence_matches(&fence, shell) {
+                    if !fence.is_valid(shell) {
                         return;
                     }
                     shell.client.local_store.set_folders(folders.clone());
@@ -65,14 +47,20 @@ impl AppShell {
 
     /// Fetches user contacts from backend and syncs both shell cache and contacts modal.
     pub fn refresh_contacts(&mut self, cx: &mut Context<Self>) {
-        let Some(fence) = session_fence(self) else {
+        let Some(fence) = self.capture_client_fence() else {
             return;
         };
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            if let Ok(list) = client.list_contacts().await {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            if let Ok(list) = fence
+                .client
+                .list_contacts_with_token(&fence.token, fence.client_epoch)
+                .await
+            {
                 let _ = weak.update(app, |shell, cx| {
-                    if !fence_matches(&fence, shell) {
+                    if !fence.is_valid(shell) {
                         return;
                     }
                     let rows = contacts_to_modal_rows(&list);
@@ -81,6 +69,7 @@ impl AppShell {
                         .filter(|c| !c.is_bot)
                         .filter_map(|c| c.chat_id.map(|cid| cid as u64))
                         .collect();
+                    shell.client.local_store.replace_cached_contacts(&list);
                     shell.session_sync.contacts_list = list;
                     shell.sidebar.update(cx, |sb, sb_cx| {
                         sb.contact_chat_ids = contact_cids;
@@ -99,7 +88,7 @@ impl AppShell {
 
     /// Fetches Stars and TON wallet balance/transactions and lazily updates credits settings.
     pub fn refresh_wallet(&mut self, cx: &mut Context<Self>) {
-        let Some(fence) = session_fence(self) else {
+        let Some(fence) = self.capture_client_fence() else {
             return;
         };
         let uname = self.session_sync.username.clone().unwrap_or_default();
@@ -112,12 +101,26 @@ impl AppShell {
                 });
             }
         });
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let bal = client.wallet_balance().await.ok();
-            let txs = client.wallet_transactions().await.unwrap_or_default();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let bal = fence
+                .client
+                .wallet_balance_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            let txs = if fence.preflight_ui(&weak, app).await {
+                fence
+                    .client
+                    .wallet_transactions_with_token(&fence.token, fence.client_epoch)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                return;
+            };
             let _ = weak.update(app, |shell, cx| {
-                if !fence_matches(&fence, shell) {
+                if !fence.is_valid(shell) {
                     return;
                 }
                 if let Some(b) = bal {
@@ -147,7 +150,7 @@ impl AppShell {
                     if let Some(cid) = active_chat {
                         self.show_chat_toast(cid, msg, 2600, cx);
                     } else {
-                        self.show_toast(msg, 2600, cx);
+                        self.show_non_chat_toast(msg, 2600, cx);
                     }
                 }
             }
@@ -161,7 +164,7 @@ impl AppShell {
                     if let Some(cid) = active_chat {
                         self.show_chat_toast(cid, msg, 2600, cx);
                     } else {
-                        self.show_toast(msg, 2600, cx);
+                        self.show_non_chat_toast(msg, 2600, cx);
                     }
                 }
             }
@@ -169,10 +172,21 @@ impl AppShell {
                 cx.write_to_clipboard(ClipboardItem::new_string(txt))
             }
             InspectorAction::ToggleNotifications(enabled) => {
-                if let Some(cid) = active_chat {
-                    let c = self.client.clone();
-                    cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                        let _ = c.set_chat_muted(cid as i64, !enabled, None).await;
+                if let (Some(cid), Some(fence)) = (active_chat, self.capture_client_fence()) {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let _ = fence
+                            .client
+                            .set_chat_muted_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                cid as i64,
+                                !enabled,
+                                None,
+                            )
+                            .await;
                     })
                     .detach();
                 }
@@ -203,12 +217,29 @@ impl AppShell {
                 );
             }
             InspectorAction::RevokeInviteLink => {
-                if let Some(cid) = active_chat {
-                    let c = self.client.clone();
-                    cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                        if let Ok(invs) = c.list_invites(cid as i64).await {
+                if let (Some(cid), Some(fence)) = (active_chat, self.capture_client_fence()) {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        if let Ok(invs) = fence
+                            .client
+                            .list_invites_with_token(&fence.token, fence.client_epoch, cid as i64)
+                            .await
+                        {
                             if let Some(first) = invs.first() {
-                                let _ = c.revoke_invite(cid as i64, &first.invite_id).await;
+                                if !fence.preflight_ui(&weak, app).await {
+                                    return;
+                                }
+                                let _ = fence
+                                    .client
+                                    .revoke_invite_with_token(
+                                        &fence.token,
+                                        fence.client_epoch,
+                                        cid as i64,
+                                        &first.invite_id,
+                                    )
+                                    .await;
                             }
                         }
                     })
@@ -223,20 +254,39 @@ impl AppShell {
                     let Some(cid) = active_chat else {
                         return;
                     };
-                    let Some(fence) = session_fence(self) else {
+                    let Some(fence) = self.capture_client_fence() else {
                         return;
                     };
-                    let client = self.client.clone();
                     let lang_owned = lang.to_string();
                     cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                        let add_res = client.add_chat_members(cid as i64, &[target_uid]).await;
-                        let refreshed_members = if add_res.is_ok() {
-                            client.get_chat_members(cid as i64).await.ok()
-                        } else {
-                            None
-                        };
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let add_res = fence
+                            .client
+                            .add_chat_members_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                cid as i64,
+                                &[target_uid],
+                            )
+                            .await;
+                        let refreshed_members =
+                            if add_res.is_ok() && fence.preflight_ui(&weak, app).await {
+                                fence
+                                    .client
+                                    .get_chat_members_with_token(
+                                        &fence.token,
+                                        fence.client_epoch,
+                                        cid as i64,
+                                    )
+                                    .await
+                                    .ok()
+                            } else {
+                                None
+                            };
                         let _ = weak.update(app, |shell, cx| {
-                            if !fence_matches(&fence, shell) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             match add_res {
@@ -392,11 +442,23 @@ impl AppShell {
                     if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&cid) {
                         rc.message_ttl_seconds = ttl_u32;
                     }
-                    let c = self.client.clone();
-                    cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                        let _ = c.set_chat_ttl(cid as i64, ttl_u32).await;
-                    })
-                    .detach();
+                    if let Some(fence) = self.capture_client_fence() {
+                        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
+                            }
+                            let _ = fence
+                                .client
+                                .set_chat_ttl_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    cid as i64,
+                                    ttl_u32,
+                                )
+                                .await;
+                        })
+                        .detach();
+                    }
                 }
             }
             InspectorAction::CycleMemberRole(_) => {}
@@ -450,15 +512,8 @@ impl AppShell {
                     })
                     .cloned();
                 if let Some(app) = target_app {
-                    let client = self.client.clone();
-                    let Some(token) = self.session_sync.session_token.clone() else {
+                    let Some(fence) = self.capture_client_fence() else {
                         return;
-                    };
-                    let fence = SessionRequestFence {
-                        auth_generation: self.session_sync.auth_generation,
-                        request_generation: 0,
-                        token,
-                        user_id: self.session_sync.user_id.unwrap_or(0),
                     };
                     let bot_un = app.bot_username.clone();
                     let short = app.short_name.clone();
@@ -467,14 +522,36 @@ impl AppShell {
                         .and_then(|v| u64::try_from(v).ok())
                         .filter(|&id| id > 0)
                         .or(active_chat);
+                    let captured_active_chat = active_chat;
+                    let captured_panel = self.active_panel;
                     cx.spawn(async move |weak: WeakEntity<Self>, app_cx: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app_cx).await {
+                            return;
+                        }
                         let res = if in_attach_now {
-                            client.uninstall_mini_app(&bot_un, &short).await
+                            fence
+                                .client
+                                .uninstall_mini_app_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    &bot_un,
+                                    &short,
+                                )
+                                .await
                         } else {
-                            client.install_mini_app(&bot_un, &short, true).await
+                            fence
+                                .client
+                                .install_mini_app_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    &bot_un,
+                                    &short,
+                                    true,
+                                )
+                                .await
                         };
                         let _ = weak.update(app_cx, |shell, cx| {
-                            if !fence_matches(&fence, shell) {
+                            if !fence.is_valid(shell) {
                                 return;
                             }
                             if let Ok(r) = res {
@@ -484,7 +561,19 @@ impl AppShell {
                                             shell.show_chat_toast(cid, t, 2200, cx);
                                         }
                                     } else {
-                                        shell.show_toast(t, 2200, cx);
+                                        let cur_active = resolve_active_target_chat_id(
+                                            shell.stage.read(cx).active_chat_id,
+                                            shell.sidebar.read(cx).active_chat_id,
+                                        );
+                                        if shell.active_panel == captured_panel
+                                            && cur_active == captured_active_chat
+                                        {
+                                            if let Some(cid) = captured_active_chat {
+                                                shell.show_chat_toast(cid, t, 2200, cx);
+                                            } else {
+                                                shell.show_non_chat_toast(t, 2200, cx);
+                                            }
+                                        }
                                     }
                                 }
                                 shell.refresh_miniapps_catalog(None, cx);
@@ -501,7 +590,7 @@ impl AppShell {
                     if let Some(cid) = active_chat {
                         self.show_chat_toast(cid, msg, 2200, cx);
                     } else {
-                        self.show_toast(msg, 2200, cx);
+                        self.show_non_chat_toast(msg, 2200, cx);
                     }
                 }
             }
@@ -513,7 +602,7 @@ impl AppShell {
                     } else {
                         format!("/{trimmed}")
                     };
-                    self.append_outgoing_text(slash, cx);
+                    self.append_non_composer_outgoing_text(slash, cx);
                 }
             }
             InspectorAction::FocusBotComposer => {
@@ -524,15 +613,17 @@ impl AppShell {
                 });
             }
             InspectorAction::OpenMiniAppTos => {
+                self.occlude_browser_for_overlay(cx);
                 self.prepare_for_lower_z_overlay_open(cx);
                 self.miniapps.miniapp_tos_modal_open = true;
+                self.reconcile_chat_scoped_toasts(cx);
             }
             InspectorAction::OpenBotPrivacyPolicy(url) => {
                 self.open_external_url_with_toast(&url, cx);
             }
             InspectorAction::OpenBotSettings(_bot_id) => {
                 if active_chat.is_some() {
-                    self.append_outgoing_text("/settings".to_string(), cx);
+                    self.append_non_composer_outgoing_text("/settings".to_string(), cx);
                 } else {
                     self.enqueue_localized_toast(
                         "请先点击下方开始或打开机器人对话以配置设置",
@@ -541,6 +632,9 @@ impl AppShell {
                         cx,
                     );
                 }
+            }
+            InspectorAction::OpenAiProvidersSettings => {
+                self.open_ai_providers_settings(cx);
             }
             InspectorAction::OpenAddBotToGroup(bot_id) => {
                 let is_dark = self.theme_state.palette.mode.is_dark();
@@ -638,7 +732,7 @@ impl AppShell {
                     if let Some(cid) = active_chat {
                         self.show_chat_toast(cid, msg, 2200, cx);
                     } else {
-                        self.show_toast(msg, 2200, cx);
+                        self.show_non_chat_toast(msg, 2200, cx);
                     }
                 }
             }
@@ -663,18 +757,42 @@ impl AppShell {
                 let _ = self.handle_computer_inspector_action(act, cx);
             }
             InspectorAction::PatchFabushiBot { bot_id, req } => {
-                let Some(fence) = session_fence(self) else {
+                let Some(fence) = self.capture_client_fence() else {
                     return;
                 };
-                let client = self.client.clone();
                 let lang_owned = lang.to_string();
                 let target_cid = active_chat;
+                let captured_panel = self.active_panel;
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let res = client.patch_fabushi_bot(bot_id, &req).await;
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let res = fence
+                        .client
+                        .patch_fabushi_bot_with_token(&fence.token, fence.client_epoch, bot_id, &req)
+                        .await;
                     let _ = weak.update(app, |shell, cx| {
-                        if !fence_matches(&fence, shell) {
+                        if !fence.is_valid(shell) {
                             return;
                         }
+                        let show_patch_toast =
+                            |shell: &mut Self, msg: String, duration_ms: u64, cx: &mut Context<Self>| {
+                                if let Some(cid) = target_cid {
+                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                        shell.show_chat_toast(cid, msg, duration_ms, cx);
+                                    }
+                                } else {
+                                    let cur_active = resolve_active_target_chat_id(
+                                        shell.stage.read(cx).active_chat_id,
+                                        shell.sidebar.read(cx).active_chat_id,
+                                    );
+                                    if shell.active_panel == captured_panel
+                                        && cur_active.is_none()
+                                    {
+                                        shell.show_non_chat_toast(msg, duration_ms, cx);
+                                    }
+                                }
+                            };
                         match res {
                             Ok(updated) => {
                                 if let Some(slot) = shell
@@ -690,6 +808,23 @@ impl AppShell {
                                 for prof in shell.miniapps.bot_profiles_cache.values_mut() {
                                     if prof.bot.bot_user_id == updated.bot_user_id {
                                         prof.bot.coding_agent = updated.coding_agent.clone();
+                                        prof.bot.preferred_model = updated.preferred_model.clone();
+                                    }
+                                }
+                                if let Some(comp_prof) = shell
+                                    .computers
+                                    .bot_profiles
+                                    .get_mut(&(updated.bot_user_id.max(0) as u64))
+                                {
+                                    comp_prof.preferred_model = updated.preferred_model.clone();
+                                    let synced_prof = comp_prof.clone();
+                                    if shell.inspector.read(cx).profile.bot_id
+                                        == updated.bot_user_id.max(0) as u64
+                                    {
+                                        shell.inspector.update(cx, |insp, icx| {
+                                            insp.sync_bot_computer_profile(Some(synced_prof));
+                                            icx.notify();
+                                        });
                                     }
                                 }
                                 shell.sync_fabushi_bots_to_views(cx);
@@ -699,13 +834,7 @@ impl AppShell {
                                     "已更新 Fabushi 智能体配置",
                                     "Updated Fabushi bot settings",
                                 );
-                                if let Some(cid) = target_cid {
-                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
-                                        shell.show_chat_toast(cid, msg, 1800, cx);
-                                    }
-                                } else {
-                                    shell.show_toast(msg, 1800, cx);
-                                }
+                                show_patch_toast(shell, msg.to_string(), 1800, cx);
                             }
                             Err(e) => {
                                 let msg = format!(
@@ -713,13 +842,7 @@ impl AppShell {
                                     tr_str(&lang_owned, "更新失败", "Update failed"),
                                     e
                                 );
-                                if let Some(cid) = target_cid {
-                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
-                                        shell.show_chat_toast(cid, msg, 2600, cx);
-                                    }
-                                } else {
-                                    shell.show_toast(msg, 2600, cx);
-                                }
+                                show_patch_toast(shell, msg, 2600, cx);
                             }
                         }
                         cx.notify();
@@ -742,6 +865,8 @@ impl AppShell {
             || self.sidebar.read(cx).active_chat_id == Some(cid);
         self.session_sync.rich_chats_by_id.remove(&cid);
         self.session_sync.chat_peer_user_ids.remove(&cid);
+        self.session_sync
+            .bump_draft_op_gen_and_clear_in_flight(cid);
         self.session_sync.last_draft_text_by_chat.remove(&cid);
         self.session_sync.last_saved_draft_by_chat.remove(&cid);
         self.client
@@ -805,7 +930,9 @@ impl AppShell {
             let w = ov.read(cx);
             w.companion_chat_id == Some(cid_i64) || w.source_chat_id == Some(cid_i64)
         }) {
-            self.miniapps.miniapp_overlay = None;
+            if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+                ov.update(cx, |w, _| w.close());
+            }
             self.miniapps.is_miniapp_minimized = false;
             self.clear_ime_if_miniapp_unoccluded(cx);
         }
@@ -849,12 +976,14 @@ impl AppShell {
             });
             if let Some(next_id) = next_chat_id {
                 self.composer.update(cx, |comp, c_cx| {
-                    comp.cancel_reply_or_edit();
-                    comp.editor.attachments.clear();
-                    comp.submitted_attachment = None;
-                    comp.pending_attached_files = None;
-                    comp.clear_bot_reply_keyboard();
-                    c_cx.notify();
+                    if !comp.is_compose_isolated {
+                        comp.cancel_reply_or_edit();
+                        comp.editor.attachments.clear();
+                        comp.submitted_attachment = None;
+                        comp.pending_attached_files = None;
+                        comp.clear_bot_reply_keyboard();
+                        c_cx.notify();
+                    }
                 });
                 self.sidebar.update(cx, |sb, _| sb.select_dialog(next_id));
                 self.sync_selected_chat_inspector_and_stage(next_id, cx);
@@ -865,20 +994,20 @@ impl AppShell {
                 });
                 let still_isolated = self.is_compose_or_creation_modal_active(cx);
                 self.composer.update(cx, |comp, c_cx| {
-                    comp.clear();
-                    comp.clear_bot_menu(Some(c_cx));
-                    comp.set_bot_slash_commands(Vec::new());
-                    comp.set_hermes_slash_enabled(false);
-                    comp.clear_bot_reply_keyboard();
-                    comp.cancel_reply_or_edit();
-                    comp.editor.attachments.clear();
-                    comp.submitted_attachment = None;
-                    comp.pending_attached_files = None;
-                    comp.set_send_as_options(Vec::new(), None);
                     if !still_isolated {
+                        comp.clear();
+                        comp.clear_bot_menu(Some(c_cx));
+                        comp.set_bot_slash_commands(Vec::new());
+                        comp.set_hermes_slash_enabled(false);
+                        comp.clear_bot_reply_keyboard();
+                        comp.cancel_reply_or_edit();
+                        comp.editor.attachments.clear();
+                        comp.submitted_attachment = None;
+                        comp.pending_attached_files = None;
+                        comp.set_send_as_options(Vec::new(), None);
                         comp.is_compose_isolated = false;
+                        c_cx.notify();
                     }
-                    c_cx.notify();
                 });
                 self.inspector.update(cx, |insp, insp_cx| {
                     insp.clear_peer_facts();
@@ -901,7 +1030,6 @@ impl AppShell {
         action: SidebarContextAction,
         cx: &mut Context<Self>,
     ) {
-        let client = self.client.clone();
         match action {
             SidebarContextAction::TogglePin(id) => {
                 let pinned = self
@@ -921,10 +1049,23 @@ impl AppShell {
                         st_cx.notify();
                     });
                 }
-                cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                    let _ = client.set_chat_pinned(id as i64, pinned).await;
-                })
-                .detach();
+                if let Some(fence) = self.capture_client_fence() {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let _ = fence
+                            .client
+                            .set_chat_pinned_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                id as i64,
+                                pinned,
+                            )
+                            .await;
+                    })
+                    .detach();
+                }
             }
             SidebarContextAction::ToggleMute(id) => {
                 let muted = self
@@ -944,30 +1085,75 @@ impl AppShell {
                         st_cx.notify();
                     });
                 }
-                cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                    let _ = client.set_chat_muted(id as i64, muted, None).await;
-                })
-                .detach();
+                if let Some(fence) = self.capture_client_fence() {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let _ = fence
+                            .client
+                            .set_chat_muted_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                id as i64,
+                                muted,
+                                None,
+                            )
+                            .await;
+                    })
+                    .detach();
+                }
             }
             SidebarContextAction::ToggleArchive(id) => {
                 let arch = self.sidebar.read(cx).archived_ids.contains(&id);
                 if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&id) {
                     rc.is_archived = arch;
                 }
-                cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                    let _ = client.set_chat_archived(id as i64, arch).await;
-                })
-                .detach();
+                if let Some(fence) = self.capture_client_fence() {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let _ = fence
+                            .client
+                            .set_chat_archived_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                id as i64,
+                                arch,
+                            )
+                            .await;
+                    })
+                    .detach();
+                }
             }
             SidebarContextAction::DeleteChat(id) => {
+                let fence = self.capture_client_fence();
                 self.cleanup_deleted_or_left_chat_state(id, cx);
-                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let _ = client.leave_or_delete_chat(id as i64).await;
-                    let _ = weak.update(app, |s, cx| s.refresh_chats(cx));
-                })
-                .detach();
+                if let Some(fence) = fence {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let _ = fence
+                            .client
+                            .leave_or_delete_chat_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                id as i64,
+                            )
+                            .await;
+                        let _ = weak.update(app, |s, cx| {
+                            if fence.is_valid(s) {
+                                s.refresh_chats(cx);
+                            }
+                        });
+                    })
+                    .detach();
+                }
             }
             SidebarContextAction::ClearHistory(id) => {
+                let fence = self.capture_client_fence();
                 self.stage.update(cx, |st, st_cx| {
                     st.chat_histories.insert(id, Vec::new());
                     if st.active_chat_id == Some(id) {
@@ -976,11 +1162,27 @@ impl AppShell {
                         st_cx.notify();
                     }
                 });
-                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    let _ = client.clear_chat_history(id as i64).await;
-                    let _ = weak.update(app, |s, cx| s.refresh_chats(cx));
-                })
-                .detach();
+                if let Some(fence) = fence {
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let _ = fence
+                            .client
+                            .clear_chat_history_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                id as i64,
+                            )
+                            .await;
+                        let _ = weak.update(app, |s, cx| {
+                            if fence.is_valid(s) {
+                                s.refresh_chats(cx);
+                            }
+                        });
+                    })
+                    .detach();
+                }
             }
             SidebarContextAction::ToggleUnread(_) => {}
         }

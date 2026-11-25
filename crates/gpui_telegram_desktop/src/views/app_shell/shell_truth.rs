@@ -1,8 +1,13 @@
 //! Truthful initial state, authoritative sync, and session/generation fencing (`FUS-D004`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use gpui::{AsyncApp, WeakEntity};
+use gpui_telegram_client::TelegramClient;
 
 use crate::views::chat_sidebar::{DialogDeliveryStatus, DialogItemModel};
+use crate::views::shell::AppShell;
 use crate::views::stage::cards::{
     DeliveryStatus, InlineButtonType, InlineKeyboardButton, MediaType, MessageContent,
     MessageDirection, MessageItemModel, PollOption, PollType, ReactionItem, ReplyReference,
@@ -36,6 +41,79 @@ impl SessionRequestFence {
             && self.request_generation == current_req_gen
             && current_token == Some(self.token.as_str())
             && current_user_id == Some(self.user_id)
+    }
+}
+
+#[derive(Clone)]
+pub struct ClientCallFence {
+    pub auth_generation: u64,
+    pub user_id: Option<u64>,
+    pub token: String,
+    pub session_token: Option<String>,
+    pub client: Arc<TelegramClient>,
+    pub client_epoch: u64,
+}
+
+impl ClientCallFence {
+    pub fn capture(shell: &AppShell) -> Option<Self> {
+        if !shell.is_authenticated {
+            return None;
+        }
+        let session_token = shell
+            .session_sync
+            .session_token
+            .clone()
+            .filter(|t| !t.trim().is_empty());
+        let token = shell
+            .client
+            .token()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| session_token.clone())?;
+        Some(Self {
+            auth_generation: shell.session_sync.auth_generation,
+            user_id: shell.session_sync.user_id,
+            token,
+            session_token,
+            client: shell.client.clone(),
+            client_epoch: shell.client.session_epoch(),
+        })
+    }
+
+    pub fn matches_shell(&self, shell: &AppShell) -> bool {
+        shell.is_authenticated
+            && shell.session_sync.auth_generation == self.auth_generation
+            && shell.session_sync.user_id == self.user_id
+            && Arc::ptr_eq(&shell.client, &self.client)
+            && shell.client.session_epoch() == self.client_epoch
+            && shell
+                .session_sync
+                .session_token
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                == self.session_token.as_deref()
+    }
+
+    pub fn is_valid(&self, shell: &AppShell) -> bool {
+        self.matches_shell(shell)
+            && self
+                .client
+                .ensure_pinned_session(self.client_epoch, &self.token)
+                .is_ok()
+    }
+
+    pub async fn preflight_ui(&self, weak: &WeakEntity<AppShell>, app: &mut AsyncApp) -> bool {
+        weak.update(app, |shell, _| self.matches_shell(shell))
+            .unwrap_or(false)
+            && self
+                .client
+                .ensure_pinned_session(self.client_epoch, &self.token)
+                .is_ok()
+    }
+}
+
+impl AppShell {
+    pub fn capture_client_fence(&self) -> Option<ClientCallFence> {
+        ClientCallFence::capture(self)
     }
 }
 
@@ -383,10 +461,14 @@ pub fn apply_authoritative_chat_list(
         })
         .collect();
     sidebar.inner_widget.total_rows = sidebar.dialogs.len();
+    sidebar.is_loading_dialogs = false;
+    sidebar.has_synced_dialogs = true;
     sidebar.recompute_folder_badges();
 
     let valid_ids: HashSet<u64> = sidebar.dialogs.iter().map(|d| d.id).collect();
+    stage.is_loading_workspace = false;
     stage.chat_histories.retain(|id, _| valid_ids.contains(id));
+    stage.loaded_history_chats.retain(|id| valid_ids.contains(id));
     stage.chat_pinned_messages.retain(|id, _| valid_ids.contains(id));
     stage.chat_scroll_positions.retain(|id, _| valid_ids.contains(id));
 
@@ -766,7 +848,7 @@ fn message_content_preview(content: &MessageContent) -> String {
     }
 }
 
-fn resolve_reply_references(models: &mut [MessageItemModel], existing: &[MessageItemModel]) {
+pub fn resolve_reply_references(models: &mut [MessageItemModel], existing: &[MessageItemModel]) {
     let mut index: HashMap<u64, (String, String)> = existing
         .iter()
         .map(|m| (m.id, (m.sender_name.clone(), message_content_preview(&m.content))))
@@ -792,6 +874,29 @@ fn resolve_reply_references(models: &mut [MessageItemModel], existing: &[Message
             }
         }
     }
+}
+
+/// Converts a persisted `CachedChatHistorySnapshot` into stage `MessageItemModel` rows
+/// with rich sender/keyboard metadata and resolved reply references for instant 0ms hydration.
+pub fn build_cached_history_models(
+    messages: &[HistoricalMessage],
+    rich_messages: &[HermesRichMessageDto],
+    self_user_id: u64,
+    peer_name: &str,
+    peer_initials: &str,
+    peer_color: u32,
+) -> Vec<MessageItemModel> {
+    let mut models: Vec<MessageItemModel> = messages
+        .iter()
+        .map(|hm| {
+            historical_message_to_model(hm, self_user_id, peer_name, peer_initials, peer_color)
+        })
+        .collect();
+    if !rich_messages.is_empty() {
+        overlay_rich_message_metadata(&mut models, rich_messages);
+    }
+    resolve_reply_references(&mut models, &[]);
+    models
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -871,7 +976,9 @@ pub fn apply_authoritative_chat_history(
         }
     }
 
+    stage.loaded_history_chats.insert(chat_id);
     if stage.active_chat_id == Some(chat_id) {
+        stage.is_loading_history = false;
         stage.messages = reconciled.clone();
         stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
     }

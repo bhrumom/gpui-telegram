@@ -221,9 +221,11 @@ fn render_collapsed_icon_btn<V: 'static>(
 }
 
 /// Renders the `64px` collapsed rail with expand toggle, new-chat/contacts shortcuts, scrollable chat avatars, add-friend & account triggers.
+#[allow(clippy::too_many_arguments)]
 pub fn render_collapsed_gemini_sidebar<V: 'static>(
     nav: &UnifiedNavSnapshot,
     dialogs: &[(&DialogItemModel, SidebarDialogMeta)],
+    is_loading_dialogs: bool,
     active_chat_id: Option<u64>,
     hovered_item: Option<&'static str>,
     hovered_dialog_id: Option<u64>,
@@ -398,6 +400,25 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                     on_action.clone(),
                     UnifiedSidebarAction::OpenContacts,
                 ))
+                .child(render_collapsed_icon_btn(
+                    "rail-browser-btn",
+                    "browser",
+                    IconName::ScreenShare,
+                    tr_str(lang_id, "内置浏览器", "Browser"),
+                    nav.active_destination == NavDestination::Browser,
+                    0,
+                    hovered_item,
+                    palette,
+                    cx,
+                    on_action.clone(),
+                    UnifiedSidebarAction::SelectDestination(
+                        if nav.active_destination == NavDestination::Browser {
+                            NavDestination::Chats
+                        } else {
+                            NavDestination::Browser
+                        },
+                    ),
+                ))
                 .child(
                     div()
                         .w(px(24.0))
@@ -422,6 +443,37 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                 .flex_col()
                 .items_center()
                 .gap(px(8.0))
+                .when(is_loading_dialogs && dialogs.is_empty(), |el| {
+                    let skel_col = if palette.mode.is_dark() {
+                        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.10)
+                    } else {
+                        TdesktopThemePalette::rgba_with_alpha(0x000000, 0.08)
+                    };
+                    let fades: [f32; 5] = [0.95, 0.78, 0.62, 0.46, 0.30];
+                    el.child(
+                        div()
+                            .id("rail-dialogs-loading-skeleton")
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(10.0))
+                            .children(fades.into_iter().map(move |alpha| {
+                                div()
+                                    .w(px(36.0))
+                                    .h(px(36.0))
+                                    .rounded_full()
+                                    .bg(skel_col)
+                                    .opacity(alpha)
+                            }))
+                            .with_animation(
+                                "rail-dialogs-skeleton-pulse",
+                                Animation::new(std::time::Duration::from_millis(1200))
+                                    .repeat()
+                                    .with_easing(pulsating_between(0.45, 1.0)),
+                                |container, delta| container.opacity(delta),
+                            ),
+                    )
+                })
                 .children(dialogs.iter().map(|(dialog, meta)| {
                     let dialog_id = dialog.id;
                     let is_active = active_chat_id == Some(dialog_id);

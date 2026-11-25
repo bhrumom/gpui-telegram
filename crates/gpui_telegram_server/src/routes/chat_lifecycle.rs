@@ -288,6 +288,9 @@ pub async fn chats_create_strict(auth: AuthBearer, State(state): State<Arc<AppSt
     if let Some(arr) = payload.get("member_ids").and_then(|v| v.as_array()) {
         for v in arr {
             if let Some(id) = v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).map(UserId) {
+                if id.0 == gpui_telegram_agent::fabushi_bot::OFFICIAL_DEFAULT_BOT_USER_ID as u64 {
+                    crate::server::ensure_default_ai_bot(&state.db);
+                }
                 if id != auth.user_id && !member_ids.contains(&id) { member_ids.push(id); }
             }
         }
@@ -301,6 +304,11 @@ pub async fn chats_create_strict(auth: AuthBearer, State(state): State<Arc<AppSt
                     }
                 } else if let Some(inst) = state.fabushi_bots.get_by_agent_id_or_username(un) {
                     let buid = UserId(inst.bot_user_id as u64);
+                    if buid != auth.user_id && !member_ids.contains(&buid) {
+                        member_ids.push(buid);
+                    }
+                } else if let Ok(Some(bot_rec)) = state.db.get_bot_by_username(un) {
+                    let buid = UserId(bot_rec.bot_user_id as u64);
                     if buid != auth.user_id && !member_ids.contains(&buid) {
                         member_ids.push(buid);
                     }

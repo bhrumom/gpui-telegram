@@ -13,10 +13,10 @@ use gpui_telegram_proto::{
 use rusqlite::{params, OptionalExtension, Row, Transaction};
 use std::collections::HashSet;
 
-/// Migration V41: Authoritative user cloud creations, physically isolated public catalog,
+/// Migration V42: Authoritative user cloud creations, physically isolated public catalog,
 /// standalone FTS5 index with atomic triggers, immutable review audit log, per-user states,
 /// public ratings/reviews, game leaderboards, and CAS public asset allowlist.
-pub const MIGRATION_V41_CREATIONS_AND_CATALOG: &str = r#"
+pub const MIGRATION_V42_CREATIONS_AND_CATALOG: &str = r#"
 CREATE TABLE IF NOT EXISTS user_creations (
     creation_id TEXT PRIMARY KEY,
     owner_user_id INTEGER NOT NULL REFERENCES users(user_id),

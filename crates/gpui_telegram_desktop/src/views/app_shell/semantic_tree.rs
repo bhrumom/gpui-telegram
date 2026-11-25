@@ -34,6 +34,7 @@ fn active_panel_label(panel: ActiveWorkspacePanel) -> String {
         ActiveWorkspacePanel::Calls => "Calls".to_string(),
         ActiveWorkspacePanel::TaskCenter => "TaskCenter".to_string(),
         ActiveWorkspacePanel::McpTools => "McpTools".to_string(),
+        ActiveWorkspacePanel::Browser => "Browser".to_string(),
         ActiveWorkspacePanel::Settings => "Settings".to_string(),
         ActiveWorkspacePanel::ContentHub(section) => format!("ContentHub({section:?})"),
     }
@@ -48,6 +49,7 @@ fn nav_dest_label(dest: NavDestination) -> String {
         NavDestination::McpTools => "McpTools".to_string(),
         NavDestination::TalkMode => "TalkMode".to_string(),
         NavDestination::RemoteComputer => "RemoteComputer".to_string(),
+        NavDestination::Browser => "Browser".to_string(),
         NavDestination::SavedMessages => "SavedMessages".to_string(),
         NavDestination::Settings => "Settings".to_string(),
     }
@@ -181,6 +183,7 @@ impl AppShell {
                                 }
                             });
                         });
+                        self.reconcile_chat_scoped_toasts(cx);
                     }
                     (
                         "SelectChat",
@@ -282,6 +285,7 @@ impl AppShell {
                             mcx.notify();
                         }
                     });
+                    self.reconcile_chat_scoped_toasts(cx);
                     (
                         "OpenModal",
                         true,

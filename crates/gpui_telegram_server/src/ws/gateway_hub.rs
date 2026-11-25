@@ -1,5 +1,7 @@
 use chrono::Utc;
-use gpui_telegram_core::types::{ChatId, MessageFlags, MessageId, MsgId, PeerId, UserId, UserStatus};
+use gpui_telegram_core::types::{
+    ChatId, MessageFlags, MessageId, MsgId, PeerId, TopicId, UserId, UserStatus,
+};
 use gpui_telegram_proto::contracts::CallSignalRequest;
 use gpui_telegram_proto::message::{DeleteTombstone, MessageContent, MessageItem, ReactionCount, ReplyHeader};
 use gpui_telegram_proto::sync::{
@@ -13,6 +15,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+pub type WsMessageSentHandler =
+    Arc<dyn Fn(ChatId, UserId, MsgId, String, Option<MsgId>, Option<TopicId>, i64) + Send + Sync>;
 
 #[derive(Clone)]
 struct WsSubscriberEntry {
@@ -92,6 +97,8 @@ pub struct GatewayHub {
     ws_guard: Arc<WsTaskGuard>,
     /// Optional callback invoked when a remote SessionRevoked event arrives
     session_revoked_handler: Arc<RwLock<Option<Arc<dyn Fn(u64, &str) + Send + Sync>>>>,
+    /// Optional callback invoked after a plaintext WsClientFrame::SendMessage commits new PTS
+    message_sent_handler: Arc<RwLock<Option<WsMessageSentHandler>>>,
     /// Shared liveness token for clean background task shutdown
     liveness: Arc<()>,
 }
@@ -116,6 +123,7 @@ struct WeakGatewayHub {
     shutdown_tx: std::sync::Weak<tokio::sync::watch::Sender<bool>>,
     ws_guard: std::sync::Weak<WsTaskGuard>,
     session_revoked_handler: std::sync::Weak<RwLock<Option<Arc<dyn Fn(u64, &str) + Send + Sync>>>>,
+    message_sent_handler: std::sync::Weak<RwLock<Option<WsMessageSentHandler>>>,
     liveness: std::sync::Weak<()>,
 }
 
@@ -141,6 +149,7 @@ impl WeakGatewayHub {
             shutdown_tx: self.shutdown_tx.upgrade()?,
             ws_guard: self.ws_guard.upgrade()?,
             session_revoked_handler: self.session_revoked_handler.upgrade()?,
+            message_sent_handler: self.message_sent_handler.upgrade()?,
             liveness: self.liveness.upgrade()?,
         })
     }
@@ -188,6 +197,7 @@ impl Default for GatewayHub {
             shutdown_tx,
             ws_guard,
             session_revoked_handler: Arc::new(RwLock::new(None)),
+            message_sent_handler: Arc::new(RwLock::new(None)),
             liveness: Arc::new(()),
         }
     }
@@ -249,6 +259,10 @@ impl GatewayHub {
 
     pub fn set_session_revoked_handler(&self, handler: Arc<dyn Fn(u64, &str) + Send + Sync>) {
         *self.session_revoked_handler.write() = Some(handler);
+    }
+
+    pub fn set_message_sent_handler(&self, handler: WsMessageSentHandler) {
+        *self.message_sent_handler.write() = Some(handler);
     }
 
     pub fn set_event_bus(&self, bus: Arc<dyn crate::bus::CrossNodeEventBus>) {
@@ -358,6 +372,9 @@ impl GatewayHub {
 
         let old_revoked = self.session_revoked_handler.write().take();
         drop(old_revoked);
+
+        let old_msg_sent = self.message_sent_handler.write().take();
+        drop(old_msg_sent);
     }
 
     fn downgrade(&self) -> WeakGatewayHub {
@@ -381,6 +398,7 @@ impl GatewayHub {
             shutdown_tx: Arc::downgrade(&self.shutdown_tx),
             ws_guard: Arc::downgrade(&self.ws_guard),
             session_revoked_handler: Arc::downgrade(&self.session_revoked_handler),
+            message_sent_handler: Arc::downgrade(&self.message_sent_handler),
             liveness: Arc::downgrade(&self.liveness),
         }
     }
@@ -1159,7 +1177,22 @@ impl GatewayHub {
                                 message_id: msg_id,
                                 pts: pts_update.pts,
                             });
+                            let pts_count = pts_update.pts_count;
                             self.broadcast_to_chat_and_members(req.chat_id, Some(user_id), WsServerFrame::PtsPush(pts_update));
+                            if pts_count > 0 && !matches!(req.content, MessageContent::Encrypted(_)) {
+                                if let Some(handler) = self.message_sent_handler.read().clone() {
+                                    let preview = crate::server::extract_message_content_text(&req.content);
+                                    handler(
+                                        req.chat_id,
+                                        user_id,
+                                        MsgId(msg_id),
+                                        preview,
+                                        req.reply_to,
+                                        req.topic_id,
+                                        date_ms,
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             let _ = reply_tx.send(WsServerFrame::Error {

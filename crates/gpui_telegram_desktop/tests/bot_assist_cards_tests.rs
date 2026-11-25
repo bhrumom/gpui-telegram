@@ -2020,11 +2020,27 @@ async fn body_appshell_zero_friction_split_key_and_v1_upgrade(mut cx: AsyncApp) 
             assert!(!st_json.contains("/vault-setup"));
             assert!(!st_json.contains("/vault-unlock"));
 
-            // Navigating to Settings -> PrivacySecurity propagates custody state immediately
+            // Navigating to Settings -> PrivacySecurity triggers Navigated subscriber
             s.settings_router.update(cx, |r, rcx| {
                 r.navigate_to(SettingsSectionType::PrivacySecurity, true, rcx);
             });
-            s.sync_vault_custody_to_settings(cx);
+        })
+        .unwrap();
+
+    for _ in 0..80 {
+        let materialized = shell_a
+            .read_with(&cx, |s, cx| s.settings_router.read(cx).settings_privacy.is_some())
+            .unwrap();
+        if materialized {
+            break;
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+
+    shell_a
+        .read_with(&cx, |s, cx| {
             let sp = s
                 .settings_router
                 .read(cx)

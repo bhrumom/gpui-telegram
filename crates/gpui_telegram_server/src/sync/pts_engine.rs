@@ -108,6 +108,7 @@ impl PtsEngine {
             UpdateEvent::CodingHostCommand(_) => "coding_host_command",
             UpdateEvent::UserCreationChanged { .. } => "user_creation_changed",
             UpdateEvent::PublicCatalogChanged { .. } => "public_catalog_changed",
+            UpdateEvent::CommunityEvent { .. } => "community_event",
         };
 
         let (new_pts, pts_update) = self.db.pool().with_transaction(|tx| {

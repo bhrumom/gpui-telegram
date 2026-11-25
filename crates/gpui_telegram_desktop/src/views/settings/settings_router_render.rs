@@ -483,8 +483,28 @@ impl SettingsRouter {
 impl Render for SettingsRouter {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette;
-        let box_w = pal.scaled_px(540.0).min(880.0);
-        let box_h = pal.scaled_px(650.0).min(840.0);
+        let is_computers = self.settings_section == SettingsSectionType::Computers;
+        let (box_w, box_h) = if is_computers {
+            (
+                pal.scaled_px(960.0).min(1160.0),
+                pal.scaled_px(660.0).min(860.0),
+            )
+        } else {
+            (
+                pal.scaled_px(540.0).min(880.0),
+                pal.scaled_px(650.0).min(840.0),
+            )
+        };
+        let panel_body: AnyElement = if is_computers {
+            let standalone = self.standalone_computers_mode;
+            let comp = self.ensure_computers(cx);
+            if comp.read(cx).standalone_mode != standalone {
+                comp.update(cx, |sc, _| sc.standalone_mode = standalone);
+            }
+            comp.into_any_element()
+        } else {
+            self.render_settings_panel(cx).into_any_element()
+        };
         div()
             .id("telegram-settings-modal-backdrop")
             .absolute()
@@ -512,7 +532,7 @@ impl Render for SettingsRouter {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(self.render_settings_panel(cx)),
+                    .child(panel_body),
             )
     }
 }

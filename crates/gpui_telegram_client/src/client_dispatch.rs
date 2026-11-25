@@ -396,6 +396,7 @@ pub(crate) fn apply_update_event(
                 action,
             });
         }
+        UpdateEvent::CommunityEvent { .. } => {}
     }
 }
 

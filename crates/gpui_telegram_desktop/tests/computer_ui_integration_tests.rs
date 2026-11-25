@@ -363,3 +363,170 @@ fn sync_measured_row_heights_updates_prefix_sums_and_prevents_bottom_overscroll_
     assert!(stage.is_at_bottom());
     assert_eq!(stage.unread_anchor_msg_id, Some(40));
 }
+
+#[test]
+fn bot_profile_model_syncs_with_settings_and_never_injects_fake_gpt54() {
+    use gpui_telegram_client::net::hermes_client::{
+        MagpiePresetDto, MagpieProviderDto, MagpieRoutingGroupDto, MagpieStateDto,
+        MagpieSubscriptionDto,
+    };
+    use gpui_telegram_desktop::views::drawer::bot_computer_inspector::format_bot_effective_model_label;
+    use gpui_telegram_desktop::views::drawer::InspectorAiModelCatalog;
+    use gpui_telegram_desktop::views::settings::sections::settings_ai_providers::SubscriptionAccountDto;
+
+    // 1. Fresh ContextInspector with no BotComputerProfileDto must NOT inject fake "gpt-5.4".
+    let mut insp = ContextInspector::new();
+    insp.sync_bot_computer_profile(None);
+    assert!(
+        insp.bot_draft_model.is_empty(),
+        "sync_bot_computer_profile(None) must keep bot_draft_model empty instead of injecting fake gpt-5.4"
+    );
+
+    // 2. Sync real Settings state (Google Vertex AI active with Gemini models + routing group).
+    let magpie_state = MagpieStateDto {
+        active_provider: "google_vertex:my-proj".to_string(),
+        active_model: "gemini-2.5-pro".to_string(),
+        needs_provider_selection: false,
+        has_active_subscription: true,
+        has_configured_provider: true,
+        subscriptions: vec![MagpieSubscriptionDto {
+            id: "google_vertex:my-proj".to_string(),
+            kind: "google_vertex".to_string(),
+            label: "Magpie Google Vertex AI (Magpie)".to_string(),
+            active: true,
+            default_model: Some("gemini-2.5-pro".to_string()),
+            ..Default::default()
+        }],
+        providers: vec![MagpieProviderDto {
+            provider_id: "google_vertex:my-proj".to_string(),
+            name: "Google Vertex AI".to_string(),
+            default_model: "gemini-2.5-pro".to_string(),
+            models: vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+            enabled: true,
+            is_active: true,
+            ..Default::default()
+        }],
+        routing_groups: vec![MagpieRoutingGroupDto {
+            id: "smart-pool".to_string(),
+            name: "Smart Pool".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let local_subs = vec![SubscriptionAccountDto {
+        id: "google_vertex:my-proj".to_string(),
+        kind: "google_vertex".to_string(),
+        label: "Google Vertex AI".to_string(),
+        models: vec![
+            "gemini-2.5-pro".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-flash-lite".to_string(),
+        ],
+        active: true,
+        ..Default::default()
+    }];
+
+    let catalog = InspectorAiModelCatalog::from_magpie_state(&magpie_state, &[], &local_subs);
+    assert!(catalog.synced);
+    assert_eq!(catalog.active_provider_name, "Google Vertex AI");
+    assert_eq!(catalog.active_model, "gemini-2.5-pro");
+    assert_eq!(
+        catalog.active_summary().as_deref(),
+        Some("Google Vertex AI · gemini-2.5-pro")
+    );
+    let selectable = catalog.selectable_models();
+    assert!(selectable.contains(&"gemini-2.5-pro".to_string()));
+    assert!(selectable.contains(&"gemini-2.5-flash".to_string()));
+    assert!(selectable.contains(&"gemini-2.5-flash-lite".to_string()));
+    assert!(selectable.contains(&"group/smart-pool".to_string()));
+    assert!(
+        !selectable.iter().any(|m| m == "gpt-5.4" || m == "claude-sonnet-4.6" || m == "deepseek-reasoner"),
+        "selectable models must reflect Settings only, never hardcoded fake presets: {selectable:?}"
+    );
+    assert!(catalog.is_model_consistent_with_settings(""));
+    assert!(catalog.is_model_consistent_with_settings("gemini-2.5-flash"));
+    assert!(catalog.is_model_consistent_with_settings("group/smart-pool"));
+    assert!(!catalog.is_model_consistent_with_settings("gpt-5.4"));
+
+    insp.sync_ai_models(catalog);
+
+    // 3. When bot has no explicit override, label reflects Settings' live active model.
+    assert_eq!(
+        format_bot_effective_model_label(&insp, "zh-CN"),
+        "跟随设置 · gemini-2.5-pro"
+    );
+    assert_eq!(
+        format_bot_effective_model_label(&insp, "en"),
+        "Settings · gemini-2.5-pro"
+    );
+
+    // 4. Stale override inconsistent with active Settings provider is explicitly flagged.
+    insp.sync_bot_computer_profile(Some(BotComputerProfileDto {
+        bot_id: 777001,
+        bound_node_id: None,
+        persona_prompt: String::new(),
+        preferred_model: "gpt-5.4".to_string(),
+        approval_mode: ComputerRunPolicy::AskEveryTime,
+        allow_cross_device_control: true,
+        allow_cloud_self_config: true,
+        updated_at_ms: 1_700_000_000_000,
+    }));
+    assert_eq!(
+        format_bot_effective_model_label(&insp, "zh-CN"),
+        "gpt-5.4 (与设置不一致)"
+    );
+
+    // 5. Consistent per-bot override displays cleanly without warning.
+    insp.sync_bot_computer_profile(Some(BotComputerProfileDto {
+        bot_id: 777001,
+        bound_node_id: None,
+        persona_prompt: String::new(),
+        preferred_model: "gemini-2.5-flash".to_string(),
+        approval_mode: ComputerRunPolicy::AskEveryTime,
+        allow_cross_device_control: true,
+        allow_cloud_self_config: true,
+        updated_at_ms: 1_700_000_000_001,
+    }));
+    assert_eq!(
+        format_bot_effective_model_label(&insp, "zh-CN"),
+        "gemini-2.5-flash"
+    );
+
+    // 6. Preset-backed API provider pulls suggested models from Settings' active provider preset.
+    let deepseek_state = MagpieStateDto {
+        active_provider: "deepseek".to_string(),
+        active_model: "deepseek-chat".to_string(),
+        needs_provider_selection: false,
+        has_configured_provider: true,
+        providers: vec![MagpieProviderDto {
+            provider_id: "deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            default_model: "deepseek-chat".to_string(),
+            preset_id: Some("deepseek".to_string()),
+            enabled: true,
+            is_active: true,
+            ..Default::default()
+        }],
+        presets: vec![MagpiePresetDto {
+            id: "deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            default_model: "deepseek-chat".to_string(),
+            suggested_models: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let ds_catalog = InspectorAiModelCatalog::from_magpie_state(&deepseek_state, &[], &[]);
+    assert_eq!(
+        ds_catalog.selectable_models(),
+        vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]
+    );
+
+    // 7. Switching peers keeps account-wide Settings model catalog; logout clears it.
+    insp.sync_ai_models(ds_catalog);
+    insp.clear_peer_facts();
+    assert_eq!(insp.ai_models.active_model, "deepseek-chat");
+    insp.configure_for_cloud_workspace("http://127.0.0.1:8080");
+    assert!(!insp.ai_models.synced);
+    assert!(insp.ai_models.active_model.is_empty());
+}

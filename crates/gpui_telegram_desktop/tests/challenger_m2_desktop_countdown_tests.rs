@@ -205,9 +205,19 @@ fn test_shell_source_ast_countdown_state_machine_compliance() {
         content.contains("s.email_code_cooldown -= 1;"),
         "Countdown ticker must decrement email_code_cooldown"
     );
+    let normalized_ws = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let timer_guard_block = normalized_ws
+        .split("weak_timer .update(")
+        .nth(1)
+        .or_else(|| normalized_ws.split("weak_timer.update(").nth(1))
+        .and_then(|rest| rest.split("s.email_code_cooldown -= 1;").next())
+        .expect("Countdown ticker must contain weak_timer.update guard before decrementing");
     assert!(
-        content.contains("if s.email_cooldown_generation != cd_gen {"),
-        "Countdown ticker must check generation to avoid stale timer races"
+        timer_guard_block.contains("s.email_cooldown_generation != cd_gen")
+            && timer_guard_block.contains("s.is_authenticated")
+            && timer_guard_block.contains("s.client.is_same_session_epoch(expected_epoch)")
+            && timer_guard_block.contains("return false;"),
+        "Countdown ticker must check generation, auth state, and session epoch to avoid stale timer races"
     );
 
     // 4. UI renders countdown vs static button label

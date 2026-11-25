@@ -590,7 +590,7 @@ fn test_nav_rail_1to1_geometry_metrics() {
     assert_eq!(nav_rail::NAV_DIVIDER_HEIGHT, 1.0);
 
     let rail = NavRail::new();
-    assert_eq!(rail.items.len(), 9);
+    assert_eq!(rail.items.len(), 10);
     assert!(!rail.is_connected);
     assert_eq!(rail.account_initials, "TG");
 }

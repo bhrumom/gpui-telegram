@@ -505,6 +505,7 @@ impl AppShell {
     }
 
     pub(crate) fn leave_workspace_modal_panel_for_hub(&mut self, cx: &mut Context<Self>) {
+        self.leave_browser_panel_if_active(cx);
         self.cleanup_settings_panel_if_active(cx);
         if matches!(
             self.active_panel,
@@ -527,6 +528,7 @@ impl AppShell {
     }
 
     fn dismiss_transient_popovers_for_hub(&mut self, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
         self.clear_all_ime_preedits(cx);
         self.main_menu_drawer.update(cx, |m, mcx| {
             if m.is_open {
@@ -540,7 +542,7 @@ impl AppShell {
                 || sb.compose_title_focused
                 || sb.is_account_popover_open
                 || sb.search_focused;
-            sb.exit_compose_mode();
+            sb.cancel_compose_mode();
             sb.is_account_popover_open = false;
             sb.search_focused = false;
             if changed {

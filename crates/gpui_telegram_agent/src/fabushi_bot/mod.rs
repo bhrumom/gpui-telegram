@@ -13,12 +13,20 @@
 
 use crate::acp::AcpRunner;
 use crate::computer::ComputerCloudProvider;
+use crate::hermes::browser_session::{
+    BrowserAutomationEvent, BrowserAutomationSession, BrowserSessionRegistry,
+};
 use crate::hermes::memory::{MemoryTarget, SoulProfile};
 use crate::hermes::security::ApprovalMode;
 use crate::hermes::toolsets::{
     AgenticStateBackend, FabushiTeammateHandler, PlatformImBridge, ToolsetId, ToolsetPreset,
 };
 use crate::hermes::{HermesEngine, HermesEngineConfig};
+use bot_browser::backend::BrowserSessionBackend;
+use bot_browser::script_app::{
+    AutomationScriptApp, ScriptAppMetadata, ScriptReplayReport, VaultSecretResolver,
+};
+use bot_browser::types::BotBrowserError;
 use crate::mcp::ToolPermissionDock;
 use crate::multi_agent::GroupWorkspaceBridge;
 use chrono::Utc;
@@ -50,11 +58,12 @@ use mahayana_host_runtime::runner::sand_agent_profile_prompt::{
 };
 use mahayana_host_runtime::storage::agent_paths::assert_valid_sand_agent_id;
 use serde_json::{Map, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tempfile::TempDir;
+use tokio::sync::broadcast;
 
 pub const OFFICIAL_DEFAULT_BOT_USER_ID: i64 = 777_000;
 pub const OFFICIAL_DEFAULT_AGENT_ID: &str = "fabushi-ai-bot";
@@ -120,7 +129,7 @@ pub fn build_group_turn_guidance(
         format!("Room: {display_room}"),
         format!("Teammates in Room: {peer_list}"),
         format!("Remaining Multi-Agent Turn Budget: {remaining_hops} hop(s)"),
-        "- Stay-Silent Protocol: If another teammate already answered completely, or the message does not require your role/expertise and you have nothing materially new to contribute, respond ONLY with `[PASS]` (or `<PASS/>` / `NO_REPLY`) to yield the floor cleanly without cluttering the room.".to_string(),
+        "- Stay-Silent Protocol: ONLY when another AI teammate in this room has already fully answered the user's message and you have nothing materially new to contribute, respond ONLY with `[PASS]` (or `<PASS/>` / `NO_REPLY`) to yield the floor cleanly without cluttering the room. If a human directly addressed you, you are the only bot in the room, or no teammate has answered the user's latest message yet, you MUST respond helpfully and NEVER output `[PASS]`.".to_string(),
         "- Shared Group Workspace: Use `group_workspace_list`, `group_workspace_read`, and `group_workspace_write` to coordinate structured plans, checklists, and intermediate artifacts with room teammates.".to_string(),
     ];
 
@@ -389,6 +398,7 @@ pub struct FabushiBotHost {
     acp_runner: RwLock<Arc<AcpRunner>>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
     bot_browser: RwLock<Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>>>,
+    browser_registry: RwLock<Arc<BrowserSessionRegistry>>,
     teammate_handler: RwLock<Option<Arc<dyn FabushiTeammateHandler>>>,
     platform_im_bridge: RwLock<Option<Arc<dyn PlatformImBridge>>>,
     agentic_backend: RwLock<Option<Arc<dyn AgenticStateBackend>>>,
@@ -427,6 +437,7 @@ impl FabushiBotHost {
         let default_model = core_config.default_model.clone();
         let core_engine = Arc::new(HermesEngine::new(core_config)?);
         core_engine.set_bound_agent_id(OFFICIAL_DEFAULT_AGENT_ID);
+        let browser_registry = core_engine.browser_registry();
         let acp_runner =
             Arc::new(AcpRunner::new(&default_model).with_hermes_engine(Arc::clone(&core_engine)));
         Ok(Self {
@@ -436,6 +447,7 @@ impl FabushiBotHost {
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
             bot_browser: RwLock::new(None),
+            browser_registry: RwLock::new(browser_registry),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -467,6 +479,7 @@ impl FabushiBotHost {
                 .or_else(|_| HermesEngine::in_memory())?,
         );
         core_engine.set_bound_agent_id(OFFICIAL_DEFAULT_AGENT_ID);
+        let browser_registry = core_engine.browser_registry();
         let acp_runner =
             Arc::new(AcpRunner::new(&model).with_hermes_engine(Arc::clone(&core_engine)));
         Ok(Self {
@@ -476,6 +489,7 @@ impl FabushiBotHost {
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
             bot_browser: RwLock::new(None),
+            browser_registry: RwLock::new(browser_registry),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -495,6 +509,7 @@ impl FabushiBotHost {
         let root = agents_root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let default_model = core_engine.providers().active_info().1;
+        let browser_registry = core_engine.browser_registry();
         let acp_runner =
             Arc::new(AcpRunner::new(&default_model).with_hermes_engine(Arc::clone(&core_engine)));
         Ok(Self {
@@ -504,6 +519,7 @@ impl FabushiBotHost {
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
             bot_browser: RwLock::new(None),
+            browser_registry: RwLock::new(browser_registry),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -522,6 +538,7 @@ impl FabushiBotHost {
         })?;
         let root = temp_dir.path().to_path_buf();
         let default_model = core_engine.providers().active_info().1;
+        let browser_registry = core_engine.browser_registry();
         let acp_runner =
             Arc::new(AcpRunner::new(&default_model).with_hermes_engine(Arc::clone(&core_engine)));
         Ok(Self {
@@ -531,6 +548,7 @@ impl FabushiBotHost {
             acp_runner: RwLock::new(acp_runner),
             computer_provider: RwLock::new(None),
             bot_browser: RwLock::new(None),
+            browser_registry: RwLock::new(browser_registry),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -645,6 +663,8 @@ impl FabushiBotHost {
         &self,
         orchestrator: Arc<bot_browser::orchestrator::BotBrowserOrchestrator>,
     ) {
+        self.browser_registry()
+            .set_orchestrator(Arc::clone(&orchestrator));
         if let Ok(mut guard) = self.bot_browser.write() {
             *guard = Some(Arc::clone(&orchestrator));
         }
@@ -666,6 +686,69 @@ impl FabushiBotHost {
             .ok()
             .and_then(|g| g.clone())
             .or_else(|| self.core_engine.bot_browser())
+    }
+
+    pub fn browser_registry(&self) -> Arc<BrowserSessionRegistry> {
+        self.browser_registry
+            .read()
+            .map(|g| Arc::clone(&*g))
+            .unwrap_or_else(|e| Arc::clone(&*e.into_inner()))
+    }
+
+    pub fn set_browser_registry(&self, registry: Arc<BrowserSessionRegistry>) {
+        if let Some(orch) = self.bot_browser() {
+            registry.set_orchestrator(orch);
+        }
+        if let Ok(mut guard) = self.browser_registry.write() {
+            *guard = Arc::clone(&registry);
+        }
+        self.core_engine.set_browser_registry(Arc::clone(&registry));
+        if let Ok(instances) = self.instances.read() {
+            for inst in instances.values() {
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_browser_registry(Arc::clone(&registry));
+                }
+            }
+        }
+    }
+
+    pub fn register_browser_session(
+        &self,
+        session_id: impl Into<String>,
+        backend: Arc<dyn BrowserSessionBackend>,
+    ) -> Arc<BrowserAutomationSession> {
+        self.browser_registry().register_backend(session_id, backend)
+    }
+
+    pub fn unregister_browser_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<BrowserAutomationSession>> {
+        self.browser_registry().unregister_backend(session_id)
+    }
+
+    pub fn subscribe_browser_events(&self) -> broadcast::Receiver<BrowserAutomationEvent> {
+        self.browser_registry().subscribe()
+    }
+
+    pub fn distill_browser_script(
+        &self,
+        session_id: &str,
+        meta: ScriptAppMetadata,
+    ) -> std::result::Result<AutomationScriptApp, BotBrowserError> {
+        self.browser_registry().distill_script(session_id, meta)
+    }
+
+    pub async fn replay_browser_script(
+        &self,
+        session_id: &str,
+        app: &AutomationScriptApp,
+        params: &BTreeMap<String, String>,
+        vault_resolver: Option<&dyn VaultSecretResolver>,
+    ) -> std::result::Result<ScriptReplayReport, BotBrowserError> {
+        self.browser_registry()
+            .replay_script(session_id, app, params, vault_resolver)
+            .await
     }
 
     pub fn set_teammate_handler(&self, handler: Arc<dyn FabushiTeammateHandler>) {
@@ -893,6 +976,13 @@ impl FabushiBotHost {
             "kanban",
             "接管",
             "takeover",
+            "distill",
+            "脚本",
+            "自动",
+            "网页",
+            "x.com",
+            "发布",
+            "登录",
         ]
         .iter()
         .any(|kw| lower.contains(kw) || trimmed.contains(kw));
@@ -1148,6 +1238,7 @@ impl FabushiBotHost {
                 if let Some(orch) = self.bot_browser() {
                     existing.hermes.set_bot_browser(orch);
                 }
+                existing.hermes.set_browser_registry(self.browser_registry());
             }
             let prof_snap = existing.profile();
             self.register_in_core_registry(
@@ -1242,20 +1333,25 @@ impl FabushiBotHost {
                 hidden_from_sidebar: DEFAULT_HIDDEN_FROM_SIDEBAR,
             }
         };
+        // Keep `preferred_model` empty when no explicit per-bot override was specified so the bot
+        // dynamically follows the user's current active Settings model rather than freezing startup state.
         let preferred_model = spec
             .preferred_model
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                let active = self.core_engine.providers().active_info().1;
-                if active.eq_ignore_ascii_case("hermes-local-v1") {
-                    String::new()
-                } else {
-                    active
-                }
-            });
+            .unwrap_or_default();
+        let runner_default_model = if !preferred_model.is_empty() {
+            preferred_model.clone()
+        } else {
+            let active = self.core_engine.providers().active_info().1;
+            if active.eq_ignore_ascii_case("hermes-local-v1") {
+                String::new()
+            } else {
+                active
+            }
+        };
         let thinking_level = Self::normalize_thinking_level(spec.thinking_level.as_deref());
         let approval_mode = Self::normalize_approval_mode_name(spec.approval_mode.as_deref());
         let toolset_preset = Self::normalize_toolset_preset_name(spec.toolset_preset.as_deref());
@@ -1319,6 +1415,7 @@ impl FabushiBotHost {
             } else if let Some(orch) = self.core_engine.bot_browser() {
                 engine.set_bot_browser(orch);
             }
+            engine.set_browser_registry(self.browser_registry());
             if let Some(handler) = self.teammate_handler.read().ok().and_then(|g| g.clone()) {
                 engine.set_teammate_handler(handler);
             } else if let Some(handler) = self.core_engine.teammate_handler() {
@@ -1349,8 +1446,9 @@ impl FabushiBotHost {
             } else if let Some(dock) = self.core_engine.permission_dock() {
                 engine.set_permission_dock(dock);
             }
-            let runner =
-                Arc::new(AcpRunner::new(&preferred_model).with_hermes_engine(Arc::clone(&engine)));
+            let runner = Arc::new(
+                AcpRunner::new(&runner_default_model).with_hermes_engine(Arc::clone(&engine)),
+            );
             (engine, runner)
         };
 

@@ -13,14 +13,13 @@ use crate::i18n::tr_str;
 use crate::views::app_shell::shell_actions::{
     calls_to_modal_logs, peer_avatar_color, resolve_active_target_chat_id,
 };
-use crate::views::app_shell::shell_truth::{derive_initials, SessionRequestFence};
+use crate::views::app_shell::shell_truth::{derive_initials, ClientCallFence};
 use crate::views::call_overlay::TalkModeState;
-use crate::views::computer_workbench::HostDeviceSpec;
 use crate::views::shell::AppShell;
 use crate::views::stage::cards::{
     DeliveryStatus, MessageContent, MessageDirection, MessageItemModel,
 };
-use crate::views::{CallOverlay, ComputerWorkbench};
+use crate::views::CallOverlay;
 
 fn signaling_frame_to_request(frame: SignalingFrame) -> Option<(CallSignalRequest, Option<u64>)> {
     match frame {
@@ -106,28 +105,10 @@ fn signaling_frame_to_request(frame: SignalingFrame) -> Option<(CallSignalReques
 }
 
 impl AppShell {
-    fn build_session_fence(&self) -> Option<(u64, SessionRequestFence)> {
-        let token = self.session_sync.session_token.clone()?;
+    fn build_session_fence(&self) -> Option<(u64, ClientCallFence)> {
         let uid = self.session_sync.user_id?;
-        Some((
-            uid,
-            SessionRequestFence {
-                auth_generation: self.session_sync.auth_generation,
-                request_generation: 0,
-                token,
-                user_id: uid,
-            },
-        ))
-    }
-
-    fn fence_still_valid(&self, fence: &SessionRequestFence) -> bool {
-        fence.matches(
-            self.is_authenticated,
-            self.session_sync.auth_generation,
-            0,
-            self.session_sync.session_token.as_deref(),
-            self.session_sync.user_id,
-        )
+        let fence = self.capture_client_fence()?;
+        Some((uid, fence))
     }
 
     fn clear_non_call_overlays(&mut self) {
@@ -227,11 +208,16 @@ impl AppShell {
         self.panel_state.calls_loading = true;
         self.panel_state.calls_error = None;
         cx.notify();
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client.list_calls().await;
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let res = fence
+                .client
+                .list_calls_with_token(&fence.token, fence.client_epoch)
+                .await;
             let _ = weak.update(app, |shell, cx| {
-                if !shell.fence_still_valid(&fence) {
+                if !fence.is_valid(shell) {
                     return;
                 }
                 shell.panel_state.calls_loading = false;
@@ -278,20 +264,40 @@ impl AppShell {
                 });
                 if let Some(stars) = rating_opt {
                     if let Some(cid) = shell.rtc_talk.active_call_id.clone() {
-                        let c = shell.client.clone();
-                        cx.spawn(async move |_: WeakEntity<AppShell>, _: &mut AsyncApp| {
-                            let _ = c.rate_call(&cid, stars).await;
-                        })
-                        .detach();
+                        if let Some(fence) = shell.capture_client_fence() {
+                            cx.spawn(async move |weak: WeakEntity<AppShell>, app: &mut AsyncApp| {
+                                if !fence.preflight_ui(&weak, app).await {
+                                    return;
+                                }
+                                let _ = fence
+                                    .client
+                                    .rate_call_with_feedback_with_token(
+                                        &fence.token,
+                                        fence.client_epoch,
+                                        &cid,
+                                        stars,
+                                        None,
+                                    )
+                                    .await;
+                            })
+                            .detach();
+                        }
                     }
                 }
                 if pending_hangup && !should_close {
                     if let Some(cid) = shell.rtc_talk.active_call_id.clone() {
-                        let c = shell.client.clone();
-                        cx.spawn(async move |_: WeakEntity<AppShell>, _: &mut AsyncApp| {
-                            let _ = c.call_hangup(&cid).await;
-                        })
-                        .detach();
+                        if let Some(fence) = shell.capture_client_fence() {
+                            cx.spawn(async move |weak: WeakEntity<AppShell>, app: &mut AsyncApp| {
+                                if !fence.preflight_ui(&weak, app).await {
+                                    return;
+                                }
+                                let _ = fence
+                                    .client
+                                    .call_hangup_with_token(&fence.token, fence.client_epoch, &cid)
+                                    .await;
+                            })
+                            .detach();
+                        }
                     }
                 }
                 if should_close {
@@ -345,6 +351,7 @@ impl AppShell {
             .or(chat_opt)
             .unwrap_or(777000);
 
+        self.occlude_browser_for_overlay(cx);
         self.prepare_for_media_or_call_overlay_open(cx);
         self.clear_non_call_overlays();
         self.main_menu_drawer.update(cx, |d, _| d.close());
@@ -408,19 +415,27 @@ impl AppShell {
         });
         self.bind_talk_overlay_observer(&overlay, cx);
         self.rtc_talk.talk_mode_overlay = Some(overlay);
+        self.reconcile_chat_scoped_toasts(cx);
         cx.notify();
 
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let invite_res = client
-                .hermes_call_invite(&HermesCallInviteRequest {
-                    callee_id,
-                    is_video,
-                    chat_id: chat_opt.map(|id| id as i64),
-                })
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let invite_res = fence
+                .client
+                .hermes_call_invite_with_token(
+                    &fence.token,
+                    fence.client_epoch,
+                    &HermesCallInviteRequest {
+                        callee_id,
+                        is_video,
+                        chat_id: chat_opt.map(|id| id as i64),
+                    },
+                )
                 .await;
             let _ = weak.update(app, |shell, cx| {
-                if !shell.fence_still_valid(&fence) {
+                if !fence.is_valid(shell) {
                     return;
                 }
                 match invite_res {
@@ -474,7 +489,7 @@ impl AppShell {
                                 shell.show_chat_toast(cid, msg, 3200, cx);
                             }
                         } else {
-                            shell.show_toast(msg, 3200, cx);
+                            shell.show_non_chat_toast(msg, 3200, cx);
                         }
                     }
                 }
@@ -524,20 +539,27 @@ impl AppShell {
                 .or(Some(cid))
         });
         let session_id = self.rtc_talk.active_talk_session_id.clone();
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = client
-                .hermes_talk_turn(&HermesTalkTurnRequest {
-                    session_id,
-                    chat_id: bot_chat_id.map(|id| id as i64),
-                    bot_id,
-                    transcript: clean,
-                    voice_preset: Some("hermes-neural".to_string()),
-                    barge_in: Some(barge_in),
-                })
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let res = fence
+                .client
+                .hermes_talk_turn_with_token(
+                    &fence.token,
+                    fence.client_epoch,
+                    &HermesTalkTurnRequest {
+                        session_id,
+                        chat_id: bot_chat_id.map(|id| id as i64),
+                        bot_id,
+                        transcript: clean,
+                        voice_preset: Some("hermes-neural".to_string()),
+                        barge_in: Some(barge_in),
+                    },
+                )
                 .await;
             let _ = weak.update(app, |shell, cx| {
-                if !shell.fence_still_valid(&fence) {
+                if !fence.is_valid(shell) {
                     return;
                 }
                 match res {
@@ -571,7 +593,9 @@ impl AppShell {
                             shell.rtc_talk.talk_coordinator.resume_listening();
                         }
                         if let Some(cid) = bot_chat_id {
-                            shell.load_historical_messages(cid, cx);
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.load_historical_messages(cid, cx);
+                            }
                         }
                     }
                     Err(err) => {
@@ -584,12 +608,14 @@ impl AppShell {
                             tr_str(shell.active_lang_id(), "语音回合失败", "Talk turn failed"),
                             err
                         );
-                        if let Some(cid) = bot_chat_id {
+                        if shell.rtc_talk.talk_mode_overlay.is_some() {
+                            shell.show_non_chat_toast(msg, 2800, cx);
+                        } else if let Some(cid) = bot_chat_id {
                             if shell.stage.read(cx).active_chat_id == Some(cid) {
                                 shell.show_chat_toast(cid, msg, 2800, cx);
                             }
                         } else {
-                            shell.show_toast(msg, 2800, cx);
+                            shell.show_non_chat_toast(msg, 2800, cx);
                         }
                     }
                 }
@@ -617,24 +643,30 @@ impl AppShell {
                 );
             });
         }
-        let Some(token) = self.session_sync.session_token.clone() else {
+        let Some(fence) = self.capture_client_fence() else {
             cx.notify();
             return;
         };
-        let _ = token;
-        let client = self.client.clone();
         let session_id = self.rtc_talk.active_talk_session_id.clone();
         let chat_id = self.rtc_talk.active_talk_bot_chat_id.map(|id| id as i64);
-        cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-            let _ = client
-                .hermes_talk_turn(&HermesTalkTurnRequest {
-                    session_id,
-                    chat_id,
-                    bot_id: None,
-                    transcript: String::new(),
-                    voice_preset: None,
-                    barge_in: Some(true),
-                })
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let _ = fence
+                .client
+                .hermes_talk_turn_with_token(
+                    &fence.token,
+                    fence.client_epoch,
+                    &HermesTalkTurnRequest {
+                        session_id,
+                        chat_id,
+                        bot_id: None,
+                        transcript: String::new(),
+                        voice_preset: None,
+                        barge_in: Some(true),
+                    },
+                )
                 .await;
         })
         .detach();
@@ -657,6 +689,7 @@ impl AppShell {
         };
         let lang = self.active_lang_id();
         let pal = self.theme_state.palette;
+        self.occlude_browser_for_overlay(cx);
         self.prepare_for_media_or_call_overlay_open(cx);
         self.clear_non_call_overlays();
         self.reset_talk_session_flags();
@@ -669,6 +702,7 @@ impl AppShell {
         });
         self.bind_talk_overlay_observer(&overlay, cx);
         self.rtc_talk.talk_mode_overlay = Some(overlay);
+        self.reconcile_chat_scoped_toasts(cx);
         cx.notify();
 
         let chat_opt = resolve_active_target_chat_id(
@@ -676,18 +710,33 @@ impl AppShell {
             self.sidebar.read(cx).active_chat_id,
         )
         .map(|id| id as i64);
-        let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let turn_json = client.get_turn_credentials().await.ok();
-            let invite_res = client
-                .call_invite(&CallInviteRequest {
-                    callee_id: peer_id,
-                    is_video,
-                    chat_id: chat_opt,
-                })
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let turn_json = fence
+                .client
+                .get_turn_credentials_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let invite_res = fence
+                .client
+                .call_invite_with_token(
+                    &fence.token,
+                    fence.client_epoch,
+                    &CallInviteRequest {
+                        callee_id: peer_id,
+                        is_video,
+                        chat_id: chat_opt,
+                    },
+                )
                 .await;
+            let fence_for_signals = fence.clone();
             let _ = weak.update(app, |shell, cx| {
-                if !shell.fence_still_valid(&fence) {
+                if !fence.is_valid(shell) {
                     return;
                 }
                 match invite_res {
@@ -722,9 +771,20 @@ impl AppShell {
                         for frame in outbound {
                             if let Some((mut sig, target)) = signaling_frame_to_request(frame) {
                                 sig.call_id = rec.call_id.clone();
-                                let c2 = client.clone();
-                                cx.spawn(async move |_: WeakEntity<Self>, _: &mut AsyncApp| {
-                                    let _ = c2.send_call_signal(sig, target.or(Some(peer_id))).await;
+                                let sig_fence = fence_for_signals.clone();
+                                cx.spawn(async move |weak2: WeakEntity<Self>, app2: &mut AsyncApp| {
+                                    if !sig_fence.preflight_ui(&weak2, app2).await {
+                                        return;
+                                    }
+                                    let _ = sig_fence
+                                        .client
+                                        .send_call_signal_with_token(
+                                            &sig_fence.token,
+                                            sig_fence.client_epoch,
+                                            sig,
+                                            target.or(Some(peer_id)),
+                                        )
+                                        .await;
                                 })
                                 .detach();
                             }
@@ -754,7 +814,7 @@ impl AppShell {
                                 shell.show_chat_toast(cid, msg, 3200, cx);
                             }
                         } else {
-                            shell.show_toast(msg, 3200, cx);
+                            shell.show_non_chat_toast(msg, 3200, cx);
                         }
                     }
                 }
@@ -794,114 +854,32 @@ impl AppShell {
         self.rtc_talk.ai_peer_transport = None;
         self.reset_talk_session_flags();
         if let Some(call_id) = self.rtc_talk.active_call_id.take() {
-            let client = self.client.clone();
-            cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                let _ = client.call_hangup(&call_id).await;
-                let _ = weak.update(app, |shell, cx| shell.sync_calls_history(cx));
-            })
-            .detach();
+            if let Some(fence) = self.capture_client_fence() {
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    if !fence.preflight_ui(&weak, app).await {
+                        return;
+                    }
+                    let _ = fence
+                        .client
+                        .call_hangup_with_token(&fence.token, fence.client_epoch, &call_id)
+                        .await;
+                    let _ = weak.update(app, |shell, cx| {
+                        if fence.is_valid(shell) {
+                            shell.sync_calls_history(cx);
+                        }
+                    });
+                })
+                .detach();
+            }
         }
         self.rtc_talk.talk_mode_overlay = None;
         self.clear_ime_if_below_z5_unoccluded(cx);
         cx.notify();
     }
 
+    /// Opens the NetEase UU Remote-style Remote Computers hub (supersedes the legacy Cloud Host lease stub).
     pub fn open_computer_workbench_live(&mut self, cx: &mut Context<Self>) {
-        let Some((my_id, fence)) = self.build_session_fence() else {
-            return;
-        };
-        self.prepare_for_computer_overlay_open(cx);
-        self.rtc_talk.talk_mode_overlay = None;
-        self.rtc_talk.active_talk_session_is_ai = false;
-        self.overlays.media_viewer_overlay = None;
-        self.overlays.iv_viewer_overlay = None;
-        self.main_menu_drawer.update(cx, |d, _| d.close());
-        let lang = self.active_lang_id();
-        let pal = self.theme_state.palette;
-        let overlay = cx.new(|_| {
-            ComputerWorkbench::new_live(
-                tr_str(lang, "远程桌面主机", "Remote Desktop").into(),
-                pal,
-                lang,
-            )
-        });
-        cx.observe(
-            &overlay,
-            |shell: &mut AppShell, ov: gpui::Entity<ComputerWorkbench>, cx: &mut Context<AppShell>| {
-                let (close, act) = ov.update(cx, |w, _| (w.should_close, w.take_action()));
-                if let Some(cmd) = act {
-                    shell.window_runtime.enqueue_toast(cmd, 2400);
-                }
-                if close {
-                    shell.hide_remote_computer(cx);
-                }
-                cx.notify();
-            },
-        )
-        .detach();
-        self.overlays.computer_overlay = Some(overlay);
-        cx.notify();
-        let client = self.client.clone();
-        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let payload = serde_json::json!({ "requested_by": my_id });
-            let res = client.acquire_computer_lease(&payload).await;
-            let _ = weak.update(app, |shell, cx| {
-                if !shell.fence_still_valid(&fence) {
-                    return;
-                }
-                if let Some(ov) = shell.overlays.computer_overlay.clone() {
-                    match res {
-                        Ok(v) => {
-                            let spec = HostDeviceSpec {
-                                name: v
-                                    .get("device_name")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("Cloud Host")
-                                    .to_string(),
-                                ip_address: v
-                                    .get("host")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                os_name: v
-                                    .get("os")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("Linux / macOS")
-                                    .to_string(),
-                                resolution: v
-                                    .get("resolution")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("1920x1080")
-                                    .to_string(),
-                                latency_ms: v.get("latency_ms").and_then(|x| x.as_u64()).unwrap_or(0)
-                                    as u32,
-                                fps: v.get("fps").and_then(|x| x.as_u64()).unwrap_or(60) as u32,
-                                is_tunnel_encrypted: true,
-                            };
-                            let frame = v
-                                .get("stream_url")
-                                .and_then(|x| x.as_str())
-                                .map(str::to_string);
-                            ov.update(cx, |w, _| w.sync_lease(spec, frame, true));
-                        }
-                        Err(err) => shell.window_runtime.enqueue_toast(
-                            format!(
-                                "{}: {}",
-                                tr_str(
-                                    shell.active_lang_id(),
-                                    "无法获取远程会话",
-                                    "Remote lease failed"
-                                ),
-                                err
-                            ),
-                            3200,
-                        ),
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.open_remote_computers_hub(cx);
     }
 
     pub fn toggle_voice_recording(&mut self, start: bool, cx: &mut Context<Self>) {
@@ -983,37 +961,89 @@ impl AppShell {
                 is_pinned: false,
             })
         });
-        let client = self.client.clone();
         let wav = note.wav_bytes;
         let wave = note.waveform_5bit;
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            if let Ok(up) = client.upload_media("voice.wav", "audio/wav", wav).await {
-                let req = RichSendMessageRequest {
-                    chat_id: chat_id as i64,
-                    text: Some("Voice message".into()),
-                    content: Some(ProtoMessageContent::Voice(VoiceItem {
-                        file_id: up.file_id,
-                        duration_seconds: dur_secs,
-                        waveform: wave,
-                        mime_type: "audio/wav".into(),
-                        size_bytes: up.size_bytes,
-                    })),
-                    entities: Vec::new(),
-                    reply_to: None,
-                    quote_text: None,
-                    topic_id: None,
-                    client_nonce: Some(client.next_client_nonce()),
-                    forward_from_chat_id: None,
-                    forward_from_msg_id: None,
-                    silent: false,
-                    scheduled_at_ms: None,
-                    inline_keyboard: None,
-                    send_as_peer_id: None,
-                    skip_server_bot_reply: false,
-                };
-                let _ = client.send_message_durable(req).await;
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let upload_fence = fence.clone();
+            let uploaded = fence
+                .client
+                .runtime()
+                .spawn(async move {
+                    upload_fence
+                        .client
+                        .upload_media_with_token(
+                            &upload_fence.token,
+                            upload_fence.client_epoch,
+                            "voice.wav",
+                            "audio/wav",
+                            wav,
+                        )
+                        .await
+                        .ok()
+                })
+                .await
+                .ok()
+                .flatten();
+            let Some(up) = uploaded else {
+                return;
+            };
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let send_fence = fence.clone();
+            let sent = fence
+                .client
+                .runtime()
+                .spawn(async move {
+                    if send_fence
+                        .client
+                        .ensure_pinned_session(send_fence.client_epoch, &send_fence.token)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    let req = RichSendMessageRequest {
+                        chat_id: chat_id as i64,
+                        text: Some("Voice message".into()),
+                        content: Some(ProtoMessageContent::Voice(VoiceItem {
+                            file_id: up.file_id,
+                            duration_seconds: dur_secs,
+                            waveform: wave,
+                            mime_type: "audio/wav".into(),
+                            size_bytes: up.size_bytes,
+                        })),
+                        entities: Vec::new(),
+                        reply_to: None,
+                        quote_text: None,
+                        topic_id: None,
+                        client_nonce: Some(send_fence.client.next_client_nonce()),
+                        forward_from_chat_id: None,
+                        forward_from_msg_id: None,
+                        silent: false,
+                        scheduled_at_ms: None,
+                        inline_keyboard: None,
+                        send_as_peer_id: None,
+                        skip_server_bot_reply: false,
+                    };
+                    let _ = send_fence
+                        .client
+                        .send_message_durable_with_token(
+                            &send_fence.token,
+                            send_fence.client_epoch,
+                            req,
+                        )
+                        .await;
+                    true
+                })
+                .await
+                .unwrap_or(false);
+            if sent {
                 let _ = weak.update(app, |shell, cx| {
-                    if shell.fence_still_valid(&fence) {
+                    if fence.is_valid(shell) && shell.stage.read(cx).active_chat_id == Some(chat_id)
+                    {
                         shell.load_historical_messages(chat_id, cx);
                     }
                 });

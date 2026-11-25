@@ -26,6 +26,7 @@ pub enum NavDestination {
     McpTools,
     TalkMode,
     RemoteComputer,
+    Browser,
     SavedMessages,
     Settings,
 }
@@ -40,6 +41,7 @@ impl NavDestination {
             Self::McpTools => IconName::TerminalMcp,
             Self::TalkMode => IconName::Mic,
             Self::RemoteComputer => IconName::ComputerDesktop,
+            Self::Browser => IconName::ScreenShare,
             Self::SavedMessages => IconName::SavedMessages,
             Self::Settings => IconName::SettingsGear,
         }
@@ -54,6 +56,7 @@ impl NavDestination {
             Self::McpTools => tr_str(lang_id, "MCP 工具", "MCP Tools"),
             Self::TalkMode => tr_str(lang_id, "语音对话", "Talk Mode"),
             Self::RemoteComputer => tr_str(lang_id, "远程电脑", "Remote Computer"),
+            Self::Browser => tr_str(lang_id, "浏览器", "Browser"),
             Self::SavedMessages => tr_str(lang_id, "收藏夹", "Saved Messages"),
             Self::Settings => tr_str(lang_id, "设置", "Settings"),
         }
@@ -155,6 +158,12 @@ impl NavRail {
                 destination: NavDestination::RemoteComputer,
                 icon_label: "remote".to_string(),
                 tooltip: "Remote Computer".to_string(),
+                unread_badge: 0,
+            },
+            NavItem {
+                destination: NavDestination::Browser,
+                icon_label: "browser".to_string(),
+                tooltip: "Browser".to_string(),
                 unread_badge: 0,
             },
             NavItem {

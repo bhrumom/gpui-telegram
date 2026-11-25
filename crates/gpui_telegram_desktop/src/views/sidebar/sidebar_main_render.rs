@@ -105,6 +105,7 @@ impl Render for ChatSidebar {
             return render_collapsed_gemini_sidebar(
                 &nav_snapshot,
                 &rail_dialogs,
+                self.is_loading_dialogs,
                 row_active_id,
                 self.hovered_rail_item,
                 self.hovered_rail_dialog_id,
@@ -591,37 +592,135 @@ impl Render for ChatSidebar {
                 || !main_with_meta.is_empty()
                 || pending_creation.is_some();
             if !has_any_dialog {
-                list.push(
-                    div()
-                        .id("sidebar-empty-dialogs-state")
-                        .w_full()
-                        .py(px(40.0))
-                        .px(px(16.0))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(10.0))
-                        .child(tg_icon(IconName::FolderChat, 32.0, palette.text_secondary))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(palette.text_primary))
-                                .child(tr_str(&lang_id, "暂无对话", "No chats yet")),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.5))
-                                .text_color(rgb(palette.text_secondary))
-                                .child(tr_str(
-                                    &lang_id,
-                                    "点击右上角图标添加联系人或创建群组",
-                                    "Start a chat or connect your workspace",
-                                )),
-                        )
-                        .into_any_element(),
-                );
+                if self.is_loading_dialogs && query.trim().is_empty() {
+                    let is_dark = palette.mode.is_dark();
+                    let primary_skel = if is_dark {
+                        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.11)
+                    } else {
+                        TdesktopThemePalette::rgba_with_alpha(0x000000, 0.08)
+                    };
+                    let secondary_skel = if is_dark {
+                        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.065)
+                    } else {
+                        TdesktopThemePalette::rgba_with_alpha(0x000000, 0.05)
+                    };
+                    let rows_spec: [(f32, f32, f32); 7] = [
+                        (104.0, 154.0, 0.96),
+                        (128.0, 126.0, 0.85),
+                        (92.0, 166.0, 0.74),
+                        (118.0, 140.0, 0.62),
+                        (98.0, 118.0, 0.50),
+                        (132.0, 148.0, 0.38),
+                        (86.0, 130.0, 0.26),
+                    ];
+                    let avatar_sz = palette.scaled_px(if is_apple { 42.0 } else { 44.0 });
+                    let row_h = palette.scaled_px(if is_apple { 58.0 } else { 62.0 });
+                    list.push(
+                        div()
+                            .id("sidebar-loading-dialogs-skeleton")
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .children(rows_spec.into_iter().map(move |(title_w, preview_w, fade)| {
+                                div()
+                                    .w_full()
+                                    .h(px(row_h))
+                                    .px(px(palette.scaled_px(10.0)))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(palette.scaled_px(11.0)))
+                                    .opacity(fade)
+                                    .child(
+                                        div()
+                                            .w(px(avatar_sz))
+                                            .h(px(avatar_sz))
+                                            .rounded_full()
+                                            .flex_shrink_0()
+                                            .bg(primary_skel),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(palette.scaled_px(8.0)))
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .gap(px(8.0))
+                                                    .child(
+                                                        div()
+                                                            .w(px(palette.scaled_px(title_w)))
+                                                            .max_w(px(148.0))
+                                                            .h(px(palette.scaled_px(11.0)))
+                                                            .rounded_full()
+                                                            .bg(primary_skel),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(palette.scaled_px(30.0)))
+                                                            .h(px(palette.scaled_px(9.0)))
+                                                            .rounded_full()
+                                                            .flex_shrink_0()
+                                                            .bg(secondary_skel),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(palette.scaled_px(preview_w)))
+                                                    .max_w_full()
+                                                    .h(px(palette.scaled_px(9.5)))
+                                                    .rounded_full()
+                                                    .bg(secondary_skel),
+                                            ),
+                                    )
+                            }))
+                            .with_animation(
+                                "sidebar-dialogs-skeleton-pulse",
+                                Animation::new(std::time::Duration::from_millis(1200))
+                                    .repeat()
+                                    .with_easing(pulsating_between(0.48, 1.0)),
+                                |container, delta| container.opacity(delta),
+                            )
+                            .into_any_element(),
+                    );
+                } else {
+                    list.push(
+                        div()
+                            .id("sidebar-empty-dialogs-state")
+                            .w_full()
+                            .py(px(40.0))
+                            .px(px(16.0))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(10.0))
+                            .child(tg_icon(IconName::FolderChat, 32.0, palette.text_secondary))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette.text_primary))
+                                    .child(tr_str(&lang_id, "暂无对话", "No chats yet")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(palette.text_secondary))
+                                    .child(tr_str(
+                                        &lang_id,
+                                        "点击右上角图标添加联系人或创建群组",
+                                        "Start a chat or connect your workspace",
+                                    )),
+                            )
+                            .into_any_element(),
+                    );
+                }
             }
 
             if !list.is_empty() {

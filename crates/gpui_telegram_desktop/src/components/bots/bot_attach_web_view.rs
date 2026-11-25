@@ -474,6 +474,7 @@ impl BotAttachWebView {
         self.confirm_close_open = false;
         self.write_access_prompt_open = false;
         self.custom_popup = None;
+        self.focused_input = None;
         self.hide_native_webview();
     }
 
@@ -806,6 +807,32 @@ impl BotAttachWebView {
         }
     }
 
+    /// Returns `true` only when the full Mini App host sheet is open and unoccluded so its native
+    /// `WKWebView` is legitimately allowed to own macOS `NSWindow.firstResponder` keyboard focus.
+    /// Floating PiP live previews and parked background WebViews ALWAYS return `false`.
+    pub fn allows_native_webview_keyboard_focus(&self) -> bool {
+        self.is_open
+            && !self.is_floating_pip
+            && self.disclaimer_accepted
+            && !self.is_loading
+            && !self.external_modal_occluding
+            && !self.write_access_prompt_open
+            && !self.menu_open
+            && !self.confirm_close_open
+            && self.custom_popup.is_none()
+            && self.focused_input.is_none()
+    }
+
+    /// Updates whether the attached native `WKWebView` may claim macOS `firstResponder`.
+    pub fn set_native_webview_allow_focus(&mut self, allow: bool) {
+        #[cfg(target_os = "macos")]
+        if let Some(ref mut wv) = self.macos_webview {
+            wv.set_allow_first_responder(allow);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = allow;
+    }
+
     /// Updates live AI/takeover control status metadata shown in chrome banner and Floating PiP card.
     pub fn apply_control_status(
         &mut self,
@@ -836,6 +863,9 @@ impl BotAttachWebView {
             return;
         }
 
+        if !self.is_open {
+            self.set_native_webview_allow_focus(false);
+        }
         self.control_mode = MiniAppControlMode::AiControlling;
         self.active_webmcp_tool = cmd.tool_name.clone();
         self.control_status_text = cmd
@@ -1033,7 +1063,9 @@ impl BotAttachWebView {
             }
             let had_events = self.drain_native_bridge_events();
             let resolved_url = self.resolved_webview_url();
+            let allow_focus = self.allows_native_webview_keyboard_focus() && visible;
             if let Some(ref mut wv) = self.macos_webview {
+                wv.set_allow_first_responder(allow_focus);
                 if resolved_url.starts_with("http://") || resolved_url.starts_with("https://") {
                     let same_url = wv.loaded_url() == resolved_url;
                     if !same_url {
