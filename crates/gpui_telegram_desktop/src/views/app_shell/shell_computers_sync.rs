@@ -1850,6 +1850,7 @@ impl AppShell {
     /// the computer icon beside the user avatar, main menu, tray, or `/computer`).
     pub fn open_remote_computers_hub(&mut self, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.rtc_talk.talk_mode_overlay = None;
         self.rtc_talk.active_talk_session_is_ai = false;
         self.overlays.media_viewer_overlay = None;
@@ -1939,7 +1940,13 @@ impl AppShell {
             scx.notify();
         });
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.active_panel = ActiveWorkspacePanel::Settings;
+        self.last_handled_nav_dest = Some(NavDestination::Settings);
+        self.nav_rail.update(cx, |r, rcx| {
+            r.set_active_destination(NavDestination::Settings);
+            rcx.notify();
+        });
         self.reconcile_chat_scoped_toasts(cx);
         self.sync_computers_to_views(cx);
         self.refresh_computers(cx);

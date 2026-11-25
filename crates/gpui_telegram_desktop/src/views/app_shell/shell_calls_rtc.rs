@@ -15,6 +15,7 @@ use crate::views::app_shell::shell_actions::{
 };
 use crate::views::app_shell::shell_truth::{derive_initials, ClientCallFence};
 use crate::views::call_overlay::TalkModeState;
+use crate::views::nav_rail::NavDestination;
 use crate::views::shell::AppShell;
 use crate::views::stage::cards::{
     DeliveryStatus, MessageContent, MessageDirection, MessageItemModel,
@@ -477,6 +478,10 @@ impl AppShell {
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
                         shell.reset_talk_session_flags();
+                        shell.reset_nav_destination_if(
+                            &[NavDestination::TalkMode, NavDestination::Calls],
+                            cx,
+                        );
                         let msg = format!(
                             "{}: {}",
                             tr_str(shell.active_lang_id(), "AI 语音连接失败", "AI Talk failed"),
@@ -800,6 +805,10 @@ impl AppShell {
                     }
                     Err(err) => {
                         shell.rtc_talk.talk_mode_overlay = None;
+                        shell.reset_nav_destination_if(
+                            &[NavDestination::TalkMode, NavDestination::Calls],
+                            cx,
+                        );
                         let msg = format!(
                             "{}: {}",
                             tr_str(shell.active_lang_id(), "通话发起失败", "Call failed"),
@@ -869,6 +878,7 @@ impl AppShell {
             }
         }
         self.rtc_talk.talk_mode_overlay = None;
+        self.reset_nav_destination_if(&[NavDestination::TalkMode, NavDestination::Calls], cx);
         cx.notify();
     }
 

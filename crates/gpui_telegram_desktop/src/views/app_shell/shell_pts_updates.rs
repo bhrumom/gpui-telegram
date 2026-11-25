@@ -1524,6 +1524,26 @@ impl AppShell {
                 }
                 cx.notify();
             }
+            UpdateEvent::CommunityEvent {
+                event_kind,
+                community_id,
+                post_id,
+                comment_id,
+                actor_id,
+                payload_json,
+                timestamp_ms,
+            } => {
+                self.handle_community_ws_event(
+                    event_kind,
+                    community_id,
+                    post_id,
+                    comment_id,
+                    actor_id,
+                    payload_json,
+                    timestamp_ms,
+                    cx,
+                );
+            }
             _ => {}
         }
     }
@@ -1877,6 +1897,13 @@ impl AppShell {
                 if self.rtc_talk.active_call_id.as_deref() == Some(call_id.as_str()) {
                     self.rtc_talk.active_call_id = None;
                     self.rtc_talk.talk_mode_overlay = None;
+                    self.reset_nav_destination_if(
+                        &[
+                            crate::views::nav_rail::NavDestination::TalkMode,
+                            crate::views::nav_rail::NavDestination::Calls,
+                        ],
+                        cx,
+                    );
                 }
                 self.sync_calls_history(cx);
             }

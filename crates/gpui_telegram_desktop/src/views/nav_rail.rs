@@ -27,6 +27,7 @@ pub enum NavDestination {
     TalkMode,
     RemoteComputer,
     Browser,
+    Community,
     SavedMessages,
     Settings,
 }
@@ -42,6 +43,7 @@ impl NavDestination {
             Self::TalkMode => IconName::Mic,
             Self::RemoteComputer => IconName::ComputerDesktop,
             Self::Browser => IconName::ScreenShare,
+            Self::Community => IconName::CommunityGlobe,
             Self::SavedMessages => IconName::SavedMessages,
             Self::Settings => IconName::SettingsGear,
         }
@@ -57,6 +59,7 @@ impl NavDestination {
             Self::TalkMode => tr_str(lang_id, "语音对话", "Talk Mode"),
             Self::RemoteComputer => tr_str(lang_id, "远程电脑", "Remote Computer"),
             Self::Browser => tr_str(lang_id, "浏览器", "Browser"),
+            Self::Community => tr_str(lang_id, "社区", "Community"),
             Self::SavedMessages => tr_str(lang_id, "收藏夹", "Saved Messages"),
             Self::Settings => tr_str(lang_id, "设置", "Settings"),
         }
@@ -167,6 +170,12 @@ impl NavRail {
                 unread_badge: 0,
             },
             NavItem {
+                destination: NavDestination::Community,
+                icon_label: "community".to_string(),
+                tooltip: "Community".to_string(),
+                unread_badge: 0,
+            },
+            NavItem {
                 destination: NavDestination::SavedMessages,
                 icon_label: "saved".to_string(),
                 tooltip: "Saved Messages".to_string(),
@@ -229,7 +238,9 @@ impl NavRail {
     }
 
     pub fn unread_total(&self) -> u32 {
-        self.items.iter().map(|it| it.unread_badge).sum()
+        self.items
+            .iter()
+            .fold(0u32, |acc, it| acc.saturating_add(it.unread_badge))
     }
 
     pub fn set_connected(&mut self, connected: bool) {

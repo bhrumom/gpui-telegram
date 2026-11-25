@@ -7,6 +7,7 @@ pub mod browser;
 pub mod call_overlay;
 pub mod canonical_composer;
 pub mod chat_sidebar;
+pub mod community;
 pub mod composer;
 pub mod computer_workbench;
 pub mod context_inspector;
@@ -33,6 +34,10 @@ pub use browser::{
 pub use call_overlay::{CallOverlay, TalkModeState, TranscriptEntry};
 pub use canonical_composer::CanonicalComposer;
 pub use chat_sidebar::ChatSidebar;
+pub use community::{
+    ActiveCommunityInput, CommunityLayoutMode, CommunityRoute, CommunityWorkspace,
+    CommunityWorkspaceAction, FeedDensity,
+};
 pub use computer_workbench::{ComputerWorkbench, HostDeviceSpec};
 pub use context_inspector::ContextInspector;
 pub use conversation_stage::ConversationStage;

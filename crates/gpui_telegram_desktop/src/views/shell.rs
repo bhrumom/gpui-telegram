@@ -43,9 +43,9 @@ use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
 };
 use crate::views::{
-    BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, ComputerWorkbench,
-    ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer,
-    NavRail,
+    BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, CommunityWorkspace,
+    ComputerWorkbench, ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer,
+    MediaViewer, NavRail,
 };
 use crate::window::WindowSubsystemRuntime;
 
@@ -57,6 +57,7 @@ pub enum ActiveWorkspacePanel {
     TaskCenter,
     McpTools,
     Browser,
+    Community,
     Settings,
 }
 
@@ -114,6 +115,9 @@ pub struct AppShell {
     pub main_menu_drawer: Entity<MainMenuDrawer>,
     pub tasks_workspace: Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<Entity<BrowserWorkspace>>,
+    pub community_workspace: Option<Entity<CommunityWorkspace>>,
+    pub community_ime_preedit_input_gen: Option<u64>,
+    pub community_pending_share: Option<(String, String)>,
     pub auth_wizard: Entity<AuthWizardView>,
     pub settings_router: Entity<SettingsRouter>,
     pub client: Arc<TelegramClient>,
@@ -229,6 +233,9 @@ impl AppShell {
             main_menu_drawer,
             tasks_workspace,
             browser_workspace: None,
+            community_workspace: None,
+            community_ime_preedit_input_gen: None,
+            community_pending_share: None,
             auth_wizard,
             settings_router,
             client: client.clone(),
@@ -673,6 +680,10 @@ impl AppShell {
             self.compose_isolation_snapshot = None;
             self.active_panel = ActiveWorkspacePanel::Chats;
             self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.nav_rail.update(cx, |r, _| {
+                r.set_unread(NavDestination::Community, 0);
+                r.set_active_destination(NavDestination::Chats);
+            });
             self.modal_container.update(cx, |m, _| {
                 m.hide_all();
                 m.dialog.pending_outcome = None;
@@ -765,7 +776,17 @@ impl AppShell {
                     w.set_occluded(true, wcx);
                 });
             }
-            if self.active_panel == ActiveWorkspacePanel::Browser {
+            self.community_workspace = None;
+            self.community_pending_share = None;
+            self.community_ime_preedit_input_gen = None;
+            self.nav_rail.update(cx, |r, _| {
+                r.set_unread(NavDestination::Community, 0);
+                r.set_active_destination(NavDestination::Chats);
+            });
+            if matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+            ) {
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
             }
@@ -875,6 +896,9 @@ impl AppShell {
                 w.set_occluded(true, wcx);
             });
         }
+        self.community_workspace = None;
+        self.community_pending_share = None;
+        self.community_ime_preedit_input_gen = None;
         self.bot_browser.reset_on_logout();
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
@@ -927,6 +951,7 @@ impl AppShell {
         self.nav_rail.update(cx, |r, _| {
             r.is_connected = false;
             r.set_account("?", "");
+            r.set_unread(NavDestination::Community, 0);
             r.set_active_destination(NavDestination::Chats);
         });
         self.clear_stored_session_for_shell();
@@ -969,13 +994,45 @@ impl AppShell {
         .detach();
     }
 
-    fn reset_nav_destination_if(&mut self, matching: &[NavDestination], cx: &mut Context<Self>) {
-        self.last_handled_nav_dest = Some(NavDestination::Chats);
-        self.nav_rail.update(cx, |r, _| {
+    pub(crate) fn nav_destination_for_active_panel(&self, cx: &App) -> NavDestination {
+        match self.active_panel {
+            ActiveWorkspacePanel::Chats => NavDestination::Chats,
+            ActiveWorkspacePanel::Calls => NavDestination::Calls,
+            ActiveWorkspacePanel::TaskCenter => NavDestination::TaskCenter,
+            ActiveWorkspacePanel::McpTools => NavDestination::McpTools,
+            ActiveWorkspacePanel::Browser => NavDestination::Browser,
+            ActiveWorkspacePanel::Community => NavDestination::Community,
+            ActiveWorkspacePanel::Settings => {
+                let sr = self.settings_router.read(cx);
+                if sr.standalone_computers_mode
+                    && sr.settings_section == SettingsSectionType::Computers
+                {
+                    NavDestination::RemoteComputer
+                } else {
+                    NavDestination::Settings
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reset_nav_destination_if(
+        &mut self,
+        matching: &[NavDestination],
+        cx: &mut Context<Self>,
+    ) {
+        let restored = self.nav_destination_for_active_panel(cx);
+        let did_reset = self.nav_rail.update(cx, |r, rcx| {
             if matching.contains(&r.active_destination) {
-                r.set_active_destination(NavDestination::Chats);
+                r.set_active_destination(restored);
+                rcx.notify();
+                true
+            } else {
+                false
             }
         });
+        if did_reset {
+            self.last_handled_nav_dest = Some(restored);
+        }
     }
 
     pub fn show_talk_mode(&mut self, cx: &mut Context<Self>) {
@@ -1012,6 +1069,7 @@ impl AppShell {
 
     pub fn show_media_viewer(&mut self, url: impl Into<String>, is_video: bool, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
+        self.occlude_community_for_overlay(cx);
         let overlay = cx.new(|_| MediaViewer::new(url.into(), is_video));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, |shell, _| shell.hide_media_viewer(), cx);
         self.overlays.media_viewer_overlay = Some(overlay);
@@ -1028,6 +1086,7 @@ impl AppShell {
     /// Opens or navigates within the lazy `SettingsRouter` modal and dismisses conflicting popovers.
     pub fn navigate_settings_to(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.sidebar.update(cx, |sb, sb_cx| {
             sb.cancel_compose_mode();
             sb.is_account_popover_open = false;
@@ -1269,7 +1328,10 @@ impl AppShell {
             || create_bot_modal_open
             || creation_dialog_open
             || show_bot_start_bar
-            || self.active_panel == ActiveWorkspacePanel::Browser
+            || matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+            )
     }
 
     /// Flushes the active chat's unsent draft and isolates `CanonicalComposer` for `+` / creation.
@@ -1342,6 +1404,7 @@ impl AppShell {
             .to_vec();
         let cached_chosen_send_as = self.session_sync.send_as_peers.chosen(chat_id);
         let show_start_bar = self.stage.read(cx).show_bot_start_bar;
+        let hide_composer = self.should_hide_composer(cx);
         self.composer.update(cx, |c, ccx| {
             c.is_compose_isolated = false;
             if saved_draft.is_empty() {
@@ -1355,7 +1418,7 @@ impl AppShell {
             c.pending_attached_files = None;
             c.clear_bot_reply_keyboard();
             c.set_send_as_options(cached_send_as_list, cached_chosen_send_as);
-            c.is_input_focused = !show_start_bar;
+            c.is_input_focused = !show_start_bar && !hide_composer;
             ccx.notify();
         });
         self.sync_composer_mention_candidates(chat_id, None, cx);
@@ -1404,6 +1467,7 @@ impl AppShell {
             })
             .unwrap_or_default();
         let show_start_bar = self.stage.read(cx).show_bot_start_bar;
+        let hide_composer = self.should_hide_composer(cx);
 
         self.composer.update(cx, |c, ccx| {
             c.is_compose_isolated = false;
@@ -1431,7 +1495,7 @@ impl AppShell {
                 }
             }
             c.set_send_as_options(send_as_opts.0, send_as_opts.1);
-            c.is_input_focused = !show_start_bar;
+            c.is_input_focused = !show_start_bar && !hide_composer;
             ccx.notify();
         });
         if let Some(cid) = active_cid {
@@ -1514,7 +1578,7 @@ impl AppShell {
                 if (hide_composer || send_disabled) && c.is_input_focused {
                     c.is_input_focused = false;
                 }
-            } else if show_bot_start_bar && c.is_input_focused {
+            } else if (hide_composer || show_bot_start_bar) && c.is_input_focused {
                 c.is_input_focused = false;
             }
             c.set_compose_placeholder_override(placeholder_override);
@@ -1696,7 +1760,7 @@ impl AppShell {
         }
     }
 
-    fn is_error_toast_text(text: &str) -> bool {
+    pub fn is_error_toast_text(text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
         text.contains("PROVIDER_ERROR")
             || text.contains("Error:")
@@ -1959,6 +2023,27 @@ impl Render for AppShell {
             }
         }
 
+        if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Community {
+            let sb_w = self.sidebar.read(cx).effective_width();
+            let occluded = self.has_community_visual_occlusion_overlay(cx);
+            if let Some(cw) = self.community_workspace.clone() {
+                if occluded && cw.read(cx).has_focused_text_input() {
+                    if self.community_ime_preedit_input_gen.is_some() {
+                        self.ime.clear_preedit();
+                        self.community_ime_preedit_input_gen = None;
+                    }
+                    cw.update(cx, |w, wcx| {
+                        w.set_host_sidebar_width(sb_w);
+                        w.blur_active_input(wcx);
+                    });
+                } else {
+                    cw.update(cx, |w, _| {
+                        w.set_host_sidebar_width(sb_w);
+                    });
+                }
+            }
+        }
+
         let cdp_surface_focused = self.is_authenticated && self.is_browser_cdp_viewport_focused(window, cx);
         if self.is_authenticated && !cdp_surface_focused && !self.focus_handle.is_focused(window) {
             self.focus_handle.focus(window);
@@ -2076,7 +2161,19 @@ impl Render for AppShell {
                             row
                         }
                     })
-                    .when(self.active_panel != ActiveWorkspacePanel::Browser, |row| {
+                    .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
+                        if let Some(ref cw) = self.community_workspace {
+                            row.child(cw.clone())
+                        } else {
+                            row
+                        }
+                    })
+                    .when(
+                        !matches!(
+                            self.active_panel,
+                            ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                        ),
+                        |row| {
                         row.child(
                             div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
                                 .bg(rgb(pal.stage_bg))

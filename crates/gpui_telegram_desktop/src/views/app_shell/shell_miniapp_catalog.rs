@@ -242,6 +242,7 @@ fn clear_bot_composer_and_inspector(
 
 fn activate_chats_workspace(shell: &mut AppShell, cx: &mut Context<AppShell>) {
     shell.leave_browser_panel_if_active(cx);
+    shell.leave_community_panel_if_active(cx);
     shell.active_panel = ActiveWorkspacePanel::Chats;
     shell.last_handled_nav_dest = Some(NavDestination::Chats);
     shell.nav_rail.update(cx, |r, r_cx| {
@@ -341,6 +342,9 @@ impl AppShell {
                 });
                 shell.sync_composer_and_inspector_miniapp_state(cx);
                 shell.sync_fabushi_bots_to_views(cx);
+                if shell.community_workspace.is_some() {
+                    shell.sync_community_identities(cx);
+                }
                 cx.notify();
             });
         })

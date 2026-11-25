@@ -48,6 +48,9 @@ impl AppShell {
         if dest != NavDestination::Browser {
             self.hide_browser_native_webview(cx);
         }
+        if dest != NavDestination::Community {
+            self.leave_community_panel_if_active(cx);
+        }
         match dest {
             NavDestination::Chats | NavDestination::Folders => {
                 self.active_panel = ActiveWorkspacePanel::Chats;
@@ -153,6 +156,9 @@ impl AppShell {
             NavDestination::Browser => {
                 self.open_browser_workspace(cx);
             }
+            NavDestination::Community => {
+                self.open_community_workspace(cx);
+            }
             NavDestination::TaskCenter => {
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.tasks_workspace
@@ -182,6 +188,7 @@ impl AppShell {
                 | NavDestination::TalkMode
                 | NavDestination::RemoteComputer
                 | NavDestination::Browser
+                | NavDestination::Community
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
@@ -265,6 +272,7 @@ impl AppShell {
             "k" => {
                 self.ime.clear_preedit();
                 self.bot_browser.ime_preedit_input_gen = None;
+                self.community_ime_preedit_input_gen = None;
                 if let Some(ref bw) = self.browser_workspace {
                     bw.update(cx, |w, wcx| {
                         w.set_active_input(
@@ -272,6 +280,11 @@ impl AppShell {
                             None,
                             wcx,
                         );
+                    });
+                }
+                if let Some(ref cw) = self.community_workspace {
+                    cw.update(cx, |w, wcx| {
+                        w.blur_active_input(wcx);
                     });
                 }
                 self.sidebar.update(cx, |sb, sb_cx| {
@@ -325,6 +338,14 @@ impl AppShell {
                 }
                 true
             }
+            "c" if is_shift => {
+                if self.active_panel == ActiveWorkspacePanel::Community {
+                    self.activate_nav_destination(NavDestination::Chats, cx);
+                } else {
+                    self.open_community_workspace(cx);
+                }
+                true
+            }
             "b" | "\\" => {
                 self.sidebar.update(cx, |sb, sb_cx| {
                     sb.toggle_collapsed_from_user();
@@ -349,6 +370,7 @@ impl AppShell {
             }
             "n" => {
                 self.leave_browser_panel_if_active(cx);
+                self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
                 self.nav_rail.update(cx, |r, r_cx| {
@@ -357,6 +379,7 @@ impl AppShell {
                 });
                 self.ime.clear_preedit();
                 self.bot_browser.ime_preedit_input_gen = None;
+                self.community_ime_preedit_input_gen = None;
                 self.enter_compose_or_modal_isolation(cx);
                 self.sidebar.update(cx, |sb, sb_cx| {
                     if is_shift {

@@ -93,6 +93,7 @@ fn format_live_miniapp_telemetry(
 impl AppShell {
     fn close_workspace_modal_to_chats(&mut self, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
         self.nav_rail.update(cx, |r, _| {
@@ -1812,6 +1813,7 @@ impl AppShell {
                     .child(menu_row("account-popover-botfather", IconName::BotRobot, tr_str(lang, "BotFather · 创建机器人/小程序", "BotFather · Create Bot/App"), pal.accent, false, |this, cx| this.open_botfather_chat(cx)))
                     .child(menu_row("account-popover-miniapps", IconName::FolderBots, tr_str(lang, "小程序中心", "Mini Apps Center"), pal.text_primary, false, |this, cx| this.open_miniapps_center(cx)))
                     .child(menu_row("account-popover-browser", IconName::ScreenShare, tr_str(lang, "内置浏览器 · 自动化应用", "Built-in Browser & Apps"), pal.accent, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Browser, cx)))
+                    .child(menu_row("account-popover-community", IconName::CommunityGlobe, tr_str(lang, "社区 · Reddit × X", "Community · Reddit × X"), pal.accent, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Community, cx)))
                     .child(menu_row("account-popover-settings", IconName::SettingsGear, tr_str(lang, "设置", "Settings"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Settings, cx)))
                     .when(has_passcode, |col| {
                         col.child(menu_row(
@@ -2234,7 +2236,13 @@ impl AppShell {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.bot_browser.first_creation_banner_open = false;
                                 this.leave_browser_panel_if_active(cx);
+                                this.leave_community_panel_if_active(cx);
                                 this.active_panel = ActiveWorkspacePanel::Settings;
+                                this.last_handled_nav_dest = Some(NavDestination::Settings);
+                                this.nav_rail.update(cx, |r, rcx| {
+                                    r.set_active_destination(NavDestination::Settings);
+                                    rcx.notify();
+                                });
                                 this.reconcile_chat_scoped_toasts(cx);
                                 this.settings_router.update(cx, |r, rcx| {
                                     r.ensure_privacy(rcx);

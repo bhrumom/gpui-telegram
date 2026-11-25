@@ -21,6 +21,7 @@ pub struct UnifiedNavSnapshot {
     pub tasks_unread: u32,
     pub mcp_unread: u32,
     pub saved_unread: u32,
+    pub community_unread: u32,
     pub account_initials: String,
     pub account_name: String,
     pub is_connected: bool,
@@ -49,6 +50,7 @@ impl UnifiedNavSnapshot {
                 tasks_unread: badge_for(NavDestination::TaskCenter),
                 mcp_unread: badge_for(NavDestination::McpTools),
                 saved_unread: badge_for(NavDestination::SavedMessages),
+                community_unread: badge_for(NavDestination::Community),
                 account_initials: r.account_initials.clone(),
                 account_name: r.account_name.clone(),
                 is_connected: r.is_connected,
@@ -62,6 +64,7 @@ impl UnifiedNavSnapshot {
                 tasks_unread: 0,
                 mcp_unread: 0,
                 saved_unread: 0,
+                community_unread: 0,
                 account_initials: "TG".to_string(),
                 account_name: String::new(),
                 is_connected: false,
@@ -416,6 +419,25 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                             NavDestination::Chats
                         } else {
                             NavDestination::Browser
+                        },
+                    ),
+                ))
+                .child(render_collapsed_icon_btn(
+                    "rail-community-btn",
+                    "community",
+                    IconName::CommunityGlobe,
+                    tr_str(lang_id, "社区", "Community"),
+                    nav.active_destination == NavDestination::Community,
+                    nav.community_unread,
+                    hovered_item,
+                    palette,
+                    cx,
+                    on_action.clone(),
+                    UnifiedSidebarAction::SelectDestination(
+                        if nav.active_destination == NavDestination::Community {
+                            NavDestination::Chats
+                        } else {
+                            NavDestination::Community
                         },
                     ),
                 ))

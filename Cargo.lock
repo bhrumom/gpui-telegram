@@ -3530,6 +3530,7 @@ dependencies = [
  "gpui_telegram_agent",
  "gpui_telegram_client",
  "gpui_telegram_coding",
+ "gpui_telegram_community",
  "gpui_telegram_core",
  "gpui_telegram_media",
  "gpui_telegram_proto",

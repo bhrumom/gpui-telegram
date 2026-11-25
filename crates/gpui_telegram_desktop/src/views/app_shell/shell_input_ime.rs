@@ -89,6 +89,24 @@ impl AppShell {
             })
     }
 
+    /// Returns `true` when any shell modal/drawer/overlay/popover/lockscreen occludes CommunityWorkspace.
+    pub fn has_community_visual_occlusion_overlay(&self, cx: &App) -> bool {
+        self.has_browser_visual_occlusion_overlay(cx)
+            || (!self.theme_state.palette.is_apple_style()
+                && self.sidebar.read(cx).is_plus_menu_open)
+    }
+
+    /// Returns `true` when `CommunityWorkspace` is active and has a focused text input without occlusion.
+    pub fn is_community_input_active(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::Community
+            && !self.has_community_visual_occlusion_overlay(cx)
+            && !self.sidebar.read(cx).search_focused
+            && self
+                .community_workspace
+                .as_ref()
+                .is_some_and(|cw| cw.read(cx).has_focused_text_input())
+    }
+
     /// Returns `true` when `BrowserWorkspace`'s `CdpViewportSurface` holds GPUI focus
     /// and no shell modal/overlay/search/browser text input is active.
     pub fn is_browser_cdp_viewport_focused(&self, window: &Window, cx: &App) -> bool {
@@ -132,6 +150,12 @@ impl AppShell {
             && self.stage.read(cx).active_bot_card_field.is_some()
     }
 
+    /// Returns `true` when in-chat transcript search (`ConversationStage::search_open`) is active
+    /// on the visible `Chats` workspace panel.
+    pub fn is_stage_search_active(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::Chats && self.stage.read(cx).search_open
+    }
+
     /// Returns `true` when Apple Messages inline Compose mode (`收件人:`) should receive keyboard & IME input.
     pub fn is_apple_compose_input_active(&self, cx: &App) -> bool {
         let sb = self.sidebar.read(cx);
@@ -151,8 +175,8 @@ impl AppShell {
         });
     }
 
-    /// Returns `true` when keyboard/IME input should target a non-composer field or be suppressed.
-    pub fn is_non_composer_text_capturing(&self, cx: &App) -> bool {
+    /// Returns `true` when an explicit non-composer text input target is currently focused.
+    fn has_active_non_composer_text_target(&self, cx: &App) -> bool {
         let sb = self.sidebar.read(cx);
         self.overlays.is_passcode_locked
             || self.is_computer_workbench_input_active(cx)
@@ -165,15 +189,21 @@ impl AppShell {
             || self.miniapps.miniapp_overlay.as_ref().is_some_and(|w| w.read(cx).has_focused_text_input())
             || self.is_studio_input_active(cx)
             || self.is_browser_workspace_input_active(cx)
+            || self.is_community_input_active(cx)
             || self.is_settings_input_active(cx)
             || self.is_inspector_bot_input_active(cx)
             || self.is_bot_card_input_active(cx)
-            || self.stage.read(cx).search_open
-            || self.should_hide_composer(cx)
+            || self.is_stage_search_active(cx)
+    }
+
+    /// Returns `true` when keyboard/IME input should target a non-composer field or be suppressed.
+    pub fn is_non_composer_text_capturing(&self, cx: &App) -> bool {
+        self.has_active_non_composer_text_target(cx) || self.should_hide_composer(cx)
     }
 
     fn take_ime_preedit_commit(&mut self, cx: &mut Context<Self>) -> bool {
         self.bot_browser.ime_preedit_input_gen = None;
+        self.community_ime_preedit_input_gen = None;
         if let Some(p) = self.ime.ime_preedit.take() {
             self.insert_committed_text(&p, cx);
             true
@@ -251,6 +281,17 @@ impl AppShell {
                 .unwrap_or_default();
             return (txt, pre());
         }
+        if self.is_community_input_active(cx) {
+            let (txt, cw_pre) = self
+                .community_workspace
+                .as_ref()
+                .map(|cw| {
+                    let r = cw.read(cx);
+                    (r.active_input_text(), r.active_input_ime_preedit())
+                })
+                .unwrap_or_else(|| (String::new(), None));
+            return (txt, cw_pre.or_else(pre));
+        }
         if self.is_apple_compose_input_active(cx) {
             if sb.compose_title_focused {
                 return (sb.compose_draft.custom_group_title.clone(), pre());
@@ -258,7 +299,8 @@ impl AppShell {
             return (sb.compose_recipient_query.clone(), pre());
         }
         if sb.search_focused { return (sb.search_query.clone(), pre()); }
-        if self.stage.read(cx).search_open { return (self.stage.read(cx).search_query.clone(), pre()); }
+        if self.is_stage_search_active(cx) { return (self.stage.read(cx).search_query.clone(), pre()); }
+        if self.should_hide_composer(cx) { return (String::new(), None); }
         let c = self.composer.read(cx);
         (c.text().to_string(), c.ime_machine.preedit_text().map(str::to_string))
     }
@@ -272,6 +314,7 @@ impl AppShell {
     pub fn clear_active_field(&mut self, cx: &mut Context<Self>) {
         self.ime.clear_preedit();
         self.bot_browser.ime_preedit_input_gen = None;
+        self.community_ime_preedit_input_gen = None;
         if !self.is_authenticated {
             self.auth_wizard.update(cx, |w, wcx| w.clear_active_field(wcx));
             cx.notify();
@@ -315,6 +358,13 @@ impl AppShell {
             if let Some(bw) = self.browser_workspace.clone() {
                 bw.update(cx, |w, wcx| w.clear_active_input(wcx));
             }
+        } else if self.is_community_input_active(cx) {
+            if let Some(cw) = self.community_workspace.clone() {
+                cw.update(cx, |w, wcx| {
+                    w.set_ime_preedit(None, wcx);
+                    w.clear_active_input(wcx);
+                });
+            }
         } else if self.is_inspector_bot_input_active(cx) {
             self.inspector.update(cx, |ins, icx| { let _ = ins.clear_active_bot_input(icx); });
         } else if self.is_bot_card_input_active(cx) {
@@ -325,7 +375,7 @@ impl AppShell {
             });
         } else if self.sidebar.read(cx).search_focused {
             self.sidebar.update(cx, |sb, scx| { sb.set_search_query(""); scx.notify(); });
-        } else if self.stage.read(cx).search_open {
+        } else if self.is_stage_search_active(cx) {
             self.stage.update(cx, |st, stcx| {
                 st.search_query.clear();
                 st.recompute_search_matches();
@@ -341,6 +391,7 @@ impl AppShell {
     pub fn insert_committed_text(&mut self, raw_text: &str, cx: &mut Context<Self>) {
         self.ime.clear_preedit();
         self.bot_browser.ime_preedit_input_gen = None;
+        self.community_ime_preedit_input_gen = None;
         if raw_text.is_empty() {
             cx.notify();
             return;
@@ -349,6 +400,7 @@ impl AppShell {
         if clean.is_empty()
             && !self.is_inspector_bot_input_active(cx)
             && !self.is_browser_workspace_input_active(cx)
+            && !self.is_community_input_active(cx)
         {
             cx.notify();
             return;
@@ -435,6 +487,13 @@ impl AppShell {
                     w.insert_text_to_active_input(raw_text, wcx);
                 });
             }
+        } else if self.is_community_input_active(cx) {
+            if let Some(cw) = self.community_workspace.clone() {
+                cw.update(cx, |w, wcx| {
+                    w.set_ime_preedit(None, wcx);
+                    w.insert_text_to_active_input(raw_text, wcx);
+                });
+            }
         } else if self.sidebar.read(cx).search_focused {
             self.sidebar.update(cx, |sb, scx| {
                 let mut q = sb.search_query.clone();
@@ -442,7 +501,7 @@ impl AppShell {
                 sb.set_search_query(q);
                 scx.notify();
             });
-        } else if self.stage.read(cx).search_open {
+        } else if self.is_stage_search_active(cx) {
             self.stage.update(cx, |st, stcx| {
                 st.search_query.push_str(&clean);
                 st.recompute_search_matches();
@@ -462,6 +521,10 @@ impl AppShell {
     fn dismiss_pre_auth_escape(&mut self, is_shift: bool, cx: &mut Context<Self>) -> bool {
         if self.ime.ime_preedit.take().is_some() {
             self.bot_browser.ime_preedit_input_gen = None;
+            self.community_ime_preedit_input_gen = None;
+            if let Some(cw) = self.community_workspace.clone() {
+                cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+            }
             if self.is_bot_card_input_active(cx) {
                 self.stage.update(cx, |st, stcx| {
                     st.bot_assist_ime_preedit = None;
@@ -470,7 +533,7 @@ impl AppShell {
             }
             return true;
         }
-        if self.composer.read(cx).ime_machine.is_composing() {
+        if !self.should_hide_composer(cx) && self.composer.read(cx).ime_machine.is_composing() {
             self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_cancel(); c.sync_autocomplete(); ccx.notify(); });
             return true;
         }
@@ -478,7 +541,7 @@ impl AppShell {
             self.tasks_workspace.update(cx, |w, wcx| { w.active_input = StudioInputTarget::None; wcx.notify(); });
             return true;
         }
-        if self.composer.update(cx, |c, ccx| {
+        if !self.should_hide_composer(cx) && self.composer.update(cx, |c, ccx| {
             let ok = c.handle_hermes_autocomplete_nav("escape", is_shift);
             if ok { ccx.notify(); }
             ok
@@ -489,6 +552,7 @@ impl AppShell {
             self.miniapps.miniapp_tos_modal_open = false;
             self.ime.clear_preedit();
             self.bot_browser.ime_preedit_input_gen = None;
+            self.community_ime_preedit_input_gen = None;
             return true;
         }
         if self.miniapps.bot_profile_box.as_ref().is_some_and(|b| b.read(cx).is_visible) {
@@ -501,12 +565,14 @@ impl AppShell {
             self.miniapps.bot_profile_box = None;
             self.ime.clear_preedit();
             self.bot_browser.ime_preedit_input_gen = None;
+            self.community_ime_preedit_input_gen = None;
             return true;
         }
         if self.miniapps.pending_miniapp_confirm.is_some() {
             self.miniapps.pending_miniapp_confirm = None;
             self.ime.clear_preedit();
             self.bot_browser.ime_preedit_input_gen = None;
+            self.community_ime_preedit_input_gen = None;
             return true;
         }
         if self.miniapps.create_bot_box.as_ref().is_some_and(|b| b.read(cx).is_visible) {
@@ -536,6 +602,7 @@ impl AppShell {
         if self.overlays.computer_overlay.is_some() { self.hide_remote_computer(cx); return true; }
         if self.modal_container.read(cx).is_modal_active() {
             self.modal_container.update(cx, |mc, mcx| { mc.dismiss_top(); mcx.notify(); });
+            self.community_pending_share = None;
             if self.composer.read(cx).is_compose_isolated && !self.is_compose_or_creation_modal_active(cx) {
                 self.exit_compose_or_modal_isolation(true, cx);
             }
@@ -564,7 +631,7 @@ impl AppShell {
                 self.exit_compose_or_modal_isolation(true, cx);
             } else {
                 self.sync_compose_state_to_composer(true, cx);
-                self.set_composer_focused(true, cx);
+                self.set_composer_focused(!self.should_hide_composer(cx), cx);
             }
             return true;
         }
@@ -593,7 +660,7 @@ impl AppShell {
                     self.exit_compose_or_modal_isolation(true, cx);
                 } else {
                     self.sync_compose_state_to_composer(true, cx);
-                    self.set_composer_focused(true, cx);
+                    self.set_composer_focused(!self.should_hide_composer(cx), cx);
                 }
             }
             return true;
@@ -601,6 +668,10 @@ impl AppShell {
         if self.sidebar.read(cx).is_account_popover_open || self.sidebar.read(cx).is_plus_menu_open {
             self.ime.clear_preedit();
             self.bot_browser.ime_preedit_input_gen = None;
+            self.community_ime_preedit_input_gen = None;
+            if let Some(cw) = self.community_workspace.clone() {
+                cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+            }
             self.sidebar.update(cx, |s, scx| {
                 s.is_account_popover_open = false;
                 s.cancel_compose_mode();
@@ -654,6 +725,32 @@ impl AppShell {
             self.nav_rail.update(cx, |r, _| { r.set_active_destination(NavDestination::Chats); });
             return true;
         }
+        if self.active_panel == ActiveWorkspacePanel::Community {
+            if self.sidebar.read(cx).search_focused {
+                self.sidebar.update(cx, |sb, scx| {
+                    sb.exit_search();
+                    scx.notify();
+                });
+                return true;
+            }
+            if let Some(cw) = self.community_workspace.clone() {
+                if cw.update(cx, |w, wcx| w.handle_escape_key(wcx)) {
+                    return true;
+                }
+            }
+            if !self.sidebar.read(cx).search_query.is_empty() {
+                self.sidebar.update(cx, |sb, scx| {
+                    sb.exit_search();
+                    scx.notify();
+                });
+                return true;
+            }
+            self.leave_community_panel_if_active(cx);
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.nav_rail.update(cx, |r, _| { r.set_active_destination(NavDestination::Chats); });
+            return true;
+        }
         if matches!(self.active_panel, ActiveWorkspacePanel::Calls | ActiveWorkspacePanel::TaskCenter | ActiveWorkspacePanel::McpTools) {
             self.active_panel = ActiveWorkspacePanel::Chats;
             self.last_handled_nav_dest = Some(NavDestination::Chats);
@@ -689,7 +786,7 @@ impl AppShell {
             return true;
         }
         if self.inspector.read(cx).is_open { self.set_inspector_open(false, cx); return true; }
-        if self.stage.read(cx).search_open {
+        if self.is_stage_search_active(cx) {
             self.stage.update(cx, |st, stcx| {
                 st.search_open = false;
                 st.search_query.clear();
@@ -697,12 +794,12 @@ impl AppShell {
                 st.search_match_cursor = 0;
                 stcx.notify();
             });
-            self.set_composer_focused(true, cx);
+            self.set_composer_focused(!self.should_hide_composer(cx), cx);
             return true;
         }
         if self.sidebar.read(cx).search_focused || !self.sidebar.read(cx).search_query.is_empty() {
             self.sidebar.update(cx, |sb, scx| { sb.exit_search(); scx.notify(); });
-            self.set_composer_focused(true, cx);
+            self.set_composer_focused(!self.should_hide_composer(cx), cx);
             return true;
         }
         if self.composer.read(cx).replying_to.is_some() || self.stage.read(cx).pending_reply.is_some() {
@@ -1112,7 +1209,7 @@ impl AppShell {
             cx.notify();
             return true;
         }
-        if self.stage.read(cx).search_open && !self.sidebar.read(cx).search_focused {
+        if self.is_stage_search_active(cx) && !self.sidebar.read(cx).search_focused {
             match key {
                 "backspace" => {
                     if self.ime.ime_preedit.take().is_none() {
@@ -1165,6 +1262,38 @@ impl AppShell {
                 }
             }
         }
+        if self.is_community_input_active(cx) {
+            if key == "backspace" && self.ime.ime_preedit.take().is_some() {
+                self.community_ime_preedit_input_gen = None;
+                if let Some(cw) = self.community_workspace.clone() {
+                    cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+                }
+                cx.notify();
+                return true;
+            }
+            if key == "enter" && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed()) {
+                if let Some(cw) = self.community_workspace.clone() {
+                    cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+                }
+                cx.notify();
+                return true;
+            }
+            if key == "tab" {
+                self.ime.clear_preedit();
+                self.community_ime_preedit_input_gen = None;
+                if let Some(cw) = self.community_workspace.clone() {
+                    cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+                }
+            }
+            if let Some(cw) = self.community_workspace.clone() {
+                if cw.update(cx, |w, wcx| {
+                    w.handle_non_char_key_input(key, is_shift, is_alt, wcx)
+                }) {
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
         if self.active_panel == ActiveWorkspacePanel::Chats
             && !self.sidebar.read(cx).search_focused
             && self.sidebar.read(cx).active_creation_modal.is_none()
@@ -1176,8 +1305,10 @@ impl AppShell {
             return true;
         }
         if key == "tab" {
-            if self.active_panel == ActiveWorkspacePanel::Browser
-                && !self.sidebar.read(cx).search_focused
+            if matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+            ) && !self.sidebar.read(cx).search_focused
             {
                 return true;
             }
@@ -1186,7 +1317,11 @@ impl AppShell {
                 if currently_search { sb.exit_search(); } else { sb.focus_search(); }
                 scx.notify();
             });
-            self.set_composer_focused(currently_search, cx);
+            if self.should_hide_composer(cx) {
+                self.set_composer_focused(false, cx);
+            } else {
+                self.set_composer_focused(currently_search, cx);
+            }
             cx.notify();
             return true;
         }
@@ -1203,7 +1338,9 @@ impl AppShell {
                 "enter" => {
                     if self.take_ime_preedit_commit(cx) { return true; }
                     self.sidebar.update(cx, |sb, scx| { sb.search_focused = false; scx.notify(); });
-                    self.set_composer_focused(true, cx);
+                    if !self.should_hide_composer(cx) {
+                        self.set_composer_focused(true, cx);
+                    }
                 }
                 _ => return false,
             }
@@ -1260,6 +1397,12 @@ impl AppShell {
         }
         self.ime.mark_ime_committed();
         if let Some(p) = self.ime.ime_preedit.take().filter(|p| !p.is_empty()) { self.insert_committed_text(&p, cx); return; }
+        if self.is_community_input_active(cx) {
+            self.community_ime_preedit_input_gen = None;
+            if let Some(cw) = self.community_workspace.clone() {
+                cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+            }
+        }
         if !self.should_hide_composer(cx) {
             if let Some(p) = self.composer.read(cx).ime_machine.preedit_text().map(str::to_string) {
                 self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_commit(&p); ccx.notify(); });
@@ -1283,6 +1426,7 @@ impl AppShell {
         if new_text.is_empty() {
             self.ime.clear_preedit();
             self.bot_browser.ime_preedit_input_gen = None;
+            self.community_ime_preedit_input_gen = None;
             if let Some(ov) = self.active_computer_terminal_overlay(cx) {
                 ov.update(cx, |w, wcx| {
                     if let Some(c) = w.terminal_input.as_ref() {
@@ -1307,17 +1451,35 @@ impl AppShell {
                     st.bot_assist_ime_preedit = None;
                     stcx.notify();
                 });
+            } else if self.is_community_input_active(cx) {
+                if let Some(cw) = self.community_workspace.clone() {
+                    cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+                }
             }
             if !non_composer {
                 self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_cancel(); c.sync_autocomplete(); ccx.notify(); });
             }
         } else if non_composer {
+            if !self.has_active_non_composer_text_target(cx) {
+                self.ime.clear_preedit();
+                self.bot_browser.ime_preedit_input_gen = None;
+                self.community_ime_preedit_input_gen = None;
+                cx.notify();
+                return;
+            }
             self.ime.ime_preedit = Some(new_text.to_string());
             self.ime.just_committed_ime = false;
             self.bot_browser.ime_preedit_input_gen = if self.is_browser_workspace_input_active(cx) {
                 self.browser_workspace
                     .as_ref()
                     .map(|bw| bw.read(cx).active_input_generation())
+            } else {
+                None
+            };
+            self.community_ime_preedit_input_gen = if self.is_community_input_active(cx) {
+                self.community_workspace
+                    .as_ref()
+                    .map(|cw| cw.read(cx).active_input_generation())
             } else {
                 None
             };
@@ -1347,6 +1509,10 @@ impl AppShell {
                     st.bot_assist_ime_preedit = Some(new_text.to_string());
                     stcx.notify();
                 });
+            } else if self.is_community_input_active(cx) {
+                if let Some(cw) = self.community_workspace.clone() {
+                    cw.update(cx, |w, wcx| w.set_ime_preedit(Some(new_text), wcx));
+                }
             }
         } else {
             self.composer.update(cx, |c, ccx| {
@@ -1357,6 +1523,22 @@ impl AppShell {
             });
         }
         cx.notify();
+    }
+
+    /// Commits text as delivered by `EntityInputHandler::replace_text_in_range`, arming the
+    /// 80ms trailing-Enter IME commit fence only when an active visible input was composing.
+    pub fn commit_replace_text_in_range(&mut self, text: &str, cx: &mut Context<Self>) {
+        let was_composing = self.has_active_ime_preedit(cx)
+            || (!self.should_hide_composer(cx)
+                && self.composer.read(cx).ime_machine.is_composing());
+        self.insert_committed_text(text, cx);
+        if was_composing {
+            if self.is_authenticated {
+                self.ime.mark_ime_committed();
+            } else {
+                self.auth_wizard.update(cx, |w, _| w.ime.mark_ime_committed());
+            }
+        }
     }
 }
 
@@ -1386,12 +1568,7 @@ impl EntityInputHandler for AppShell {
     }
 
     fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
-        let was_composing = self.has_active_ime_preedit(cx) || self.composer.read(cx).ime_machine.is_composing();
-        self.insert_committed_text(text, cx);
-        if was_composing {
-            if self.is_authenticated { self.ime.mark_ime_committed(); }
-            else { self.auth_wizard.update(cx, |w, _| w.ime.mark_ime_committed()); }
-        }
+        self.commit_replace_text_in_range(text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1466,7 +1643,16 @@ impl EntityInputHandler for AppShell {
                 + px((char_count as f32 * 7.5).min(360.0));
             return Some(Bounds::new(point(caret_x, element_bounds.origin.y + px(28.0)), size(px(2.0), px(18.0))));
         }
-        if self.stage.read(cx).search_open {
+        if self.is_community_input_active(cx) {
+            let sb_w = self.sidebar.read(cx).effective_width();
+            let caret_x = element_bounds.origin.x
+                + px(sb_w + 260.0 + (char_count as f32 * 8.0).min(420.0));
+            return Some(Bounds::new(
+                point(caret_x, element_bounds.origin.y + px(140.0)),
+                size(px(2.0), px(18.0)),
+            ));
+        }
+        if self.is_stage_search_active(cx) {
             let caret_x = element_bounds.origin.x + px(360.0) + px((char_count as f32 * 8.0).min(280.0));
             return Some(Bounds::new(point(caret_x, element_bounds.origin.y + px(84.0)), size(px(2.0), px(18.0))));
         }

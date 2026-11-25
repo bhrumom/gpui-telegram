@@ -33,6 +33,7 @@ pub mod shell_actions;
 pub mod shell_bot_browser;
 pub mod shell_calls_rtc;
 pub mod shell_coding_host;
+pub mod shell_community;
 pub mod shell_composer_actions;
 pub mod shell_computers_sync;
 pub mod shell_dialogs_fetch;

@@ -337,6 +337,9 @@ impl AppShell {
             {
                 shell.exit_compose_or_modal_isolation(true, cx);
             }
+            if !cur_modal_active {
+                shell.community_pending_share = None;
+            }
             prev_modal_active = cur_modal_active;
             prev_creation_dialog_open = cur_creation_dialog_open;
         })
@@ -351,7 +354,7 @@ impl AppShell {
 
     fn observe_nav_rail_entity(&self, cx: &mut Context<Self>) {
         cx.observe(&self.nav_rail, |shell, rail, cx| {
-            let (dest, logout_req, trigger, menu_req, archive_req, theme_req, folder_req) =
+            let (mut dest, logout_req, trigger, menu_req, archive_req, theme_req, folder_req) =
                 rail.update(cx, |r, _| {
                     let f = r.selected_folder_requested.take().and_then(|fid| {
                         r.custom_folders.iter().find(|i| i.folder_id == fid).map(|i| i.title.clone())
@@ -371,7 +374,15 @@ impl AppShell {
             }
             if archive_req {
                 shell.leave_browser_panel_if_active(cx);
+                shell.leave_community_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
+                shell.last_handled_nav_dest = Some(NavDestination::Chats);
+                shell.last_handled_nav_trigger = trigger;
+                dest = NavDestination::Chats;
+                rail.update(cx, |r, rcx| {
+                    r.set_active_destination(NavDestination::Chats);
+                    rcx.notify();
+                });
                 shell.sidebar.update(cx, |sb, _| sb.is_archived_expanded = !sb.is_archived_expanded);
                 cx.notify();
             }
@@ -382,7 +393,15 @@ impl AppShell {
             }
             if let Some(folder_title) = folder_req {
                 shell.leave_browser_panel_if_active(cx);
+                shell.leave_community_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
+                shell.last_handled_nav_dest = Some(NavDestination::Chats);
+                shell.last_handled_nav_trigger = trigger;
+                dest = NavDestination::Chats;
+                rail.update(cx, |r, rcx| {
+                    r.set_active_destination(NavDestination::Chats);
+                    rcx.notify();
+                });
                 shell.sidebar.update(cx, |sb, sb_cx| {
                     sb.select_folder(folder_title);
                     sb_cx.notify();
@@ -477,7 +496,7 @@ impl AppShell {
                 shell.toggle_account_popover(cx);
                 shell_dirty = true;
             }
-            let (sb_popup, cur_overlay_open, cur_compose_open, cur_compose_query) = {
+            let (sb_popup, cur_overlay_open, mut cur_compose_open, cur_compose_query) = {
                 let s = shell.sidebar.read(cx);
                 let overlay_open = s.is_contacts_modal_open
                     || s.active_creation_modal.is_some()
@@ -493,6 +512,42 @@ impl AppShell {
                 shell.occlude_browser_for_overlay(cx);
                 shell_dirty = true;
             }
+            if !prev_compose_open && cur_compose_open {
+                if shell.theme_state.palette.is_apple_style()
+                    && shell.active_panel != ActiveWorkspacePanel::Chats
+                {
+                    shell.leave_browser_panel_if_active(cx);
+                    shell.leave_community_panel_if_active(cx);
+                    shell.ime.clear_preedit();
+                    shell.bot_browser.ime_preedit_input_gen = None;
+                    shell.community_ime_preedit_input_gen = None;
+                    shell.active_panel = ActiveWorkspacePanel::Chats;
+                    shell.last_handled_nav_dest = Some(NavDestination::Chats);
+                    shell.nav_rail.update(cx, |r, _| {
+                        r.set_active_destination(NavDestination::Chats);
+                    });
+                } else {
+                    shell.occlude_browser_for_overlay(cx);
+                }
+                shell_dirty = true;
+            } else if cur_compose_open
+                && shell.theme_state.palette.is_apple_style()
+                && shell.active_panel != ActiveWorkspacePanel::Chats
+            {
+                shell.sidebar.update(cx, |sb, scx| {
+                    sb.cancel_compose_mode();
+                    scx.notify();
+                });
+                if shell.composer.read(cx).is_compose_isolated
+                    && !shell.is_compose_or_creation_modal_active(cx)
+                {
+                    shell.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    shell.sync_compose_state_to_composer(true, cx);
+                }
+                cur_compose_open = false;
+                shell_dirty = true;
+            }
             if !prev_search_focused && search_focused && shell.active_panel == ActiveWorkspacePanel::Browser {
                 shell.ime.clear_preedit();
                 shell.bot_browser.ime_preedit_input_gen = None;
@@ -505,6 +560,18 @@ impl AppShell {
                                 wcx,
                             );
                         }
+                    });
+                }
+                shell_dirty = true;
+            }
+            if !prev_search_focused && search_focused && shell.active_panel == ActiveWorkspacePanel::Community {
+                if shell.community_ime_preedit_input_gen.is_some() {
+                    shell.ime.clear_preedit();
+                    shell.community_ime_preedit_input_gen = None;
+                }
+                if let Some(ref cw) = shell.community_workspace {
+                    cw.update(cx, |w, wcx| {
+                        w.blur_active_input(wcx);
                     });
                 }
                 shell_dirty = true;
@@ -553,6 +620,7 @@ impl AppShell {
                 selection_changed = true;
                 if let Some(d) = selected_dialog {
                     shell.leave_browser_panel_if_active(cx);
+                    shell.leave_community_panel_if_active(cx);
                     shell.active_panel = ActiveWorkspacePanel::Chats;
                     shell.last_handled_nav_dest = Some(NavDestination::Chats);
                     shell.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Chats));
