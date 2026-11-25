@@ -106,6 +106,7 @@ impl PtsEngine {
             UpdateEvent::MiniAppWebMcpCommand(_) => "miniapp_webmcp_command",
             UpdateEvent::MiniAppControlStatus { .. } => "miniapp_control_status",
             UpdateEvent::CodingHostCommand(_) => "coding_host_command",
+            UpdateEvent::CommunityEvent { .. } => "community_event",
         };
 
         let (new_pts, pts_update) = self.db.pool().with_transaction(|tx| {

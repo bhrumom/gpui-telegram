@@ -3471,6 +3471,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_telegram_community"
+version = "1.6.14"
+dependencies = [
+ "chrono",
+ "gpui_telegram_core",
+ "gpui_telegram_proto",
+ "parking_lot",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tantivy",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "gpui_telegram_core"
 version = "1.6.14"
 dependencies = [
