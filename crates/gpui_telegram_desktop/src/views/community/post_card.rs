@@ -68,11 +68,36 @@ pub fn render_post_card(
     idx: usize,
     cx: &mut Context<CommunityWorkspace>,
 ) -> AnyElement {
+    render_post_card_inner(ws, item, idx, false, cx)
+}
+
+/// Renders a post in expanded full-detail mode (always full Markdown body, media gallery,
+/// interactive poll, embeds, and engagement bar regardless of feed density).
+pub fn render_post_card_expanded(
+    ws: &CommunityWorkspace,
+    item: &FeedItemDto,
+    idx: usize,
+    cx: &mut Context<CommunityWorkspace>,
+) -> AnyElement {
+    render_post_card_inner(ws, item, idx, true, cx)
+}
+
+fn render_post_card_inner(
+    ws: &CommunityWorkspace,
+    item: &FeedItemDto,
+    idx: usize,
+    force_expanded: bool,
+    cx: &mut Context<CommunityWorkspace>,
+) -> AnyElement {
     let pal = ws.palette;
     let lang = ws.language_id.as_str();
     let post = &item.post;
     let pid = post.post_id.clone();
-    let density = ws.state.density;
+    let density = if force_expanded {
+        FeedDensity::Card
+    } else {
+        ws.state.density
+    };
     let veil_locked = (post.is_nsfw || post.is_spoiler)
         && !ws.state.revealed_post_veils.contains(&post.post_id);
 
@@ -1176,7 +1201,10 @@ fn render_engagement_bar(
     let vote_pid = pid.clone();
     let reply_pid = pid.clone();
     let repost_pid = pid.clone();
-    let quote_pid = pid.clone();
+    let quote_post = post.clone();
+    let crosspost_origin = post.clone();
+    let edit_post = post.clone();
+    let is_owner = ws.is_viewer_owned_actor(&post.author_actor_id);
     let like_pid = pid.clone();
     let award_pid = pid.clone();
     let bookmark_pid = pid.clone();
@@ -1261,19 +1289,33 @@ fn render_engagement_bar(
                     &pal,
                     cx,
                     move |this, cx| {
-                        this.state.quote_post_draft.clear();
-                        this.toggle_popover(CommunityPopover::QuotePost(quote_pid.clone()), cx);
-                        if matches!(
-                            this.state.active_popover,
-                            Some(CommunityPopover::QuotePost(_))
-                        ) {
-                            this.state.focus_input(ActiveCommunityInput::QuotePostNote);
-                        } else {
-                            this.state.blur_input();
-                        }
-                        cx.notify();
+                        this.open_composer_quote(quote_post.clone(), cx);
                     },
                 ))
+                .child(render_action_pill(
+                    SharedString::from(format!("card-crosspost-{pid}-{idx}")),
+                    IconName::CommunityThread,
+                    None,
+                    None,
+                    &pal,
+                    cx,
+                    move |this, cx| {
+                        this.open_composer_crosspost(crosspost_origin.clone(), cx);
+                    },
+                ))
+                .when(is_owner, |row| {
+                    row.child(render_action_pill(
+                        SharedString::from(format!("card-edit-{pid}-{idx}")),
+                        IconName::ComposePen,
+                        None,
+                        Some(pal.accent),
+                        &pal,
+                        cx,
+                        move |this, cx| {
+                            this.open_composer_edit(edit_post.clone(), cx);
+                        },
+                    ))
+                })
                 .child(render_action_pill(
                     SharedString::from(format!("card-like-{pid}-{idx}")),
                     IconName::HeartReaction,

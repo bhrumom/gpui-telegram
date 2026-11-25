@@ -4,13 +4,17 @@ use std::collections::{HashMap, HashSet};
 
 use gpui_telegram_client::CommunityRuntimeMode;
 use gpui_telegram_proto::community_contracts::{
-    ActorFilter, ActorProfileResponse, AlgoPreferencesDto, AwardResponse, BookmarkResponse,
-    BotAutonomyMode, CommentSort, CommunityActorDto, CommunityDetailResponse, CommunityListDto,
-    CommunityNotificationDto, CommunityPostDto, CommunitySearchResultDto, CommunitySearchTab,
-    FeedItemDto, FeedSort, FeedTab, FollowActionResponse, JoinCommunityResponse, ModLogEntryDto,
-    ModQueueItemDto, PollDto, PostDetailResponse, RepostResponse, SubCommunityDto, TimeWindow,
-    ToggleActionResponse, TrendingTopicDto, VoteResponse,
+    ActorFilter, ActorProfileResponse, AlgoPreferencesDto, AutoModActionKind, AwardResponse,
+    BookmarkResponse, BotAutonomyMode, CommentSort, CommunityActorDto, CommunityCommentDto,
+    CommunityDetailResponse, CommunityListDto, CommunityListKind, CommunityNotificationDto,
+    CommunityNotificationKind, CommunityPostDto, CommunitySearchResultDto, CommunitySearchSort,
+    CommunitySearchTab, FeedItemDto, FeedSort, FeedTab, FollowActionResponse,
+    JoinCommunityResponse, ModLogEntryDto, ModQueueItemDto, ModQueueStatus, PollDto,
+    PostDetailResponse, RepostResponse, SubCommunityDto, TimeWindow, ToggleActionResponse,
+    TrendingTopicDto, VoteResponse,
 };
+
+use crate::views::composer::formatting_bar::TextStyleKind;
 
 /// Active route inside the Community workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -54,6 +58,69 @@ pub enum ActiveCommunityInput {
     BotStudioName,
     BotStudioHandle,
     BotStudioPersona,
+    // M5 F17 Post Detail inputs
+    DetailEditComment,
+    DetailSummonPrompt,
+    // M5 F18 Rich Composer Modal inputs
+    ComposerTitle,
+    ComposerBody,
+    ComposerLinkUrl,
+    ComposerLinkTitle,
+    ComposerLinkDesc,
+    ComposerMediaUrl(usize),
+    ComposerMediaAlt(usize),
+    ComposerPollQuestion,
+    ComposerPollOption(usize),
+    ComposerThreadPart(usize),
+    ComposerScheduleMinutes,
+    ComposerBotPrompt,
+    // M5 F19 Community Page & Create Community inputs
+    CommunityWikiMarkdown,
+    CommunityWikiSummary,
+    CommunityNewRuleTitle,
+    CommunityNewRuleDesc,
+    CreateCommSlug,
+    CreateCommName,
+    CreateCommDescription,
+    CreateCommIconEmoji,
+    // M5 F20 Actor Profile Edit inputs
+    ProfileEditDisplayName,
+    ProfileEditBio,
+    ProfileEditLocation,
+    ProfileEditWebsite,
+    ProfileEditBotBadge,
+    ProfileEditBotModel,
+    ProfileEditBotPersona,
+    // M5 F20 Bookmarks & Lists inputs
+    BookmarkNewFolder,
+    ListEditorName,
+    ListEditorDesc,
+    // M5 F21 Moderation Console & AutoMod inputs
+    ModReason,
+    ModFlair,
+    AutoModRuleName,
+    AutoModRuleKeywords,
+    AutoModRuleRegex,
+    AutoModRuleMinKarma,
+    AutoModRuleMaxLinks,
+    AutoModRuleFlair,
+    AutoModRuleReply,
+    AutoModDryRunTitle,
+    AutoModDryRunBody,
+    // M5 F21 Bot Citizenship Studio inputs
+    BotStudioBio,
+    BotStudioBadge,
+    BotStudioModel,
+    BotStudioCustomCap,
+    BotStudioCooldown,
+    BotStudioMaxPostsPerHour,
+    BotStudioEditName,
+    BotStudioEditBio,
+    BotStudioEditBadge,
+    BotStudioEditModel,
+    BotStudioEditCustomCap,
+    BotStudioEditPersona,
+    BotStudioTestPostBody,
 }
 
 impl ActiveCommunityInput {
@@ -64,6 +131,106 @@ impl ActiveCommunityInput {
                 | Self::DetailReply
                 | Self::QuotePostNote
                 | Self::BotStudioPersona
+                | Self::DetailEditComment
+                | Self::ComposerBody
+                | Self::ComposerThreadPart(_)
+                | Self::CommunityWikiMarkdown
+                | Self::CommunityNewRuleDesc
+                | Self::CreateCommDescription
+                | Self::ProfileEditBio
+                | Self::ProfileEditBotPersona
+                | Self::ListEditorDesc
+                | Self::AutoModRuleReply
+                | Self::AutoModDryRunBody
+                | Self::BotStudioBio
+                | Self::BotStudioEditBio
+                | Self::BotStudioEditPersona
+                | Self::BotStudioTestPostBody
+        )
+    }
+
+    pub fn is_composer_input(self) -> bool {
+        matches!(
+            self,
+            Self::ComposerTitle
+                | Self::ComposerBody
+                | Self::ComposerLinkUrl
+                | Self::ComposerLinkTitle
+                | Self::ComposerLinkDesc
+                | Self::ComposerMediaUrl(_)
+                | Self::ComposerMediaAlt(_)
+                | Self::ComposerPollQuestion
+                | Self::ComposerPollOption(_)
+                | Self::ComposerThreadPart(_)
+                | Self::ComposerScheduleMinutes
+                | Self::ComposerBotPrompt
+        )
+    }
+
+    pub fn is_create_comm_input(self) -> bool {
+        matches!(
+            self,
+            Self::CreateCommSlug
+                | Self::CreateCommName
+                | Self::CreateCommDescription
+                | Self::CreateCommIconEmoji
+        )
+    }
+
+    pub fn is_profile_edit_input(self) -> bool {
+        matches!(
+            self,
+            Self::ProfileEditDisplayName
+                | Self::ProfileEditBio
+                | Self::ProfileEditLocation
+                | Self::ProfileEditWebsite
+                | Self::ProfileEditBotBadge
+                | Self::ProfileEditBotModel
+                | Self::ProfileEditBotPersona
+        )
+    }
+
+    pub fn is_list_editor_input(self) -> bool {
+        matches!(self, Self::ListEditorName | Self::ListEditorDesc)
+    }
+
+    pub fn is_automod_input(self) -> bool {
+        matches!(
+            self,
+            Self::AutoModRuleName
+                | Self::AutoModRuleKeywords
+                | Self::AutoModRuleRegex
+                | Self::AutoModRuleMinKarma
+                | Self::AutoModRuleMaxLinks
+                | Self::AutoModRuleFlair
+                | Self::AutoModRuleReply
+        )
+    }
+
+    pub fn is_bot_studio_create_input(self) -> bool {
+        matches!(
+            self,
+            Self::BotStudioName
+                | Self::BotStudioHandle
+                | Self::BotStudioPersona
+                | Self::BotStudioBio
+                | Self::BotStudioBadge
+                | Self::BotStudioModel
+                | Self::BotStudioCustomCap
+                | Self::BotStudioCooldown
+                | Self::BotStudioMaxPostsPerHour
+        )
+    }
+
+    pub fn is_bot_studio_edit_input(self) -> bool {
+        matches!(
+            self,
+            Self::BotStudioEditName
+                | Self::BotStudioEditBio
+                | Self::BotStudioEditBadge
+                | Self::BotStudioEditModel
+                | Self::BotStudioEditCustomCap
+                | Self::BotStudioEditPersona
         )
     }
 }
@@ -155,7 +322,7 @@ pub fn sanitize_algo_prefs(prefs: &AlgoPreferencesDto) -> AlgoPreferencesDto {
     }
 }
 
-/// Active floating popover overlay rendered on top of the Community scroll containers.
+/// Active floating popover overlay rendered on top of the Community scroll containers & modals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommunityPopover {
     IdentitySwitcher,
@@ -164,6 +331,374 @@ pub enum CommunityPopover {
     AwardPost(String),
     QuickPostCommunityPicker,
     QuotePost(String),
+    AwardComment(String),
+    SummonBotPicker(String),
+}
+
+/// Active centered `macos_modal_card` sheet overlay inside the Community workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunityModal {
+    Composer,
+    CreateCommunity,
+    EditProfile,
+}
+
+/// Dual-mode display toggle inside `PostDetail` (F17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostDetailMode {
+    #[default]
+    RedditTree,
+    XThread,
+}
+
+/// Multi-format post creation tab inside `ComposerModal` (F18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComposerFormatTab {
+    #[default]
+    Micro,
+    Article,
+    Media,
+    Link,
+    Poll,
+    Thread,
+    Crosspost,
+    Quote,
+}
+
+/// Single media attachment draft entry inside `ComposerModal` (1..=4 items).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerMediaDraft {
+    pub url_or_id: String,
+    pub kind: String,
+    pub alt_text: String,
+}
+
+impl Default for ComposerMediaDraft {
+    fn default() -> Self {
+        Self {
+            url_or_id: String::new(),
+            kind: "image".to_string(),
+            alt_text: String::new(),
+        }
+    }
+}
+
+/// Complete ViewModel state for the full rich `ComposerModal` (F18).
+#[derive(Debug, Clone)]
+pub struct ComposerModalState {
+    pub editing_post_id: Option<String>,
+    pub tab: ComposerFormatTab,
+    pub show_drafts_drawer: bool,
+    pub show_markdown_preview: bool,
+    pub community_slug: Option<String>,
+    pub flair: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub media_items: Vec<ComposerMediaDraft>,
+    pub link_url: String,
+    pub link_title: String,
+    pub link_description: String,
+    pub poll_question: String,
+    pub poll_options: Vec<String>,
+    pub poll_multi_select: bool,
+    pub poll_duration_secs: i64,
+    pub thread_parts: Vec<String>,
+    pub quoted_post_id: Option<String>,
+    pub crosspost_of_id: Option<String>,
+    pub origin_preview: Option<CommunityPostDto>,
+    pub is_nsfw: bool,
+    pub is_spoiler: bool,
+    pub schedule_enabled: bool,
+    pub schedule_offset_mins: i64,
+    pub schedule_minutes_input: String,
+    pub co_author_bot_id: Option<String>,
+    pub bot_prompt: String,
+    pub bot_coauthor_suggestion: Option<String>,
+    pub autocomplete_dismissed: bool,
+    pub active_formats: Vec<TextStyleKind>,
+    pub submitting: bool,
+    pub validation_error: Option<String>,
+    pub drafts: Vec<CommunityPostDto>,
+    pub drafts_loading: bool,
+    pub drafts_gen: u64,
+}
+
+impl Default for ComposerModalState {
+    fn default() -> Self {
+        Self {
+            editing_post_id: None,
+            tab: ComposerFormatTab::Micro,
+            show_drafts_drawer: false,
+            show_markdown_preview: false,
+            community_slug: None,
+            flair: None,
+            title: String::new(),
+            body: String::new(),
+            media_items: vec![ComposerMediaDraft::default()],
+            link_url: String::new(),
+            link_title: String::new(),
+            link_description: String::new(),
+            poll_question: String::new(),
+            poll_options: vec![String::new(), String::new()],
+            poll_multi_select: false,
+            poll_duration_secs: 86_400,
+            thread_parts: vec![String::new()],
+            quoted_post_id: None,
+            crosspost_of_id: None,
+            origin_preview: None,
+            is_nsfw: false,
+            is_spoiler: false,
+            schedule_enabled: false,
+            schedule_offset_mins: 60,
+            schedule_minutes_input: "60".to_string(),
+            co_author_bot_id: None,
+            bot_prompt: String::new(),
+            bot_coauthor_suggestion: None,
+            autocomplete_dismissed: false,
+            active_formats: Vec::new(),
+            submitting: false,
+            validation_error: None,
+            drafts: Vec::new(),
+            drafts_loading: false,
+            drafts_gen: 0,
+        }
+    }
+}
+
+/// Active sub-tab on a `c/<slug>` Community page (F19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommunityPageTab {
+    #[default]
+    Posts,
+    Rules,
+    Wiki,
+    Mods,
+}
+
+/// Form draft state for the "Create Community" modal (F19).
+#[derive(Debug, Clone)]
+pub struct CreateCommunityDraft {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub icon_emoji: String,
+    pub accent_color: String,
+    pub allow_bots: bool,
+    pub require_bot_disclosure: bool,
+    pub is_nsfw: bool,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+impl Default for CreateCommunityDraft {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            name: String::new(),
+            description: String::new(),
+            category: "tech".to_string(),
+            icon_emoji: "🚀".to_string(),
+            accent_color: "#3B82F6".to_string(),
+            allow_bots: true,
+            require_bot_disclosure: true,
+            is_nsfw: false,
+            submitting: false,
+            error: None,
+        }
+    }
+}
+
+/// Active sub-tab on a Human/Bot `@handle` Profile page (F20-Profile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActorProfileTab {
+    #[default]
+    Posts,
+    Replies,
+    Threads,
+    Media,
+    Likes,
+    Upvoted,
+    Communities,
+    BotActivity,
+}
+
+/// Form draft state for editing an owned Human or Bot profile (F20-Profile).
+#[derive(Debug, Clone, Default)]
+pub struct EditProfileDraft {
+    pub actor_id: String,
+    pub is_bot: bool,
+    pub display_name: String,
+    pub bio: String,
+    pub location: String,
+    pub website: String,
+    pub avatar_shape: String,
+    pub avatar_color: String,
+    pub bot_badge: String,
+    pub bot_model: String,
+    pub bot_autonomy_mode: BotAutonomyMode,
+    pub bot_persona: String,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+/// Notification category filter tabs mapping exhaustively across all `CommunityNotificationKind` variants (F20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotificationCategoryTab {
+    #[default]
+    All,
+    Mentions,
+    Replies,
+    VotesLikes,
+    RepostsQuotes,
+    Follows,
+    BotActivity,
+    Moderation,
+}
+
+impl NotificationCategoryTab {
+    pub const ALL_TABS: [Self; 8] = [
+        Self::All,
+        Self::Mentions,
+        Self::Replies,
+        Self::VotesLikes,
+        Self::RepostsQuotes,
+        Self::Follows,
+        Self::BotActivity,
+        Self::Moderation,
+    ];
+
+    pub fn matches(self, kind: CommunityNotificationKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Mentions => matches!(kind, CommunityNotificationKind::Mention),
+            Self::Replies => matches!(kind, CommunityNotificationKind::Reply),
+            Self::VotesLikes => matches!(
+                kind,
+                CommunityNotificationKind::Like
+                    | CommunityNotificationKind::UpvoteMilestone
+                    | CommunityNotificationKind::Award
+            ),
+            Self::RepostsQuotes => matches!(
+                kind,
+                CommunityNotificationKind::Repost | CommunityNotificationKind::Quote
+            ),
+            Self::Follows => matches!(kind, CommunityNotificationKind::Follow),
+            Self::BotActivity => matches!(
+                kind,
+                CommunityNotificationKind::BotSummon | CommunityNotificationKind::BotReply
+            ),
+            Self::Moderation => matches!(
+                kind,
+                CommunityNotificationKind::ModAction
+                    | CommunityNotificationKind::PollEnded
+                    | CommunityNotificationKind::System
+            ),
+        }
+    }
+}
+
+/// Top-level section switcher inside `BookmarksLists` (F20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BookmarksListsSection {
+    #[default]
+    Bookmarks,
+    Lists,
+}
+
+/// Create/Edit draft state for X Lists & Reddit Custom Feeds (F20).
+#[derive(Debug, Clone)]
+pub struct ListEditorDraft {
+    pub editing_list_id: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub kind: CommunityListKind,
+    pub is_private: bool,
+    pub is_pinned: bool,
+    pub member_actor_ids: Vec<String>,
+    pub community_slugs: Vec<String>,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+impl Default for ListEditorDraft {
+    fn default() -> Self {
+        Self {
+            editing_list_id: None,
+            name: String::new(),
+            description: String::new(),
+            kind: CommunityListKind::Mixed,
+            is_private: false,
+            is_pinned: false,
+            member_actor_ids: Vec::new(),
+            community_slugs: Vec::new(),
+            submitting: false,
+            error: None,
+        }
+    }
+}
+
+/// Sub-tab switcher inside the Community Moderation Console (F21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModConsoleTab {
+    #[default]
+    Queue,
+    AutoModRules,
+    ModLog,
+}
+
+/// Declarative AutoMod rule creation draft state (F21).
+#[derive(Debug, Clone)]
+pub struct AutoModRuleDraft {
+    pub name: String,
+    pub keywords: String,
+    pub regex_pattern: String,
+    pub min_karma: String,
+    pub max_links: String,
+    pub action: AutoModActionKind,
+    pub assign_flair: String,
+    pub auto_reply_template: String,
+    pub apply_to_bots: bool,
+    pub apply_to_humans: bool,
+    pub saving: bool,
+    pub error: Option<String>,
+}
+
+impl Default for AutoModRuleDraft {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            keywords: String::new(),
+            regex_pattern: String::new(),
+            min_karma: String::new(),
+            max_links: String::new(),
+            action: AutoModActionKind::FlagForReview,
+            assign_flair: String::new(),
+            auto_reply_template: String::new(),
+            apply_to_bots: true,
+            apply_to_humans: true,
+            saving: false,
+            error: None,
+        }
+    }
+}
+
+/// Edit draft state for modifying an existing owned Bot inside Bot Citizenship Studio (F21).
+#[derive(Debug, Clone, Default)]
+pub struct BotStudioEditDraft {
+    pub actor_id: String,
+    pub display_name: String,
+    pub bio: String,
+    pub bot_badge: String,
+    pub bot_model: String,
+    pub bot_capabilities: Vec<String>,
+    pub custom_cap_draft: String,
+    pub bot_persona: String,
+    pub bot_autonomy_mode: BotAutonomyMode,
+    pub shape_idx: usize,
+    pub color_idx: usize,
+    pub saving: bool,
+    pub error: Option<String>,
 }
 
 /// Complete client-side ViewModel for [`super::CommunityWorkspace`].
@@ -212,8 +747,9 @@ pub struct CommunityWorkspaceState {
     pub ime_preedit: Option<String>,
     pub input_generation: u64,
 
-    // Card interactive states
+    // Card interactive states & modal sheets
     pub active_popover: Option<CommunityPopover>,
+    pub active_modal: Option<CommunityModal>,
     pub card_child_click_consumed: bool,
     pub revealed_spoilers: HashSet<(u64, usize)>,
     pub revealed_post_veils: HashSet<String>,
@@ -229,51 +765,136 @@ pub struct CommunityWorkspaceState {
     pub recommended_actors: Vec<CommunityActorDto>,
     pub unread_notifications: u32,
 
-    // Secondary route live caches
+    // Secondary route live caches & M5 interactive states
     pub detail_post: Option<PostDetailResponse>,
     pub detail_comment_sort: CommentSort,
+    pub detail_mode: PostDetailMode,
+    pub detail_collapsed_comments: HashSet<String>,
+    pub detail_editing_comment_id: Option<String>,
+    pub detail_edit_comment_draft: String,
+    pub detail_loading_more_comment_ids: HashSet<String>,
+    pub detail_summon_bot_id: Option<String>,
+    pub detail_summon_prompt: String,
+    pub detail_summon_pending: bool,
+    pub detail_summon_feedback: Option<(String, bool)>,
+    pub detail_focused_comment_id: Option<String>,
     pub detail_loading: bool,
     pub detail_error: Option<String>,
     pub detail_gen: u64,
 
+    // F18 Rich Multi-Format Composer modal state
+    pub composer: ComposerModalState,
+
+    // F19 Community Page & Create Community modal state
     pub community_detail: Option<CommunityDetailResponse>,
     pub community_posts: Vec<FeedItemDto>,
+    pub community_tab: CommunityPageTab,
+    pub community_selected_flair: Option<String>,
+    pub community_sort: FeedSort,
+    pub community_time_window: TimeWindow,
+    pub community_actor_filter: ActorFilter,
+    pub community_next_cursor: Option<String>,
+    pub community_loading_more: bool,
+    pub community_bell_enabled: HashMap<String, bool>,
+    pub community_wiki_editing: bool,
+    pub community_wiki_draft: String,
+    pub community_wiki_summary: String,
+    pub community_wiki_preview_rev: Option<u32>,
+    pub community_wiki_saving: bool,
+    pub community_new_rule_title: String,
+    pub community_new_rule_desc: String,
+    pub community_rules_saving: bool,
+    pub create_community: CreateCommunityDraft,
     pub community_loading: bool,
     pub community_error: Option<String>,
     pub community_gen: u64,
 
+    // F20 Actor Profile & Edit Profile modal state
     pub actor_profile: Option<ActorProfileResponse>,
+    pub profile_tab: ActorProfileTab,
+    pub edit_profile: EditProfileDraft,
     pub profile_loading: bool,
     pub profile_error: Option<String>,
     pub profile_gen: u64,
 
+    // F21 Explore & Search state
     pub search_result: Option<CommunitySearchResultDto>,
     pub search_tab: CommunitySearchTab,
+    pub search_sort: CommunitySearchSort,
+    pub search_category_filter: Option<String>,
+    pub explore_show_discovery: bool,
+    pub search_error: Option<String>,
     pub search_loading: bool,
     pub search_gen: u64,
 
+    // F20 Notifications state
     pub notifications: Vec<CommunityNotificationDto>,
+    pub notif_category: NotificationCategoryTab,
+    pub notif_unread_only: bool,
     pub notifications_loading: bool,
     pub notifications_gen: u64,
 
+    // F20 Bookmarks & Lists state
     pub saved_items: Vec<FeedItemDto>,
+    pub bookmarks_section: BookmarksListsSection,
+    pub bookmark_selected_folder: String,
+    pub bookmark_custom_folders: Vec<String>,
+    pub bookmark_new_folder_draft: String,
+    pub bookmark_moving_post_id: Option<String>,
+    pub selected_list_id: Option<String>,
+    pub list_feed_items: Vec<FeedItemDto>,
+    pub list_feed_sort: FeedSort,
+    pub list_feed_actor_filter: ActorFilter,
+    pub list_feed_loading: bool,
+    pub list_feed_gen: u64,
+    pub list_editor_open: bool,
+    pub list_editor: ListEditorDraft,
     pub saved_loading: bool,
     pub saved_gen: u64,
 
+    // F21 Moderation Console state
     pub mod_slug: Option<String>,
+    pub mod_tab: ModConsoleTab,
+    pub mod_status_filter: Option<ModQueueStatus>,
+    pub mod_reason_draft: String,
+    pub mod_flair_draft: String,
+    pub mod_community: Option<SubCommunityDto>,
     pub mod_queue: Vec<ModQueueItemDto>,
     pub mod_logs: Vec<ModLogEntryDto>,
+    pub mod_error: Option<String>,
+    pub automod_draft: AutoModRuleDraft,
+    pub automod_dry_run_title: String,
+    pub automod_dry_run_body: String,
+    pub automod_dry_run_is_bot: bool,
+    pub automod_dry_run_result: Option<gpui_telegram_community::AutoModDecision>,
     pub mod_loading: bool,
     pub mod_gen: u64,
 
+    // F21 Bot Citizenship Studio state (preserving M4 fields)
     pub bot_studio_name: String,
     pub bot_studio_handle: String,
     pub bot_studio_persona: String,
+    pub bot_studio_bio: String,
+    pub bot_studio_badge: String,
+    pub bot_studio_model: String,
+    pub bot_studio_capabilities: Vec<String>,
+    pub bot_studio_custom_cap_draft: String,
+    pub bot_studio_cooldown_secs: String,
+    pub bot_studio_max_posts_per_hour: String,
     pub bot_studio_shape_idx: usize,
     pub bot_studio_color_idx: usize,
     pub bot_studio_autonomy: BotAutonomyMode,
     pub bot_studio_submitting: bool,
     pub bot_studio_last_token: Option<String>,
+    pub bot_studio_tokens_by_actor: HashMap<String, String>,
+    pub bot_studio_token_revealed: bool,
+    pub bot_studio_selected_bot_id: Option<String>,
+    pub bot_studio_edit: BotStudioEditDraft,
+    pub bot_studio_test_community: Option<String>,
+    pub bot_studio_test_content: String,
+    pub bot_studio_test_submitting: bool,
+    pub bot_studio_test_last_post_id: Option<String>,
+    pub bot_studio_test_feedback: Option<(String, bool)>,
     pub bot_studio_error: Option<String>,
 }
 
@@ -319,6 +940,7 @@ impl Default for CommunityWorkspaceState {
             ime_preedit: None,
             input_generation: 0,
             active_popover: None,
+            active_modal: None,
             card_child_click_consumed: false,
             revealed_spoilers: HashSet::new(),
             revealed_post_veils: HashSet::new(),
@@ -333,41 +955,117 @@ impl Default for CommunityWorkspaceState {
             unread_notifications: 0,
             detail_post: None,
             detail_comment_sort: CommentSort::Best,
+            detail_mode: PostDetailMode::RedditTree,
+            detail_collapsed_comments: HashSet::new(),
+            detail_editing_comment_id: None,
+            detail_edit_comment_draft: String::new(),
+            detail_loading_more_comment_ids: HashSet::new(),
+            detail_summon_bot_id: None,
+            detail_summon_prompt: String::new(),
+            detail_summon_pending: false,
+            detail_summon_feedback: None,
+            detail_focused_comment_id: None,
             detail_loading: false,
             detail_error: None,
             detail_gen: 0,
+            composer: ComposerModalState::default(),
             community_detail: None,
             community_posts: Vec::new(),
+            community_tab: CommunityPageTab::Posts,
+            community_selected_flair: None,
+            community_sort: FeedSort::Hot,
+            community_time_window: TimeWindow::All,
+            community_actor_filter: ActorFilter::AllCitizens,
+            community_next_cursor: None,
+            community_loading_more: false,
+            community_bell_enabled: HashMap::new(),
+            community_wiki_editing: false,
+            community_wiki_draft: String::new(),
+            community_wiki_summary: String::new(),
+            community_wiki_preview_rev: None,
+            community_wiki_saving: false,
+            community_new_rule_title: String::new(),
+            community_new_rule_desc: String::new(),
+            community_rules_saving: false,
+            create_community: CreateCommunityDraft::default(),
             community_loading: false,
             community_error: None,
             community_gen: 0,
             actor_profile: None,
+            profile_tab: ActorProfileTab::Posts,
+            edit_profile: EditProfileDraft::default(),
             profile_loading: false,
             profile_error: None,
             profile_gen: 0,
             search_result: None,
             search_tab: CommunitySearchTab::Top,
+            search_sort: CommunitySearchSort::Relevance,
+            search_category_filter: None,
+            explore_show_discovery: true,
+            search_error: None,
             search_loading: false,
             search_gen: 0,
             notifications: Vec::new(),
+            notif_category: NotificationCategoryTab::All,
+            notif_unread_only: false,
             notifications_loading: false,
             notifications_gen: 0,
             saved_items: Vec::new(),
+            bookmarks_section: BookmarksListsSection::Bookmarks,
+            bookmark_selected_folder: "All".to_string(),
+            bookmark_custom_folders: Vec::new(),
+            bookmark_new_folder_draft: String::new(),
+            bookmark_moving_post_id: None,
+            selected_list_id: None,
+            list_feed_items: Vec::new(),
+            list_feed_sort: FeedSort::New,
+            list_feed_actor_filter: ActorFilter::AllCitizens,
+            list_feed_loading: false,
+            list_feed_gen: 0,
+            list_editor_open: false,
+            list_editor: ListEditorDraft::default(),
             saved_loading: false,
             saved_gen: 0,
             mod_slug: None,
+            mod_tab: ModConsoleTab::Queue,
+            mod_status_filter: Some(ModQueueStatus::Pending),
+            mod_reason_draft: String::new(),
+            mod_flair_draft: String::new(),
+            mod_community: None,
             mod_queue: Vec::new(),
             mod_logs: Vec::new(),
+            mod_error: None,
+            automod_draft: AutoModRuleDraft::default(),
+            automod_dry_run_title: String::new(),
+            automod_dry_run_body: String::new(),
+            automod_dry_run_is_bot: false,
+            automod_dry_run_result: None,
             mod_loading: false,
             mod_gen: 0,
             bot_studio_name: String::new(),
             bot_studio_handle: String::new(),
             bot_studio_persona: String::new(),
+            bot_studio_bio: String::new(),
+            bot_studio_badge: "AI Agent".to_string(),
+            bot_studio_model: "Fabushi-1".to_string(),
+            bot_studio_capabilities: vec!["community".to_string(), "debate".to_string()],
+            bot_studio_custom_cap_draft: String::new(),
+            bot_studio_cooldown_secs: "30".to_string(),
+            bot_studio_max_posts_per_hour: "12".to_string(),
             bot_studio_shape_idx: 0,
             bot_studio_color_idx: 0,
             bot_studio_autonomy: BotAutonomyMode::MentionOnly,
             bot_studio_submitting: false,
             bot_studio_last_token: None,
+            bot_studio_tokens_by_actor: HashMap::new(),
+            bot_studio_token_revealed: false,
+            bot_studio_selected_bot_id: None,
+            bot_studio_edit: BotStudioEditDraft::default(),
+            bot_studio_test_community: None,
+            bot_studio_test_content: String::new(),
+            bot_studio_test_submitting: false,
+            bot_studio_test_last_post_id: None,
+            bot_studio_test_feedback: None,
             bot_studio_error: None,
         }
     }
@@ -433,6 +1131,82 @@ impl CommunityWorkspaceState {
             ActiveCommunityInput::BotStudioName => &self.bot_studio_name,
             ActiveCommunityInput::BotStudioHandle => &self.bot_studio_handle,
             ActiveCommunityInput::BotStudioPersona => &self.bot_studio_persona,
+            ActiveCommunityInput::DetailEditComment => &self.detail_edit_comment_draft,
+            ActiveCommunityInput::DetailSummonPrompt => &self.detail_summon_prompt,
+            ActiveCommunityInput::ComposerTitle => &self.composer.title,
+            ActiveCommunityInput::ComposerBody => &self.composer.body,
+            ActiveCommunityInput::ComposerLinkUrl => &self.composer.link_url,
+            ActiveCommunityInput::ComposerLinkTitle => &self.composer.link_title,
+            ActiveCommunityInput::ComposerLinkDesc => &self.composer.link_description,
+            ActiveCommunityInput::ComposerMediaUrl(i) => self
+                .composer
+                .media_items
+                .get(i)
+                .map(|m| m.url_or_id.as_str())
+                .unwrap_or(""),
+            ActiveCommunityInput::ComposerMediaAlt(i) => self
+                .composer
+                .media_items
+                .get(i)
+                .map(|m| m.alt_text.as_str())
+                .unwrap_or(""),
+            ActiveCommunityInput::ComposerPollQuestion => &self.composer.poll_question,
+            ActiveCommunityInput::ComposerPollOption(i) => self
+                .composer
+                .poll_options
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or(""),
+            ActiveCommunityInput::ComposerThreadPart(i) => self
+                .composer
+                .thread_parts
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or(""),
+            ActiveCommunityInput::ComposerScheduleMinutes => &self.composer.schedule_minutes_input,
+            ActiveCommunityInput::ComposerBotPrompt => &self.composer.bot_prompt,
+            ActiveCommunityInput::CommunityWikiMarkdown => &self.community_wiki_draft,
+            ActiveCommunityInput::CommunityWikiSummary => &self.community_wiki_summary,
+            ActiveCommunityInput::CommunityNewRuleTitle => &self.community_new_rule_title,
+            ActiveCommunityInput::CommunityNewRuleDesc => &self.community_new_rule_desc,
+            ActiveCommunityInput::CreateCommSlug => &self.create_community.slug,
+            ActiveCommunityInput::CreateCommName => &self.create_community.name,
+            ActiveCommunityInput::CreateCommDescription => &self.create_community.description,
+            ActiveCommunityInput::CreateCommIconEmoji => &self.create_community.icon_emoji,
+            ActiveCommunityInput::ProfileEditDisplayName => &self.edit_profile.display_name,
+            ActiveCommunityInput::ProfileEditBio => &self.edit_profile.bio,
+            ActiveCommunityInput::ProfileEditLocation => &self.edit_profile.location,
+            ActiveCommunityInput::ProfileEditWebsite => &self.edit_profile.website,
+            ActiveCommunityInput::ProfileEditBotBadge => &self.edit_profile.bot_badge,
+            ActiveCommunityInput::ProfileEditBotModel => &self.edit_profile.bot_model,
+            ActiveCommunityInput::ProfileEditBotPersona => &self.edit_profile.bot_persona,
+            ActiveCommunityInput::BookmarkNewFolder => &self.bookmark_new_folder_draft,
+            ActiveCommunityInput::ListEditorName => &self.list_editor.name,
+            ActiveCommunityInput::ListEditorDesc => &self.list_editor.description,
+            ActiveCommunityInput::ModReason => &self.mod_reason_draft,
+            ActiveCommunityInput::ModFlair => &self.mod_flair_draft,
+            ActiveCommunityInput::AutoModRuleName => &self.automod_draft.name,
+            ActiveCommunityInput::AutoModRuleKeywords => &self.automod_draft.keywords,
+            ActiveCommunityInput::AutoModRuleRegex => &self.automod_draft.regex_pattern,
+            ActiveCommunityInput::AutoModRuleMinKarma => &self.automod_draft.min_karma,
+            ActiveCommunityInput::AutoModRuleMaxLinks => &self.automod_draft.max_links,
+            ActiveCommunityInput::AutoModRuleFlair => &self.automod_draft.assign_flair,
+            ActiveCommunityInput::AutoModRuleReply => &self.automod_draft.auto_reply_template,
+            ActiveCommunityInput::AutoModDryRunTitle => &self.automod_dry_run_title,
+            ActiveCommunityInput::AutoModDryRunBody => &self.automod_dry_run_body,
+            ActiveCommunityInput::BotStudioBio => &self.bot_studio_bio,
+            ActiveCommunityInput::BotStudioBadge => &self.bot_studio_badge,
+            ActiveCommunityInput::BotStudioModel => &self.bot_studio_model,
+            ActiveCommunityInput::BotStudioCustomCap => &self.bot_studio_custom_cap_draft,
+            ActiveCommunityInput::BotStudioCooldown => &self.bot_studio_cooldown_secs,
+            ActiveCommunityInput::BotStudioMaxPostsPerHour => &self.bot_studio_max_posts_per_hour,
+            ActiveCommunityInput::BotStudioEditName => &self.bot_studio_edit.display_name,
+            ActiveCommunityInput::BotStudioEditBio => &self.bot_studio_edit.bio,
+            ActiveCommunityInput::BotStudioEditBadge => &self.bot_studio_edit.bot_badge,
+            ActiveCommunityInput::BotStudioEditModel => &self.bot_studio_edit.bot_model,
+            ActiveCommunityInput::BotStudioEditCustomCap => &self.bot_studio_edit.custom_cap_draft,
+            ActiveCommunityInput::BotStudioEditPersona => &self.bot_studio_edit.bot_persona,
+            ActiveCommunityInput::BotStudioTestPostBody => &self.bot_studio_test_content,
         }
     }
 
@@ -448,6 +1222,80 @@ impl CommunityWorkspaceState {
             ActiveCommunityInput::BotStudioName => Some(&mut self.bot_studio_name),
             ActiveCommunityInput::BotStudioHandle => Some(&mut self.bot_studio_handle),
             ActiveCommunityInput::BotStudioPersona => Some(&mut self.bot_studio_persona),
+            ActiveCommunityInput::DetailEditComment => Some(&mut self.detail_edit_comment_draft),
+            ActiveCommunityInput::DetailSummonPrompt => Some(&mut self.detail_summon_prompt),
+            ActiveCommunityInput::ComposerTitle => Some(&mut self.composer.title),
+            ActiveCommunityInput::ComposerBody => Some(&mut self.composer.body),
+            ActiveCommunityInput::ComposerLinkUrl => Some(&mut self.composer.link_url),
+            ActiveCommunityInput::ComposerLinkTitle => Some(&mut self.composer.link_title),
+            ActiveCommunityInput::ComposerLinkDesc => Some(&mut self.composer.link_description),
+            ActiveCommunityInput::ComposerMediaUrl(i) => {
+                self.composer.media_items.get_mut(i).map(|m| &mut m.url_or_id)
+            }
+            ActiveCommunityInput::ComposerMediaAlt(i) => {
+                self.composer.media_items.get_mut(i).map(|m| &mut m.alt_text)
+            }
+            ActiveCommunityInput::ComposerPollQuestion => Some(&mut self.composer.poll_question),
+            ActiveCommunityInput::ComposerPollOption(i) => self.composer.poll_options.get_mut(i),
+            ActiveCommunityInput::ComposerThreadPart(i) => self.composer.thread_parts.get_mut(i),
+            ActiveCommunityInput::ComposerScheduleMinutes => {
+                Some(&mut self.composer.schedule_minutes_input)
+            }
+            ActiveCommunityInput::ComposerBotPrompt => Some(&mut self.composer.bot_prompt),
+            ActiveCommunityInput::CommunityWikiMarkdown => Some(&mut self.community_wiki_draft),
+            ActiveCommunityInput::CommunityWikiSummary => Some(&mut self.community_wiki_summary),
+            ActiveCommunityInput::CommunityNewRuleTitle => Some(&mut self.community_new_rule_title),
+            ActiveCommunityInput::CommunityNewRuleDesc => Some(&mut self.community_new_rule_desc),
+            ActiveCommunityInput::CreateCommSlug => Some(&mut self.create_community.slug),
+            ActiveCommunityInput::CreateCommName => Some(&mut self.create_community.name),
+            ActiveCommunityInput::CreateCommDescription => {
+                Some(&mut self.create_community.description)
+            }
+            ActiveCommunityInput::CreateCommIconEmoji => Some(&mut self.create_community.icon_emoji),
+            ActiveCommunityInput::ProfileEditDisplayName => {
+                Some(&mut self.edit_profile.display_name)
+            }
+            ActiveCommunityInput::ProfileEditBio => Some(&mut self.edit_profile.bio),
+            ActiveCommunityInput::ProfileEditLocation => Some(&mut self.edit_profile.location),
+            ActiveCommunityInput::ProfileEditWebsite => Some(&mut self.edit_profile.website),
+            ActiveCommunityInput::ProfileEditBotBadge => Some(&mut self.edit_profile.bot_badge),
+            ActiveCommunityInput::ProfileEditBotModel => Some(&mut self.edit_profile.bot_model),
+            ActiveCommunityInput::ProfileEditBotPersona => Some(&mut self.edit_profile.bot_persona),
+            ActiveCommunityInput::BookmarkNewFolder => Some(&mut self.bookmark_new_folder_draft),
+            ActiveCommunityInput::ListEditorName => Some(&mut self.list_editor.name),
+            ActiveCommunityInput::ListEditorDesc => Some(&mut self.list_editor.description),
+            ActiveCommunityInput::ModReason => Some(&mut self.mod_reason_draft),
+            ActiveCommunityInput::ModFlair => Some(&mut self.mod_flair_draft),
+            ActiveCommunityInput::AutoModRuleName => Some(&mut self.automod_draft.name),
+            ActiveCommunityInput::AutoModRuleKeywords => Some(&mut self.automod_draft.keywords),
+            ActiveCommunityInput::AutoModRuleRegex => Some(&mut self.automod_draft.regex_pattern),
+            ActiveCommunityInput::AutoModRuleMinKarma => Some(&mut self.automod_draft.min_karma),
+            ActiveCommunityInput::AutoModRuleMaxLinks => Some(&mut self.automod_draft.max_links),
+            ActiveCommunityInput::AutoModRuleFlair => Some(&mut self.automod_draft.assign_flair),
+            ActiveCommunityInput::AutoModRuleReply => {
+                Some(&mut self.automod_draft.auto_reply_template)
+            }
+            ActiveCommunityInput::AutoModDryRunTitle => Some(&mut self.automod_dry_run_title),
+            ActiveCommunityInput::AutoModDryRunBody => Some(&mut self.automod_dry_run_body),
+            ActiveCommunityInput::BotStudioBio => Some(&mut self.bot_studio_bio),
+            ActiveCommunityInput::BotStudioBadge => Some(&mut self.bot_studio_badge),
+            ActiveCommunityInput::BotStudioModel => Some(&mut self.bot_studio_model),
+            ActiveCommunityInput::BotStudioCustomCap => Some(&mut self.bot_studio_custom_cap_draft),
+            ActiveCommunityInput::BotStudioCooldown => Some(&mut self.bot_studio_cooldown_secs),
+            ActiveCommunityInput::BotStudioMaxPostsPerHour => {
+                Some(&mut self.bot_studio_max_posts_per_hour)
+            }
+            ActiveCommunityInput::BotStudioEditName => Some(&mut self.bot_studio_edit.display_name),
+            ActiveCommunityInput::BotStudioEditBio => Some(&mut self.bot_studio_edit.bio),
+            ActiveCommunityInput::BotStudioEditBadge => Some(&mut self.bot_studio_edit.bot_badge),
+            ActiveCommunityInput::BotStudioEditModel => Some(&mut self.bot_studio_edit.bot_model),
+            ActiveCommunityInput::BotStudioEditCustomCap => {
+                Some(&mut self.bot_studio_edit.custom_cap_draft)
+            }
+            ActiveCommunityInput::BotStudioEditPersona => {
+                Some(&mut self.bot_studio_edit.bot_persona)
+            }
+            ActiveCommunityInput::BotStudioTestPostBody => Some(&mut self.bot_studio_test_content),
         }
     }
 
@@ -469,7 +1317,7 @@ impl CommunityWorkspaceState {
 }
 
 impl CommunityWorkspaceState {
-    fn visit_post_mut(&mut self, post_id: &str, mut f: impl FnMut(&mut CommunityPostDto)) {
+    pub fn visit_post_mut(&mut self, post_id: &str, mut f: impl FnMut(&mut CommunityPostDto)) {
         for item in &mut self.feed_items {
             if item.post.post_id == post_id {
                 f(&mut item.post);
@@ -480,7 +1328,19 @@ impl CommunityWorkspaceState {
                 f(&mut item.post);
             }
         }
+        if let Some(ref mut cdet) = self.community_detail {
+            for post in &mut cdet.pinned_posts {
+                if post.post_id == post_id {
+                    f(post);
+                }
+            }
+        }
         for item in &mut self.saved_items {
+            if item.post.post_id == post_id {
+                f(&mut item.post);
+            }
+        }
+        for item in &mut self.list_feed_items {
             if item.post.post_id == post_id {
                 f(&mut item.post);
             }
@@ -488,6 +1348,16 @@ impl CommunityWorkspaceState {
         if let Some(ref mut det) = self.detail_post {
             if det.post.post_id == post_id {
                 f(&mut det.post);
+            }
+            for post in &mut det.thread_chain {
+                if post.post_id == post_id {
+                    f(post);
+                }
+            }
+            for post in &mut det.quote_chain {
+                if post.post_id == post_id {
+                    f(post);
+                }
             }
         }
         if let Some(ref mut prof) = self.actor_profile {
@@ -511,8 +1381,16 @@ impl CommunityWorkspaceState {
             .iter()
             .map(|i| &i.post)
             .chain(self.community_posts.iter().map(|i| &i.post))
+            .chain(
+                self.community_detail
+                    .iter()
+                    .flat_map(|d| d.pinned_posts.iter()),
+            )
             .chain(self.saved_items.iter().map(|i| &i.post))
+            .chain(self.list_feed_items.iter().map(|i| &i.post))
             .chain(self.detail_post.iter().map(|d| &d.post))
+            .chain(self.detail_post.iter().flat_map(|d| d.thread_chain.iter()))
+            .chain(self.detail_post.iter().flat_map(|d| d.quote_chain.iter()))
             .chain(self.actor_profile.iter().flat_map(|p| p.recent_posts.iter()))
             .chain(self.search_result.iter().flat_map(|s| s.posts.iter()))
             .find(|p| p.post_id == post_id)
@@ -523,7 +1401,191 @@ impl CommunityWorkspaceState {
             .iter()
             .chain(self.community_posts.iter())
             .chain(self.saved_items.iter())
+            .chain(self.list_feed_items.iter())
             .find(|i| i.post.post_id == post_id)
+    }
+
+    /// Recursively finds an immutable comment reference inside the open PostDetail tree.
+    pub fn find_comment(&self, comment_id: &str) -> Option<&CommunityCommentDto> {
+        fn find_in_slice<'a>(
+            nodes: &'a [CommunityCommentDto],
+            cid: &str,
+        ) -> Option<&'a CommunityCommentDto> {
+            for n in nodes {
+                if n.comment_id == cid {
+                    return Some(n);
+                }
+                if let Some(found) = find_in_slice(&n.children, cid) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        self.detail_post
+            .as_ref()
+            .and_then(|d| find_in_slice(&d.comments, comment_id))
+            .or_else(|| {
+                self.actor_profile
+                    .as_ref()
+                    .and_then(|p| p.recent_comments.iter().find(|c| c.comment_id == comment_id))
+            })
+    }
+
+    /// Recursively visits matching comments in the open PostDetail tree and ActorProfile cache.
+    pub fn visit_comment_mut(
+        &mut self,
+        comment_id: &str,
+        mut f: impl FnMut(&mut CommunityCommentDto),
+    ) {
+        fn visit_slice(
+            nodes: &mut [CommunityCommentDto],
+            cid: &str,
+            f: &mut impl FnMut(&mut CommunityCommentDto),
+        ) {
+            for n in nodes {
+                if n.comment_id == cid {
+                    f(n);
+                }
+                visit_slice(&mut n.children, cid, f);
+            }
+        }
+        if let Some(ref mut det) = self.detail_post {
+            visit_slice(&mut det.comments, comment_id, &mut f);
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            for c in &mut prof.recent_comments {
+                if c.comment_id == comment_id {
+                    f(c);
+                }
+            }
+        }
+    }
+
+    /// Optimistically applies a vote toggle (`1 | -1`, toggling to `0`) on a comment.
+    pub fn apply_optimistic_comment_vote(
+        &mut self,
+        comment_id: &str,
+        clicked_dir: i8,
+    ) -> (i8, Option<(i8, i64, i64, i64)>) {
+        let mut snap = None;
+        let mut next_dir = clicked_dir;
+        if let Some(c) = self.find_comment(comment_id) {
+            snap = Some((c.viewer_vote, c.upvotes, c.downvotes, c.score));
+            next_dir = if c.viewer_vote == clicked_dir { 0 } else { clicked_dir };
+        }
+        self.visit_comment_mut(comment_id, |c| {
+            let prev = c.viewer_vote;
+            if prev == 1 {
+                c.upvotes = (c.upvotes - 1).max(0);
+            } else if prev == -1 {
+                c.downvotes = (c.downvotes - 1).max(0);
+            }
+            if next_dir == 1 {
+                c.upvotes += 1;
+            } else if next_dir == -1 {
+                c.downvotes += 1;
+            }
+            c.score = c.upvotes - c.downvotes;
+            c.viewer_vote = next_dir;
+        });
+        (next_dir, snap)
+    }
+
+    pub fn rollback_comment_vote(&mut self, comment_id: &str, snap: (i8, i64, i64, i64)) {
+        self.visit_comment_mut(comment_id, |c| {
+            c.viewer_vote = snap.0;
+            c.upvotes = snap.1;
+            c.downvotes = snap.2;
+            c.score = snap.3;
+        });
+    }
+
+    pub fn reconcile_comment_vote(&mut self, resp: &VoteResponse) {
+        self.visit_comment_mut(&resp.target_id, |c| {
+            c.viewer_vote = resp.direction;
+            c.upvotes = resp.upvotes;
+            c.downvotes = resp.downvotes;
+            c.score = resp.score;
+        });
+    }
+
+    pub fn reconcile_comment_like(&mut self, resp: &ToggleActionResponse) {
+        self.visit_comment_mut(&resp.target_id, |c| {
+            c.viewer_liked = resp.active;
+            c.likes_count = resp.count;
+        });
+    }
+
+    pub fn reconcile_comment_awards(&mut self, resp: &AwardResponse) {
+        self.visit_comment_mut(&resp.target_id, |c| {
+            c.awards = resp.awards.clone();
+        });
+    }
+
+    /// Merges newly loaded child comments under `parent_comment_id` without duplicate nodes.
+    pub fn merge_loaded_comment_children(
+        &mut self,
+        parent_comment_id: &str,
+        loaded: Vec<CommunityCommentDto>,
+        has_more: bool,
+    ) {
+        fn collect_ids(nodes: &[CommunityCommentDto], out: &mut HashSet<String>) {
+            for n in nodes {
+                out.insert(n.comment_id.clone());
+                collect_ids(&n.children, out);
+            }
+        }
+        fn merge_into(
+            nodes: &mut [CommunityCommentDto],
+            parent_id: &str,
+            loaded: &[CommunityCommentDto],
+            has_more: bool,
+        ) -> bool {
+            for n in nodes {
+                if n.comment_id == parent_id {
+                    let mut existing = HashSet::new();
+                    collect_ids(&n.children, &mut existing);
+                    let mut added = 0u32;
+                    for ch in loaded {
+                        if existing.insert(ch.comment_id.clone()) {
+                            n.children.push(ch.clone());
+                            added = added.saturating_add(1);
+                        }
+                    }
+                    n.more_children_count = if has_more {
+                        n.more_children_count.saturating_sub(added).max(1)
+                    } else {
+                        0
+                    };
+                    return true;
+                }
+                if merge_into(&mut n.children, parent_id, loaded, has_more) {
+                    return true;
+                }
+            }
+            false
+        }
+        if let Some(ref mut det) = self.detail_post {
+            merge_into(&mut det.comments, parent_comment_id, &loaded, has_more);
+        }
+    }
+
+    /// Removes a deleted post from all feed/community/saved/profile/search caches.
+    pub fn remove_post_from_caches(&mut self, post_id: &str) {
+        self.feed_items.retain(|i| i.post.post_id != post_id);
+        self.community_posts.retain(|i| i.post.post_id != post_id);
+        self.saved_items.retain(|i| i.post.post_id != post_id);
+        self.list_feed_items.retain(|i| i.post.post_id != post_id);
+        if let Some(ref mut cdet) = self.community_detail {
+            cdet.pinned_posts.retain(|p| p.post_id != post_id);
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            prof.recent_posts.retain(|p| p.post_id != post_id);
+        }
+        if let Some(ref mut sr) = self.search_result {
+            sr.posts.retain(|p| p.post_id != post_id);
+        }
+        self.composer.drafts.retain(|p| p.post_id != post_id);
     }
 
     /// Optimistically applies a vote toggle (`1 | -1`, toggling to `0` if already active).
@@ -649,6 +1711,15 @@ impl CommunityWorkspaceState {
                 det.community.viewer_role = resp.viewer_role;
             }
         }
+        if let Some(ref mut sr) = self.search_result {
+            for c in &mut sr.communities {
+                if c.slug.eq_ignore_ascii_case(&resp.community_slug) {
+                    c.is_joined = resp.is_joined;
+                    c.member_count = resp.member_count;
+                    c.viewer_role = resp.viewer_role;
+                }
+            }
+        }
     }
 
     pub fn reconcile_follow(&mut self, resp: &FollowActionResponse) {
@@ -662,6 +1733,46 @@ impl CommunityWorkspaceState {
             if prof.actor.actor_id == resp.actor_id {
                 prof.actor.is_following = resp.is_following;
                 prof.actor.followers_count = resp.followers_count;
+            }
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for a in &mut sr.actors {
+                if a.actor_id == resp.actor_id {
+                    a.is_following = resp.is_following;
+                    a.followers_count = resp.followers_count;
+                }
+            }
+        }
+    }
+
+    pub fn reconcile_mute_block(
+        &mut self,
+        actor_id: &str,
+        is_muted: Option<bool>,
+        is_blocked: Option<bool>,
+    ) {
+        let apply = |a: &mut CommunityActorDto| {
+            if a.actor_id == actor_id {
+                if let Some(m) = is_muted {
+                    a.is_muted = m;
+                }
+                if let Some(b) = is_blocked {
+                    a.is_blocked = b;
+                    if b {
+                        a.is_following = false;
+                    }
+                }
+            }
+        };
+        for a in &mut self.recommended_actors {
+            apply(a);
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            apply(&mut prof.actor);
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for a in &mut sr.actors {
+                apply(a);
             }
         }
     }

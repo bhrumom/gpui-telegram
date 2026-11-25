@@ -733,28 +733,59 @@ fn render_inline_quick_post(
                 )
                 .child(
                     div()
-                        .id("quick-post-submit-btn")
-                        .cursor_pointer()
-                        .px(px(14.0))
-                        .py(px(6.0))
-                        .rounded_full()
-                        .bg(rgb(pal.accent))
-                        .hover(move |s| s.bg(rgb(pal.accent_hover)))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.active_button_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.submit_quick_post(cx);
-                            }),
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id("quick-post-full-composer-btn")
+                                .cursor_pointer()
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .rounded_full()
+                                .bg(pal.service_pill_rgba())
+                                .hover(move |s| s.bg(pal.row_hover_rgba()))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(pal.text_primary))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_composer_from_quick_post(cx);
+                                    }),
+                                )
+                                .child(tg_icon(IconName::ComposePen, 12.0, pal.accent))
+                                .child(tr_str(lang, "富文本/投票/串贴", "Full Composer")),
                         )
-                        .child(if submitting {
-                            tr_str(lang, "发布中…", "Posting…")
-                        } else {
-                            tr_str(lang, "发布", "Post")
-                        }),
+                        .child(
+                            div()
+                                .id("quick-post-submit-btn")
+                                .cursor_pointer()
+                                .px(px(14.0))
+                                .py(px(6.0))
+                                .rounded_full()
+                                .bg(rgb(pal.accent))
+                                .hover(move |s| s.bg(rgb(pal.accent_hover)))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(pal.active_button_fg))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.submit_quick_post(cx);
+                                    }),
+                                )
+                                .child(if submitting {
+                                    tr_str(lang, "发布中…", "Posting…")
+                                } else {
+                                    tr_str(lang, "发布", "Post")
+                                }),
+                        ),
                 ),
         )
 }

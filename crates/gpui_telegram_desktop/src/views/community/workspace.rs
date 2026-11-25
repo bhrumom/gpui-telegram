@@ -10,16 +10,15 @@ use gpui::*;
 use gpui_telegram_client::{
     CommunityClientFacade, TelegramBotSyncInput, TelegramClient, TelegramHumanSyncInput,
 };
+use gpui_telegram_community::validate_create_comment_request;
 use gpui_telegram_proto::community_contracts::{
-    ActorFilter, BookmarkRequest, BotAutonomyMode, CommentSort, CommunityCommentDto,
-    CommunityIdentitiesResponse, CommunityPollVoteRequest, CommunitySearchRequestDto,
-    CommunitySearchTab, CreateCommentRequest, CreatePostRequest, EngagementSignalKind, FeedItemDto,
-    FeedRequestDto, FeedSort, FeedTab, GiveAwardRequest, MarkNotificationsReadRequest,
-    ModActionKind, ModActionRequest, PostFormat, PostStatus, RecordSignalRequest,
-    RegisterBotActorRequest, RepostRequest, SummonBotRequest, TimeWindow, VoteRequest,
+    ActorFilter, BookmarkRequest, CommentSort, CommunityIdentitiesResponse,
+    CommunityPollVoteRequest, CommunitySearchRequestDto, CommunitySearchTab, CreateCommentRequest,
+    CreatePostRequest, EngagementSignalKind, FeedItemDto, FeedRequestDto, FeedSort, FeedTab,
+    GiveAwardRequest, MarkNotificationsReadRequest, ModActionKind, ModActionRequest, PostFormat,
+    PostStatus, RecordSignalRequest, RepostRequest, TimeWindow, VoteRequest,
 };
 
-use crate::components::grok_bot_avatar::GROK_COLOR_PALETTE;
 use crate::components::ui::text_input_controller::{
     delete_prev_word, pop_last_char, sanitize_paste_text,
 };
@@ -27,29 +26,33 @@ use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::stage::entities_render::RichTextAction;
 
+use super::actor_profile_view::{render_actor_profile_view, render_edit_profile_modal};
+use super::bookmarks_lists_view::render_bookmarks_lists_view;
+use super::bot_studio_view::render_bot_studio_view;
+use super::community_page_view::{render_community_page_view, render_create_community_modal};
+use super::composer_modal::{compute_composer_autocomplete, render_composer_modal};
+use super::explore_search_view::{build_search_request, render_explore_search_view};
 use super::feed_view::{
     render_algo_tuner_popover, render_feed_view, render_quick_post_community_picker_popover,
 };
 use super::left_nav::{render_compact_top_nav, render_left_nav};
+use super::mod_queue_view::render_mod_queue_view;
+use super::notifications_view::render_notifications_view;
 use super::post_card::{
-    render_award_popover, render_explain_popover, render_post_card, render_quote_popover,
+    render_award_popover, render_explain_popover, render_quote_popover,
+};
+use super::post_detail_view::{
+    render_comment_award_popover, render_post_detail_view, render_summon_bot_picker_popover,
 };
 use super::right_rail::render_right_rail;
-use super::shared_widgets::{
-    format_compact_count, format_relative_time, render_actor_avatar, render_actor_badge_row,
-    render_empty_state, render_flair_chip, render_identity_switcher_popover, render_input_display,
-    render_loading_skeleton,
-};
+use super::shared_widgets::render_identity_switcher_popover;
 use super::state::{
-    sanitize_algo_prefs, ActiveCommunityInput, CommunityLayoutMode, CommunityPopover,
-    CommunityRoute, CommunityWorkspaceAction, CommunityWorkspaceState, FeedDensity,
+    sanitize_algo_prefs, ActiveCommunityInput, BookmarksListsSection, CommunityLayoutMode,
+    CommunityModal, CommunityPopover, CommunityRoute, CommunityWorkspaceAction,
+    CommunityWorkspaceState, FeedDensity,
 };
 
-const GROK_SHAPE_CHOICES: [&str; 8] = [
-    "blob", "pebble", "squircle", "tablet", "wedge", "hex", "cloud", "teardrop",
-];
-
-async fn run_on_community_tokio<F, T>(
+pub(super) async fn run_on_community_tokio<F, T>(
     handle: &tokio::runtime::Handle,
     fut: F,
 ) -> Result<T, String>
@@ -480,6 +483,23 @@ impl CommunityWorkspace {
         }
         if self.state.active_input == ActiveCommunityInput::QuickPostBody {
             self.state.quick_post_validation_error = None;
+        } else if self.state.active_input.is_composer_input() {
+            self.state.composer.validation_error = None;
+            if self.state.active_input == ActiveCommunityInput::ComposerBody {
+                self.state.composer.autocomplete_dismissed = false;
+            }
+        } else if self.state.active_input.is_create_comm_input() {
+            self.state.create_community.error = None;
+        } else if self.state.active_input.is_profile_edit_input() {
+            self.state.edit_profile.error = None;
+        } else if self.state.active_input.is_list_editor_input() {
+            self.state.list_editor.error = None;
+        } else if self.state.active_input.is_automod_input() {
+            self.state.automod_draft.error = None;
+        } else if self.state.active_input.is_bot_studio_create_input() {
+            self.state.bot_studio_error = None;
+        } else if self.state.active_input.is_bot_studio_edit_input() {
+            self.state.bot_studio_edit.error = None;
         }
         if let Some(buf) = self.state.active_input_text_mut() {
             buf.push_str(&clean);
@@ -501,6 +521,9 @@ impl CommunityWorkspace {
         }
         match key {
             "backspace" => {
+                if target == ActiveCommunityInput::ComposerBody {
+                    self.state.composer.autocomplete_dismissed = false;
+                }
                 if let Some(buf) = self.state.active_input_text_mut() {
                     if is_alt {
                         delete_prev_word(buf);
@@ -512,6 +535,9 @@ impl CommunityWorkspace {
                 true
             }
             "space" => {
+                if target == ActiveCommunityInput::ComposerBody {
+                    self.state.composer.autocomplete_dismissed = false;
+                }
                 if let Some(buf) = self.state.active_input_text_mut() {
                     buf.push(' ');
                 }
@@ -536,10 +562,26 @@ impl CommunityWorkspace {
                     }
                     ActiveCommunityInput::ExploreSearch => {
                         let q = self.state.explore_search_draft.trim().to_string();
+                        self.state.explore_show_discovery = q.is_empty();
                         self.execute_search(q, self.state.search_tab, cx);
                     }
                     ActiveCommunityInput::DetailReply => {
                         self.submit_detail_reply(cx);
+                    }
+                    ActiveCommunityInput::DetailEditComment => {
+                        self.submit_edit_comment(cx);
+                    }
+                    ActiveCommunityInput::DetailSummonPrompt => {
+                        if let Some(CommunityPopover::SummonBotPicker(pid)) =
+                            self.state.active_popover.clone()
+                        {
+                            let bid = self.state.detail_summon_bot_id.clone();
+                            let prompt = Some(self.state.detail_summon_prompt.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            let parent = self.state.detail_reply_parent_id.clone();
+                            self.state.detail_summon_prompt.clear();
+                            self.summon_bot_with_options(pid, bid, prompt, parent, cx);
+                        }
                     }
                     ActiveCommunityInput::QuotePostNote => {
                         if let Some(CommunityPopover::QuotePost(pid)) =
@@ -550,8 +592,114 @@ impl CommunityWorkspace {
                     }
                     ActiveCommunityInput::BotStudioName
                     | ActiveCommunityInput::BotStudioHandle
-                    | ActiveCommunityInput::BotStudioPersona => {
+                    | ActiveCommunityInput::BotStudioPersona
+                    | ActiveCommunityInput::BotStudioBadge
+                    | ActiveCommunityInput::BotStudioModel
+                    | ActiveCommunityInput::BotStudioCooldown
+                    | ActiveCommunityInput::BotStudioMaxPostsPerHour => {
                         self.submit_register_bot(cx);
+                    }
+                    ActiveCommunityInput::BotStudioCustomCap => {
+                        self.add_bot_studio_custom_capability(cx);
+                    }
+                    ActiveCommunityInput::BotStudioEditCustomCap => {
+                        self.add_bot_studio_edit_custom_capability(cx);
+                    }
+                    ActiveCommunityInput::BotStudioEditName
+                    | ActiveCommunityInput::BotStudioEditBadge
+                    | ActiveCommunityInput::BotStudioEditModel => {
+                        self.save_selected_bot_edits(cx);
+                    }
+                    ActiveCommunityInput::BookmarkNewFolder => {
+                        self.create_bookmark_folder(cx);
+                    }
+                    ActiveCommunityInput::ListEditorName => {
+                        self.submit_list_editor(cx);
+                    }
+                    ActiveCommunityInput::AutoModRuleName
+                    | ActiveCommunityInput::AutoModRuleKeywords
+                    | ActiveCommunityInput::AutoModRuleRegex
+                    | ActiveCommunityInput::AutoModRuleMinKarma
+                    | ActiveCommunityInput::AutoModRuleMaxLinks
+                    | ActiveCommunityInput::AutoModRuleFlair => {
+                        self.submit_add_automod_rule(cx);
+                    }
+                    ActiveCommunityInput::AutoModDryRunTitle => {
+                        self.run_automod_dry_run(cx);
+                    }
+                    ActiveCommunityInput::ModReason | ActiveCommunityInput::ModFlair => {
+                        self.state.blur_input();
+                        cx.notify();
+                    }
+                    ActiveCommunityInput::ComposerBody
+                    | ActiveCommunityInput::ComposerThreadPart(_)
+                    | ActiveCommunityInput::CommunityWikiMarkdown
+                    | ActiveCommunityInput::CommunityNewRuleDesc
+                    | ActiveCommunityInput::CreateCommDescription
+                    | ActiveCommunityInput::ProfileEditBio
+                    | ActiveCommunityInput::ProfileEditBotPersona
+                    | ActiveCommunityInput::ListEditorDesc
+                    | ActiveCommunityInput::AutoModRuleReply
+                    | ActiveCommunityInput::AutoModDryRunBody
+                    | ActiveCommunityInput::BotStudioBio
+                    | ActiveCommunityInput::BotStudioEditBio
+                    | ActiveCommunityInput::BotStudioEditPersona
+                    | ActiveCommunityInput::BotStudioTestPostBody => {
+                        if let Some(buf) = self.state.active_input_text_mut() {
+                            buf.push('\n');
+                        }
+                        cx.notify();
+                    }
+                    ActiveCommunityInput::ComposerBotPrompt => {
+                        self.generate_bot_coauthor_suggestion(cx);
+                    }
+                    ActiveCommunityInput::ComposerTitle
+                    | ActiveCommunityInput::ComposerLinkUrl
+                    | ActiveCommunityInput::ComposerLinkTitle
+                    | ActiveCommunityInput::ComposerLinkDesc
+                    | ActiveCommunityInput::ComposerMediaUrl(_)
+                    | ActiveCommunityInput::ComposerMediaAlt(_)
+                    | ActiveCommunityInput::ComposerPollQuestion
+                    | ActiveCommunityInput::ComposerPollOption(_)
+                    | ActiveCommunityInput::ComposerScheduleMinutes => {
+                        let status = if self.state.composer.schedule_enabled {
+                            PostStatus::Scheduled
+                        } else {
+                            PostStatus::Published
+                        };
+                        self.submit_composer(status, cx);
+                    }
+                    ActiveCommunityInput::CommunityWikiSummary => {
+                        if let Some(slug) = self
+                            .state
+                            .community_detail
+                            .as_ref()
+                            .map(|d| d.community.slug.clone())
+                        {
+                            self.save_community_wiki(slug, cx);
+                        }
+                    }
+                    ActiveCommunityInput::CommunityNewRuleTitle => {
+                        if let Some(slug) = self
+                            .state
+                            .community_detail
+                            .as_ref()
+                            .map(|d| d.community.slug.clone())
+                        {
+                            self.add_community_rule(slug, cx);
+                        }
+                    }
+                    ActiveCommunityInput::CreateCommSlug
+                    | ActiveCommunityInput::CreateCommName
+                    | ActiveCommunityInput::CreateCommIconEmoji => {
+                        self.submit_create_community(cx);
+                    }
+                    ActiveCommunityInput::ProfileEditDisplayName
+                    | ActiveCommunityInput::ProfileEditLocation
+                    | ActiveCommunityInput::ProfileEditWebsite
+                    | ActiveCommunityInput::ProfileEditBotBadge
+                    | ActiveCommunityInput::ProfileEditBotModel => {
+                        self.submit_edit_profile(cx);
                     }
                     ActiveCommunityInput::None => return false,
                 }
@@ -561,9 +709,48 @@ impl CommunityWorkspace {
                 let next = match target {
                     ActiveCommunityInput::QuickPostTitle => ActiveCommunityInput::QuickPostBody,
                     ActiveCommunityInput::QuickPostBody => ActiveCommunityInput::QuickPostTitle,
+                    ActiveCommunityInput::ComposerTitle => ActiveCommunityInput::ComposerBody,
+                    ActiveCommunityInput::ComposerBody => ActiveCommunityInput::ComposerTitle,
+                    ActiveCommunityInput::CreateCommSlug => ActiveCommunityInput::CreateCommName,
+                    ActiveCommunityInput::CreateCommName => {
+                        ActiveCommunityInput::CreateCommDescription
+                    }
+                    ActiveCommunityInput::CreateCommDescription => {
+                        ActiveCommunityInput::CreateCommSlug
+                    }
+                    ActiveCommunityInput::ProfileEditDisplayName => {
+                        ActiveCommunityInput::ProfileEditBio
+                    }
+                    ActiveCommunityInput::ProfileEditBio => {
+                        ActiveCommunityInput::ProfileEditLocation
+                    }
+                    ActiveCommunityInput::ProfileEditLocation => {
+                        ActiveCommunityInput::ProfileEditWebsite
+                    }
+                    ActiveCommunityInput::ProfileEditWebsite => {
+                        ActiveCommunityInput::ProfileEditDisplayName
+                    }
+                    ActiveCommunityInput::ListEditorName => ActiveCommunityInput::ListEditorDesc,
+                    ActiveCommunityInput::ListEditorDesc => ActiveCommunityInput::ListEditorName,
+                    ActiveCommunityInput::AutoModRuleName => {
+                        ActiveCommunityInput::AutoModRuleKeywords
+                    }
+                    ActiveCommunityInput::AutoModRuleKeywords => {
+                        ActiveCommunityInput::AutoModRuleRegex
+                    }
+                    ActiveCommunityInput::AutoModRuleRegex => ActiveCommunityInput::AutoModRuleName,
                     ActiveCommunityInput::BotStudioName => ActiveCommunityInput::BotStudioHandle,
                     ActiveCommunityInput::BotStudioHandle => ActiveCommunityInput::BotStudioPersona,
                     ActiveCommunityInput::BotStudioPersona => ActiveCommunityInput::BotStudioName,
+                    ActiveCommunityInput::BotStudioEditName => {
+                        ActiveCommunityInput::BotStudioEditBio
+                    }
+                    ActiveCommunityInput::BotStudioEditBio => {
+                        ActiveCommunityInput::BotStudioEditPersona
+                    }
+                    ActiveCommunityInput::BotStudioEditPersona => {
+                        ActiveCommunityInput::BotStudioEditName
+                    }
                     other => other,
                 };
                 self.state.focus_input(next);
@@ -575,15 +762,58 @@ impl CommunityWorkspace {
     }
 
     /// Progressive Escape cascade inside Community:
-    /// 1) Close open Community popover (Algo Tuner / Identity Switcher / Explain / Award / Quote)
-    /// 2) Blur focused Community text input
-    /// 3) Return `false` so `AppShell::dismiss_post_auth_escape` exits Community back to `Chats`.
+    /// 1) Dismiss open Composer `@/#`/`c/` autocomplete popup
+    /// 2) Close open Community popover (Identity Switcher / Algo Tuner / Explain / Award / Quote / Summon Bot)
+    /// 3) Close open Community modal sheet (Composer / Create Community / Edit Profile)
+    /// 4) Close open inline List Editor / Bookmark Folder Move picker
+    /// 5) Blur focused Community text input
+    /// 6) Return `false` so `AppShell::dismiss_post_auth_escape` exits Community back to `Chats`.
     pub fn handle_escape_key(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.state.active_modal == Some(CommunityModal::Composer)
+            && compute_composer_autocomplete(self).is_some()
+        {
+            self.state.composer.autocomplete_dismissed = true;
+            cx.notify();
+            return true;
+        }
         if self.state.active_popover.is_some() {
             self.state.active_popover = None;
-            if self.state.active_input == ActiveCommunityInput::QuotePostNote {
+            if matches!(
+                self.state.active_input,
+                ActiveCommunityInput::QuotePostNote | ActiveCommunityInput::DetailSummonPrompt
+            ) {
                 self.state.blur_input();
             }
+            cx.notify();
+            return true;
+        }
+        if let Some(modal) = self.state.active_modal.take() {
+            match modal {
+                CommunityModal::Composer => {
+                    if self.state.active_input.is_composer_input() {
+                        self.state.blur_input();
+                    }
+                }
+                CommunityModal::CreateCommunity => {
+                    if self.state.active_input.is_create_comm_input() {
+                        self.state.blur_input();
+                    }
+                }
+                CommunityModal::EditProfile => {
+                    if self.state.active_input.is_profile_edit_input() {
+                        self.state.blur_input();
+                    }
+                }
+            }
+            cx.notify();
+            return true;
+        }
+        if self.state.list_editor_open {
+            self.close_list_editor(cx);
+            return true;
+        }
+        if self.state.bookmark_moving_post_id.is_some() {
+            self.state.bookmark_moving_post_id = None;
             cx.notify();
             return true;
         }
@@ -637,6 +867,7 @@ impl CommunityWorkspace {
             CommunityRoute::Explore { initial_query } => {
                 let q = initial_query.clone().unwrap_or_default();
                 self.state.explore_search_draft = q.clone();
+                self.state.explore_show_discovery = q.trim().is_empty();
                 self.execute_search(q, self.state.search_tab, cx);
             }
             CommunityRoute::Notifications => self.load_notifications(cx),
@@ -644,13 +875,28 @@ impl CommunityWorkspace {
             CommunityRoute::ModQueue(slug) => {
                 let target = slug
                     .clone()
-                    .or_else(|| self.state.mod_slug.clone())
-                    .or_else(|| self.state.communities.first().map(|c| c.slug.clone()));
+                    .or_else(|| self.moderated_communities().first().map(|c| c.slug.clone()));
                 if let Some(s) = target {
                     self.load_mod_queue(s, cx);
+                } else {
+                    self.state.mod_slug = None;
+                    self.state.mod_community = None;
+                    self.state.mod_queue.clear();
+                    self.state.mod_logs.clear();
                 }
             }
-            CommunityRoute::BotStudio => {}
+            CommunityRoute::BotStudio => {
+                if self.state.bot_studio_selected_bot_id.is_none() {
+                    if let Some(first_bot) = self
+                        .state
+                        .identities
+                        .as_ref()
+                        .and_then(|i| i.bot_actors.first().cloned())
+                    {
+                        self.select_bot_for_studio(first_bot, cx);
+                    }
+                }
+            }
         }
     }
 
@@ -1460,6 +1706,10 @@ impl CommunityWorkspace {
             .is_some_and(|d| d.post.post_id != post_id)
         {
             self.state.detail_post = None;
+            self.state.detail_editing_comment_id = None;
+            self.state.detail_edit_comment_draft.clear();
+            self.state.detail_summon_feedback = None;
+            self.state.detail_reply_parent_id = None;
         }
         self.state.detail_error = None;
         self.state.detail_loading = true;
@@ -1498,26 +1748,53 @@ impl CommunityWorkspace {
     }
 
     pub fn submit_detail_reply(&mut self, cx: &mut Context<Self>) {
-        let Some(post_id) = self
+        let Some((post_id, is_locked, status)) = self
             .state
             .detail_post
             .as_ref()
-            .map(|d| d.post.post_id.clone())
+            .map(|d| (d.post.post_id.clone(), d.post.is_locked, d.post.status))
         else {
             return;
         };
+        let lang = self.language_id.clone();
+        if is_locked || status == PostStatus::Deleted {
+            self.emit_action(
+                CommunityWorkspaceAction::ShowToast {
+                    text: tr_str(
+                        &lang,
+                        "该帖子已锁定或已删除，无法发表新回复",
+                        "Cannot reply to a locked or deleted post",
+                    )
+                    .to_string(),
+                    is_error: true,
+                },
+                cx,
+            );
+            return;
+        }
         let body = self.state.detail_reply_draft.trim().to_string();
         if body.is_empty() {
             return;
         }
-        let parent_id = self.state.detail_reply_parent_id.take();
-        self.state.detail_reply_draft.clear();
+        let parent_id = self.state.detail_reply_parent_id.clone();
         let req = CreateCommentRequest {
             parent_comment_id: parent_id,
             body,
             media: Vec::new(),
             is_mod_distinguished: false,
         };
+        if let Err(err) = validate_create_comment_request(&req) {
+            self.emit_action(
+                CommunityWorkspaceAction::ShowToast {
+                    text: err.to_string(),
+                    is_error: true,
+                },
+                cx,
+            );
+            return;
+        }
+        self.state.detail_reply_parent_id = None;
+        self.state.detail_reply_draft.clear();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let reload_pid = post_id.clone();
@@ -1553,52 +1830,13 @@ impl CommunityWorkspace {
             .iter()
             .find(|a| a.actor_kind.is_bot_like())
             .map(|a| a.actor_id.clone());
-        let req = SummonBotRequest {
-            bot_actor_id: bot_id,
-            bot_handle: None,
-            prompt: Some("Join this discussion with a thoughtful perspective.".to_string()),
-            parent_comment_id: None,
-        };
-        let facade = self.facade.clone();
-        let handle = facade.runtime_handle().clone();
-        let reload_pid = post_id.clone();
-        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade.summon_bot(&post_id, &req).await
-            })
-            .await;
-            let _ = weak.update(app, |this, cx| {
-                let lang = this.language_id.clone();
-                match res {
-                    Ok(Ok(r)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: if r.triggered {
-                                    tr_str(&lang, "已召唤 Bot 参与讨论！", "Bot summoned to thread!")
-                                        .to_string()
-                                } else {
-                                    r.reason
-                                },
-                                is_error: !r.triggered,
-                            },
-                            cx,
-                        );
-                        this.load_post_detail(reload_pid, cx);
-                    }
-                    Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: e.to_string(),
-                                is_error: true,
-                            },
-                            cx,
-                        );
-                    }
-                    Err(_) => {}
-                }
-            });
-        })
-        .detach();
+        self.summon_bot_with_options(
+            post_id,
+            bot_id,
+            Some("Join this discussion with a thoughtful perspective.".to_string()),
+            None,
+            cx,
+        );
     }
 
     pub fn load_community_page(&mut self, slug: String, cx: &mut Context<Self>) {
@@ -1612,9 +1850,17 @@ impl CommunityWorkspace {
         {
             self.state.community_detail = None;
             self.state.community_posts.clear();
+            self.state.community_selected_flair = None;
+            self.state.community_wiki_editing = false;
+            self.state.community_wiki_preview_rev = None;
+            self.state.community_next_cursor = None;
         }
         self.state.community_error = None;
         self.state.community_loading = true;
+        let sort = self.state.community_sort;
+        let time_window = self.state.community_time_window;
+        let actor_filter = self.state.community_actor_filter;
+        let flair = self.state.community_selected_flair.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -1625,6 +1871,10 @@ impl CommunityWorkspace {
                     facade
                         .get_feed(&FeedRequestDto {
                             tab: FeedTab::Community(slug),
+                            sort,
+                            time_window,
+                            actor_filter,
+                            flair,
                             limit: 25,
                             ..Default::default()
                         })
@@ -1644,17 +1894,25 @@ impl CommunityWorkspace {
                 match res {
                     Ok((Ok(detail), feed)) => {
                         this.state.community_detail = Some(detail);
-                        this.state.community_posts = feed.map(|f| f.items).unwrap_or_default();
+                        if let Some(f) = feed {
+                            this.state.community_posts = f.items;
+                            this.state.community_next_cursor = f.next_cursor;
+                        } else {
+                            this.state.community_posts.clear();
+                            this.state.community_next_cursor = None;
+                        }
                         this.state.community_error = None;
                     }
                     Ok((Err(e), _)) => {
                         this.state.community_detail = None;
                         this.state.community_posts.clear();
+                        this.state.community_next_cursor = None;
                         this.state.community_error = Some(e.to_string());
                     }
                     Err(e) => {
                         this.state.community_detail = None;
                         this.state.community_posts.clear();
+                        this.state.community_next_cursor = None;
                         this.state.community_error = Some(e);
                     }
                 }
@@ -1720,12 +1978,8 @@ impl CommunityWorkspace {
         let my_gen = self.state.search_gen;
         self.state.search_tab = tab;
         self.state.search_loading = true;
-        let req = CommunitySearchRequestDto {
-            query,
-            tab,
-            limit: 25,
-            ..Default::default()
-        };
+        self.state.search_error = None;
+        let req = build_search_request(&query, tab, self.state.search_sort);
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -1737,8 +1991,17 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.search_loading = false;
-                if let Ok(Ok(sr)) = res {
-                    this.state.search_result = Some(sr);
+                match res {
+                    Ok(Ok(sr)) => {
+                        this.state.search_result = Some(sr);
+                        this.state.search_error = None;
+                    }
+                    Ok(Err(e)) => {
+                        this.state.search_error = Some(e.to_string());
+                    }
+                    Err(e) => {
+                        this.state.search_error = Some(e);
+                    }
                 }
                 cx.notify();
             });
@@ -1820,7 +2083,7 @@ impl CommunityWorkspace {
                 let saved = facade
                     .get_feed(&FeedRequestDto {
                         tab: FeedTab::Saved,
-                        limit: 30,
+                        limit: 50,
                         ..Default::default()
                     })
                     .await
@@ -1839,6 +2102,16 @@ impl CommunityWorkspace {
                     if let Some(l) = lists {
                         this.state.lists = l.lists;
                     }
+                    if this.state.bookmarks_section == BookmarksListsSection::Lists {
+                        let sel = this
+                            .state
+                            .selected_list_id
+                            .clone()
+                            .or_else(|| this.state.lists.first().map(|l| l.list_id.clone()));
+                        if let Some(lid) = sel {
+                            this.select_list_for_preview(lid, cx);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -1851,14 +2124,17 @@ impl CommunityWorkspace {
         let my_gen = self.state.mod_gen;
         self.state.mod_slug = Some(slug.clone());
         self.state.mod_loading = true;
+        self.state.mod_error = None;
+        let status_filter = self.state.mod_status_filter;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                let queue = facade.get_mod_queue(&slug, None, Some(30)).await.ok();
-                let logs = facade.get_mod_logs(&slug, Some(30)).await.ok();
-                (queue, logs)
+                let detail = facade.get_community(&slug).await.ok();
+                let queue = facade.get_mod_queue(&slug, status_filter, Some(40)).await;
+                let logs = facade.get_mod_logs(&slug, Some(40)).await.ok();
+                (detail, queue, logs)
             })
             .await;
             let _ = weak.update(app, |this, cx| {
@@ -1866,9 +2142,30 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.mod_loading = false;
-                if let Ok((q, l)) = res {
-                    this.state.mod_queue = q.map(|x| x.items).unwrap_or_default();
-                    this.state.mod_logs = l.map(|x| x.logs).unwrap_or_default();
+                if let Ok((detail, queue_res, logs_res)) = res {
+                    if let Some(d) = detail {
+                        let comm = d.community;
+                        if let Some(pos) = this
+                            .state
+                            .communities
+                            .iter()
+                            .position(|c| c.slug.eq_ignore_ascii_case(&comm.slug))
+                        {
+                            this.state.communities[pos] = comm.clone();
+                        }
+                        this.state.mod_community = Some(comm);
+                    }
+                    match queue_res {
+                        Ok(q) => {
+                            this.state.mod_queue = q.items;
+                            this.state.mod_error = None;
+                        }
+                        Err(e) => {
+                            this.state.mod_queue.clear();
+                            this.state.mod_error = Some(e.to_string());
+                        }
+                    }
+                    this.state.mod_logs = logs_res.map(|x| x.logs).unwrap_or_default();
                 }
                 cx.notify();
             });
@@ -1919,108 +2216,10 @@ impl CommunityWorkspace {
         })
         .detach();
     }
-
-    pub fn submit_register_bot(&mut self, cx: &mut Context<Self>) {
-        if self.state.bot_studio_submitting {
-            return;
-        }
-        let name = self.state.bot_studio_name.trim().to_string();
-        let handle_raw = self
-            .state
-            .bot_studio_handle
-            .trim()
-            .trim_start_matches('@')
-            .to_string();
-        if name.is_empty() || handle_raw.is_empty() {
-            let lang = self.language_id.as_str();
-            self.state.bot_studio_error = Some(
-                tr_str(lang, "请填写 Bot 名称和 @handle", "Bot display name and @handle are required")
-                    .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let shape = GROK_SHAPE_CHOICES[self.state.bot_studio_shape_idx % GROK_SHAPE_CHOICES.len()];
-        let color = GROK_COLOR_PALETTE[self.state.bot_studio_color_idx % GROK_COLOR_PALETTE.len()].id;
-        let persona = {
-            let p = self.state.bot_studio_persona.trim().to_string();
-            if p.is_empty() { None } else { Some(p) }
-        };
-        let req = RegisterBotActorRequest {
-            bot_user_id: None,
-            actor_kind: Some(gpui_telegram_proto::community_contracts::ActorKind::Bot),
-            handle: handle_raw,
-            display_name: name,
-            bio: persona.clone(),
-            avatar_media_id: None,
-            banner_media_id: None,
-            avatar_shape: Some(shape.to_string()),
-            avatar_color: Some(color.to_string()),
-            bot_badge: Some("AI Agent".to_string()),
-            bot_model: Some("Fabushi-1".to_string()),
-            bot_capabilities: vec!["community".to_string(), "debate".to_string()],
-            bot_autonomy_mode: self.state.bot_studio_autonomy,
-            bot_persona: persona,
-            cooldown_secs: Some(30),
-            max_posts_per_hour: Some(12),
-        };
-        self.state.bot_studio_submitting = true;
-        self.state.bot_studio_error = None;
-        self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
-        let my_id_gen = self.state.identities_gen;
-        let facade = self.facade.clone();
-        let handle = facade.runtime_handle().clone();
-        cx.notify();
-        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                let created = facade.register_bot_actor(&req).await;
-                let ids = facade.get_identities().await.ok();
-                (created, ids)
-            })
-            .await;
-            let _ = weak.update(app, |this, cx| {
-                this.state.bot_studio_submitting = false;
-                match res {
-                    Ok((Ok(reg), ids)) => {
-                        this.state.bot_studio_name.clear();
-                        this.state.bot_studio_handle.clear();
-                        this.state.bot_studio_persona.clear();
-                        this.state.bot_studio_last_token = reg.bot_token;
-                        if this.state.identities_gen == my_id_gen {
-                            if let Some(i) = ids {
-                                this.state.identities = Some(i);
-                            }
-                        }
-                        let lang = this.language_id.clone();
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(
-                                    &lang,
-                                    "Bot 社区公民注册成功！现可在左侧身份切换器中选择它发帖。",
-                                    "Bot citizen registered! Select it in the Identity Switcher to post.",
-                                )
-                                .to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
-                    }
-                    Ok((Err(e), _)) => {
-                        this.state.bot_studio_error = Some(e.to_string());
-                    }
-                    Err(e) => {
-                        this.state.bot_studio_error = Some(e);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
 }
 
 impl CommunityWorkspace {
-    fn render_secondary_header(
+    pub(super) fn render_secondary_header(
         &self,
         title: String,
         subtitle: Option<String>,
@@ -2088,1298 +2287,32 @@ impl CommunityWorkspace {
                     }),
             )
     }
-
-    fn render_comment_node(
-        &self,
-        comment: &CommunityCommentDto,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let indent = ((comment.depth.min(6)) as f32) * 16.0;
-        let cid = comment.comment_id.clone();
-        let reply_cid = cid.clone();
-        let author_handle = comment.author_handle.clone();
-
-        div()
-            .w_full()
-            .pl(px(indent))
-            .flex()
-            .flex_col()
-            .gap(px(5.0))
-            .child(
-                div()
-                    .w_full()
-                    .p(px(10.0))
-                    .rounded(px(9.0))
-                    .bg(pal.card_surface_rgba())
-                    .border_l_2()
-                    .border_color(if comment.author_kind.is_bot_like() {
-                        rgb(0x8B5CF6).into()
-                    } else {
-                        pal.separator_rgba()
-                    })
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .flex_wrap()
-                            .gap(px(5.0))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("cmt-author-{cid}")))
-                                    .cursor_pointer()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.text_primary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.open_actor_profile(author_handle.clone(), cx);
-                                        }),
-                                    )
-                                    .child(comment.author_display_name.clone()),
-                            )
-                            .child(render_actor_badge_row(
-                                comment.author_kind,
-                                comment.author_verified_tier,
-                                comment.author_bot_badge.as_deref(),
-                                comment.is_mod_distinguished,
-                                comment.is_op,
-                                &comment.author_avatar_color,
-                                &pal,
-                                lang,
-                            ))
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(pal.text_secondary))
-                                    .child(format!(
-                                        "@{} · {} · ▲ {}",
-                                        comment.author_handle,
-                                        format_relative_time(comment.created_at_ms, lang),
-                                        comment.score
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .text_color(rgb(pal.text_primary))
-                            .child(comment.body.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("cmt-reply-btn-{cid}")))
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(pal.accent))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.state.detail_reply_parent_id = Some(reply_cid.clone());
-                                    this.state.focus_input(ActiveCommunityInput::DetailReply);
-                                    cx.notify();
-                                }),
-                            )
-                            .child(tr_str(lang, "回复", "Reply")),
-                    ),
-            )
-            .children(comment.children.iter().map(|ch| self.render_comment_node(ch, cx)))
-    }
-
-    fn render_post_detail_route(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let det = self.state.detail_post.clone();
-        let reply_focused = self.state.active_input == ActiveCommunityInput::DetailReply;
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                tr_str(lang, "帖子详情与讨论树", "Post Thread & Comments").to_string(),
-                det.as_ref().map(|d| format!("{} comments", d.total_comments)),
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-detail-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.detail_scroll_handle)
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .when(self.state.detail_loading && det.is_none(), |col| {
-                                col.child(render_loading_skeleton(2, &pal))
-                            })
-                            .when(!self.state.detail_loading && det.is_none(), |col| {
-                                let sub = self.state.detail_error.as_deref().unwrap_or_else(|| {
-                                    tr_str(
-                                        lang,
-                                        "该帖子可能已被删除或链接无效，请返回信息流浏览。",
-                                        "This post may have been removed or does not exist.",
-                                    )
-                                });
-                                col.child(render_empty_state(
-                                    IconName::CommunityThread,
-                                    tr_str(lang, "未找到该帖子", "Post not found"),
-                                    sub,
-                                    &pal,
-                                ))
-                            })
-                            .when_some(det, |col, d| {
-                                let pid = d.post.post_id.clone();
-                                let summon_pid = pid.clone();
-                                let item = FeedItemDto {
-                                    post: d.post,
-                                    explanation: None,
-                                    rank_score: 0.0,
-                                    is_exploration_slot: false,
-                                };
-                                col.child(render_post_card(self, &item, 0, cx))
-                                    // Inline Reply + Summon Bot bar
-                                    .child(
-                                        div()
-                                            .p(px(10.0))
-                                            .rounded(px(10.0))
-                                            .bg(pal.card_surface_rgba())
-                                            .border_1()
-                                            .border_color(pal.hairline_border_rgba())
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(8.0))
-                                            .child(
-                                                div()
-                                                    .id("detail-reply-input")
-                                                    .cursor_text()
-                                                    .w_full()
-                                                    .min_h(px(44.0))
-                                                    .p(px(8.0))
-                                                    .rounded(px(8.0))
-                                                    .bg(rgb(pal.input_bg))
-                                                    .border_1()
-                                                    .border_color(if reply_focused {
-                                                        rgb(pal.accent).into()
-                                                    } else {
-                                                        pal.hairline_border_rgba()
-                                                    })
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.state.focus_input(ActiveCommunityInput::DetailReply);
-                                                            cx.notify();
-                                                        }),
-                                                    )
-                                                    .child(render_input_display(
-                                                        &self.state.detail_reply_draft,
-                                                        if reply_focused {
-                                                            self.state.ime_preedit.as_deref()
-                                                        } else {
-                                                            None
-                                                        },
-                                                        tr_str(lang, "写下你的回复（以当前人类或 Bot 身份发言）…", "Write a reply as your active Human or Bot identity…"),
-                                                        reply_focused,
-                                                        &pal,
-                                                    )),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .gap(px(8.0))
-                                                    .child(
-                                                        div()
-                                                            .id("detail-summon-bot-btn")
-                                                            .cursor_pointer()
-                                                            .px(px(10.0))
-                                                            .py(px(5.0))
-                                                            .rounded_full()
-                                                            .bg(TdesktopThemePalette::rgba_with_alpha(0x8B5CF6, 0.16))
-                                                            .text_size(px(11.5))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(rgb(0x8B5CF6))
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(move |this, _, _, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.summon_bot_on_post(summon_pid.clone(), cx);
-                                                                }),
-                                                            )
-                                                            .child(tr_str(lang, "🤖 召唤 Bot 参与讨论", "🤖 Summon Bot")),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id("detail-reply-submit-btn")
-                                                            .cursor_pointer()
-                                                            .px(px(14.0))
-                                                            .py(px(5.0))
-                                                            .rounded_full()
-                                                            .bg(rgb(pal.accent))
-                                                            .text_size(px(12.0))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(rgb(pal.active_button_fg))
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(|this, _, _, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.submit_detail_reply(cx);
-                                                                }),
-                                                            )
-                                                            .child(tr_str(lang, "发送回复", "Reply")),
-                                                    ),
-                                            ),
-                                    )
-                                    .children(d.comments.iter().map(|c| self.render_comment_node(c, cx)))
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-}
-
-impl CommunityWorkspace {
-    fn render_community_page_route(&self, slug: &str, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let detail = self.state.community_detail.clone();
-        let posts = self.state.community_posts.clone();
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                format!("c/{slug}"),
-                detail.as_ref().map(|d| d.community.name.clone()),
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-page-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .when(self.state.community_loading && detail.is_none(), |col| {
-                                col.child(render_loading_skeleton(2, &pal))
-                            })
-                            .when(!self.state.community_loading && detail.is_none(), |col| {
-                                let sub =
-                                    self.state.community_error.as_deref().unwrap_or_else(|| {
-                                        tr_str(
-                                            lang,
-                                            "未找到对应的 c/ 社区，请检查社区名称或前往探索页。",
-                                            "Could not find this c/ community. Check the slug or browse Explore.",
-                                        )
-                                    });
-                                col.child(render_empty_state(
-                                    IconName::CommunityGlobe,
-                                    tr_str(lang, "未找到该社区", "Community not found"),
-                                    sub,
-                                    &pal,
-                                ))
-                            })
-                            .when_some(detail, |col, d| {
-                                let c = d.community;
-                                let join_slug = c.slug.clone();
-                                let joined = c.is_joined;
-                                col.child(
-                                    div()
-                                        .p(px(14.0))
-                                        .rounded(px(12.0))
-                                        .bg(pal.card_surface_rgba())
-                                        .border_1()
-                                        .border_color(pal.hairline_border_rgba())
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(8.0))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap(px(8.0))
-                                                        .child(div().text_size(px(22.0)).child(if c.icon_emoji.trim().is_empty() { "🌐".to_string() } else { c.icon_emoji }))
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .child(div().text_size(px(15.0)).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(c.name))
-                                                                .child(div().text_size(px(11.5)).text_color(rgb(pal.text_secondary)).child(format!("c/{} · {} Humans · {} Bots", c.slug, c.human_member_count, c.bot_member_count))),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("comm-page-join-btn")
-                                                        .cursor_pointer()
-                                                        .px(px(14.0))
-                                                        .py(px(6.0))
-                                                        .rounded_full()
-                                                        .bg(if joined { pal.service_pill_rgba() } else { rgb(pal.accent).into() })
-                                                        .text_size(px(12.0))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(rgb(if joined { pal.text_primary } else { pal.active_button_fg }))
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(move |this, _, _, cx| {
-                                                                cx.stop_propagation();
-                                                                this.toggle_join_community(join_slug.clone(), !joined, cx);
-                                                            }),
-                                                        )
-                                                        .child(if joined { tr_str(lang, "已加入", "Joined") } else { tr_str(lang, "加入社区", "Join") }),
-                                                ),
-                                        )
-                                        .child(div().text_size(px(12.5)).text_color(rgb(pal.text_secondary)).child(c.description))
-                                        .when(!c.post_flairs.is_empty(), |box_el| {
-                                            box_el.child(
-                                                div()
-                                                    .flex()
-                                                    .flex_wrap()
-                                                    .gap(px(5.0))
-                                                    .children(c.post_flairs.iter().map(|f| render_flair_chip(&f.text, Some(&f.bg_color), &pal))),
-                                            )
-                                        })
-                                        .when(!c.rules.is_empty(), |box_el| {
-                                            box_el.child(
-                                                div()
-                                                    .pt(px(6.0))
-                                                    .border_t_1()
-                                                    .border_color(pal.hairline_border_rgba())
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(3.0))
-                                                    .child(div().text_size(px(11.0)).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_secondary)).child(tr_str(lang, "社区规则", "Community Rules")))
-                                                    .children(c.rules.iter().enumerate().map(|(i, r)| {
-                                                        div().text_size(px(11.5)).text_color(rgb(pal.text_primary)).child(format!("{}. {}", i + 1, r.title))
-                                                    })),
-                                            )
-                                        }),
-                                )
-                            })
-                            .children(posts.iter().enumerate().map(|(i, it)| render_post_card(self, it, i, cx))),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_actor_profile_route(&self, handle: &str, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let prof = self.state.actor_profile.clone();
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                format!("@{handle}"),
-                prof.as_ref().map(|p| p.actor.display_name.clone()),
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-profile-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .when(self.state.profile_loading && prof.is_none(), |col| {
-                                col.child(render_loading_skeleton(2, &pal))
-                            })
-                            .when(!self.state.profile_loading && prof.is_none(), |col| {
-                                let sub =
-                                    self.state.profile_error.as_deref().unwrap_or_else(|| {
-                                        tr_str(
-                                            lang,
-                                            "未找到该人类或 Bot 公民主页。",
-                                            "This Human or Bot citizen profile could not be found.",
-                                        )
-                                    });
-                                col.child(render_empty_state(
-                                    IconName::BotRobot,
-                                    tr_str(lang, "未找到该用户或 Bot", "Actor not found"),
-                                    sub,
-                                    &pal,
-                                ))
-                            })
-                            .when_some(prof, |col, p| {
-                                let a = p.actor;
-                                let aid = a.actor_id.clone();
-                                let following = a.is_following;
-                                let linked_uid = a.linked_user_id.unwrap_or(0);
-                                col.child(
-                                    div()
-                                        .p(px(14.0))
-                                        .rounded(px(12.0))
-                                        .bg(pal.card_surface_rgba())
-                                        .border_1()
-                                        .border_color(pal.hairline_border_rgba())
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(8.0))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .gap(px(10.0))
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap(px(10.0))
-                                                        .child(render_actor_avatar(
-                                                            &a.actor_id,
-                                                            &a.display_name,
-                                                            a.actor_kind,
-                                                            a.avatar_media_id.as_deref(),
-                                                            &a.avatar_shape,
-                                                            &a.avatar_color,
-                                                            48.0,
-                                                            pal.card_bg,
-                                                            &self.media_base_url,
-                                                            true,
-                                                            &pal,
-                                                        ))
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .gap(px(2.0))
-                                                                .child(
-                                                                    div()
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .gap(px(6.0))
-                                                                        .child(div().text_size(px(15.0)).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(a.display_name))
-                                                                        .child(render_actor_badge_row(a.actor_kind, a.verified_tier, a.bot_badge.as_deref(), false, false, &a.avatar_color, &pal, lang)),
-                                                                )
-                                                                .child(div().text_size(px(12.0)).text_color(rgb(pal.text_secondary)).child(format!("@{} · {} Post Karma · {} Comment Karma", a.handle, format_compact_count(a.post_karma), format_compact_count(a.comment_karma)))),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap(px(6.0))
-                                                        .child(
-                                                            div()
-                                                                .id("profile-dm-btn")
-                                                                .cursor_pointer()
-                                                                .px(px(10.0))
-                                                                .py(px(5.0))
-                                                                .rounded_full()
-                                                                .bg(pal.service_pill_rgba())
-                                                                .text_size(px(11.5))
-                                                                .font_weight(FontWeight::MEDIUM)
-                                                                .text_color(rgb(pal.text_primary))
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    cx.listener(move |this, _, _, cx| {
-                                                                        cx.stop_propagation();
-                                                                        this.emit_action(CommunityWorkspaceAction::OpenDmWithActor { linked_user_id: linked_uid }, cx);
-                                                                    }),
-                                                                )
-                                                                .child(tr_str(lang, "私聊", "Message")),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id("profile-follow-btn")
-                                                                .cursor_pointer()
-                                                                .px(px(12.0))
-                                                                .py(px(5.0))
-                                                                .rounded_full()
-                                                                .bg(if following { pal.service_pill_rgba() } else { rgb(pal.accent).into() })
-                                                                .text_size(px(11.5))
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_color(rgb(if following { pal.text_primary } else { pal.active_button_fg }))
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    cx.listener(move |this, _, _, cx| {
-                                                                        cx.stop_propagation();
-                                                                        this.toggle_follow_actor(aid.clone(), !following, cx);
-                                                                    }),
-                                                                )
-                                                                .child(if following { tr_str(lang, "已关注", "Following") } else { tr_str(lang, "关注", "Follow") }),
-                                                        ),
-                                                ),
-                                        )
-                                        .when(!a.bio.trim().is_empty(), |b| {
-                                            b.child(div().text_size(px(12.5)).text_color(rgb(pal.text_primary)).child(a.bio))
-                                        }),
-                                )
-                                .children(p.recent_posts.into_iter().enumerate().map(|(i, post)| {
-                                    let it = FeedItemDto { post, explanation: None, rank_score: 0.0, is_exploration_slot: false };
-                                    render_post_card(self, &it, i, cx)
-                                }))
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-}
-
-impl CommunityWorkspace {
-    fn render_explore_route(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let focused = self.state.active_input == ActiveCommunityInput::ExploreSearch;
-        let sr = self.state.search_result.clone();
-        let active_tab = self.state.search_tab;
-        let tabs: [(CommunitySearchTab, &'static str, &'static str); 7] = [
-            (CommunitySearchTab::Top, "综合", "Top"),
-            (CommunitySearchTab::Latest, "最新", "Latest"),
-            (CommunitySearchTab::People, "人类", "People"),
-            (CommunitySearchTab::Bots, "Bots", "Bots"),
-            (CommunitySearchTab::Communities, "社区", "Communities"),
-            (CommunitySearchTab::Media, "媒体", "Media"),
-            (CommunitySearchTab::Polls, "投票", "Polls"),
-        ];
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                tr_str(lang, "探索与全站搜索", "Explore & Search").to_string(),
-                None,
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-explore-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .id("explore-search-box")
-                                    .cursor_text()
-                                    .w_full()
-                                    .px(px(12.0))
-                                    .py(px(9.0))
-                                    .rounded_full()
-                                    .bg(rgb(pal.input_bg))
-                                    .border_1()
-                                    .border_color(if focused { rgb(pal.accent).into() } else { pal.hairline_border_rgba() })
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.state.focus_input(ActiveCommunityInput::ExploreSearch);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tg_icon(IconName::Search, 15.0, pal.text_secondary))
-                                    .child(div().flex_1().child(render_input_display(
-                                        &self.state.explore_search_draft,
-                                        if focused { self.state.ime_preedit.as_deref() } else { None },
-                                        tr_str(lang, "输入关键词、#话题、from:handle、c/slug 并按回车…", "Search keywords, #tag, from:handle, c/slug + Enter…"),
-                                        focused,
-                                        &pal,
-                                    ))),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap(px(5.0))
-                                    .children(tabs.into_iter().map(|(tab, zh, en)| {
-                                        let active = active_tab == tab;
-                                        div()
-                                            .id(SharedString::from(format!("explore-tab-{en}")))
-                                            .cursor_pointer()
-                                            .px(px(10.0))
-                                            .py(px(4.0))
-                                            .rounded_full()
-                                            .bg(if active { rgb(pal.accent).into() } else { pal.service_pill_rgba() })
-                                            .text_size(px(11.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(if active { pal.active_button_fg } else { pal.text_secondary }))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    let q = this.state.explore_search_draft.trim().to_string();
-                                                    this.execute_search(q, tab, cx);
-                                                }),
-                                            )
-                                            .child(tr_str(lang, zh, en))
-                                    })),
-                            )
-                            .when_some(sr, |col, res| {
-                                col.children(res.posts.into_iter().enumerate().map(|(i, p)| {
-                                    let it = FeedItemDto { post: p, explanation: None, rank_score: 0.0, is_exploration_slot: false };
-                                    render_post_card(self, &it, i, cx)
-                                }))
-                                .children(res.actors.into_iter().map(|a| {
-                                    let handle = a.handle.clone();
-                                    div()
-                                        .id(SharedString::from(format!("explore-actor-{}", a.actor_id)))
-                                        .cursor_pointer()
-                                        .p(px(10.0))
-                                        .rounded(px(10.0))
-                                        .bg(pal.card_surface_rgba())
-                                        .border_1()
-                                        .border_color(pal.hairline_border_rgba())
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(10.0))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.open_actor_profile(handle.clone(), cx);
-                                            }),
-                                        )
-                                        .child(render_actor_avatar(&a.actor_id, &a.display_name, a.actor_kind, a.avatar_media_id.as_deref(), &a.avatar_shape, &a.avatar_color, 34.0, pal.card_bg, &self.media_base_url, true, &pal))
-                                        .child(div().flex().flex_col().child(div().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(a.display_name)).child(div().text_size(px(11.5)).text_color(rgb(pal.text_secondary)).child(format!("@{}", a.handle))))
-                                }))
-                                .children(res.communities.into_iter().map(|c| {
-                                    let slug = c.slug.clone();
-                                    div()
-                                        .id(SharedString::from(format!("explore-comm-{}", c.slug)))
-                                        .cursor_pointer()
-                                        .p(px(10.0))
-                                        .rounded(px(10.0))
-                                        .bg(pal.card_surface_rgba())
-                                        .border_1()
-                                        .border_color(pal.hairline_border_rgba())
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.navigate_to(CommunityRoute::CommunityPage(slug.clone()), cx);
-                                            }),
-                                        )
-                                        .child(div().text_size(px(13.0)).font_weight(FontWeight::BOLD).text_color(rgb(pal.accent)).child(format!("c/{} · {}", c.slug, c.name)))
-                                        .child(div().text_size(px(11.5)).text_color(rgb(pal.text_secondary)).child(c.description))
-                                }))
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_notifications_route(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let notifs = self.state.notifications.clone();
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                tr_str(lang, "社区通知", "Notifications").to_string(),
-                Some(format!("{} unread", self.state.unread_notifications)),
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-notifs-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_end()
-                                    .child(
-                                        div()
-                                            .id("notifs-mark-all-read-btn")
-                                            .cursor_pointer()
-                                            .px(px(12.0))
-                                            .py(px(5.0))
-                                            .rounded_full()
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
-                                            .text_size(px(11.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(pal.accent))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.mark_all_notifications_read(cx);
-                                                }),
-                                            )
-                                            .child(tr_str(lang, "全部标为已读", "Mark all read")),
-                                    ),
-                            )
-                            .when(notifs.is_empty(), |col| {
-                                col.child(render_empty_state(
-                                    IconName::ChannelMegaphone,
-                                    tr_str(lang, "暂无社区通知", "No notifications yet"),
-                                    tr_str(lang, "当有人类或 Bot 回复、@提及或打赏你时将实时出现在这里。", "Replies, mentions, bot responses, and awards will appear here."),
-                                    &pal,
-                                ))
-                            })
-                            .children(notifs.into_iter().map(|n| {
-                                let target_post = n.target_post_id.clone();
-                                div()
-                                    .id(SharedString::from(format!("notif-row-{}", n.notif_id)))
-                                    .cursor_pointer()
-                                    .p(px(11.0))
-                                    .rounded(px(10.0))
-                                    .bg(if n.is_read { pal.card_surface_rgba() } else { TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.10) })
-                                    .border_1()
-                                    .border_color(pal.hairline_border_rgba())
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            if let Some(pid) = target_post.clone() {
-                                                this.open_post_detail(pid, cx);
-                                            }
-                                        }),
-                                    )
-                                    .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(format!("{} (@{}) · {}", n.actor_display_name, n.actor_handle, n.kind.as_str())))
-                                    .child(div().text_size(px(12.0)).text_color(rgb(pal.text_secondary)).child(n.preview_text))
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_bookmarks_lists_route(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let saved = self.state.saved_items.clone();
-        let lists = self.state.lists.clone();
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                tr_str(lang, "收藏夹与自定义列表", "Bookmarks & Custom Lists").to_string(),
-                None,
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-bookmarks-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .when(!lists.is_empty(), |col| {
-                                col.child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap(px(8.0))
-                                        .children(lists.into_iter().map(|l| {
-                                            let lid = l.list_id.clone();
-                                            div()
-                                                .id(SharedString::from(format!("bmk-list-{}", l.list_id)))
-                                                .cursor_pointer()
-                                                .px(px(12.0))
-                                                .py(px(8.0))
-                                                .rounded(px(10.0))
-                                                .bg(pal.card_surface_rgba())
-                                                .border_1()
-                                                .border_color(pal.hairline_border_rgba())
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.select_feed_tab(FeedTab::List(lid.clone()), cx);
-                                                    }),
-                                                )
-                                                .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(l.name))
-                                                .child(div().text_size(px(11.0)).text_color(rgb(pal.text_secondary)).child(l.description))
-                                        })),
-                                )
-                            })
-                            .when(saved.is_empty(), |col| {
-                                col.child(render_empty_state(
-                                    IconName::Bookmark,
-                                    tr_str(lang, "还没有收藏帖子", "No saved posts yet"),
-                                    tr_str(lang, "点击任意帖子底部的书签图标即可加入收藏夹。", "Click the bookmark icon on any post to save it here."),
-                                    &pal,
-                                ))
-                            })
-                            .children(saved.iter().enumerate().map(|(i, it)| render_post_card(self, it, i, cx))),
-                    ),
-            )
-            .into_any_element()
-    }
-}
-
-impl CommunityWorkspace {
-    fn render_mod_queue_route(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let active_slug = self
-            .state
-            .mod_slug
-            .clone()
-            .unwrap_or_else(|| "general".to_string());
-        let comms = self.state.communities.clone();
-        let queue = self.state.mod_queue.clone();
-        let logs = self.state.mod_logs.clone();
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                tr_str(lang, "社区审核队列与审计日志", "Moderation Queue & Audit Logs").to_string(),
-                Some(format!("c/{active_slug}")),
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-mod-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap(px(5.0))
-                                    .children(comms.into_iter().take(8).map(|c| {
-                                        let slug = c.slug.clone();
-                                        let is_act = slug == active_slug;
-                                        div()
-                                            .id(SharedString::from(format!("mod-comm-{slug}")))
-                                            .cursor_pointer()
-                                            .px(px(9.0))
-                                            .py(px(4.0))
-                                            .rounded_full()
-                                            .bg(if is_act { rgb(pal.accent).into() } else { pal.service_pill_rgba() })
-                                            .text_size(px(11.5))
-                                            .text_color(rgb(if is_act { pal.active_button_fg } else { pal.text_primary }))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.load_mod_queue(slug.clone(), cx);
-                                                }),
-                                            )
-                                            .child(format!("c/{}", c.slug))
-                                    })),
-                            )
-                            .when(queue.is_empty(), |col| {
-                                col.child(render_empty_state(
-                                    IconName::ShieldMod,
-                                    tr_str(lang, "当前队列已清空", "Moderation queue is clear"),
-                                    tr_str(lang, "所有举报与 AutoMod 触发项均已处理完毕。", "All reports and AutoMod flags are resolved."),
-                                    &pal,
-                                ))
-                            })
-                            .children(queue.into_iter().map(|it| {
-                                let slug_a = active_slug.clone();
-                                let slug_r = active_slug.clone();
-                                let iid_a = it.item_id.clone();
-                                let iid_r = it.item_id.clone();
-                                let tk_a = it.target_kind.clone();
-                                let tk_r = it.target_kind.clone();
-                                let tid_a = it.target_id.clone();
-                                let tid_r = it.target_id.clone();
-                                div()
-                                    .p(px(11.0))
-                                    .rounded(px(10.0))
-                                    .bg(pal.card_surface_rgba())
-                                    .border_1()
-                                    .border_color(pal.hairline_border_rgba())
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .flex()
-                                            .flex_col()
-                                            .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(format!("[{}] {}", it.target_kind, it.reason)))
-                                            .child(div().text_size(px(11.0)).text_color(rgb(pal.text_secondary)).child(format!("Source: {} · Target: {}", it.source, it.target_id))),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!("mod-approve-{}", it.item_id)))
-                                                    .cursor_pointer()
-                                                    .px(px(10.0))
-                                                    .py(px(5.0))
-                                                    .rounded(px(7.0))
-                                                    .bg(TdesktopThemePalette::rgba_with_alpha(0x10B981, 0.16))
-                                                    .text_size(px(11.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(0x10B981))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.execute_mod_decision(slug_a.clone(), iid_a.clone(), tk_a.clone(), tid_a.clone(), ModActionKind::Approve, cx);
-                                                        }),
-                                                    )
-                                                    .child(tr_str(lang, "通过", "Approve")),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!("mod-remove-{}", it.item_id)))
-                                                    .cursor_pointer()
-                                                    .px(px(10.0))
-                                                    .py(px(5.0))
-                                                    .rounded(px(7.0))
-                                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.16))
-                                                    .text_size(px(11.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(pal.danger))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.execute_mod_decision(slug_r.clone(), iid_r.clone(), tk_r.clone(), tid_r.clone(), ModActionKind::Remove, cx);
-                                                        }),
-                                                    )
-                                                    .child(tr_str(lang, "移除", "Remove")),
-                                            ),
-                                    )
-                            }))
-                            .when(!logs.is_empty(), |col| {
-                                col.child(div().pt(px(8.0)).text_size(px(12.5)).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(tr_str(lang, "透明审核日志", "Transparent Mod Audit Log")))
-                                    .children(logs.into_iter().take(12).map(|log| {
-                                        div()
-                                            .p(px(9.0))
-                                            .rounded(px(8.0))
-                                            .bg(pal.card_surface_rgba())
-                                            .text_size(px(11.5))
-                                            .text_color(rgb(pal.text_secondary))
-                                            .child(format!("@{} -> {} ({}) · {}", log.moderator_handle, log.action.as_str(), log.target_id, log.reason.unwrap_or_default()))
-                                    }))
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_bot_studio_route(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.as_str();
-        let bots = self
-            .state
-            .identities
-            .as_ref()
-            .map(|i| i.bot_actors.clone())
-            .unwrap_or_default();
-        let name_foc = self.state.active_input == ActiveCommunityInput::BotStudioName;
-        let handle_foc = self.state.active_input == ActiveCommunityInput::BotStudioHandle;
-        let persona_foc = self.state.active_input == ActiveCommunityInput::BotStudioPersona;
-        let shape = GROK_SHAPE_CHOICES[self.state.bot_studio_shape_idx % GROK_SHAPE_CHOICES.len()];
-        let color = GROK_COLOR_PALETTE[self.state.bot_studio_color_idx % GROK_COLOR_PALETTE.len()].id;
-        let autonomy = self.state.bot_studio_autonomy;
-        let autonomies = [
-            (BotAutonomyMode::Manual, "手动", "Manual"),
-            (BotAutonomyMode::MentionOnly, "@提及回复", "Mention Only"),
-            (BotAutonomyMode::Reactive, "社区响应", "Reactive"),
-            (BotAutonomyMode::Autonomous, "自主创作", "Autonomous"),
-        ];
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(pal.stage_bg))
-            .child(self.render_secondary_header(
-                tr_str(lang, "Bot 公民工作室", "Bot Citizenship Studio").to_string(),
-                Some(tr_str(lang, "Bot 与人类同等一等公民 · 注册、定制外观与发帖身份", "Bots are equal first-class citizens · Register, customize & post").to_string()),
-                cx,
-            ))
-            .child(
-                div()
-                    .id("community-bot-studio-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(px(740.0))
-                            .mx_auto()
-                            .flex()
-                            .flex_col()
-                            .gap(px(12.0))
-                            // Owned bots list
-                            .child(
-                                div()
-                                    .p(px(12.0))
-                                    .rounded(px(12.0))
-                                    .bg(pal.card_surface_rgba())
-                                    .border_1()
-                                    .border_color(pal.hairline_border_rgba())
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(8.0))
-                                    .child(div().text_size(px(13.5)).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(format!("{} ({})", tr_str(lang, "我的社区 Bot 身份", "My Community Bots"), bots.len())))
-                                    .when(bots.is_empty(), |col| {
-                                        col.child(div().text_size(px(12.0)).text_color(rgb(pal.text_secondary)).child(tr_str(lang, "暂无绑定的 Bot，在下方注册一个即可立即在社区发帖和参与辩论。", "No bots registered yet. Create one below to start posting and debating.")))
-                                    })
-                                    .children(bots.into_iter().map(|b| {
-                                        let aid = b.actor_id.clone();
-                                        let is_active = aid == self.state.active_actor_id;
-                                        div()
-                                            .p(px(8.0))
-                                            .rounded(px(9.0))
-                                            .bg(pal.service_pill_rgba())
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(8.0))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(8.0))
-                                                    .child(render_actor_avatar(&b.actor_id, &b.display_name, b.actor_kind, b.avatar_media_id.as_deref(), &b.avatar_shape, &b.avatar_color, 34.0, pal.card_bg, &self.media_base_url, true, &pal))
-                                                    .child(div().flex().flex_col().child(div().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(b.display_name)).child(div().text_size(px(11.0)).text_color(rgb(pal.text_secondary)).child(format!("@{} · {} · {} karma", b.handle, b.bot_autonomy_mode.as_str(), b.post_karma + b.comment_karma)))),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!("studio-act-as-{}", b.actor_id)))
-                                                    .cursor_pointer()
-                                                    .px(px(10.0))
-                                                    .py(px(5.0))
-                                                    .rounded_full()
-                                                    .bg(if is_active { TdesktopThemePalette::rgba_with_alpha(0x10B981, 0.16) } else { rgb(pal.accent).into() })
-                                                    .text_size(px(11.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(if is_active { 0x10B981 } else { pal.active_button_fg }))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.switch_active_actor(aid.clone(), cx);
-                                                        }),
-                                                    )
-                                                    .child(if is_active { tr_str(lang, "当前身份", "Active") } else { tr_str(lang, "切换为此身份", "Act As Bot") }),
-                                            )
-                                    })),
-                            )
-                            // Register new bot form
-                            .child(
-                                div()
-                                    .p(px(14.0))
-                                    .rounded(px(12.0))
-                                    .bg(pal.card_surface_rgba())
-                                    .border_1()
-                                    .border_color(pal.hairline_border_rgba())
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(9.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(div().text_size(px(13.5)).font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(tr_str(lang, "注册新 Bot 公民", "Register New Bot Citizen")))
-                                            .child(render_actor_avatar("preview-bot", "Bot", gpui_telegram_proto::community_contracts::ActorKind::Bot, None, shape, color, 34.0, pal.card_bg, &self.media_base_url, true, &pal)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("studio-name-input")
-                                            .cursor_text()
-                                            .p(px(8.0))
-                                            .rounded(px(8.0))
-                                            .bg(rgb(pal.input_bg))
-                                            .border_1()
-                                            .border_color(if name_foc { rgb(pal.accent).into() } else { pal.hairline_border_rgba() })
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { cx.stop_propagation(); this.state.focus_input(ActiveCommunityInput::BotStudioName); cx.notify(); }))
-                                            .child(render_input_display(&self.state.bot_studio_name, if name_foc { self.state.ime_preedit.as_deref() } else { None }, tr_str(lang, "Bot 显示名称 (如: Rust架构师Bot)", "Bot Display Name"), name_foc, &pal)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("studio-handle-input")
-                                            .cursor_text()
-                                            .p(px(8.0))
-                                            .rounded(px(8.0))
-                                            .bg(rgb(pal.input_bg))
-                                            .border_1()
-                                            .border_color(if handle_foc { rgb(pal.accent).into() } else { pal.hairline_border_rgba() })
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { cx.stop_propagation(); this.state.focus_input(ActiveCommunityInput::BotStudioHandle); cx.notify(); }))
-                                            .child(render_input_display(&self.state.bot_studio_handle, if handle_foc { self.state.ime_preedit.as_deref() } else { None }, tr_str(lang, "Bot @handle (如: rust_arch_bot)", "Bot @handle"), handle_foc, &pal)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("studio-persona-input")
-                                            .cursor_text()
-                                            .min_h(px(46.0))
-                                            .p(px(8.0))
-                                            .rounded(px(8.0))
-                                            .bg(rgb(pal.input_bg))
-                                            .border_1()
-                                            .border_color(if persona_foc { rgb(pal.accent).into() } else { pal.hairline_border_rgba() })
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { cx.stop_propagation(); this.state.focus_input(ActiveCommunityInput::BotStudioPersona); cx.notify(); }))
-                                            .child(render_input_display(&self.state.bot_studio_persona, if persona_foc { self.state.ime_preedit.as_deref() } else { None }, tr_str(lang, "Bot 人设与专长简介 (可选)", "Bot persona & bio (optional)"), persona_foc, &pal)),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .gap(px(5.0))
-                                            .children(autonomies.into_iter().map(|(m, zh, en)| {
-                                                let act = autonomy == m;
-                                                div()
-                                                    .id(SharedString::from(format!("studio-autonomy-{en}")))
-                                                    .cursor_pointer()
-                                                    .px(px(9.0))
-                                                    .py(px(4.0))
-                                                    .rounded_full()
-                                                    .bg(if act { rgb(pal.accent).into() } else { pal.service_pill_rgba() })
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(if act { pal.active_button_fg } else { pal.text_primary }))
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| { cx.stop_propagation(); this.state.bot_studio_autonomy = m; cx.notify(); }))
-                                                    .child(tr_str(lang, zh, en))
-                                            })),
-                                    )
-                                    .when_some(self.state.bot_studio_error.clone(), |col, err| {
-                                        col.child(div().text_size(px(11.5)).text_color(rgb(pal.danger)).child(err))
-                                    })
-                                    .child(
-                                        div()
-                                            .id("studio-register-btn")
-                                            .cursor_pointer()
-                                            .py(px(8.0))
-                                            .rounded(px(9.0))
-                                            .bg(rgb(pal.accent))
-                                            .hover(move |s| s.bg(rgb(pal.accent_hover)))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(12.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(pal.active_button_fg))
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { cx.stop_propagation(); this.submit_register_bot(cx); }))
-                                            .child(tr_str(lang, "注册 Bot 公民", "Register Bot Citizen")),
-                                    ),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
 }
 
 impl CommunityWorkspace {
     fn render_route_content(&self, cx: &mut Context<Self>) -> AnyElement {
         match &self.state.route {
             CommunityRoute::Feed => render_feed_view(self, cx),
-            CommunityRoute::PostDetail(_) => self.render_post_detail_route(cx),
-            CommunityRoute::CommunityPage(slug) => self.render_community_page_route(slug, cx),
-            CommunityRoute::ActorProfile(handle) => self.render_actor_profile_route(handle, cx),
-            CommunityRoute::Explore { .. } => self.render_explore_route(cx),
-            CommunityRoute::Notifications => self.render_notifications_route(cx),
-            CommunityRoute::BookmarksLists => self.render_bookmarks_lists_route(cx),
-            CommunityRoute::ModQueue(_) => self.render_mod_queue_route(cx),
-            CommunityRoute::BotStudio => self.render_bot_studio_route(cx),
+            CommunityRoute::PostDetail(_) => render_post_detail_view(self, cx),
+            CommunityRoute::CommunityPage(slug) => render_community_page_view(self, slug, cx),
+            CommunityRoute::ActorProfile(handle) => render_actor_profile_view(self, handle, cx),
+            CommunityRoute::Explore { .. } => render_explore_search_view(self, cx),
+            CommunityRoute::Notifications => render_notifications_view(self, cx),
+            CommunityRoute::BookmarksLists => render_bookmarks_lists_view(self, cx),
+            CommunityRoute::ModQueue(_) => render_mod_queue_view(self, cx),
+            CommunityRoute::BotStudio => render_bot_studio_view(self, cx),
+        }
+    }
+
+    fn render_active_modal_overlay(
+        &self,
+        modal: CommunityModal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match modal {
+            CommunityModal::Composer => render_composer_modal(self, cx),
+            CommunityModal::CreateCommunity => render_create_community_modal(self, cx),
+            CommunityModal::EditProfile => render_edit_profile_modal(self, cx),
         }
     }
 
@@ -3397,6 +2330,8 @@ impl CommunityWorkspace {
                 render_quick_post_community_picker_popover(self, cx)
             }
             CommunityPopover::QuotePost(pid) => render_quote_popover(self, pid, cx),
+            CommunityPopover::AwardComment(cid) => render_comment_award_popover(self, cid, cx),
+            CommunityPopover::SummonBotPicker(pid) => render_summon_bot_picker_popover(self, pid, cx),
         };
 
         div()
@@ -3413,7 +2348,11 @@ impl CommunityWorkspace {
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
                     this.state.active_popover = None;
-                    if this.state.active_input == ActiveCommunityInput::QuotePostNote {
+                    if matches!(
+                        this.state.active_input,
+                        ActiveCommunityInput::QuotePostNote
+                            | ActiveCommunityInput::DetailSummonPrompt
+                    ) {
                         this.state.blur_input();
                     }
                     cx.notify();
@@ -3431,6 +2370,7 @@ impl CommunityWorkspace {
             }
         }
     }
+
     /// Builds the full Community GPUI element tree for a given window viewport width.
     pub fn render_for_viewport_width(
         &mut self,
@@ -3441,6 +2381,7 @@ impl CommunityWorkspace {
         self.last_layout_mode = layout;
 
         let pal = self.palette;
+        let active_modal = self.state.active_modal;
         let active_popover = self.state.active_popover.clone();
         let center = self.render_route_content(cx);
 
@@ -3471,6 +2412,9 @@ impl CommunityWorkspace {
                         row.child(render_right_rail(self, cx))
                     }),
             )
+            .when_some(active_modal, |root, modal| {
+                root.child(self.render_active_modal_overlay(modal, cx))
+            })
             .when_some(active_popover, |root, pop| {
                 root.child(self.render_active_popover_overlay(&pop, cx))
             })

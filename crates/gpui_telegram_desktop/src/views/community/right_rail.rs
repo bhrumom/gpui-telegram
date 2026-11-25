@@ -208,14 +208,42 @@ fn render_recommended_communities_card(
             div()
                 .flex()
                 .items_center()
+                .justify_between()
                 .gap(px(6.0))
-                .child(tg_icon(IconName::CommunityGlobe, 14.5, pal.accent))
                 .child(
                     div()
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.text_primary))
-                        .child(tr_str(lang, "推荐社区 (c/)", "Communities")),
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(tg_icon(IconName::CommunityGlobe, 14.5, pal.accent))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(pal.text_primary))
+                                .child(tr_str(lang, "推荐社区 (c/)", "Communities")),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("rail-create-community-btn")
+                        .cursor_pointer()
+                        .px(px(7.0))
+                        .py(px(2.5))
+                        .rounded_full()
+                        .bg(pal.service_pill_rgba())
+                        .hover(move |s| s.bg(hover_bg))
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(pal.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_create_community_modal(cx);
+                            }),
+                        )
+                        .child(tr_str(lang, "+ 创建", "+ Create")),
                 ),
         )
         .children(comms.into_iter().map(|c| {

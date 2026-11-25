@@ -15,17 +15,29 @@
 //! - `workspace`: Root `Entity<CommunityWorkspace>`, Tokio async bridge, centralized CJK IME
 //!   hooks, progressive Escape cascade, popover overlay layer, and live-data secondary routes.
 
+pub mod actor_profile_view;
+pub mod bookmarks_lists_view;
+pub mod bot_studio_view;
+pub mod community_page_view;
+pub mod composer_modal;
+pub mod explore_search_view;
 pub mod feed_view;
 pub mod left_nav;
+pub mod mod_queue_view;
+pub mod notifications_view;
 pub mod post_card;
+pub mod post_detail_view;
 pub mod right_rail;
 pub mod shared_widgets;
 pub mod state;
 pub mod workspace;
 
 pub use state::{
-    sanitize_algo_prefs, sanitize_unit_f64, ActiveCommunityInput, CommunityLayoutMode,
-    CommunityPopover, CommunityRoute, CommunityWorkspaceAction, CommunityWorkspaceState,
-    FeedDensity, PollBreakdownMode,
+    sanitize_algo_prefs, sanitize_unit_f64, ActiveCommunityInput, ActorProfileTab,
+    AutoModRuleDraft, BookmarksListsSection, BotStudioEditDraft, CommunityLayoutMode,
+    CommunityModal, CommunityPageTab, CommunityPopover, CommunityRoute, CommunityWorkspaceAction,
+    CommunityWorkspaceState, ComposerFormatTab, ComposerMediaDraft, ComposerModalState,
+    CreateCommunityDraft, EditProfileDraft, FeedDensity, ListEditorDraft, ModConsoleTab,
+    NotificationCategoryTab, PollBreakdownMode, PostDetailMode,
 };
 pub use workspace::CommunityWorkspace;

@@ -253,7 +253,11 @@ pub fn render_left_nav(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.open_quick_post_composer(cx);
+                                let cur_slug = match &this.state.route {
+                                    CommunityRoute::CommunityPage(s) => Some(s.clone()),
+                                    _ => None,
+                                };
+                                this.open_composer_modal(cur_slug, cx);
                             }),
                         )
                         .child(tg_icon(IconName::ComposePen, 14.0, pal.active_button_fg))
@@ -271,17 +275,44 @@ pub fn render_left_nav(
                         .flex_col()
                         .gap(px(2.0))
                         .pt(px(4.0))
+                        .child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.text_secondary))
+                                        .child(tr_str(lang, "已加入的社区 (c/)", "MY COMMUNITIES")),
+                                )
+                                .child(
+                                    div()
+                                        .id("left-nav-create-community-btn")
+                                        .cursor_pointer()
+                                        .px(px(6.0))
+                                        .py(px(1.5))
+                                        .rounded(px(5.0))
+                                        .bg(pal.service_pill_rgba())
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(pal.accent))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.open_create_community_modal(cx);
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "+ 新建", "+ New")),
+                                ),
+                        )
                         .when(!joined_communities.is_empty(), |col| {
-                            col.child(
-                                div()
-                                    .px(px(8.0))
-                                    .py(px(4.0))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.text_secondary))
-                                    .child(tr_str(lang, "已加入的社区 (c/)", "MY COMMUNITIES")),
-                            )
-                            .children(joined_communities.into_iter().map(|c| {
+                            col.children(joined_communities.into_iter().map(|c| {
                                 let slug = c.slug.clone();
                                 let row_id = SharedString::from(format!("left-nav-comm-{}", c.slug));
                                 let active = route == CommunityRoute::CommunityPage(c.slug.clone());
@@ -334,10 +365,41 @@ pub fn render_left_nav(
                                     .px(px(8.0))
                                     .pt(px(8.0))
                                     .pb(px(4.0))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.text_secondary))
-                                    .child(tr_str(lang, "置顶列表", "PINNED LISTS")),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(pal.text_secondary))
+                                            .child(tr_str(lang, "置顶列表", "PINNED LISTS")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("left-nav-manage-lists-btn")
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(1.5))
+                                            .rounded(px(5.0))
+                                            .bg(pal.service_pill_rgba())
+                                            .hover(move |s| s.bg(hover_bg))
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(pal.accent))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.navigate_to(
+                                                        CommunityRoute::BookmarksLists,
+                                                        cx,
+                                                    );
+                                                    this.open_create_list_form(cx);
+                                                }),
+                                            )
+                                            .child(tr_str(lang, "+ 新建", "+ New")),
+                                    ),
                             )
                             .children(pinned_lists.into_iter().map(|list| {
                                 let lid = list.list_id.clone();
@@ -669,7 +731,35 @@ pub fn render_compact_top_nav(
                     matches!(route, CommunityRoute::BotStudio),
                     0,
                     Box::new(|this, cx| this.navigate_to(CommunityRoute::BotStudio, cx)),
-                )),
+                ))
+                .child(
+                    div()
+                        .id("compact-new-post-btn")
+                        .cursor_pointer()
+                        .px(px(9.0))
+                        .py(px(5.0))
+                        .rounded_full()
+                        .bg(rgb(pal.accent))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(pal.active_button_fg))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                let cur_slug = match &this.state.route {
+                                    CommunityRoute::CommunityPage(s) => Some(s.clone()),
+                                    _ => None,
+                                };
+                                this.open_composer_modal(cur_slug, cx);
+                            }),
+                        )
+                        .child(tg_icon(IconName::ComposePen, 12.0, pal.active_button_fg))
+                        .child(tr_str(lang, "发帖", "Post")),
+                ),
         )
         .child(
             div()
