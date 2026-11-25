@@ -317,6 +317,14 @@ impl AppShell {
                 self.set_inspector_open(next_open, cx);
                 true
             }
+            "b" if is_shift => {
+                if self.active_panel == ActiveWorkspacePanel::Browser {
+                    self.activate_nav_destination(NavDestination::Chats, cx);
+                } else {
+                    self.open_browser_workspace(cx);
+                }
+                true
+            }
             "b" | "\\" => {
                 self.sidebar.update(cx, |sb, sb_cx| {
                     sb.toggle_collapsed_from_user();

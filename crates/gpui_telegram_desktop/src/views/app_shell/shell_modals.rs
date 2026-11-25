@@ -385,6 +385,9 @@ impl AppShell {
                 self.refresh_tasks_and_mcp(cx);
             }
             MainMenuCommand::RemoteComputer => self.open_remote_computers_hub(cx),
+            MainMenuCommand::Browser => {
+                self.open_browser_workspace(cx);
+            }
             MainMenuCommand::Settings => {
                 self.navigate_settings_to(SettingsSectionType::Main, cx);
             }

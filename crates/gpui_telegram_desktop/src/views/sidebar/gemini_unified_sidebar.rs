@@ -400,6 +400,25 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                     on_action.clone(),
                     UnifiedSidebarAction::OpenContacts,
                 ))
+                .child(render_collapsed_icon_btn(
+                    "rail-browser-btn",
+                    "browser",
+                    IconName::ScreenShare,
+                    tr_str(lang_id, "内置浏览器", "Browser"),
+                    nav.active_destination == NavDestination::Browser,
+                    0,
+                    hovered_item,
+                    palette,
+                    cx,
+                    on_action.clone(),
+                    UnifiedSidebarAction::SelectDestination(
+                        if nav.active_destination == NavDestination::Browser {
+                            NavDestination::Chats
+                        } else {
+                            NavDestination::Browser
+                        },
+                    ),
+                ))
                 .child(
                     div()
                         .w(px(24.0))

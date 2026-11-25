@@ -1811,6 +1811,7 @@ impl AppShell {
                     .child(menu_row("account-popover-fabushi", IconName::BotRobot, tr_str(lang, "新建智能体 · Fabushi Bot", "New Fabushi Bot"), pal.accent, false, |this, cx| this.open_fabushi_creator_modal(cx)))
                     .child(menu_row("account-popover-botfather", IconName::BotRobot, tr_str(lang, "BotFather · 创建机器人/小程序", "BotFather · Create Bot/App"), pal.accent, false, |this, cx| this.open_botfather_chat(cx)))
                     .child(menu_row("account-popover-miniapps", IconName::FolderBots, tr_str(lang, "小程序中心", "Mini Apps Center"), pal.text_primary, false, |this, cx| this.open_miniapps_center(cx)))
+                    .child(menu_row("account-popover-browser", IconName::ScreenShare, tr_str(lang, "内置浏览器 · 自动化应用", "Built-in Browser & Apps"), pal.accent, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Browser, cx)))
                     .child(menu_row("account-popover-settings", IconName::SettingsGear, tr_str(lang, "设置", "Settings"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Settings, cx)))
                     .when(has_passcode, |col| {
                         col.child(menu_row(

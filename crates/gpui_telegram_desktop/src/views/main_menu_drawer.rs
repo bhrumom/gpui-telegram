@@ -29,6 +29,7 @@ pub enum MainMenuCommand {
     TaskCenter,
     McpTools,
     RemoteComputer,
+    Browser,
     Settings,
     ToggleNightMode,
     WalletAndStars,
@@ -283,6 +284,12 @@ impl Render for MainMenuDrawer {
                 zh: "远程电脑",
                 en: "Remote Computer",
                 cmd: MainMenuCommand::RemoteComputer,
+            },
+            MenuRowEntry::Action {
+                icon: IconName::ScreenShare,
+                zh: "内置浏览器",
+                en: "Built-in Browser",
+                cmd: MainMenuCommand::Browser,
             },
             MenuRowEntry::Divider,
             MenuRowEntry::Action {
