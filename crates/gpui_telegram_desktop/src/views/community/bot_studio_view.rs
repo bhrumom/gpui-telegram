@@ -188,6 +188,9 @@ impl CommunityWorkspace {
             bot_autonomy_mode: bot.bot_autonomy_mode,
             shape_idx,
             color_idx,
+            shape_edited: false,
+            color_edited: false,
+            autonomy_edited: false,
             saving: false,
             error: None,
         };
@@ -212,6 +215,18 @@ impl CommunityWorkspace {
             }
             if !prev.custom_cap_draft.is_empty() {
                 draft.custom_cap_draft = prev.custom_cap_draft;
+            }
+            if prev.shape_edited || prev.shape_idx != 0 {
+                draft.shape_idx = clamp_grok_avatar_indices(prev.shape_idx, 0).0;
+                draft.shape_edited = true;
+            }
+            if prev.color_edited || prev.color_idx != 0 {
+                draft.color_idx = clamp_grok_avatar_indices(0, prev.color_idx).1;
+                draft.color_edited = true;
+            }
+            if prev.autonomy_edited || prev.bot_autonomy_mode != BotAutonomyMode::Manual {
+                draft.bot_autonomy_mode = prev.bot_autonomy_mode;
+                draft.autonomy_edited = true;
             }
         }
         self.state.bot_studio_edit = draft;
@@ -240,6 +255,9 @@ impl CommunityWorkspace {
             bot_autonomy_mode: actor.bot_autonomy_mode,
             shape_idx,
             color_idx,
+            shape_edited: false,
+            color_edited: false,
+            autonomy_edited: false,
             saving: false,
             error: None,
         };
@@ -274,8 +292,25 @@ impl CommunityWorkspace {
         let (s, c) = clamp_grok_avatar_indices(shape_idx, color_idx);
         self.state.bot_studio_edit.shape_idx = s;
         self.state.bot_studio_edit.color_idx = c;
+        self.state.bot_studio_edit.shape_edited = true;
+        self.state.bot_studio_edit.color_edited = true;
         let preview_id = format!("studio-edit-{}", self.state.bot_studio_edit.actor_id);
         trigger_grok_avatar_bounce(&preview_id);
+        cx.notify();
+    }
+
+    pub fn set_bot_studio_edit_autonomy(
+        &mut self,
+        mode: BotAutonomyMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.bot_studio_edit.actor_id.is_empty() {
+            if let Some(bot) = self.resolve_selected_owned_bot() {
+                self.ensure_bot_studio_edit_hydrated(&bot);
+            }
+        }
+        self.state.bot_studio_edit.bot_autonomy_mode = mode;
+        self.state.bot_studio_edit.autonomy_edited = true;
         cx.notify();
     }
 
@@ -1895,8 +1930,7 @@ fn render_selected_bot_editor_card(
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.ensure_bot_studio_edit_hydrated(&hb);
-                                this.state.bot_studio_edit.bot_autonomy_mode = mode;
-                                cx.notify();
+                                this.set_bot_studio_edit_autonomy(mode, cx);
                             }),
                         )
                         .child(autonomy_choice_label(mode, lang))

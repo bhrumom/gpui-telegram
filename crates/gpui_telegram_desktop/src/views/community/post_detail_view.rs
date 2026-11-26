@@ -644,11 +644,14 @@ impl CommunityWorkspace {
             let _ = weak.update(app, |this, cx| {
                 this.state.detail_summon_pending = false;
                 let lang = this.language_id.clone();
+                let still_on_post = this.state.route == CommunityRoute::PostDetail(reload_pid.clone());
                 match res {
                     Ok(Ok(r)) => {
                         if r.triggered {
                             let ok_msg = tr_str(&lang, "已召唤 Bot 参与讨论！", "Bot summoned to discussion!").to_string();
-                            this.state.detail_summon_feedback = Some((ok_msg.clone(), false));
+                            if still_on_post {
+                                this.state.detail_summon_feedback = Some((ok_msg.clone(), false));
+                            }
                             if let (Some(created), Some(det)) =
                                 (r.created_comment, &mut this.state.detail_post)
                             {
@@ -664,7 +667,7 @@ impl CommunityWorkspace {
                                 CommunityWorkspaceAction::ShowToast { text: ok_msg, is_error: false },
                                 cx,
                             );
-                            if this.state.route == CommunityRoute::PostDetail(reload_pid.clone()) {
+                            if still_on_post {
                                 this.load_post_detail(reload_pid, cx);
                             }
                         } else {
@@ -673,7 +676,9 @@ impl CommunityWorkspace {
                             } else {
                                 r.reason
                             };
-                            this.state.detail_summon_feedback = Some((reason.clone(), true));
+                            if still_on_post {
+                                this.state.detail_summon_feedback = Some((reason.clone(), true));
+                            }
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast { text: reason, is_error: true },
                                 cx,
@@ -682,14 +687,18 @@ impl CommunityWorkspace {
                     }
                     Ok(Err(e)) => {
                         let msg = e.to_string();
-                        this.state.detail_summon_feedback = Some((msg.clone(), true));
+                        if still_on_post {
+                            this.state.detail_summon_feedback = Some((msg.clone(), true));
+                        }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast { text: msg, is_error: true },
                             cx,
                         );
                     }
                     Err(e) => {
-                        this.state.detail_summon_feedback = Some((e, true));
+                        if still_on_post {
+                            this.state.detail_summon_feedback = Some((e, true));
+                        }
                         cx.notify();
                     }
                 }

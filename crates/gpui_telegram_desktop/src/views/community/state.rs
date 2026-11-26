@@ -697,6 +697,9 @@ pub struct BotStudioEditDraft {
     pub bot_autonomy_mode: BotAutonomyMode,
     pub shape_idx: usize,
     pub color_idx: usize,
+    pub shape_edited: bool,
+    pub color_edited: bool,
+    pub autonomy_edited: bool,
     pub saving: bool,
     pub error: Option<String>,
 }

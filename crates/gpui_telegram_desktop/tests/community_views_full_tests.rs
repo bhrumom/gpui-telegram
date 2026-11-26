@@ -469,6 +469,44 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
     assert!(validate_automod_regex_syntax("[^]a]").is_ok());
     assert!(validate_automod_regex_syntax("\\(?").is_ok());
     assert!(validate_automod_regex_syntax("").is_ok());
+    for ok_pat in [
+        "foo]bar",
+        "]",
+        "\\[SPAM]",
+        "foo}bar",
+        "}",
+        "\\b{start}foo\\b{end}",
+        "\\b{start-half}x\\b{end-half}",
+        "a{1,2}??",
+        "a**",
+        "a+*",
+        "[[:alpha:]-z]",
+        "[[:bogus:]]",
+        "\\p{L}",
+        "\\pL",
+        "\\p{Han}",
+        "\\p{Emoji}",
+        "\\p{gc=Letter}",
+        "\\p{sc=Latin}",
+        "\\p{sc!=Greek}",
+        "(?-u:[\\x00-\\x7f])",
+        "(?-u:foo)\\p{L}",
+        "(?:spam|scam|phish){1,5}",
+        "(?x) a { 1 , 2 } # comment",
+        "(?x) a { 1 2 }",
+        "^[\\p{Han}\\w\\s]+$",
+        "\\w+",
+        "\\d{10}",
+        "\\s{80}",
+        ".{60}",
+        "(?-u:\\w{500})",
+    ] {
+        assert!(
+            validate_automod_regex_syntax(ok_pat).is_ok(),
+            "valid Rust regex `{ok_pat}` must be accepted, got: {:?}",
+            validate_automod_regex_syntax(ok_pat)
+        );
+    }
     for bad in [
         "(unclosed",
         "[unclosed",
@@ -495,6 +533,34 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
         "a{99999999}",
         "(?P=foo)",
         "(a{50}){50}",
+        "((a{10}){10}){10}",
+        "(?:(?:a{10}){10}){10}",
+        "\\p{NotARealProperty}",
+        "\\p{123}",
+        "\\pX",
+        "[\\p{NotAReal}]",
+        "\\p{Cs}",
+        "(?-u:\\xff)",
+        "(?-u:.)",
+        "(?-u:[^a])",
+        "(?-u:\\p{L})",
+        "(?-u:\\D)",
+        "(?-u:[é])",
+        "\\字",
+        "\\🚀",
+        "\\b{bogus}",
+        "[\\d-z]",
+        "[\\w-a]",
+        "[a-\\w]",
+        "[\\b]",
+        "^[\\p{Han}\\w\\s]{1,50}$",
+        "\\w{2}",
+        "\\w{10}",
+        "\\d{20}",
+        "\\s{100}",
+        ".{100}",
+        "\\p{L}{2}",
+        "(?-u:\\w{700})",
     ] {
         assert!(
             validate_automod_regex_syntax(bad).is_err(),
@@ -502,7 +568,7 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
         );
     }
 
-    // Strict Link URL validation
+    // Strict Link URL validation (ASCII + multi-byte UTF-8 / CJK / emoji panic-free)
     for bad_url in [
         "",
         "not-a-url",
@@ -513,12 +579,24 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
         "https://example.com/a b",
         "ftp://example.com",
         "https://example.com/\x00",
+        "你好世界测试",
+        "123456é",
     ] {
         assert!(
             validate_composer_link_url(bad_url).is_err(),
             "invalid Link URL `{bad_url:?}` must be rejected"
         );
     }
+    assert!(
+        validate_composer_link_url("http://例子.测试").is_ok(),
+        "UTF-8 IDN http:// URL must not panic and should parse host cleanly"
+    );
+    assert!(
+        validate_composer_link_url("https://例子.测试/路径").is_ok(),
+        "UTF-8 IDN https:// URL must not panic and should parse host cleanly"
+    );
+    // Emoji host must never panic regardless of IDNA acceptance
+    let _ = validate_composer_link_url("http://🚀.example");
     assert_eq!(
         validate_composer_link_url("https://rust-lang.org/learn").unwrap(),
         "rust-lang.org"
@@ -657,6 +735,7 @@ fn test_m5_bot_studio_validation_grok_clamp_and_snippet() {
     let filtered = filter_search_result_by_operators(&req_comm, sample_res);
     assert_eq!(filtered.communities.len(), 1);
     assert_eq!(filtered.communities[0].slug, "rust");
+    assert_eq!(filtered.total_hits, 1);
 }
 
 #[test]
@@ -1066,6 +1145,50 @@ async fn body_f17_post_detail(mut app: AsyncApp) {
             "Stale Post B async reply reload must NEVER overwrite active Post A detail_post"
         );
     });
+
+    // Cross-post Summon Bot feedback isolation: summon on Post B then immediately open Post A ->
+    // Post B's summon completion MUST NOT leak `detail_summon_feedback` onto Post A!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_post_detail(pid_b.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            cw.read(cx)
+                .state
+                .detail_post
+                .as_ref()
+                .is_some_and(|d| d.post.post_id == pid_b)
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.summon_bot_with_options(
+            pid_b.clone(),
+            Some(bot_id.clone()),
+            Some("Cross-post summon isolation test".to_string()),
+            None,
+            cx,
+        );
+        w.open_post_detail(pid.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_summon_pending
+                && !st.detail_loading
+                && st.detail_post.as_ref().is_some_and(|d| d.post.post_id == pid)
+        })
+        .await
+    );
+    app.background_executor().timer(Duration::from_millis(80)).await;
+    let _ = cw.read_with(&app, |w, _| {
+        assert_eq!(w.state.route, CommunityRoute::PostDetail(pid.clone()));
+        assert!(
+            w.state.detail_summon_feedback.is_none(),
+            "Post B summon completion must NEVER leak detail_summon_feedback onto Post A, got: {:?}",
+            w.state.detail_summon_feedback
+        );
+    });
 }
 
 // ============================================================================
@@ -1397,13 +1520,36 @@ async fn body_f18_composer_modal(mut app: AsyncApp) {
         .unwrap();
     let _ = cw.update(&mut app, |w, cx| {
         w.resume_draft_into_composer(art_draft, cx);
+        assert_eq!(w.state.composer.tab, ComposerFormatTab::Article);
+        // Mid-edit tab switching MUST be locked (immutable PostFormat) so Article validation cannot be bypassed!
+        w.set_composer_tab(ComposerFormatTab::Media, cx);
+        assert_eq!(
+            w.state.composer.tab,
+            ComposerFormatTab::Article,
+            "set_composer_tab must be a no-op while editing an existing post/draft"
+        );
         w.state.composer.body = "   ".to_string();
         w.submit_composer(PostStatus::Published, cx);
         assert!(
             w.state.composer.validation_error.is_some() && !w.state.composer.submitting,
-            "Editing/publishing an Article draft with empty body must be rejected"
+            "Editing/publishing an Article draft with empty body must be rejected even after tab switch attempt"
         );
         assert_eq!(w.state.active_modal, Some(CommunityModal::Composer));
+
+        // Scoped `has_payload` check: editing a Media post with stale link_url but NO media/title/body must reject!
+        let mut fake_media_post = sample_post.clone();
+        fake_media_post.format = PostFormat::Media;
+        fake_media_post.title = None;
+        fake_media_post.body = String::new();
+        fake_media_post.media.clear();
+        w.open_composer_edit(fake_media_post, cx);
+        assert_eq!(w.state.composer.tab, ComposerFormatTab::Media);
+        w.state.composer.link_url = "https://stale-other-tab.example.com".to_string();
+        w.submit_composer(PostStatus::Published, cx);
+        assert!(
+            w.state.composer.validation_error.is_some() && !w.state.composer.submitting,
+            "Media edit must not treat stale link_url from another tab as valid Media payload"
+        );
     });
     host.draw(&mut app);
 }
@@ -1900,6 +2046,48 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
         assert!(
             w.state.detail_focused_comment_id.is_none(),
             "Direct navigation to another post must clear stale detail_focused_comment_id"
+        );
+
+        // In-flight notification jump (Post A) immediately superseded by direct open_post_detail(Post B):
+        // `detail_opened_from_notification` must be consumed synchronously so Post B clears Post A's focused comment!
+        w.open_notification_target(
+            CommunityNotificationDto {
+                notif_id: "n_inflight_race".to_string(),
+                recipient_actor_id: own_human.actor_id.clone(),
+                actor_id: target_bot.actor_id.clone(),
+                actor_handle: target_bot.handle.clone(),
+                actor_display_name: target_bot.display_name.clone(),
+                actor_kind: ActorKind::Bot,
+                kind: CommunityNotificationKind::Reply,
+                target_post_id: Some(sample_pid.clone()),
+                target_comment_id: Some("c_race_stale".to_string()),
+                preview_text: "in-flight race notification".to_string(),
+                is_read: true,
+                created_at_ms: 1_700_000_004_000,
+            },
+            cx,
+        );
+        assert!(
+            !w.state.detail_opened_from_notification,
+            "load_post_detail must consume detail_opened_from_notification synchronously"
+        );
+        w.open_post_detail(other_pid.clone(), cx);
+        assert!(
+            w.state.detail_focused_comment_id.is_none(),
+            "Immediate direct open_post_detail after in-flight notification jump must clear stale focused comment"
+        );
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading && st.detail_post.as_ref().is_some_and(|d| d.post.post_id == other_pid)
+        })
+        .await
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        assert!(
+            w.state.detail_focused_comment_id.is_none(),
+            "Post B must settle with no leaked detail_focused_comment_id"
         );
     });
     host.draw(&mut app);
@@ -2400,33 +2588,98 @@ async fn body_f21_explore_mod_bot_studio(mut app: AsyncApp) {
         .read_with(&app, |w, _| w.state.identities.clone().unwrap())
         .unwrap();
     let _ = cw.update(&mut app, |w, cx| {
+        // 4a. Unhydrated direct edits (including Grok avatar shape/color & autonomy) preserved on hydrate
         w.state.bot_studio_selected_bot_id = None;
         w.state.bot_studio_edit = BotStudioEditDraft::default();
         w.state.bot_studio_edit.display_name = "Preserved Unhydrated Draft".to_string();
+        w.state.bot_studio_edit.shape_idx = 6;
+        w.state.bot_studio_edit.color_idx = 9;
+        w.state.bot_studio_edit.bot_autonomy_mode = BotAutonomyMode::Autonomous;
         w.ensure_bot_studio_edit_hydrated(&owned_bot_dto);
         assert_eq!(w.state.bot_studio_edit.actor_id, bot_id);
-        assert_eq!(
-            w.state.bot_studio_edit.display_name,
-            "Preserved Unhydrated Draft",
-            "Hydrating an unhydrated edit draft must preserve user edits"
-        );
+        assert_eq!(w.state.bot_studio_edit.display_name, "Preserved Unhydrated Draft");
+        assert_eq!(w.state.bot_studio_edit.shape_idx, 6);
+        assert_eq!(w.state.bot_studio_edit.color_idx, 9);
+        assert_eq!(w.state.bot_studio_edit.bot_autonomy_mode, BotAutonomyMode::Autonomous);
 
+        // 4b. Pre-load edits made on BotStudio BEFORE identities arrive (including explicit 0/Manual via setters)
+        // MUST be preserved by `apply_identities_response`!
+        w.state.identities = None;
         w.state.bot_studio_selected_bot_id = None;
         w.state.bot_studio_edit = BotStudioEditDraft::default();
-        w.apply_identities_response(ids_snap, cx);
+        w.state.bot_studio_edit.display_name = "User Edited Pre-Load".to_string();
+        w.state.bot_studio_edit.bio = "Custom bio before load".to_string();
+        w.set_bot_studio_edit_avatar_indices(5, 7, cx);
+        w.set_bot_studio_edit_autonomy(BotAutonomyMode::Autonomous, cx);
+        w.apply_identities_response(ids_snap.clone(), cx);
         assert_eq!(
             w.state.bot_studio_selected_bot_id.as_deref(),
             Some(bot_id.as_str()),
             "apply_identities_response on BotStudio must auto-hydrate selected bot"
         );
         assert_eq!(w.state.bot_studio_edit.actor_id, bot_id);
+        assert_eq!(w.state.bot_studio_edit.display_name, "User Edited Pre-Load");
+        assert_eq!(w.state.bot_studio_edit.bio, "Custom bio before load");
+        assert_eq!(w.state.bot_studio_edit.shape_idx, 5);
+        assert_eq!(w.state.bot_studio_edit.color_idx, 7);
+        assert_eq!(w.state.bot_studio_edit.bot_autonomy_mode, BotAutonomyMode::Autonomous);
+
+        // 4c. Explicit pre-load setter edit to (0, 0) + Manual must also survive hydration via dirty flags
+        w.state.identities = None;
+        w.state.bot_studio_selected_bot_id = None;
+        w.state.bot_studio_edit = BotStudioEditDraft::default();
+        w.set_bot_studio_edit_avatar_indices(0, 0, cx);
+        w.set_bot_studio_edit_autonomy(BotAutonomyMode::Manual, cx);
+        w.apply_identities_response(ids_snap, cx);
+        assert_eq!(w.state.bot_studio_edit.shape_idx, 0);
+        assert_eq!(w.state.bot_studio_edit.color_idx, 0);
+        assert_eq!(w.state.bot_studio_edit.bot_autonomy_mode, BotAutonomyMode::Manual);
     });
 
-    // 5. Mod Console actor-switch role revocation: Owner -> non-mod Bot immediately revokes ModQueue access!
+    // 5. Mod Console actor-switch role revocation (on-route AND off-route!) + mod_gen fence
     let owner_id = cw
         .read_with(&app, |w, _| w.state.active_actor_id.clone())
         .unwrap();
     let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::ModQueue(Some("mod_lab".to_string())), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.mod_loading && cw.read(cx).can_moderate_active_mod_community()
+        })
+        .await
+    );
+    // 5a. Off-route switch: Owner leaves ModQueue to Feed, then switches to non-mod Bot ->
+    // MUST unconditionally clear mod_community/mod_queue/mod_logs/mod_slug and bump mod_gen!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::Feed, cx);
+        assert!(w.state.mod_community.is_some());
+        let prev_gen = w.state.mod_gen;
+        w.switch_active_actor(bot_id.clone(), cx);
+        assert_ne!(w.state.mod_gen, prev_gen, "switch_active_actor must bump mod_gen off-route");
+        assert!(w.state.mod_community.is_none());
+        assert!(w.state.mod_slug.is_none());
+        assert!(!w.can_moderate_community_slug("mod_lab"));
+        assert!(w.moderated_communities().is_empty());
+    });
+    app.background_executor().timer(Duration::from_millis(120)).await;
+    let _ = cw.update(&mut app, |w, cx| {
+        assert!(
+            !w.can_moderate_community_slug("mod_lab"),
+            "Non-mod Bot must NOT retain stale mod_community permissions after communities refresh"
+        );
+        assert!(w.moderated_communities().is_empty());
+        w.navigate_to(CommunityRoute::ModQueue(None), cx);
+        assert!(
+            !w.can_moderate_active_mod_community(),
+            "Navigating to ModQueue(None) as non-mod Bot after off-route switch must stay locked"
+        );
+    });
+    host.draw(&mut app);
+
+    // 5b. Switch back to Owner on ModQueue(Some("mod_lab")), then on-route switch to non-mod Bot
+    let _ = cw.update(&mut app, |w, cx| {
+        w.switch_active_actor(owner_id.clone(), cx);
         w.navigate_to(CommunityRoute::ModQueue(Some("mod_lab".to_string())), cx);
     });
     assert!(

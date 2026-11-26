@@ -209,9 +209,17 @@ pub fn validate_composer_link_url(raw: &str) -> Result<String, &'static str> {
     if url.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("invalid_chars");
     }
-    let after_scheme = if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
+    let after_scheme = if url
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"https://"))
+    {
         &url[8..]
-    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
+    } else if url
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"http://"))
+    {
         &url[7..]
     } else {
         return Err("invalid_scheme");
@@ -375,6 +383,9 @@ impl CommunityWorkspace {
     }
 
     pub fn set_composer_tab(&mut self, tab: ComposerFormatTab, cx: &mut Context<Self>) {
+        if self.state.composer.editing_post_id.is_some() {
+            return;
+        }
         self.state.composer.tab = tab;
         self.state.composer.validation_error = None;
         if tab == ComposerFormatTab::Media && self.state.composer.media_items.is_empty() {
@@ -968,15 +979,22 @@ impl CommunityWorkspace {
                 | ComposerFormatTab::Link
                 | ComposerFormatTab::Poll
                 | ComposerFormatTab::Crosspost => {
-                    let has_payload = self
-                        .state
-                        .composer
-                        .media_items
-                        .iter()
-                        .any(|m| !m.url_or_id.trim().is_empty())
-                        || !self.state.composer.link_url.trim().is_empty()
-                        || !self.state.composer.poll_question.trim().is_empty()
-                        || self.state.composer.crosspost_of_id.is_some();
+                    let has_payload = match self.state.composer.tab {
+                        ComposerFormatTab::Media => self
+                            .state
+                            .composer
+                            .media_items
+                            .iter()
+                            .any(|m| !m.url_or_id.trim().is_empty()),
+                        ComposerFormatTab::Link => !self.state.composer.link_url.trim().is_empty(),
+                        ComposerFormatTab::Poll => {
+                            !self.state.composer.poll_question.trim().is_empty()
+                        }
+                        ComposerFormatTab::Crosspost => {
+                            self.state.composer.crosspost_of_id.is_some()
+                        }
+                        _ => false,
+                    };
                     if body.is_empty() && title.is_none() && !has_payload {
                         self.state.composer.validation_error = Some(
                             tr_str(
@@ -1344,9 +1362,11 @@ pub fn render_composer_modal(
                         .gap(px(5.0))
                         .children(format_tabs.into_iter().map(|(tab, zh, en)| {
                             let active = c.tab == tab;
+                            let locked = is_editing && !active;
                             div()
                                 .id(SharedString::from(format!("composer-tab-{tab:?}")))
-                                .cursor_pointer()
+                                .when(!locked, |d| d.cursor_pointer())
+                                .when(locked, |d| d.opacity(0.45))
                                 .px(px(9.5))
                                 .py(px(5.0))
                                 .rounded_full()
@@ -1355,23 +1375,31 @@ pub fn render_composer_modal(
                                 } else {
                                     pal.service_pill_rgba()
                                 })
-                                .hover(move |s| {
-                                    if active { s.bg(rgb(pal.accent_hover)) } else { s.bg(hover_bg) }
+                                .when(!locked, |d| {
+                                    d.hover(move |s| {
+                                        if active {
+                                            s.bg(rgb(pal.accent_hover))
+                                        } else {
+                                            s.bg(hover_bg)
+                                        }
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.set_composer_tab(tab, cx);
+                                        }),
+                                    )
                                 })
                                 .text_size(px(11.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(if active {
                                     pal.active_button_fg
+                                } else if locked {
+                                    pal.text_secondary
                                 } else {
                                     pal.text_primary
                                 }))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.set_composer_tab(tab, cx);
-                                    }),
-                                )
                                 .child(tr_str(lang, zh, en))
                         })),
                 )

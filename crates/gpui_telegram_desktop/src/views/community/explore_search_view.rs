@@ -186,6 +186,7 @@ pub fn filter_search_result_by_operators(
             ActorKind::HybridAgent => a.actor_kind == ActorKind::HybridAgent,
         });
     }
+    res.total_hits = res.posts.len() + res.actors.len() + res.communities.len();
     res
 }
 

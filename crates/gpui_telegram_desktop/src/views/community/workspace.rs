@@ -180,7 +180,12 @@ impl CommunityWorkspace {
             return;
         }
         if let Some(bot) = self.resolve_selected_owned_bot() {
-            if self.state.bot_studio_selected_bot_id.as_deref() != Some(bot.actor_id.as_str())
+            if self.state.bot_studio_edit.actor_id.is_empty() {
+                self.state.bot_studio_selected_bot_id = Some(bot.actor_id.clone());
+                self.ensure_bot_studio_edit_hydrated(&bot);
+                cx.notify();
+            } else if self.state.bot_studio_selected_bot_id.as_deref()
+                != Some(bot.actor_id.as_str())
                 || self.state.bot_studio_edit.actor_id != bot.actor_id
             {
                 self.select_bot_for_studio(bot, cx);
@@ -1574,11 +1579,14 @@ impl CommunityWorkspace {
         if let Some(ref mut det) = self.state.community_detail {
             det.community.viewer_role = None;
         }
-        if matches!(self.state.route, CommunityRoute::ModQueue(_)) {
-            self.state.mod_community = None;
-            self.state.mod_queue.clear();
-            self.state.mod_logs.clear();
-            self.state.mod_error = None;
+        self.state.mod_gen = self.state.mod_gen.wrapping_add(1);
+        self.state.mod_loading = false;
+        self.state.mod_community = None;
+        self.state.mod_queue.clear();
+        self.state.mod_logs.clear();
+        self.state.mod_error = None;
+        if !matches!(self.state.route, CommunityRoute::ModQueue(Some(_))) {
+            self.state.mod_slug = None;
         }
         let lang = self.language_id.clone();
         let handle = self
@@ -1775,6 +1783,7 @@ impl CommunityWorkspace {
     pub fn load_post_detail(&mut self, post_id: String, cx: &mut Context<Self>) {
         self.state.detail_gen = self.state.detail_gen.wrapping_add(1);
         let my_gen = self.state.detail_gen;
+        let from_notif = std::mem::take(&mut self.state.detail_opened_from_notification);
         let is_same_post = self
             .state
             .detail_post
@@ -1786,7 +1795,7 @@ impl CommunityWorkspace {
             self.state.detail_edit_comment_draft.clear();
             self.state.detail_summon_feedback = None;
             self.state.detail_reply_parent_id = None;
-            if !self.state.detail_opened_from_notification {
+            if !from_notif {
                 self.state.detail_focused_comment_id = None;
             }
         }
@@ -1808,7 +1817,6 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.detail_loading = false;
-                let from_notif = std::mem::take(&mut this.state.detail_opened_from_notification);
                 match res {
                     Ok(Ok(det)) => {
                         this.state.detail_post = Some(det);
