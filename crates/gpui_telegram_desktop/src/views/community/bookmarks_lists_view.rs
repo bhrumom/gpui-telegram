@@ -433,7 +433,6 @@ impl CommunityWorkspace {
     fn rollback_bookmark_flight(&mut self, post_id: &str) {
         self.state.bookmark_dirty.remove(post_id);
         self.state.bookmark_pending_target.remove(post_id);
-        self.state.bookmark_cached_items.remove(post_id);
         if let Some(snap) = self.state.bookmark_last_synced.remove(post_id) {
             self.state.bookmark_state_epoch = self.state.bookmark_state_epoch.wrapping_add(1);
             self.state.visit_post_mut(post_id, |post| {
@@ -483,6 +482,7 @@ impl CommunityWorkspace {
                 );
             }
         }
+        self.state.bookmark_cached_items.remove(post_id);
     }
 }
 
@@ -678,60 +678,90 @@ impl CommunityWorkspace {
                 let lang = this.language_id.clone();
                 match res {
                     Ok((Ok(saved), lists)) => {
-                        let edited_deleting = editing_id_cb
-                            .as_ref()
-                            .is_some_and(|lid| this.state.list_deleting.contains(lid));
-                        let edited_was_in_flight = editing_id_cb
-                            .as_ref()
-                            .is_some_and(|lid| this.state.list_membership_in_flight.contains_key(lid));
-                        if this.state.lists_gen == my_lists_gen {
-                            if let Some(l) = lists {
-                                this.state.merge_refreshed_lists(l.lists);
-                            } else if !edited_deleting {
-                                if let Some(pos) = this
-                                    .state
-                                    .lists
-                                    .iter()
-                                    .position(|x| x.list_id == saved.list_id)
-                                {
-                                    this.state.lists[pos] = saved.clone();
-                                } else {
-                                    this.state.lists.insert(0, saved.clone());
-                                }
-                            }
-                        }
+                        let mut saved_present = false;
                         if let Some(ref lid) = editing_id_cb {
-                            if !edited_deleting {
+                            // Evaluate BEFORE merge_refreshed_lists so an already-deleted list
+                            // (or one currently being deleted) can never be resurrected or selected.
+                            let edited_gone = this.state.list_deleting.contains(lid)
+                                || !this.state.lists.iter().any(|x| &x.list_id == lid);
+                            if !edited_gone {
+                                let edited_was_in_flight =
+                                    this.state.list_membership_in_flight.contains_key(lid);
+                                let edited_was_dirty =
+                                    this.state.list_membership_dirty.contains(lid);
+                                let preserve_optimistic_toggle =
+                                    this.state.lists_gen != my_lists_gen
+                                        && (edited_was_in_flight || edited_was_dirty);
+                                if this.state.lists_gen == my_lists_gen {
+                                    if let Some(l) = lists {
+                                        this.state.merge_refreshed_lists(l.lists);
+                                    }
+                                }
                                 if let Some(pos) =
                                     this.state.lists.iter().position(|x| &x.list_id == lid)
                                 {
-                                    this.state.lists[pos] = saved.clone();
+                                    let mut reconciled = saved.clone();
+                                    if preserve_optimistic_toggle {
+                                        let prev = &this.state.lists[pos];
+                                        reconciled.is_pinned = prev.is_pinned;
+                                        reconciled.member_actor_ids =
+                                            prev.member_actor_ids.clone();
+                                        reconciled.community_slugs = prev.community_slugs.clone();
+                                    }
+                                    this.state.lists[pos] = reconciled;
+                                    if edited_was_in_flight {
+                                        // A quick-toggle flight is still running; mark dirty so once it
+                                        // settles it flushes the reconciled authoritative state.
+                                        this.state.list_membership_dirty.insert(lid.clone());
+                                    } else if !edited_was_dirty {
+                                        this.state.list_membership_dirty.remove(lid);
+                                        this.state.list_membership_needs_feed_reload.remove(lid);
+                                        this.state.list_membership_last_synced.remove(lid);
+                                    }
+                                    this.state.lists_gen = this.state.lists_gen.wrapping_add(1);
+                                    saved_present = this
+                                        .state
+                                        .lists
+                                        .iter()
+                                        .any(|x| x.list_id == saved.list_id);
                                 }
-                                if edited_was_in_flight {
-                                    // A pre-editor quick-toggle flight is still running; mark dirty so
-                                    // once it finishes it flushes the editor's authoritative saved state.
-                                    this.state.list_membership_dirty.insert(lid.clone());
-                                } else {
-                                    this.state.list_membership_dirty.remove(lid);
-                                    this.state.list_membership_needs_feed_reload.remove(lid);
-                                    this.state.list_membership_last_synced.remove(lid);
+                            }
+                        } else {
+                            // Create mode: merge full snapshot only if lists_gen is unchanged,
+                            // then unconditionally ensure the newly created list is present (unless deleting)
+                            // and bump lists_gen so an older GET /lists cannot drop it.
+                            if this.state.lists_gen == my_lists_gen {
+                                if let Some(l) = lists {
+                                    this.state.merge_refreshed_lists(l.lists);
                                 }
+                            }
+                            if !this.state.list_deleting.contains(&saved.list_id) {
+                                if !this
+                                    .state
+                                    .lists
+                                    .iter()
+                                    .any(|x| x.list_id == saved.list_id)
+                                {
+                                    this.state.lists.insert(0, saved.clone());
+                                }
+                                this.state.lists_gen = this.state.lists_gen.wrapping_add(1);
+                                saved_present = true;
                             }
                         }
                         this.state.list_editor_open = false;
                         if this.state.active_input.is_list_editor_input() {
                             this.state.blur_input();
                         }
-                        if !edited_deleting {
+                        if saved_present {
                             this.select_list_for_preview(saved.list_id, cx);
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "列表已保存", "List saved").to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
                         }
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "列表已保存", "List saved").to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
                     }
                     Ok((Err(e), _)) => {
                         this.state.list_editor.error = Some(e.to_string());

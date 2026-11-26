@@ -799,6 +799,15 @@ pub struct CommunityWorkspaceState {
     pub poll_breakdown_by_post: HashMap<String, PollBreakdownMode>,
     pub hidden_post_ids: HashSet<String>,
     pub post_vote_gen: HashMap<String, u64>,
+    pub post_like_flight_seq: u64,
+    pub post_like_in_flight: HashMap<String, u64>,
+    pub post_like_pending_toggle: HashSet<String>,
+    pub post_like_last_synced: HashMap<String, (bool, u64)>,
+    pub comment_vote_gen: HashMap<String, u64>,
+    pub comment_like_flight_seq: u64,
+    pub comment_like_in_flight: HashMap<String, u64>,
+    pub comment_like_pending_toggle: HashSet<String>,
+    pub comment_like_last_synced: HashMap<String, (bool, u64)>,
 
     // Left Nav & Right Rail caches
     pub communities: Vec<SubCommunityDto>,
@@ -862,6 +871,16 @@ pub struct CommunityWorkspaceState {
     pub profile_loading: bool,
     pub profile_error: Option<String>,
     pub profile_gen: u64,
+    pub actor_mute_flight_seq: u64,
+    pub actor_mute_in_flight: HashMap<String, u64>,
+    pub actor_mute_dirty: HashSet<String>,
+    pub actor_mute_pending_target: HashMap<String, bool>,
+    pub actor_mute_last_synced: HashMap<String, bool>,
+    pub actor_block_flight_seq: u64,
+    pub actor_block_in_flight: HashMap<String, u64>,
+    pub actor_block_dirty: HashSet<String>,
+    pub actor_block_pending_target: HashMap<String, bool>,
+    pub actor_block_last_synced: HashMap<String, (bool, bool)>,
 
     // F21 Explore & Search state
     pub search_result: Option<CommunitySearchResultDto>,
@@ -1017,6 +1036,15 @@ impl Default for CommunityWorkspaceState {
             poll_breakdown_by_post: HashMap::new(),
             hidden_post_ids: HashSet::new(),
             post_vote_gen: HashMap::new(),
+            post_like_flight_seq: 0,
+            post_like_in_flight: HashMap::new(),
+            post_like_pending_toggle: HashSet::new(),
+            post_like_last_synced: HashMap::new(),
+            comment_vote_gen: HashMap::new(),
+            comment_like_flight_seq: 0,
+            comment_like_in_flight: HashMap::new(),
+            comment_like_pending_toggle: HashSet::new(),
+            comment_like_last_synced: HashMap::new(),
             communities: Vec::new(),
             communities_gen: 0,
             lists: Vec::new(),
@@ -1070,6 +1098,16 @@ impl Default for CommunityWorkspaceState {
             profile_loading: false,
             profile_error: None,
             profile_gen: 0,
+            actor_mute_flight_seq: 0,
+            actor_mute_in_flight: HashMap::new(),
+            actor_mute_dirty: HashSet::new(),
+            actor_mute_pending_target: HashMap::new(),
+            actor_mute_last_synced: HashMap::new(),
+            actor_block_flight_seq: 0,
+            actor_block_in_flight: HashMap::new(),
+            actor_block_dirty: HashSet::new(),
+            actor_block_pending_target: HashMap::new(),
+            actor_block_last_synced: HashMap::new(),
             search_result: None,
             search_tab: CommunitySearchTab::Top,
             search_sort: CommunitySearchSort::Relevance,
@@ -1631,6 +1669,29 @@ impl CommunityWorkspaceState {
         });
     }
 
+    pub fn apply_optimistic_comment_like(&mut self, comment_id: &str) -> Option<(bool, u64)> {
+        let snap = self
+            .find_comment(comment_id)
+            .map(|c| (c.viewer_liked, c.likes_count));
+        self.visit_comment_mut(comment_id, |c| {
+            if c.viewer_liked {
+                c.viewer_liked = false;
+                c.likes_count = c.likes_count.saturating_sub(1);
+            } else {
+                c.viewer_liked = true;
+                c.likes_count = c.likes_count.saturating_add(1);
+            }
+        });
+        snap
+    }
+
+    pub fn rollback_comment_like(&mut self, comment_id: &str, snap: (bool, u64)) {
+        self.visit_comment_mut(comment_id, |c| {
+            c.viewer_liked = snap.0;
+            c.likes_count = snap.1;
+        });
+    }
+
     pub fn reconcile_comment_like(&mut self, resp: &ToggleActionResponse) {
         self.visit_comment_mut(&resp.target_id, |c| {
             c.viewer_liked = resp.active;
@@ -1715,6 +1776,9 @@ impl CommunityWorkspaceState {
         self.bookmark_cached_items.remove(post_id);
         self.bookmark_recent_overrides.remove(post_id);
         self.post_vote_gen.remove(post_id);
+        self.post_like_in_flight.remove(post_id);
+        self.post_like_pending_toggle.remove(post_id);
+        self.post_like_last_synced.remove(post_id);
     }
 
     /// Optimistically applies a vote toggle (`1 | -1`, toggling to `0` if already active).
@@ -1897,6 +1961,23 @@ impl CommunityWorkspaceState {
         }
     }
 
+    pub fn find_actor(&self, actor_id: &str) -> Option<&CommunityActorDto> {
+        self.actor_profile
+            .as_ref()
+            .map(|p| &p.actor)
+            .filter(|a| a.actor_id == actor_id)
+            .or_else(|| {
+                self.recommended_actors
+                    .iter()
+                    .find(|a| a.actor_id == actor_id)
+            })
+            .or_else(|| {
+                self.search_result
+                    .as_ref()
+                    .and_then(|sr| sr.actors.iter().find(|a| a.actor_id == actor_id))
+            })
+    }
+
     pub fn reconcile_mute_block(
         &mut self,
         actor_id: &str,
@@ -1914,6 +1995,31 @@ impl CommunityWorkspaceState {
                         a.is_following = false;
                     }
                 }
+            }
+        };
+        for a in &mut self.recommended_actors {
+            apply(a);
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            apply(&mut prof.actor);
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for a in &mut sr.actors {
+                apply(a);
+            }
+        }
+    }
+
+    pub fn restore_block_and_follow(
+        &mut self,
+        actor_id: &str,
+        is_blocked: bool,
+        is_following: bool,
+    ) {
+        let apply = |a: &mut CommunityActorDto| {
+            if a.actor_id == actor_id {
+                a.is_blocked = is_blocked;
+                a.is_following = is_following;
             }
         };
         for a in &mut self.recommended_actors {

@@ -92,20 +92,55 @@ impl CommunityWorkspace {
             return;
         }
         let next_muted = !currently_muted;
-        self.state.reconcile_mute_block(&actor_id, Some(next_muted), None);
+        if !self.state.actor_mute_last_synced.contains_key(&actor_id) {
+            let orig_muted = self
+                .state
+                .find_actor(&actor_id)
+                .map(|a| a.is_muted)
+                .unwrap_or(currently_muted);
+            self.state
+                .actor_mute_last_synced
+                .insert(actor_id.clone(), orig_muted);
+        }
+        self.state
+            .actor_mute_pending_target
+            .insert(actor_id.clone(), next_muted);
+        self.state
+            .reconcile_mute_block(&actor_id, Some(next_muted), None);
+        cx.notify();
+        if self.state.actor_mute_in_flight.contains_key(&actor_id) {
+            self.state.actor_mute_dirty.insert(actor_id);
+            return;
+        }
+        self.flush_actor_mute_sync(actor_id, cx);
+    }
+
+    fn flush_actor_mute_sync(&mut self, actor_id: String, cx: &mut Context<Self>) {
+        let Some(target_muted) = self.state.actor_mute_pending_target.get(&actor_id).copied()
+        else {
+            self.state.actor_mute_dirty.remove(&actor_id);
+            self.state.actor_mute_last_synced.remove(&actor_id);
+            return;
+        };
+        self.state.actor_mute_dirty.remove(&actor_id);
+        self.state.actor_mute_flight_seq = self.state.actor_mute_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.actor_mute_flight_seq;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .actor_mute_in_flight
+            .insert(actor_id.clone(), my_flight_seq);
         let req = MuteBlockRequest {
             target_kind: MuteBlockTargetKind::Actor,
             target_value: actor_id.clone(),
             action: MuteBlockActionKind::Mute,
             reason: None,
         };
-        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
-        cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                if next_muted {
+                if target_muted {
                     facade.set_mute_block(&req).await.map(|_| ())
                 } else {
                     facade.remove_mute_block(&req).await.map(|_| ())
@@ -113,14 +148,37 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
+                if this.state.actor_mute_in_flight.get(&actor_id).copied() != Some(my_flight_seq) {
+                    return;
+                }
+                this.state.actor_mute_in_flight.remove(&actor_id);
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(())) => {
                         this.state
-                            .reconcile_mute_block(&actor_id, Some(next_muted), None);
+                            .actor_mute_last_synced
+                            .insert(actor_id.clone(), target_muted);
+                        let is_dirty = this.state.actor_mute_dirty.remove(&actor_id);
+                        if is_dirty
+                            && this
+                                .state
+                                .actor_mute_pending_target
+                                .get(&actor_id)
+                                .copied()
+                                .is_some_and(|want| want != target_muted)
+                        {
+                            this.flush_actor_mute_sync(actor_id, cx);
+                            return;
+                        }
+                        this.state.actor_mute_pending_target.remove(&actor_id);
+                        this.state.actor_mute_last_synced.remove(&actor_id);
+                        this.state
+                            .reconcile_mute_block(&actor_id, Some(target_muted), None);
                         if this.state.profile_loading {
                             if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
                                 this.load_actor_profile(h, cx);
@@ -128,7 +186,7 @@ impl CommunityWorkspace {
                         }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
-                                text: if next_muted {
+                                text: if target_muted {
                                     tr_str(&lang, "已静音该公民", "Actor muted").to_string()
                                 } else {
                                     tr_str(&lang, "已取消静音", "Actor unmuted").to_string()
@@ -140,14 +198,34 @@ impl CommunityWorkspace {
                         cx.notify();
                     }
                     Ok(Err(e)) => {
-                        this.state.reconcile_mute_block(&actor_id, Some(currently_muted), None);
+                        this.state.actor_mute_dirty.remove(&actor_id);
+                        this.state.actor_mute_pending_target.remove(&actor_id);
+                        let orig_muted = this
+                            .state
+                            .actor_mute_last_synced
+                            .remove(&actor_id)
+                            .unwrap_or(!target_muted);
+                        this.state
+                            .reconcile_mute_block(&actor_id, Some(orig_muted), None);
                         this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
+                            CommunityWorkspaceAction::ShowToast {
+                                text: e.to_string(),
+                                is_error: true,
+                            },
                             cx,
                         );
+                        cx.notify();
                     }
                     Err(_) => {
-                        this.state.reconcile_mute_block(&actor_id, Some(currently_muted), None);
+                        this.state.actor_mute_dirty.remove(&actor_id);
+                        this.state.actor_mute_pending_target.remove(&actor_id);
+                        let orig_muted = this
+                            .state
+                            .actor_mute_last_synced
+                            .remove(&actor_id)
+                            .unwrap_or(!target_muted);
+                        this.state
+                            .reconcile_mute_block(&actor_id, Some(orig_muted), None);
                         cx.notify();
                     }
                 }
@@ -166,20 +244,55 @@ impl CommunityWorkspace {
             return;
         }
         let next_blocked = !currently_blocked;
-        self.state.reconcile_mute_block(&actor_id, None, Some(next_blocked));
+        if !self.state.actor_block_last_synced.contains_key(&actor_id) {
+            let orig = self
+                .state
+                .find_actor(&actor_id)
+                .map(|a| (a.is_blocked, a.is_following))
+                .unwrap_or((currently_blocked, false));
+            self.state
+                .actor_block_last_synced
+                .insert(actor_id.clone(), orig);
+        }
+        self.state
+            .actor_block_pending_target
+            .insert(actor_id.clone(), next_blocked);
+        self.state
+            .reconcile_mute_block(&actor_id, None, Some(next_blocked));
+        cx.notify();
+        if self.state.actor_block_in_flight.contains_key(&actor_id) {
+            self.state.actor_block_dirty.insert(actor_id);
+            return;
+        }
+        self.flush_actor_block_sync(actor_id, cx);
+    }
+
+    fn flush_actor_block_sync(&mut self, actor_id: String, cx: &mut Context<Self>) {
+        let Some(target_blocked) = self.state.actor_block_pending_target.get(&actor_id).copied()
+        else {
+            self.state.actor_block_dirty.remove(&actor_id);
+            self.state.actor_block_last_synced.remove(&actor_id);
+            return;
+        };
+        self.state.actor_block_dirty.remove(&actor_id);
+        self.state.actor_block_flight_seq = self.state.actor_block_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.actor_block_flight_seq;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .actor_block_in_flight
+            .insert(actor_id.clone(), my_flight_seq);
         let req = MuteBlockRequest {
             target_kind: MuteBlockTargetKind::Actor,
             target_value: actor_id.clone(),
             action: MuteBlockActionKind::Block,
             reason: None,
         };
-        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
-        cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                if next_blocked {
+                if target_blocked {
                     facade.set_mute_block(&req).await.map(|_| ())
                 } else {
                     facade.remove_mute_block(&req).await.map(|_| ())
@@ -187,14 +300,47 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
+                if this.state.actor_block_in_flight.get(&actor_id).copied() != Some(my_flight_seq)
+                {
+                    return;
+                }
+                this.state.actor_block_in_flight.remove(&actor_id);
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(())) => {
+                        let committed_following = if target_blocked {
+                            false
+                        } else {
+                            this.state
+                                .actor_block_last_synced
+                                .get(&actor_id)
+                                .map(|&(_, f)| f)
+                                .unwrap_or(false)
+                        };
                         this.state
-                            .reconcile_mute_block(&actor_id, None, Some(next_blocked));
+                            .actor_block_last_synced
+                            .insert(actor_id.clone(), (target_blocked, committed_following));
+                        let is_dirty = this.state.actor_block_dirty.remove(&actor_id);
+                        if is_dirty
+                            && this
+                                .state
+                                .actor_block_pending_target
+                                .get(&actor_id)
+                                .copied()
+                                .is_some_and(|want| want != target_blocked)
+                        {
+                            this.flush_actor_block_sync(actor_id, cx);
+                            return;
+                        }
+                        this.state.actor_block_pending_target.remove(&actor_id);
+                        this.state.actor_block_last_synced.remove(&actor_id);
+                        this.state
+                            .reconcile_mute_block(&actor_id, None, Some(target_blocked));
                         if this.state.profile_loading {
                             if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
                                 this.load_actor_profile(h, cx);
@@ -202,7 +348,7 @@ impl CommunityWorkspace {
                         }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
-                                text: if next_blocked {
+                                text: if target_blocked {
                                     tr_str(&lang, "已屏蔽该公民并取消互关", "Actor blocked")
                                         .to_string()
                                 } else {
@@ -215,14 +361,34 @@ impl CommunityWorkspace {
                         cx.notify();
                     }
                     Ok(Err(e)) => {
-                        this.state.reconcile_mute_block(&actor_id, None, Some(currently_blocked));
+                        this.state.actor_block_dirty.remove(&actor_id);
+                        this.state.actor_block_pending_target.remove(&actor_id);
+                        let (orig_blocked, orig_following) = this
+                            .state
+                            .actor_block_last_synced
+                            .remove(&actor_id)
+                            .unwrap_or((!target_blocked, false));
+                        this.state
+                            .restore_block_and_follow(&actor_id, orig_blocked, orig_following);
                         this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
+                            CommunityWorkspaceAction::ShowToast {
+                                text: e.to_string(),
+                                is_error: true,
+                            },
                             cx,
                         );
+                        cx.notify();
                     }
                     Err(_) => {
-                        this.state.reconcile_mute_block(&actor_id, None, Some(currently_blocked));
+                        this.state.actor_block_dirty.remove(&actor_id);
+                        this.state.actor_block_pending_target.remove(&actor_id);
+                        let (orig_blocked, orig_following) = this
+                            .state
+                            .actor_block_last_synced
+                            .remove(&actor_id)
+                            .unwrap_or((!target_blocked, false));
+                        this.state
+                            .restore_block_and_follow(&actor_id, orig_blocked, orig_following);
                         cx.notify();
                     }
                 }

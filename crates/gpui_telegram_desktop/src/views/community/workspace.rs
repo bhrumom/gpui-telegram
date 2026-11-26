@@ -1315,28 +1315,79 @@ impl CommunityWorkspace {
     }
 
     pub fn toggle_like(&mut self, post_id: String, cx: &mut Context<Self>) {
-        let rollback = self.state.apply_optimistic_like(&post_id);
+        if !self.state.post_like_last_synced.contains_key(&post_id) {
+            if let Some(p) = self.state.find_post(&post_id) {
+                self.state
+                    .post_like_last_synced
+                    .insert(post_id.clone(), (p.viewer_liked, p.likes_count));
+            }
+        }
+        let _ = self.state.apply_optimistic_like(&post_id);
+        cx.notify();
+        if self.state.post_like_in_flight.contains_key(&post_id) {
+            if !self.state.post_like_pending_toggle.remove(&post_id) {
+                self.state.post_like_pending_toggle.insert(post_id);
+            }
+            return;
+        }
+        self.flush_post_like_sync(post_id, cx);
+    }
+
+    fn flush_post_like_sync(&mut self, post_id: String, cx: &mut Context<Self>) {
+        self.state.post_like_flight_seq = self.state.post_like_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.post_like_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .post_like_in_flight
+            .insert(post_id.clone(), my_flight_seq);
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
-        cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
                 facade.toggle_post_like(&pid).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
+                if this.state.post_like_in_flight.get(&post_id).copied() != Some(my_flight_seq) {
+                    return;
+                }
+                this.state.post_like_in_flight.remove(&post_id);
                 match res {
                     Ok(Ok(resp)) => {
+                        this.state
+                            .post_like_last_synced
+                            .insert(post_id.clone(), (resp.active, resp.count));
+                        if this.state.post_like_pending_toggle.remove(&post_id) {
+                            this.flush_post_like_sync(post_id, cx);
+                            return;
+                        }
                         this.state.reconcile_like(&resp);
                         this.reload_detail_if_loading_post(&post_id, cx);
+                        this.state.post_like_last_synced.remove(&post_id);
                     }
-                    _ => {
-                        if let Some(snap) = rollback {
+                    Ok(Err(e)) => {
+                        this.state.post_like_pending_toggle.remove(&post_id);
+                        if let Some(snap) = this.state.post_like_last_synced.remove(&post_id) {
+                            this.state.rollback_like(&post_id, snap);
+                        }
+                        this.emit_action(
+                            CommunityWorkspaceAction::ShowToast {
+                                text: e.to_string(),
+                                is_error: true,
+                            },
+                            cx,
+                        );
+                    }
+                    Err(_) => {
+                        this.state.post_like_pending_toggle.remove(&post_id);
+                        if let Some(snap) = this.state.post_like_last_synced.remove(&post_id) {
                             this.state.rollback_like(&post_id, snap);
                         }
                     }
@@ -1646,6 +1697,13 @@ impl CommunityWorkspace {
         self.state.automod_reset_draft_pending.clear();
         self.state.automod_last_synced.clear();
         self.state.post_vote_gen.clear();
+        self.state.post_like_in_flight.clear();
+        self.state.post_like_pending_toggle.clear();
+        self.state.post_like_last_synced.clear();
+        self.state.comment_vote_gen.clear();
+        self.state.comment_like_in_flight.clear();
+        self.state.comment_like_pending_toggle.clear();
+        self.state.comment_like_last_synced.clear();
 
         self.state.community_gen = self.state.community_gen.wrapping_add(1);
         self.state.community_loading = false;
@@ -1658,6 +1716,14 @@ impl CommunityWorkspace {
         self.state.profile_gen = self.state.profile_gen.wrapping_add(1);
         self.state.profile_loading = false;
         self.state.edit_profile.submitting = false;
+        self.state.actor_mute_in_flight.clear();
+        self.state.actor_mute_dirty.clear();
+        self.state.actor_mute_pending_target.clear();
+        self.state.actor_mute_last_synced.clear();
+        self.state.actor_block_in_flight.clear();
+        self.state.actor_block_dirty.clear();
+        self.state.actor_block_pending_target.clear();
+        self.state.actor_block_last_synced.clear();
 
         // CRITICAL: Do NOT clear `detail_post = None` synchronously — same-tick reply/delete
         // calls right after `switch_active_actor` on PostDetail depend on `detail_post` staying
@@ -2242,7 +2308,28 @@ impl CommunityWorkspace {
                 }
                 this.state.profile_loading = false;
                 match res {
-                    Ok(Ok(prof)) => {
+                    Ok(Ok(mut prof)) => {
+                        let aid = prof.actor.actor_id.clone();
+                        if this.state.actor_mute_in_flight.contains_key(&aid)
+                            || this.state.actor_mute_dirty.contains(&aid)
+                        {
+                            if let Some(&want_muted) = this.state.actor_mute_pending_target.get(&aid)
+                            {
+                                prof.actor.is_muted = want_muted;
+                            }
+                        }
+                        if this.state.actor_block_in_flight.contains_key(&aid)
+                            || this.state.actor_block_dirty.contains(&aid)
+                        {
+                            if let Some(&want_blocked) =
+                                this.state.actor_block_pending_target.get(&aid)
+                            {
+                                prof.actor.is_blocked = want_blocked;
+                                if want_blocked {
+                                    prof.actor.is_following = false;
+                                }
+                            }
+                        }
                         this.state.actor_profile = Some(prof);
                         this.state.profile_error = None;
                     }

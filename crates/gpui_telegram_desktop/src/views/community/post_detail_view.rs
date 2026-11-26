@@ -204,6 +204,16 @@ impl CommunityWorkspace {
     pub fn vote_comment_action(&mut self, comment_id: String, clicked_dir: i8, cx: &mut Context<Self>) {
         let (next_dir, snap) = self.state.apply_optimistic_comment_vote(&comment_id, clicked_dir);
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        let my_vote_gen = {
+            let entry = self
+                .state
+                .comment_vote_gen
+                .entry(comment_id.clone())
+                .or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let cid = comment_id.clone();
@@ -214,7 +224,10 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                    || this.state.comment_vote_gen.get(&comment_id).copied() != Some(my_vote_gen)
+                {
                     return;
                 }
                 match res {
@@ -230,6 +243,7 @@ impl CommunityWorkspace {
                             CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
                             cx,
                         );
+                        cx.notify();
                     }
                     Err(_) => {
                         if let Some(s) = snap {
@@ -244,30 +258,88 @@ impl CommunityWorkspace {
     }
 
     pub fn toggle_comment_like_action(&mut self, comment_id: String, cx: &mut Context<Self>) {
+        if !self.state.comment_like_last_synced.contains_key(&comment_id) {
+            if let Some(c) = self.state.find_comment(&comment_id) {
+                self.state
+                    .comment_like_last_synced
+                    .insert(comment_id.clone(), (c.viewer_liked, c.likes_count));
+            }
+        }
+        let _ = self.state.apply_optimistic_comment_like(&comment_id);
+        cx.notify();
+        if self.state.comment_like_in_flight.contains_key(&comment_id) {
+            if !self.state.comment_like_pending_toggle.remove(&comment_id) {
+                self.state.comment_like_pending_toggle.insert(comment_id);
+            }
+            return;
+        }
+        self.flush_comment_like_sync(comment_id, cx);
+    }
+
+    fn flush_comment_like_sync(&mut self, comment_id: String, cx: &mut Context<Self>) {
+        self.state.comment_like_flight_seq = self.state.comment_like_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.comment_like_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .comment_like_in_flight
+            .insert(comment_id.clone(), my_flight_seq);
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
+        let cid = comment_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                facade.toggle_comment_like(&comment_id).await
+                facade.toggle_comment_like(&cid).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
+                if this.state.comment_like_in_flight.get(&comment_id).copied()
+                    != Some(my_flight_seq)
+                {
+                    return;
+                }
+                this.state.comment_like_in_flight.remove(&comment_id);
                 match res {
                     Ok(Ok(resp)) => {
+                        this.state
+                            .comment_like_last_synced
+                            .insert(comment_id.clone(), (resp.active, resp.count));
+                        if this.state.comment_like_pending_toggle.remove(&comment_id) {
+                            this.flush_comment_like_sync(comment_id, cx);
+                            return;
+                        }
                         this.state.reconcile_comment_like(&resp);
+                        this.state.comment_like_last_synced.remove(&comment_id);
                         cx.notify();
                     }
                     Ok(Err(e)) => {
+                        this.state.comment_like_pending_toggle.remove(&comment_id);
+                        if let Some(snap) = this.state.comment_like_last_synced.remove(&comment_id)
+                        {
+                            this.state.rollback_comment_like(&comment_id, snap);
+                        }
                         this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
+                            CommunityWorkspaceAction::ShowToast {
+                                text: e.to_string(),
+                                is_error: true,
+                            },
                             cx,
                         );
+                        cx.notify();
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        this.state.comment_like_pending_toggle.remove(&comment_id);
+                        if let Some(snap) = this.state.comment_like_last_synced.remove(&comment_id)
+                        {
+                            this.state.rollback_comment_like(&comment_id, snap);
+                        }
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -320,9 +392,10 @@ impl CommunityWorkspace {
         let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
+        let cid = comment_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                facade.delete_comment(&comment_id).await
+                facade.delete_comment(&cid).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
@@ -331,6 +404,10 @@ impl CommunityWorkspace {
                 }
                 match res {
                     Ok(Ok(_)) => {
+                        this.state.comment_vote_gen.remove(&comment_id);
+                        this.state.comment_like_in_flight.remove(&comment_id);
+                        this.state.comment_like_pending_toggle.remove(&comment_id);
+                        this.state.comment_like_last_synced.remove(&comment_id);
                         if let Some(pid) = reload_pid {
                             if this.state.route == CommunityRoute::PostDetail(pid.clone()) {
                                 this.load_post_detail(pid, cx);
