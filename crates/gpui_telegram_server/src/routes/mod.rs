@@ -19,6 +19,12 @@ pub mod mcp_oauth;
 pub mod media;
 pub mod messages;
 pub mod official_mcp;
+pub mod orca_bots;
+pub mod orca_bots_groups;
+pub mod orca_bots_items;
+pub mod orca_error;
+pub mod orca_rpc;
+pub mod orca_share_wake;
 pub mod remote_assist;
 pub mod social;
 pub mod sync_polls;
@@ -27,6 +33,8 @@ pub mod telegram_bot_api;
 pub mod updates;
 pub mod user_vault;
 pub mod users;
+
+pub use orca_rpc::orca_router;
 
 use crate::db::schema::{ChatMemberRecord, ChatRecord, UserRecord};
 use crate::server::AppState;

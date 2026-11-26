@@ -270,6 +270,13 @@ pub struct AppState {
     pub community_search_indexer: Arc<gpui_telegram_community::CommunitySearchIndexer>,
     pub community_bot_guard: Arc<gpui_telegram_community::BotLoopGuard>,
     pub community_ticker_started: Arc<std::sync::atomic::AtomicBool>,
+    pub orca_bots: Arc<orca_bots::OrcaBotsFacade>,
+    pub orca_ide: Arc<orca_ide::OrcaIdeFacade>,
+    pub orca_wake_hub: Arc<crate::routes::orca_share_wake::OrcaWakeHub>,
+    pub orca_handover_lineage: Arc<orca_bots::InMemoryWorkspaceLineage>,
+    pub orca_webhook_calls: Arc<RwLock<HashMap<String, Vec<orca_bots::WebhookCallRecord>>>>,
+    pub orca_telegram_links: Arc<RwLock<HashMap<String, i64>>>,
+    _orca_temp_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl Default for AppState {
@@ -812,6 +819,69 @@ impl AppState {
 
         let agent_capability_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&action_approval_secret));
 
+        let (orca_root, _orca_temp_dir) = if let Ok(dir) = std::env::var("ORCA_DATA_DIR")
+            && !dir.trim().is_empty()
+        {
+            (std::path::PathBuf::from(dir.trim()), None)
+        } else if !config.is_in_memory() {
+            let db_path = std::path::PathBuf::from(config.resolve_db_path());
+            let parent = db_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            (parent.join("orca"), None)
+        } else {
+            let td = tempfile::Builder::new()
+                .prefix("gpui_orca_inmem_")
+                .tempdir()
+                .expect("Failed to create ephemeral Orca tempdir");
+            let root = td.path().to_path_buf();
+            (root, Some(Arc::new(td)))
+        };
+
+        let orca_host_id = std::env::var("ORCA_HOST_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| orca_core::LOCAL_EXECUTION_HOST_ID.to_string());
+        let allow_loopback_oauth = std::env::var("GPUI_OFFLINE_TEST").ok().as_deref() == Some("1")
+            || std::env::var("ORCA_ALLOW_LOOPBACK_OAUTH").ok().as_deref() == Some("1");
+        let oauth_policy = if allow_loopback_oauth {
+            orca_bots::OAuthSecurityPolicy::allow_loopback_for_tests()
+        } else {
+            orca_bots::OAuthSecurityPolicy::strict()
+        };
+
+        let mut bots_cfg = orca_bots::OrcaBotsConfig::new(
+            orca_root.join("bots_data"),
+            orca_root.join("bots_home"),
+        );
+        bots_cfg.host_id = orca_host_id.clone();
+        bots_cfg.oauth_policy = oauth_policy;
+        bots_cfg.webhook_base_url = format!("http://{}:{}", config.host, config.port);
+        if config.is_in_memory() {
+            bots_cfg.import_roots = Some(orca_bots::BotImportDiscoveryRoots::default_for_home(
+                &orca_root.join("fake_home"),
+            ));
+        }
+        let orca_bots = Arc::new(
+            orca_bots::OrcaBotsFacade::open(bots_cfg).expect("Failed to initialize OrcaBotsFacade"),
+        );
+
+        let mut ide_cfg = orca_ide::OrcaIdeConfig::new(
+            orca_root.join("ide_data"),
+            orca_root.join("workspaces"),
+        );
+        ide_cfg.host_id = orca_host_id;
+        let orca_ide = Arc::new(
+            orca_ide::OrcaIdeFacade::open_with_bots(ide_cfg, orca_bots.clone())
+                .expect("Failed to initialize OrcaIdeFacade"),
+        );
+        let orca_wake_hub = Arc::new(crate::routes::orca_share_wake::OrcaWakeHub::new());
+        let orca_handover_lineage = Arc::new(orca_bots::InMemoryWorkspaceLineage::new());
+        let orca_webhook_calls = Arc::new(RwLock::new(HashMap::new()));
+        let orca_telegram_links = Arc::new(RwLock::new(HashMap::new()));
+
         let _shutdown_guard = Arc::new(AppShutdownGuard {
             gateway_hub: Arc::downgrade(&gateway_hub),
         });
@@ -861,6 +931,13 @@ impl AppState {
             community_search_indexer,
             community_bot_guard,
             community_ticker_started,
+            orca_bots,
+            orca_ide,
+            orca_wake_hub,
+            orca_handover_lineage,
+            orca_webhook_calls,
+            orca_telegram_links,
+            _orca_temp_dir,
         }
     }
 
@@ -1150,6 +1227,7 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
 
     Router::new()
         .merge(routes::community::router())
+        .merge(routes::orca_router())
         // --- Public Routes ---
         .route("/health", get(health_check))
         .route("/api/v1/status", get(server_status))
@@ -1868,7 +1946,7 @@ async fn server_status() -> Json<Value> {
             "statistics", "export", "wallet_stars", "acp_durable",
             "hermes_agent", "hermes_gateway", "openai_compat", "acp_json_rpc",
             "auto_update_relay", "official_mcp_oauth21", "remote_control",
-            "remote_assist", "community"
+            "remote_assist", "community", "orca"
         ]
     }))
 }
