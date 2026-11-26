@@ -42,6 +42,10 @@ use crate::views::nav_rail::NavDestination;
 use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
 };
+use crate::views::orca::{
+    OrcaBotsWorkspace, OrcaDesktopRuntime, OrcaIdeWorkspace, ScopedJumpPalette,
+    SecuritySurfaceModal,
+};
 use crate::views::{
     AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
     CommunityWorkspace, ComputerWorkbench, ContentHubSection, ContentHubWorkspace,
@@ -59,6 +63,8 @@ pub enum ActiveWorkspacePanel {
     McpTools,
     Browser,
     Community,
+    OrcaBots,
+    OrcaIde,
     Settings,
     ContentHub(ContentHubSection),
 }
@@ -120,6 +126,11 @@ pub struct AppShell {
     pub tasks_workspace: Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<Entity<BrowserWorkspace>>,
     pub community_workspace: Option<Entity<CommunityWorkspace>>,
+    pub orca_runtime: Option<Arc<OrcaDesktopRuntime>>,
+    pub orca_bots_workspace: Option<Entity<OrcaBotsWorkspace>>,
+    pub orca_ide_workspace: Option<Entity<OrcaIdeWorkspace>>,
+    pub orca_jump_palette: Option<Entity<ScopedJumpPalette>>,
+    pub orca_security_modal: Option<Entity<SecuritySurfaceModal>>,
     pub community_ime_preedit_input_gen: Option<u64>,
     pub community_pending_share: Option<(String, String)>,
     pub auth_wizard: Entity<AuthWizardView>,
@@ -247,6 +258,11 @@ impl AppShell {
             tasks_workspace,
             browser_workspace: None,
             community_workspace: None,
+            orca_runtime: None,
+            orca_bots_workspace: None,
+            orca_ide_workspace: None,
+            orca_jump_palette: None,
+            orca_security_modal: None,
             community_ime_preedit_input_gen: None,
             community_pending_share: None,
             auth_wizard,
@@ -994,11 +1010,19 @@ impl AppShell {
                 });
             }
             self.community_workspace = None;
+            self.orca_runtime = None;
+            self.orca_bots_workspace = None;
+            self.orca_ide_workspace = None;
+            self.orca_jump_palette = None;
+            self.orca_security_modal = None;
             self.community_pending_share = None;
             self.community_ime_preedit_input_gen = None;
             if matches!(
                 self.active_panel,
-                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                ActiveWorkspacePanel::Browser
+                    | ActiveWorkspacePanel::Community
+                    | ActiveWorkspacePanel::OrcaBots
+                    | ActiveWorkspacePanel::OrcaIde
             ) {
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
@@ -1112,6 +1136,11 @@ impl AppShell {
             });
         }
         self.community_workspace = None;
+        self.orca_runtime = None;
+        self.orca_bots_workspace = None;
+        self.orca_ide_workspace = None;
+        self.orca_jump_palette = None;
+        self.orca_security_modal = None;
         self.community_pending_share = None;
         self.community_ime_preedit_input_gen = None;
         self.bot_browser.reset_on_logout();
@@ -1214,6 +1243,8 @@ impl AppShell {
             ActiveWorkspacePanel::McpTools => NavDestination::McpTools,
             ActiveWorkspacePanel::Browser => NavDestination::Browser,
             ActiveWorkspacePanel::Community => NavDestination::Community,
+            ActiveWorkspacePanel::OrcaBots => NavDestination::OrcaBots,
+            ActiveWorkspacePanel::OrcaIde => NavDestination::OrcaIde,
             ActiveWorkspacePanel::Settings => {
                 let sr = self.settings_router.read(cx);
                 if sr.standalone_computers_mode
@@ -1592,6 +1623,8 @@ impl AppShell {
                 self.active_panel,
                 ActiveWorkspacePanel::Browser
                     | ActiveWorkspacePanel::Community
+                    | ActiveWorkspacePanel::OrcaBots
+                    | ActiveWorkspacePanel::OrcaIde
                     | ActiveWorkspacePanel::ContentHub(_)
             )
             || self.is_publish_review_modal_active(cx)
@@ -2748,10 +2781,27 @@ impl Render for AppShell {
                                 row
                             }
                         })
+                        .when(self.active_panel == ActiveWorkspacePanel::OrcaBots, |row| {
+                            if let Some(ref ob) = self.orca_bots_workspace {
+                                row.child(ob.clone())
+                            } else {
+                                row
+                            }
+                        })
+                        .when(self.active_panel == ActiveWorkspacePanel::OrcaIde, |row| {
+                            if let Some(ref oi) = self.orca_ide_workspace {
+                                row.child(oi.clone())
+                            } else {
+                                row
+                            }
+                        })
                         .when(
                             !matches!(
                                 self.active_panel,
-                                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                                ActiveWorkspacePanel::Browser
+                                    | ActiveWorkspacePanel::Community
+                                    | ActiveWorkspacePanel::OrcaBots
+                                    | ActiveWorkspacePanel::OrcaIde
                             ),
                             |row| {
                             row.child(
@@ -2849,6 +2899,8 @@ impl Render for AppShell {
                 el.child(self.render_publish_review_modal_overlay(cx))
             })
             .when_some(self.overlays.computer_overlay.clone(), |el, ov| el.child(self.render_remote_computer_overlay(ov)))
+            .when_some(self.orca_jump_palette.clone(), |el, ov| el.child(ov))
+            .when_some(self.orca_security_modal.clone(), |el, ov| el.child(ov))
             .when(self.overlays.is_passcode_locked, |el| el.child(self.render_passcode_lock_overlay(cx)))
             .when_some(
                 self.computers.pending_approvals.first().cloned(),

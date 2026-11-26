@@ -5229,6 +5229,10 @@ impl AppShell {
                 }
             })
             .detach();
+            cx.subscribe(&created, |shell, _, ev, cx| {
+                shell.handle_browser_workspace_event(ev, cx);
+            })
+            .detach();
             self.browser_workspace = Some(created.clone());
             created
         };

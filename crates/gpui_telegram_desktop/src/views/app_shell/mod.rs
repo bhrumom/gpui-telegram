@@ -45,6 +45,7 @@ pub mod shell_miniapp_catalog;
 pub mod shell_miniapps_bots;
 pub mod shell_modals;
 pub mod shell_observers;
+pub mod shell_orca;
 pub mod shell_overlays_render;
 pub mod shell_panels;
 pub mod shell_panels_sync;

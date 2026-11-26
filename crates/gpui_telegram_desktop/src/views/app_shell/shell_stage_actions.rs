@@ -335,6 +335,9 @@ impl AppShell {
             tasks_workspace: &self.tasks_workspace,
             browser_workspace: self.browser_workspace.as_ref(),
             community_workspace: self.community_workspace.as_ref(),
+            orca_bots_workspace: self.orca_bots_workspace.as_ref(),
+            orca_ide_workspace: self.orca_ide_workspace.as_ref(),
+            orca_jump_palette: self.orca_jump_palette.as_ref(),
             talk_mode_overlay: self.rtc_talk.talk_mode_overlay.as_ref(),
             computer_overlay: self.overlays.computer_overlay.as_ref(),
             media_viewer_overlay: self.overlays.media_viewer_overlay.as_ref(),
@@ -345,6 +348,10 @@ impl AppShell {
             create_bot_box: self.miniapps.create_bot_box.as_ref(),
         };
         propagate_theme_and_locale(targets, &pal, lang, cx);
+        // Anti-spoofing invariant: propagate ONLY locale into top-Z SecuritySurfaceModal, NEVER theme palette!
+        if let Some(ref sec_modal) = self.orca_security_modal {
+            sec_modal.update(cx, |m, mcx| m.set_locale(lang, mcx));
+        }
         if self.theme_state.palette.is_apple_style()
             && self.active_panel != ActiveWorkspacePanel::Chats
             && self.sidebar.read(cx).is_plus_menu_open

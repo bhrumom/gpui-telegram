@@ -54,6 +54,8 @@ impl AppShell {
                 | NavDestination::Calls
                 | NavDestination::Browser
                 | NavDestination::Community
+                | NavDestination::OrcaBots
+                | NavDestination::OrcaIde
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
         ) {
@@ -184,6 +186,12 @@ impl AppShell {
             NavDestination::Community => {
                 self.open_community_workspace(cx);
             }
+            NavDestination::OrcaBots => {
+                let _ = self.open_orca_bots_workspace(cx);
+            }
+            NavDestination::OrcaIde => {
+                let _ = self.open_orca_ide_workspace(cx);
+            }
             NavDestination::TaskCenter => {
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.tasks_workspace
@@ -214,6 +222,8 @@ impl AppShell {
                 | NavDestination::RemoteComputer
                 | NavDestination::Browser
                 | NavDestination::Community
+                | NavDestination::OrcaBots
+                | NavDestination::OrcaIde
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
@@ -258,6 +268,39 @@ impl AppShell {
                 }
                 _ => return true,
             }
+        }
+        if self.is_authenticated && self.has_active_orca_security_modal(cx) {
+            return true;
+        }
+        if self.is_authenticated && self.orca_jump_palette.is_some() {
+            self.record_user_activity();
+            if !is_shift {
+                match key_lower.as_str() {
+                    "1" | "2" | "3" | "4" | "5" | "6" => {
+                        let digit = key_lower.as_bytes()[0] - b'0';
+                        let _ = self.handle_jump_palette_shortcut_digit(digit, cx);
+                        return true;
+                    }
+                    "j" => {
+                        self.close_scoped_jump_palette(cx);
+                        return true;
+                    }
+                    "v" => {
+                        if let Some(clip_text) =
+                            cx.read_from_clipboard().and_then(|item| item.text())
+                        {
+                            self.insert_committed_text(&clip_text, cx);
+                        }
+                        return true;
+                    }
+                    "backspace" | "a" | "u" => {
+                        self.clear_active_field(cx);
+                        return true;
+                    }
+                    _ => return true,
+                }
+            }
+            return true;
         }
         if self.is_authenticated {
             self.record_user_activity();
@@ -420,6 +463,12 @@ impl AppShell {
                 self.navigate_settings_back(cx);
                 true
             }
+            "i" if is_shift && self.active_panel == ActiveWorkspacePanel::Browser => {
+                if let Some(ref bw) = self.browser_workspace {
+                    bw.update(cx, |w, wcx| w.toggle_design_mode(wcx));
+                }
+                true
+            }
             "i" => {
                 if self.active_panel == ActiveWorkspacePanel::Chats {
                     let next_open = !self.inspector.read(cx).is_open;
@@ -449,6 +498,8 @@ impl AppShell {
                     ActiveWorkspacePanel::Chats
                         | ActiveWorkspacePanel::Browser
                         | ActiveWorkspacePanel::Community
+                        | ActiveWorkspacePanel::OrcaBots
+                        | ActiveWorkspacePanel::OrcaIde
                 ) {
                     self.sidebar.update(cx, |sb, sb_cx| {
                         sb.toggle_collapsed_from_user();
@@ -467,15 +518,26 @@ impl AppShell {
                 cx.notify();
                 true
             }
+            "j" if is_shift => {
+                self.flip_chat_terminal_session(cx);
+                true
+            }
             "j" => {
-                self.refresh_contacts(cx);
-                self.open_modal_dialog(
-                    tr_str(lang, "联系人", "Contacts"),
-                    ModalDialogKind::Contacts,
-                    420.0,
-                    500.0,
-                    cx,
-                );
+                if matches!(
+                    self.active_panel,
+                    ActiveWorkspacePanel::Community | ActiveWorkspacePanel::ContentHub(_)
+                ) {
+                    self.refresh_contacts(cx);
+                    self.open_modal_dialog(
+                        tr_str(lang, "联系人", "Contacts"),
+                        ModalDialogKind::Contacts,
+                        420.0,
+                        500.0,
+                        cx,
+                    );
+                } else {
+                    self.toggle_scoped_jump_palette(cx);
+                }
                 true
             }
             "n" => {

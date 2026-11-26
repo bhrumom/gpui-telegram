@@ -36,6 +36,8 @@ fn active_panel_label(panel: ActiveWorkspacePanel) -> String {
         ActiveWorkspacePanel::McpTools => "McpTools".to_string(),
         ActiveWorkspacePanel::Browser => "Browser".to_string(),
         ActiveWorkspacePanel::Community => "Community".to_string(),
+        ActiveWorkspacePanel::OrcaBots => "OrcaBots".to_string(),
+        ActiveWorkspacePanel::OrcaIde => "OrcaIde".to_string(),
         ActiveWorkspacePanel::Settings => "Settings".to_string(),
         ActiveWorkspacePanel::ContentHub(section) => format!("ContentHub({section:?})"),
     }
@@ -52,6 +54,8 @@ fn nav_dest_label(dest: NavDestination) -> String {
         NavDestination::RemoteComputer => "RemoteComputer".to_string(),
         NavDestination::Browser => "Browser".to_string(),
         NavDestination::Community => "Community".to_string(),
+        NavDestination::OrcaBots => "OrcaBots".to_string(),
+        NavDestination::OrcaIde => "OrcaIde".to_string(),
         NavDestination::SavedMessages => "SavedMessages".to_string(),
         NavDestination::Settings => "Settings".to_string(),
     }

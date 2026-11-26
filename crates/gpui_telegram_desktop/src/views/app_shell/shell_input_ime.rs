@@ -3,8 +3,8 @@
 use std::ops::Range;
 
 use gpui::{
-    point, px, size, App, Bounds, Context, Entity, EntityInputHandler, Pixels, Point,
-    UTF16Selection, Window,
+    point, px, size, App, Bounds, Context, Entity, EntityInputHandler, KeyDownEvent, Keystroke,
+    Modifiers, Pixels, Point, UTF16Selection, Window,
 };
 
 use crate::components::ui::{
@@ -27,6 +27,8 @@ fn backspace_string(target: &mut String, is_alt: bool) -> bool {
 pub(crate) enum ShellInputTarget {
     AuthWizard,
     PasscodeLock,
+    OrcaSecurityModal,
+    OrcaJumpPalette,
     ComputerTerminal(Entity<crate::views::ComputerWorkbench>),
     PublishReviewModal,
     ModalContainer,
@@ -42,6 +44,8 @@ pub(crate) enum ShellInputTarget {
     ContentHubInput,
     BrowserInput,
     CommunityInput,
+    OrcaBotsInput,
+    OrcaIdeInput,
     SidebarSearch,
     StageSearch,
     Composer,
@@ -95,6 +99,14 @@ impl AppShell {
         // Z #16: PasscodeLock
         if self.overlays.is_passcode_locked {
             return ShellInputTarget::PasscodeLock;
+        }
+        // Z #15.8: Top-Z Non-Themable Orca SecuritySurfaceModal
+        if self.orca_security_modal.is_some() {
+            return ShellInputTarget::OrcaSecurityModal;
+        }
+        // Z #15.5: Top-Level Orca ScopedJumpPalette (`Cmd+J`)
+        if self.orca_jump_palette.is_some() {
+            return ShellInputTarget::OrcaJumpPalette;
         }
         // Z #15: ComputerWorkbench (terminal/PTY or non-terminal absorber)
         if self.overlays.computer_overlay.is_some() {
@@ -232,6 +244,52 @@ impl AppShell {
                 ShellInputTarget::Absorbed
             };
         }
+        // Z #1: Base Workspace — OrcaBotsWorkspace
+        if self.active_panel == ActiveWorkspacePanel::OrcaBots {
+            if self
+                .orca_bots_workspace
+                .as_ref()
+                .is_some_and(|w| w.read(cx).has_active_security_modal())
+            {
+                return ShellInputTarget::OrcaSecurityModal;
+            }
+            if sb.search_focused {
+                return ShellInputTarget::SidebarSearch;
+            }
+            let bots_focused = !self.main_menu_drawer.read(cx).is_open
+                && self
+                    .orca_bots_workspace
+                    .as_ref()
+                    .is_some_and(|w| w.read(cx).has_active_text_input());
+            return if bots_focused {
+                ShellInputTarget::OrcaBotsInput
+            } else {
+                ShellInputTarget::Absorbed
+            };
+        }
+        // Z #1: Base Workspace — OrcaIdeWorkspace
+        if self.active_panel == ActiveWorkspacePanel::OrcaIde {
+            if self
+                .orca_ide_workspace
+                .as_ref()
+                .is_some_and(|w| w.read(cx).has_active_security_modal())
+            {
+                return ShellInputTarget::OrcaSecurityModal;
+            }
+            if sb.search_focused {
+                return ShellInputTarget::SidebarSearch;
+            }
+            let ide_focused = !self.main_menu_drawer.read(cx).is_open
+                && self
+                    .orca_ide_workspace
+                    .as_ref()
+                    .is_some_and(|w| w.read(cx).has_active_text_input());
+            return if ide_focused {
+                ShellInputTarget::OrcaIdeInput
+            } else {
+                ShellInputTarget::Absorbed
+            };
+        }
         // Z #1: Base Workspace — Chats inline inputs
         if self.raw_apple_compose_input_active(cx) {
             return ShellInputTarget::AppleCompose;
@@ -263,6 +321,7 @@ impl AppShell {
     pub(crate) fn has_blocking_modal_or_fullscreen_overlay_for_shortcuts(&self, cx: &App) -> bool {
         let sb = self.sidebar.read(cx);
         self.overlays.is_passcode_locked
+            || self.has_active_orca_security_modal(cx)
             || self.has_blocking_fullscreen_overlay(cx)
             || self.is_publish_review_modal_active(cx)
             || self.modal_container.read(cx).is_modal_active()
@@ -306,6 +365,8 @@ impl AppShell {
             || self.modal_container.read(cx).is_modal_active()
             || self.is_publish_review_modal_active(cx)
             || self.overlays.is_passcode_locked
+            || self.orca_security_modal.is_some()
+            || self.orca_jump_palette.is_some()
             || self.rtc_talk.talk_mode_overlay.is_some()
             || self.overlays.media_viewer_overlay.is_some()
             || self.overlays.iv_viewer_overlay.is_some()
@@ -551,7 +612,7 @@ impl AppShell {
 
     fn target_accepts_ime_text(&self, target: &ShellInputTarget, cx: &App) -> bool {
         match target {
-            ShellInputTarget::Absorbed => false,
+            ShellInputTarget::Absorbed | ShellInputTarget::OrcaSecurityModal => false,
             ShellInputTarget::PublishReviewModal => self.is_publish_review_modal_input_active(cx),
             ShellInputTarget::ModalContainer => self.modal_container.read(cx).dialog.has_text_input(),
             _ => true,
@@ -574,6 +635,15 @@ impl AppShell {
         match self.resolve_input_target(cx) {
             ShellInputTarget::AuthWizard => self.auth_wizard.read(cx).active_text_and_preedit(),
             ShellInputTarget::PasscodeLock => (self.overlays.passcode_unlock_input.clone(), pre()),
+            ShellInputTarget::OrcaSecurityModal => (String::new(), None),
+            ShellInputTarget::OrcaJumpPalette => {
+                let q = self
+                    .orca_jump_palette
+                    .as_ref()
+                    .map(|jp| jp.read(cx).state().query.clone())
+                    .unwrap_or_default();
+                (q, pre())
+            }
             ShellInputTarget::ComputerTerminal(ov) => {
                 let (committed, term_pre) = ov.read(cx).terminal_text_and_preedit(cx);
                 (committed, term_pre.or_else(pre))
@@ -655,6 +725,9 @@ impl AppShell {
                     .unwrap_or_else(|| (String::new(), None));
                 (txt, cw_pre.or_else(pre))
             }
+            ShellInputTarget::OrcaBotsInput | ShellInputTarget::OrcaIdeInput => {
+                (String::new(), pre())
+            }
             ShellInputTarget::SidebarSearch => {
                 (self.sidebar.read(cx).search_query.clone(), pre())
             }
@@ -689,6 +762,16 @@ impl AppShell {
             ShellInputTarget::PasscodeLock => {
                 self.overlays.passcode_unlock_input.clear();
                 self.overlays.passcode_unlock_error = None;
+            }
+            ShellInputTarget::OrcaSecurityModal => return,
+            ShellInputTarget::OrcaJumpPalette => {
+                if let Some(jp) = self.orca_jump_palette.clone() {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    jp.update(cx, |p, pcx| {
+                        p.state_mut().set_query(String::new(), now_ms);
+                        pcx.notify();
+                    });
+                }
             }
             ShellInputTarget::ComputerTerminal(ov) => {
                 ov.update(cx, |w, wcx| w.clear_terminal_input(wcx));
@@ -773,6 +856,7 @@ impl AppShell {
                     });
                 }
             }
+            ShellInputTarget::OrcaBotsInput | ShellInputTarget::OrcaIdeInput => {}
             ShellInputTarget::SidebarSearch => {
                 self.sidebar.update(cx, |sb, scx| {
                     sb.set_search_query("");
@@ -805,7 +889,10 @@ impl AppShell {
         let clean_multiline = sanitize_paste_text(raw_text, true);
         let raw_passthrough = matches!(
             target,
-            ShellInputTarget::BrowserInput | ShellInputTarget::CommunityInput
+            ShellInputTarget::BrowserInput
+                | ShellInputTarget::CommunityInput
+                | ShellInputTarget::OrcaBotsInput
+                | ShellInputTarget::OrcaIdeInput
         ) && !raw_text.is_empty();
         if clean.is_empty() && clean_multiline.is_empty() && !raw_passthrough {
             if target == ShellInputTarget::Composer
@@ -836,6 +923,16 @@ impl AppShell {
                 if !clean.is_empty() {
                     self.overlays.passcode_unlock_input.push_str(&clean);
                     self.overlays.passcode_unlock_error = None;
+                }
+            }
+            ShellInputTarget::OrcaSecurityModal => {}
+            ShellInputTarget::OrcaJumpPalette => {
+                if !clean.is_empty()
+                    && let Some(jp) = self.orca_jump_palette.clone()
+                {
+                    jp.update(cx, |p, pcx| {
+                        let _ = p.insert_committed_text(&clean, pcx);
+                    });
                 }
             }
             ShellInputTarget::ComputerTerminal(ov) => {
@@ -990,6 +1087,20 @@ impl AppShell {
                     });
                 }
             }
+            ShellInputTarget::OrcaBotsInput => {
+                if let Some(ob) = self.orca_bots_workspace.clone() {
+                    ob.update(cx, |w, wcx| {
+                        let _ = w.insert_committed_text(raw_text, wcx);
+                    });
+                }
+            }
+            ShellInputTarget::OrcaIdeInput => {
+                if let Some(oi) = self.orca_ide_workspace.clone() {
+                    oi.update(cx, |w, wcx| {
+                        let _ = w.insert_committed_text(raw_text, wcx);
+                    });
+                }
+            }
             ShellInputTarget::SidebarSearch => {
                 if !clean.is_empty() {
                     self.sidebar.update(cx, |sb, scx| {
@@ -1040,6 +1151,15 @@ impl AppShell {
                 || (target.is_non_composer_ime_owner() && self.has_active_ime_preedit(cx)))
         {
             self.clear_all_ime_preedits(cx);
+            return true;
+        }
+        // Step 0.5 — Z #15.8 / #15.5: Top-Z Orca SecuritySurfaceModal & ScopedJumpPalette
+        if self.orca_security_modal.is_some() {
+            self.close_orca_security_modal(cx);
+            return true;
+        }
+        if self.orca_jump_palette.is_some() {
+            self.close_scoped_jump_palette(cx);
             return true;
         }
         // Step 1 — Z #15: ComputerWorkbench
@@ -1348,7 +1468,11 @@ impl AppShell {
                 });
                 return true;
             }
-            if self.is_browser_workspace_input_active(cx) {
+            let design_picker_active = self.browser_workspace.as_ref().is_some_and(|bw| {
+                let r = bw.read(cx);
+                r.design_mode.enabled && r.design_mode.picker_active
+            });
+            if self.is_browser_workspace_input_active(cx) || design_picker_active {
                 if let Some(bw) = self.browser_workspace.clone() {
                     let handled =
                         bw.update(cx, |w, wcx| w.handle_non_char_key_input("escape", false, wcx));
@@ -1398,6 +1522,64 @@ impl AppShell {
                 r.trigger_counter
             });
             self.last_handled_nav_trigger = nav_trigger;
+            self.sync_apple_sidebar_to_active_panel(cx);
+            self.reconcile_chat_scoped_toasts(cx);
+            return true;
+        }
+        if self.active_panel == ActiveWorkspacePanel::OrcaBots {
+            if self.sidebar.read(cx).search_focused {
+                self.clear_all_ime_preedits(cx);
+                self.sidebar.update(cx, |sb, scx| {
+                    sb.exit_search();
+                    scx.notify();
+                });
+                return true;
+            }
+            if let Some(ob) = self.orca_bots_workspace.clone() {
+                let esc_ev = KeyDownEvent {
+                    keystroke: Keystroke {
+                        modifiers: Modifiers::default(),
+                        key: "escape".to_string(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                };
+                if ob.update(cx, |w, wcx| w.handle_key_down(&esc_ev, wcx)) {
+                    return true;
+                }
+            }
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
+            self.sync_apple_sidebar_to_active_panel(cx);
+            self.reconcile_chat_scoped_toasts(cx);
+            return true;
+        }
+        if self.active_panel == ActiveWorkspacePanel::OrcaIde {
+            if self.sidebar.read(cx).search_focused {
+                self.clear_all_ime_preedits(cx);
+                self.sidebar.update(cx, |sb, scx| {
+                    sb.exit_search();
+                    scx.notify();
+                });
+                return true;
+            }
+            if let Some(oi) = self.orca_ide_workspace.clone() {
+                let esc_ev = KeyDownEvent {
+                    keystroke: Keystroke {
+                        modifiers: Modifiers::default(),
+                        key: "escape".to_string(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                };
+                if oi.update(cx, |w, wcx| w.handle_key_down(&esc_ev, wcx)) {
+                    return true;
+                }
+            }
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
             self.sync_apple_sidebar_to_active_panel(cx);
             self.reconcile_chat_scoped_toasts(cx);
             return true;
@@ -1564,6 +1746,44 @@ impl AppShell {
                         }
                     }
                     _ => {}
+                }
+                true
+            }
+            ShellInputTarget::OrcaSecurityModal => true,
+            ShellInputTarget::OrcaJumpPalette => {
+                if key == "backspace" && self.ime.ime_preedit.take().is_some() {
+                    cx.notify();
+                    return true;
+                }
+                if key == "enter"
+                    && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed())
+                {
+                    cx.notify();
+                    return true;
+                }
+                if let Some(jp) = self.orca_jump_palette.clone() {
+                    if key == "tab" {
+                        self.clear_all_ime_preedits(cx);
+                        let handled = jp.update(cx, |p, pcx| p.handle_tab_chip(pcx));
+                        cx.notify();
+                        return handled;
+                    }
+                    let ev = KeyDownEvent {
+                        keystroke: Keystroke {
+                            modifiers: Modifiers {
+                                shift: is_shift,
+                                alt: is_alt,
+                                ..Default::default()
+                            },
+                            key: key.to_string(),
+                            key_char: None,
+                        },
+                        is_held: false,
+                    };
+                    let handled = jp.update(cx, |p, pcx| p.handle_key_down(&ev, pcx));
+                    self.drain_jump_palette_selection(cx);
+                    cx.notify();
+                    return handled;
                 }
                 true
             }
@@ -2130,6 +2350,76 @@ impl AppShell {
                 }
                 key == "tab"
             }
+            ShellInputTarget::OrcaBotsInput => {
+                if key == "backspace" && self.ime.ime_preedit.take().is_some() {
+                    cx.notify();
+                    return true;
+                }
+                if key == "enter"
+                    && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed())
+                {
+                    cx.notify();
+                    return true;
+                }
+                if let Some(ob) = self.orca_bots_workspace.clone() {
+                    if key == "space" {
+                        let handled = ob.update(cx, |w, wcx| w.insert_committed_text(" ", wcx));
+                        cx.notify();
+                        return handled;
+                    }
+                    let ev = KeyDownEvent {
+                        keystroke: Keystroke {
+                            modifiers: Modifiers {
+                                shift: is_shift,
+                                alt: is_alt,
+                                ..Default::default()
+                            },
+                            key: key.to_string(),
+                            key_char: None,
+                        },
+                        is_held: false,
+                    };
+                    let handled = ob.update(cx, |w, wcx| w.handle_key_down(&ev, wcx));
+                    cx.notify();
+                    return handled;
+                }
+                false
+            }
+            ShellInputTarget::OrcaIdeInput => {
+                if key == "backspace" && self.ime.ime_preedit.take().is_some() {
+                    cx.notify();
+                    return true;
+                }
+                if key == "enter"
+                    && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed())
+                {
+                    cx.notify();
+                    return true;
+                }
+                if let Some(oi) = self.orca_ide_workspace.clone() {
+                    if key == "space" {
+                        let handled = oi.update(cx, |w, wcx| w.insert_committed_text(" ", wcx));
+                        cx.notify();
+                        return handled;
+                    }
+                    let ev = KeyDownEvent {
+                        keystroke: Keystroke {
+                            modifiers: Modifiers {
+                                shift: is_shift,
+                                alt: is_alt,
+                                ..Default::default()
+                            },
+                            key: key.to_string(),
+                            key_char: None,
+                        },
+                        is_held: false,
+                    };
+                    let handled = oi.update(cx, |w, wcx| w.handle_key_down(&ev, wcx));
+                    cx.notify();
+                    return handled;
+                }
+                false
+            }
             ShellInputTarget::SidebarSearch => match key {
                 "tab" => {
                     self.clear_all_ime_preedits(cx);
@@ -2390,7 +2680,7 @@ impl AppShell {
             }
         }
         match target {
-            ShellInputTarget::Absorbed => {
+            ShellInputTarget::Absorbed | ShellInputTarget::OrcaSecurityModal => {
                 self.clear_all_ime_preedits(cx);
             }
             ShellInputTarget::Composer => {
@@ -2496,6 +2786,9 @@ impl AppShell {
                 }
             }
             ShellInputTarget::PasscodeLock
+            | ShellInputTarget::OrcaJumpPalette
+            | ShellInputTarget::OrcaBotsInput
+            | ShellInputTarget::OrcaIdeInput
             | ShellInputTarget::StudioInput
             | ShellInputTarget::CreationModal
             | ShellInputTarget::ContactsModal
@@ -2576,6 +2869,8 @@ impl EntityInputHandler for AppShell {
         match target {
             ShellInputTarget::AuthWizard
             | ShellInputTarget::PasscodeLock
+            | ShellInputTarget::OrcaSecurityModal
+            | ShellInputTarget::OrcaJumpPalette
             | ShellInputTarget::ComputerTerminal(_)
             | ShellInputTarget::PublishReviewModal
             | ShellInputTarget::ModalContainer
@@ -2646,7 +2941,9 @@ impl EntityInputHandler for AppShell {
                     size(px(2.0), px(18.0)),
                 ))
             }
-            ShellInputTarget::CommunityInput => {
+            ShellInputTarget::CommunityInput
+            | ShellInputTarget::OrcaBotsInput
+            | ShellInputTarget::OrcaIdeInput => {
                 let apple_w = self.apple_sidebar.read(cx).effective_width();
                 let sb_w = self.sidebar.read(cx).effective_width();
                 let caret_x = element_bounds.origin.x

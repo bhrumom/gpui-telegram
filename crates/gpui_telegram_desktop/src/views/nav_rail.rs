@@ -28,6 +28,8 @@ pub enum NavDestination {
     RemoteComputer,
     Browser,
     Community,
+    OrcaBots,
+    OrcaIde,
     SavedMessages,
     Settings,
 }
@@ -44,6 +46,8 @@ impl NavDestination {
             Self::RemoteComputer => IconName::ComputerDesktop,
             Self::Browser => IconName::ScreenShare,
             Self::Community => IconName::CommunityGlobe,
+            Self::OrcaBots => IconName::FolderBots,
+            Self::OrcaIde => IconName::TerminalMcp,
             Self::SavedMessages => IconName::SavedMessages,
             Self::Settings => IconName::SettingsGear,
         }
@@ -60,6 +64,8 @@ impl NavDestination {
             Self::RemoteComputer => tr_str(lang_id, "远程电脑", "Remote Computer"),
             Self::Browser => tr_str(lang_id, "浏览器", "Browser"),
             Self::Community => tr_str(lang_id, "社区", "Community"),
+            Self::OrcaBots => tr_str(lang_id, "Orca 机器人", "Orca Bots"),
+            Self::OrcaIde => tr_str(lang_id, "Orca IDE", "Orca IDE"),
             Self::SavedMessages => tr_str(lang_id, "收藏夹", "Saved Messages"),
             Self::Settings => tr_str(lang_id, "设置", "Settings"),
         }
@@ -185,6 +191,18 @@ impl NavRail {
                 destination: NavDestination::Settings,
                 icon_label: "settings".to_string(),
                 tooltip: "Settings".to_string(),
+                unread_badge: 0,
+            },
+            NavItem {
+                destination: NavDestination::OrcaBots,
+                icon_label: "orca_bots".to_string(),
+                tooltip: "Orca Bots".to_string(),
+                unread_badge: 0,
+            },
+            NavItem {
+                destination: NavDestination::OrcaIde,
+                icon_label: "orca_ide".to_string(),
+                tooltip: "Orca IDE".to_string(),
                 unread_badge: 0,
             },
         ];
