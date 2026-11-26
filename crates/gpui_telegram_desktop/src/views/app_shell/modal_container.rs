@@ -161,7 +161,7 @@ pub(crate) fn macos_popover_surface(id: &'static str, pal: TdesktopThemePalette)
 
 /// Crisp Apple-style primary accent pill CTA button (`#007AFF` / `#0A84FF`).
 pub(crate) fn macos_primary_pill_btn(
-    id: &'static str,
+    id: impl Into<ElementId>,
     label: &'static str,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
@@ -184,7 +184,7 @@ pub(crate) fn macos_primary_pill_btn(
 
 /// Subtle Apple-style secondary pill button with hairline border.
 pub(crate) fn macos_secondary_pill_btn(
-    id: &'static str,
+    id: impl Into<ElementId>,
     label: &'static str,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {

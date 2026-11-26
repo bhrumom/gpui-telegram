@@ -65,14 +65,14 @@ Every Survey feature is assigned a Milestone (zero unassigned).
 
 | # | Name | Scope (Features) | Dependencies | Status |
 |---|------|------------------|--------------|--------|
-| E2E | E2E Testing Track | Requirement-driven opaque-box 4-tier E2E suite (`TEST_INFRA_APPLE_SIDEBAR.md`, HTTP/WS Tiers 1–4 + GPUI headless UI E2E after M6 -> `TEST_READY.md`) | none (UI binary after M6) | PHASE_A_DONE (`5/5 PASS`, 94 tests in `tests/e2e_suite/tests/apple_sidebar_*`; Phase B pending M6) |
-| M1 | Shared Contracts, Deep-Links & Audio Synth | F1, F2, F3 (`gpui_telegram_proto`, `gpui_telegram_core`, `gpui_telegram_media`) | none | DONE (`5/5 PASS`, 404/404 crate tests + 401/401 probes, `sub_orch_m1/handoff.md`) |
-| M2 | Server Cloud Creations, Review FSM & Public Catalog | F4, F5, F6 (`gpui_telegram_server` DB, search, REST/WS routes) | M1 | DONE (`5/5 PASS`, 12/12 M2 + 48/48 lib + 140+ live probes, `sub_orch_m2/handoff.md`) |
-| M3 | Bot Creation & Public Recommendation Engine | F7, F8 (`gpui_telegram_agent` tools + `gpui_telegram_server` bridge, `@CreatorStudioBot`, inline query) | M2 | DONE (`5/5 PASS`, 82 agent + 16 M3 + 12 M2 + 48 server + 4 hermes + 999 probes + 500 fuzz, `sub_orch_m3_gen3/handoff.md`) |
-| M4 | Client Cloud Sync, Local Mirror & Mini-Game Runtime | F9, F10 (`gpui_telegram_client` net/cache + `gpui_telegram_desktop` `game_runtime.rs`) | M2 (serialized after M3) | DONE (`5/5 PASS`, 37+8+12+8+52 tests + 328 F9 probes + 18,000 F10 fuzz ops, `sub_orch_m4_gen6/handoff.md`) |
-| M5 | Apple Sidebar, Cloud Creations Hub & Shell Integration | F11, F12, F13 (`gpui_telegram_desktop` icons, `AppleAppSidebar`, `ContentHubWorkspace`, `MyCreations`, `PublishReviewModal`, `AppShell` routing/IME/deep-links) | M3, M4 | IN_PROGRESS (`c96ab87fb98f90cb0ad7b45745ea9fcc`, `sub_orch_m5_gen9` — Iter 8 Batch 1 `3/3 CLEAN/APPROVE/APPROVE`; running Batch 2 -> 5/5 Gate) |
-| M6 | Four Apple Verticals (Books, Music, Games, App Store) | F14, F15, F16, F17 (`gpui_telegram_desktop` `books_view`, `book_reader`, `music_view`, `music_player_bar`, `games_view`, `game_runtime_sheet`, `app_store_view`) | M5 | PLANNED |
-| M7 | Final Milestone: 100% E2E Pass (Tiers 1–4) + Tier 5 Hardening | F18 (Phase 1: Tiers 1–4 sequential pass; Phase 2: Tier 5 white-box adversarial hardening + full regression/ledger gate) | M6, E2E | PLANNED |
+| E2E | E2E Testing Track | Requirement-driven opaque-box 4-tier E2E suite (`TEST_INFRA_APPLE_SIDEBAR.md`, HTTP/WS Tiers 1–4 + GPUI headless UI E2E -> `TEST_READY.md`) | none (UI binary after M6) | DONE (`110/110 PASS`: Phase A 94/94 live Tiers 1–4 + Phase B 16/16 headless GPUI UI E2E, certified in `TEST_READY.md`) |
+| M1 | Shared Contracts, Deep-Links & Audio Synth | F1, F2, F3 (`gpui_telegram_proto`, `gpui_telegram_core`, `gpui_telegram_media`) | none | DONE (`21/21` targeted crate tests + `404/404` workspace crate tests) |
+| M2 | Server Cloud Creations, Review FSM & Public Catalog | F4, F5, F6 (`gpui_telegram_server` DB V43, search, REST/WS routes) | M1 | DONE (`12/12` `creations_catalog_tests` PASS) |
+| M3 | Bot Creation & Public Recommendation Engine | F7, F8 (`gpui_telegram_agent` tools + `gpui_telegram_server` bridge, `@CreatorStudioBot`, inline query) | M2 | DONE (`16/16` `creator_bot_recommendations_tests` + `89/89` `gpui_telegram_agent` PASS) |
+| M4 | Client Cloud Sync, Local Mirror & Mini-Game Runtime | F9, F10 (`gpui_telegram_client` net/cache + `gpui_telegram_desktop` `game_runtime.rs`) | M2 (serialized after M3) | DONE (`8/8` `creations_cache_sync_tests` + `12/12` `mini_game_runtime_tests` PASS) |
+| M5 | Apple Sidebar, Cloud Creations Hub & Shell Integration | F11, F12, F13 (`gpui_telegram_desktop` icons, `AppleAppSidebar`, `ContentHubWorkspace`, `MyCreations`, `PublishReviewModal`, `AppShell` routing/IME/deep-links) | M3, M4 | DONE (`22/22` `apple_sidebar_m5_tests` PASS) |
+| M6 | Four Apple Verticals (Books, Music, Games, App Store) | F14, F15, F16, F17 (`gpui_telegram_desktop` `books_view`, `book_reader`, `music_view`, `music_player_bar`, `games_view`, `game_runtime_sheet`, `app_store_view`) | M5 | DONE (`7/7` `apple_sidebar_m6_tests` + `73/73` desktop guardrail suites PASS) |
+| M7 | Final Milestone: 100% E2E Pass (Tiers 1–4) + Tier 5 Hardening | F18 (Phase 1: Tiers 1–4 + UI E2E; Phase 2: Tier 5 white-box adversarial hardening + full regression/ledger gate) | M6, E2E | DONE (`94/94` Tiers 1–4 + `16/16` UI E2E + `5/5` Tier 5 hardening = `115/115` E2E PASS; `375/375` total verified) |
 
 ---
 
@@ -197,7 +197,8 @@ tests/e2e_suite/tests/
   ├── apple_sidebar_tier2_boundary.rs   # E2E: Tier 2 boundaries, security & zero-leak isolation
   ├── apple_sidebar_tier3_cross_feature.rs # E2E: Tier 3 pairwise cross-feature interactions
   ├── apple_sidebar_tier4_scenarios.rs  # E2E: Tier 4 real-world journeys & server restart durability
-  └── apple_sidebar_ui_e2e.rs           # E2E: Headless GPUI Apple sidebar, verticals & deep-link E2E
+  ├── apple_sidebar_ui_e2e.rs           # E2E Phase B: Headless GPUI Apple sidebar, verticals & deep-link E2E
+  └── apple_sidebar_tier5_hardening.rs  # M7 Tier 5: White-box adversarial concurrency, CAS, XSS & restart hardening
 ```
 
 ---

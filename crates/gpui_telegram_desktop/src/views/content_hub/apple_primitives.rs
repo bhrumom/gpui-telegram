@@ -573,3 +573,94 @@ pub fn render_editable_field_box(
             })
         })
 }
+
+/// Formats seconds into `M:SS` / `MM:SS` for Apple Music durations and timers.
+pub fn format_duration_secs(secs: u64) -> String {
+    let mins = secs / 60;
+    let rem = secs % 60;
+    format!("{mins}:{rem:02}")
+}
+
+/// Formats milliseconds into `M:SS` for playback progress & game timers.
+pub fn format_duration_ms(ms: u64) -> String {
+    format_duration_secs(ms / 1000)
+}
+
+/// Renders an Apple HIG slim horizontal progress bar (`0.0..=1.0`).
+pub fn apple_progress_bar(fraction: f32, accent_rgb: u32, pal: TdesktopThemePalette) -> Div {
+    let clamped = fraction.clamp(0.0, 1.0);
+    div()
+        .w_full()
+        .h(px(4.0))
+        .rounded(px(999.0))
+        .bg(pal.separator_rgba())
+        .overflow_hidden()
+        .child(
+            div()
+                .h_full()
+                .w(gpui::relative(clamped))
+                .rounded(px(999.0))
+                .bg(rgb(accent_rgb)),
+        )
+}
+
+/// Renders a subtle section shelf header with title and optional trailing count/badge.
+pub fn apple_shelf_header(
+    title: impl Into<SharedString>,
+    subtitle: Option<String>,
+    pal: TdesktopThemePalette,
+) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .items_baseline()
+        .justify_between()
+        .gap(px(8.0))
+        .child(
+            div()
+                .text_size(px(17.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(pal.text_primary))
+                .child(title.into()),
+        )
+        .when_some(subtitle, |el, sub| {
+            el.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(sub),
+            )
+        })
+}
+
+/// Renders an Apple-style accent-colored segmented sub-tab button for vertical navigation bars.
+pub fn vertical_sub_tab_pill(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    active: bool,
+    accent_rgb: u32,
+    pal: TdesktopThemePalette,
+) -> Stateful<Div> {
+    let label_str: SharedString = label.into();
+    let hover_bg = pal.row_hover_rgba();
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(13.0))
+        .py(px(6.0))
+        .rounded(px(999.0))
+        .when(active, |el| {
+            el.bg(rgb(accent_rgb))
+                .text_color(rgb(0xFFFFFF))
+                .font_weight(FontWeight::SEMIBOLD)
+        })
+        .when(!active, |el| {
+            el.bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.06))
+                .text_color(rgb(pal.text_secondary))
+                .hover(move |s| s.bg(hover_bg))
+        })
+        .text_size(px(12.0))
+        .whitespace_nowrap()
+        .child(label_str)
+}
+
