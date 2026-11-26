@@ -288,6 +288,9 @@ impl CommunityWorkspace {
             // updates `actor_block_last_synced` and strictly serializes Block afterward.
             self.state.actor_follow_dirty.remove(&actor_id);
             self.state.actor_follow_pending_target.remove(&actor_id);
+            if !self.state.actor_follow_in_flight.contains_key(&actor_id) {
+                self.state.actor_follow_last_synced.remove(&actor_id);
+            }
         }
         self.state
             .reconcile_mute_block(&actor_id, None, Some(next_blocked));
@@ -390,6 +393,44 @@ impl CommunityWorkspace {
                         this.state.actor_block_pending_target.remove(&actor_id);
                         this.state.actor_block_chain_had_block.remove(&actor_id);
                         this.state.actor_block_last_synced.remove(&actor_id);
+                        // Symmetric Unblock -> Follow serialization: launch deferred Follow strictly
+                        // after Unblock commits without wiping optimistic Follow UI mid-flight.
+                        let deferred_follow_target = if !target_blocked
+                            && this.state.actor_follow_dirty.contains(&actor_id)
+                            && !this.state.actor_follow_in_flight.contains_key(&actor_id)
+                        {
+                            this.state
+                                .actor_follow_pending_target
+                                .get(&actor_id)
+                                .copied()
+                        } else {
+                            None
+                        };
+                        if let Some(want_follow) = deferred_follow_target {
+                            if want_follow != committed_following {
+                                this.state.reconcile_mute_block(&actor_id, None, Some(false));
+                                this.state.actor_follow_last_synced.insert(
+                                    actor_id.clone(),
+                                    (committed_following, committed_followers),
+                                );
+                                this.flush_actor_follow_sync(actor_id.clone(), cx);
+                                this.reload_actor_route_if_loading(cx);
+                                this.emit_action(
+                                    CommunityWorkspaceAction::ShowToast {
+                                        text: tr_str(&lang, "已解除屏蔽", "Actor unblocked")
+                                            .to_string(),
+                                        is_error: false,
+                                    },
+                                    cx,
+                                );
+                                cx.notify();
+                                return;
+                            }
+                            // Deferred Follow + Unfollow canceled back to committed post-Unblock truth.
+                            this.state.actor_follow_dirty.remove(&actor_id);
+                            this.state.actor_follow_pending_target.remove(&actor_id);
+                            this.state.actor_follow_last_synced.remove(&actor_id);
+                        }
                         this.state.restore_block_and_follow(
                             &actor_id,
                             target_blocked,
@@ -415,6 +456,9 @@ impl CommunityWorkspace {
                         this.state.actor_block_dirty.remove(&actor_id);
                         this.state.actor_block_pending_target.remove(&actor_id);
                         this.state.actor_block_chain_had_block.remove(&actor_id);
+                        this.state.actor_follow_dirty.remove(&actor_id);
+                        this.state.actor_follow_pending_target.remove(&actor_id);
+                        this.state.actor_follow_last_synced.remove(&actor_id);
                         let (orig_blocked, orig_following, orig_followers) = this
                             .state
                             .actor_block_last_synced
@@ -447,6 +491,9 @@ impl CommunityWorkspace {
                         this.state.actor_block_dirty.remove(&actor_id);
                         this.state.actor_block_pending_target.remove(&actor_id);
                         this.state.actor_block_chain_had_block.remove(&actor_id);
+                        this.state.actor_follow_dirty.remove(&actor_id);
+                        this.state.actor_follow_pending_target.remove(&actor_id);
+                        this.state.actor_follow_last_synced.remove(&actor_id);
                         let (orig_blocked, orig_following, orig_followers) = this
                             .state
                             .actor_block_last_synced
@@ -542,10 +589,14 @@ impl CommunityWorkspace {
             bot_persona: d.is_bot.then_some(d.bot_persona.trim().to_string()),
         };
         let aid = d.actor_id.clone();
+        let aid_cb = aid.clone();
         self.state.edit_profile.submitting = true;
         self.state.edit_profile.error = None;
         self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
         let my_id_gen = self.state.identities_gen;
+        let actor_edit_entry = self.state.actor_edit_seq.entry(aid.clone()).or_insert(0);
+        *actor_edit_entry = actor_edit_entry.wrapping_add(1);
+        let my_actor_edit_seq = *actor_edit_entry;
         let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -558,36 +609,47 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                let is_latest_actor_edit = this
+                    .state
+                    .actor_edit_seq
+                    .get(&aid_cb)
+                    .copied()
+                    == Some(my_actor_edit_seq);
                 if this.state.actor_switch_gen != my_actor_gen {
-                    if this.state.identities_gen == my_id_gen {
-                        if let Ok(Ok((_, Some(id_resp)))) = res {
-                            this.state.identities = Some(id_resp);
-                            this.ensure_bot_studio_selected_hydrated(cx);
-                            cx.notify();
+                    let mut changed = false;
+                    if let Ok(Ok((updated, ids))) = res {
+                        if this.state.identities_gen == my_id_gen {
+                            if let Some(id_resp) = ids {
+                                this.state.identities = Some(id_resp);
+                                this.ensure_bot_studio_selected_hydrated(cx);
+                                changed = true;
+                            }
                         }
+                        if is_latest_actor_edit {
+                            this.state.patch_edited_actor_metadata(&updated);
+                            this.sync_bot_studio_edit_metadata_if_matching(&updated);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        cx.notify();
                     }
                     return;
                 }
                 this.state.edit_profile.submitting = false;
                 let lang = this.language_id.clone();
                 match res {
-                    Ok(Ok((mut updated, ids))) => {
-                        this.state.overlay_in_flight_actor_mutations(&mut updated);
-                        if let Some(ref mut prof) = this.state.actor_profile {
-                            if prof.actor.actor_id == updated.actor_id {
-                                prof.actor = updated.clone();
-                            }
-                        }
-                        if this.state.profile_loading {
-                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
-                                this.load_actor_profile(h, cx);
-                            }
-                        }
+                    Ok(Ok((updated, ids))) => {
                         if this.state.identities_gen == my_id_gen {
                             if let Some(id_resp) = ids {
                                 this.apply_identities_response(id_resp, cx);
                             }
                         }
+                        if is_latest_actor_edit {
+                            this.state.patch_edited_actor_metadata(&updated);
+                            this.sync_bot_studio_edit_metadata_if_matching(&updated);
+                        }
+                        this.reload_actor_route_if_loading(cx);
                         this.close_edit_profile_modal(cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {

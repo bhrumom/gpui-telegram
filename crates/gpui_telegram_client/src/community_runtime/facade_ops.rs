@@ -305,12 +305,8 @@ impl CommunityClientFacade {
         actor_id: &str,
         req: &CreatePostRequest,
     ) -> Result<CreatePostResponse> {
-        let normalized = actor_id.trim_matches(' ');
-        if normalized.is_empty() {
-            return Err(gpui_telegram_core::error::TelegramError::Validation(
-                "actor_id must not be empty".to_string(),
-            ));
-        }
+        let normalized = crate::net::api_community::validate_and_normalize_actor_id(actor_id)
+            .map_err(|msg| gpui_telegram_core::error::TelegramError::Validation(msg.to_string()))?;
         self.create_post_inner(Some(normalized), req).await
     }
 

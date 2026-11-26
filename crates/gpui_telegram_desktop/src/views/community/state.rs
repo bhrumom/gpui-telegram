@@ -8,10 +8,11 @@ use gpui_telegram_proto::community_contracts::{
     AwardResponse, BookmarkResponse, BotAutonomyMode, CommentSort, CommunityActorDto,
     CommunityCommentDto, CommunityDetailResponse, CommunityListDto, CommunityListKind,
     CommunityMemberRole, CommunityNotificationDto, CommunityNotificationKind, CommunityPostDto,
-    CommunitySearchResultDto, CommunitySearchSort, CommunitySearchTab, FeedItemDto, FeedSort,
-    FeedTab, FollowActionResponse, JoinCommunityResponse, ModLogEntryDto, ModQueueItemDto,
-    ModQueueStatus, PollDto, PostAwardDto, PostDetailResponse, RepostResponse, SubCommunityDto,
-    TimeWindow, ToggleActionResponse, TrendingTopicDto, VoteResponse,
+    CommunityRuleDto, CommunitySearchResultDto, CommunitySearchSort, CommunitySearchTab,
+    FeedItemDto, FeedSort, FeedTab, FollowActionResponse, JoinCommunityResponse, ModLogEntryDto,
+    ModQueueItemDto, ModQueueStatus, PollDto, PostAwardDto, PostDetailResponse, PostStatus,
+    RepostResponse, SubCommunityDto, TimeWindow, ToggleActionResponse, TrendingTopicDto,
+    VoteResponse,
 };
 
 use crate::views::composer::formatting_bar::TextStyleKind;
@@ -836,6 +837,8 @@ pub struct CommunityWorkspaceState {
     pub lists_gen: u64,
     pub trending: Vec<TrendingTopicDto>,
     pub recommended_actors: Vec<CommunityActorDto>,
+    pub recommended_actors_loading: bool,
+    pub recommended_actors_gen: u64,
     pub unread_notifications: u32,
 
     // Secondary route live caches & M5 interactive states
@@ -845,6 +848,8 @@ pub struct CommunityWorkspaceState {
     pub detail_collapsed_comments: HashSet<String>,
     pub detail_editing_comment_id: Option<String>,
     pub detail_edit_comment_draft: String,
+    pub detail_edit_comment_saving: bool,
+    pub detail_edit_comment_save_seq: u64,
     pub detail_loading_more_comment_ids: HashSet<String>,
     pub detail_comment_more_cursors: HashMap<String, String>,
     pub detail_summon_bot_id: Option<String>,
@@ -876,9 +881,11 @@ pub struct CommunityWorkspaceState {
     pub community_wiki_summary: String,
     pub community_wiki_preview_rev: Option<u32>,
     pub community_wiki_saving: bool,
+    pub community_wiki_save_seq: u64,
     pub community_new_rule_title: String,
     pub community_new_rule_desc: String,
     pub community_rules_saving: bool,
+    pub community_rules_save_seq: u64,
     pub create_community: CreateCommunityDraft,
     pub community_loading: bool,
     pub community_error: Option<String>,
@@ -893,6 +900,8 @@ pub struct CommunityWorkspaceState {
     pub actor_profile: Option<ActorProfileResponse>,
     pub profile_tab: ActorProfileTab,
     pub edit_profile: EditProfileDraft,
+    /// Monotonic per-actor edit sequence across EditProfile & BotStudio (NEVER cleared on actor switch).
+    pub actor_edit_seq: HashMap<String, u64>,
     pub profile_loading: bool,
     pub profile_error: Option<String>,
     pub profile_gen: u64,
@@ -1106,6 +1115,8 @@ impl Default for CommunityWorkspaceState {
             lists_gen: 0,
             trending: Vec::new(),
             recommended_actors: Vec::new(),
+            recommended_actors_loading: false,
+            recommended_actors_gen: 0,
             unread_notifications: 0,
             detail_post: None,
             detail_comment_sort: CommentSort::Best,
@@ -1113,6 +1124,8 @@ impl Default for CommunityWorkspaceState {
             detail_collapsed_comments: HashSet::new(),
             detail_editing_comment_id: None,
             detail_edit_comment_draft: String::new(),
+            detail_edit_comment_saving: false,
+            detail_edit_comment_save_seq: 0,
             detail_loading_more_comment_ids: HashSet::new(),
             detail_comment_more_cursors: HashMap::new(),
             detail_summon_bot_id: None,
@@ -1140,9 +1153,11 @@ impl Default for CommunityWorkspaceState {
             community_wiki_summary: String::new(),
             community_wiki_preview_rev: None,
             community_wiki_saving: false,
+            community_wiki_save_seq: 0,
             community_new_rule_title: String::new(),
             community_new_rule_desc: String::new(),
             community_rules_saving: false,
+            community_rules_save_seq: 0,
             create_community: CreateCommunityDraft::default(),
             community_loading: false,
             community_error: None,
@@ -1155,6 +1170,7 @@ impl Default for CommunityWorkspaceState {
             actor_profile: None,
             profile_tab: ActorProfileTab::Posts,
             edit_profile: EditProfileDraft::default(),
+            actor_edit_seq: HashMap::new(),
             profile_loading: false,
             profile_error: None,
             profile_gen: 0,
@@ -1587,6 +1603,39 @@ impl CommunityWorkspaceState {
                 if post.post_id == post_id {
                     f(post);
                 }
+            }
+        }
+    }
+
+    /// Field-scoped post edit patch (Dead End #4 closure): patches ONLY editable post metadata
+    /// across all 8 `visit_post_mut` caches, `composer.drafts`, and bookmark rollback snapshots,
+    /// NEVER touching orthogonal viewer/engagement/poll/award/moderation fields.
+    pub fn patch_edited_post_metadata(&mut self, updated: &CommunityPostDto) {
+        self.visit_post_mut(&updated.post_id, |p| {
+            apply_edited_post_metadata(p, updated);
+        });
+        if updated.status == PostStatus::Published {
+            self.composer
+                .drafts
+                .retain(|d| d.post_id != updated.post_id);
+        } else {
+            for d in &mut self.composer.drafts {
+                if d.post_id == updated.post_id {
+                    apply_edited_post_metadata(d, updated);
+                }
+            }
+        }
+        if let Some(item) = self.bookmark_cached_items.get_mut(&updated.post_id) {
+            apply_edited_post_metadata(&mut item.post, updated);
+        }
+        if let Some(ov) = self.bookmark_recent_overrides.get_mut(&updated.post_id) {
+            if let Some(ref mut item) = ov.item {
+                apply_edited_post_metadata(&mut item.post, updated);
+            }
+        }
+        if let Some(snap) = self.bookmark_last_synced.get_mut(&updated.post_id) {
+            if let Some(ref mut item) = snap.saved_item {
+                apply_edited_post_metadata(&mut item.post, updated);
             }
         }
     }
@@ -2145,6 +2194,55 @@ impl CommunityWorkspaceState {
         })
     }
 
+    /// Visits every cached `SubCommunityDto` matching `slug` (case-insensitive) across all 4 caches:
+    /// `communities`, `community_detail.community`, `mod_community`, and `search_result.communities`.
+    pub fn visit_community_mut(&mut self, slug: &str, mut f: impl FnMut(&mut SubCommunityDto)) {
+        for c in &mut self.communities {
+            if c.slug.eq_ignore_ascii_case(slug) {
+                f(c);
+            }
+        }
+        if let Some(ref mut det) = self.community_detail {
+            if det.community.slug.eq_ignore_ascii_case(slug) {
+                f(&mut det.community);
+            }
+        }
+        if let Some(ref mut mc) = self.mod_community {
+            if mc.slug.eq_ignore_ascii_case(slug) {
+                f(mc);
+            }
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for c in &mut sr.communities {
+                if c.slug.eq_ignore_ascii_case(slug) {
+                    f(c);
+                }
+            }
+        }
+    }
+
+    /// Field-scoped community rules patch (Dead End #4): updates ONLY `rules` across all 4 caches.
+    pub fn patch_community_rules(&mut self, slug: &str, rules: &[CommunityRuleDto]) {
+        self.visit_community_mut(slug, |c| {
+            c.rules = rules.to_vec();
+        });
+    }
+
+    /// Field-scoped AutoMod rules patch (Dead End #4): updates ONLY `automod_rules` across all 4 caches.
+    pub fn patch_community_automod_rules(&mut self, slug: &str, automod_rules: &[AutoModRuleDto]) {
+        self.visit_community_mut(slug, |c| {
+            c.automod_rules = automod_rules.to_vec();
+        });
+    }
+
+    /// Field-scoped Wiki patch (Dead End #4): updates ONLY `wiki_markdown` & `wiki_revision` across all 4 caches.
+    pub fn patch_community_wiki(&mut self, slug: &str, markdown: &str, revision: u32) {
+        self.visit_community_mut(slug, |c| {
+            c.wiki_markdown = markdown.to_string();
+            c.wiki_revision = revision;
+        });
+    }
+
     /// Optimistically updates ONLY `is_joined` and `member_count` across caches.
     /// NEVER grants `viewer_role` optimistically (preserves `2D JOIN-RACE` security invariant).
     pub fn apply_optimistic_join(&mut self, slug: &str, target_joined: bool) {
@@ -2358,6 +2456,61 @@ impl CommunityWorkspaceState {
                         .and_then(|det| det.moderators.iter().find(|a| a.actor_id == actor_id))
                 })
         })
+    }
+
+    /// Visits every cached `CommunityActorDto` matching `actor_id` across `recommended_actors`,
+    /// `actor_profile.actor`, `search_result.actors`, and `community_detail.moderators`.
+    pub fn visit_actor_mut(&mut self, actor_id: &str, mut f: impl FnMut(&mut CommunityActorDto)) {
+        for a in &mut self.recommended_actors {
+            if a.actor_id == actor_id {
+                f(a);
+            }
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            if prof.actor.actor_id == actor_id {
+                f(&mut prof.actor);
+            }
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for a in &mut sr.actors {
+                if a.actor_id == actor_id {
+                    f(a);
+                }
+            }
+        }
+        if let Some(ref mut det) = self.community_detail {
+            for m in &mut det.moderators {
+                if m.actor_id == actor_id {
+                    f(m);
+                }
+            }
+        }
+    }
+
+    /// Field-scoped actor metadata patch (Dead End #4): patches ONLY the 13 editable fields of
+    /// `UpdateCommunityActorRequest` across all 5 actor caches (including `identities`),
+    /// NEVER clobbering `is_following`, `followers_count`, `is_muted`, `is_blocked`, or karma.
+    pub fn patch_edited_actor_metadata(&mut self, updated: &CommunityActorDto) {
+        self.visit_actor_mut(&updated.actor_id, |a| {
+            apply_edited_actor_metadata(a, updated);
+        });
+        if let Some(ref mut ids) = self.identities {
+            if let Some(ref mut h) = ids.human_actor {
+                if h.actor_id == updated.actor_id {
+                    apply_edited_actor_metadata(h, updated);
+                }
+            }
+            for b in &mut ids.bot_actors {
+                if b.actor_id == updated.actor_id {
+                    apply_edited_actor_metadata(b, updated);
+                }
+            }
+            for a in &mut ids.all_actors {
+                if a.actor_id == updated.actor_id {
+                    apply_edited_actor_metadata(a, updated);
+                }
+            }
+        }
     }
 
     pub fn reconcile_mute_block(
@@ -2616,9 +2769,14 @@ impl CommunityWorkspaceState {
         }
     }
 
-    /// Universal Case A overlay for a community DTO (join/leave without granting `viewer_role`).
+    /// Universal Case A overlay for a community DTO (join/leave without granting `viewer_role`,
+    /// plus in-flight/dirty `automod_rules` preservation across all community loaders).
     pub fn overlay_in_flight_community_mutations(&self, comm: &mut SubCommunityDto) {
-        if self.community_join_in_flight.is_empty() && self.community_join_dirty.is_empty() {
+        if self.community_join_in_flight.is_empty()
+            && self.community_join_dirty.is_empty()
+            && self.automod_in_flight.is_empty()
+            && self.automod_dirty.is_empty()
+        {
             return;
         }
         let slug_key = comm.slug.to_ascii_lowercase();
@@ -2634,6 +2792,15 @@ impl CommunityWorkspaceState {
                     }
                     comm.is_joined = want_joined;
                 }
+            }
+        }
+        if self.automod_in_flight.contains_key(&slug_key) || self.automod_dirty.contains(&slug_key) {
+            if let Some(mc) = self
+                .mod_community
+                .as_ref()
+                .filter(|c| c.slug.eq_ignore_ascii_case(&comm.slug))
+            {
+                comm.automod_rules = mc.automod_rules.clone();
             }
         }
     }
@@ -2658,6 +2825,22 @@ impl CommunityWorkspaceState {
             }
         }
         self.lists = fresh;
+    }
+
+    /// Field-scoped list membership patch (Dead End #4 sibling): `flush_list_sync` sends ONLY
+    /// `is_pinned`/`member_actor_ids`/`community_slugs`, so reconciliation patches ONLY those
+    /// fields + monotonic `updated_at_ms`, never clobbering `name`/`description`/`kind`/`is_private`.
+    pub fn patch_list_membership_fields(&mut self, updated: &CommunityListDto) {
+        if let Some(entry) = self
+            .lists
+            .iter_mut()
+            .find(|l| l.list_id == updated.list_id)
+        {
+            entry.is_pinned = updated.is_pinned;
+            entry.member_actor_ids = updated.member_actor_ids.clone();
+            entry.community_slugs = updated.community_slugs.clone();
+            entry.updated_at_ms = entry.updated_at_ms.max(updated.updated_at_ms);
+        }
     }
 
     /// Replaces `self.saved_items` with a freshly fetched snapshot while preserving:
@@ -2814,4 +2997,36 @@ fn merge_awards_monotonic(existing: &mut Vec<PostAwardDto>, incoming: &[PostAwar
         }
     }
     *existing = merged;
+}
+
+fn apply_edited_post_metadata(target: &mut CommunityPostDto, updated: &CommunityPostDto) {
+    target.title = updated.title.clone();
+    target.body = updated.body.clone();
+    target.flair = updated.flair.clone();
+    target.tags = updated.tags.clone();
+    target.mentions = updated.mentions.clone();
+    target.is_nsfw = updated.is_nsfw;
+    target.is_spoiler = updated.is_spoiler;
+    target.status = updated.status;
+    target.scheduled_at_ms = updated.scheduled_at_ms;
+    if !updated.edit_history.is_empty() {
+        target.edit_history = updated.edit_history.clone();
+    }
+    target.updated_at_ms = target.updated_at_ms.max(updated.updated_at_ms);
+}
+
+fn apply_edited_actor_metadata(target: &mut CommunityActorDto, updated: &CommunityActorDto) {
+    target.display_name = updated.display_name.clone();
+    target.bio = updated.bio.clone();
+    target.location = updated.location.clone();
+    target.website = updated.website.clone();
+    target.avatar_media_id = updated.avatar_media_id.clone();
+    target.banner_media_id = updated.banner_media_id.clone();
+    target.avatar_shape = updated.avatar_shape.clone();
+    target.avatar_color = updated.avatar_color.clone();
+    target.bot_badge = updated.bot_badge.clone();
+    target.bot_model = updated.bot_model.clone();
+    target.bot_capabilities = updated.bot_capabilities.clone();
+    target.bot_autonomy_mode = updated.bot_autonomy_mode;
+    target.bot_persona = updated.bot_persona.clone();
 }

@@ -273,6 +273,9 @@ impl CommunityWorkspace {
         self.state.notifications_gen = self.state.notifications_gen.wrapping_add(1);
         let my_notif_gen = self.state.notifications_gen;
         self.state.notifications_loading = false;
+        self.state.recommended_actors_gen = self.state.recommended_actors_gen.wrapping_add(1);
+        self.state.recommended_actors_loading = true;
+        let my_rec_gen = self.state.recommended_actors_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -374,11 +377,16 @@ impl CommunityWorkspace {
                                 }
                             }
                         }
-                        if this.state.actor_switch_gen == my_actor_gen && !rec.is_empty() {
-                            for a in &mut rec {
-                                this.state.overlay_in_flight_actor_mutations(a);
+                        if this.state.recommended_actors_gen == my_rec_gen
+                            && this.state.actor_switch_gen == my_actor_gen
+                        {
+                            this.state.recommended_actors_loading = false;
+                            if !rec.is_empty() {
+                                for a in &mut rec {
+                                    this.state.overlay_in_flight_actor_mutations(a);
+                                }
+                                this.state.recommended_actors = rec;
                             }
-                            this.state.recommended_actors = rec;
                         }
                         cx.notify();
                     });
@@ -389,6 +397,11 @@ impl CommunityWorkspace {
                             && this.state.actor_switch_gen == my_actor_gen
                         {
                             this.state.communities_loading = false;
+                        }
+                        if this.state.recommended_actors_gen == my_rec_gen
+                            && this.state.actor_switch_gen == my_actor_gen
+                        {
+                            this.state.recommended_actors_loading = false;
                         }
                         cx.notify();
                     });
@@ -1305,7 +1318,7 @@ impl CommunityWorkspace {
 
     pub(super) fn reload_detail_if_loading_post(
         &mut self,
-        post_id: &str,
+        _post_id: &str,
         allow_saved_reload: bool,
         cx: &mut Context<Self>,
     ) {
@@ -1313,7 +1326,7 @@ impl CommunityWorkspace {
             self.load_feed(cx);
         }
         match self.state.route.clone() {
-            CommunityRoute::PostDetail(id) if id == post_id => {
+            CommunityRoute::PostDetail(id) => {
                 if self.state.detail_loading {
                     self.load_post_detail(id, cx);
                 }
@@ -1353,11 +1366,11 @@ impl CommunityWorkspace {
 
     pub(super) fn reload_comment_route_if_loading(
         &mut self,
-        detail_pid: Option<&str>,
+        _detail_pid: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         match self.state.route.clone() {
-            CommunityRoute::PostDetail(id) if detail_pid == Some(id.as_str()) => {
+            CommunityRoute::PostDetail(id) => {
                 if self.state.detail_loading {
                     self.load_post_detail(id, cx);
                 }
@@ -1371,7 +1384,72 @@ impl CommunityWorkspace {
         }
     }
 
+    pub(super) fn reload_recommended_actors(&mut self, cx: &mut Context<Self>) {
+        self.state.recommended_actors_gen = self.state.recommended_actors_gen.wrapping_add(1);
+        self.state.recommended_actors_loading = true;
+        let my_rec_gen = self.state.recommended_actors_gen;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let facade = self.facade.clone();
+        let rt_handle = facade.runtime_handle().clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = run_on_community_tokio(&rt_handle, async move {
+                let bots = facade
+                    .search(&CommunitySearchRequestDto {
+                        query: String::new(),
+                        tab: CommunitySearchTab::Bots,
+                        limit: 8,
+                        ..Default::default()
+                    })
+                    .await
+                    .ok();
+                let people = facade
+                    .search(&CommunitySearchRequestDto {
+                        query: String::new(),
+                        tab: CommunitySearchTab::People,
+                        limit: 8,
+                        ..Default::default()
+                    })
+                    .await
+                    .ok();
+                (bots, people)
+            })
+            .await;
+            let _ = weak.update(app, |this, cx| {
+                if this.state.recommended_actors_gen != my_rec_gen
+                    || this.state.actor_switch_gen != my_actor_gen
+                {
+                    return;
+                }
+                this.state.recommended_actors_loading = false;
+                if let Ok((bots, people)) = res {
+                    let mut rec = Vec::new();
+                    if let Some(b) = bots {
+                        rec.extend(b.actors);
+                    }
+                    if let Some(p) = people {
+                        for a in p.actors {
+                            if !rec.iter().any(|x| x.actor_id == a.actor_id) {
+                                rec.push(a);
+                            }
+                        }
+                    }
+                    if !rec.is_empty() {
+                        for a in &mut rec {
+                            this.state.overlay_in_flight_actor_mutations(a);
+                        }
+                        this.state.recommended_actors = rec;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn reload_actor_route_if_loading(&mut self, cx: &mut Context<Self>) {
+        if self.state.recommended_actors_loading {
+            self.reload_recommended_actors(cx);
+        }
         match self.state.route.clone() {
             CommunityRoute::ActorProfile(handle) => {
                 if self.state.profile_loading {
@@ -2169,7 +2247,9 @@ impl CommunityWorkspace {
         self.state.community_loading_more = false;
         self.state.community_wiki_editing = false;
         self.state.community_wiki_saving = false;
+        self.state.community_wiki_save_seq = self.state.community_wiki_save_seq.wrapping_add(1);
         self.state.community_rules_saving = false;
+        self.state.community_rules_save_seq = self.state.community_rules_save_seq.wrapping_add(1);
         self.state.create_community.submitting = false;
         self.state.community_join_in_flight.clear();
         self.state.community_join_dirty.clear();
@@ -2178,6 +2258,8 @@ impl CommunityWorkspace {
 
         self.state.profile_gen = self.state.profile_gen.wrapping_add(1);
         self.state.profile_loading = false;
+        self.state.recommended_actors_gen = self.state.recommended_actors_gen.wrapping_add(1);
+        self.state.recommended_actors_loading = false;
         self.state.edit_profile.submitting = false;
         self.state.actor_mute_in_flight.clear();
         self.state.actor_mute_dirty.clear();
@@ -2198,6 +2280,9 @@ impl CommunityWorkspace {
         // available until the fresh actor-scoped `load_post_detail` completes.
         self.state.detail_gen = self.state.detail_gen.wrapping_add(1);
         self.state.detail_loading = false;
+        self.state.detail_edit_comment_saving = false;
+        self.state.detail_edit_comment_save_seq =
+            self.state.detail_edit_comment_save_seq.wrapping_add(1);
         self.state.detail_summon_pending = false;
         self.state.detail_summon_feedback = None;
         self.state.detail_loading_more_comment_ids.clear();
@@ -2471,14 +2556,17 @@ impl CommunityWorkspace {
             .insert(actor_id.clone(), follow);
         self.state.apply_optimistic_follow(&actor_id, follow);
         cx.notify();
-        if self.state.actor_follow_in_flight.contains_key(&actor_id) {
+        if self.state.actor_follow_in_flight.contains_key(&actor_id)
+            || self.state.actor_block_in_flight.contains_key(&actor_id)
+            || self.state.actor_block_dirty.contains(&actor_id)
+        {
             self.state.actor_follow_dirty.insert(actor_id);
             return;
         }
         self.flush_actor_follow_sync(actor_id, cx);
     }
 
-    fn flush_actor_follow_sync(&mut self, actor_id: String, cx: &mut Context<Self>) {
+    pub(super) fn flush_actor_follow_sync(&mut self, actor_id: String, cx: &mut Context<Self>) {
         let Some(target_follow) = self
             .state
             .actor_follow_pending_target
@@ -2525,7 +2613,12 @@ impl CommunityWorkspace {
                 // settled Follow, never set `is_following = true` onto a blocked actor, and launch
                 // any deferred Block flight strictly after Follow settles.
                 let block_superseding = this.state.actor_block_dirty.contains(&actor_id)
-                    || this.state.actor_block_pending_target.contains_key(&actor_id)
+                    || this
+                        .state
+                        .actor_block_pending_target
+                        .get(&actor_id)
+                        .copied()
+                        == Some(true)
                     || this.state.actor_block_chain_had_block.contains(&actor_id)
                     || this
                         .state
@@ -2668,6 +2761,9 @@ impl CommunityWorkspace {
             self.state.detail_post = None;
             self.state.detail_editing_comment_id = None;
             self.state.detail_edit_comment_draft.clear();
+            self.state.detail_edit_comment_saving = false;
+            self.state.detail_edit_comment_save_seq =
+                self.state.detail_edit_comment_save_seq.wrapping_add(1);
             self.state.detail_summon_feedback = None;
             self.state.detail_reply_parent_id = None;
             if !from_notif {
@@ -2860,7 +2956,11 @@ impl CommunityWorkspace {
             self.state.community_wiki_editing = false;
             self.state.community_wiki_preview_rev = None;
             self.state.community_wiki_saving = false;
+            self.state.community_wiki_save_seq =
+                self.state.community_wiki_save_seq.wrapping_add(1);
             self.state.community_rules_saving = false;
+            self.state.community_rules_save_seq =
+                self.state.community_rules_save_seq.wrapping_add(1);
             self.state.community_next_cursor = None;
         }
         self.state.community_error = None;

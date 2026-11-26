@@ -125,6 +125,9 @@ impl CommunityWorkspace {
     }
 
     pub fn start_edit_comment(&mut self, comment_id: String, current_body: String, cx: &mut Context<Self>) {
+        if self.state.detail_edit_comment_saving {
+            return;
+        }
         self.state.detail_editing_comment_id = Some(comment_id);
         self.state.detail_edit_comment_draft = current_body;
         self.state.focus_input(ActiveCommunityInput::DetailEditComment);
@@ -141,6 +144,9 @@ impl CommunityWorkspace {
     }
 
     pub fn submit_edit_comment(&mut self, cx: &mut Context<Self>) {
+        if self.state.detail_edit_comment_saving {
+            return;
+        }
         let Some(cid) = self.state.detail_editing_comment_id.clone() else {
             return;
         };
@@ -165,11 +171,16 @@ impl CommunityWorkspace {
                 CommunityRoute::PostDetail(p) => Some(p.clone()),
                 _ => None,
             });
+        self.state.detail_edit_comment_save_seq =
+            self.state.detail_edit_comment_save_seq.wrapping_add(1);
+        let my_save_seq = self.state.detail_edit_comment_save_seq;
+        self.state.detail_edit_comment_saving = true;
         let req = UpdateCommentRequest { body };
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
+        cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
                 facade.update_comment(&cid, &req).await
@@ -181,33 +192,47 @@ impl CommunityWorkspace {
                 {
                     return;
                 }
+                let still_current_save = this.state.detail_edit_comment_save_seq == my_save_seq;
+                if still_current_save {
+                    this.state.detail_edit_comment_saving = false;
+                }
                 match res {
                     Ok(Ok(updated)) => {
-                        this.state.visit_comment_mut(&updated.comment_id, |c| {
-                            c.body = updated.body.clone();
-                            c.updated_at_ms = updated.updated_at_ms;
-                        });
-                        this.cancel_edit_comment(cx);
+                        if still_current_save {
+                            this.state.visit_comment_mut(&updated.comment_id, |c| {
+                                c.body = updated.body.clone();
+                                c.updated_at_ms = c.updated_at_ms.max(updated.updated_at_ms);
+                            });
+                            this.cancel_edit_comment(cx);
+                        }
                         this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
-                        let lang = this.language_id.clone();
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "评论已更新", "Comment updated").to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
+                        if still_current_save {
+                            let lang = this.language_id.clone();
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "评论已更新", "Comment updated").to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                        }
+                        cx.notify();
                     }
                     Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: e.to_string(),
-                                is_error: true,
-                            },
-                            cx,
-                        );
+                        if still_current_save {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e.to_string(),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
+                        cx.notify();
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -803,6 +828,10 @@ impl CommunityWorkspace {
                             this.state.detail_post = None;
                             this.state.detail_gen = this.state.detail_gen.wrapping_add(1);
                             this.state.detail_loading = false;
+                        } else if this.state.detail_loading {
+                            if let CommunityRoute::PostDetail(id) = this.state.route.clone() {
+                                this.load_post_detail(id, cx);
+                            }
                         }
                         // Case B reloads: prevent any in-flight loader or pagination from resurrecting the deleted post.
                         if this.state.feed_loading || this.state.feed_loading_more {

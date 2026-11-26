@@ -1017,7 +1017,9 @@ impl LocalCommunityRuntime {
                 }
             }
         }
-        let moderators = self.store.list_moderators(&community.community_id)?;
+        let moderators = self
+            .store
+            .list_moderators_for_viewer(&community.community_id, Some(&viewer_id))?;
         let wiki_revisions = self.store.list_wiki_revisions(&community.community_id, 25)?;
         Ok(CommunityDetailResponse {
             community,
@@ -1308,7 +1310,7 @@ impl LocalCommunityRuntime {
             CommunitySearchTab::Top | CommunitySearchTab::People | CommunitySearchTab::Bots
         ) {
             self.store
-                .list_actors(None, 200)?
+                .list_actors_for_viewer(None, Some(&viewer_id), 200)?
                 .into_iter()
                 .filter(|a| {
                     let kind_ok = match req.tab {

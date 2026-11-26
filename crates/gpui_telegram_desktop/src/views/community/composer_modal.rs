@@ -673,8 +673,10 @@ impl CommunityWorkspace {
                     return;
                 }
                 match res {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(updated)) => {
+                        this.state.patch_edited_post_metadata(&updated);
                         this.state.composer.drafts.retain(|d| d.post_id != post_id);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                         if this.state.composer.drafts_loading {
                             this.load_composer_drafts(cx);
                         }
@@ -1098,11 +1100,9 @@ impl CommunityWorkspace {
                     this.state.composer.submitting = false;
                     let lang = this.language_id.clone();
                     match res {
-                        Ok(Ok(mut updated)) => {
-                            this.state.overlay_in_flight_post_mutations(&mut updated);
+                        Ok(Ok(updated)) => {
                             let updated_pid = updated.post_id.clone();
-                            this.state
-                                .visit_post_mut(&updated_pid, |p| *p = updated.clone());
+                            this.state.patch_edited_post_metadata(&updated);
                             let was_feed_loading =
                                 this.state.feed_loading || this.state.feed_loading_more;
                             this.reload_detail_if_loading_post(&updated_pid, true, cx);

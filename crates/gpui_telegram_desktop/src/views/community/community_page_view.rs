@@ -289,6 +289,8 @@ impl CommunityWorkspace {
             self.state.community_wiki_summary.trim().to_string()
         };
         let req = UpdateCommunityWikiRequest { markdown, summary };
+        self.state.community_wiki_save_seq = self.state.community_wiki_save_seq.wrapping_add(1);
+        let my_save_seq = self.state.community_wiki_save_seq;
         self.state.community_wiki_saving = true;
         let my_actor_gen = self.state.actor_switch_gen;
         let my_comm_gen = self.state.community_gen;
@@ -308,15 +310,8 @@ impl CommunityWorkspace {
                 {
                     return;
                 }
-                let on_different_comm = matches!(
-                    &this.state.route,
-                    CommunityRoute::CommunityPage(s) if !s.eq_ignore_ascii_case(&reload_slug)
-                ) || this
-                    .state
-                    .community_detail
-                    .as_ref()
-                    .is_some_and(|d| !d.community.slug.eq_ignore_ascii_case(&reload_slug));
-                if !on_different_comm {
+                let still_current_save = this.state.community_wiki_save_seq == my_save_seq;
+                if still_current_save {
                     this.state.community_wiki_saving = false;
                 }
                 let still_same_comm_gen = this.state.community_gen == my_comm_gen;
@@ -327,45 +322,86 @@ impl CommunityWorkspace {
                             &this.state.route,
                             CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&reload_slug)
                         );
-                        if still_same_comm_gen || on_same_comm_route {
-                            this.state.community_wiki_editing = false;
-                            this.state.community_wiki_preview_rev = None;
-                            if matches!(
-                                this.state.active_input,
-                                ActiveCommunityInput::CommunityWikiMarkdown
-                                    | ActiveCommunityInput::CommunityWikiSummary
-                            ) {
-                                this.state.blur_input();
+                        if still_current_save {
+                            if still_same_comm_gen || on_same_comm_route {
+                                this.state.community_wiki_editing = false;
+                                this.state.community_wiki_preview_rev = None;
+                                if matches!(
+                                    this.state.active_input,
+                                    ActiveCommunityInput::CommunityWikiMarkdown
+                                        | ActiveCommunityInput::CommunityWikiSummary
+                                ) {
+                                    this.state.blur_input();
+                                }
                             }
-                        }
-                        if still_same_comm_gen {
-                            if let Some(ref mut det) = this.state.community_detail {
-                                if det.community.slug.eq_ignore_ascii_case(&reload_slug) {
-                                    det.community.wiki_markdown = rev.markdown.clone();
-                                    det.community.wiki_revision = rev.revision;
-                                    det.wiki_revisions.insert(0, rev);
+                            this.state.patch_community_wiki(
+                                &reload_slug,
+                                &rev.markdown,
+                                rev.revision,
+                            );
+                            if still_same_comm_gen {
+                                if let Some(ref mut det) = this.state.community_detail {
+                                    if det.community.slug.eq_ignore_ascii_case(&reload_slug)
+                                        && !det
+                                            .wiki_revisions
+                                            .iter()
+                                            .any(|r| r.revision == rev.revision)
+                                    {
+                                        det.wiki_revisions.insert(0, rev);
+                                    }
                                 }
                             }
                         }
-                        if on_same_comm_route
-                            && (this.state.community_loading || !still_same_comm_gen)
-                        {
-                            this.load_community_page(reload_slug, cx);
+                        if this.state.communities_loading {
+                            this.reload_communities_list(cx);
                         }
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "社区 Wiki 新版本已保存！", "Community Wiki revision saved!").to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
+                        if on_same_comm_route
+                            && (this.state.community_loading
+                                || (still_current_save && !still_same_comm_gen))
+                        {
+                            this.load_community_page(reload_slug.clone(), cx);
+                        }
+                        if this.state.mod_loading
+                            && this
+                                .state
+                                .mod_slug
+                                .as_deref()
+                                .is_some_and(|s| s.eq_ignore_ascii_case(&reload_slug))
+                        {
+                            this.load_mod_queue(reload_slug, cx);
+                        }
+                        if this.state.search_loading
+                            && matches!(this.state.route, CommunityRoute::Explore { .. })
+                        {
+                            let q = this.state.explore_search_draft.trim().to_string();
+                            this.execute_search(q, this.state.search_tab, cx);
+                        }
+                        if still_current_save {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(
+                                        &lang,
+                                        "社区 Wiki 新版本已保存！",
+                                        "Community Wiki revision saved!",
+                                    )
+                                    .to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                        }
                         cx.notify();
                     }
                     Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
-                            cx,
-                        );
+                        if still_current_save {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e.to_string(),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                         cx.notify();
                     }
                     Err(_) => {
@@ -441,6 +477,8 @@ impl CommunityWorkspace {
         if self.state.community_rules_saving {
             return;
         }
+        self.state.community_rules_save_seq = self.state.community_rules_save_seq.wrapping_add(1);
+        let my_save_seq = self.state.community_rules_save_seq;
         self.state.community_rules_saving = true;
         let my_actor_gen = self.state.actor_switch_gen;
         let my_comm_gen = self.state.community_gen;
@@ -464,70 +502,19 @@ impl CommunityWorkspace {
                 {
                     return;
                 }
-                let on_different_comm = matches!(
-                    &this.state.route,
-                    CommunityRoute::CommunityPage(s) if !s.eq_ignore_ascii_case(&reload_slug)
-                ) || this
-                    .state
-                    .community_detail
-                    .as_ref()
-                    .is_some_and(|d| !d.community.slug.eq_ignore_ascii_case(&reload_slug));
-                if !on_different_comm {
+                let still_current_save = this.state.community_rules_save_seq == my_save_seq;
+                if still_current_save {
                     this.state.community_rules_saving = false;
                 }
                 let still_same_comm_gen = this.state.community_gen == my_comm_gen;
                 let lang = this.language_id.clone();
                 match res {
-                    Ok(Ok(mut updated)) => {
-                        this.state.community_new_rule_title.clear();
-                        this.state.community_new_rule_desc.clear();
-                        this.state.overlay_in_flight_community_mutations(&mut updated);
-                        let slug_key = updated.slug.to_ascii_lowercase();
-                        if this.state.automod_in_flight.contains_key(&slug_key)
-                            || this.state.automod_dirty.contains(&slug_key)
-                        {
-                            let existing_automod = this
-                                .state
-                                .mod_community
-                                .as_ref()
-                                .filter(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
-                                .or_else(|| {
-                                    this.state
-                                        .communities
-                                        .iter()
-                                        .find(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
-                                })
-                                .or_else(|| {
-                                    this.state
-                                        .community_detail
-                                        .as_ref()
-                                        .map(|d| &d.community)
-                                        .filter(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
-                                })
-                                .map(|c| c.automod_rules.clone());
-                            if let Some(rules) = existing_automod {
-                                updated.automod_rules = rules;
-                            }
-                        }
-                        if let Some(pos) = this
-                            .state
-                            .communities
-                            .iter()
-                            .position(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
-                        {
-                            this.state.communities[pos] = updated.clone();
-                        }
-                        if let Some(ref mut mc) = this.state.mod_community {
-                            if mc.slug.eq_ignore_ascii_case(&updated.slug) {
-                                *mc = updated.clone();
-                            }
-                        }
-                        if still_same_comm_gen {
-                            if let Some(ref mut det) = this.state.community_detail {
-                                if det.community.slug.eq_ignore_ascii_case(&updated.slug) {
-                                    det.community = updated;
-                                }
-                            }
+                    Ok(Ok(updated)) => {
+                        if still_current_save {
+                            this.state.community_new_rule_title.clear();
+                            this.state.community_new_rule_desc.clear();
+                            this.state
+                                .patch_community_rules(&updated.slug, &updated.rules);
                         }
                         if this.state.communities_loading {
                             this.reload_communities_list(cx);
@@ -537,7 +524,8 @@ impl CommunityWorkspace {
                             CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&reload_slug)
                         );
                         if on_same_comm_route
-                            && (this.state.community_loading || !still_same_comm_gen)
+                            && (this.state.community_loading
+                                || (still_current_save && !still_same_comm_gen))
                         {
                             this.load_community_page(reload_slug.clone(), cx);
                         }
@@ -550,20 +538,34 @@ impl CommunityWorkspace {
                         {
                             this.load_mod_queue(reload_slug, cx);
                         }
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "社区规则已更新", "Community rules updated").to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
+                        if this.state.search_loading
+                            && matches!(this.state.route, CommunityRoute::Explore { .. })
+                        {
+                            let q = this.state.explore_search_draft.trim().to_string();
+                            this.execute_search(q, this.state.search_tab, cx);
+                        }
+                        if still_current_save {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "社区规则已更新", "Community rules updated")
+                                        .to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                        }
                         cx.notify();
                     }
                     Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
-                            cx,
-                        );
+                        if still_current_save {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e.to_string(),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                         cx.notify();
                     }
                     Err(_) => {

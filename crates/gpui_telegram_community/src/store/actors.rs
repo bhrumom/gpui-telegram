@@ -376,6 +376,19 @@ pub fn list_actors_conn(
     Ok(out)
 }
 
+pub fn list_actors_for_viewer_conn(
+    conn: &Connection,
+    kind_filter: Option<ActorKind>,
+    viewer_actor_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CommunityActorDto>> {
+    let mut out = list_actors_conn(conn, kind_filter, limit)?;
+    for actor in &mut out {
+        hydrate_actor_viewer_flags(conn, actor, viewer_actor_id)?;
+    }
+    Ok(out)
+}
+
 pub fn sync_telegram_identities_tx(
     tx: &Transaction<'_>,
     human: &TelegramHumanSyncInput,
@@ -794,6 +807,15 @@ impl CommunityStore {
         self.with_conn(|conn| list_actors_conn(conn, kind_filter, limit))
     }
 
+    pub fn list_actors_for_viewer(
+        &self,
+        kind_filter: Option<ActorKind>,
+        viewer_actor_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CommunityActorDto>> {
+        self.with_conn(|conn| list_actors_for_viewer_conn(conn, kind_filter, viewer_actor_id, limit))
+    }
+
     pub fn update_actor(
         &self,
         actor_id: &str,
@@ -935,5 +957,104 @@ mod tests {
             .expect("bob exists");
         assert!(bob_view.is_following);
         assert_eq!(bob_view.followers_count, 1);
+    }
+
+    #[test]
+    fn list_actors_for_viewer_hydrates_social_flags_and_preserves_legacy_list_actors() {
+        let store = CommunityStore::open_in_memory().expect("in-memory store");
+        let now = 1_750_000_000_000_i64;
+        let alice = store
+            .create_human_actor(
+                3001,
+                &RegisterHumanActorRequest {
+                    handle: "alice_list".into(),
+                    display_name: "Alice".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("alice");
+        let bob = store
+            .create_human_actor(
+                3002,
+                &RegisterHumanActorRequest {
+                    handle: "bob_list".into(),
+                    display_name: "Bob".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("bob");
+        let carol = store
+            .create_human_actor(
+                3003,
+                &RegisterHumanActorRequest {
+                    handle: "carol_list".into(),
+                    display_name: "Carol".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("carol");
+
+        store
+            .follow_actor(&alice.actor_id, &bob.actor_id, now + 10)
+            .expect("follow bob");
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: bob.actor_id.clone(),
+                    action: MuteBlockActionKind::Mute,
+                    reason: None,
+                },
+                now + 11,
+            )
+            .expect("mute bob");
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: carol.actor_id.clone(),
+                    action: MuteBlockActionKind::Block,
+                    reason: None,
+                },
+                now + 12,
+            )
+            .expect("block carol");
+
+        let hydrated = store
+            .list_actors_for_viewer(None, Some(&alice.actor_id), 50)
+            .expect("list_actors_for_viewer");
+        let alice_dto = hydrated.iter().find(|a| a.actor_id == alice.actor_id).expect("alice");
+        assert!(!alice_dto.is_following && !alice_dto.is_muted && !alice_dto.is_blocked);
+        let bob_dto = hydrated.iter().find(|a| a.actor_id == bob.actor_id).expect("bob");
+        assert!(bob_dto.is_following && bob_dto.is_muted && !bob_dto.is_blocked);
+        let carol_dto = hydrated.iter().find(|a| a.actor_id == carol.actor_id).expect("carol");
+        assert!(!carol_dto.is_following && !carol_dto.is_muted && carol_dto.is_blocked);
+
+        // Legacy list_actors signature and behavior remain untouched.
+        let legacy = store.list_actors(None, 50).expect("legacy list_actors");
+        assert!(legacy.iter().all(|a| !a.is_following && !a.is_muted && !a.is_blocked));
     }
 }

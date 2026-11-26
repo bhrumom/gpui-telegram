@@ -22,9 +22,7 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use super::shared_widgets::{
     format_compact_count, render_actor_avatar, render_actor_badge_row, render_input_display,
 };
-use super::state::{
-    ActiveCommunityInput, BotStudioEditDraft, CommunityRoute, CommunityWorkspaceAction,
-};
+use super::state::{ActiveCommunityInput, BotStudioEditDraft, CommunityWorkspaceAction};
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
 const PRESET_CAPABILITIES: [&str; 6] = [
@@ -533,6 +531,32 @@ impl CommunityWorkspace {
         .detach();
     }
 
+    /// Synchronizes `bot_studio_edit` metadata fields when an external surface (`submit_edit_profile`)
+    /// commits newer metadata for the same selected bot, without touching `bot_studio_edit.saving`
+    /// or `bot_studio_edit_save_seq`.
+    pub(super) fn sync_bot_studio_edit_metadata_if_matching(&mut self, actor: &CommunityActorDto) {
+        if self.state.bot_studio_edit.actor_id != actor.actor_id {
+            return;
+        }
+        let shape_idx = GROK_AVATAR_SHAPES
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(&actor.avatar_shape))
+            .unwrap_or(self.state.bot_studio_edit.shape_idx);
+        let color_idx = GROK_AVATAR_COLOR_IDS
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(&actor.avatar_color))
+            .unwrap_or(self.state.bot_studio_edit.color_idx);
+        self.state.bot_studio_edit.display_name = actor.display_name.clone();
+        self.state.bot_studio_edit.bio = actor.bio.clone();
+        self.state.bot_studio_edit.bot_badge = actor.bot_badge.clone().unwrap_or_default();
+        self.state.bot_studio_edit.bot_model = actor.bot_model.clone().unwrap_or_default();
+        self.state.bot_studio_edit.bot_capabilities = actor.bot_capabilities.clone();
+        self.state.bot_studio_edit.bot_persona = actor.bot_persona.clone().unwrap_or_default();
+        self.state.bot_studio_edit.bot_autonomy_mode = actor.bot_autonomy_mode;
+        self.state.bot_studio_edit.shape_idx = shape_idx;
+        self.state.bot_studio_edit.color_idx = color_idx;
+    }
+
     /// Saves edits to the currently selected owned Bot via `facade.update_actor`.
     pub fn save_selected_bot_edits(&mut self, cx: &mut Context<Self>) {
         if self.state.bot_studio_edit.saving {
@@ -577,6 +601,13 @@ impl CommunityWorkspace {
         self.state.bot_studio_edit.error = None;
         self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
         let my_id_gen = self.state.identities_gen;
+        let actor_edit_entry = self
+            .state
+            .actor_edit_seq
+            .entry(actor_id.clone())
+            .or_insert(0);
+        *actor_edit_entry = actor_edit_entry.wrapping_add(1);
+        let my_actor_edit_seq = *actor_edit_entry;
         let actor_id_cb = actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -595,31 +626,30 @@ impl CommunityWorkspace {
                     && this.state.bot_studio_selected_bot_id.as_deref()
                         == Some(actor_id_cb.as_str());
                 let latest_identities = this.state.identities_gen == my_id_gen;
+                let is_latest_actor_edit = this
+                    .state
+                    .actor_edit_seq
+                    .get(&actor_id_cb)
+                    .copied()
+                    == Some(my_actor_edit_seq);
                 if still_current_save {
                     this.state.bot_studio_edit.saving = false;
                 }
                 match res {
-                    Ok((Ok(mut updated), ids)) => {
-                        this.state.overlay_in_flight_actor_mutations(&mut updated);
+                    Ok((Ok(updated), ids)) => {
                         if latest_identities {
                             if let Some(i) = ids {
                                 this.state.identities = Some(i);
                             }
-                            if let Some(ref mut prof) = this.state.actor_profile {
-                                if prof.actor.actor_id == updated.actor_id {
-                                    prof.actor = updated.clone();
-                                }
-                            }
                         }
-                        if this.state.profile_loading {
-                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
-                                this.load_actor_profile(h, cx);
-                            }
+                        if is_latest_actor_edit {
+                            this.state.patch_edited_actor_metadata(&updated);
                         }
-                        if still_current_save {
+                        this.reload_actor_route_if_loading(cx);
+                        if still_current_save && is_latest_actor_edit {
                             this.select_bot_for_studio(updated, cx);
                         }
-                        if still_current_save || latest_identities {
+                        if is_latest_actor_edit {
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast {
                                     text: tr_str(

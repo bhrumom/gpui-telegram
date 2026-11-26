@@ -2734,5 +2734,273 @@ async fn test_r9_create_post_as_actor_header_isolation_and_validation() {
     drop_client(client).await;
 }
 
+#[tokio::test]
+async fn test_r10_actor_id_unicode_obs_text_rejection_and_offline_viewer_hydration() {
+    // Part A (R9-HUNT-1): Unicode whitespace (NBSP, U+3000, NEL, U+2028), zero-width/BOM,
+    // obs-text/emoji, embedded space, and ASCII controls MUST all fail client-side validation
+    // with ZERO HTTP requests captured (never silently falling back to Human Bearer identity).
+    let state = MockState::default();
+    let server = spawn_router(build_full_mock_router(state.clone())).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = open_client(&server.base_url, dir.path());
+    client.set_auth_session(make_auth_session(1001, "alice_r10", "tok_alice"));
+    let c = client.community();
+    let http = client.http_client.clone();
+    c.set_active_actor_id(Some("u:1001".to_string()));
+
+    let req = CreatePostRequest {
+        community_slug: Some("rust".into()),
+        body: "R10 actor validation test".into(),
+        ..Default::default()
+    };
+
+    let bad_payloads = [
+        "",
+        "   ",
+        "\t",
+        "\r\n",
+        "\x00",
+        "\x7f",
+        "b:42\r\nX-Injected: 1",
+        "b:42 evil",
+        "\u{00A0}",
+        "\u{3000}",
+        " \u{00A0} ",
+        "\u{0085}",
+        "\u{2028}",
+        "\u{2029}",
+        "\u{200B}",
+        "\u{200C}",
+        "\u{200D}",
+        "\u{FEFF}",
+        "b:42\u{00A0}",
+        "b:42\u{200B}",
+        "b:42🦀",
+    ];
+
+    for bad in bad_payloads {
+        let before = state.captured.lock().len();
+        let err = c
+            .create_post_as(bad, &req)
+            .await
+            .expect_err(&format!("online create_post_as({bad:?}) must fail validation"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "online create_post_as({bad:?}) expected Validation, got {err:?}"
+        );
+        assert_eq!(
+            state.captured.lock().len(),
+            before,
+            "online create_post_as({bad:?}) must send 0 HTTP requests"
+        );
+        assert_eq!(
+            c.active_actor_id().as_deref(),
+            Some("u:1001"),
+            "create_post_as({bad:?}) must not mutate active_actor_id"
+        );
+
+        // Direct HttpClient::community_create_post check for non-empty bad headers
+        if !bad.is_empty() && bad != "   " {
+            let http_err = http
+                .community_create_post(Some("tok_alice"), Some(bad), &req)
+                .await
+                .expect_err(&format!("direct HTTP act_as={bad:?} must fail"));
+            assert!(
+                matches!(http_err, gpui_telegram_client::CommunityApiError::InvalidInput(_)),
+                "direct HTTP act_as={bad:?} expected InvalidInput, got {http_err:?}"
+            );
+            assert_eq!(
+                state.captured.lock().len(),
+                before,
+                "direct HTTP act_as={bad:?} must send 0 HTTP requests"
+            );
+        }
+    }
+
+    // set_active_actor_id with Unicode whitespace / obs-text must fail outbound get_feed with
+    // 0 HTTP requests and must NOT poison persisted SQLite active_actor_id on disk!
+    for bad in ["\u{00A0}", "\u{3000}", "\u{200B}", "\u{FEFF}", "b:42🦀", "b:42 evil"] {
+        let before = state.captured.lock().len();
+        c.set_active_actor_id(Some(bad.to_string()));
+        let err = c
+            .get_feed(&FeedRequestDto::default())
+            .await
+            .expect_err(&format!("online get_feed with active_actor_id={bad:?} must fail"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "online get_feed({bad:?}) expected Validation, got {err:?}"
+        );
+        assert_eq!(
+            state.captured.lock().len(),
+            before,
+            "online get_feed({bad:?}) must send 0 HTTP requests"
+        );
+    }
+
+    // Re-bind same account scope: persisted active_actor_id must still be clean "u:1001"
+    c.local_runtime()
+        .bind_account_scope(1001, "alice_r10", Some("Alice R10"))
+        .expect("rebind account scope");
+    assert_eq!(
+        c.active_actor_id().as_deref(),
+        Some("u:1001"),
+        "invalid actor_ids must NEVER persist to SQLite community_client_meta"
+    );
+
+    // Positive check: valid padded ASCII actor_id succeeds and sends normalized X-Community-Actor-Id
+    let _ = c
+        .create_post_as("  b:42  ", &req)
+        .await
+        .expect("padded valid actor_id must succeed");
+    assert_eq!(
+        state
+            .captured
+            .lock()
+            .last()
+            .and_then(|r| r.actor_id.as_deref()),
+        Some("b:42")
+    );
+
+    // Switch to offline/local fallback mode and test BOTH R9-HUNT-1 offline & R9-HUNT-6!
+    let _ = c.get_identities().await.expect("mirror b:42 locally");
+    server.stop().await;
+
+    for bad in bad_payloads {
+        let err = c
+            .create_post_as(bad, &req)
+            .await
+            .expect_err(&format!("offline create_post_as({bad:?}) must fail validation"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "offline create_post_as({bad:?}) expected Validation, got {err:?}"
+        );
+    }
+    for bad in ["\u{00A0}", "\u{200B}", "b:42🦀", "b:42 evil"] {
+        c.set_active_actor_id(Some(bad.to_string()));
+        let err = c
+            .get_feed(&FeedRequestDto::default())
+            .await
+            .expect_err(&format!("offline get_feed({bad:?}) must fail"));
+        assert!(matches!(err, TelegramError::Validation(_)));
+    }
+    c.set_active_actor_id(Some("u:1001".to_string()));
+
+    // Part B (R9-HUNT-6): Offline LocalCommunityRuntime::get_community moderators AND
+    // LocalCommunityRuntime::search actors MUST hydrate is_following / is_muted / is_blocked!
+    let local_rt = c.local_runtime();
+    let comm_init = local_rt
+        .get_community(Some("u:1001"), "rust")
+        .expect("local get_community rust");
+    let other_mod = comm_init
+        .moderators
+        .iter()
+        .find(|m| m.actor_id != "u:1001")
+        .cloned()
+        .expect("seeded rust community must have a non-viewer moderator");
+    assert!(!other_mod.is_following && !other_mod.is_muted && !other_mod.is_blocked);
+
+    // Follow + mute the moderator in local SQLite
+    local_rt
+        .follow_actor(Some("u:1001"), &other_mod.actor_id)
+        .expect("local follow moderator");
+    local_rt
+        .set_mute_block(
+            Some("u:1001"),
+            &MuteBlockRequest {
+                target_kind: MuteBlockTargetKind::Actor,
+                target_value: other_mod.actor_id.clone(),
+                action: MuteBlockActionKind::Mute,
+                reason: None,
+            },
+        )
+        .expect("local mute moderator");
+
+    let comm_after_fm = local_rt
+        .get_community(Some("u:1001"), "rust")
+        .expect("local get_community after follow+mute");
+    let mod_fm = comm_after_fm
+        .moderators
+        .iter()
+        .find(|m| m.actor_id == other_mod.actor_id)
+        .expect("moderator present");
+    assert!(
+        mod_fm.is_following && mod_fm.is_muted && !mod_fm.is_blocked,
+        "R9-HUNT-6: offline get_community moderators must hydrate is_following+is_muted, got {mod_fm:?}"
+    );
+
+    // Bonus sibling check: offline search People/Bots must also hydrate viewer flags!
+    let search_tab = if other_mod.actor_kind.is_bot_like() {
+        CommunitySearchTab::Bots
+    } else {
+        CommunitySearchTab::People
+    };
+    let search_fm = local_rt
+        .search(
+            Some("u:1001"),
+            &CommunitySearchRequestDto {
+                tab: search_tab,
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .expect("local search");
+    let found_actor = search_fm
+        .actors
+        .iter()
+        .find(|a| a.actor_id == other_mod.actor_id)
+        .expect("moderator present in local search");
+    assert!(
+        found_actor.is_following && found_actor.is_muted && !found_actor.is_blocked,
+        "R9-HUNT-6 sibling: offline search actors must hydrate is_following+is_muted, got {found_actor:?}"
+    );
+
+    // Block the moderator -> is_blocked=true, is_following=false in BOTH get_community & search!
+    local_rt
+        .set_mute_block(
+            Some("u:1001"),
+            &MuteBlockRequest {
+                target_kind: MuteBlockTargetKind::Actor,
+                target_value: other_mod.actor_id.clone(),
+                action: MuteBlockActionKind::Block,
+                reason: None,
+            },
+        )
+        .expect("local block moderator");
+
+    let comm_after_blk = local_rt
+        .get_community(Some("u:1001"), "rust")
+        .expect("local get_community after block");
+    let mod_blk = comm_after_blk
+        .moderators
+        .iter()
+        .find(|m| m.actor_id == other_mod.actor_id)
+        .expect("moderator present after block");
+    assert!(
+        !mod_blk.is_following && mod_blk.is_blocked,
+        "R9-HUNT-6: offline get_community moderator must reflect block+unfollow, got {mod_blk:?}"
+    );
+    let search_blk = local_rt
+        .search(
+            Some("u:1001"),
+            &CommunitySearchRequestDto {
+                tab: search_tab,
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .expect("local search after block");
+    let found_blk = search_blk
+        .actors
+        .iter()
+        .find(|a| a.actor_id == other_mod.actor_id)
+        .expect("actor present in search after block");
+    assert!(
+        !found_blk.is_following && found_blk.is_blocked,
+        "R9-HUNT-6 sibling: offline search actor must reflect block+unfollow, got {found_blk:?}"
+    );
+
+    drop_client(client).await;
+}
+
 
 

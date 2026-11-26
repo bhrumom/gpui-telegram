@@ -379,13 +379,32 @@ fn classify_non_success(resp: &RawCommunityHttpResponse) -> CommunityApiError {
     }
 }
 
+/// Validates and normalizes an explicit actor ID (`X-Community-Actor-Id` / `act_as`).
+/// Rejects all ASCII control bytes (`< 0x20`, `0x7f`), ALL non-ASCII bytes (`>= 0x80`, covering
+/// Unicode whitespace NBSP/U+3000/NEL/U+2028, zero-width/BOM U+200B..U+FEFF, and obs-text smuggling),
+/// empty/ASCII-space-only values, and embedded ASCII spaces. Valid actor IDs (`u:123`, `b:456`,
+/// `"  b:42  "`) normalize cleanly to printable non-space ASCII (`0x21..=0x7e`).
+pub(crate) fn validate_and_normalize_actor_id(raw: &str) -> std::result::Result<&str, &'static str> {
+    if raw.bytes().any(|b| b < 0x20 || b >= 0x7f) {
+        return Err("actor_id contains invalid control or non-ASCII characters");
+    }
+    let trimmed = raw.trim_matches(' ');
+    if trimmed.is_empty() {
+        return Err("actor_id must not be empty");
+    }
+    if trimmed.bytes().any(|b| b == b' ') {
+        return Err("actor_id must not contain embedded whitespace");
+    }
+    Ok(trimmed)
+}
+
 fn validate_header_value(field: &str, raw: &str) -> Result<String, CommunityApiError> {
-    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+    if raw.bytes().any(|b| b < 0x20 || b >= 0x7f) {
         return Err(CommunityApiError::InvalidInput(format!(
             "Invalid characters in {field} header"
         )));
     }
-    let trimmed = raw.trim();
+    let trimmed = raw.trim_matches(' ');
     if trimmed.is_empty() {
         return Err(CommunityApiError::InvalidInput(format!(
             "{field} must not be empty"
@@ -570,12 +589,12 @@ impl HttpClient {
     ) -> Result<RawCommunityHttpResponse, CommunityApiError> {
         let auth_header: Option<HeaderValue> = match auth {
             Some(CommunityAuth::Bearer(raw)) => {
-                if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                if raw.bytes().any(|b| b < 0x20 || b >= 0x7f) {
                     return Err(CommunityApiError::InvalidInput(
-                        "Invalid control characters in Authorization header".into(),
+                        "Invalid control or non-ASCII characters in Authorization header".into(),
                     ));
                 }
-                if raw.trim().is_empty() {
+                if raw.trim_matches(' ').is_empty() {
                     None
                 } else {
                     let clean = validate_header_value("Authorization", raw)?;
@@ -589,12 +608,12 @@ impl HttpClient {
                 }
             }
             Some(CommunityAuth::Bot(raw)) => {
-                if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                if raw.bytes().any(|b| b < 0x20 || b >= 0x7f) {
                     return Err(CommunityApiError::InvalidInput(
-                        "Invalid control characters in Authorization header".into(),
+                        "Invalid control or non-ASCII characters in Authorization header".into(),
                     ));
                 }
-                if raw.trim().is_empty() {
+                if raw.trim_matches(' ').is_empty() {
                     None
                 } else {
                     let clean = validate_header_value("Authorization", raw)?;
@@ -612,21 +631,21 @@ impl HttpClient {
 
         let actor_header: Option<HeaderValue> = match act_as_actor_id {
             Some(raw) if !raw.is_empty() => {
-                if raw.trim().is_empty() {
-                    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
-                        return Err(CommunityApiError::InvalidInput(format!(
-                            "Invalid control characters in {HEADER_COMMUNITY_ACTOR_ID} header"
-                        )));
-                    }
+                if raw.bytes().any(|b| b < 0x20 || b >= 0x7f) {
+                    return Err(CommunityApiError::InvalidInput(format!(
+                        "Invalid control or non-ASCII characters in {HEADER_COMMUNITY_ACTOR_ID} header"
+                    )));
+                }
+                let trimmed = raw.trim_matches(' ');
+                if trimmed.is_empty() {
                     None
                 } else {
-                    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
-                        return Err(CommunityApiError::InvalidInput(format!(
-                            "Invalid control characters in {HEADER_COMMUNITY_ACTOR_ID} header"
-                        )));
-                    }
-                    let clean = validate_header_value(HEADER_COMMUNITY_ACTOR_ID, raw)?;
-                    Some(HeaderValue::from_str(&clean).map_err(|_| {
+                    let clean = validate_and_normalize_actor_id(trimmed).map_err(|msg| {
+                        CommunityApiError::InvalidInput(format!(
+                            "Invalid {HEADER_COMMUNITY_ACTOR_ID} header: {msg}"
+                        ))
+                    })?;
+                    Some(HeaderValue::from_str(clean).map_err(|_| {
                         CommunityApiError::InvalidInput(format!(
                             "Invalid {HEADER_COMMUNITY_ACTOR_ID} header"
                         ))
@@ -1975,5 +1994,46 @@ mod tests {
         assert!(search_q.contains("actor_kind=bot"));
         assert!(search_q.contains("has_poll=true"));
         assert!(search_q.contains("offset=5"));
+    }
+
+    #[test]
+    fn validate_and_normalize_actor_id_rejects_unicode_whitespace_obs_text_and_controls() {
+        assert_eq!(validate_and_normalize_actor_id("u:1001").unwrap(), "u:1001");
+        assert_eq!(validate_and_normalize_actor_id("  b:42  ").unwrap(), "b:42");
+        assert_eq!(validate_and_normalize_actor_id("u:0").unwrap(), "u:0");
+
+        for bad in [
+            "",
+            "   ",
+            "\t",
+            "\r\n",
+            "\x00",
+            "\x7f",
+            "b:42\r\nX-Injected: 1",
+            "b:42 evil",
+            "\u{00A0}",
+            "\u{3000}",
+            " \u{00A0} ",
+            "\u{0085}",
+            "\u{2028}",
+            "\u{2029}",
+            "\u{200B}",
+            "\u{200C}",
+            "\u{200D}",
+            "\u{FEFF}",
+            "b:42\u{00A0}",
+            "b:42\u{200B}",
+            "b:42🦀",
+        ] {
+            assert!(
+                validate_and_normalize_actor_id(bad).is_err(),
+                "actor_id {bad:?} must be rejected"
+            );
+            assert!(
+                validate_header_value(HEADER_COMMUNITY_ACTOR_ID, bad).is_err()
+                    || bad == "b:42 evil",
+                "validate_header_value({bad:?}) must reject control/non-ASCII/empty"
+            );
+        }
     }
 }

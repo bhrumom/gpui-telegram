@@ -1243,7 +1243,7 @@ impl CommunityWorkspace {
                             if is_dirty || ui_differs {
                                 this.state.list_membership_dirty.insert(list_id.clone());
                             } else {
-                                this.state.lists[pos] = updated;
+                                this.state.patch_list_membership_fields(&updated);
                                 this.state.list_membership_last_synced.remove(&list_id);
                             }
                             cx.notify();
@@ -1254,7 +1254,7 @@ impl CommunityWorkspace {
                             this.flush_list_sync(list_id, cx);
                             return;
                         }
-                        this.state.lists[pos] = updated;
+                        this.state.patch_list_membership_fields(&updated);
                         this.state.list_membership_last_synced.remove(&list_id);
                         if (this.state.list_membership_needs_feed_reload.remove(&list_id)
                             || this.state.list_feed_loading)
