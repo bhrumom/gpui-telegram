@@ -123,6 +123,7 @@ define_icons! {
     }
     extra {
         ArrowUp => "arrow_up.svg",
+        CodeScene => "code_scene.svg",
         HubBooks => "hub_books.svg",
         HubMusic => "hub_music.svg",
         HubGames => "hub_games.svg",

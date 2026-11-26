@@ -101,6 +101,9 @@ impl NavigationStateMachineSimulator {
             NavDestination::Browser => {
                 self.active_panel = ActiveWorkspacePanel::Browser;
             }
+            NavDestination::CodeScene => {
+                self.active_panel = ActiveWorkspacePanel::CodeScene;
+            }
             NavDestination::Community => {
                 self.active_panel = ActiveWorkspacePanel::Community;
             }
@@ -138,6 +141,9 @@ impl NavigationStateMachineSimulator {
                 }
                 NavDestination::Browser => {
                     self.active_panel = ActiveWorkspacePanel::Browser;
+                }
+                NavDestination::CodeScene => {
+                    self.active_panel = ActiveWorkspacePanel::CodeScene;
                 }
                 NavDestination::Community => {
                     self.active_panel = ActiveWorkspacePanel::Community;

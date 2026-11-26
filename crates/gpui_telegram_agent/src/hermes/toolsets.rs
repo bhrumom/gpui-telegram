@@ -197,7 +197,7 @@ impl ToolsetId {
             Self::SessionSearch => "Full-text and CJK fallback search across past conversation sessions",
             Self::Workspace => "Workspace file checkpoint inspection and atomic turn rollback",
             Self::Voice => "Full-duplex Voice / Talk Mode coordinator state control",
-            Self::PlatformIm => "Native platform IM messaging, channels, topics, reactions, pins, polls, MiniApps, and Community",
+            Self::PlatformIm => "Native platform IM messaging, channels, topics, reactions, pins, polls, MiniApps, Community, and Code Scene creation & publishing",
         }
     }
 }
@@ -2874,6 +2874,117 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             false,
         ),
         HermesToolSpec::new(
+            "code_scene_create_draft",
+            ToolsetId::PlatformIm,
+            "Generate and dry-run validate a new Code Scene (video, animation, or playable game) draft in `cs1` script from a natural-language prompt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Natural-language description of the video, animation, or playable game to create." },
+                    "kind": { "type": "string", "enum": ["video", "animation", "game"] },
+                    "style_tags": { "type": "array", "items": { "type": "string" } },
+                    "seed": { "type": "integer" },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": ["prompt"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "code_scene_iterate_draft",
+            ToolsetId::PlatformIm,
+            "Iteratively refine an existing Code Scene draft or `cs1` source_code with a modification instruction and dry-run validate the updated result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "draft_id": { "type": "string" },
+                    "source_code": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "instruction": { "type": "string" },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": ["instruction"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "code_scene_validate",
+            ToolsetId::PlatformIm,
+            "Compile and 5-frame dry-run validate a `cs1` Code Scene script inside the sandboxed VM, returning diagnostics and render statistics.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source_code": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["video", "animation", "game"] },
+                    "manifest": { "type": "object" },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": ["source_code"]
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "code_scene_publish",
+            ToolsetId::PlatformIm,
+            "Generate (if prompt provided), compile-and-verify, atomically publish a Code Scene into the live feed recommender, and optionally post an interactive GenerativeCard to chat.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "draft_id": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["video", "animation", "game"] },
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "source_code": { "type": "string" },
+                    "manifest": { "type": "object" },
+                    "controls_hint": { "type": "string" },
+                    "remix_parent_id": { "type": "string" },
+                    "post_card_to_chat": { "type": "boolean" },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": []
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "code_scene_remix",
+            ToolsetId::PlatformIm,
+            "Remix an existing Code Scene asset with a modification prompt, preserving remix lineage and optionally auto-publishing with an interactive chat card.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "scene_id": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "auto_publish": { "type": "boolean" },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": ["scene_id", "prompt"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "code_scene_list_mine",
+            ToolsetId::PlatformIm,
+            "List Code Scene assets published by the current user, optionally filtered by modality.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["video", "animation", "game"] },
+                    "limit": { "type": "integer" },
+                    "chat_id": { "type": "integer" }
+                },
+                "required": []
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
             "create_book",
             ToolsetId::PlatformIm,
             "Create a rich multi-chapter book draft saved to the caller's private cloud creations (Apple Books format, ready for review submission).",
@@ -3694,6 +3805,79 @@ fn validate_platform_im_args(spec_name: &str, args: &Value) -> Result<(), String
                 }
             }
         }
+        "code_scene_create_draft" => {
+            if !obj
+                .get("prompt")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err("code_scene_create_draft requires non-empty 'prompt'".into());
+            }
+        }
+        "code_scene_iterate_draft" => {
+            if !obj
+                .get("instruction")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err("code_scene_iterate_draft requires non-empty 'instruction'".into());
+            }
+            let has_draft = obj
+                .get("draft_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_src = obj
+                .get("source_code")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_draft && !has_src {
+                return Err(
+                    "code_scene_iterate_draft requires either 'draft_id' or 'source_code'".into(),
+                );
+            }
+        }
+        "code_scene_validate" => {
+            if !obj
+                .get("source_code")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err("code_scene_validate requires non-empty 'source_code'".into());
+            }
+        }
+        "code_scene_publish" => {
+            let has_draft = obj
+                .get("draft_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_src = obj
+                .get("source_code")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_prompt = obj
+                .get("prompt")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_draft && !has_src && !has_prompt {
+                return Err(
+                    "code_scene_publish requires at least one of 'draft_id', 'source_code', or 'prompt'"
+                        .into(),
+                );
+            }
+        }
+        "code_scene_remix" => {
+            let has_scene = obj
+                .get("scene_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_prompt = obj
+                .get("prompt")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_scene || !has_prompt {
+                return Err("code_scene_remix requires non-empty 'scene_id' and 'prompt'".into());
+            }
+        }
         "create_book" | "create_music" | "create_game" => {
             let has_title = obj
                 .get("title")
@@ -3775,6 +3959,36 @@ async fn execute_platform_im_tool(
     }
 
     let Some(bridge) = ctx.platform_im_bridge.as_ref() else {
+        if spec_name == "code_scene_validate" {
+            let source_code = args
+                .get("source_code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(gpui_telegram_proto::code_scene_contracts::AssetKind::parse)
+                .unwrap_or(gpui_telegram_proto::code_scene_contracts::AssetKind::Animation);
+            let mut manifest = args
+                .get("manifest")
+                .and_then(|v| {
+                    serde_json::from_value::<
+                        gpui_telegram_proto::code_scene_contracts::AssetManifest,
+                    >(v.clone())
+                    .ok()
+                })
+                .unwrap_or_else(|| {
+                    gpui_telegram_proto::code_scene_contracts::AssetManifest::for_kind(kind)
+                });
+            manifest.clamp_in_place();
+            let report = gpui_telegram_code_scene::validate_to_report(source_code, &manifest);
+            let val = serde_json::to_value(&report).unwrap_or_else(|_| json!({ "ok": report.ok }));
+            return HermesToolResult::ok(
+                spec_name,
+                serde_json::to_string_pretty(&val).unwrap_or_default(),
+                Some(val),
+            );
+        }
         return HermesToolResult::err(
             spec_name,
             "PlatformImBridge is not attached to HermesToolContext",
@@ -3832,7 +4046,46 @@ async fn execute_platform_im_tool(
                     error: Some(err_msg),
                 }
             } else {
-                HermesToolResult::ok(spec_name, pretty, Some(val))
+                let mut res = HermesToolResult::ok(spec_name, pretty, Some(val.clone()));
+                if matches!(spec_name, "code_scene_publish" | "code_scene_remix") {
+                    if let Some(sid) = val
+                        .get("scene_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| val.pointer("/asset/scene_id").and_then(Value::as_str))
+                        .or_else(|| {
+                            val.pointer("/published/asset/scene_id")
+                                .and_then(Value::as_str)
+                        })
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let sid_str = sid.to_string();
+                        res = res.with_inline_buttons(vec![
+                            HermesInlineButton {
+                                label: "▶ 打开代码场景".to_string(),
+                                callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Open(
+                                    sid_str.clone(),
+                                )
+                                .to_payload(),
+                            },
+                            HermesInlineButton {
+                                label: "✨ Remix 改编".to_string(),
+                                callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Remix(
+                                    sid_str.clone(),
+                                )
+                                .to_payload(),
+                            },
+                            HermesInlineButton {
+                                label: "↗ 分享".to_string(),
+                                callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Share(
+                                    sid_str,
+                                )
+                                .to_payload(),
+                            },
+                        ]);
+                    }
+                }
+                res
             }
         }
         Err(err) => HermesToolResult::err(spec_name, err),

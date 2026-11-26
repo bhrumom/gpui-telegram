@@ -10,8 +10,9 @@ use crate::views::settings::SettingsRouter;
 use crate::views::tdesktop_theme::resolve_desktop_palette;
 use crate::views::{
     AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
-    CommunityWorkspace, ComputerWorkbench, ContentHubWorkspace, ContextInspector,
-    ConversationStage, GlobalTasksWorkspace, IvViewer, MainMenuDrawer, MediaViewer, NavRail,
+    CodeSceneWorkspace, CommunityWorkspace, ComputerWorkbench, ContentHubWorkspace,
+    ContextInspector, ConversationStage, GlobalTasksWorkspace, IvViewer, MainMenuDrawer,
+    MediaViewer, NavRail,
 };
 
 /// Maps persisted app preferences and optional desktop mode override into a full theme palette.
@@ -117,6 +118,7 @@ pub struct ShellThemeTargets<'a> {
     pub modal_container: &'a Entity<ModalContainer>,
     pub tasks_workspace: &'a Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<&'a Entity<BrowserWorkspace>>,
+    pub code_scene_workspace: Option<&'a Entity<CodeSceneWorkspace>>,
     pub community_workspace: Option<&'a Entity<CommunityWorkspace>>,
     pub talk_mode_overlay: Option<&'a Entity<CallOverlay>>,
     pub computer_overlay: Option<&'a Entity<ComputerWorkbench>>,
@@ -184,6 +186,11 @@ pub fn propagate_theme_and_locale<V: 'static>(
     }
     if let Some(browser) = targets.browser_workspace {
         browser.update(cx, |w, wcx| {
+            w.sync_theme_and_locale(palette.clone(), lang_id, wcx);
+        });
+    }
+    if let Some(code_scene) = targets.code_scene_workspace {
+        code_scene.update(cx, |w, wcx| {
             w.sync_theme_and_locale(palette.clone(), lang_id, wcx);
         });
     }

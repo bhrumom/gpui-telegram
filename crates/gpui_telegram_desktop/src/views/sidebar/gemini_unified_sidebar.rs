@@ -404,6 +404,25 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                     UnifiedSidebarAction::OpenContacts,
                 ))
                 .child(render_collapsed_icon_btn(
+                    "rail-code-scene-btn",
+                    "code_scene",
+                    IconName::CodeScene,
+                    tr_str(lang_id, "代码场景", "Code Scene"),
+                    nav.active_destination == NavDestination::CodeScene,
+                    0,
+                    hovered_item,
+                    palette,
+                    cx,
+                    on_action.clone(),
+                    UnifiedSidebarAction::SelectDestination(
+                        if nav.active_destination == NavDestination::CodeScene {
+                            NavDestination::Chats
+                        } else {
+                            NavDestination::CodeScene
+                        },
+                    ),
+                ))
+                .child(render_collapsed_icon_btn(
                     "rail-browser-btn",
                     "browser",
                     IconName::ScreenShare,

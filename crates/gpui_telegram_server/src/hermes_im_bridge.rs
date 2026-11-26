@@ -95,6 +95,8 @@ pub struct ServerPlatformImBridge {
     search_indexer: Weak<TantivyIndexer>,
     hybrid_memory: Weak<HybridMemoryEngine>,
     webmcp_broker: Weak<MiniAppWebMcpBroker>,
+    code_scene: Arc<crate::routes::code_scene::CodeSceneRuntimeState>,
+    fabushi_bots: Weak<gpui_telegram_agent::fabushi_bot::FabushiBotHost>,
     community_search: Weak<gpui_telegram_community::CommunitySearchIndexer>,
     community_bot_guard: Weak<gpui_telegram_community::BotLoopGuard>,
     state_weak: Arc<OnceLock<Weak<AppState>>>,
@@ -111,6 +113,8 @@ impl ServerPlatformImBridge {
         search_indexer: Weak<TantivyIndexer>,
         hybrid_memory: Weak<HybridMemoryEngine>,
         webmcp_broker: Weak<MiniAppWebMcpBroker>,
+        code_scene: Arc<crate::routes::code_scene::CodeSceneRuntimeState>,
+        fabushi_bots: Weak<gpui_telegram_agent::fabushi_bot::FabushiBotHost>,
         community_search: Weak<gpui_telegram_community::CommunitySearchIndexer>,
         community_bot_guard: Weak<gpui_telegram_community::BotLoopGuard>,
         state_weak: Arc<OnceLock<Weak<AppState>>>,
@@ -123,6 +127,8 @@ impl ServerPlatformImBridge {
             search_indexer,
             hybrid_memory,
             webmcp_broker,
+            code_scene,
+            fabushi_bots,
             community_search,
             community_bot_guard,
             state_weak,
@@ -163,6 +169,60 @@ impl ServerPlatformImBridge {
         if let Some(hub) = self.gateway_hub.upgrade() {
             emit_user_creation_changed_to_hub(&hub, dto);
         }
+    }
+
+    fn resolve_user_provider_router(
+        &self,
+        caller_uid: UserId,
+    ) -> Option<gpui_telegram_agent::ProviderRouter> {
+        self.fabushi_bots
+            .upgrade()
+            .map(|host| host.core_engine().providers_for_user(&caller_uid.0.to_string()))
+            .or_else(|| {
+                self.state_weak
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .map(|st| st.fabushi_core().providers_for_user(&caller_uid.0.to_string()))
+            })
+    }
+
+    fn resolve_code_scene_actors(
+        &self,
+        caller: &PlatformImCaller,
+        caller_uid: UserId,
+    ) -> (i64, Option<i64>, Option<String>) {
+        let author_user_id = caller_uid.0 as i64;
+        let explicit_bot_id = caller.bot_id.filter(|&b| b > 0).or_else(|| {
+            caller.bound_agent_id.as_deref().and_then(|aid| {
+                self.db
+                    .list_all_bots()
+                    .ok()
+                    .and_then(|bots| bots.into_iter().find(|b| b.agent_id == aid))
+                    .map(|b| b.bot_user_id)
+            })
+        });
+        let (bot_id, bot_username) = crate::routes::code_scene::resolve_creator_bot(
+            &self.db,
+            explicit_bot_id,
+            None,
+            true,
+        );
+        (author_user_id, bot_id, bot_username)
+    }
+
+    fn resolve_optional_chat_id(
+        args: &Value,
+        caller: &PlatformImCaller,
+    ) -> Result<Option<ChatId>, String> {
+        if let Some(pinned) = caller.chat_id {
+            Self::reject_cross_chat_arg(args, pinned)?;
+            return Ok((pinned > 0).then_some(ChatId(pinned)));
+        }
+        Ok(args
+            .get("chat_id")
+            .and_then(|v| v.as_i64())
+            .filter(|&c| c > 0)
+            .map(ChatId))
     }
 
     fn resolve_caller_user(&self, caller: &PlatformImCaller) -> Result<UserId, String> {
@@ -2688,6 +2748,571 @@ impl PlatformImBridge for ServerPlatformImBridge {
                         "mode": evt.mode,
                         "user_note": evt.user_note,
                         "state_snapshot": evt.state_snapshot,
+                    }))
+                }
+                "code_scene_create_draft" => {
+                    if let Some(pinned) = caller.chat_id {
+                        Self::reject_cross_chat_arg(args, pinned)?;
+                    }
+                    let prompt = args
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "code_scene_create_draft requires non-empty 'prompt'".to_string())?;
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(gpui_telegram_proto::code_scene_contracts::AssetKind::parse);
+                    let style_tags = args.get("style_tags").and_then(|v| {
+                        serde_json::from_value::<Vec<String>>(v.clone()).ok()
+                    });
+                    let seed = args.get("seed").and_then(Value::as_u64);
+                    let (author_uid, bot_id, bot_username) =
+                        self.resolve_code_scene_actors(&caller, caller_uid);
+                    let req = gpui_telegram_proto::code_scene_contracts::AiGenerateSceneRequest {
+                        prompt: prompt.to_string(),
+                        kind,
+                        bot_id,
+                        bot_username: bot_username.clone(),
+                        style_tags,
+                        seed,
+                    };
+                    let router = self.resolve_user_provider_router(caller_uid);
+                    let mut outcome = gpui_telegram_agent::CodeSceneBotGenerator::default()
+                        .generate(router.as_ref(), &req)
+                        .await;
+                    if !outcome.draft.validation.ok {
+                        let (rechecked, _) = self
+                            .code_scene
+                            .run_validation_offloaded(
+                                outcome.draft.source_code.clone(),
+                                outcome.draft.manifest.clone(),
+                            )
+                            .await;
+                        outcome.draft.validation = rechecked;
+                    }
+                    let draft_id = format!("draft_{}", Uuid::new_v4().simple());
+                    let resp = outcome.draft.into_ai_generate_response(
+                        draft_id,
+                        bot_id,
+                        bot_username,
+                        outcome.repair_attempts,
+                    );
+                    let rec = crate::routes::code_scene::draft_record_from_ai_response(
+                        &resp,
+                        author_uid,
+                        None,
+                        vec![prompt.to_string()],
+                        Utc::now().timestamp_millis(),
+                    );
+                    self.db
+                        .upsert_code_scene_bot_draft(&rec)
+                        .map_err(|e| e.to_string())?;
+                    serde_json::to_value(&resp).map_err(|e| e.to_string())
+                }
+                "code_scene_iterate_draft" => {
+                    if let Some(pinned) = caller.chat_id {
+                        Self::reject_cross_chat_arg(args, pinned)?;
+                    }
+                    let instruction = args
+                        .get("instruction")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "code_scene_iterate_draft requires non-empty 'instruction'".to_string())?;
+                    let (author_uid, bot_id, bot_username) =
+                        self.resolve_code_scene_actors(&caller, caller_uid);
+                    let draft_id_arg = args
+                        .get("draft_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let inline_source = args
+                        .get("source_code")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty());
+                    let inline_manifest = args.get("manifest").and_then(|v| {
+                        serde_json::from_value::<gpui_telegram_proto::code_scene_contracts::AssetManifest>(v.clone()).ok()
+                    });
+
+                    let (base_src, mut base_manifest, base_title, base_tags, mut history, remix_parent_id, draft_id, created_at_ms) =
+                        if let Some(did) = draft_id_arg {
+                            let d = self
+                                .db
+                                .get_code_scene_bot_draft(did)
+                                .map_err(|e| e.to_string())?
+                                .ok_or_else(|| format!("Draft '{did}' not found"))?;
+                            if d.user_id != author_uid {
+                                return Err("Cannot iterate a draft owned by another user".to_string());
+                            }
+                            (
+                                inline_source.map(str::to_string).unwrap_or(d.source_code),
+                                inline_manifest.unwrap_or(d.manifest),
+                                Some(d.title),
+                                d.tags,
+                                d.prompt_history,
+                                d.remix_parent_id,
+                                d.draft_id,
+                                d.created_at_ms,
+                            )
+                        } else if let Some(src) = inline_source {
+                            (
+                                src.to_string(),
+                                inline_manifest.unwrap_or_else(|| {
+                                    gpui_telegram_proto::code_scene_contracts::AssetManifest::for_kind(
+                                        gpui_telegram_proto::code_scene_contracts::AssetKind::Animation,
+                                    )
+                                }),
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                format!("draft_{}", Uuid::new_v4().simple()),
+                                Utc::now().timestamp_millis(),
+                            )
+                        } else {
+                            return Err("code_scene_iterate_draft requires 'draft_id' or 'source_code'".to_string());
+                        };
+                    base_manifest.clamp_in_place();
+                    history.push(instruction.to_string());
+                    let router = self.resolve_user_provider_router(caller_uid);
+                    let mut outcome = gpui_telegram_agent::CodeSceneBotGenerator::default()
+                        .iterate_or_remix(
+                            router.as_ref(),
+                            &base_src,
+                            &base_manifest,
+                            base_title.as_deref(),
+                            &base_tags,
+                            instruction,
+                        )
+                        .await;
+                    if !outcome.draft.validation.ok {
+                        let (rechecked, _) = self
+                            .code_scene
+                            .run_validation_offloaded(
+                                outcome.draft.source_code.clone(),
+                                outcome.draft.manifest.clone(),
+                            )
+                            .await;
+                        outcome.draft.validation = rechecked;
+                    }
+                    let resp = outcome.draft.into_ai_generate_response(
+                        draft_id,
+                        bot_id,
+                        bot_username,
+                        outcome.repair_attempts,
+                    );
+                    let rec = crate::routes::code_scene::draft_record_from_ai_response(
+                        &resp,
+                        author_uid,
+                        remix_parent_id,
+                        history,
+                        created_at_ms,
+                    );
+                    self.db
+                        .upsert_code_scene_bot_draft(&rec)
+                        .map_err(|e| e.to_string())?;
+                    serde_json::to_value(&resp).map_err(|e| e.to_string())
+                }
+                "code_scene_validate" => {
+                    if let Some(pinned) = caller.chat_id {
+                        Self::reject_cross_chat_arg(args, pinned)?;
+                    }
+                    let source_code = args
+                        .get("source_code")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| "code_scene_validate requires non-empty 'source_code'".to_string())?;
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(gpui_telegram_proto::code_scene_contracts::AssetKind::parse)
+                        .unwrap_or(gpui_telegram_proto::code_scene_contracts::AssetKind::Animation);
+                    let mut manifest = args
+                        .get("manifest")
+                        .and_then(|v| {
+                            serde_json::from_value::<gpui_telegram_proto::code_scene_contracts::AssetManifest>(v.clone()).ok()
+                        })
+                        .unwrap_or_else(|| {
+                            gpui_telegram_proto::code_scene_contracts::AssetManifest::for_kind(kind)
+                        });
+                    manifest.clamp_in_place();
+                    let (report, _) = self
+                        .code_scene
+                        .run_validation_offloaded(source_code.to_string(), manifest)
+                        .await;
+                    serde_json::to_value(&report).map_err(|e| e.to_string())
+                }
+                "code_scene_publish" => {
+                    let target_chat = Self::resolve_optional_chat_id(args, &caller)?;
+                    let post_card = args
+                        .get("post_card_to_chat")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if post_card {
+                        if let Some(cid) = target_chat {
+                            self.check_send_permitted(cid, caller_uid)?;
+                        }
+                    }
+
+                    let (author_uid, bot_id, bot_username) =
+                        self.resolve_code_scene_actors(&caller, caller_uid);
+                    let draft_id_arg = args
+                        .get("draft_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let inline_source = args
+                        .get("source_code")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty());
+                    let prompt_arg = args
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let kind_override = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(gpui_telegram_proto::code_scene_contracts::AssetKind::parse);
+
+                    let mut engine_used = String::new();
+                    let mut repair_attempts = 0u32;
+                    let (mut title, mut description, mut kind, mut tags, source_code, mut manifest, mut controls_hint, mut remix_parent_id, mark_draft_id) =
+                        if let Some(did) = draft_id_arg {
+                            let d = self
+                                .db
+                                .get_code_scene_bot_draft(did)
+                                .map_err(|e| e.to_string())?
+                                .ok_or_else(|| format!("Draft '{did}' not found"))?;
+                            if d.user_id != author_uid {
+                                return Err("Cannot publish a draft owned by another user".to_string());
+                            }
+                            engine_used = d.engine_used.clone();
+                            repair_attempts = d.repair_attempts;
+                            (
+                                d.title,
+                                d.description,
+                                d.kind,
+                                d.tags,
+                                inline_source.map(str::to_string).unwrap_or(d.source_code),
+                                d.manifest,
+                                d.controls_hint,
+                                d.remix_parent_id,
+                                Some(d.draft_id),
+                            )
+                        } else if let Some(src) = inline_source {
+                            let k = kind_override.unwrap_or(
+                                gpui_telegram_proto::code_scene_contracts::AssetKind::Animation,
+                            );
+                            (
+                                "AI Code Scene".to_string(),
+                                String::new(),
+                                k,
+                                Vec::new(),
+                                src.to_string(),
+                                gpui_telegram_proto::code_scene_contracts::AssetManifest::for_kind(k),
+                                String::new(),
+                                None,
+                                None,
+                            )
+                        } else if let Some(prompt) = prompt_arg {
+                            let req = gpui_telegram_proto::code_scene_contracts::AiGenerateSceneRequest {
+                                prompt: prompt.to_string(),
+                                kind: kind_override,
+                                bot_id,
+                                bot_username: bot_username.clone(),
+                                style_tags: None,
+                                seed: None,
+                            };
+                            let router = self.resolve_user_provider_router(caller_uid);
+                            let outcome = gpui_telegram_agent::CodeSceneBotGenerator::default()
+                                .generate(router.as_ref(), &req)
+                                .await;
+                            engine_used = outcome.draft.engine_used.clone();
+                            repair_attempts = outcome.repair_attempts;
+                            (
+                                outcome.draft.title,
+                                outcome.draft.description,
+                                outcome.draft.kind,
+                                outcome.draft.tags,
+                                outcome.draft.source_code,
+                                outcome.draft.manifest,
+                                outcome.draft.controls_hint,
+                                None,
+                                None,
+                            )
+                        } else {
+                            return Err("code_scene_publish requires 'draft_id', 'source_code', or 'prompt'".to_string());
+                        };
+
+                    if let Some(t) = args.get("title").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                        title = t.to_string();
+                    }
+                    if let Some(d) = args.get("description").and_then(Value::as_str) {
+                        description = d.to_string();
+                    }
+                    if let Some(k) = kind_override {
+                        kind = k;
+                    }
+                    if let Some(t) = args.get("tags").and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok()) {
+                        tags = t;
+                    }
+                    if let Some(m) = args.get("manifest").and_then(|v| serde_json::from_value::<gpui_telegram_proto::code_scene_contracts::AssetManifest>(v.clone()).ok()) {
+                        manifest = m;
+                    }
+                    if let Some(h) = args.get("controls_hint").and_then(Value::as_str) {
+                        controls_hint = h.to_string();
+                    }
+                    if let Some(rp) = args.get("remix_parent_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                        remix_parent_id = Some(rp.to_string());
+                    }
+                    manifest.kind = kind;
+                    manifest.clamp_in_place();
+
+                    let pub_req = gpui_telegram_proto::code_scene_contracts::PublishCodeSceneRequest {
+                        scene_id: None,
+                        title,
+                        description,
+                        kind,
+                        tags,
+                        source_code,
+                        code_format: gpui_telegram_proto::code_scene_contracts::CODE_SCENE_FORMAT_CS1.to_string(),
+                        manifest,
+                        controls_hint,
+                        creator_bot_id: bot_id,
+                        creator_bot_username: bot_username,
+                        remix_parent_id,
+                        share_to_chat_id: target_chat.map(|c| c.0),
+                    };
+
+                    let (asset, report, _created) =
+                        crate::routes::code_scene::publish_validated_scene_atomic(
+                            &self.db,
+                            &self.code_scene,
+                            author_uid,
+                            &pub_req,
+                            mark_draft_id.as_deref(),
+                            true,
+                        )
+                        .await
+                        .map_err(|e| e.into_message())?;
+
+                    let posted_chat_message_id = if post_card {
+                        if let Some(cid) = target_chat {
+                            let (card_sender, is_bot_sender) = match bot_id.filter(|&id| id > 0) {
+                                Some(bid) => (UserId(bid as u64), true),
+                                None => (caller_uid, false),
+                            };
+                            let hub = self.gateway_hub.upgrade();
+                            let idx = self.search_indexer.upgrade();
+                            let hm = self.hybrid_memory.upgrade();
+                            let mid = crate::routes::code_scene::post_code_scene_card_to_chat_raw(
+                                &self.pipeline,
+                                hub.as_deref(),
+                                idx.as_deref(),
+                                hm.as_deref(),
+                                cid,
+                                card_sender,
+                                is_bot_sender,
+                                &asset,
+                            )?;
+                            Some(mid)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    Ok(json!({
+                        "success": true,
+                        "scene_id": asset.scene_id,
+                        "asset": asset,
+                        "validation": report,
+                        "posted_chat_message_id": posted_chat_message_id,
+                        "engine_used": engine_used,
+                        "repair_attempts": repair_attempts,
+                    }))
+                }
+                "code_scene_remix" => {
+                    let parent_id = args
+                        .get("scene_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "code_scene_remix requires non-empty 'scene_id'".to_string())?;
+                    let prompt = args
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "code_scene_remix requires non-empty 'prompt'".to_string())?;
+                    let auto_publish = args
+                        .get("auto_publish")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let target_chat = Self::resolve_optional_chat_id(args, &caller)?;
+                    if auto_publish {
+                        if let Some(cid) = target_chat {
+                            self.check_send_permitted(cid, caller_uid)?;
+                        }
+                    }
+
+                    let parent = self
+                        .db
+                        .get_code_scene(parent_id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("Parent Code Scene '{parent_id}' not found"))?;
+                    let (author_uid, bot_id, bot_username) =
+                        self.resolve_code_scene_actors(&caller, caller_uid);
+                    let router = self.resolve_user_provider_router(caller_uid);
+                    let mut outcome = gpui_telegram_agent::CodeSceneBotGenerator::default()
+                        .iterate_or_remix(
+                            router.as_ref(),
+                            &parent.source_code,
+                            &parent.manifest,
+                            Some(&parent.title),
+                            &parent.tags,
+                            prompt,
+                        )
+                        .await;
+                    if !outcome.draft.validation.ok {
+                        let (rechecked, _) = self
+                            .code_scene
+                            .run_validation_offloaded(
+                                outcome.draft.source_code.clone(),
+                                outcome.draft.manifest.clone(),
+                            )
+                            .await;
+                        outcome.draft.validation = rechecked;
+                    }
+                    let draft_id = format!("draft_{}", Uuid::new_v4().simple());
+                    let draft_resp = outcome.draft.into_ai_generate_response(
+                        draft_id.clone(),
+                        bot_id,
+                        bot_username.clone(),
+                        outcome.repair_attempts,
+                    );
+                    let rec = crate::routes::code_scene::draft_record_from_ai_response(
+                        &draft_resp,
+                        author_uid,
+                        Some(parent.scene_id.clone()),
+                        vec![prompt.to_string()],
+                        Utc::now().timestamp_millis(),
+                    );
+                    self.db
+                        .upsert_code_scene_bot_draft(&rec)
+                        .map_err(|e| e.to_string())?;
+
+                    if !auto_publish {
+                        return Ok(json!({
+                            "success": true,
+                            "draft": draft_resp,
+                            "published": Value::Null,
+                        }));
+                    }
+
+                    let pub_req = gpui_telegram_proto::code_scene_contracts::PublishCodeSceneRequest {
+                        scene_id: None,
+                        title: draft_resp.title.clone(),
+                        description: draft_resp.description.clone(),
+                        kind: draft_resp.kind,
+                        tags: draft_resp.tags.clone(),
+                        source_code: draft_resp.source_code.clone(),
+                        code_format: draft_resp.code_format.clone(),
+                        manifest: draft_resp.manifest.clone(),
+                        controls_hint: draft_resp.controls_hint.clone(),
+                        creator_bot_id: bot_id,
+                        creator_bot_username: bot_username,
+                        remix_parent_id: Some(parent.scene_id.clone()),
+                        share_to_chat_id: target_chat.map(|c| c.0),
+                    };
+                    let (asset, report, _created) =
+                        crate::routes::code_scene::publish_validated_scene_atomic(
+                            &self.db,
+                            &self.code_scene,
+                            author_uid,
+                            &pub_req,
+                            Some(&draft_id),
+                            true,
+                        )
+                        .await
+                        .map_err(|e| e.into_message())?;
+
+                    crate::routes::code_scene::record_remix_parent_telemetry(
+                        &self.db,
+                        &self.code_scene,
+                        author_uid,
+                        &parent.scene_id,
+                        parent.author_user_id,
+                    );
+
+                    let posted_chat_message_id = if let Some(cid) = target_chat {
+                        let (card_sender, is_bot_sender) = match bot_id.filter(|&id| id > 0) {
+                            Some(bid) => (UserId(bid as u64), true),
+                            None => (caller_uid, false),
+                        };
+                        let hub = self.gateway_hub.upgrade();
+                        let idx = self.search_indexer.upgrade();
+                        let hm = self.hybrid_memory.upgrade();
+                        let mid = crate::routes::code_scene::post_code_scene_card_to_chat_raw(
+                            &self.pipeline,
+                            hub.as_deref(),
+                            idx.as_deref(),
+                            hm.as_deref(),
+                            cid,
+                            card_sender,
+                            is_bot_sender,
+                            &asset,
+                        )?;
+                        Some(mid)
+                    } else {
+                        None
+                    };
+
+                    Ok(json!({
+                        "success": true,
+                        "scene_id": asset.scene_id,
+                        "draft": draft_resp,
+                        "published": {
+                            "asset": asset,
+                            "validation": report,
+                            "posted_chat_message_id": posted_chat_message_id,
+                        },
+                    }))
+                }
+                "code_scene_list_mine" => {
+                    if let Some(pinned) = caller.chat_id {
+                        Self::reject_cross_chat_arg(args, pinned)?;
+                    }
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(gpui_telegram_proto::code_scene_contracts::AssetKind::parse);
+                    let limit = args
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .map(|v| (v as usize).clamp(1, 100))
+                        .unwrap_or(20);
+                    let author_uid = caller_uid.0 as i64;
+                    let query = gpui_telegram_proto::code_scene_contracts::ListCodeSceneAssetsQuery {
+                        q: None,
+                        kind,
+                        tag: None,
+                        author_user_id: Some(author_uid),
+                        creator_bot_id: None,
+                        limit: Some(limit),
+                        offset: Some(0),
+                    };
+                    let list = {
+                        let reco = self.code_scene.recommender().read();
+                        reco.list_assets(&query)
+                    };
+                    Ok(json!({
+                        "count": list.total,
+                        "scenes": list.assets,
                     }))
                 }
                 "create_book" => self.exec_create_book(args, &caller, now_ms),

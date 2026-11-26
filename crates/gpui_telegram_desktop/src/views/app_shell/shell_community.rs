@@ -28,6 +28,7 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Entity<CommunityWorkspace> {
         self.leave_browser_panel_if_active(cx);
+        self.leave_code_scene_panel_if_active(cx);
         self.cleanup_settings_panel_if_active(cx);
         let was_outside = self.active_panel != ActiveWorkspacePanel::Community;
         if was_outside {

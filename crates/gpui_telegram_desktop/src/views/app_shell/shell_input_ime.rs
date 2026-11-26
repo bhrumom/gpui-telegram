@@ -41,6 +41,7 @@ pub(crate) enum ShellInputTarget {
     BotAssistCard,
     ContentHubInput,
     BrowserInput,
+    CodeSceneInput,
     CommunityInput,
     SidebarSearch,
     StageSearch,
@@ -212,6 +213,26 @@ impl AppShell {
                 ShellInputTarget::Absorbed
             };
         }
+        // Z #1: Base Workspace — CodeSceneWorkspace (occluded by main menu drawer & Classic plus-menu)
+        if self.active_panel == ActiveWorkspacePanel::CodeScene {
+            if self.content_hub.read(cx).has_focused_input(false) {
+                return ShellInputTarget::ContentHubInput;
+            }
+            if sb.search_focused {
+                return ShellInputTarget::SidebarSearch;
+            }
+            let cs_focused = !self.main_menu_drawer.read(cx).is_open
+                && (self.theme_state.palette.is_apple_style() || !sb.is_plus_menu_open)
+                && self
+                    .code_scene_workspace
+                    .as_ref()
+                    .is_some_and(|cs| cs.read(cx).has_focused_text_input());
+            return if cs_focused {
+                ShellInputTarget::CodeSceneInput
+            } else {
+                ShellInputTarget::Absorbed
+            };
+        }
         // Z #1: Base Workspace — CommunityWorkspace (occluded by main menu drawer & Classic plus-menu)
         if self.active_panel == ActiveWorkspacePanel::Community {
             if self.content_hub.read(cx).has_focused_input(false) {
@@ -342,6 +363,18 @@ impl AppShell {
         self.resolve_input_target(cx) == ShellInputTarget::BrowserInput
     }
 
+    /// Returns `true` when any shell modal/drawer/overlay/popover/lockscreen/search occludes `CodeSceneWorkspace`.
+    pub fn has_code_scene_shell_blocker(&self, cx: &App) -> bool {
+        self.has_browser_shell_blocker(cx)
+            || (!self.theme_state.palette.is_apple_style()
+                && self.sidebar.read(cx).is_plus_menu_open)
+    }
+
+    /// Returns `true` when `CodeSceneWorkspace` is active and holds the top-Z text input target.
+    pub fn is_code_scene_input_active(&self, cx: &App) -> bool {
+        self.resolve_input_target(cx) == ShellInputTarget::CodeSceneInput
+    }
+
     /// Returns `true` when any shell modal/drawer/overlay/popover/lockscreen occludes `CommunityWorkspace`.
     pub fn has_community_visual_occlusion_overlay(&self, cx: &App) -> bool {
         self.has_browser_visual_occlusion_overlay(cx)
@@ -457,6 +490,11 @@ impl AppShell {
         self.ime.clear_ime_state();
         self.bot_browser.ime_preedit_input_gen = None;
         self.community_ime_preedit_input_gen = None;
+        if let Some(cs) = self.code_scene_workspace.clone() {
+            if cs.read(cx).ime_preedit.is_some() {
+                cs.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+            }
+        }
         if let Some(cw) = self.community_workspace.clone() {
             if cw.read(cx).active_input_ime_preedit().is_some() {
                 cw.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
@@ -644,6 +682,17 @@ impl AppShell {
                     .unwrap_or_default();
                 (txt, pre())
             }
+            ShellInputTarget::CodeSceneInput => {
+                let (txt, cs_pre) = self
+                    .code_scene_workspace
+                    .as_ref()
+                    .map(|cs| {
+                        let r = cs.read(cx);
+                        (r.active_input_text(), r.ime_preedit.clone())
+                    })
+                    .unwrap_or_else(|| (String::new(), None));
+                (txt, cs_pre.or_else(pre))
+            }
             ShellInputTarget::CommunityInput => {
                 let (txt, cw_pre) = self
                     .community_workspace
@@ -765,6 +814,14 @@ impl AppShell {
                     bw.update(cx, |w, wcx| w.clear_active_input(wcx));
                 }
             }
+            ShellInputTarget::CodeSceneInput => {
+                if let Some(cs) = self.code_scene_workspace.clone() {
+                    cs.update(cx, |w, wcx| {
+                        w.set_ime_preedit(None, wcx);
+                        let _ = w.clear_active_input(wcx);
+                    });
+                }
+            }
             ShellInputTarget::CommunityInput => {
                 if let Some(cw) = self.community_workspace.clone() {
                     cw.update(cx, |w, wcx| {
@@ -805,7 +862,9 @@ impl AppShell {
         let clean_multiline = sanitize_paste_text(raw_text, true);
         let raw_passthrough = matches!(
             target,
-            ShellInputTarget::BrowserInput | ShellInputTarget::CommunityInput
+            ShellInputTarget::BrowserInput
+                | ShellInputTarget::CodeSceneInput
+                | ShellInputTarget::CommunityInput
         ) && !raw_text.is_empty();
         if clean.is_empty() && clean_multiline.is_empty() && !raw_passthrough {
             if target == ShellInputTarget::Composer
@@ -979,6 +1038,14 @@ impl AppShell {
                 if let Some(bw) = self.browser_workspace.clone() {
                     bw.update(cx, |w, wcx| {
                         w.insert_text_to_active_input(raw_text, wcx);
+                    });
+                }
+            }
+            ShellInputTarget::CodeSceneInput => {
+                if let Some(cs) = self.code_scene_workspace.clone() {
+                    cs.update(cx, |w, wcx| {
+                        w.set_ime_preedit(None, wcx);
+                        let _ = w.insert_text_input(raw_text, wcx);
                     });
                 }
             }
@@ -1363,6 +1430,36 @@ impl AppShell {
             self.nav_rail.update(cx, |r, _| {
                 r.set_active_destination(NavDestination::Chats);
             });
+            self.sync_apple_sidebar_to_active_panel(cx);
+            self.reconcile_chat_scoped_toasts(cx);
+            return true;
+        }
+        if self.active_panel == ActiveWorkspacePanel::CodeScene {
+            if self.sidebar.read(cx).search_focused {
+                self.clear_all_ime_preedits(cx);
+                self.sidebar.update(cx, |sb, scx| {
+                    sb.exit_search();
+                    scx.notify();
+                });
+                return true;
+            }
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                if cs.update(cx, |w, wcx| {
+                    w.handle_non_char_key_input("escape", false, false, wcx)
+                }) {
+                    cx.notify();
+                    return true;
+                }
+            }
+            self.leave_code_scene_panel_if_active(cx);
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            let nav_trigger = self.nav_rail.update(cx, |r, rcx| {
+                r.set_active_destination(NavDestination::Chats);
+                rcx.notify();
+                r.trigger_counter
+            });
+            self.last_handled_nav_trigger = nav_trigger;
             self.sync_apple_sidebar_to_active_panel(cx);
             self.reconcile_chat_scoped_toasts(cx);
             return true;
@@ -2102,6 +2199,34 @@ impl AppShell {
                 }
                 key == "tab"
             }
+            ShellInputTarget::CodeSceneInput => {
+                if key == "backspace"
+                    && (self.ime.has_preedit() || self.has_active_ime_preedit(cx))
+                {
+                    self.clear_all_ime_preedits(cx);
+                    cx.notify();
+                    return true;
+                }
+                if key == "enter"
+                    && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed())
+                {
+                    self.clear_all_ime_preedits(cx);
+                    cx.notify();
+                    return true;
+                }
+                if key == "tab" {
+                    self.clear_all_ime_preedits(cx);
+                }
+                if let Some(cs) = self.code_scene_workspace.clone() {
+                    if cs.update(cx, |w, wcx| {
+                        w.handle_non_char_key_input(key, is_shift, is_alt, wcx)
+                    }) {
+                        cx.notify();
+                        return true;
+                    }
+                }
+                key == "tab"
+            }
             ShellInputTarget::CommunityInput => {
                 if key == "backspace"
                     && (self.ime.has_preedit() || self.has_active_ime_preedit(cx))
@@ -2381,6 +2506,13 @@ impl AppShell {
         if target != ShellInputTarget::BrowserInput {
             self.bot_browser.ime_preedit_input_gen = None;
         }
+        if target != ShellInputTarget::CodeSceneInput {
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                if cs.read(cx).ime_preedit.is_some() {
+                    cs.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+                }
+            }
+        }
         if target != ShellInputTarget::CommunityInput {
             self.community_ime_preedit_input_gen = None;
             if let Some(cw) = self.community_workspace.clone() {
@@ -2483,6 +2615,13 @@ impl AppShell {
                     .browser_workspace
                     .as_ref()
                     .map(|bw| bw.read(cx).active_input_generation());
+            }
+            ShellInputTarget::CodeSceneInput => {
+                self.ime.ime_preedit = Some(new_text.to_string());
+                self.ime.clear_commit_fence();
+                if let Some(cs) = self.code_scene_workspace.clone() {
+                    cs.update(cx, |w, wcx| w.set_ime_preedit(Some(new_text.to_string()), wcx));
+                }
             }
             ShellInputTarget::CommunityInput => {
                 self.ime.ime_preedit = Some(new_text.to_string());
@@ -2643,6 +2782,16 @@ impl EntityInputHandler for AppShell {
                     + px((char_count as f32 * 7.5).min(360.0));
                 Some(Bounds::new(
                     point(caret_x, element_bounds.origin.y + px(28.0)),
+                    size(px(2.0), px(18.0)),
+                ))
+            }
+            ShellInputTarget::CodeSceneInput => {
+                let apple_w = self.apple_sidebar.read(cx).effective_width();
+                let sb_w = self.sidebar.read(cx).effective_width();
+                let caret_x = element_bounds.origin.x
+                    + px(apple_w + sb_w + 220.0 + (char_count as f32 * 8.0).min(420.0));
+                Some(Bounds::new(
+                    point(caret_x, element_bounds.origin.y + px(140.0)),
                     size(px(2.0), px(18.0)),
                 ))
             }

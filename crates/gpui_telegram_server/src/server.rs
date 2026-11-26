@@ -267,6 +267,7 @@ pub struct AppState {
     pub mcp_oauth_state: Arc<crate::routes::mcp_oauth::McpOAuthRuntimeState>,
     pub remote_sessions: Arc<crate::routes::remote_assist::RemoteSessionRegistry>,
     pub mcp_sessions: Arc<crate::routes::official_mcp::McpSessionRegistry>,
+    pub code_scene: Arc<crate::routes::code_scene::CodeSceneRuntimeState>,
     pub community_search_indexer: Arc<gpui_telegram_community::CommunitySearchIndexer>,
     pub community_bot_guard: Arc<gpui_telegram_community::BotLoopGuard>,
     pub community_ticker_started: Arc<std::sync::atomic::AtomicBool>,
@@ -503,6 +504,10 @@ impl AppState {
         let _ = db.seed_default_catalog_if_empty();
         let _ = db.seed_botfather_and_flagship_apps();
         let _ = ensure_default_ai_bot(&db);
+        let _ = db.seed_official_code_scene_bots_and_assets();
+        let code_scene = Arc::new(
+            crate::routes::code_scene::CodeSceneRuntimeState::hydrate_from_db(&db),
+        );
         let _ = ensure_creator_studio_bot(&db);
 
         // Idempotent starter Community seeding (8 communities, Humans+Bots, posts, comments, lists)
@@ -599,6 +604,8 @@ impl AppState {
             Arc::downgrade(&search_indexer),
             Arc::downgrade(&hybrid_memory),
             Arc::downgrade(&webmcp_broker),
+            code_scene.clone(),
+            Arc::downgrade(&fabushi_bots),
             Arc::downgrade(&community_search_indexer),
             Arc::downgrade(&community_bot_guard),
             self_weak.clone(),
@@ -928,6 +935,7 @@ impl AppState {
             mcp_oauth_state: Arc::new(crate::routes::mcp_oauth::McpOAuthRuntimeState::new()),
             remote_sessions: Arc::new(crate::routes::remote_assist::RemoteSessionRegistry::new()),
             mcp_sessions: Arc::new(crate::routes::official_mcp::McpSessionRegistry::new()),
+            code_scene,
             community_search_indexer,
             community_bot_guard,
             community_ticker_started,
@@ -954,6 +962,10 @@ impl AppState {
 
     pub fn shutdown(&self) {
         self.gateway_hub.shutdown();
+        let _ = self.db.pool().with_writer(|c| {
+            let _ = c.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+            Ok(())
+        });
     }
 
     fn open_database(config: &ServerConfig) -> crate::db::ServerDatabase {
@@ -1674,6 +1686,60 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             post(routes::automation_apps::automation_app_record_run),
         )
         .route(
+            "/api/v1/code-scene/feed",
+            post(routes::code_scene::code_scene_feed),
+        )
+        .route(
+            "/api/v1/code-scene/assets",
+            get(routes::code_scene::code_scene_assets_list)
+                .post(routes::code_scene::code_scene_assets_publish),
+        )
+        .route(
+            "/api/v1/code-scene/assets/validate",
+            post(routes::code_scene::code_scene_assets_validate),
+        )
+        .route(
+            "/api/v1/code-scene/assets/{id}",
+            get(routes::code_scene::code_scene_asset_get),
+        )
+        .route(
+            "/api/v1/code-scene/assets/{id}/like",
+            post(routes::code_scene::code_scene_asset_like),
+        )
+        .route(
+            "/api/v1/code-scene/assets/{id}/bookmark",
+            post(routes::code_scene::code_scene_asset_bookmark),
+        )
+        .route(
+            "/api/v1/code-scene/assets/{id}/comments",
+            get(routes::code_scene::code_scene_comments_list)
+                .post(routes::code_scene::code_scene_comments_create),
+        )
+        .route(
+            "/api/v1/code-scene/creators/{id}/follow",
+            post(routes::code_scene::code_scene_creator_follow),
+        )
+        .route(
+            "/api/v1/code-scene/telemetry",
+            post(routes::code_scene::code_scene_telemetry),
+        )
+        .route(
+            "/api/v1/code-scene/ai/generate",
+            post(routes::code_scene::code_scene_ai_generate),
+        )
+        .route(
+            "/api/v1/code-scene/ai/iterate",
+            post(routes::code_scene::code_scene_ai_iterate),
+        )
+        .route(
+            "/api/v1/code-scene/ai/publish",
+            post(routes::code_scene::code_scene_ai_publish),
+        )
+        .route(
+            "/api/v1/code-scene/ai/remix",
+            post(routes::code_scene::code_scene_ai_remix),
+        )
+        .route(
             "/api/v1/bots",
             get(routes::bots_miniapps::bots_list).post(routes::bots_miniapps::bots_create),
         )
@@ -1946,7 +2012,7 @@ async fn server_status() -> Json<Value> {
             "statistics", "export", "wallet_stars", "acp_durable",
             "hermes_agent", "hermes_gateway", "openai_compat", "acp_json_rpc",
             "auto_update_relay", "official_mcp_oauth21", "remote_control",
-            "remote_assist", "community", "orca"
+            "remote_assist", "community", "orca", "code_scene"
         ]
     }))
 }
@@ -4652,6 +4718,21 @@ pub(crate) fn detect_target_bots_with_addressing(
             return vec![(ai_bot_members[0], false)];
         }
         if text.trim().starts_with('/') {
+            if let Some(mentioned) = gpui_telegram_agent::SlashCommandParser::parse(text)
+                .and_then(|p| p.bot_mention)
+            {
+                let mention_lower = mentioned.to_ascii_lowercase();
+                for &buid in &ai_bot_members {
+                    if let Ok(Some(u)) = state.db.get_user(buid) {
+                        if u.username
+                            .as_deref()
+                            .is_some_and(|un| un.eq_ignore_ascii_case(&mention_lower))
+                        {
+                            return vec![(buid, true)];
+                        }
+                    }
+                }
+            }
             return vec![(ai_bot_members[0], true)];
         }
 

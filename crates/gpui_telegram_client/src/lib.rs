@@ -7,6 +7,7 @@ pub mod client_dispatch;
 pub mod client_e2ee;
 pub mod client_features;
 pub mod client_messaging;
+pub mod code_scene_service;
 pub mod community_runtime;
 pub mod config;
 pub mod e2ee;
@@ -16,8 +17,13 @@ pub mod outbox;
 pub mod session_persistence;
 pub mod sync;
 
-pub use cache::{CachedChatHistorySnapshot, CachedMediaEntry, LocalStore};
+pub use cache::{
+    CachedChatHistorySnapshot, CachedCodeSceneComment, CachedCodeSceneRecord, CachedMediaEntry,
+    CodeSceneLocalSocialEntry, CodeSceneSocialRelationKind, LocalCodeSceneDraft, LocalStore,
+    TelemetryOutboxRecord,
+};
 pub use client::TelegramClient;
+pub use code_scene_service::{CodeSceneSyncReport, LocalCodeSceneService, TelemetryFlushReport};
 pub use client_dispatch::ClientDomainEvent;
 pub use community_runtime::{
     CommunityClientFacade, CommunityRuntimeMode, LocalCommunityRuntime, COMMUNITY_DB_FILENAME,
@@ -86,8 +92,9 @@ pub use net::{
     InstallAutomationAppResponse, InstalledAutomationApp, ListAutomationAppsQuery,
     ListAutomationAppsResponse, ListInstalledAutomationAppsResponse, PublishAutomationAppRequest,
     RecordAutomationRunRequest, RecordAutomationRunResponse, UninstallAutomationAppResponse,
-    AUTOMATION_APP_SCHEMA_VERSION_V1, OrcaClient, OrcaClientError,
+    AUTOMATION_APP_SCHEMA_VERSION_V1, CodeSceneHttpClient, OrcaClient, OrcaClientError,
 };
+pub use gpui_telegram_proto::code_scene_contracts::*;
 pub use session_persistence::{
     AccountSessionRecord, ActiveDeviceSession, PersistedClientState, ProxyEndpointRecord,
     SessionPersistenceBridge, WalletTransactionRecord,

@@ -44,9 +44,9 @@ use crate::views::settings::{
 };
 use crate::views::{
     AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
-    CommunityWorkspace, ComputerWorkbench, ContentHubSection, ContentHubWorkspace,
-    ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer,
-    NavRail,
+    CodeSceneWorkspace, CommunityWorkspace, ComputerWorkbench, ContentHubSection,
+    ContentHubWorkspace, ContextInspector, ConversationStage, GlobalTasksWorkspace,
+    MainMenuDrawer, MediaViewer, NavRail,
 };
 use crate::window::WindowSubsystemRuntime;
 
@@ -58,6 +58,7 @@ pub enum ActiveWorkspacePanel {
     TaskCenter,
     McpTools,
     Browser,
+    CodeScene,
     Community,
     Settings,
     ContentHub(ContentHubSection),
@@ -119,6 +120,7 @@ pub struct AppShell {
     pub main_menu_drawer: Entity<MainMenuDrawer>,
     pub tasks_workspace: Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<Entity<BrowserWorkspace>>,
+    pub code_scene_workspace: Option<Entity<CodeSceneWorkspace>>,
     pub community_workspace: Option<Entity<CommunityWorkspace>>,
     pub community_ime_preedit_input_gen: Option<u64>,
     pub community_pending_share: Option<(String, String)>,
@@ -246,6 +248,7 @@ impl AppShell {
             main_menu_drawer,
             tasks_workspace,
             browser_workspace: None,
+            code_scene_workspace: None,
             community_workspace: None,
             community_ime_preedit_input_gen: None,
             community_pending_share: None,
@@ -993,12 +996,19 @@ impl AppShell {
                     w.set_occluded(true, wcx);
                 });
             }
+            if let Some(cs) = self.code_scene_workspace.take() {
+                cs.update(cx, |w, wcx| {
+                    w.teardown(wcx);
+                });
+            }
             self.community_workspace = None;
             self.community_pending_share = None;
             self.community_ime_preedit_input_gen = None;
             if matches!(
                 self.active_panel,
-                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                ActiveWorkspacePanel::Browser
+                    | ActiveWorkspacePanel::CodeScene
+                    | ActiveWorkspacePanel::Community
             ) {
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
@@ -1111,6 +1121,11 @@ impl AppShell {
                 w.set_occluded(true, wcx);
             });
         }
+        if let Some(cs) = self.code_scene_workspace.take() {
+            cs.update(cx, |w, wcx| {
+                w.teardown(wcx);
+            });
+        }
         self.community_workspace = None;
         self.community_pending_share = None;
         self.community_ime_preedit_input_gen = None;
@@ -1213,6 +1228,7 @@ impl AppShell {
             ActiveWorkspacePanel::TaskCenter => NavDestination::TaskCenter,
             ActiveWorkspacePanel::McpTools => NavDestination::McpTools,
             ActiveWorkspacePanel::Browser => NavDestination::Browser,
+            ActiveWorkspacePanel::CodeScene => NavDestination::CodeScene,
             ActiveWorkspacePanel::Community => NavDestination::Community,
             ActiveWorkspacePanel::Settings => {
                 let sr = self.settings_router.read(cx);
@@ -1591,6 +1607,7 @@ impl AppShell {
             || matches!(
                 self.active_panel,
                 ActiveWorkspacePanel::Browser
+                    | ActiveWorkspacePanel::CodeScene
                     | ActiveWorkspacePanel::Community
                     | ActiveWorkspacePanel::ContentHub(_)
             )
@@ -2700,6 +2717,17 @@ impl Render for AppShell {
                 .as_ref()
                 .is_some_and(|ov| ov.read(cx).is_open)
                 && !self.miniapps.is_miniapp_minimized);
+        if let Some(ref cs) = self.code_scene_workspace {
+            let cs_occluded = self.has_code_scene_shell_blocker(cx);
+            let want_vis =
+                self.is_authenticated && self.active_panel == ActiveWorkspacePanel::CodeScene;
+            cs.update(cx, |w, wcx| {
+                w.set_occluded(cs_occluded, wcx);
+                if !want_vis && w.is_visible {
+                    w.set_visible(false, wcx);
+                }
+            });
+        }
         self.sync_compose_state_to_composer(false, cx);
 
         div()
@@ -2710,6 +2738,9 @@ impl Render for AppShell {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_window_key_down(event, window, cx);
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
+                this.handle_window_key_up(event, cx);
             }))
             .relative().size_full().flex().flex_col()
             .bg(rgb(pal.window_bg))
@@ -2741,6 +2772,13 @@ impl Render for AppShell {
                                 row
                             }
                         })
+                        .when(self.active_panel == ActiveWorkspacePanel::CodeScene, |row| {
+                            if let Some(ref cs) = self.code_scene_workspace {
+                                row.child(cs.clone())
+                            } else {
+                                row
+                            }
+                        })
                         .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
                             if let Some(ref cw) = self.community_workspace {
                                 row.child(cw.clone())
@@ -2751,7 +2789,9 @@ impl Render for AppShell {
                         .when(
                             !matches!(
                                 self.active_panel,
-                                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                                ActiveWorkspacePanel::Browser
+                                    | ActiveWorkspacePanel::CodeScene
+                                    | ActiveWorkspacePanel::Community
                             ),
                             |row| {
                             row.child(

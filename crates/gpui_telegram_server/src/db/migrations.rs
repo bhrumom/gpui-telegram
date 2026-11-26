@@ -70,6 +70,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             43,
             crate::db::creations_store::MIGRATION_V43_CREATIONS_AND_CATALOG,
         ),
+        (
+            44,
+            crate::db::code_scene_store::MIGRATION_V42_CODE_SCENE,
+        ),
     ];
 
     for (idx, &migration_sql) in ALL_MIGRATIONS.iter().enumerate() {

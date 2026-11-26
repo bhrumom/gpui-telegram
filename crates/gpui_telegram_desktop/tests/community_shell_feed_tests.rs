@@ -478,7 +478,7 @@ fn test_community_icons_extra_invariant_and_svg_load() {
 #[test]
 fn test_nav_rail_community_entry_badges_and_shortcut_digits() {
     let mut rail = NavRail::new();
-    assert_eq!(rail.items.len(), 11);
+    assert_eq!(rail.items.len(), 12);
     let comm_item = rail
         .items
         .iter()

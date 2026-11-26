@@ -369,6 +369,7 @@ impl AppShell {
             MainMenuCommand::Calls => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Calls;
                 self.sync_nav_rail_destination_silent(NavDestination::Calls, cx);
@@ -378,6 +379,7 @@ impl AppShell {
             MainMenuCommand::SavedMessages => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.sync_nav_rail_destination_silent(NavDestination::SavedMessages, cx);
@@ -394,6 +396,7 @@ impl AppShell {
             MainMenuCommand::TaskCenter => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.sync_nav_rail_destination_silent(NavDestination::TaskCenter, cx);
@@ -404,6 +407,7 @@ impl AppShell {
             MainMenuCommand::McpTools => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::McpTools;
                 self.sync_nav_rail_destination_silent(NavDestination::McpTools, cx);
@@ -411,14 +415,23 @@ impl AppShell {
                 self.tasks_workspace.update(cx, |w, _| w.set_tab(TasksWorkspaceTab::McpTools));
                 self.refresh_tasks_and_mcp(cx);
             }
-            MainMenuCommand::RemoteComputer => self.open_remote_computers_hub(cx),
+            MainMenuCommand::RemoteComputer => {
+                self.leave_code_scene_panel_if_active(cx);
+                self.open_remote_computers_hub(cx);
+            }
+            MainMenuCommand::CodeScene => {
+                self.open_code_scene_workspace(cx);
+            }
             MainMenuCommand::Browser => {
+                self.leave_code_scene_panel_if_active(cx);
                 self.open_browser_workspace(cx);
             }
             MainMenuCommand::Community => {
+                self.leave_code_scene_panel_if_active(cx);
                 self.open_community_workspace(cx);
             }
             MainMenuCommand::Settings => {
+                self.leave_code_scene_panel_if_active(cx);
                 self.navigate_settings_to(SettingsSectionType::Main, cx);
             }
             MainMenuCommand::ToggleNightMode => {

@@ -1388,6 +1388,7 @@ impl AppShell {
                     || lower.starts_with("computer:")
                     || lower.starts_with("approval:")
                     || lower.starts_with("hermes:")
+                    || lower.starts_with("code_scene:")
                 {
                     self.execute_hermes_inline_callback(trimmed, cx);
                     return;

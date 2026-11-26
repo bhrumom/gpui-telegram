@@ -54,5 +54,7 @@ pub use creations::*;
 pub mod automation_apps;
 pub use automation_apps::*;
 
+pub mod code_scene_contracts;
+pub use code_scene_contracts::*;
 pub mod orca_contracts;
 pub use orca_contracts::*;

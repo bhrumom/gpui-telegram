@@ -389,6 +389,7 @@ impl AppShell {
             ActiveWorkspacePanel::ContentHub(sec) => {
                 AppleSidebarSection::from_content_hub_section(sec)
             }
+            ActiveWorkspacePanel::CodeScene => AppleSidebarSection::CodeScene,
             ActiveWorkspacePanel::Community => AppleSidebarSection::Community,
             _ => AppleSidebarSection::Chats,
         };
@@ -434,13 +435,25 @@ impl AppShell {
         });
     }
 
-    /// Switches between `Chats`, `Community`, and any Apple Content Hub vertical without clearing chat state.
+    /// Switches between `Chats`, `Community`, `CodeScene`, and any Apple Content Hub vertical without clearing chat state.
     pub fn select_apple_sidebar_section(
         &mut self,
         section: AppleSidebarSection,
         cx: &mut Context<Self>,
     ) {
         if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        if section == AppleSidebarSection::CodeScene {
+            self.leave_workspace_modal_panel_for_hub(cx);
+            self.dismiss_transient_popovers_for_hub(cx);
+            self.content_hub.update(cx, |h, hcx| {
+                if h.active_input != ContentHubInputTarget::QuickDrawerSearch {
+                    h.active_input = ContentHubInputTarget::None;
+                }
+                hcx.notify();
+            });
+            self.open_code_scene_workspace(cx);
             return;
         }
         if section == AppleSidebarSection::Community {
@@ -529,6 +542,7 @@ impl AppShell {
 
     pub(crate) fn leave_workspace_modal_panel_for_hub(&mut self, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
+        self.leave_code_scene_panel_if_active(cx);
         self.leave_community_panel_if_active(cx);
         self.cleanup_settings_panel_if_active(cx);
         if matches!(

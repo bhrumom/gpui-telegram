@@ -8,6 +8,7 @@ pub mod browser;
 pub mod call_overlay;
 pub mod canonical_composer;
 pub mod chat_sidebar;
+pub mod code_scene;
 pub mod community;
 pub mod composer;
 pub mod computer_workbench;
@@ -37,6 +38,7 @@ pub use browser::{
 pub use call_overlay::{CallOverlay, TalkModeState, TranscriptEntry};
 pub use canonical_composer::CanonicalComposer;
 pub use chat_sidebar::ChatSidebar;
+pub use code_scene::{CodeScenePendingAction, CodeSceneWorkspace, CodeSceneWorkspaceConfig};
 pub use community::{
     ActiveCommunityInput, CommunityLayoutMode, CommunityRoute, CommunityWorkspace,
     CommunityWorkspaceAction, FeedDensity,

@@ -25,6 +25,7 @@ pub const TOP_CLEARANCE_HEIGHT: f32 = 52.0;
 pub enum AppleSidebarSection {
     Chats,
     Community,
+    CodeScene,
     Books,
     Music,
     Games,
@@ -33,10 +34,10 @@ pub enum AppleSidebarSection {
 }
 
 impl AppleSidebarSection {
-    /// Converts this sidebar destination into a [`ContentHubSection`] (`None` for `Chats`/`Community`).
+    /// Converts this sidebar destination into a [`ContentHubSection`] (`None` for `Chats`/`Community`/`CodeScene`).
     pub fn to_content_hub_section(self) -> Option<ContentHubSection> {
         match self {
-            Self::Chats | Self::Community => None,
+            Self::Chats | Self::Community | Self::CodeScene => None,
             Self::Books => Some(ContentHubSection::Books),
             Self::Music => Some(ContentHubSection::Music),
             Self::Games => Some(ContentHubSection::Games),
@@ -416,6 +417,16 @@ impl Render for AppleAppSidebar {
                         tr_str(&lang, "社区", "Community"),
                         community_badge,
                         community_collapsed_dot,
+                        cx,
+                    ))
+                    .child(self.render_nav_row(
+                        "apple-sidebar-nav-code-scene",
+                        AppleSidebarSection::CodeScene,
+                        IconName::CodeScene,
+                        0xFE2C55,
+                        tr_str(&lang, "代码场景", "Code Scene"),
+                        None,
+                        None,
                         cx,
                     ))
                     .child(self.render_nav_row(

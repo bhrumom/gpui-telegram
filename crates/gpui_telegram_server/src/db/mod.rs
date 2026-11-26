@@ -4,6 +4,7 @@ pub mod analytics_store;
 pub mod auth_store;
 pub mod automation_app_store;
 pub mod chat_extras;
+pub mod code_scene_store;
 pub mod computer_store;
 pub mod creations_store;
 pub mod e2ee_store;

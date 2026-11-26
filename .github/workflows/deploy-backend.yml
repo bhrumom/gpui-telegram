@@ -7,6 +7,7 @@ on:
       - "crates/gpui_telegram_core/**"
       - "crates/gpui_telegram_common/**"
       - "crates/gpui_telegram_proto/**"
+      - "crates/gpui_telegram_code_scene/**"
       - "crates/gpui_telegram_media/**"
       - "crates/gpui_telegram_webrtc/**"
       - "crates/gpui_telegram_agent/**"

@@ -991,6 +991,7 @@ impl AppShell {
                     shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
                     shell.cleanup_settings_panel_if_active(cx);
                     shell.leave_browser_panel_if_active(cx);
+                    shell.leave_code_scene_panel_if_active(cx);
                     shell.leave_community_panel_if_active(cx);
                     shell.active_panel = ActiveWorkspacePanel::Chats;
                     shell.last_handled_nav_dest = Some(NavDestination::Chats);

@@ -334,6 +334,7 @@ impl AppShell {
             modal_container: &self.modal_container,
             tasks_workspace: &self.tasks_workspace,
             browser_workspace: self.browser_workspace.as_ref(),
+            code_scene_workspace: self.code_scene_workspace.as_ref(),
             community_workspace: self.community_workspace.as_ref(),
             talk_mode_overlay: self.rtc_talk.talk_mode_overlay.as_ref(),
             computer_overlay: self.overlays.computer_overlay.as_ref(),
@@ -1648,7 +1649,7 @@ impl AppShell {
         .detach();
     }
 
-    /// Dispatches Hermes inline callback commands, approvals, Talk Mode, Remote Computer, or Mini-Apps.
+    /// Dispatches Hermes inline callback commands, approvals, Talk Mode, Remote Computer, Code Scene, or Mini-Apps.
     pub fn execute_hermes_inline_callback(&mut self, raw_action: String, cx: &mut Context<Self>) {
         if self.try_handle_or_swallow_apple_deep_link(&raw_action, true, cx) {
             return;
@@ -1656,6 +1657,13 @@ impl AppShell {
         let trimmed = raw_action.trim().to_string();
         let lower = trimmed.to_ascii_lowercase();
         let lang = self.active_lang_id();
+
+        if let Some(cs_action) =
+            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::parse_payload(&trimmed)
+        {
+            self.handle_code_scene_card_action(cs_action, cx);
+            return;
+        }
 
         if matches!(
             lower.as_str(),

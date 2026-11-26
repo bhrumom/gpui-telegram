@@ -29,6 +29,7 @@ pub enum MainMenuCommand {
     TaskCenter,
     McpTools,
     RemoteComputer,
+    CodeScene,
     Browser,
     Community,
     Settings,
@@ -285,6 +286,12 @@ impl Render for MainMenuDrawer {
                 zh: "远程电脑",
                 en: "Remote Computer",
                 cmd: MainMenuCommand::RemoteComputer,
+            },
+            MenuRowEntry::Action {
+                icon: IconName::CodeScene,
+                zh: "代码场景",
+                en: "Code Scene",
+                cmd: MainMenuCommand::CodeScene,
             },
             MenuRowEntry::Action {
                 icon: IconName::ScreenShare,

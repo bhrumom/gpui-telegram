@@ -1,12 +1,20 @@
+use crate::cache::code_scene_sqlite::{
+    CachedCodeSceneComment, CachedCodeSceneRecord, CodeSceneLocalSocialEntry,
+    CodeSceneSocialRelationKind, LocalCodeSceneDraft, TelemetryOutboxRecord,
+};
 use crate::cache::sqlite_cache::{
     sort_public_catalog_items, sort_user_creation_states, sort_user_creations,
     CachedChatHistorySnapshot, CachedMediaEntry, SqliteClientCache, META_CREATIONS_LAST_REVISION,
 };
 use crate::net::hermes_client::{HermesRichChatDto, HermesRichMessageDto};
 use crate::net::http_client::{ChatSummary, HistoricalMessage};
+use gpui_telegram_code_scene::UserInterestProfile;
 use gpui_telegram_core::error::Result;
 use gpui_telegram_core::types::{ChatId, MessageId, UserId};
 use gpui_telegram_proto::automation_apps::{AutomationAppDetail, InstalledAutomationApp};
+use gpui_telegram_proto::code_scene_contracts::{
+    CodeSceneAssetDto, CodeSceneCommentSort, SceneBehaviorEventDto,
+};
 use gpui_telegram_proto::contracts::auth::ContactDto;
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
 use gpui_telegram_proto::creations::{
@@ -19,6 +27,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use uuid::Uuid;
 
 const MAX_CACHED_HISTORY_MESSAGES_PER_CHAT: usize = 100;
 const META_KEY_LAST_ACTIVE_CHAT_ID: &str = "last_active_chat_id";
@@ -45,6 +54,13 @@ struct LocalCacheState {
     cache_meta: HashMap<String, String>,
     installed_automation_apps: HashMap<String, InstalledAutomationApp>,
     cached_automation_apps: HashMap<String, AutomationAppDetail>,
+    code_scenes_cache: HashMap<String, CachedCodeSceneRecord>,
+    code_scene_profiles: HashMap<i64, UserInterestProfile>,
+    code_scene_telemetry_outbox: Vec<TelemetryOutboxRecord>,
+    next_mem_telemetry_outbox_id: i64,
+    code_scene_drafts: HashMap<String, LocalCodeSceneDraft>,
+    code_scene_social: HashMap<(i64, CodeSceneSocialRelationKind, String), CodeSceneLocalSocialEntry>,
+    code_scene_comments: HashMap<String, Vec<CachedCodeSceneComment>>,
     cached_dialog_summaries: Vec<ChatSummary>,
     cached_rich_chats: HashMap<u64, HermesRichChatDto>,
     cached_chat_histories: HashMap<u64, CachedChatHistorySnapshot>,
@@ -68,6 +84,7 @@ pub struct LocalStore {
     state: Arc<RwLock<LocalCacheState>>,
     sqlite: Option<Arc<SqliteClientCache>>,
     clear_hooks: ClearHookList,
+    code_scene_clear_hooks: ClearHookList,
 }
 
 impl LocalStore {
@@ -105,6 +122,18 @@ impl LocalStore {
         }
         let installed_automation_apps = db.load_installed_automation_apps()?;
         let cached_automation_apps = db.load_cached_automation_apps()?;
+        let code_scenes_cache = db.load_cached_code_scenes()?;
+        let code_scene_profiles = db.load_code_scene_profiles()?;
+        let code_scene_telemetry_outbox = db.load_code_scene_telemetry_outbox()?;
+        let next_mem_telemetry_outbox_id = code_scene_telemetry_outbox
+            .iter()
+            .map(|r| r.outbox_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let code_scene_drafts = db.load_code_scene_drafts()?;
+        let code_scene_social = db.load_code_scene_social()?;
+        let code_scene_comments = db.load_code_scene_comments()?;
         let cached_dialog_summaries = db.load_cached_dialog_summaries().unwrap_or_default();
         let cached_rich_chats = db.load_cached_rich_chats().unwrap_or_default();
         let cached_chat_histories = db.load_cached_chat_histories().unwrap_or_default();
@@ -137,6 +166,13 @@ impl LocalStore {
             cache_meta,
             installed_automation_apps,
             cached_automation_apps,
+            code_scenes_cache,
+            code_scene_profiles,
+            code_scene_telemetry_outbox,
+            next_mem_telemetry_outbox_id,
+            code_scene_drafts,
+            code_scene_social,
+            code_scene_comments,
             cached_dialog_summaries,
             cached_rich_chats,
             cached_chat_histories,
@@ -148,11 +184,20 @@ impl LocalStore {
             state: Arc::new(RwLock::new(state)),
             sqlite: Some(db),
             clear_hooks: ClearHookList::default(),
+            code_scene_clear_hooks: ClearHookList::default(),
         })
     }
 
     pub(crate) fn register_clear_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.clear_hooks.0.lock().push(hook);
+    }
+
+    /// Registers a Code Scene-specific scope-reset hook invoked both on `clear_all()` and
+    /// unconditionally on Guest (`None`) -> Authenticated (`Some(user_id)`) transitions in
+    /// `bind_account_scope`, fencing mid-flight Guest async fallbacks even when all 6 Code Scene
+    /// tables were initially empty.
+    pub fn register_code_scene_clear_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.code_scene_clear_hooks.0.lock().push(hook);
     }
 
     pub(crate) fn sqlite_cache(&self) -> Option<Arc<SqliteClientCache>> {
@@ -178,18 +223,29 @@ impl LocalStore {
             return;
         }
         let norm_srv = server_url.trim().trim_end_matches('/').to_string();
-        let should_clear = {
+        let (should_clear_all, transitioning_from_guest) = {
             let guard = self.state.read();
             match &guard.owner_scope {
                 Some((prev_srv, prev_uid)) => {
-                    *prev_uid != user_id
-                        || (!norm_srv.is_empty() && !prev_srv.is_empty() && *prev_srv != norm_srv)
+                    let changed = *prev_uid != user_id
+                        || (!norm_srv.is_empty() && !prev_srv.is_empty() && *prev_srv != norm_srv);
+                    (changed, false)
                 }
-                None => false,
+                None => (false, true),
             }
         };
-        if should_clear {
+        if should_clear_all {
             self.clear_all();
+        } else if transitioning_from_guest {
+            // Wipe all 6 Code Scene tables (RAM & SQLite) and unconditionally fire dedicated
+            // Code Scene clear hooks when transitioning from an unbound Guest (`user_id == 0`)
+            // session into an authenticated account so anonymous edits and mid-flight async
+            // fallbacks never leak across account boundaries (without triggering non-CS hooks).
+            self.clear_code_scene_state();
+            let cs_hooks = self.code_scene_clear_hooks.0.lock().clone();
+            for hook in cs_hooks {
+                hook();
+            }
         }
         self.state.write().owner_scope = Some((norm_srv.clone(), user_id));
         if let Some(db) = &self.sqlite {
@@ -215,6 +271,10 @@ impl LocalStore {
         None
     }
 
+    pub fn owner_scope(&self) -> Option<(String, u64)> {
+        self.state.read().owner_scope.clone()
+    }
+
     pub fn clear_all(&self) {
         {
             let mut guard = self.state.write();
@@ -235,6 +295,13 @@ impl LocalStore {
             guard.cache_meta.clear();
             guard.installed_automation_apps.clear();
             guard.cached_automation_apps.clear();
+            guard.code_scenes_cache.clear();
+            guard.code_scene_profiles.clear();
+            guard.code_scene_telemetry_outbox.clear();
+            guard.next_mem_telemetry_outbox_id = 1;
+            guard.code_scene_drafts.clear();
+            guard.code_scene_social.clear();
+            guard.code_scene_comments.clear();
             guard.mem_media_bytes.clear();
             guard.cached_dialog_summaries.clear();
             guard.cached_rich_chats.clear();
@@ -248,6 +315,10 @@ impl LocalStore {
         }
         let hooks = self.clear_hooks.0.lock().clone();
         for hook in hooks {
+            hook();
+        }
+        let cs_hooks = self.code_scene_clear_hooks.0.lock().clone();
+        for hook in cs_hooks {
             hook();
         }
     }
@@ -1532,5 +1603,430 @@ impl LocalStore {
             .collect();
         sort_public_catalog_items(&mut items);
         items
+    }
+
+    // ========================================================================
+    // Code Scene Offline-First Cache, Profile, Telemetry Outbox & Social Store
+    // ========================================================================
+
+    pub fn clear_code_scene_state(&self) {
+        {
+            let mut guard = self.state.write();
+            guard.code_scenes_cache.clear();
+            guard.code_scene_profiles.clear();
+            guard.code_scene_telemetry_outbox.clear();
+            guard.next_mem_telemetry_outbox_id = 1;
+            guard.code_scene_drafts.clear();
+            guard.code_scene_social.clear();
+            guard.code_scene_comments.clear();
+        }
+        if let Some(db) = &self.sqlite {
+            db.clear_code_scene_tables();
+        }
+    }
+
+    pub fn clear_code_scene_for_user(&self, user_id: i64) {
+        {
+            let mut guard = self.state.write();
+            guard
+                .code_scenes_cache
+                .retain(|_, r| !(r.is_local_only && r.asset.author_user_id == user_id));
+            guard.code_scene_profiles.remove(&user_id);
+            guard
+                .code_scene_telemetry_outbox
+                .retain(|r| r.event.user_id != user_id);
+            guard
+                .code_scene_drafts
+                .retain(|_, d| d.user_id != user_id);
+            guard
+                .code_scene_social
+                .retain(|(uid, _, _), _| *uid != user_id);
+            for comments in guard.code_scene_comments.values_mut() {
+                comments.retain(|c| c.comment.author_user_id != user_id);
+            }
+            guard.code_scene_comments.retain(|_, list| !list.is_empty());
+        }
+        if let Some(db) = &self.sqlite {
+            db.clear_code_scene_for_user(user_id);
+        }
+    }
+
+    pub fn upsert_cached_code_scene(&self, asset: CodeSceneAssetDto, is_local_only: bool) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let rec = CachedCodeSceneRecord {
+            asset,
+            is_local_only,
+            cached_at_ms: now_ms,
+        };
+        {
+            let mut guard = self.state.write();
+            guard
+                .code_scenes_cache
+                .insert(rec.asset.scene_id.clone(), rec.clone());
+        }
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_code_scene(&rec);
+        }
+    }
+
+    pub fn get_cached_code_scene(&self, scene_id: &str) -> Option<CachedCodeSceneRecord> {
+        self.state.read().code_scenes_cache.get(scene_id).cloned()
+    }
+
+    pub fn list_cached_code_scenes(&self) -> Vec<CachedCodeSceneRecord> {
+        let mut items: Vec<CachedCodeSceneRecord> = self
+            .state
+            .read()
+            .code_scenes_cache
+            .values()
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            b.asset
+                .updated_at_ms
+                .cmp(&a.asset.updated_at_ms)
+                .then_with(|| a.asset.scene_id.cmp(&b.asset.scene_id))
+        });
+        items
+    }
+
+    pub fn list_local_only_code_scenes(&self) -> Vec<CachedCodeSceneRecord> {
+        self.list_cached_code_scenes()
+            .into_iter()
+            .filter(|r| r.is_local_only)
+            .collect()
+    }
+
+    pub fn delete_cached_code_scene(&self, scene_id: &str) {
+        self.state.write().code_scenes_cache.remove(scene_id);
+        if let Some(db) = &self.sqlite {
+            db.delete_cached_code_scene(scene_id);
+        }
+    }
+
+    pub fn upsert_code_scene_profile(&self, mut profile: UserInterestProfile) {
+        profile.sanitize();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut guard = self.state.write();
+            guard
+                .code_scene_profiles
+                .insert(profile.user_id, profile.clone());
+        }
+        if let Some(db) = &self.sqlite {
+            db.upsert_code_scene_profile(&profile, now_ms);
+        }
+    }
+
+    pub fn get_code_scene_profile(&self, user_id: i64) -> Option<UserInterestProfile> {
+        self.state.read().code_scene_profiles.get(&user_id).cloned()
+    }
+
+    pub fn enqueue_code_scene_telemetry(
+        &self,
+        mut event: SceneBehaviorEventDto,
+    ) -> TelemetryOutboxRecord {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if event.event_id.trim().is_empty() {
+            event.event_id = format!("cs_ev_{}", Uuid::new_v4().simple());
+        }
+        if event.timestamp_ms <= 0 {
+            event.timestamp_ms = now_ms;
+        }
+        let event = event.sanitized();
+
+        // Check in-memory dedup first
+        {
+            let guard = self.state.read();
+            if let Some(existing) = guard
+                .code_scene_telemetry_outbox
+                .iter()
+                .find(|r| r.event.event_id == event.event_id)
+            {
+                return existing.clone();
+            }
+        }
+
+        let persisted_rec = self
+            .sqlite
+            .as_ref()
+            .and_then(|db| db.enqueue_code_scene_telemetry(&event, now_ms));
+
+        let mut guard = self.state.write();
+        if let Some(existing) = guard
+            .code_scene_telemetry_outbox
+            .iter()
+            .find(|r| r.event.event_id == event.event_id)
+        {
+            return existing.clone();
+        }
+        let rec = match persisted_rec {
+            Some(r) => {
+                if r.outbox_id >= guard.next_mem_telemetry_outbox_id {
+                    guard.next_mem_telemetry_outbox_id = r.outbox_id.saturating_add(1);
+                }
+                r
+            }
+            None => {
+                if guard.next_mem_telemetry_outbox_id <= 0 {
+                    guard.next_mem_telemetry_outbox_id = 1;
+                }
+                let id = guard.next_mem_telemetry_outbox_id;
+                guard.next_mem_telemetry_outbox_id = id.saturating_add(1);
+                TelemetryOutboxRecord {
+                    outbox_id: id,
+                    event,
+                    retry_count: 0,
+                    last_error: None,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                }
+            }
+        };
+        guard.code_scene_telemetry_outbox.push(rec.clone());
+        guard
+            .code_scene_telemetry_outbox
+            .sort_by_key(|r| r.outbox_id);
+        rec
+    }
+
+    pub fn list_code_scene_telemetry_outbox(
+        &self,
+        user_id: i64,
+        limit: usize,
+    ) -> Vec<TelemetryOutboxRecord> {
+        let guard = self.state.read();
+        guard
+            .code_scene_telemetry_outbox
+            .iter()
+            .filter(|r| r.event.user_id == user_id)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn pending_code_scene_telemetry_count(&self, user_id: i64) -> usize {
+        self.state
+            .read()
+            .code_scene_telemetry_outbox
+            .iter()
+            .filter(|r| r.event.user_id == user_id)
+            .count()
+    }
+
+    pub fn ack_code_scene_telemetry_outbox(&self, outbox_ids: &[i64]) {
+        if outbox_ids.is_empty() {
+            return;
+        }
+        {
+            let mut guard = self.state.write();
+            guard
+                .code_scene_telemetry_outbox
+                .retain(|r| !outbox_ids.contains(&r.outbox_id));
+        }
+        if let Some(db) = &self.sqlite {
+            db.ack_code_scene_telemetry_outbox(outbox_ids);
+        }
+    }
+
+    pub fn mark_code_scene_telemetry_outbox_failed(&self, outbox_ids: &[i64], err: &str) {
+        if outbox_ids.is_empty() {
+            return;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut guard = self.state.write();
+            for rec in &mut guard.code_scene_telemetry_outbox {
+                if outbox_ids.contains(&rec.outbox_id) {
+                    rec.retry_count = rec.retry_count.saturating_add(1);
+                    rec.last_error = Some(err.to_string());
+                    rec.updated_at_ms = now_ms;
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.mark_code_scene_telemetry_outbox_failed(outbox_ids, err, now_ms);
+        }
+    }
+
+    pub fn upsert_code_scene_draft(&self, draft: LocalCodeSceneDraft) {
+        {
+            let mut guard = self.state.write();
+            guard
+                .code_scene_drafts
+                .insert(draft.draft_id.clone(), draft.clone());
+        }
+        if let Some(db) = &self.sqlite {
+            db.upsert_code_scene_draft(&draft);
+        }
+    }
+
+    pub fn get_code_scene_draft(&self, draft_id: &str) -> Option<LocalCodeSceneDraft> {
+        self.state.read().code_scene_drafts.get(draft_id).cloned()
+    }
+
+    pub fn list_code_scene_drafts(&self, user_id: i64) -> Vec<LocalCodeSceneDraft> {
+        let mut items: Vec<LocalCodeSceneDraft> = self
+            .state
+            .read()
+            .code_scene_drafts
+            .values()
+            .filter(|d| d.user_id == user_id)
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.draft_id.cmp(&b.draft_id))
+        });
+        items
+    }
+
+    pub fn delete_code_scene_draft(&self, draft_id: &str) {
+        self.state.write().code_scene_drafts.remove(draft_id);
+        if let Some(db) = &self.sqlite {
+            db.delete_code_scene_draft(draft_id);
+        }
+    }
+
+    pub fn upsert_code_scene_social(&self, entry: CodeSceneLocalSocialEntry) {
+        {
+            let mut guard = self.state.write();
+            guard.code_scene_social.insert(
+                (entry.user_id, entry.relation_kind, entry.target_id.clone()),
+                entry.clone(),
+            );
+        }
+        if let Some(db) = &self.sqlite {
+            db.upsert_code_scene_social(&entry);
+        }
+    }
+
+    pub fn list_code_scene_social(&self, user_id: i64) -> Vec<CodeSceneLocalSocialEntry> {
+        let mut items: Vec<CodeSceneLocalSocialEntry> = self
+            .state
+            .read()
+            .code_scene_social
+            .values()
+            .filter(|e| e.user_id == user_id)
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| a.updated_at_ms.cmp(&b.updated_at_ms));
+        items
+    }
+
+    pub fn list_pending_code_scene_social(&self, user_id: i64) -> Vec<CodeSceneLocalSocialEntry> {
+        self.list_code_scene_social(user_id)
+            .into_iter()
+            .filter(|e| e.pending_sync)
+            .collect()
+    }
+
+    pub fn upsert_code_scene_comment(&self, record: CachedCodeSceneComment) {
+        {
+            let mut guard = self.state.write();
+            let list = guard
+                .code_scene_comments
+                .entry(record.comment.scene_id.clone())
+                .or_default();
+            if let Some(existing) = list
+                .iter_mut()
+                .find(|c| c.comment.comment_id == record.comment.comment_id)
+            {
+                *existing = record.clone();
+            } else {
+                list.push(record.clone());
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.upsert_code_scene_comment(&record);
+        }
+    }
+
+    pub fn replace_code_scene_comments_for_scene(
+        &self,
+        scene_id: &str,
+        synced_records: Vec<CachedCodeSceneComment>,
+    ) {
+        {
+            let mut guard = self.state.write();
+            let entry = guard
+                .code_scene_comments
+                .entry(scene_id.to_string())
+                .or_default();
+            let pending: Vec<CachedCodeSceneComment> =
+                entry.iter().filter(|c| c.pending_sync).cloned().collect();
+            entry.clear();
+            entry.extend(synced_records.iter().cloned());
+            for p in pending {
+                if !entry
+                    .iter()
+                    .any(|c| c.comment.comment_id == p.comment.comment_id)
+                {
+                    entry.push(p);
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_synced_code_scene_comments(scene_id, &synced_records);
+        }
+    }
+
+    pub fn delete_code_scene_comment(&self, scene_id: &str, comment_id: &str) {
+        {
+            let mut guard = self.state.write();
+            if let Some(list) = guard.code_scene_comments.get_mut(scene_id) {
+                list.retain(|c| c.comment.comment_id != comment_id);
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.delete_code_scene_comment(comment_id);
+        }
+    }
+
+    pub fn list_code_scene_comments(
+        &self,
+        scene_id: &str,
+        sort: CodeSceneCommentSort,
+    ) -> Vec<CachedCodeSceneComment> {
+        let mut list = self
+            .state
+            .read()
+            .code_scene_comments
+            .get(scene_id)
+            .cloned()
+            .unwrap_or_default();
+        match sort {
+            CodeSceneCommentSort::Hot => list.sort_by(|a, b| {
+                b.comment
+                    .likes_count
+                    .cmp(&a.comment.likes_count)
+                    .then_with(|| b.comment.created_at_ms.cmp(&a.comment.created_at_ms))
+                    .then_with(|| a.comment.comment_id.cmp(&b.comment.comment_id))
+            }),
+            CodeSceneCommentSort::Newest => list.sort_by(|a, b| {
+                b.comment
+                    .created_at_ms
+                    .cmp(&a.comment.created_at_ms)
+                    .then_with(|| a.comment.comment_id.cmp(&b.comment.comment_id))
+            }),
+        }
+        list
+    }
+
+    pub fn list_pending_code_scene_comments(
+        &self,
+        author_user_id: i64,
+    ) -> Vec<CachedCodeSceneComment> {
+        let mut out = Vec::new();
+        for list in self.state.read().code_scene_comments.values() {
+            for c in list {
+                if c.pending_sync && c.comment.author_user_id == author_user_id {
+                    out.push(c.clone());
+                }
+            }
+        }
+        out.sort_by_key(|c| c.comment.created_at_ms);
+        out
     }
 }
