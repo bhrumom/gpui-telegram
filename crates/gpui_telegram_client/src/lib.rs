@@ -86,7 +86,7 @@ pub use net::{
     InstallAutomationAppResponse, InstalledAutomationApp, ListAutomationAppsQuery,
     ListAutomationAppsResponse, ListInstalledAutomationAppsResponse, PublishAutomationAppRequest,
     RecordAutomationRunRequest, RecordAutomationRunResponse, UninstallAutomationAppResponse,
-    AUTOMATION_APP_SCHEMA_VERSION_V1,
+    AUTOMATION_APP_SCHEMA_VERSION_V1, OrcaClient, OrcaClientError,
 };
 pub use session_persistence::{
     AccountSessionRecord, ActiveDeviceSession, PersistedClientState, ProxyEndpointRecord,

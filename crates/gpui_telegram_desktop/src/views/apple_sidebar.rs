@@ -24,6 +24,7 @@ pub const TOP_CLEARANCE_HEIGHT: f32 = 52.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppleSidebarSection {
     Chats,
+    Community,
     Books,
     Music,
     Games,
@@ -32,10 +33,10 @@ pub enum AppleSidebarSection {
 }
 
 impl AppleSidebarSection {
-    /// Converts this sidebar destination into a [`ContentHubSection`] (`None` for `Chats`).
+    /// Converts this sidebar destination into a [`ContentHubSection`] (`None` for `Chats`/`Community`).
     pub fn to_content_hub_section(self) -> Option<ContentHubSection> {
         match self {
-            Self::Chats => None,
+            Self::Chats | Self::Community => None,
             Self::Books => Some(ContentHubSection::Books),
             Self::Music => Some(ContentHubSection::Music),
             Self::Games => Some(ContentHubSection::Games),
@@ -74,6 +75,7 @@ pub struct AppleAppSidebar {
     pub creations_filters_expanded: bool,
     pub active_creation_kind_filter: Option<CreationKind>,
     pub unread_chats_count: u32,
+    pub community_unread_count: u32,
     pub creations_count: usize,
     pub pending_review_count: usize,
     pub palette: TdesktopThemePalette,
@@ -91,6 +93,7 @@ impl AppleAppSidebar {
             creations_filters_expanded: true,
             active_creation_kind_filter: None,
             unread_chats_count: 0,
+            community_unread_count: 0,
             creations_count: 0,
             pending_review_count: 0,
             palette,
@@ -141,11 +144,16 @@ impl AppleAppSidebar {
         self.pending_review_count = pending_review_count;
     }
 
+    pub fn set_community_unread(&mut self, count: u32) {
+        self.community_unread_count = count;
+    }
+
     pub fn reset_for_logout_or_account_switch(&mut self) {
         self.active_section = AppleSidebarSection::Chats;
         self.creations_drawer_open = false;
         self.active_creation_kind_filter = None;
         self.unread_chats_count = 0;
+        self.community_unread_count = 0;
         self.creations_count = 0;
         self.pending_review_count = 0;
     }
@@ -246,14 +254,20 @@ impl AppleAppSidebar {
                             .px(px(6.0))
                             .py(px(1.0))
                             .rounded(px(999.0))
-                            .bg(if section == AppleSidebarSection::Chats {
+                            .bg(if matches!(
+                                section,
+                                AppleSidebarSection::Chats | AppleSidebarSection::Community
+                            ) {
                                 rgb(pal.unread_badge_bg)
                             } else {
                                 TdesktopThemePalette::rgba_with_alpha(accent, 0.16)
                             })
                             .text_size(px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if section == AppleSidebarSection::Chats {
+                            .text_color(rgb(if matches!(
+                                section,
+                                AppleSidebarSection::Chats | AppleSidebarSection::Community
+                            ) {
                                 pal.unread_badge_fg
                             } else {
                                 accent
@@ -295,6 +309,13 @@ impl Render for AppleAppSidebar {
                 self.unread_chats_count.to_string()
             }
         });
+        let community_badge = (self.community_unread_count > 0).then(|| {
+            if self.community_unread_count > 999 {
+                "999+".to_string()
+            } else {
+                self.community_unread_count.to_string()
+            }
+        });
         let creations_badge = (self.creations_count > 0).then(|| self.creations_count.to_string());
         let pending_review_label = (self.pending_review_count > 0).then(|| {
             let count_txt = if self.pending_review_count > 99 {
@@ -305,6 +326,8 @@ impl Render for AppleAppSidebar {
             format!("{} {}", tr_str(&lang, "待审", "Review"), count_txt)
         });
         let chats_collapsed_dot = (self.unread_chats_count > 0).then_some(pal.unread_badge_bg);
+        let community_collapsed_dot =
+            (self.community_unread_count > 0).then_some(pal.unread_badge_bg);
         let creations_collapsed_dot = (self.pending_review_count > 0).then_some(0xFF9F0A);
 
         div()
@@ -383,6 +406,16 @@ impl Render for AppleAppSidebar {
                         tr_str(&lang, "消息", "Chats"),
                         unread_badge,
                         chats_collapsed_dot,
+                        cx,
+                    ))
+                    .child(self.render_nav_row(
+                        "apple-sidebar-nav-community",
+                        AppleSidebarSection::Community,
+                        IconName::CommunityGlobe,
+                        pal.accent,
+                        tr_str(&lang, "社区", "Community"),
+                        community_badge,
+                        community_collapsed_dot,
                         cx,
                     ))
                     .child(self.render_nav_row(

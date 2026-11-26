@@ -2,11 +2,16 @@
 //! `recorder_panel`, `store_panel`, and engine metadata).
 
 pub mod cdp_surface;
+pub mod design_mode;
 pub mod recorder_panel;
 pub mod store_panel;
 pub mod workspace;
 
 pub use cdp_surface::{decode_png_to_render_image, map_point_contain, CdpViewportSurface};
+pub use design_mode::{
+    contain_draw_rect, project_css_rect_to_overlay_px, project_norm_bp_to_overlay_px,
+    BrowserWorkspaceEvent, DesignHandoffTarget, DesignModePanelState, OverlayBoxPx,
+};
 pub use recorder_panel::{BrowserLogEntry, BrowserLogLevel, ChromeProbeUiState, RecorderPanelState};
 pub use store_panel::StorePanelState;
 pub use workspace::{

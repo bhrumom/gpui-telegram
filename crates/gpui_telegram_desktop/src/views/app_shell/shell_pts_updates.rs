@@ -1547,6 +1547,26 @@ impl AppShell {
             } => {
                 self.handle_ws_public_catalog_changed(creation_id, kind, action, cx);
             }
+            UpdateEvent::CommunityEvent {
+                event_kind,
+                community_id,
+                post_id,
+                comment_id,
+                actor_id,
+                payload_json,
+                timestamp_ms,
+            } => {
+                self.handle_community_ws_event(
+                    event_kind,
+                    community_id,
+                    post_id,
+                    comment_id,
+                    actor_id,
+                    payload_json,
+                    timestamp_ms,
+                    cx,
+                );
+            }
             _ => {}
         }
     }
@@ -1901,6 +1921,13 @@ impl AppShell {
                     self.rtc_talk.active_call_id = None;
                     self.rtc_talk.talk_mode_overlay = None;
                     self.clear_ime_if_below_z5_unoccluded(cx);
+                    self.reset_nav_destination_if(
+                        &[
+                            crate::views::nav_rail::NavDestination::TalkMode,
+                            crate::views::nav_rail::NavDestination::Calls,
+                        ],
+                        cx,
+                    );
                 }
                 self.sync_calls_history(cx);
             }

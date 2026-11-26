@@ -8,10 +8,11 @@ use crate::views::auth::AuthWizardView;
 use crate::views::boxes::peers::create_managed_bot_box::CreateManagedBotBoxPeers;
 use crate::views::settings::SettingsRouter;
 use crate::views::tdesktop_theme::resolve_desktop_palette;
+use crate::views::orca::{OrcaBotsWorkspace, OrcaIdeWorkspace, ScopedJumpPalette};
 use crate::views::{
     AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
-    ComputerWorkbench, ContentHubWorkspace, ContextInspector, ConversationStage,
-    GlobalTasksWorkspace, IvViewer, MainMenuDrawer, MediaViewer, NavRail,
+    CommunityWorkspace, ComputerWorkbench, ContentHubWorkspace, ContextInspector,
+    ConversationStage, GlobalTasksWorkspace, IvViewer, MainMenuDrawer, MediaViewer, NavRail,
 };
 
 /// Maps persisted app preferences and optional desktop mode override into a full theme palette.
@@ -117,6 +118,10 @@ pub struct ShellThemeTargets<'a> {
     pub modal_container: &'a Entity<ModalContainer>,
     pub tasks_workspace: &'a Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<&'a Entity<BrowserWorkspace>>,
+    pub community_workspace: Option<&'a Entity<CommunityWorkspace>>,
+    pub orca_bots_workspace: Option<&'a Entity<OrcaBotsWorkspace>>,
+    pub orca_ide_workspace: Option<&'a Entity<OrcaIdeWorkspace>>,
+    pub orca_jump_palette: Option<&'a Entity<ScopedJumpPalette>>,
     pub talk_mode_overlay: Option<&'a Entity<CallOverlay>>,
     pub computer_overlay: Option<&'a Entity<ComputerWorkbench>>,
     pub media_viewer_overlay: Option<&'a Entity<MediaViewer>>,
@@ -184,6 +189,26 @@ pub fn propagate_theme_and_locale<V: 'static>(
     if let Some(browser) = targets.browser_workspace {
         browser.update(cx, |w, wcx| {
             w.sync_theme_and_locale(palette.clone(), lang_id, wcx);
+        });
+    }
+    if let Some(community) = targets.community_workspace {
+        community.update(cx, |w, wcx| {
+            w.sync_theme_and_locale(palette.clone(), lang_id, wcx);
+        });
+    }
+    if let Some(orca_bots) = targets.orca_bots_workspace {
+        orca_bots.update(cx, |w, wcx| {
+            w.set_theme_and_locale(palette.clone(), lang_id, wcx);
+        });
+    }
+    if let Some(orca_ide) = targets.orca_ide_workspace {
+        orca_ide.update(cx, |w, wcx| {
+            w.set_theme_and_locale(palette.clone(), lang_id, wcx);
+        });
+    }
+    if let Some(jump_palette) = targets.orca_jump_palette {
+        jump_palette.update(cx, |w, wcx| {
+            w.set_theme_and_locale(palette.clone(), lang_id, wcx);
         });
     }
     if let Some(overlay) = targets.computer_overlay {

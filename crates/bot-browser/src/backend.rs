@@ -262,6 +262,10 @@ pub trait BrowserSessionBackend: Send + Sync {
         }
     }
 
+    fn cdp_bridge(&self) -> Option<&Arc<CdpBridge>> {
+        None
+    }
+
     async fn close(&self) -> Result<(), BotBrowserError> {
         Ok(())
     }
@@ -1446,6 +1450,10 @@ impl BrowserSessionBackend for CdpBrowserBackend {
 
     fn performance_metrics(&self) -> BrowserPerformanceMetrics {
         self.telemetry.lock().snapshot()
+    }
+
+    fn cdp_bridge(&self) -> Option<&Arc<CdpBridge>> {
+        Some(&self.bridge)
     }
 
     async fn close(&self) -> Result<(), BotBrowserError> {

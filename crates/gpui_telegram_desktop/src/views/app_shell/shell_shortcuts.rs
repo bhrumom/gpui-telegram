@@ -52,6 +52,10 @@ impl AppShell {
                 | NavDestination::Folders
                 | NavDestination::SavedMessages
                 | NavDestination::Calls
+                | NavDestination::Browser
+                | NavDestination::Community
+                | NavDestination::OrcaBots
+                | NavDestination::OrcaIde
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
         ) {
@@ -68,6 +72,9 @@ impl AppShell {
         self.last_handled_nav_trigger = nav_trigger;
         if dest != NavDestination::Browser {
             self.hide_browser_native_webview(cx);
+        }
+        if dest != NavDestination::Community {
+            self.leave_community_panel_if_active(cx);
         }
         match dest {
             NavDestination::Chats | NavDestination::Folders => {
@@ -176,6 +183,15 @@ impl AppShell {
             NavDestination::Browser => {
                 self.open_browser_workspace(cx);
             }
+            NavDestination::Community => {
+                self.open_community_workspace(cx);
+            }
+            NavDestination::OrcaBots => {
+                let _ = self.open_orca_bots_workspace(cx);
+            }
+            NavDestination::OrcaIde => {
+                let _ = self.open_orca_ide_workspace(cx);
+            }
             NavDestination::TaskCenter => {
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.tasks_workspace
@@ -205,6 +221,9 @@ impl AppShell {
                 | NavDestination::TalkMode
                 | NavDestination::RemoteComputer
                 | NavDestination::Browser
+                | NavDestination::Community
+                | NavDestination::OrcaBots
+                | NavDestination::OrcaIde
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
@@ -250,6 +269,39 @@ impl AppShell {
                 _ => return true,
             }
         }
+        if self.is_authenticated && self.has_active_orca_security_modal(cx) {
+            return true;
+        }
+        if self.is_authenticated && self.orca_jump_palette.is_some() {
+            self.record_user_activity();
+            if !is_shift {
+                match key_lower.as_str() {
+                    "1" | "2" | "3" | "4" | "5" | "6" => {
+                        let digit = key_lower.as_bytes()[0] - b'0';
+                        let _ = self.handle_jump_palette_shortcut_digit(digit, cx);
+                        return true;
+                    }
+                    "j" => {
+                        self.close_scoped_jump_palette(cx);
+                        return true;
+                    }
+                    "v" => {
+                        if let Some(clip_text) =
+                            cx.read_from_clipboard().and_then(|item| item.text())
+                        {
+                            self.insert_committed_text(&clip_text, cx);
+                        }
+                        return true;
+                    }
+                    "backspace" | "a" | "u" => {
+                        self.clear_active_field(cx);
+                        return true;
+                    }
+                    _ => return true,
+                }
+            }
+            return true;
+        }
         if self.is_authenticated {
             self.record_user_activity();
         }
@@ -264,7 +316,7 @@ impl AppShell {
                 }
                 return true;
             }
-            "c" if publish_modal_ime_active || content_hub_ime_active => {
+            "c" if !is_shift && (publish_modal_ime_active || content_hub_ime_active) => {
                 let (committed, _) = self.active_text_and_preedit(cx);
                 if !committed.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(committed));
@@ -361,6 +413,29 @@ impl AppShell {
                     cx.notify();
                     true
                 }
+                ActiveWorkspacePanel::Community => {
+                    self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                    self.community_ime_preedit_input_gen = None;
+                    if let Some(ref cw) = self.community_workspace {
+                        cw.update(cx, |w, wcx| {
+                            w.blur_active_input(wcx);
+                        });
+                    }
+                    self.sidebar.update(cx, |sb, sb_cx| {
+                        sb.focus_search();
+                        sb_cx.notify();
+                    });
+                    if self.composer.read(cx).is_compose_isolated
+                        && !self.is_compose_or_creation_modal_active(cx)
+                    {
+                        self.exit_compose_or_modal_isolation(true, cx);
+                    } else {
+                        self.sync_compose_state_to_composer(true, cx);
+                    }
+                    self.blur_composer_and_cancel_ime(cx);
+                    cx.notify();
+                    true
+                }
                 ActiveWorkspacePanel::Chats => {
                     self.clear_ime_and_blur_content_hub_for_transition(true, cx);
                     self.sidebar.update(cx, |sb, sb_cx| {
@@ -388,6 +463,12 @@ impl AppShell {
                 self.navigate_settings_back(cx);
                 true
             }
+            "i" if is_shift && self.active_panel == ActiveWorkspacePanel::Browser => {
+                if let Some(ref bw) = self.browser_workspace {
+                    bw.update(cx, |w, wcx| w.toggle_design_mode(wcx));
+                }
+                true
+            }
             "i" => {
                 if self.active_panel == ActiveWorkspacePanel::Chats {
                     let next_open = !self.inspector.read(cx).is_open;
@@ -403,8 +484,23 @@ impl AppShell {
                 }
                 true
             }
+            "c" if is_shift => {
+                if self.active_panel == ActiveWorkspacePanel::Community {
+                    self.activate_nav_destination(NavDestination::Chats, cx);
+                } else {
+                    self.open_community_workspace(cx);
+                }
+                true
+            }
             "b" | "\\" => {
-                if self.active_panel == ActiveWorkspacePanel::Chats {
+                if matches!(
+                    self.active_panel,
+                    ActiveWorkspacePanel::Chats
+                        | ActiveWorkspacePanel::Browser
+                        | ActiveWorkspacePanel::Community
+                        | ActiveWorkspacePanel::OrcaBots
+                        | ActiveWorkspacePanel::OrcaIde
+                ) {
                     self.sidebar.update(cx, |sb, sb_cx| {
                         sb.toggle_collapsed_from_user();
                         sb_cx.notify();
@@ -417,24 +513,37 @@ impl AppShell {
                 self.toggle_account_popover(cx);
                 if self.sidebar.read(cx).is_account_popover_open {
                     self.blur_composer_and_cancel_ime(cx);
+                    self.blur_community_if_focused(cx);
                 }
                 cx.notify();
                 true
             }
+            "j" if is_shift => {
+                self.flip_chat_terminal_session(cx);
+                true
+            }
             "j" => {
-                self.refresh_contacts(cx);
-                self.open_modal_dialog(
-                    tr_str(lang, "联系人", "Contacts"),
-                    ModalDialogKind::Contacts,
-                    420.0,
-                    500.0,
-                    cx,
-                );
+                if matches!(
+                    self.active_panel,
+                    ActiveWorkspacePanel::Community | ActiveWorkspacePanel::ContentHub(_)
+                ) {
+                    self.refresh_contacts(cx);
+                    self.open_modal_dialog(
+                        tr_str(lang, "联系人", "Contacts"),
+                        ModalDialogKind::Contacts,
+                        420.0,
+                        500.0,
+                        cx,
+                    );
+                } else {
+                    self.toggle_scoped_jump_palette(cx);
+                }
                 true
             }
             "n" => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
                 let nav_trigger = self.nav_rail.update(cx, |r, r_cx| {
@@ -446,6 +555,7 @@ impl AppShell {
                 self.sync_apple_sidebar_to_active_panel(cx);
                 self.clear_ime_and_blur_content_hub_for_transition(true, cx);
                 self.bot_browser.ime_preedit_input_gen = None;
+                self.community_ime_preedit_input_gen = None;
                 if self.theme_state.palette.is_apple_style() {
                     self.enter_compose_or_modal_isolation(cx);
                     self.sidebar.update(cx, |sb, sb_cx| {

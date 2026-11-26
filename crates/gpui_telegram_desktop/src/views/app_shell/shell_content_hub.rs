@@ -421,6 +421,7 @@ impl AppShell {
             ActiveWorkspacePanel::ContentHub(sec) => {
                 AppleSidebarSection::from_content_hub_section(sec)
             }
+            ActiveWorkspacePanel::Community => AppleSidebarSection::Community,
             _ => AppleSidebarSection::Chats,
         };
         self.apple_sidebar.update(cx, |sb, scx| {
@@ -431,9 +432,17 @@ impl AppShell {
         });
     }
 
-    /// Synchronizes unread chat count, cloud creations count, and pending review count to `AppleAppSidebar`.
+    /// Synchronizes unread chat count, community unread count, cloud creations count, and pending review count to `AppleAppSidebar`.
     pub fn sync_apple_sidebar_badges(&mut self, cx: &mut Context<Self>) {
         let unread = self.sidebar.read(cx).total_unread_badge();
+        let community_unread = self
+            .nav_rail
+            .read(cx)
+            .items
+            .iter()
+            .find(|i| i.destination == NavDestination::Community)
+            .map(|i| i.unread_badge)
+            .unwrap_or(0);
         let (creations_count, pending_count) = {
             let h = self.content_hub.read(cx);
             (
@@ -446,22 +455,36 @@ impl AppShell {
         };
         self.apple_sidebar.update(cx, |sb, scx| {
             if sb.unread_chats_count != unread
+                || sb.community_unread_count != community_unread
                 || sb.creations_count != creations_count
                 || sb.pending_review_count != pending_count
             {
                 sb.set_badges(unread, creations_count, pending_count);
+                sb.set_community_unread(community_unread);
                 scx.notify();
             }
         });
     }
 
-    /// Switches between `Chats` and any Apple Content Hub vertical without clearing chat state.
+    /// Switches between `Chats`, `Community`, and any Apple Content Hub vertical without clearing chat state.
     pub fn select_apple_sidebar_section(
         &mut self,
         section: AppleSidebarSection,
         cx: &mut Context<Self>,
     ) {
         if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        if section == AppleSidebarSection::Community {
+            self.leave_workspace_modal_panel_for_hub(cx);
+            self.dismiss_transient_popovers_for_hub(cx);
+            self.content_hub.update(cx, |h, hcx| {
+                if h.active_input != ContentHubInputTarget::QuickDrawerSearch {
+                    h.active_input = ContentHubInputTarget::None;
+                }
+                hcx.notify();
+            });
+            self.open_community_workspace(cx);
             return;
         }
         self.leave_workspace_modal_panel_for_hub(cx);
@@ -538,6 +561,7 @@ impl AppShell {
 
     pub(crate) fn leave_workspace_modal_panel_for_hub(&mut self, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.cleanup_settings_panel_if_active(cx);
         if matches!(
             self.active_panel,
@@ -561,6 +585,7 @@ impl AppShell {
 
     fn dismiss_transient_popovers_for_hub(&mut self, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
+        self.blur_community_if_focused(cx);
         self.clear_all_ime_preedits(cx);
         self.main_menu_drawer.update(cx, |m, mcx| {
             if m.is_open {
@@ -970,6 +995,12 @@ impl AppShell {
                     self.overlays.computer_overlay.is_none()
                 } else if matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_)) {
                     self.is_content_hub_input_active(cx)
+                } else if matches!(
+                    self.active_panel,
+                    ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::Community
+                ) {
+                    self.is_base_workspace_unoccluded(cx)
+                        && self.content_hub.read(cx).has_focused_input(false)
                 } else {
                     self.is_chats_inline_unoccluded(cx)
                         && self.content_hub.read(cx).has_focused_input(false)
@@ -979,6 +1010,7 @@ impl AppShell {
                 }
                 self.clear_all_ime_preedits(cx);
                 self.blur_composer_and_cancel_ime(cx);
+                self.blur_community_if_focused(cx);
                 self.sidebar.update(cx, |sb, scx| {
                     if sb.search_focused {
                         sb.search_focused = false;
@@ -2320,6 +2352,7 @@ impl AppShell {
         // Z #14: PublishReviewModal
         self.close_publish_review_modal(cx);
         // Z #13: ModalContainer
+        self.community_pending_share = None;
         self.modal_container.update(cx, |m, mcx| {
             if m.is_modal_active() {
                 m.hide_all();

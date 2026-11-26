@@ -284,6 +284,10 @@ impl CdpViewportSurface {
         *self.viewport_bounds.lock() = bounds;
     }
 
+    pub fn viewport_bounds(&self) -> Option<Bounds<Pixels>> {
+        *self.viewport_bounds.lock()
+    }
+
     pub fn last_frame_revision(&self) -> u64 {
         self.frame_revision
     }

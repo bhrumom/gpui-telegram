@@ -244,6 +244,7 @@ fn activate_chats_workspace(shell: &mut AppShell, cx: &mut Context<AppShell>) {
     shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
     shell.cleanup_settings_panel_if_active(cx);
     shell.leave_browser_panel_if_active(cx);
+    shell.leave_community_panel_if_active(cx);
     shell.active_panel = ActiveWorkspacePanel::Chats;
     shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
     shell.main_menu_drawer.update(cx, |m, m_cx| {
@@ -340,6 +341,9 @@ impl AppShell {
                 });
                 shell.sync_composer_and_inspector_miniapp_state(cx);
                 shell.sync_fabushi_bots_to_views(cx);
+                if shell.community_workspace.is_some() {
+                    shell.sync_community_identities(cx);
+                }
                 cx.notify();
             });
         })

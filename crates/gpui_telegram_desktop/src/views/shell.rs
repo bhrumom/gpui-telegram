@@ -42,10 +42,15 @@ use crate::views::nav_rail::NavDestination;
 use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
 };
+use crate::views::orca::{
+    OrcaBotsWorkspace, OrcaDesktopRuntime, OrcaIdeWorkspace, ScopedJumpPalette,
+    SecuritySurfaceModal,
+};
 use crate::views::{
     AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
-    ComputerWorkbench, ContentHubSection, ContentHubWorkspace, ContextInspector,
-    ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer, NavRail,
+    CommunityWorkspace, ComputerWorkbench, ContentHubSection, ContentHubWorkspace,
+    ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer,
+    NavRail,
 };
 use crate::window::WindowSubsystemRuntime;
 
@@ -57,6 +62,9 @@ pub enum ActiveWorkspacePanel {
     TaskCenter,
     McpTools,
     Browser,
+    Community,
+    OrcaBots,
+    OrcaIde,
     Settings,
     ContentHub(ContentHubSection),
 }
@@ -117,6 +125,14 @@ pub struct AppShell {
     pub main_menu_drawer: Entity<MainMenuDrawer>,
     pub tasks_workspace: Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<Entity<BrowserWorkspace>>,
+    pub community_workspace: Option<Entity<CommunityWorkspace>>,
+    pub orca_runtime: Option<Arc<OrcaDesktopRuntime>>,
+    pub orca_bots_workspace: Option<Entity<OrcaBotsWorkspace>>,
+    pub orca_ide_workspace: Option<Entity<OrcaIdeWorkspace>>,
+    pub orca_jump_palette: Option<Entity<ScopedJumpPalette>>,
+    pub orca_security_modal: Option<Entity<SecuritySurfaceModal>>,
+    pub community_ime_preedit_input_gen: Option<u64>,
+    pub community_pending_share: Option<(String, String)>,
     pub auth_wizard: Entity<AuthWizardView>,
     pub settings_router: Entity<SettingsRouter>,
     pub client: Arc<TelegramClient>,
@@ -241,6 +257,14 @@ impl AppShell {
             main_menu_drawer,
             tasks_workspace,
             browser_workspace: None,
+            community_workspace: None,
+            orca_runtime: None,
+            orca_bots_workspace: None,
+            orca_ide_workspace: None,
+            orca_jump_palette: None,
+            orca_security_modal: None,
+            community_ime_preedit_input_gen: None,
+            community_pending_share: None,
             auth_wizard,
             settings_router,
             client: client.clone(),
@@ -868,6 +892,9 @@ impl AppShell {
                 self.magpie_local.legacy_keepalive_generation.wrapping_add(1);
             self.magpie_local.active_legacy_subscription_id = None;
             self.magpie_local.active_legacy_model = None;
+            self.community_workspace = None;
+            self.community_pending_share = None;
+            self.community_ime_preedit_input_gen = None;
             self.reset_nav_rail_for_logout_or_account_switch(cx);
         }
         if is_user_switch {
@@ -982,9 +1009,24 @@ impl AppShell {
                     w.set_occluded(true, wcx);
                 });
             }
-            if self.active_panel == ActiveWorkspacePanel::Browser {
+            self.community_workspace = None;
+            self.orca_runtime = None;
+            self.orca_bots_workspace = None;
+            self.orca_ide_workspace = None;
+            self.orca_jump_palette = None;
+            self.orca_security_modal = None;
+            self.community_pending_share = None;
+            self.community_ime_preedit_input_gen = None;
+            if matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Browser
+                    | ActiveWorkspacePanel::Community
+                    | ActiveWorkspacePanel::OrcaBots
+                    | ActiveWorkspacePanel::OrcaIde
+            ) {
                 self.active_panel = ActiveWorkspacePanel::Chats;
-                self.last_handled_nav_dest = Some(NavDestination::Chats);
+                self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
+                self.sync_apple_sidebar_to_active_panel(cx);
             }
             self.bot_browser.reset_on_logout();
             self.miniapps.reset();
@@ -1093,6 +1135,14 @@ impl AppShell {
                 w.set_occluded(true, wcx);
             });
         }
+        self.community_workspace = None;
+        self.orca_runtime = None;
+        self.orca_bots_workspace = None;
+        self.orca_ide_workspace = None;
+        self.orca_jump_palette = None;
+        self.orca_security_modal = None;
+        self.community_pending_share = None;
+        self.community_ime_preedit_input_gen = None;
         self.bot_browser.reset_on_logout();
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
@@ -1183,13 +1233,50 @@ impl AppShell {
         .detach();
     }
 
-    fn reset_nav_destination_if(&mut self, matching: &[NavDestination], cx: &mut Context<Self>) {
-        self.last_handled_nav_dest = Some(NavDestination::Chats);
-        self.nav_rail.update(cx, |r, _| {
+    pub(crate) fn nav_destination_for_active_panel(&self, cx: &App) -> NavDestination {
+        match self.active_panel {
+            ActiveWorkspacePanel::Chats | ActiveWorkspacePanel::ContentHub(_) => {
+                NavDestination::Chats
+            }
+            ActiveWorkspacePanel::Calls => NavDestination::Calls,
+            ActiveWorkspacePanel::TaskCenter => NavDestination::TaskCenter,
+            ActiveWorkspacePanel::McpTools => NavDestination::McpTools,
+            ActiveWorkspacePanel::Browser => NavDestination::Browser,
+            ActiveWorkspacePanel::Community => NavDestination::Community,
+            ActiveWorkspacePanel::OrcaBots => NavDestination::OrcaBots,
+            ActiveWorkspacePanel::OrcaIde => NavDestination::OrcaIde,
+            ActiveWorkspacePanel::Settings => {
+                let sr = self.settings_router.read(cx);
+                if sr.standalone_computers_mode
+                    && sr.settings_section == SettingsSectionType::Computers
+                {
+                    NavDestination::RemoteComputer
+                } else {
+                    NavDestination::Settings
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reset_nav_destination_if(
+        &mut self,
+        matching: &[NavDestination],
+        cx: &mut Context<Self>,
+    ) {
+        let restored = self.nav_destination_for_active_panel(cx);
+        let (did_reset, nav_trigger) = self.nav_rail.update(cx, |r, rcx| {
             if matching.contains(&r.active_destination) {
-                r.set_active_destination(NavDestination::Chats);
+                r.set_active_destination(restored);
+                rcx.notify();
+                (true, r.trigger_counter)
+            } else {
+                (false, r.trigger_counter)
             }
         });
+        if did_reset {
+            self.last_handled_nav_dest = Some(restored);
+            self.last_handled_nav_trigger = nav_trigger;
+        }
     }
 
     pub fn show_talk_mode(&mut self, cx: &mut Context<Self>) {
@@ -1267,6 +1354,7 @@ impl AppShell {
     /// Opens or navigates within the lazy `SettingsRouter` modal and dismisses conflicting popovers.
     pub fn navigate_settings_to(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         let was_outside = self.active_panel != ActiveWorkspacePanel::Settings;
         self.active_panel = ActiveWorkspacePanel::Settings;
@@ -1385,6 +1473,7 @@ impl AppShell {
         self.clear_ime_and_blur_content_hub_for_transition(false, cx);
         self.blur_composer_and_cancel_ime(cx);
         self.occlude_browser_for_overlay(cx);
+        self.occlude_community_for_overlay(cx);
         self.reconcile_chat_scoped_toasts(cx);
         self.settings_router.update(cx, |sr, scx| {
             if let Some(ref lp) = sr.settings_local_passcode {
@@ -1530,9 +1619,15 @@ impl AppShell {
             || create_bot_modal_open
             || creation_dialog_open
             || show_bot_start_bar
-            || matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_))
+            || matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Browser
+                    | ActiveWorkspacePanel::Community
+                    | ActiveWorkspacePanel::OrcaBots
+                    | ActiveWorkspacePanel::OrcaIde
+                    | ActiveWorkspacePanel::ContentHub(_)
+            )
             || self.is_publish_review_modal_active(cx)
-            || self.active_panel == ActiveWorkspacePanel::Browser
     }
 
     /// Flushes the active chat's unsent draft and isolates `CanonicalComposer` for `+` / creation.
@@ -1709,6 +1804,7 @@ impl AppShell {
         self.clear_ime_if_miniapp_unoccluded(cx);
         self.blur_composer_and_cancel_ime(cx);
         self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
     }
 
     /// Clears IME preedits iff `CreateManagedBotBox` (Z #5b) is unoccluded by Z #5c..#17.
@@ -1777,6 +1873,15 @@ impl AppShell {
         });
     }
 
+    pub(crate) fn blur_community_if_focused(&mut self, cx: &mut Context<Self>) {
+        self.community_ime_preedit_input_gen = None;
+        if let Some(cw) = self.community_workspace.clone() {
+            if cw.read(cx).has_focused_text_input() {
+                cw.update(cx, |w, wcx| w.blur_active_input(wcx));
+            }
+        }
+    }
+
     /// Prepares shell input state when opening `ComputerWorkbench` (Z #15, below `PasscodeLock`
     /// and above `PublishReviewModal`/`ModalContainer`).
     pub(crate) fn prepare_for_computer_overlay_open(&mut self, cx: &mut Context<Self>) {
@@ -1785,6 +1890,7 @@ impl AppShell {
         }
         self.blur_composer_and_cancel_ime(cx);
         self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
     }
 
     /// Prepares shell input state when opening/restoring a Z #5 MiniApp/Bot overlay
@@ -1793,6 +1899,7 @@ impl AppShell {
         self.clear_ime_if_no_tier2_to_5_overlay(cx);
         self.blur_composer_and_cancel_ime(cx);
         self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
     }
 
     /// Prepares shell input state when opening a Z #2..#4 overlay (`TalkMode`, `MediaViewer`, `IvViewer`).
@@ -1800,6 +1907,7 @@ impl AppShell {
         self.clear_ime_if_below_z5_unoccluded(cx);
         self.blur_composer_and_cancel_ime(cx);
         self.blur_content_hub_if_focused(cx);
+        self.blur_community_if_focused(cx);
     }
 
     pub(crate) fn can_focus_chat_composer(&self, cx: &App) -> bool {
@@ -2219,7 +2327,7 @@ impl AppShell {
         }
     }
 
-    fn is_error_toast_text(text: &str) -> bool {
+    pub fn is_error_toast_text(text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
         text.contains("PROVIDER_ERROR")
             || text.contains("Error:")
@@ -2482,6 +2590,27 @@ impl Render for AppShell {
             }
         }
 
+        if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Community {
+            let sb_w = self.sidebar.read(cx).effective_width();
+            let occluded = self.has_community_visual_occlusion_overlay(cx);
+            if let Some(cw) = self.community_workspace.clone() {
+                if occluded && cw.read(cx).has_focused_text_input() {
+                    if self.community_ime_preedit_input_gen.is_some() {
+                        self.ime.clear_preedit();
+                        self.community_ime_preedit_input_gen = None;
+                    }
+                    cw.update(cx, |w, wcx| {
+                        w.set_host_sidebar_width(sb_w);
+                        w.blur_active_input(wcx);
+                    });
+                } else {
+                    cw.update(cx, |w, _| {
+                        w.set_host_sidebar_width(sb_w);
+                    });
+                }
+            }
+        }
+
         let cdp_surface_focused = self.is_authenticated && self.is_browser_cdp_viewport_focused(window, cx);
         if self.is_authenticated && !cdp_surface_focused && !self.focus_handle.is_focused(window) {
             self.focus_handle.focus(window);
@@ -2645,7 +2774,36 @@ impl Render for AppShell {
                                 row
                             }
                         })
-                        .when(self.active_panel != ActiveWorkspacePanel::Browser, |row| {
+                        .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
+                            if let Some(ref cw) = self.community_workspace {
+                                row.child(cw.clone())
+                            } else {
+                                row
+                            }
+                        })
+                        .when(self.active_panel == ActiveWorkspacePanel::OrcaBots, |row| {
+                            if let Some(ref ob) = self.orca_bots_workspace {
+                                row.child(ob.clone())
+                            } else {
+                                row
+                            }
+                        })
+                        .when(self.active_panel == ActiveWorkspacePanel::OrcaIde, |row| {
+                            if let Some(ref oi) = self.orca_ide_workspace {
+                                row.child(oi.clone())
+                            } else {
+                                row
+                            }
+                        })
+                        .when(
+                            !matches!(
+                                self.active_panel,
+                                ActiveWorkspacePanel::Browser
+                                    | ActiveWorkspacePanel::Community
+                                    | ActiveWorkspacePanel::OrcaBots
+                                    | ActiveWorkspacePanel::OrcaIde
+                            ),
+                            |row| {
                             row.child(
                                 div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
                                     .bg(rgb(pal.stage_bg))
@@ -2741,6 +2899,8 @@ impl Render for AppShell {
                 el.child(self.render_publish_review_modal_overlay(cx))
             })
             .when_some(self.overlays.computer_overlay.clone(), |el, ov| el.child(self.render_remote_computer_overlay(ov)))
+            .when_some(self.orca_jump_palette.clone(), |el, ov| el.child(ov))
+            .when_some(self.orca_security_modal.clone(), |el, ov| el.child(ov))
             .when(self.overlays.is_passcode_locked, |el| el.child(self.render_passcode_lock_overlay(cx)))
             .when_some(
                 self.computers.pending_approvals.first().cloned(),

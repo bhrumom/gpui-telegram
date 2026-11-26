@@ -8,6 +8,7 @@ pub mod browser;
 pub mod call_overlay;
 pub mod canonical_composer;
 pub mod chat_sidebar;
+pub mod community;
 pub mod composer;
 pub mod computer_workbench;
 pub mod content_hub;
@@ -36,6 +37,10 @@ pub use browser::{
 pub use call_overlay::{CallOverlay, TalkModeState, TranscriptEntry};
 pub use canonical_composer::CanonicalComposer;
 pub use chat_sidebar::ChatSidebar;
+pub use community::{
+    ActiveCommunityInput, CommunityLayoutMode, CommunityRoute, CommunityWorkspace,
+    CommunityWorkspaceAction, FeedDensity,
+};
 pub use computer_workbench::{ComputerWorkbench, HostDeviceSpec};
 pub use content_hub::{ContentHubEvent, ContentHubSection, ContentHubWorkspace};
 pub use context_inspector::ContextInspector;
@@ -61,3 +66,4 @@ pub use drawer::inspector_tabs::{
 
 pub mod iv;
 pub use iv::*;
+pub mod orca;

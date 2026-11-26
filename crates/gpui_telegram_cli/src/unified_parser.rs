@@ -103,6 +103,9 @@ pub enum UnifiedCommand {
     Mcp {
         op: McpOp,
     },
+
+    // Orca Bot OS, Orchestration, Webhooks/Automations, Worktrees & Agent IDE
+    Orca(crate::orca_commands::OrcaCliCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,15 +686,18 @@ pub fn parse_unified_command(
             }
         }
         "bot" => {
-            let sub = args.get(idx).map(|s| s.as_str());
-            if matches!(sub, Some("list" | "bind-computer"))
-                || sub.is_none()
-                || help_requested
-                || sub.is_some_and(|s| s.starts_with('-'))
-            {
+            let sub = crate::orca_commands::peek_subcommand(args, idx);
+            if sub == Some("bind-computer") {
+                parse_bot(args, idx, opts, help_requested)?
+            } else if matches!(
+                sub,
+                Some("list-bots" | "list_bots" | "bind-bot-computer" | "bind_bot_computer")
+            ) {
+                return Ok(None);
+            } else if sub.is_none() || help_requested {
                 parse_bot(args, idx, opts, help_requested)?
             } else {
-                return Ok(None);
+                crate::orca_commands::parse_orca_command("bot", args, idx, opts, help_requested)?
             }
         }
         "miniapp" => {
@@ -731,6 +737,24 @@ pub fn parse_unified_command(
             } else {
                 return Ok(None);
             }
+        }
+        "orchestration"
+        | "webhooks"
+        | "webhook"
+        | "automations"
+        | "automation"
+        | "worktree"
+        | "worktrees"
+        | "ide"
+        | "browser"
+        | "computer"
+        | "artifacts"
+        | "artifact"
+        | "plugin"
+        | "plugins"
+        | "serve"
+        | "profile" => {
+            crate::orca_commands::parse_orca_command(head, args, idx, opts, help_requested)?
         }
         _ => return Ok(None),
     };

@@ -1221,7 +1221,11 @@ fn ui_t2_04_icon_and_nav_rail_regression_guardrails() {
     }
     assert_eq!(ToolsetId::all().len(), 29, "ToolsetId::all() must stay 29");
     let nav = NavRail::new();
-    assert_eq!(nav.items.len(), 10, "9 legacy destinations + upstream Browser");
+    assert_eq!(
+        nav.items.len(),
+        13,
+        "9 legacy destinations + upstream Browser + Community + OrcaBots + OrcaIde"
+    );
     assert_eq!(NAV_RAIL_WIDTH, 52.0);
     assert_eq!(DEFAULT_WIDTH, 288.0);
     assert_eq!(COLLAPSED_WIDTH, 64.0);

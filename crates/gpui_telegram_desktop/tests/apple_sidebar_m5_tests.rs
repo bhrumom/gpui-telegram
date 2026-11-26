@@ -1104,7 +1104,11 @@ fn test_m5_guardrails_icons_nav_rail_chat_sidebar_and_game_polish() {
 
     // 2. NavRail & ChatSidebar guardrails.
     let nav = NavRail::new();
-    assert_eq!(nav.items.len(), 10, "9 legacy destinations + upstream Browser");
+    assert_eq!(
+        nav.items.len(),
+        13,
+        "9 legacy destinations + upstream Browser + Community + OrcaBots + OrcaIde"
+    );
     assert_eq!(NAV_RAIL_WIDTH, 52.0);
     assert_eq!(DEFAULT_WIDTH, 288.0);
     assert_eq!(COLLAPSED_WIDTH, 64.0);

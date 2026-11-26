@@ -232,20 +232,27 @@ impl AppShell {
             let pub_closing_with_clear = prev_pub_open && !cur_pub_open && pub_close_pending_clear;
             let pub_changed = pub_opening_or_switched || pub_closing_with_clear;
             if pub_changed && shell.is_publish_review_modal_unoccluded(cx) {
+                if pub_opening_or_switched {
+                    shell.blur_community_if_focused(cx);
+                }
                 if !(pub_opening_or_switched && cur_pub_owns_preedit) {
                     shell.clear_all_ime_preedits(cx);
                 }
             } else if !pub_changed
                 && cur_hub_input != prev_hub_input
                 && shell.is_base_workspace_unoccluded(cx)
-                && !cur_hub_owns_preedit
             {
-                let should_clear = shell.is_content_hub_input_active(cx)
-                    || (cur_hub_input == ContentHubInputTarget::None
-                        && prev_hub_input != ContentHubInputTarget::None
-                        && !other_input_owns_ime(shell, cx));
-                if should_clear {
-                    shell.clear_all_ime_preedits(cx);
+                if cur_hub_input != ContentHubInputTarget::None {
+                    shell.blur_community_if_focused(cx);
+                }
+                if !cur_hub_owns_preedit {
+                    let should_clear = shell.is_content_hub_input_active(cx)
+                        || (cur_hub_input == ContentHubInputTarget::None
+                            && prev_hub_input != ContentHubInputTarget::None
+                            && !other_input_owns_ime(shell, cx));
+                    if should_clear {
+                        shell.clear_all_ime_preedits(cx);
+                    }
                 }
             }
             prev_pub_open = cur_pub_open;
@@ -536,6 +543,7 @@ impl AppShell {
                     }
                 });
                 shell.blur_composer_and_cancel_ime(cx);
+                shell.blur_community_if_focused(cx);
                 shell.reconcile_chat_scoped_toasts(cx);
             } else if prev_modal_active && !cur_modal_active && shell.is_modal_container_unoccluded(cx) {
                 shell.clear_all_ime_preedits(cx);
@@ -558,7 +566,9 @@ impl AppShell {
             {
                 shell.exit_compose_or_modal_isolation(true, cx);
             }
-            prev_modal_active = cur_modal_active;
+            if !cur_modal_active {
+                shell.community_pending_share = None;
+            }
             prev_creation_dialog_open = cur_creation_dialog_open;
         })
         .detach();
@@ -584,7 +594,7 @@ impl AppShell {
 
     fn observe_nav_rail_entity(&self, cx: &mut Context<Self>) {
         cx.observe(&self.nav_rail, |shell, rail, cx| {
-            let (dest, logout_req, trigger, menu_req, archive_req, theme_req, folder_req) =
+            let (mut dest, logout_req, trigger, menu_req, archive_req, theme_req, folder_req) =
                 rail.update(cx, |r, _| {
                     let f = r.selected_folder_requested.take().and_then(|fid| {
                         r.custom_folders.iter().find(|i| i.folder_id == fid).map(|i| i.title.clone())
@@ -604,6 +614,7 @@ impl AppShell {
                 if shell.sidebar.read(cx).is_account_popover_open && shell.is_account_popover_unoccluded(cx) {
                     shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
                     shell.blur_composer_and_cancel_ime(cx);
+                    shell.blur_community_if_focused(cx);
                 }
                 cx.notify();
             }
@@ -611,7 +622,10 @@ impl AppShell {
                 shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
                 shell.cleanup_settings_panel_if_active(cx);
                 shell.leave_browser_panel_if_active(cx);
+                shell.leave_community_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
+                shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
+                dest = NavDestination::Chats;
                 shell.sync_apple_sidebar_to_active_panel(cx);
                 shell.sidebar.update(cx, |sb, _| sb.is_archived_expanded = !sb.is_archived_expanded);
                 cx.notify();
@@ -625,7 +639,10 @@ impl AppShell {
                 shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
                 shell.cleanup_settings_panel_if_active(cx);
                 shell.leave_browser_panel_if_active(cx);
+                shell.leave_community_panel_if_active(cx);
                 shell.active_panel = ActiveWorkspacePanel::Chats;
+                shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
+                dest = NavDestination::Chats;
                 shell.sync_apple_sidebar_to_active_panel(cx);
                 shell.sidebar.update(cx, |sb, sb_cx| {
                     sb.select_folder(folder_title);
@@ -734,7 +751,7 @@ impl AppShell {
                 cur_overlay_open,
                 contacts_modal_open,
                 account_popover_open,
-                cur_compose_open,
+                mut cur_compose_open,
                 cur_compose_title_focused,
                 cur_compose_query,
                 cur_creation_key,
@@ -757,6 +774,49 @@ impl AppShell {
             };
             if !prev_overlay_open && cur_overlay_open {
                 shell.occlude_browser_for_overlay(cx);
+                shell.blur_community_if_focused(cx);
+                shell_dirty = true;
+            }
+            if !prev_compose_open && cur_compose_open {
+                if shell.theme_state.palette.is_apple_style()
+                    && shell.active_panel != ActiveWorkspacePanel::Chats
+                {
+                    shell.cleanup_settings_panel_if_active(cx);
+                    shell.leave_browser_panel_if_active(cx);
+                    shell.leave_community_panel_if_active(cx);
+                    shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                    shell.bot_browser.ime_preedit_input_gen = None;
+                    shell.community_ime_preedit_input_gen = None;
+                    shell.active_panel = ActiveWorkspacePanel::Chats;
+                    shell.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
+                    shell.sync_apple_sidebar_to_active_panel(cx);
+                } else {
+                    shell.occlude_browser_for_overlay(cx);
+                    if !shell.theme_state.palette.is_apple_style() {
+                        if shell.is_base_workspace_unoccluded(cx) {
+                            shell.occlude_community_for_overlay(cx);
+                        } else {
+                            shell.blur_community_if_focused(cx);
+                        }
+                    }
+                }
+                shell_dirty = true;
+            } else if cur_compose_open
+                && shell.theme_state.palette.is_apple_style()
+                && shell.active_panel != ActiveWorkspacePanel::Chats
+            {
+                shell.sidebar.update(cx, |sb, scx| {
+                    sb.cancel_compose_mode();
+                    scx.notify();
+                });
+                if shell.composer.read(cx).is_compose_isolated
+                    && !shell.is_compose_or_creation_modal_active(cx)
+                {
+                    shell.exit_compose_or_modal_isolation(true, cx);
+                } else {
+                    shell.sync_compose_state_to_composer(true, cx);
+                }
+                cur_compose_open = false;
                 shell_dirty = true;
             }
             if !prev_search_focused && search_focused && shell.active_panel == ActiveWorkspacePanel::Browser {
@@ -771,6 +831,27 @@ impl AppShell {
                                 wcx,
                             );
                         }
+                    });
+                }
+                shell_dirty = true;
+            }
+            if !prev_search_focused && search_focused && shell.active_panel == ActiveWorkspacePanel::Community {
+                if shell.community_ime_preedit_input_gen.is_some() {
+                    shell.ime.clear_preedit();
+                    shell.community_ime_preedit_input_gen = None;
+                }
+                if let Some(ref cw) = shell.community_workspace {
+                    cw.update(cx, |w, wcx| {
+                        w.blur_active_input(wcx);
+                    });
+                }
+                if shell.is_base_workspace_unoccluded(cx)
+                    && shell.content_hub.read(cx).active_input
+                        == ContentHubInputTarget::QuickDrawerSearch
+                {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        h.blur_input();
+                        hcx.notify();
                     });
                 }
                 shell_dirty = true;
@@ -920,6 +1001,7 @@ impl AppShell {
                     shell.clear_ime_and_blur_content_hub_for_transition(true, cx);
                     shell.cleanup_settings_panel_if_active(cx);
                     shell.leave_browser_panel_if_active(cx);
+                    shell.leave_community_panel_if_active(cx);
                     shell.active_panel = ActiveWorkspacePanel::Chats;
                     shell.last_handled_nav_dest = Some(NavDestination::Chats);
                     let nav_trigger = shell.nav_rail.update(cx, |r, rcx| {
@@ -1450,6 +1532,9 @@ impl AppShell {
                 self.reset_conversation_views(url, None, cx);
                 self.reset_composer_for_account_boundary(cx);
                 self.reset_tasks_workspace_for_account_boundary(cx);
+                self.community_workspace = None;
+                self.community_pending_share = None;
+                self.community_ime_preedit_input_gen = None;
                 self.reset_content_hub_for_logout_or_account_switch(cx);
                 self.reset_nav_rail_for_logout_or_account_switch(cx);
                 self.main_menu_drawer.update(cx, |m, _| {

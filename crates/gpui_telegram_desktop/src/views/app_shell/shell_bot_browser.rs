@@ -5136,16 +5136,15 @@ impl AppShell {
 
     /// Opens or focuses the built-in `BrowserWorkspace` panel and wires shared `BrowserSessionRegistry`.
     pub fn open_browser_workspace(&mut self, cx: &mut Context<Self>) -> Entity<BrowserWorkspace> {
+        self.leave_community_panel_if_active(cx);
+        self.cleanup_settings_panel_if_active(cx);
         let was_outside = self.active_panel != ActiveWorkspacePanel::Browser;
         if was_outside {
-            self.ime.clear_preedit();
+            self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         }
         self.active_panel = ActiveWorkspacePanel::Browser;
-        self.last_handled_nav_dest = Some(NavDestination::Browser);
-        self.nav_rail.update(cx, |r, rcx| {
-            r.set_active_destination(NavDestination::Browser);
-            rcx.notify();
-        });
+        self.sync_nav_rail_destination_silent(NavDestination::Browser, cx);
+        self.sync_apple_sidebar_to_active_panel(cx);
         self.sidebar.update(cx, |sb, scx| {
             if sb.search_focused {
                 sb.search_focused = false;
@@ -5230,6 +5229,10 @@ impl AppShell {
                 }
             })
             .detach();
+            cx.subscribe(&created, |shell, _, ev, cx| {
+                shell.handle_browser_workspace_event(ev, cx);
+            })
+            .detach();
             self.browser_workspace = Some(created.clone());
             created
         };
@@ -5269,7 +5272,7 @@ impl AppShell {
         }
     }
 
-    /// Occludes `BrowserWorkspace` when a shell modal/drawer/overlay opens on top of it.
+    /// Occludes `BrowserWorkspace` (and `CommunityWorkspace`) when a shell modal/drawer/overlay opens on top of it.
     pub fn occlude_browser_for_overlay(&mut self, cx: &mut Context<Self>) {
         if self.active_panel == ActiveWorkspacePanel::Browser {
             self.ime.clear_preedit();
@@ -5283,15 +5286,18 @@ impl AppShell {
                 });
             }
         }
+        self.occlude_community_for_overlay(cx);
     }
 
-    /// Toggles the sidebar Account Popover cleanly while preventing occluded Browser input/IME leaks.
+    /// Toggles the sidebar Account Popover cleanly while preventing occluded Browser/Community input/IME leaks.
     pub fn toggle_account_popover(&mut self, cx: &mut Context<Self>) {
         let opening = !self.sidebar.read(cx).is_account_popover_open;
         self.ime.clear_preedit();
         self.bot_browser.ime_preedit_input_gen = None;
+        self.community_ime_preedit_input_gen = None;
         if opening {
             self.occlude_browser_for_overlay(cx);
+            self.occlude_community_for_overlay(cx);
         }
         self.sidebar.update(cx, |s, s_cx| {
             s.is_account_popover_open = opening;

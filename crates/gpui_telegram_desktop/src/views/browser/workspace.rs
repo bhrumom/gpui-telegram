@@ -45,12 +45,18 @@ use crate::components::bots::{
 };
 use crate::components::ui::{pop_last_char, sanitize_paste_text};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::views::browser::design_mode::{
+    render_design_mode_overlay, render_design_mode_tab, BrowserWorkspaceEvent, DesignHandoffTarget,
+    DesignModePanelState,
+};
 use crate::views::browser::recorder_panel::{
     format_locator_summary, render_copilot_tab, render_recorder_tab, render_session_tab,
     BrowserLogLevel, ChromeProbeUiState, RecorderPanelState,
 };
 use crate::views::browser::store_panel::{render_store_tab, StorePanelState};
-use crate::views::browser::{BrowserEngineKind, CdpViewportSurface};
+use crate::views::browser::{
+    decode_png_to_render_image, map_point_contain, BrowserEngineKind, CdpViewportSurface,
+};
 use crate::views::tdesktop_theme::tr_str;
 
 const DEFAULT_BROWSER_SESSION_ID: &str = "browser_tab_1";
@@ -361,6 +367,10 @@ impl BrowserSessionBackend for SingleFlightNavBackend {
         self.inner.performance_metrics()
     }
 
+    fn cdp_bridge(&self) -> Option<&Arc<bot_browser::cdp::CdpBridge>> {
+        self.inner.cdp_bridge()
+    }
+
     fn close<'life0, 'async_trait>(
         &'life0 self,
     ) -> NavBoxFuture<'async_trait, Result<(), BotBrowserError>>
@@ -407,6 +417,7 @@ pub enum BrowserInspectorTab {
     Recorder,
     Session,
     Store,
+    Design,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +434,8 @@ pub enum ActiveBrowserInput {
     ScriptParam(String),
     StoreSearch,
     StoreChangelog,
+    DesignNote,
+    DesignSelectorQuery,
 }
 
 impl ActiveBrowserInput {
@@ -437,6 +450,7 @@ impl ActiveBrowserInput {
             | Self::ScriptParam(_) => Some(BrowserInspectorTab::Recorder),
             Self::ProfileName | Self::CookieImport => Some(BrowserInspectorTab::Session),
             Self::StoreSearch | Self::StoreChangelog => Some(BrowserInspectorTab::Store),
+            Self::DesignNote | Self::DesignSelectorQuery => Some(BrowserInspectorTab::Design),
         }
     }
 }
@@ -500,6 +514,10 @@ pub struct BrowserWorkspace {
     pub inspector_tab: BrowserInspectorTab,
     pub recorder: RecorderPanelState,
     pub store: StorePanelState,
+    pub design_mode: DesignModePanelState,
+    on_design_handoff: Option<
+        Arc<dyn Fn(DesignHandoffTarget, bot_browser::DesignModeChatHandoff) + Send + Sync>,
+    >,
     external_occluded: bool,
     workspace_visible: bool,
     pub close_requested: bool,
@@ -542,7 +560,10 @@ impl BrowserWorkspace {
             .or_else(|| config.client.as_ref().map(|c| c.runtime().handle().clone()))
             .or_else(|| tokio::runtime::Handle::try_current().ok());
 
-        cx.on_release(|this: &mut Self, _| {
+        cx.on_release(|this: &mut Self, cx: &mut gpui::App| {
+            if let Some(prev) = this.design_mode.preview_image.take() {
+                cx.drop_image(prev, None);
+            }
             #[cfg(target_os = "macos")]
             if let Some(mut wv) = this.wkwebview.take() {
                 wv.destroy();
@@ -598,6 +619,8 @@ impl BrowserWorkspace {
             inspector_tab: BrowserInspectorTab::Copilot,
             recorder: RecorderPanelState::default(),
             store,
+            design_mode: DesignModePanelState::default(),
+            on_design_handoff: None,
             external_occluded: false,
             workspace_visible: true,
             close_requested: false,
@@ -779,7 +802,8 @@ impl BrowserWorkspace {
 
     fn sync_cdp_surface_interactivity(&self, cx: &mut Context<Self>) {
         let interactive = !self.is_workspace_occluded()
-            && !matches!(self.control_mode(), BrowserControlMode::AiControlling { .. });
+            && !matches!(self.control_mode(), BrowserControlMode::AiControlling { .. })
+            && !(self.design_mode.enabled && self.design_mode.picker_active);
         if let Some(ref surface) = self.cdp_surface {
             surface.update(cx, |s, _| s.set_interactive_enabled(interactive));
         }
@@ -907,6 +931,10 @@ impl BrowserWorkspace {
             }
             ActiveBrowserInput::StoreSearch => Some((&mut self.store.search_query_draft, false)),
             ActiveBrowserInput::StoreChangelog => Some((&mut self.store.changelog_draft, false)),
+            ActiveBrowserInput::DesignNote => Some((&mut self.design_mode.note_draft, true)),
+            ActiveBrowserInput::DesignSelectorQuery => {
+                Some((&mut self.design_mode.selector_query_draft, false))
+            }
         }
     }
 
@@ -931,6 +959,10 @@ impl BrowserWorkspace {
                 .unwrap_or_default(),
             ActiveBrowserInput::StoreSearch => self.store.search_query_draft.clone(),
             ActiveBrowserInput::StoreChangelog => self.store.changelog_draft.clone(),
+            ActiveBrowserInput::DesignNote => self.design_mode.note_draft.clone(),
+            ActiveBrowserInput::DesignSelectorQuery => {
+                self.design_mode.selector_query_draft.clone()
+            }
         }
     }
 
@@ -964,10 +996,16 @@ impl BrowserWorkspace {
         is_alt: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        if key == "escape" && self.active_input != ActiveBrowserInput::None {
-            self.assign_active_input(ActiveBrowserInput::None);
-            cx.notify();
-            return true;
+        if key == "escape" {
+            if self.active_input != ActiveBrowserInput::None {
+                self.assign_active_input(ActiveBrowserInput::None);
+                cx.notify();
+                return true;
+            }
+            if self.design_mode.enabled && self.design_mode.picker_active {
+                self.set_design_picker_active(false, cx);
+                return true;
+            }
         }
         let target = self.active_input.clone();
         let Some((buf, is_multiline)) = self.active_input_mut() else {
@@ -1016,6 +1054,10 @@ impl BrowserWorkspace {
                     }
                     ActiveBrowserInput::StoreSearch => {
                         self.search_store_apps(cx);
+                    }
+                    ActiveBrowserInput::DesignSelectorQuery => {
+                        let selector = self.design_mode.selector_query_draft.clone();
+                        self.capture_design_element_by_selector(selector, cx);
                     }
                     _ => {
                         self.assign_active_input(ActiveBrowserInput::None);
@@ -2920,7 +2962,297 @@ impl BrowserWorkspace {
             wv.sync_bounds(bounds, visible);
         }
     }
+    /// Returns `(viewport_bounds, frame_pixel_size, css_viewport_size)` for Design Mode overlay projection.
+    pub(crate) fn cdp_surface_geometry(
+        &self,
+        cx: &App,
+    ) -> Option<(Bounds<Pixels>, (u32, u32), (u32, u32))> {
+        let surface = self.cdp_surface.as_ref()?;
+        let s = surface.read(cx);
+        let bounds = s.viewport_bounds()?;
+        let vp_sz = s.viewport_size();
+        let img_sz = s.frame_pixel_size().unwrap_or(vp_sz);
+        Some((bounds, img_sz, vp_sz))
+    }
+
+    pub fn set_on_design_handoff(
+        &mut self,
+        cb: Arc<dyn Fn(DesignHandoffTarget, bot_browser::DesignModeChatHandoff) + Send + Sync>,
+    ) {
+        self.on_design_handoff = Some(cb);
+    }
+
+    pub fn toggle_design_mode(&mut self, cx: &mut Context<Self>) {
+        let next = !self.design_mode.enabled;
+        self.set_design_mode_enabled(next, cx);
+    }
+
+    pub fn set_design_mode_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.design_mode.enabled == enabled {
+            if enabled {
+                self.inspector_open = true;
+                self.set_inspector_tab(BrowserInspectorTab::Design, cx);
+            }
+            return;
+        }
+        self.design_mode.enabled = enabled;
+        if enabled {
+            self.design_mode.picker_active = true;
+            self.design_mode.last_error = None;
+            self.inspector_open = true;
+            self.set_inspector_tab(BrowserInspectorTab::Design, cx);
+        } else {
+            self.design_mode.picker_active = false;
+            self.design_mode.hover_target = None;
+            self.design_mode.last_hover_css_point = None;
+        }
+        self.sync_cdp_surface_interactivity(cx);
+        cx.notify();
+    }
+
+    pub fn set_design_picker_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.design_mode.picker_active = active;
+        if !active {
+            self.design_mode.hover_target = None;
+            self.design_mode.last_hover_css_point = None;
+        }
+        self.sync_cdp_surface_interactivity(cx);
+        cx.notify();
+    }
+
+    pub fn clear_design_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(prev) = self.design_mode.clear_selection() {
+            cx.drop_image(prev, None);
+        }
+        cx.notify();
+    }
+
+    fn resolve_design_backend(&self) -> Option<Arc<dyn BrowserSessionBackend>> {
+        self.cdp_backend
+            .clone()
+            .or_else(|| self.active_backend.clone())
+    }
+
+    fn apply_design_capture_result(
+        &mut self,
+        res: Result<bot_browser::DesignModeCapture, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.design_mode.is_capturing = false;
+        match res {
+            Ok(capture) => {
+                let decoded_preview = capture
+                    .cropped_png_bytes
+                    .as_deref()
+                    .and_then(|bytes| decode_png_to_render_image(bytes).ok());
+                if let Some(prev) = self.design_mode.preview_image.take() {
+                    cx.drop_image(prev, None);
+                }
+                let selector = capture.selector.clone();
+                self.design_mode.apply_capture(capture);
+                if let Some((img, dims)) = decoded_preview {
+                    self.design_mode.preview_image = Some(img);
+                    self.design_mode.preview_dimensions = Some(dims);
+                }
+                self.design_mode.last_status = Some(format!("Captured element: {selector}"));
+                self.inspector_open = true;
+                self.inspector_tab = BrowserInspectorTab::Design;
+            }
+            Err(err) => {
+                self.design_mode.last_error = Some(err);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn probe_design_hover_at_window_point(
+        &mut self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.design_mode.enabled || !self.design_mode.picker_active {
+            return;
+        }
+        let Some((bounds, img_sz, vp_sz)) = self.cdp_surface_geometry(cx) else {
+            return;
+        };
+        let (css_x, css_y) = map_point_contain(pos, bounds, img_sz, vp_sz);
+        if let Some((prev_x, prev_y)) = self.design_mode.last_hover_css_point {
+            if (css_x - prev_x).abs() < 3.0 && (css_y - prev_y).abs() < 3.0 {
+                return;
+            }
+        }
+        let Some(backend) = self.resolve_design_backend() else {
+            return;
+        };
+        self.design_mode.last_hover_css_point = Some((css_x, css_y));
+        self.design_mode.hover_probe_generation =
+            self.design_mode.hover_probe_generation.wrapping_add(1);
+        let generation = self.design_mode.hover_probe_generation;
+        let handle = resolve_browser_tokio_handle(self.tokio_handle.as_ref());
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let result = run_on_tokio(&handle, async move {
+                bot_browser::design_mode::probe_element_at_point(backend.as_ref(), css_x, css_y)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            let _ = weak.update(app, |this, cx| {
+                if this.design_mode.hover_probe_generation != generation
+                    || !this.design_mode.enabled
+                    || !this.design_mode.picker_active
+                {
+                    return;
+                }
+                if let Ok(Ok(target)) = result {
+                    this.design_mode.hover_target = target;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn capture_design_element_at_window_point(
+        &mut self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((bounds, img_sz, vp_sz)) = self.cdp_surface_geometry(cx) else {
+            self.design_mode.last_error =
+                Some("Browser viewport bounds not ready for Design Mode capture".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(backend) = self.resolve_design_backend() else {
+            self.design_mode.last_error =
+                Some("Navigate to a page first to initialize the Rust CDP backend".to_string());
+            cx.notify();
+            return;
+        };
+        let (css_x, css_y) = map_point_contain(pos, bounds, img_sz, vp_sz);
+        self.design_mode.capture_generation = self.design_mode.capture_generation.wrapping_add(1);
+        let generation = self.design_mode.capture_generation;
+        self.design_mode.is_capturing = true;
+        self.design_mode.last_error = None;
+        let opts = bot_browser::DesignModeCaptureOptions::default();
+        let handle = resolve_browser_tokio_handle(self.tokio_handle.as_ref());
+        cx.notify();
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let result = run_on_tokio(&handle, async move {
+                bot_browser::design_mode::capture_element_at_point(
+                    backend.as_ref(),
+                    css_x,
+                    css_y,
+                    &opts,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await;
+            let flat = match result {
+                Ok(inner) => inner,
+                Err(e) => Err(e),
+            };
+            let _ = weak.update(app, |this, cx| {
+                if this.design_mode.capture_generation != generation {
+                    return;
+                }
+                this.apply_design_capture_result(flat, cx);
+            });
+        })
+        .detach();
+    }
+
+    pub fn capture_design_element_by_selector(
+        &mut self,
+        selector: String,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed = selector.trim().to_string();
+        if trimmed.is_empty() {
+            self.design_mode.last_error = Some("Enter a CSS selector to capture".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.resolve_design_backend() else {
+            self.design_mode.last_error =
+                Some("Navigate to a page first to initialize the Rust CDP backend".to_string());
+            cx.notify();
+            return;
+        };
+        self.design_mode.capture_generation = self.design_mode.capture_generation.wrapping_add(1);
+        let generation = self.design_mode.capture_generation;
+        self.design_mode.is_capturing = true;
+        self.design_mode.last_error = None;
+        let opts = bot_browser::DesignModeCaptureOptions::default();
+        let handle = resolve_browser_tokio_handle(self.tokio_handle.as_ref());
+        cx.notify();
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let result = run_on_tokio(&handle, async move {
+                bot_browser::design_mode::capture_element_by_selector(
+                    backend.as_ref(),
+                    &trimmed,
+                    &opts,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await;
+            let flat = match result {
+                Ok(inner) => inner,
+                Err(e) => Err(e),
+            };
+            let _ = weak.update(app, |this, cx| {
+                if this.design_mode.capture_generation != generation {
+                    return;
+                }
+                this.apply_design_capture_result(flat, cx);
+            });
+        })
+        .detach();
+    }
+
+    pub fn send_design_capture_to_target(
+        &mut self,
+        target: DesignHandoffTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let handoff = self.design_mode.build_handoff_payload()?;
+        self.design_mode.last_handoff = Some(handoff.clone());
+        self.design_mode.last_error = None;
+
+        match &target {
+            DesignHandoffTarget::BrowserCopilot => {
+                self.recorder.copilot_prompt_draft = handoff.prompt_markdown.clone();
+                self.inspector_open = true;
+                self.set_inspector_tab(BrowserInspectorTab::Copilot, cx);
+                self.design_mode.last_status =
+                    Some("Design capture loaded into Browser Copilot draft".to_string());
+            }
+            DesignHandoffTarget::OrcaBot { .. } => {
+                self.design_mode.last_status =
+                    Some("Design capture dispatched to Orca Bot".to_string());
+            }
+            DesignHandoffTarget::ActiveChat => {
+                self.design_mode.last_status =
+                    Some("Design capture dispatched to Active Chat".to_string());
+            }
+        }
+
+        if let Some(ref cb) = self.on_design_handoff {
+            cb(target.clone(), handoff.clone());
+        }
+        cx.emit(BrowserWorkspaceEvent::SendDesignCaptureToChat { target, handoff });
+        cx.notify();
+        Ok(())
+    }
 }
+
+impl EventEmitter<BrowserWorkspaceEvent> for BrowserWorkspace {}
 
 impl Focusable for BrowserWorkspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -2985,6 +3317,7 @@ impl Render for BrowserWorkspace {
             (BrowserInspectorTab::Recorder, "Script Apps"),
             (BrowserInspectorTab::Session, "Session"),
             (BrowserInspectorTab::Store, "Store"),
+            (BrowserInspectorTab::Design, "Design"),
         ];
 
         let inspector_body: AnyElement = match self.inspector_tab {
@@ -2992,6 +3325,7 @@ impl Render for BrowserWorkspace {
             BrowserInspectorTab::Recorder => render_recorder_tab(self, pal, &lang, cx),
             BrowserInspectorTab::Session => render_session_tab(self, pal, &lang, cx),
             BrowserInspectorTab::Store => render_store_tab(self, pal, &lang, cx),
+            BrowserInspectorTab::Design => render_design_mode_tab(self, pal, &lang, cx),
         };
 
         let addr_active = self.active_input == ActiveBrowserInput::AddressBar;
@@ -3036,6 +3370,7 @@ impl Render for BrowserWorkspace {
         } else if let Some(ref surface) = self.cdp_surface {
             div()
                 .id("browser-cdp-viewport-host")
+                .relative()
                 .flex_1()
                 .size_full()
                 .min_h(px(0.0))
@@ -3056,6 +3391,9 @@ impl Render for BrowserWorkspace {
                     }
                 }))
                 .child(surface.clone())
+                .when(self.design_mode.enabled, |host| {
+                    host.child(render_design_mode_overlay(self, pal, &lang, cx))
+                })
                 .into_any_element()
         } else {
             div()
@@ -3271,6 +3609,51 @@ impl Render for BrowserWorkspace {
                                 }),
                             )
                             .child(self.active_engine.display_name()),
+                    )
+                    // Design Mode Toggle Pill (`Cmd+Shift+I`)
+                    .child(
+                        div()
+                            .id("browser-design-mode-toggle-btn")
+                            .px(px(8.0))
+                            .py(px(4.5))
+                            .rounded(px(6.0))
+                            .bg(if self.design_mode.enabled {
+                                rgb(pal.accent)
+                            } else {
+                                rgb(pal.input_bg)
+                            })
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if self.design_mode.enabled {
+                                pal.active_button_fg
+                            } else {
+                                pal.text_primary
+                            }))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_design_mode(cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(tg_icon(
+                                IconName::Camera,
+                                12.0,
+                                if self.design_mode.enabled {
+                                    pal.active_button_fg
+                                } else {
+                                    pal.accent
+                                },
+                            ))
+                            .child(if self.design_mode.enabled {
+                                tr_str(&lang, "设计模式: 开", "Design: On")
+                            } else {
+                                tr_str(&lang, "设计模式", "Design")
+                            }),
                     )
                     // Inspector Collapse Toggle
                     .child(

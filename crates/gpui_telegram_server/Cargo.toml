@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 gpui_telegram_core = { workspace = true }
 gpui_telegram_proto = { workspace = true }
+orca_core = { workspace = true }
+orca_bots = { workspace = true }
+orca_ide = { workspace = true }
 gpui_telegram_community = { workspace = true, features = ["storage"] }
 gpui_telegram_media = { workspace = true }
 gpui_telegram_webrtc = { workspace = true }

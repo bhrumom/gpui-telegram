@@ -178,16 +178,19 @@ impl AppShell {
     }
 
     pub fn open_modal_dialog(&mut self, title: impl Into<String>, kind: ModalDialogKind, w: f32, h: f32, cx: &mut Context<Self>) {
+        self.community_pending_share = None;
         self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         // When Apple/Grok multi-select compose is available, never fall back to the legacy
         // 0-member `NewGroup` modal; route directly into multi-select compose group mode.
         if matches!(kind, ModalDialogKind::NewGroup) && self.theme_state.palette.is_apple_style() {
             self.leave_browser_panel_if_active(cx);
+            self.leave_community_panel_if_active(cx);
             self.cleanup_settings_panel_if_active(cx);
             self.active_panel = ActiveWorkspacePanel::Chats;
             self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
             self.sync_apple_sidebar_to_active_panel(cx);
             self.bot_browser.ime_preedit_input_gen = None;
+            self.community_ime_preedit_input_gen = None;
             self.enter_compose_or_modal_isolation(cx);
             self.sidebar.update(cx, |sb, sb_cx| {
                 sb.open_compose_group_mode();
@@ -223,6 +226,7 @@ impl AppShell {
             st.ttl_submenu_open = false;
         });
         self.occlude_browser_for_overlay(cx);
+        self.occlude_community_for_overlay(cx);
         let is_connection_modal = matches!(kind, ModalDialogKind::ConnectionProxy);
         let targets = chat_dialogs_to_forward_targets(&self.sidebar.read(cx).dialogs);
         let rows = contacts_to_modal_rows(&self.session_sync.contacts_list);
@@ -333,11 +337,13 @@ impl AppShell {
             MainMenuCommand::NewGroup => {
                 if self.theme_state.palette.is_apple_style() {
                     self.leave_browser_panel_if_active(cx);
+                    self.leave_community_panel_if_active(cx);
                     self.cleanup_settings_panel_if_active(cx);
                     self.active_panel = ActiveWorkspacePanel::Chats;
                     self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
                     self.sync_apple_sidebar_to_active_panel(cx);
                     self.bot_browser.ime_preedit_input_gen = None;
+                    self.community_ime_preedit_input_gen = None;
                     self.enter_compose_or_modal_isolation(cx);
                     self.sidebar.update(cx, |sb, sb_cx| {
                         sb.open_compose_group_mode();
@@ -363,6 +369,7 @@ impl AppShell {
             MainMenuCommand::Calls => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Calls;
                 self.sync_nav_rail_destination_silent(NavDestination::Calls, cx);
                 self.sync_apple_sidebar_to_active_panel(cx);
@@ -371,6 +378,7 @@ impl AppShell {
             MainMenuCommand::SavedMessages => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.sync_nav_rail_destination_silent(NavDestination::SavedMessages, cx);
                 self.sync_apple_sidebar_to_active_panel(cx);
@@ -386,6 +394,7 @@ impl AppShell {
             MainMenuCommand::TaskCenter => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.sync_nav_rail_destination_silent(NavDestination::TaskCenter, cx);
                 self.sync_apple_sidebar_to_active_panel(cx);
@@ -395,6 +404,7 @@ impl AppShell {
             MainMenuCommand::McpTools => {
                 self.cleanup_settings_panel_if_active(cx);
                 self.leave_browser_panel_if_active(cx);
+                self.leave_community_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::McpTools;
                 self.sync_nav_rail_destination_silent(NavDestination::McpTools, cx);
                 self.sync_apple_sidebar_to_active_panel(cx);
@@ -404,6 +414,9 @@ impl AppShell {
             MainMenuCommand::RemoteComputer => self.open_remote_computers_hub(cx),
             MainMenuCommand::Browser => {
                 self.open_browser_workspace(cx);
+            }
+            MainMenuCommand::Community => {
+                self.open_community_workspace(cx);
             }
             MainMenuCommand::Settings => {
                 self.navigate_settings_to(SettingsSectionType::Main, cx);
@@ -480,9 +493,78 @@ impl AppShell {
                 }
             }
             ModalActionOutcome::ForwardToChat { target_chat_id, message_ids, extra_caption, .. } => {
+                let pending_community_share = self.community_pending_share.take();
                 let Some(fence) = self.capture_client_fence() else {
                     return;
                 };
+                if message_ids.is_empty() {
+                    let summary_clean = pending_community_share
+                        .as_ref()
+                        .map(|(_, s)| s.trim())
+                        .filter(|s| !s.is_empty());
+                    let cap = extra_caption.trim();
+                    let body = match (summary_clean, cap) {
+                        (Some(summary), cap) if !cap.is_empty() => {
+                            format!("{summary}\n\n{cap}")
+                        }
+                        (Some(summary), _) => summary.to_string(),
+                        (None, cap) if !cap.is_empty() => cap.to_string(),
+                        (None, _) => return,
+                    };
+                    let lang = self.active_lang_id();
+                    self.show_non_chat_toast(
+                        tr_str(lang, "已分享帖子到会话", "Shared post to chat"),
+                        2200,
+                        cx,
+                    );
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        if !fence.preflight_ui(&weak, app).await {
+                            return;
+                        }
+                        let send_client = fence.client.clone();
+                        let exp_epoch = fence.client_epoch;
+                        let exp_tok = fence.token.clone();
+                        let _ = fence
+                            .client
+                            .runtime()
+                            .spawn(async move {
+                                if send_client
+                                    .ensure_pinned_session(exp_epoch, &exp_tok)
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let req = RichSendMessageRequest {
+                                    chat_id: target_chat_id as i64,
+                                    text: Some(body),
+                                    content: None,
+                                    entities: Vec::new(),
+                                    reply_to: None,
+                                    quote_text: None,
+                                    topic_id: None,
+                                    client_nonce: Some(send_client.next_client_nonce()),
+                                    forward_from_chat_id: None,
+                                    forward_from_msg_id: None,
+                                    silent: false,
+                                    scheduled_at_ms: None,
+                                    inline_keyboard: None,
+                                    send_as_peer_id: None,
+                                    skip_server_bot_reply: false,
+                                };
+                                let _ = send_client
+                                    .send_message_durable_with_token(&exp_tok, exp_epoch, req)
+                                    .await;
+                            })
+                            .await;
+                        let _ = weak.update(app, |s, cx| {
+                            if fence.is_valid(s) {
+                                s.refresh_chats(cx);
+                            }
+                        });
+                    })
+                    .detach();
+                    return;
+                }
                 let from_chat = active_chat.unwrap_or(target_chat_id) as i64;
                 cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
                     for mid in message_ids {
@@ -545,6 +627,7 @@ impl AppShell {
                     self.clear_ime_and_blur_content_hub_for_transition(true, cx);
                     self.cleanup_settings_panel_if_active(cx);
                     self.leave_browser_panel_if_active(cx);
+                    self.leave_community_panel_if_active(cx);
                     self.active_panel = ActiveWorkspacePanel::Chats;
                     self.sync_nav_rail_destination_silent(NavDestination::Chats, cx);
                     self.sync_apple_sidebar_to_active_panel(cx);

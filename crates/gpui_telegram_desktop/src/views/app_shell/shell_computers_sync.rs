@@ -1872,7 +1872,9 @@ impl AppShell {
     /// Opens the standalone NetEase UU Remote-style Remote Computers hub (triggered from
     /// the computer icon beside the user avatar, main menu, tray, or `/computer`).
     pub fn open_remote_computers_hub(&mut self, cx: &mut Context<Self>) {
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.rtc_talk.talk_mode_overlay = None;
         self.rtc_talk.active_talk_session_is_ai = false;
         self.overlays.media_viewer_overlay = None;
@@ -1911,10 +1913,9 @@ impl AppShell {
             scx.notify();
         });
         self.active_panel = ActiveWorkspacePanel::Settings;
+        self.sync_nav_rail_destination_silent(NavDestination::RemoteComputer, cx);
+        self.sync_apple_sidebar_to_active_panel(cx);
         self.reconcile_chat_scoped_toasts(cx);
-        self.last_handled_nav_dest = Some(NavDestination::RemoteComputer);
-        self.nav_rail
-            .update(cx, |r, _| r.set_active_destination(NavDestination::RemoteComputer));
         self.sync_computers_to_views(cx);
         self.refresh_computers(cx);
         self.refresh_remote_assist_and_grants(cx);
@@ -1963,7 +1964,9 @@ impl AppShell {
         });
         self.clear_ime_and_blur_content_hub_for_transition(true, cx);
         self.leave_browser_panel_if_active(cx);
+        self.leave_community_panel_if_active(cx);
         self.active_panel = ActiveWorkspacePanel::Settings;
+        self.sync_nav_rail_destination_silent(NavDestination::Settings, cx);
         self.sync_apple_sidebar_to_active_panel(cx);
         self.reconcile_chat_scoped_toasts(cx);
         self.sync_computers_to_views(cx);

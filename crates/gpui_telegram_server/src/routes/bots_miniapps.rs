@@ -7505,6 +7505,13 @@ pub async fn chat_callback(
         }
     }
 
+    if let Some(rest) = data.strip_prefix("orca:") {
+        return crate::routes::orca_telegram_bridge::handle_orca_chat_callback(
+            &state, cid, auth.user_id, &req, rest,
+        )
+        .await;
+    }
+
     let bot_member = members
         .into_iter()
         .find(|uid| *uid != auth.user_id && state.db.get_user(*uid).ok().flatten().is_some_and(|u| u.is_bot));

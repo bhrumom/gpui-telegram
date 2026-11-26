@@ -35,6 +35,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(err.into());
         }
     };
+    if let Err(err) = state.orca_ide.sync_startup().await {
+        tracing::warn!(
+            "Orca startup recovery encountered a non-fatal error: {}",
+            err
+        );
+    }
+
     let state_for_shutdown = Arc::clone(&state);
     let app = build_router_with_state(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -46,6 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             state_for_shutdown.shutdown();
+            if let Err(err) = state_for_shutdown.orca_ide.shutdown().await {
+                tracing::warn!(
+                    "Orca graceful shutdown encountered a non-fatal error: {}",
+                    err
+                );
+            }
         })
         .await?;
 
