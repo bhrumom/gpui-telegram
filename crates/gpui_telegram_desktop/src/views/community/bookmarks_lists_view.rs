@@ -18,7 +18,9 @@ use super::shared_widgets::{
     render_actor_avatar, render_empty_state, render_input_display, render_loading_skeleton,
 };
 use super::state::{
-    ActiveCommunityInput, BookmarksListsSection, CommunityWorkspaceAction, ListEditorDraft,
+    normalize_bookmark_folder, ActiveCommunityInput, BookmarkRollbackSnapshot,
+    BookmarkSavedOverride, BookmarksListsSection, CommunityRoute, CommunityWorkspaceAction,
+    ListEditorDraft,
 };
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
@@ -130,23 +132,6 @@ impl CommunityWorkspace {
         self.state
             .bookmark_custom_folders
             .retain(|f| !f.eq_ignore_ascii_case(&folder));
-        let affected_ids: Vec<String> = self
-            .state
-            .saved_items
-            .iter()
-            .filter(|it| {
-                it.post
-                    .viewer_bookmark_folder
-                    .as_deref()
-                    .is_some_and(|f| f.eq_ignore_ascii_case(&folder))
-            })
-            .map(|it| it.post.post_id.clone())
-            .collect();
-        for pid in &affected_ids {
-            self.state.visit_post_mut(pid, |p| {
-                p.viewer_bookmark_folder = Some("All".to_string());
-            });
-        }
         if self
             .state
             .bookmark_selected_folder
@@ -154,23 +139,35 @@ impl CommunityWorkspace {
         {
             self.state.bookmark_selected_folder = "All".to_string();
         }
-        let facade = self.facade.clone();
-        let handle = facade.runtime_handle().clone();
-        cx.notify();
-        if !affected_ids.is_empty() {
-            cx.spawn(async move |_weak: WeakEntity<Self>, _app: &mut AsyncApp| {
-                let _ = run_on_community_tokio(&handle, async move {
-                    let req = BookmarkRequest {
-                        folder: Some("All".to_string()),
-                        remove: None,
-                    };
-                    for pid in affected_ids {
-                        let _ = facade.bookmark_post(&pid, &req).await;
-                    }
-                })
-                .await;
-            })
-            .detach();
+        let mut affected_ids: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for it in &self.state.saved_items {
+            if it
+                .post
+                .viewer_bookmark_folder
+                .as_deref()
+                .is_some_and(|f| f.eq_ignore_ascii_case(&folder))
+                && seen.insert(it.post.post_id.clone())
+            {
+                affected_ids.push(it.post.post_id.clone());
+            }
+        }
+        for (pid, (bookmarked, pending_folder)) in &self.state.bookmark_pending_target {
+            if *bookmarked
+                && pending_folder
+                    .as_deref()
+                    .is_some_and(|f| f.eq_ignore_ascii_case(&folder))
+                && seen.insert(pid.clone())
+            {
+                affected_ids.push(pid.clone());
+            }
+        }
+        if affected_ids.is_empty() {
+            cx.notify();
+            return;
+        }
+        for pid in affected_ids {
+            self.enqueue_bookmark_mutation(pid, true, Some("All".to_string()), cx);
         }
     }
 
@@ -180,38 +177,241 @@ impl CommunityWorkspace {
         folder: String,
         cx: &mut Context<Self>,
     ) {
-        let target_folder = if folder.trim().is_empty() || folder.eq_ignore_ascii_case("Unsorted") {
-            "All".to_string()
-        } else {
-            folder.trim().to_string()
-        };
+        let target_folder = normalize_bookmark_folder(&folder);
         self.state.bookmark_moving_post_id = None;
-        self.state.visit_post_mut(&post_id, |p| {
-            p.viewer_bookmarked = true;
-            p.viewer_bookmark_folder = Some(target_folder.clone());
-        });
-        let req = BookmarkRequest {
-            folder: Some(target_folder.clone()),
-            remove: None,
+        self.enqueue_bookmark_mutation(post_id, true, Some(target_folder), cx);
+    }
+
+    pub fn remove_bookmark_from_saved(&mut self, post_id: String, cx: &mut Context<Self>) {
+        self.state.bookmark_moving_post_id = None;
+        self.enqueue_bookmark_mutation(post_id, false, None, cx);
+    }
+
+    /// Unified level-triggered per-`post_id` bookmark mutation entry point.
+    /// Applies synchronous optimistic UI state and guarantees at most one in-flight
+    /// `facade.bookmark_post` request per `post_id` with sequential dirty re-flush.
+    pub(crate) fn enqueue_bookmark_mutation(
+        &mut self,
+        post_id: String,
+        target_bookmarked: bool,
+        target_folder: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let normalized_folder = if target_bookmarked {
+            Some(normalize_bookmark_folder(
+                target_folder.as_deref().unwrap_or("All"),
+            ))
+        } else {
+            None
         };
+
+        if !self.state.bookmark_last_synced.contains_key(&post_id) {
+            let existing_post = self.state.find_post(&post_id);
+            let existing_saved = self
+                .state
+                .saved_items
+                .iter()
+                .find(|it| it.post.post_id == post_id)
+                .cloned();
+            self.state.bookmark_last_synced.insert(
+                post_id.clone(),
+                BookmarkRollbackSnapshot {
+                    bookmarked: existing_post.is_some_and(|p| p.viewer_bookmarked),
+                    folder: existing_post.and_then(|p| p.viewer_bookmark_folder.clone()),
+                    bookmarks_count: existing_post.map(|p| p.bookmarks_count).unwrap_or(0),
+                    saved_item: existing_saved,
+                },
+            );
+        }
+
+        // Snapshot FeedItemDto BEFORE removing from `saved_items` so remove -> re-add bursts
+        // still retain full item metadata.
+        if let Some(item) = self.state.snapshot_feed_item_for_post(&post_id) {
+            self.state
+                .bookmark_cached_items
+                .insert(post_id.clone(), item);
+        }
+
+        self.state.bookmark_state_epoch = self.state.bookmark_state_epoch.wrapping_add(1);
+        self.state
+            .bookmark_pending_target
+            .insert(post_id.clone(), (target_bookmarked, normalized_folder.clone()));
+
+        self.state.visit_post_mut(&post_id, |post| {
+            let was_bookmarked = post.viewer_bookmarked;
+            if !was_bookmarked && target_bookmarked {
+                post.bookmarks_count = post.bookmarks_count.saturating_add(1);
+            } else if was_bookmarked && !target_bookmarked {
+                post.bookmarks_count = post.bookmarks_count.saturating_sub(1);
+            }
+            post.viewer_bookmarked = target_bookmarked;
+            post.viewer_bookmark_folder = normalized_folder.clone();
+        });
+        if let Some(cached) = self.state.bookmark_cached_items.get_mut(&post_id) {
+            let was_bookmarked = cached.post.viewer_bookmarked;
+            if !was_bookmarked && target_bookmarked {
+                cached.post.bookmarks_count = cached.post.bookmarks_count.saturating_add(1);
+            } else if was_bookmarked && !target_bookmarked {
+                cached.post.bookmarks_count = cached.post.bookmarks_count.saturating_sub(1);
+            }
+            cached.post.viewer_bookmarked = target_bookmarked;
+            cached.post.viewer_bookmark_folder = normalized_folder.clone();
+        }
+
+        if target_bookmarked {
+            if !self
+                .state
+                .saved_items
+                .iter()
+                .any(|it| it.post.post_id == post_id)
+            {
+                if let Some(mut item) = self.state.snapshot_feed_item_for_post(&post_id) {
+                    item.post.viewer_bookmarked = true;
+                    item.post.viewer_bookmark_folder = normalized_folder;
+                    self.state.saved_items.insert(0, item);
+                }
+            }
+        } else {
+            self.state
+                .saved_items
+                .retain(|it| it.post.post_id != post_id);
+        }
+
+        cx.notify();
+        if self.state.bookmark_in_flight.contains_key(&post_id) {
+            self.state.bookmark_dirty.insert(post_id);
+            return;
+        }
+        self.flush_bookmark_sync(post_id, cx);
+    }
+
+    fn flush_bookmark_sync(&mut self, post_id: String, cx: &mut Context<Self>) {
+        let Some((target_bookmarked, target_folder)) =
+            self.state.bookmark_pending_target.get(&post_id).cloned()
+        else {
+            self.state.bookmark_dirty.remove(&post_id);
+            self.state.bookmark_last_synced.remove(&post_id);
+            self.state.bookmark_cached_items.remove(&post_id);
+            return;
+        };
+
+        self.state.bookmark_dirty.remove(&post_id);
+        self.state.bookmark_flight_seq = self.state.bookmark_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.bookmark_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .bookmark_in_flight
+            .insert(post_id.clone(), my_flight_seq);
+
+        let req = if target_bookmarked {
+            BookmarkRequest {
+                folder: Some(target_folder.unwrap_or_else(|| "All".to_string())),
+                remove: Some(false),
+            }
+        } else {
+            BookmarkRequest {
+                folder: None,
+                remove: Some(true),
+            }
+        };
+
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
-        cx.notify();
+        let req_post_id = post_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                facade.bookmark_post(&post_id, &req).await
+                facade.bookmark_post(&req_post_id, &req).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                // Guard 1: ABA-proof actor switch fence.
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
+                // Guard 2: Flight token ownership & deleted-post cancellation fence.
+                if this.state.bookmark_in_flight.get(&post_id).copied() != Some(my_flight_seq) {
+                    return;
+                }
+                this.state.bookmark_in_flight.remove(&post_id);
+                let is_dirty = this.state.bookmark_dirty.remove(&post_id);
+
                 match res {
                     Ok(Ok(resp)) => {
+                        let resolved_folder = if resp.bookmarked {
+                            Some(normalize_bookmark_folder(&resp.folder))
+                        } else {
+                            None
+                        };
+                        let synced_item = if resp.bookmarked {
+                            this.state
+                                .snapshot_feed_item_for_post(&post_id)
+                                .map(|mut it| {
+                                    it.post.viewer_bookmarked = true;
+                                    it.post.viewer_bookmark_folder = resolved_folder.clone();
+                                    it.post.bookmarks_count = resp.bookmarks_count;
+                                    it
+                                })
+                        } else {
+                            None
+                        };
+                        this.state.bookmark_last_synced.insert(
+                            post_id.clone(),
+                            BookmarkRollbackSnapshot {
+                                bookmarked: resp.bookmarked,
+                                folder: resolved_folder.clone(),
+                                bookmarks_count: resp.bookmarks_count,
+                                saved_item: synced_item.clone(),
+                            },
+                        );
+                        if is_dirty {
+                            // Newer user mutations arrived mid-flight: preserve optimistic UI
+                            // and flush latest level-triggered target strictly sequentially.
+                            this.flush_bookmark_sync(post_id, cx);
+                            return;
+                        }
+                        this.state.bookmark_state_epoch =
+                            this.state.bookmark_state_epoch.wrapping_add(1);
                         this.state.reconcile_bookmark(&resp);
+                        if this.state.saved_loading {
+                            let ov_item = if resp.bookmarked {
+                                synced_item
+                                    .or_else(|| this.state.snapshot_feed_item_for_post(&post_id))
+                            } else {
+                                None
+                            };
+                            this.state.bookmark_recent_overrides.insert(
+                                post_id.clone(),
+                                BookmarkSavedOverride {
+                                    epoch: this.state.bookmark_state_epoch,
+                                    bookmarked: resp.bookmarked,
+                                    folder: resolved_folder,
+                                    bookmarks_count: Some(resp.bookmarks_count),
+                                    item: ov_item,
+                                },
+                            );
+                        }
+                        this.state.bookmark_pending_target.remove(&post_id);
+                        this.state.bookmark_last_synced.remove(&post_id);
+                        this.state.bookmark_cached_items.remove(&post_id);
+                        this.reload_detail_if_loading_post(&post_id, cx);
+                        if resp.bookmarked
+                            && !this.state.saved_loading
+                            && this.state.route == CommunityRoute::BookmarksLists
+                            && !this
+                                .state
+                                .saved_items
+                                .iter()
+                                .any(|it| it.post.post_id == post_id)
+                        {
+                            this.load_saved_posts(cx);
+                            return;
+                        }
                     }
                     Ok(Err(e)) => {
+                        this.rollback_bookmark_flight(&post_id);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -220,7 +420,9 @@ impl CommunityWorkspace {
                             cx,
                         );
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        this.rollback_bookmark_flight(&post_id);
+                    }
                 }
                 cx.notify();
             });
@@ -228,39 +430,59 @@ impl CommunityWorkspace {
         .detach();
     }
 
-    pub fn remove_bookmark_from_saved(&mut self, post_id: String, cx: &mut Context<Self>) {
-        self.state.bookmark_moving_post_id = None;
-        self.state
-            .saved_items
-            .retain(|it| it.post.post_id != post_id);
-        self.state.visit_post_mut(&post_id, |p| {
-            p.viewer_bookmarked = false;
-            p.viewer_bookmark_folder = None;
-        });
-        let req = BookmarkRequest {
-            folder: None,
-            remove: Some(true),
-        };
-        let my_actor_gen = self.state.actor_switch_gen;
-        let facade = self.facade.clone();
-        let handle = facade.runtime_handle().clone();
-        cx.notify();
-        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade.bookmark_post(&post_id, &req).await
-            })
-            .await;
-            let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
-                    return;
-                }
-                if let Ok(Ok(resp)) = res {
-                    this.state.reconcile_bookmark(&resp);
-                }
-                cx.notify();
+    fn rollback_bookmark_flight(&mut self, post_id: &str) {
+        self.state.bookmark_dirty.remove(post_id);
+        self.state.bookmark_pending_target.remove(post_id);
+        self.state.bookmark_cached_items.remove(post_id);
+        if let Some(snap) = self.state.bookmark_last_synced.remove(post_id) {
+            self.state.bookmark_state_epoch = self.state.bookmark_state_epoch.wrapping_add(1);
+            self.state.visit_post_mut(post_id, |post| {
+                post.viewer_bookmarked = snap.bookmarked;
+                post.viewer_bookmark_folder = snap.folder.clone();
+                post.bookmarks_count = snap.bookmarks_count;
             });
-        })
-        .detach();
+            if snap.bookmarked {
+                if !self
+                    .state
+                    .saved_items
+                    .iter()
+                    .any(|it| it.post.post_id == post_id)
+                {
+                    if let Some(mut item) = snap
+                        .saved_item
+                        .clone()
+                        .or_else(|| self.state.snapshot_feed_item_for_post(post_id))
+                    {
+                        item.post.viewer_bookmarked = true;
+                        item.post.viewer_bookmark_folder = snap.folder.clone();
+                        item.post.bookmarks_count = snap.bookmarks_count;
+                        self.state.saved_items.insert(0, item);
+                    }
+                }
+            } else {
+                self.state
+                    .saved_items
+                    .retain(|it| it.post.post_id != post_id);
+            }
+            if self.state.saved_loading {
+                let ov_item = if snap.bookmarked {
+                    snap.saved_item
+                        .or_else(|| self.state.snapshot_feed_item_for_post(post_id))
+                } else {
+                    None
+                };
+                self.state.bookmark_recent_overrides.insert(
+                    post_id.to_string(),
+                    BookmarkSavedOverride {
+                        epoch: self.state.bookmark_state_epoch,
+                        bookmarked: snap.bookmarked,
+                        folder: snap.folder,
+                        bookmarks_count: Some(snap.bookmarks_count),
+                        item: ov_item,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -385,6 +607,18 @@ impl CommunityWorkspace {
         let community_slugs = self.state.list_editor.community_slugs.clone();
 
         if let Some(ref lid) = editing_id {
+            if self.state.list_deleting.contains(lid) {
+                self.state.list_editor.error = Some(
+                    tr_str(
+                        lang,
+                        "该列表正在删除中，无法保存修改",
+                        "This list is being deleted and cannot be saved",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
             self.state.list_membership_dirty.remove(lid);
         }
         self.state.list_editor.submitting = true;
@@ -444,42 +678,53 @@ impl CommunityWorkspace {
                 let lang = this.language_id.clone();
                 match res {
                     Ok((Ok(saved), lists)) => {
+                        let edited_deleting = editing_id_cb
+                            .as_ref()
+                            .is_some_and(|lid| this.state.list_deleting.contains(lid));
                         let edited_was_in_flight = editing_id_cb
                             .as_ref()
                             .is_some_and(|lid| this.state.list_membership_in_flight.contains_key(lid));
                         if this.state.lists_gen == my_lists_gen {
                             if let Some(l) = lists {
                                 this.state.merge_refreshed_lists(l.lists);
-                            } else if let Some(pos) = this
-                                .state
-                                .lists
-                                .iter()
-                                .position(|x| x.list_id == saved.list_id)
-                            {
-                                this.state.lists[pos] = saved.clone();
-                            } else {
-                                this.state.lists.insert(0, saved.clone());
+                            } else if !edited_deleting {
+                                if let Some(pos) = this
+                                    .state
+                                    .lists
+                                    .iter()
+                                    .position(|x| x.list_id == saved.list_id)
+                                {
+                                    this.state.lists[pos] = saved.clone();
+                                } else {
+                                    this.state.lists.insert(0, saved.clone());
+                                }
                             }
                         }
                         if let Some(ref lid) = editing_id_cb {
-                            if let Some(pos) = this.state.lists.iter().position(|x| &x.list_id == lid) {
-                                this.state.lists[pos] = saved.clone();
-                            }
-                            if edited_was_in_flight {
-                                // A pre-editor quick-toggle flight is still running; mark dirty so
-                                // once it finishes it flushes the editor's authoritative saved state.
-                                this.state.list_membership_dirty.insert(lid.clone());
-                            } else {
-                                this.state.list_membership_dirty.remove(lid);
-                                this.state.list_membership_needs_feed_reload.remove(lid);
-                                this.state.list_membership_last_synced.remove(lid);
+                            if !edited_deleting {
+                                if let Some(pos) =
+                                    this.state.lists.iter().position(|x| &x.list_id == lid)
+                                {
+                                    this.state.lists[pos] = saved.clone();
+                                }
+                                if edited_was_in_flight {
+                                    // A pre-editor quick-toggle flight is still running; mark dirty so
+                                    // once it finishes it flushes the editor's authoritative saved state.
+                                    this.state.list_membership_dirty.insert(lid.clone());
+                                } else {
+                                    this.state.list_membership_dirty.remove(lid);
+                                    this.state.list_membership_needs_feed_reload.remove(lid);
+                                    this.state.list_membership_last_synced.remove(lid);
+                                }
                             }
                         }
                         this.state.list_editor_open = false;
                         if this.state.active_input.is_list_editor_input() {
                             this.state.blur_input();
                         }
-                        this.select_list_for_preview(saved.list_id, cx);
+                        if !edited_deleting {
+                            this.select_list_for_preview(saved.list_id, cx);
+                        }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: tr_str(&lang, "列表已保存", "List saved").to_string(),
@@ -529,6 +774,7 @@ impl CommunityWorkspace {
             return;
         }
         self.state.list_deleting.insert(list_id.clone());
+        self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
         self.state.list_membership_dirty.remove(&list_id);
         self.state.list_membership_needs_feed_reload.remove(&list_id);
         let my_actor_gen = self.state.actor_switch_gen;
@@ -671,6 +917,7 @@ impl CommunityWorkspace {
         if self.state.list_deleting.contains(&list_id) {
             return;
         }
+        self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
         if reload_feed {
             self.state
                 .list_membership_needs_feed_reload
@@ -762,6 +1009,7 @@ impl CommunityWorkspace {
                 let is_dirty = this.state.list_membership_dirty.remove(&list_id);
                 match res {
                     Ok(Ok(updated)) => {
+                        this.state.lists_gen = this.state.lists_gen.wrapping_add(1);
                         this.state.list_membership_last_synced.insert(
                             list_id.clone(),
                             (

@@ -705,6 +705,42 @@ pub struct BotStudioEditDraft {
     pub error: Option<String>,
 }
 
+/// Normalizes bookmark folder names to match SQLite/server semantics
+/// (`""`, `"Unsorted"`, and `"All"` all map to `"All"`).
+pub fn normalize_bookmark_folder(folder: &str) -> String {
+    let trimmed = folder.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("Unsorted")
+        || trimmed.eq_ignore_ascii_case("All")
+    {
+        "All".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Last confirmed SQLite/server bookmark state per `post_id` for rollback on terminal error.
+#[derive(Debug, Clone)]
+pub struct BookmarkRollbackSnapshot {
+    pub bookmarked: bool,
+    pub folder: Option<String>,
+    pub bookmarks_count: u64,
+    pub saved_item: Option<FeedItemDto>,
+}
+
+/// Post-settlement override recorded ONLY while `saved_loading == true`, preventing a
+/// stale `load_saved_posts` (whose `FeedTab::Saved` read ran before `bookmark_post`
+/// committed, but whose `list_lists()` finished after `bookmark_in_flight` cleared)
+/// from clobbering `saved_items`.
+#[derive(Debug, Clone)]
+pub struct BookmarkSavedOverride {
+    pub epoch: u64,
+    pub bookmarked: bool,
+    pub folder: Option<String>,
+    pub bookmarks_count: Option<u64>,
+    pub item: Option<FeedItemDto>,
+}
+
 /// Complete client-side ViewModel for [`super::CommunityWorkspace`].
 pub struct CommunityWorkspaceState {
     pub route: CommunityRoute,
@@ -762,6 +798,7 @@ pub struct CommunityWorkspaceState {
     pub copied_code_msg: Option<u64>,
     pub poll_breakdown_by_post: HashMap<String, PollBreakdownMode>,
     pub hidden_post_ids: HashSet<String>,
+    pub post_vote_gen: HashMap<String, u64>,
 
     // Left Nav & Right Rail caches
     pub communities: Vec<SubCommunityDto>,
@@ -850,6 +887,14 @@ pub struct CommunityWorkspaceState {
     pub bookmark_custom_folders: Vec<String>,
     pub bookmark_new_folder_draft: String,
     pub bookmark_moving_post_id: Option<String>,
+    pub bookmark_state_epoch: u64,
+    pub bookmark_flight_seq: u64,
+    pub bookmark_in_flight: HashMap<String, u64>,
+    pub bookmark_dirty: HashSet<String>,
+    pub bookmark_pending_target: HashMap<String, (bool, Option<String>)>,
+    pub bookmark_last_synced: HashMap<String, BookmarkRollbackSnapshot>,
+    pub bookmark_cached_items: HashMap<String, FeedItemDto>,
+    pub bookmark_recent_overrides: HashMap<String, BookmarkSavedOverride>,
     pub selected_list_id: Option<String>,
     pub list_feed_items: Vec<FeedItemDto>,
     pub list_feed_sort: FeedSort,
@@ -883,6 +928,7 @@ pub struct CommunityWorkspaceState {
     pub automod_dry_run_body: String,
     pub automod_dry_run_is_bot: bool,
     pub automod_dry_run_result: Option<gpui_telegram_community::AutoModDecision>,
+    pub automod_rules_gen: u64,
     pub automod_flight_seq: u64,
     pub automod_in_flight: HashMap<String, u64>,
     pub automod_dirty: HashSet<String>,
@@ -970,6 +1016,7 @@ impl Default for CommunityWorkspaceState {
             copied_code_msg: None,
             poll_breakdown_by_post: HashMap::new(),
             hidden_post_ids: HashSet::new(),
+            post_vote_gen: HashMap::new(),
             communities: Vec::new(),
             communities_gen: 0,
             lists: Vec::new(),
@@ -1042,6 +1089,14 @@ impl Default for CommunityWorkspaceState {
             bookmark_custom_folders: Vec::new(),
             bookmark_new_folder_draft: String::new(),
             bookmark_moving_post_id: None,
+            bookmark_state_epoch: 0,
+            bookmark_flight_seq: 0,
+            bookmark_in_flight: HashMap::new(),
+            bookmark_dirty: HashSet::new(),
+            bookmark_pending_target: HashMap::new(),
+            bookmark_last_synced: HashMap::new(),
+            bookmark_cached_items: HashMap::new(),
+            bookmark_recent_overrides: HashMap::new(),
             selected_list_id: None,
             list_feed_items: Vec::new(),
             list_feed_sort: FeedSort::New,
@@ -1073,6 +1128,7 @@ impl Default for CommunityWorkspaceState {
             automod_dry_run_body: String::new(),
             automod_dry_run_is_bot: false,
             automod_dry_run_result: None,
+            automod_rules_gen: 0,
             automod_flight_seq: 0,
             automod_in_flight: HashMap::new(),
             automod_dirty: HashSet::new(),
@@ -1457,6 +1513,20 @@ impl CommunityWorkspaceState {
             .find(|i| i.post.post_id == post_id)
     }
 
+    pub fn snapshot_feed_item_for_post(&self, post_id: &str) -> Option<FeedItemDto> {
+        self.find_feed_item(post_id)
+            .cloned()
+            .or_else(|| {
+                self.find_post(post_id).cloned().map(|post| FeedItemDto {
+                    post,
+                    explanation: None,
+                    rank_score: 0.0,
+                    is_exploration_slot: false,
+                })
+            })
+            .or_else(|| self.bookmark_cached_items.get(post_id).cloned())
+    }
+
     /// Recursively finds an immutable comment reference inside the open PostDetail tree.
     pub fn find_comment(&self, comment_id: &str) -> Option<&CommunityCommentDto> {
         fn find_in_slice<'a>(
@@ -1638,6 +1708,13 @@ impl CommunityWorkspaceState {
             sr.posts.retain(|p| p.post_id != post_id);
         }
         self.composer.drafts.retain(|p| p.post_id != post_id);
+        self.bookmark_in_flight.remove(post_id);
+        self.bookmark_dirty.remove(post_id);
+        self.bookmark_pending_target.remove(post_id);
+        self.bookmark_last_synced.remove(post_id);
+        self.bookmark_cached_items.remove(post_id);
+        self.bookmark_recent_overrides.remove(post_id);
+        self.post_vote_gen.remove(post_id);
     }
 
     /// Optimistically applies a vote toggle (`1 | -1`, toggling to `0` if already active).
@@ -1725,18 +1802,30 @@ impl CommunityWorkspaceState {
     }
 
     pub fn reconcile_bookmark(&mut self, resp: &BookmarkResponse) {
+        let resolved_folder = if resp.bookmarked {
+            Some(normalize_bookmark_folder(&resp.folder))
+        } else {
+            None
+        };
         self.visit_post_mut(&resp.post_id, |post| {
             post.viewer_bookmarked = resp.bookmarked;
-            post.viewer_bookmark_folder = if resp.bookmarked && !resp.folder.trim().is_empty() {
-                Some(resp.folder.clone())
-            } else {
-                None
-            };
+            post.viewer_bookmark_folder = resolved_folder.clone();
             post.bookmarks_count = resp.bookmarks_count;
         });
         if !resp.bookmarked {
             self.saved_items
                 .retain(|it| it.post.post_id != resp.post_id);
+        } else if !self
+            .saved_items
+            .iter()
+            .any(|it| it.post.post_id == resp.post_id)
+        {
+            if let Some(mut item) = self.snapshot_feed_item_for_post(&resp.post_id) {
+                item.post.viewer_bookmarked = true;
+                item.post.viewer_bookmark_folder = resolved_folder;
+                item.post.bookmarks_count = resp.bookmarks_count;
+                self.saved_items.insert(0, item);
+            }
         }
     }
 
@@ -1765,6 +1854,13 @@ impl CommunityWorkspaceState {
                 det.community.is_joined = resp.is_joined;
                 det.community.member_count = resp.member_count;
                 det.community.viewer_role = resp.viewer_role;
+            }
+        }
+        if let Some(ref mut mc) = self.mod_community {
+            if mc.slug.eq_ignore_ascii_case(&resp.community_slug) {
+                mc.is_joined = resp.is_joined;
+                mc.member_count = resp.member_count;
+                mc.viewer_role = resp.viewer_role;
             }
         }
         if let Some(ref mut sr) = self.search_result {
@@ -1854,5 +1950,71 @@ impl CommunityWorkspaceState {
             }
         }
         self.lists = fresh;
+    }
+
+    /// Replaces `self.saved_items` with a freshly fetched snapshot while preserving:
+    /// 1. Order 2 post-settlement overrides (`bookmark_recent_overrides` with `ov.epoch > started_bookmark_epoch`)
+    ///    that committed while this `load_saved_posts` was still awaiting `list_lists()`, and
+    /// 2. Order 1 currently in-flight or dirty optimistic bookmark targets.
+    pub fn merge_refreshed_saved_items(
+        &mut self,
+        mut fresh: Vec<FeedItemDto>,
+        started_bookmark_epoch: u64,
+    ) {
+        // Step 1 (Order 2): apply post-settlement overrides newer than when `load_saved_posts` started.
+        for (pid, ov) in &self.bookmark_recent_overrides {
+            if ov.epoch <= started_bookmark_epoch
+                || self.bookmark_in_flight.contains_key(pid)
+                || self.bookmark_dirty.contains(pid)
+            {
+                continue;
+            }
+            if !ov.bookmarked {
+                fresh.retain(|it| it.post.post_id != *pid);
+            } else if let Some(existing) = fresh.iter_mut().find(|it| it.post.post_id == *pid) {
+                existing.post.viewer_bookmarked = true;
+                existing.post.viewer_bookmark_folder = ov.folder.clone();
+                if let Some(cnt) = ov.bookmarks_count {
+                    existing.post.bookmarks_count = cnt;
+                }
+            } else if let Some(mut item) = ov
+                .item
+                .clone()
+                .or_else(|| self.snapshot_feed_item_for_post(pid))
+            {
+                item.post.viewer_bookmarked = true;
+                item.post.viewer_bookmark_folder = ov.folder.clone();
+                if let Some(cnt) = ov.bookmarks_count {
+                    item.post.bookmarks_count = cnt;
+                }
+                fresh.insert(0, item);
+            }
+        }
+
+        // Step 2 (Order 1): apply currently in-flight or dirty optimistic bookmark targets.
+        for (pid, (target_bookmarked, target_folder)) in &self.bookmark_pending_target {
+            if !self.bookmark_in_flight.contains_key(pid) && !self.bookmark_dirty.contains(pid) {
+                continue;
+            }
+            if !*target_bookmarked {
+                fresh.retain(|it| it.post.post_id != *pid);
+            } else if let Some(existing) = fresh.iter_mut().find(|it| it.post.post_id == *pid) {
+                if !existing.post.viewer_bookmarked {
+                    existing.post.bookmarks_count =
+                        existing.post.bookmarks_count.saturating_add(1);
+                }
+                existing.post.viewer_bookmarked = true;
+                existing.post.viewer_bookmark_folder = target_folder.clone();
+            } else if let Some(mut item) = self.snapshot_feed_item_for_post(pid) {
+                item.post.viewer_bookmarked = true;
+                item.post.viewer_bookmark_folder = target_folder.clone();
+                fresh.insert(0, item);
+            }
+        }
+
+        self.saved_items = fresh;
+        if !self.saved_loading {
+            self.bookmark_recent_overrides.clear();
+        }
     }
 }

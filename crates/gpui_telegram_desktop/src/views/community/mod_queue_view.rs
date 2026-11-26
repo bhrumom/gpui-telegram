@@ -445,6 +445,7 @@ impl CommunityWorkspace {
 
     fn persist_automod_rules(&mut self, slug: String, reset_draft: bool, cx: &mut Context<Self>) {
         let slug_key = slug.to_ascii_lowercase();
+        self.state.automod_rules_gen = self.state.automod_rules_gen.wrapping_add(1);
         if reset_draft {
             self.state.automod_reset_draft_pending.insert(slug_key.clone());
         }
@@ -478,7 +479,6 @@ impl CommunityWorkspace {
         self.state.automod_flight_seq = self.state.automod_flight_seq.wrapping_add(1);
         let my_flight_seq = self.state.automod_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
-        let my_mod_gen = self.state.mod_gen;
         let submitter_actor_id = self.state.active_actor_id.clone();
         self.state
             .automod_in_flight
@@ -514,16 +514,22 @@ impl CommunityWorkspace {
                 }
                 this.state.automod_in_flight.remove(&slug_key);
 
-                let still_same_mod_gen = this.state.mod_gen == my_mod_gen;
+                let still_same_slug = this
+                    .state
+                    .mod_slug
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&slug));
                 let is_dirty = this.state.automod_dirty.remove(&slug_key);
                 let lang = this.language_id.clone();
 
                 match res {
                     Ok(Ok(updated)) => {
+                        this.state.automod_rules_gen =
+                            this.state.automod_rules_gen.wrapping_add(1);
                         this.state
                             .automod_last_synced
                             .insert(slug_key.clone(), updated.automod_rules.clone());
-                        if is_dirty && still_same_mod_gen {
+                        if is_dirty && still_same_slug {
                             // Newer optimistic rule toggles arrived mid-flight: preserve optimistic
                             // `mod_community.automod_rules` and flush latest snapshot strictly next.
                             this.flush_automod_rules_sync(slug, cx);
@@ -531,7 +537,7 @@ impl CommunityWorkspace {
                         }
                         this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
                         this.state.automod_last_synced.remove(&slug_key);
-                        if still_same_mod_gen {
+                        if still_same_slug {
                             this.state.mod_community = Some(updated.clone());
                         }
                         if let Some(pos) = this
@@ -567,7 +573,7 @@ impl CommunityWorkspace {
                         this.state.automod_reset_draft_pending.remove(&slug_key);
                         this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
                         if let Some(prev_rules) = this.state.automod_last_synced.remove(&slug_key) {
-                            if still_same_mod_gen {
+                            if still_same_slug {
                                 if let Some(ref mut mc) = this.state.mod_community {
                                     if mc.slug.eq_ignore_ascii_case(&slug) {
                                         mc.automod_rules = prev_rules;
@@ -582,7 +588,7 @@ impl CommunityWorkspace {
                         this.state.automod_reset_draft_pending.remove(&slug_key);
                         this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
                         if let Some(prev_rules) = this.state.automod_last_synced.remove(&slug_key) {
-                            if still_same_mod_gen {
+                            if still_same_slug {
                                 if let Some(ref mut mc) = this.state.mod_community {
                                     if mc.slug.eq_ignore_ascii_case(&slug) {
                                         mc.automod_rules = prev_rules;

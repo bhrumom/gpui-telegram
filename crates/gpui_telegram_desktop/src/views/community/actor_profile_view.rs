@@ -118,17 +118,27 @@ impl CommunityWorkspace {
                 }
                 let lang = this.language_id.clone();
                 match res {
-                    Ok(Ok(())) => this.emit_action(
-                        CommunityWorkspaceAction::ShowToast {
-                            text: if next_muted {
-                                tr_str(&lang, "已静音该公民", "Actor muted").to_string()
-                            } else {
-                                tr_str(&lang, "已取消静音", "Actor unmuted").to_string()
+                    Ok(Ok(())) => {
+                        this.state
+                            .reconcile_mute_block(&actor_id, Some(next_muted), None);
+                        if this.state.profile_loading {
+                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
+                                this.load_actor_profile(h, cx);
+                            }
+                        }
+                        this.emit_action(
+                            CommunityWorkspaceAction::ShowToast {
+                                text: if next_muted {
+                                    tr_str(&lang, "已静音该公民", "Actor muted").to_string()
+                                } else {
+                                    tr_str(&lang, "已取消静音", "Actor unmuted").to_string()
+                                },
+                                is_error: false,
                             },
-                            is_error: false,
-                        },
-                        cx,
-                    ),
+                            cx,
+                        );
+                        cx.notify();
+                    }
                     Ok(Err(e)) => {
                         this.state.reconcile_mute_block(&actor_id, Some(currently_muted), None);
                         this.emit_action(
@@ -182,17 +192,28 @@ impl CommunityWorkspace {
                 }
                 let lang = this.language_id.clone();
                 match res {
-                    Ok(Ok(())) => this.emit_action(
-                        CommunityWorkspaceAction::ShowToast {
-                            text: if next_blocked {
-                                tr_str(&lang, "已屏蔽该公民并取消互关", "Actor blocked").to_string()
-                            } else {
-                                tr_str(&lang, "已解除屏蔽", "Actor unblocked").to_string()
+                    Ok(Ok(())) => {
+                        this.state
+                            .reconcile_mute_block(&actor_id, None, Some(next_blocked));
+                        if this.state.profile_loading {
+                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
+                                this.load_actor_profile(h, cx);
+                            }
+                        }
+                        this.emit_action(
+                            CommunityWorkspaceAction::ShowToast {
+                                text: if next_blocked {
+                                    tr_str(&lang, "已屏蔽该公民并取消互关", "Actor blocked")
+                                        .to_string()
+                                } else {
+                                    tr_str(&lang, "已解除屏蔽", "Actor unblocked").to_string()
+                                },
+                                is_error: false,
                             },
-                            is_error: false,
-                        },
-                        cx,
-                    ),
+                            cx,
+                        );
+                        cx.notify();
+                    }
                     Ok(Err(e)) => {
                         this.state.reconcile_mute_block(&actor_id, None, Some(currently_blocked));
                         this.emit_action(
@@ -277,6 +298,8 @@ impl CommunityWorkspace {
         let aid = d.actor_id.clone();
         self.state.edit_profile.submitting = true;
         self.state.edit_profile.error = None;
+        self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
+        let my_id_gen = self.state.identities_gen;
         let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -290,10 +313,12 @@ impl CommunityWorkspace {
             .await;
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen {
-                    if let Ok(Ok((_, Some(id_resp)))) = res {
-                        this.state.identities = Some(id_resp);
-                        this.ensure_bot_studio_selected_hydrated(cx);
-                        cx.notify();
+                    if this.state.identities_gen == my_id_gen {
+                        if let Ok(Ok((_, Some(id_resp)))) = res {
+                            this.state.identities = Some(id_resp);
+                            this.ensure_bot_studio_selected_hydrated(cx);
+                            cx.notify();
+                        }
                     }
                     return;
                 }
@@ -306,8 +331,15 @@ impl CommunityWorkspace {
                                 prof.actor = updated.clone();
                             }
                         }
-                        if let Some(id_resp) = ids {
-                            this.apply_identities_response(id_resp, cx);
+                        if this.state.profile_loading {
+                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
+                                this.load_actor_profile(h, cx);
+                            }
+                        }
+                        if this.state.identities_gen == my_id_gen {
+                            if let Some(id_resp) = ids {
+                                this.apply_identities_response(id_resp, cx);
+                            }
                         }
                         this.close_edit_profile_modal(cx);
                         this.emit_action(

@@ -12,8 +12,7 @@ use gpui_telegram_client::{
 };
 use gpui_telegram_community::validate_create_comment_request;
 use gpui_telegram_proto::community_contracts::{
-    ActorFilter, BookmarkRequest, CommentSort, CommunityIdentitiesResponse,
-    CommunityPollVoteRequest, CommunitySearchRequestDto, CommunitySearchTab, CreateCommentRequest,
+    ActorFilter, CommentSort, CommunityIdentitiesResponse, CommunityPollVoteRequest, CommunitySearchRequestDto, CommunitySearchTab, CreateCommentRequest,
     CreatePostRequest, EngagementSignalKind, FeedItemDto, FeedRequestDto, FeedSort, FeedTab,
     GiveAwardRequest, MarkNotificationsReadRequest, ModActionKind, ModActionRequest, PostFormat,
     PostStatus, RecordSignalRequest, RepostRequest, TimeWindow, VoteRequest,
@@ -1265,9 +1264,22 @@ impl CommunityWorkspace {
         .detach();
     }
 
+    pub(super) fn reload_detail_if_loading_post(&mut self, post_id: &str, cx: &mut Context<Self>) {
+        if self.state.detail_loading
+            && matches!(&self.state.route, CommunityRoute::PostDetail(id) if id == post_id)
+        {
+            self.load_post_detail(post_id.to_string(), cx);
+        }
+    }
+
     pub fn vote_post(&mut self, post_id: String, clicked_dir: i8, cx: &mut Context<Self>) {
         let (next_dir, rollback) = self.state.apply_optimistic_vote(&post_id, clicked_dir);
         let my_actor_gen = self.state.actor_switch_gen;
+        let my_vote_gen = {
+            let entry = self.state.post_vote_gen.entry(post_id.clone()).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
@@ -1280,11 +1292,16 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.post_vote_gen.get(&post_id).copied() != Some(my_vote_gen)
+                {
                     return;
                 }
                 match res {
-                    Ok(Ok(resp)) => this.state.reconcile_vote(&resp),
+                    Ok(Ok(resp)) => {
+                        this.state.reconcile_vote(&resp);
+                        this.reload_detail_if_loading_post(&post_id, cx);
+                    }
                     _ => {
                         if let Some(snap) = rollback {
                             this.state.rollback_vote(&post_id, snap);
@@ -1314,7 +1331,10 @@ impl CommunityWorkspace {
                     return;
                 }
                 match res {
-                    Ok(Ok(resp)) => this.state.reconcile_like(&resp),
+                    Ok(Ok(resp)) => {
+                        this.state.reconcile_like(&resp);
+                        this.reload_detail_if_loading_post(&post_id, cx);
+                    }
                     _ => {
                         if let Some(snap) = rollback {
                             this.state.rollback_like(&post_id, snap);
@@ -1331,9 +1351,10 @@ impl CommunityWorkspace {
         let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
+        let pid = post_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                facade.repost(&post_id, &RepostRequest::default()).await
+                facade.repost(&pid, &RepostRequest::default()).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
@@ -1343,6 +1364,7 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok(resp)) => {
                         this.state.reconcile_repost(&resp);
+                        this.reload_detail_if_loading_post(&post_id, cx);
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -1417,43 +1439,19 @@ impl CommunityWorkspace {
     pub fn toggle_bookmark(&mut self, post_id: String, cx: &mut Context<Self>) {
         let already = self
             .state
-            .find_post(&post_id)
-            .is_some_and(|p| p.viewer_bookmarked);
-        let req = BookmarkRequest {
-            folder: None,
-            remove: Some(already),
-        };
-        let my_actor_gen = self.state.actor_switch_gen;
-        let facade = self.facade.clone();
-        let handle = facade.runtime_handle().clone();
-        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade.bookmark_post(&post_id, &req).await
-            })
-            .await;
-            let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
-                    return;
-                }
-                match res {
-                    Ok(Ok(resp)) => {
-                        this.state.reconcile_bookmark(&resp);
-                    }
-                    Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: e.to_string(),
-                                is_error: true,
-                            },
-                            cx,
-                        );
-                    }
-                    Err(_) => {}
-                }
-                cx.notify();
+            .bookmark_pending_target
+            .get(&post_id)
+            .map(|(bookmarked, _)| *bookmarked)
+            .unwrap_or_else(|| {
+                self.state
+                    .find_post(&post_id)
+                    .is_some_and(|p| p.viewer_bookmarked)
             });
-        })
-        .detach();
+        if already {
+            self.enqueue_bookmark_mutation(post_id, false, None, cx);
+        } else {
+            self.enqueue_bookmark_mutation(post_id, true, Some("All".to_string()), cx);
+        }
     }
 
     pub fn vote_poll(&mut self, post_id: String, option_id: String, cx: &mut Context<Self>) {
@@ -1496,6 +1494,7 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok(poll)) => {
                         this.state.reconcile_poll(&post_id, poll);
+                        this.reload_detail_if_loading_post(&post_id, cx);
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -1638,6 +1637,7 @@ impl CommunityWorkspace {
         // 2. Unconditionally bump ALL actor-scoped generation counters & reset loading/busy flags
         //    BEFORE active-route reloads so NO stale off-route fetch or mutation can write back.
         self.state.mod_gen = self.state.mod_gen.wrapping_add(1);
+        self.state.automod_rules_gen = self.state.automod_rules_gen.wrapping_add(1);
         self.state.mod_loading = false;
         self.state.automod_draft.saving = false;
         self.state.automod_draft.error = None;
@@ -1645,6 +1645,7 @@ impl CommunityWorkspace {
         self.state.automod_dirty.clear();
         self.state.automod_reset_draft_pending.clear();
         self.state.automod_last_synced.clear();
+        self.state.post_vote_gen.clear();
 
         self.state.community_gen = self.state.community_gen.wrapping_add(1);
         self.state.community_loading = false;
@@ -1674,6 +1675,14 @@ impl CommunityWorkspace {
         self.state.saved_gen = self.state.saved_gen.wrapping_add(1);
         self.state.saved_loading = false;
         self.state.saved_items.clear();
+        self.state.bookmark_moving_post_id = None;
+        self.state.bookmark_state_epoch = self.state.bookmark_state_epoch.wrapping_add(1);
+        self.state.bookmark_in_flight.clear();
+        self.state.bookmark_dirty.clear();
+        self.state.bookmark_pending_target.clear();
+        self.state.bookmark_last_synced.clear();
+        self.state.bookmark_cached_items.clear();
+        self.state.bookmark_recent_overrides.clear();
 
         self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
         self.state.list_feed_gen = self.state.list_feed_gen.wrapping_add(1);
@@ -1820,6 +1829,15 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok(resp)) => {
                         this.state.reconcile_join(&resp);
+                        if this.state.community_loading
+                            && matches!(
+                                &this.state.route,
+                                CommunityRoute::CommunityPage(s)
+                                    if s.eq_ignore_ascii_case(&resp.community_slug)
+                            )
+                        {
+                            this.load_community_page(resp.community_slug.clone(), cx);
+                        }
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -1858,6 +1876,11 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok(resp)) => {
                         this.state.reconcile_follow(&resp);
+                        if this.state.profile_loading {
+                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
+                                this.load_actor_profile(h, cx);
+                            }
+                        }
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -2315,6 +2338,7 @@ impl CommunityWorkspace {
     pub fn mark_all_notifications_read(&mut self, cx: &mut Context<Self>) {
         self.state.notifications_gen = self.state.notifications_gen.wrapping_add(1);
         let my_notif_gen = self.state.notifications_gen;
+        let my_actor_gen = self.state.actor_switch_gen;
         self.state.notifications_loading = false;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -2328,16 +2352,24 @@ impl CommunityWorkspace {
             .await;
             if let Ok(Ok(resp)) = res {
                 let _ = weak.update(app, |this, cx| {
-                    if this.state.notifications_gen != my_notif_gen {
+                    if this.state.actor_switch_gen != my_actor_gen {
                         return;
                     }
-                    this.state.notifications_loading = false;
                     let unread = resp.unread_count.min(u32::MAX as u64) as u32;
-                    this.state.unread_notifications = unread;
-                    for n in &mut this.state.notifications {
-                        n.is_read = true;
+                    if this.state.notifications_gen == my_notif_gen {
+                        this.state.notifications_loading = false;
+                        this.state.unread_notifications = unread;
+                        for n in &mut this.state.notifications {
+                            n.is_read = true;
+                        }
+                        this.emit_action(CommunityWorkspaceAction::UnreadCountChanged(unread), cx);
+                    } else if this.state.notifications_loading
+                        || (unread == 0
+                            && (this.state.unread_notifications > 0
+                                || this.state.notifications.iter().any(|n| !n.is_read)))
+                    {
+                        this.load_notifications(cx);
                     }
-                    this.emit_action(CommunityWorkspaceAction::UnreadCountChanged(unread), cx);
                     cx.notify();
                 });
             }
@@ -2350,6 +2382,9 @@ impl CommunityWorkspace {
         let my_gen = self.state.saved_gen;
         self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
         let my_lists_gen = self.state.lists_gen;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        let my_bookmark_epoch = self.state.bookmark_state_epoch;
         self.state.saved_loading = true;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -2369,12 +2404,18 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.saved_gen != my_gen {
+                if this.state.saved_gen != my_gen
+                    || this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
                 this.state.saved_loading = false;
                 if let Ok((saved, lists)) = res {
-                    this.state.saved_items = saved.map(|s| s.items).unwrap_or_default();
+                    this.state.merge_refreshed_saved_items(
+                        saved.map(|s| s.items).unwrap_or_default(),
+                        my_bookmark_epoch,
+                    );
                     if this.state.lists_gen == my_lists_gen {
                         if let Some(l) = lists {
                             this.state.merge_refreshed_lists(l.lists);
@@ -2391,6 +2432,8 @@ impl CommunityWorkspace {
                             this.select_list_for_preview(lid, cx);
                         }
                     }
+                } else if !this.state.saved_loading {
+                    this.state.bookmark_recent_overrides.clear();
                 }
                 cx.notify();
             });
@@ -2399,16 +2442,24 @@ impl CommunityWorkspace {
     }
 
     pub fn load_mod_queue(&mut self, slug: String, cx: &mut Context<Self>) {
+        let same_slug = self
+            .state
+            .mod_slug
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(&slug));
         self.state.mod_gen = self.state.mod_gen.wrapping_add(1);
         let my_gen = self.state.mod_gen;
+        let my_automod_rules_gen = self.state.automod_rules_gen;
         self.state.mod_slug = Some(slug.clone());
         self.state.mod_loading = true;
         self.state.mod_error = None;
-        self.state.automod_draft.saving = false;
-        self.state.automod_in_flight.clear();
-        self.state.automod_dirty.clear();
-        self.state.automod_reset_draft_pending.clear();
-        self.state.automod_last_synced.clear();
+        if !same_slug {
+            self.state.automod_draft.saving = false;
+            self.state.automod_in_flight.clear();
+            self.state.automod_dirty.clear();
+            self.state.automod_reset_draft_pending.clear();
+            self.state.automod_last_synced.clear();
+        }
         let status_filter = self.state.mod_status_filter;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -2428,7 +2479,29 @@ impl CommunityWorkspace {
                 this.state.mod_loading = false;
                 if let Ok((detail, queue_res, logs_res)) = res {
                     if let Some(d) = detail {
-                        let comm = d.community;
+                        let mut comm = d.community;
+                        let slug_key = comm.slug.to_ascii_lowercase();
+                        let preserve_rules = this.state.automod_in_flight.contains_key(&slug_key)
+                            || this.state.automod_dirty.contains(&slug_key)
+                            || this.state.automod_rules_gen != my_automod_rules_gen;
+                        if preserve_rules {
+                            if let Some(prev_rules) = this
+                                .state
+                                .mod_community
+                                .as_ref()
+                                .filter(|prev| prev.slug.eq_ignore_ascii_case(&comm.slug))
+                                .map(|prev| prev.automod_rules.clone())
+                                .or_else(|| {
+                                    this.state
+                                        .communities
+                                        .iter()
+                                        .find(|prev| prev.slug.eq_ignore_ascii_case(&comm.slug))
+                                        .map(|prev| prev.automod_rules.clone())
+                                })
+                            {
+                                comm.automod_rules = prev_rules;
+                            }
+                        }
                         if let Some(pos) = this
                             .state
                             .communities

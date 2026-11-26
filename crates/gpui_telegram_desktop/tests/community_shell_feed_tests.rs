@@ -428,6 +428,20 @@ async fn pump_until(
     app.update(|cx| pred(cx)).unwrap_or(false)
 }
 
+async fn wait_for_community_bootstrap(
+    app: &mut AsyncApp,
+    cw: &Entity<gpui_telegram_desktop::views::community::CommunityWorkspace>,
+) -> bool {
+    pump_until(app, Duration::from_secs(5), |cx| {
+        let st = &cw.read(cx).state;
+        !st.feed_loading
+            && !st.feed_items.is_empty()
+            && !st.communities.is_empty()
+            && st.identities.is_some()
+    })
+    .await
+}
+
 // ============================================================================
 // Pure Unit Tests (Fast, No Subprocess Required)
 // ============================================================================
@@ -1027,13 +1041,10 @@ async fn body_centralized_cjk_ime_80ms_fence_multiline_and_3step_escape(mut app:
     let shell = host.shell.clone();
     let cw = shell.update(&mut app, |s, cx| s.open_community_workspace(cx)).unwrap();
 
-    // Wait for initial seeded feed to load
+    // Wait for initial seeded feed, communities, and identities bootstrap to fully settle
     assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
-            !cw.read(cx).state.feed_loading && !cw.read(cx).state.feed_items.is_empty()
-        })
-        .await,
-        "initial seeded feed must load"
+        wait_for_community_bootstrap(&mut app, &cw).await,
+        "initial seeded feed, communities, and identities must load"
     );
     let initial_count = cw.read_with(&app, |w, _| w.state.feed_items.len()).unwrap();
 
@@ -1083,8 +1094,8 @@ async fn body_centralized_cjk_ime_80ms_fence_multiline_and_3step_escape(mut app:
         "Hello 中文测试\n第二行 Markdown"
     );
 
-    // After 95ms (> 80ms fence), Enter submits Quick-Post genuinely into SQLite!
-    app.background_executor().timer(Duration::from_millis(95)).await;
+    // After 110ms (> 80ms fence), Enter submits Quick-Post genuinely into SQLite!
+    app.background_executor().timer(Duration::from_millis(110)).await;
     let _ = shell.update(&mut app, |s, cx| {
         assert!(s.handle_non_char_key("enter", false, cx));
     });
@@ -1160,13 +1171,7 @@ async fn body_identity_switcher_0bot_fallback_and_bot_posting(mut app: AsyncApp)
     let shell = host.shell.clone();
     let cw = shell.update(&mut app, |s, cx| s.open_community_workspace(cx)).unwrap();
 
-    assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
-            let w = cw.read(cx);
-            w.state.identities.is_some() && !w.state.feed_loading
-        })
-        .await
-    );
+    assert!(wait_for_community_bootstrap(&mut app, &cw).await);
 
     // 0-bot fallback: open IdentitySwitcher popover and draw without panic!
     let _ = cw.update(&mut app, |w, cx| {
@@ -1188,11 +1193,12 @@ async fn body_identity_switcher_0bot_fallback_and_bot_posting(mut app: AsyncApp)
     });
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx)
-                .state
-                .identities
-                .as_ref()
-                .is_some_and(|i| !i.bot_actors.is_empty())
+            let st = &cw.read(cx).state;
+            !st.bot_studio_submitting
+                && st
+                    .identities
+                    .as_ref()
+                    .is_some_and(|i| !i.bot_actors.is_empty())
         })
         .await,
         "BotStudio registration must add owned bot to identities"
@@ -1265,12 +1271,15 @@ async fn body_feed_controls_algo_tuner_post_interactions_polls_and_signals(mut a
     let cw = shell.update(&mut app, |s, cx| s.open_community_workspace(cx)).unwrap();
 
     assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
-            let w = cw.read(cx);
-            !w.state.feed_loading && w.state.feed_items.len() >= 5 && !w.state.trending.is_empty()
-        })
-        .await,
-        "seeded feed and trending must load"
+        wait_for_community_bootstrap(&mut app, &cw).await
+            && pump_until(&mut app, Duration::from_secs(4), |cx| {
+                let w = cw.read(cx);
+                !w.state.feed_loading
+                    && w.state.feed_items.len() >= 5
+                    && !w.state.trending.is_empty()
+            })
+            .await,
+        "seeded feed, communities, identities, and trending must load"
     );
 
     // Draw all 3 densities (Card, Compact, Classic) via real window.draw
@@ -1349,31 +1358,43 @@ async fn body_feed_controls_algo_tuner_post_interactions_polls_and_signals(mut a
     // Upvote -> Flip to Downvote (-2) -> Toggle-off (0) -> Like -> Repost -> Bookmark -> Award
     let _ = cw.update(&mut app, |w, cx| w.vote_post(target_pid.clone(), 1, cx));
     assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
             cw.read(cx)
                 .state
                 .find_post(&target_pid)
                 .is_some_and(|p| p.viewer_vote == 1 && p.score == score_before + 1)
+                && client
+                    .community()
+                    .block_on(client.community().get_post(&target_pid, None))
+                    .is_ok_and(|d| d.post.viewer_vote == 1 && d.post.score == score_before + 1)
         })
         .await
     );
     let _ = cw.update(&mut app, |w, cx| w.vote_post(target_pid.clone(), -1, cx));
     assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
             cw.read(cx)
                 .state
                 .find_post(&target_pid)
                 .is_some_and(|p| p.viewer_vote == -1 && p.score == score_before - 1)
+                && client
+                    .community()
+                    .block_on(client.community().get_post(&target_pid, None))
+                    .is_ok_and(|d| d.post.viewer_vote == -1 && d.post.score == score_before - 1)
         })
         .await
     );
     let _ = cw.update(&mut app, |w, cx| w.vote_post(target_pid.clone(), -1, cx));
     assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
             cw.read(cx)
                 .state
                 .find_post(&target_pid)
                 .is_some_and(|p| p.viewer_vote == 0 && p.score == score_before)
+                && client
+                    .community()
+                    .block_on(client.community().get_post(&target_pid, None))
+                    .is_ok_and(|d| d.post.viewer_vote == 0 && d.post.score == score_before)
         })
         .await
     );
@@ -1384,13 +1405,28 @@ async fn body_feed_controls_algo_tuner_post_interactions_polls_and_signals(mut a
         w.give_award(target_pid.clone(), "insightful".to_string(), cx);
     });
     assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.find_post(&target_pid).is_some_and(|p| {
-                p.viewer_liked && p.viewer_reposted && p.viewer_bookmarked && !p.awards.is_empty()
-            })
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.bookmark_in_flight.contains_key(&target_pid)
+                && !st.bookmark_dirty.contains(&target_pid)
+                && st.find_post(&target_pid).is_some_and(|p| {
+                    p.viewer_liked
+                        && p.viewer_reposted
+                        && p.viewer_bookmarked
+                        && !p.awards.is_empty()
+                })
+                && client
+                    .community()
+                    .block_on(client.community().get_post(&target_pid, None))
+                    .is_ok_and(|d| {
+                        d.post.viewer_liked
+                            && d.post.viewer_reposted
+                            && d.post.viewer_bookmarked
+                            && !d.post.awards.is_empty()
+                    })
         })
         .await,
-        "Like, Repost, Bookmark, and Award must all reconcile from local runtime"
+        "Like, Repost, Bookmark, and Award must all persist and reconcile from local runtime"
     );
 
     // Poll vote + All | Humans | Bots breakdown toggle (non-optional assertion!)
@@ -1508,6 +1544,14 @@ async fn body_ws_events_unmounted_badge_malformed_json_and_cross_app_bridges(mut
 
     // 2. Mount Community and send ClientDomainEvent::CommunityEvent("post_created") -> live banner
     let cw = shell.update(&mut app, |s, cx| s.open_community_workspace(cx)).unwrap();
+    assert!(
+        wait_for_community_bootstrap(&mut app, &cw).await
+            && pump_until(&mut app, Duration::from_secs(4), |cx| {
+                !cw.read(cx).state.notifications_loading
+            })
+            .await,
+        "community bootstrap must settle before WS & badge bridge assertions"
+    );
     let _ = shell.update(&mut app, |s, cx| {
         s.handle_community_domain_event(
             ClientDomainEvent::CommunityEvent {
@@ -1728,11 +1772,12 @@ async fn body_secondary_routes_live_data_and_owned_bot_sync(mut app: AsyncApp) {
     let _ = cw.update(&mut app, |w, cx| w.open_post_detail(sample_pid.clone(), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx)
-                .state
-                .detail_post
-                .as_ref()
-                .is_some_and(|d| d.post.post_id == sample_pid)
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == sample_pid)
         })
         .await
     );
@@ -1756,6 +1801,13 @@ async fn body_secondary_routes_live_data_and_owned_bot_sync(mut app: AsyncApp) {
         "Inline PostDetail reply must persist and reload into comment tree"
     );
     let _ = cw.update(&mut app, |w, cx| w.summon_bot_on_post(sample_pid.clone(), cx));
+    assert!(
+        pump_until(&mut app, Duration::from_secs(3), |cx| {
+            !cw.read(cx).state.detail_summon_pending
+        })
+        .await,
+        "Summon Bot on PostDetail must settle before route switch"
+    );
     host.draw(&mut app);
 
     // 2. CommunityPage route: load c/<slug>, toggle join, and render
@@ -1764,11 +1816,12 @@ async fn body_secondary_routes_live_data_and_owned_bot_sync(mut app: AsyncApp) {
     });
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx)
-                .state
-                .community_detail
-                .as_ref()
-                .is_some_and(|d| d.community.slug == sample_comm)
+            let st = &cw.read(cx).state;
+            !st.community_loading
+                && st
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == sample_comm)
         })
         .await
     );
@@ -1778,11 +1831,12 @@ async fn body_secondary_routes_live_data_and_owned_bot_sync(mut app: AsyncApp) {
     let _ = cw.update(&mut app, |w, cx| w.open_actor_profile(sample_author.clone(), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx)
-                .state
-                .actor_profile
-                .as_ref()
-                .is_some_and(|p| p.actor.handle == sample_author)
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.handle == sample_author)
         })
         .await
     );
@@ -1792,7 +1846,8 @@ async fn body_secondary_routes_live_data_and_owned_bot_sync(mut app: AsyncApp) {
     let _ = cw.update(&mut app, |w, cx| w.open_explore_with_query("rust".to_string(), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.search_result.is_some()
+            let st = &cw.read(cx).state;
+            !st.search_loading && st.search_result.is_some()
         })
         .await
     );
@@ -1806,7 +1861,19 @@ async fn body_secondary_routes_live_data_and_owned_bot_sync(mut app: AsyncApp) {
         CommunityRoute::BotStudio,
     ] {
         let _ = cw.update(&mut app, |w, cx| w.navigate_to(route.clone(), cx));
-        app.background_executor().timer(Duration::from_millis(60)).await;
+        assert!(
+            pump_until(&mut app, Duration::from_secs(3), |cx| {
+                let st = &cw.read(cx).state;
+                match route {
+                    CommunityRoute::Notifications => !st.notifications_loading,
+                    CommunityRoute::BookmarksLists => !st.saved_loading,
+                    CommunityRoute::ModQueue(_) => !st.mod_loading,
+                    CommunityRoute::BotStudio => !st.bot_studio_submitting,
+                    _ => true,
+                }
+            })
+            .await
+        );
         host.draw(&mut app);
     }
     let _ = cw.update(&mut app, |w, cx| w.go_back(cx));
@@ -2029,11 +2096,12 @@ async fn body_f16_remediation_regressions(mut app: AsyncApp) {
     let cw = shell.update(&mut app, |s, cx| s.open_community_workspace(cx)).unwrap();
 
     assert!(
-        pump_until(&mut app, Duration::from_secs(3), |cx| {
-            let w = cw.read(cx);
-            !w.state.feed_loading && w.state.feed_items.len() >= 3 && !w.state.communities.is_empty()
-        })
-        .await
+        wait_for_community_bootstrap(&mut app, &cw).await
+            && pump_until(&mut app, Duration::from_secs(3), |cx| {
+                let w = cw.read(cx);
+                !w.state.feed_loading && w.state.feed_items.len() >= 3
+            })
+            .await
     );
 
     // R2-BLOCKER-1: rich-text action sets card_child_click_consumed so parent PostCard on_click skips open_post_detail
@@ -2114,8 +2182,12 @@ async fn body_f16_remediation_regressions(mut app: AsyncApp) {
     });
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.actor_profile.as_ref()
-                .is_some_and(|p| p.recent_posts.iter().any(|x| x.post_id == live_pid))
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.recent_posts.iter().any(|x| x.post_id == live_pid))
         }).await
     );
     let _ = cw.update(&mut app, |w, cx| {
@@ -2127,14 +2199,20 @@ async fn body_f16_remediation_regressions(mut app: AsyncApp) {
     });
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.find_post(&live_pid).is_some_and(|p| p.viewer_bookmarked)
+            let st = &cw.read(cx).state;
+            !st.bookmark_in_flight.contains_key(&live_pid)
+                && !st.bookmark_dirty.contains(&live_pid)
+                && st.find_post(&live_pid).is_some_and(|p| p.viewer_bookmarked)
         }).await,
         "bookmark on profile-only post must reconcile"
     );
     let _ = cw.update(&mut app, |w, cx| w.toggle_bookmark(live_pid.clone(), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.find_post(&live_pid).is_some_and(|p| !p.viewer_bookmarked)
+            let st = &cw.read(cx).state;
+            !st.bookmark_in_flight.contains_key(&live_pid)
+                && !st.bookmark_dirty.contains(&live_pid)
+                && st.find_post(&live_pid).is_some_and(|p| !p.viewer_bookmarked)
         }).await,
         "R2-BLOCKER-3 / C2-D2: unbookmark on profile-only post must reconcile"
     );
@@ -2143,7 +2221,13 @@ async fn body_f16_remediation_regressions(mut app: AsyncApp) {
     let _ = cw.update(&mut app, |w, cx| {
         w.open_post_detail(live_pid.clone(), cx);
     });
-    assert!(pump_until(&mut app, Duration::from_secs(3), |cx| cw.read(cx).state.detail_post.is_some()).await);
+    assert!(
+        pump_until(&mut app, Duration::from_secs(3), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading && st.detail_post.is_some()
+        })
+        .await
+    );
     let _ = cw.update(&mut app, |w, cx| w.open_post_detail("no_such_post_xyz".to_string(), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
@@ -2155,7 +2239,13 @@ async fn body_f16_remediation_regressions(mut app: AsyncApp) {
     host.draw(&mut app);
 
     let _ = cw.update(&mut app, |w, cx| w.navigate_to(CommunityRoute::CommunityPage(live_comm.clone()), cx));
-    assert!(pump_until(&mut app, Duration::from_secs(3), |cx| cw.read(cx).state.community_detail.is_some()).await);
+    assert!(
+        pump_until(&mut app, Duration::from_secs(3), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading && st.community_detail.is_some()
+        })
+        .await
+    );
     let _ = cw.update(&mut app, |w, cx| w.navigate_to(CommunityRoute::CommunityPage("no_such_comm_xyz".to_string()), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
@@ -2197,7 +2287,13 @@ async fn body_f16_remediation_regressions(mut app: AsyncApp) {
         assert_eq!(w.state.algo_prefs.bot_content_ratio, 1.0);
         assert!(w.state.algo_draft.recency_weight.is_finite());
     });
-    assert!(pump_until(&mut app, Duration::from_secs(3), |cx| !cw.read(cx).state.feed_loading).await);
+    assert!(
+        pump_until(&mut app, Duration::from_secs(3), |cx| {
+            let st = &cw.read(cx).state;
+            !st.feed_loading && !st.feed_items.is_empty()
+        })
+        .await
+    );
 
     // C2-D7 (duplicate post + dual embeds), R2-BLOCKER-4 (Compact NSFW veil), C2-D8 (Quote toggle-off blur)
     let _ = cw.update(&mut app, |w, cx| {
@@ -3886,12 +3982,7 @@ async fn body_r7_part3_load_more_and_notif_supersede(
     let _ = shell.update(app, |s, cx| {
         s.open_community_workspace(cx);
     });
-    assert!(
-        pump_until(app, Duration::from_secs(5), |cx| {
-            !cw.read(cx).state.feed_loading && !cw.read(cx).state.communities.is_empty()
-        })
-        .await
-    );
+    assert!(wait_for_community_bootstrap(app, cw).await);
 
     let (facade, comm_slug) = cw
         .read_with(app, |w, _| {
