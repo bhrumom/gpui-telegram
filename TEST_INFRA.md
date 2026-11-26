@@ -1786,3 +1786,321 @@ Upon successful execution of all stages, the Orchestrator aggregates the results
 ## Formal Sign-Off
 All 58 features, 3,441 upstream source files, and inherited production runtimes have been completely verified against authoritative behavioral contracts. The project is certified as TEST_READY for final release packaging.
 ```
+
+---
+
+## 11. OpenBot 1:1 Pure-Rust + GPUI Fusion 4-Tier Opaque-Box E2E Test Infrastructure
+
+### 11.1 Opaque-Box Verification Philosophy & Dual-Surface Scope (`OB-F01`..`OB-F20`)
+
+The OpenBot 1:1 Pure-Rust + GPUI Fusion (`gpui-telegram`) is verified end-to-end by an independent, standard-library-only Python 3.10+ opaque-box test suite under `tests/e2e_openbot/` orchestrated by `scripts/run_openbot_e2e_suite.py`. Every test enforces four non-negotiable engineering guarantees:
+
+1. **100% Opaque-Box Process & Network Boundary**: Tests never import internal Rust source files or mock domain logic in Python. Every test spawns the compiled external CLI (`gpui-telegram-cli openbot ... --data-dir <temp_dir> --json`) and/or connects over TCP loopback to `openbot serve` (`/v1/*` Team API REST, `/v1/events` SSE, and `127.0.0.1` automation `/run`), supplemented by read-only `sqlite3` forensic assertions against `<data_dir>/openbot.db` (schema `v69`) and `<data_dir>/Shared/Data/agent-data.db` (`user_version = 1`).
+2. **Hermetic RAII Sandbox Isolation (`AGENTS.md § 1.3`)**: Every test runs inside an isolated `TempOpenBotEnv` (`OpenBotE2EEnv`) backed by `tempfile.TemporaryDirectory(prefix="openbot_e2e_")` that terminates spawned server process groups (`os.killpg`), closes SQLite handles, and removes temporary directories deterministically on exit.
+3. **Zero Rust Panics (`assert_no_rust_panic`)**: Across all positive and negative/adversarial inputs, exit codes `101`, `132`, `134` (`SIGABRT`), `135`, `136`, `139` (`SIGSEGV`), any negative signal exit (`returncode < 0`), or `panicked at` / `stack backtrace:` diagnostics immediately fail the test.
+4. **Dual-Surface Non-Regression**: Switching between native Telegram (`Chats`) and `OpenBotWorkspaceShell` (`OpenBot`) preserves 100% of baseline Telegram layout geometry (`52px` `NavRail`, `288px` `ChatSidebar`, `320px` `ContextInspector`, `44..192px` `MessageComposer`), `TdesktopThemePalette`, `Cmd+1..9` shortcuts, and `scripts/verify_ledger_closure.py` Gates 1–6.7.
+
+---
+
+### 11.2 4-Tier Test Architecture & Coverage Matrix (`>= 230` Tests: `100` T1 + `100` T2 + `20` T3 + `10` T4 + Baseline)
+
+| Tier | Module(s) in `tests/e2e_openbot/` | Quantitative Floor | Verification Focus |
+|---|---|---|---|
+| **Tier 1 — Happy-Path Feature Coverage** | `tier1_f01_f05.py` (`30`), `tier1_f06_f10.py` (`30`), `tier1_f11_f15.py` (`>= 25`), `tier1_f16_f20.py` (`>= 25`) | **`>= 100` tests** (`>= 5` per feature across `OB-F01`..`OB-F20`; `6`/feature = `60` in `E2E-M1`) | Deterministic contracts, FNV-1a/Mulberry32/sRGB-sheen/OKLab math, SQLite `v69` CQRS & FTS5, 18 provider harnesses, `DrainScheduler`, `Mailbox`, `dm-<sha256>`, Multi-Bot `ChannelService`, ~121+ tools/Browser/Vault, Workflows, Routines, CRM, Voice/Bridges/Team API, and GPUI `ui-probe` scenarios. |
+| **Tier 2 — Boundary, Corner & Negative** | `tier2_f01_f05.py` (`30`), `tier2_f06_f10.py` (`30`), `tier2_f11_f15.py` (`>= 25`), `tier2_f16_f20.py` (`>= 25`) | **`>= 100` tests** (`>= 5` per feature across `OB-F01`..`OB-F20`; `6`/feature = `60` in `E2E-M1`) | Schema version/gap guards, SQLite `owner_agent_id` authorizer denials, `"goutte"` exclusion, `>10 MiB` / corrupt images, CSS-injection themes, `>100` agents, `>8` backups, `>32` recipients, `CHANNEL_ASSIGNMENT_LIMIT=8`, `CHANNEL_REPLY_LIMIT=2`, DAG cycles, `fill-card` screenshot lock, `30/hr` rate limit, `401`/`403` CSRF/Host guards. |
+| **Tier 3 — Cross-Feature Combinations** | `tier3_pairwise.py` | **`>= 20` tests** (each tagging `>= 2` distinct `OB-Fxx` features) | Multi-subsystem interactions: Channel delegation + `agent-data.db` + FTS5 memory, Workflow trigger -> Channel Lead router -> Browser Vault fill, Theme JSON watcher + `OpenBotWorkspaceShell` <-> Telegram `Chats` switch, Routine webhook -> `DynamicIsland` critical lock, Export/Import round-trip with routines & channels. |
+| **Tier 4 — Real-World E2E Workflows** | `tier4_scenarios.py` | **`>= 10` workflows** | Full multi-step user & multi-bot journeys spanning onboarding, multi-agent software audit channel with stopped-task recovery, live `/v1/events` SSE + Team API client sync, CRM proposal approval + static site publish, and bidirectional Telegram <-> OpenBot bridge round-trip. |
+| **Baseline Non-Regression Gate** | `scripts/run_openbot_e2e_suite.py --baseline` | `package_release.py --skip-clean` + `verify_ledger_closure.py` + desktop baseline suites | Under `cargo_build.lock` (`flock`), stages `dist/GPUI Telegram.app/Contents/MacOS/gpui_telegram_desktop` if absent (`Gate 6.7`), verifies 3,441-file C++ ledger closure (`Gates 1–6.7`), runs `gpui_telegram_desktop` baseline Rust test targets, and runs `clean_build_garbage.py` in `finally:`. |
+
+---
+
+### 11.3 Opaque-Box Entry Points: CLI (`gpui-telegram-cli openbot`) & Live HTTP/SSE (`openbot serve`)
+
+#### 11.3.1 Binary Resolution, Envelope Grammar & Exit Code Contract
+
+- **Binary Resolution Order (`resolve_cli_bin`)**:
+  1. Explicit `--bin <path>` CLI runner flag (`set_cli_bin_override`)
+  2. `GPUI_TELEGRAM_CLI_BIN` environment variable
+  3. `<repo_root>/target/debug/gpui-telegram-cli` -> `target/debug/gpui_telegram_cli`
+  4. `<repo_root>/target/release/gpui-telegram-cli` -> `target/release/gpui_telegram_cli`
+  5. `<repo_root>/target/debug/fabushi` -> `target/release/fabushi`
+  - **Fail-Closed Explicit Override**: Whenever an explicit binary override (`--bin <path>`, `set_cli_bin_override`, or non-empty `GPUI_TELEGRAM_CLI_BIN`) is supplied, `resolve_cli_bin` checks **only** the highest-priority explicit override and fails closed (`BinaryNotReadyError`, runner exit `2`) if missing or non-executable rather than falling back to `target/*`.
+- **Global Flags**: `gpui-telegram-cli openbot <entry> [action] [flags] --data-dir <dir> --json [--command-id <id>]`
+- **Exit Codes (`crates/gpui_telegram_cli/src/error.rs`)**:
+  - `0`: Command succeeded; `stdout` contains canonical JSON (`{"success": true, "data": <payload>, "error": null, "timestamp": "..."}` or direct `<payload>`).
+  - `1`: Runtime / execution / HTTP / upstream server error (`execution_error`, `http_error`, `server_error`, `NewerDatabaseError`).
+  - `2`: CLI flag/syntax parser or unknown subcommand error (`usage_error`, `unknown_command` — rejected by `harness.py:_assert_not_cli_parse_error` whenever `allow_cli_parse_error=False`), OR domain/schema/input validation or invariant check error (`validation_error`, `check_error` — required for domain validation refusals).
+  - `3`: Authentication required or token rejected (`unauthorized`).
+  - `4`: Action denied, authorizer forbidden, or human approval gate required (`forbidden`, `approval_required`).
+  - **In-Turn Coordination / Tool Soft Refusals**: Agent-turn tools (`channel assign|transfer|reply|result|cancel`, `tools call`, `tools agent-data-exec`) may either return non-zero (`1`/`2`/`4`) with `err_envelope` on `stderr`/`stdout` OR exit `0` with structured refusal payload `{"accepted": false, "reason": "...", "code": "..."}` / `{"ok": false, "code": "...", "message": "..."}` / task `state: "paused"`. Both representations are parsed uniformly by `harness.py` while strictly forbidding Rust panics (`101`).
+
+#### 11.3.2 Public Subcommand Grammar & Canonical JSON Schemas (Entry Points 1–5)
+
+1. **`openbot avatar-eval`** (`OB-F01`, `OB-F03`, `OB-F04`)
+   - **Flags**: `--seed <str_or_empty> [--hue <0|30|55|100|150|185|215|245|280|320>] [--color <#rrggbb>] [--style plush|flat] [--shape <13_shapes>] [--mood <idle|working|waiting|failed|responded|connecting|asleep>] [--state <15_states>] [--expression <16_expressions>] [--t <sec_f64>] [--pointer <nx,ny>] [--pointer-type mouse|pen|touch] [--reduced-motion] [--working-faces] [--cluster-count <usize>] [--normalize-image <path>]`
+   - **Empty Seed Rule (`packages/brand/src/bloub-avatar.ts:L161-L174` & `openbot_contracts::avatar`)**: `--seed ""` hashes raw `""` directly (`":shape"`, `":expression"`, `":color"`) without `"openbot"` coercion (`coerce_empty_to_openbot = False`), resolving deterministically to `{"style": "plush", "shape": "capsule", "expression": "excite", "color": "#e8483f"}`. (By contrast, `openbot agent create --avatar-seed ""` rejects empty/whitespace/`>128`-char/invalid-charset seeds.)
+   - **JSON `data` Schema**:
+     ```json
+     {
+       "seed": "agent-1",
+       "profile": { "style": "plush", "shape": "pentagone", "expression": "fier", "color": "#f08a24" },
+       "nearest_hue": 30,
+       "mood": "idle",
+       "state": "idle",
+       "view_box": "-158 -158 316 316",
+       "paper": "#f9f9f9",
+       "rays_count": 64,
+       "cubic_segments": 64,
+       "body_path": "M ... C ... Z",
+       "breath_sy": 1.0,
+       "eyes": {
+         "rest_open": 1.0, "open_squash": 1.0, "zero_clipping": true, "wander_active": true,
+         "gaze": { "yaw": 0.0, "pitch": 0.0, "roll": 0.0 },
+         "left": { "w": 0.186, "h": 0.412, "alpha": 1.0, "culled": false, "cutout_op": "DstOut", "pad_blend": "plus-lighter" },
+         "right": { "w": 0.186, "h": 0.412, "alpha": 1.0, "culled": false, "cutout_op": "DstOut", "pad_blend": "plus-lighter" }
+       },
+       "ornaments": { "busy_dots": 0, "notify_color": null, "orbit_arcs": 0, "sleep_zs": 0, "shake_deg": 0.0 },
+       "tint_ramp": { "0": [0,0,0,255], "64": [149,43,37,255], "128": [220,68,59,255], "140": [232,72,63,255], "200": [255,98,89,255], "255": [255,127,118,255] },
+       "cluster": { "member_count": 8, "shown_faces": 3, "hidden_count": 5, "plus_pill": "+5", "fallback_glyph": null },
+       "normalized_image": { "mime": "image/webp", "width": 512, "height": 512, "byte_length": 18432, "magic": "RIFF....WEBP", "animated": false, "frame_count": 1, "output_path": "..." }
+     }
+     ```
+
+2. **`openbot theme-eval`** (`OB-F05`)
+   - **Flags**: `[--mode dark|light] [--theme-json <path>] [--themes-dir <path>] [--backdrop <pond|forest|jellyfish|city|sunset|desert|fireflies|snow|snowfall|coast>] [--chat-color <#rrggbb>] [--reduced-motion] [--persist]`
+   - **JSON `data` Schema**:
+     `{ "mode": "dark", "palette_id": "default-dark", "token_count": 52, "tokens": { "--openbot-bg-frame": "#0d0d0d", "--openbot-bg-canvas": "#1a1a1a", "--openbot-bg-sidebar": "#1a1a1a", "--openbot-bg-surface": "#212121", "--openbot-text-primary": "#ffffff", "--openbot-accent": "#007cf7", "--openbot-accent-hover": "#1f8fff", ... }, "chat_background": { "light": "#fceae8", "dark": "#442321" }, "backdrop": { "scene": "pond", "canonical_scene": "pond", "base_hex": "#0f2426", "cell_px": 6, "calm_center_alpha": 0.55, "animated": true, "time_sec": 0.0, "draw_cells": 128 }, "transition": { "kind": "sweep_theme", "duration_ms": 1200 }, "loaded_palettes": [] }`
+
+3. **`openbot agent <action>`** (`OB-F01`, `OB-F02`, `OB-F06`, `OB-F11`)
+   - **Actions & Flags**:
+     - `create | update`: `[--id <id>] --name <1..80> [--title <0..120>] [--description <0..2000>] [--provider <18_ids>] [--model <id>] [--reasoning-effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--access full|workspace] [--computer-use true|false] [--allow-automation true|false] [--fast-mode true|false] [--ultrafast true|false] [--avatar-seed <seed>] [--avatar-hue <hue>] [--avatar-color <#hex>] [--backup-models '<json>'] [--custom-endpoint '<json>'] [--probe-servers '<csv_urls>'] [--command-id <id>]`
+     - `list` | `get --id <id>` | `delete --id <id>`
+     - `duplicate --id <src_id> --operation-id <uuid> [--simulate-concurrent-workspace-mutation]`
+     - `generate-profile --prompt <text> [--provider <id>] [--save] [--operation-id <uuid>] [--language <lang>] [--section-id <id>]`
+     - `export --ids <csv_ids> --out <bundle.openbot>` | `import --archive <bundle.openbot> [--keys all|<csv>]`
+   - **JSON `data` Schema**: `AgentSummary` (`id`, `name`, `title`, `description`, `provider`, `model`, `reasoning_effort`, `access`, `computer_use`, `allow_automation` [default `false` per `DEFAULT_AGENT_DEFAULTS.allowAutomation = false`], `fast_mode`, `ultrafast`, `avatar_seed`, `avatar_hue`, `backup_models: { "automatic": bool, "order": [...] }`, `concurrent_turns`, `workspace_path`, zero `temperature` key), `agents: [...]`, `detected_servers: [...]`; `generate-profile` returns `{"draft": {"name": str, "avatar_seed": str, ...}, "agent": AgentSummary}` (when `--save` is passed); `export` returns `{"exported_count": int}`.
+
+4. **`openbot chat <action>`** (`OB-F02`, `OB-F06`, `OB-F07`, `OB-F15`, `OB-F16`, `OB-F17`)
+   - **Actions & Per-Action CLI Flag Grammar (`17` Actions)**:
+     - `send --agent-id <id> --text <str> [--task-id <openbot-thread-uuid>] [--attachments '<json_le_10>'] [--client-message-id <id>] [--simulate-primary-rate-limit]` (enforces `ATTACHMENT_LIMITS`: `<= 10` attachments/message, `<= 100 MiB` per file, `<= 250 MiB` total bytes -> `validation_error`)
+     - `queue-add --agent-id <id> --text <str> [--attachments '<json>'] [--welcome]`
+     - `queue-list --agent-id <id>`
+     - `queue-steer --agent-id <id> --delivery-id <id> --expected-turn-id <id> [--routine-turn]` (when `--routine-turn` or active turn `sender.kind == "routine"`, refuses steering via `CliError::Forbidden`/`Validation` or structured `{"accepted": false, "steered": false, "steer_refused": true, "reason": "routine-turn"}`)
+     - `queue-reorder --agent-id <id> --delivery-ids <csv_delivery_ids>`
+     - `queue-pause --agent-id <id>` | `queue-resume --agent-id <id>`
+     - `branch --agent-id <id> --message-id <id> --request-id <id> [--task-id <src_task_id>] [--simulate-source-busy]`
+     - `side-question --agent-id <id> --question <str> [--earlier '<json_turns_le_20>']`
+     - `react --agent-id <id> [--task-id <id>] [--channel-id <id>] --message-id <id> --emoji <emoji> [--actor user|agent] [--remove]` (rejects `--channel-id` with `validation_error` / `"not-supported-in-channel"` — channel timelines forbid 1:1 message reactions)
+     - `pin --agent-id <id> [--task-id <id>] [--channel-id <id>] --message-id <id> [--pinned-by user|agent] [--unpin]` (enforces `MESSAGE_PINS_LIMIT = 50` per thread, rejects `"system"` / `"streaming"` messages with `"not-found"`, rejects `--channel-id` with `"not-pinnable-chat"`, and enforces **human-pin ownership**: `--pinned-by agent --unpin` on a message pinned by `user` (`person`) refuses with `"pinned-by-person"` [`CliError::Forbidden` exit `4` or structured `{"accepted": false, "code": "pinned-by-person", "pinned": true, "pinned_by_kind": "user"}`], whereas `user` can unpin an agent's pin)
+     - `history --agent-id <id> [--task-id <id>] [--limit <usize>]`
+     - `compact --agent-id <id> [--task-id <id>] [--simulate-usage <used/window>]`
+     - `dm-send --sender <member_id> --recipient <member_id> --client-message-id <id> --text <1..20000>`
+     - `dm-list --member <member_id>`
+     - `mailbox-send --sender-agent-id <id> --recipient-agent-ids <csv_1_to_32> --text <str> [--expects-reply true|false] [--reply-to <msg_id>] [--idempotency-key <id>]`
+     - `interrupt --caller-agent-id <id> --target-agent-id <id> [--reason <str>] [--active-turn-owner caller|user|channel|shared]`
+   - **Canonical JSON `data` Keys**:
+     - `send`: `message_id`, `thread_id`, `turn_id`, `active_provider` (`provider`), `active_model` (`model`), `usage_limit_return` (`{ "provider": "codex", "model": "..." }`), `handoff_prompt` (`"Continue this OpenBot conversation..."`).
+     - `queue-*`: `paused` (`bool`), `active_turn_id` (`turn_id` on `queue-resume`), `steered` (`bool`), `steer_refused` (`bool`), `steer_fallback` (`"provider-unsupported" | "steer-failed" | null`), `delivery_id`, `position` (1-based `int`), `items[]` (`queue[]`: `delivery_id`, `position`, `status`, `text`, `welcome`, `steered`).
+     - `branch` / `side-question` / `history` / `react` / `pin`: `task_id` (`thread_id` `openbot-thread-<uuid>`), `answer` (`<= 32,000` chars), `revision`, `messages[]`, `pinned` (`bool`), `pinned_by_kind` (`"user" | "agent"`), `reactions[]` (`emoji`, `actor`, `count`).
+     - `compact`: `compaction` (or top-level) `{ "status": "completed", "before_tokens": int, "after_tokens": int, "ratio": f64 }`.
+     - `dm-send` / `dm-list`: `message_id`, `thread_id` (`dm-<32hex>`), `threads[]` (`dms[]`: `thread_id`, `peer_member_id`, `unread_count`).
+     - `mailbox-send` / `interrupt`: `message_id`, `deliveries[]`, `expects_reply` (`bool`), `answer_optional` (`bool`), `reply_to_message_id`, `interrupted` (`bool`), `cancelled_queued_count` (`int`).
+
+5. **`openbot channel <action>`** (`OB-F02`, `OB-F08`, `OB-F09`, `OB-F17`)
+   - **Actions & Per-Action CLI Flag Grammar (`16` Actions)**:
+     - `create --name <1..80> [--title <0..120>] [--instructions <0..2000>] [--members <csv_agent_ids_1_to_100>] [--lead <agent_id>] [--isolated true|false] [--browser '<json>'] [--icon '<json>'] [--folders '<json>']` (`--icon` validates against the `20` `ChannelIconName`s `megaphone, chart, lifebuoy, search, briefcase, code, globe, mail, calendar, gift, palette, brain, book, sparkles, star, zap, shield, store, workflow, card` and `10` `AvatarHue`s, default hue `215`)
+     - `list [--rank-mentions --channel-id <id> --query <q>]`
+     - `get --channel-id <id>`
+     - `update --channel-id <id> [--name <str>] [--title <str>] [--instructions <str>] [--members <csv_agent_ids>] [--lead <agent_id_or_empty>] [--isolated true|false] [--browser '<json>'] [--icon '<json>'] [--folders '<json>']`
+     - `archive --channel-id <id>` | `restore --channel-id <id>` | `delete --channel-id <id>` (while `archived == true`, `post`, `assign`, `transfer`, `reply`, `continue`, and `reassign` are strictly `read_only` and fail with `"archived"` / `"read_only"` until `restore`)
+     - `post --channel-id <id> --text <str> [--reply-to <msg_id>] [--recipient-agent-id <id>] [--origin-routine <id>] [--router-mock <json_or_raw>] [--hold-running] [--resources-map '<json_agent_to_resources>'] [--simulate-stale-routing-state]`
+     - `assign --channel-id <id> --caller-task-id <id> --agent-id <caller_agent_id> --recipient-agent-id <target_agent_id> --task <instruction> [--expected-result <str>] --source-message-ids <csv_msg_ids> [--dependencies <csv_task_ids>] [--resources '<json_or_csv>']`
+     - `transfer --channel-id <id> --task-id <id> --agent-id <caller_agent_id> --recipient-agent-id <target_agent_id> --task <instruction> [--expected-result <str>] --source-message-ids <csv_msg_ids> [--dependencies <csv_task_ids>] [--resources '<json_or_csv>']`
+     - `reply --channel-id <id> --task-id <caller_task_id> --agent-id <caller_agent_id> --message-id <target_agent_msg_id> --text <1..2000> [--simulate-peer-failure]`
+     - `result --channel-id <id> --task-id <id> --agent-id <owner_agent_id> --text <str>`
+     - `cancel --channel-id <id> --task-id <id> [--caller-agent-id <id>] [--caller-task-id <id>] [--origin-routine <id>]`
+     - `continue --channel-id <id> --task-id <id> [--recipient-agent-id <id>]`
+     - `reassign --channel-id <id> --task-id <id> --recipient-agent-id <member_agent_id>` (rejects non-member `recipient-agent-id` and excludes current `owner_agent_id` from candidate set)
+     - `history-packet --channel-id <id> --task-id <id> --agent-id <id> [--second-turn] [--simulate-large-transcript]`
+   - **Canonical JSON `data` Keys**:
+     - `create` / `update` / `archive` / `restore` / `get`: `Channel` (direct or `{"channel": Channel}` via `unwrap_entity`: `id`, `name`, `title`, `instructions`, `members[]`, `lead_agent_id`, `isolated`, `browser`, `icon`, `archived`, `revision`), plus `tasks[]` and `messages[]` (`id`, `sequence`, `author`, `text`, `superseded`, `item_type`, `reply_to_message_id`) on `get`, and `ranked_members[]` (`agent_id`/`id`, `name`, `rank` `0..6`) on `list --rank-mentions`.
+     - `post`: `message_id`, `router_invocations` (`int`), `repumped` (`bool`), `tasks[]` (`id`, `root_task_id`, `parent_task_id`, `owner_agent_id`, `request_message_id`, `state`, `assignment_count`, `revision`, `dependencies[]`, `resources[]`, `is_reply_task`, `error`, `waits[]` with `reason: "channel-full" | "resource-busy" | "agent-busy"`).
+     - `assign` / `transfer` / `continue` / `reassign` / `cancel`: `child_task_id` (`task.id` on `assign`), `parent_state` (`"waiting"` on `assign`), `ChannelTask` (direct or `{"task": ChannelTask}`: `id`, `owner_agent_id`, `state`, `assignment_count`, `revision`, `error`).
+     - `reply`: `reply_message_id` (`channel-reply-<uuid>`), `reply_task_id` (`task.id`), `is_reply_task` (`true`), `caller_resumed` (`bool`).
+     - `result`: `message_id` (`id`), `text` (leading `<OwnName>:` / `**<OwnName> report:**` stripped), `released_parent_state` (`"queued" | null`).
+     - `history-packet`: `packet` (direct or `{"packet": ...}`: `kind` `"full" | "delta"`, `text`, `through_sequence`, `summary_chars` `<= 12,000`, `hidden_sibling_ids[]`).
+
+#### 11.3.3 Public Subcommand Grammar & Canonical JSON Schemas (Entry Points 6–9: `tools`, `platform`, `serve`, `ui-probe`)
+
+6. **`openbot tools <action>`** (`OB-F02`, `OB-F08`, `OB-F10`, `OB-F11`)
+   - **Actions & Flags**:
+     - `list [--provider <id>] [--channel-turn]` | `search --query <q> [--limit <1..10>]` | `describe --names <csv_qualified_names>`
+     - `call --agent-id <id> --name <qualified_name> [--arguments '<json>' | --raw-arguments '<possibly_unescaped_json>'] [--tab-id <id>]` (supports all ~121+ tools including `openbot.channel_remember` `{"channelId": "<id>", "text": "<1..500>"}`, `openbot.routine_no_update`, `openbot.update_profile` [refusing privilege self-widening of `access`/`computerUse`], `openbot.tool_search` [refusing recursive meta-tool calls], and `openbot_browser.{screenshot,evaluate,recording_start}` [blocked on tabs with filled payment cards until navigation])
+     - `memory-put --agent-id <id> --text <1..500> [--inclusion essential|searchable] [--essential true|false] [--site <url>] [--user-controlled]`
+     - `memory-search --agent-id <id> [--query <1..256>] [--host <hostname>] [--limit <1..10>]`
+     - `agent-data-exec --agent-id <id> --mode read|write --sql <stmt> [--params '<json_array>']`
+     - `skill-save --agent-id <id> --slug <id> --name <str> --description <0..1024> --instructions <markdown>`
+     - `mcp-register --name <1..80> --transport stdio|http [--command <bin> --args '<json>'] [--url <https_url> --headers '<json>']`
+     - `browser-run --agent-id <id> [--tab-id <id>] --url <url> --steps '<json_array_le_200>' [--timeout-ms <1000..120000>]`
+     - `vault-secret --agent-id <id> --tab-id <id> --method password|otp|authenticator [--login-id <id>] [--digits <0..12>] --submission click|enter|on_input [--submit-target '<json>']`
+     - `fill-card --agent-id <id> --tab-id <id> --card-id <id> [--expiry <mm/yy>] [--exp-month <mm> --exp-year <yy>] [--approve]`
+     - `link-payment --agent-id <id> --amount <1..100000000> [--currency <ISO3>] --merchant-name <1..200> --merchant-url <https_url> --context <100..2000_chars> [--approve]`
+     - `takeover --agent-id <id> --tab-id <id> [--reason <str>]`
+   - **JSON `data` Schema**:
+     `direct_openbot_count` (`21`), `direct_browser_count` (`3`), `catalog_total` (`>= 121`, full `160`), `tools[]`, `repaired_json` (`bool`), `memories[]`, `site_memories[]`, `budget_bytes` (`4096` / `8192`), `essential_bytes`, `has_more`, `rows[]`, `changes`, `owner_agent_id`, `assigned_skill_count` (`<= 32`), `mcp_server` (`id`, `transport`), `tab_id`, `snapshot`, `secret_document` (`true`, zero plaintext secret), `filled_card` (`bool`), `screenshots_blocked` (`bool`), `card_id`, `takeover_active` (`bool`).
+
+7. **`openbot platform <action>`** (`OB-F11`, `OB-F12`, `OB-F13`, `OB-F18`)
+   - **Actions & Flags**:
+     - `workflow-save (--spec '<json_or_@path>' | --spec-file <path>) [--workflow-id <id>] [--base-revision <u64>] [--allow-loops]` (`--spec-file <path>` / `@<path>` reads raw JSON from disk to avoid Linux `execve` `MAX_ARG_STRLEN = 128 KiB` limits on `> 1 MiB` boundary payloads; top-level JSON accepts `{"title": str, "nodes": list[WorkflowNode], "edges": list[WorkflowEdge], "strokes"?: list[WorkflowStroke]}` or `{"title": str, "graph": WorkflowGraph}` / `WorkflowDefinition`, where each `WorkflowNode` carries `at: {"x": f64, "y": f64}` & `WORKFLOW_NODE_REGISTRY` `fields` [`<= 20,000` chars/field]):
+       - **Exact 12 `WorkflowNodeKind`s (`packages/contracts/src/ipc-workflows.ts:L11-L25`, `openbot_contracts::workflows`)**: `9` executable step kinds (`trigger`, `prompt`, `asset`, `llm`, `agent`, `image`, `condition`, `approval`, `output`) + `3` canvas annotation kinds (`text`, `note`, `shape` — zero ports).
+       - Enforces `<= 200` nodes, `<= 400` edges, `<= 500` strokes (`<= 2,000` points/stroke), `<= 1,048,576`-byte JSON, typed ports (`text|image|file`), rejects self-edges (`from == to`), `annotation` edges touching `text|note|shape`, `port` mismatches, `condition` edges missing `branch: "yes"|"no"` (`condition-branch`), non-`condition` `branch` (`branch`), `duplicate` edges, and cyclic step graphs (`!workflow_loop_edges().is_empty()`) unless `--allow-loops` is passed.
+     - `workflow-run --workflow-id <id> [--run-id <id>] [--trigger-payload '<json>'] [--condition-mock '<json_node_to_yes_no>'] [--approve-node <node_id> | --reject-node <node_id>]`
+     - `routine-save --agent-id <id> [--channel-id <id>] --name <1..80> [--instruction <str>] --schedule '<json_or_expr>' [--timezone <iana_tz>] [--quiet-policy no_update|always] [--webhook-secret <secret>] [--event-type <type>] [--filters '<json_rfc6901>']` (enforces `>= 180s` / `3m` minimum cadence across `interval`, `advanced` wraparound, and strict 5-field decimal `custom` cron; future `once` `YYYY-MM-DD` `HH:MM` auto-pauses after 1 run; `webhook` schedule; `<= 64` routines/agent)
+     - `routine-run --routine-id <id> [--source scheduled|script|webhook|test] [--quiet-no-update] [--report-text <str>] [--await-events '<json_le_20>']` (enforces `INPUT_LIMITS.agentWaits = 20` open `await_event` waits per agent)
+     - `webhook-post --routine-id <id> --payload '<raw_json>' --signature <sha256=hex_or_v1,b64_or_hex> [--timestamp <unix_sec>] [--delivery-id <id>] [--event-type <type>]` (verifies `sha256=<hex>` over `"{timestamp}.{deliveryId}.{payload}"`, Standard Webhooks `v1,<b64>`, and bare `<hex>` over raw `payload` when `--delivery-id` is omitted; enforces `<= 300s` clock skew, `<= 65,536`-byte body, valid `deliveryId`, and RFC-6901 `filters`)
+     - `crm-sync --source stripe [--api-key <rk_test_or_sk_...>] [--fixture '<json>'] [--private-fields '<csv_17_fields>'] [--for-agent-id <id>]` (rejects raw Stripe secret keys `sk_*` with `sourceSecretKey`; marks synced rows `sourceOwned`)
+     - `crm-propose --agent-id <id> [--operation <10_crm_proposed_kinds> --payload '<json>' --reason <str>] [--proposal-id <id>] [--approve | --reject | --commit-unapproved] [--direct-change '<json_crm_change>']` (`--operation <kind> --payload <json>` maps `customer-create` -> `CrmCustomerInput` [`name`, `currency`, `statusId`], `payment-create` -> `CrmPaymentInput` [`customerId`, `label`, `amountMinor`, `dueOn`], and `payment-split` -> `{"paymentId", "parts": [{"amountMinor", "dueOn"}]}`; `--direct-change` parses `CrmChange`; blocks `--commit-unapproved`, `sourceOwned` mutations, `builtinStatus` `'lead'|'customer'|'former'` delete/rename, `amountMinor` outside `0..=10^12`, invalid ISO-4217 currency, `payment-split` `splitTotal` mismatch, and `> 50` pending proposals per agent)
+     - `site-publish --agent-id <id> --slug <slug> [--site-id <id>] [--replace] [--title <1..120>] [--description <1..500>] [--source-dir <path> | --files '<json>'] [--spa-fallback]` (enforces `<= 20` files, `<= 2,097,152` total bytes, `<= 1,048,576` file bytes, `30`-day expiry, and rejects `hidden` [`.git`, `.DS_Store`], `unsafe` [`.env`, `node_modules`, `server`, `api`], `secret` [`credentials`, `private_key`, `secret`, `worker.js`], `archive` [`*.map`, `*.zip`, `*.tar`, `*.gz`], and `..` path traversal)
+     - `site-delete --slug <slug> [--site-id <id>] [--agent-id <id>]`
+     - `marketplace-search [--tab apps|agents|skills] [--query <q>] [--source verified|public] [--reduced-motion] [--alpha-unsupported]`
+     - `html-render [--mode preview|page|backdrop] [--html '<markup_or_@path>' | --html-file <path>] [--title <1..200>] [--width <240..1600>] [--height <80..2000>] [--appearance dark|light] [--backdrop <scene>] [--bubbles '<json>'] [--rpc-message '<jsonrpc>'] [--generate-media image|video] [--media-model <id>] [--media-prompt <str>] [--media-cost <credits_int>] [--wallet-balance <credits_int>] [--approval-threshold <credits_int>] [--agents-credits-allowed true|false] [--approve-media | --decline-media]` (`--html-file <path>` / `@<path>` reads markup from disk for `> 128 KiB` Linux `MAX_ARG_STRLEN` payloads; `openbotPage` RPC refuses non-`http(s):` `ui/open-link` URLs and `> 2,000`-char `ui/update-model-context`; credit media requires human approval above `approval_threshold = 50`)
+     - `voice-eval --mode stt|tts|live|server-config [--stt-provider <8_ids>] [--tts-provider <7_ids>] [--tts-voice <id>] [--tts-text <str>] [--tts-speed <f64>] [--cycle-speed] [--locale <bcp47>] [--audio-rate-hz <u32>] [--audio-seconds <u32>] [--audio-bytes <usize>] [--live-voice <25_ids>] [--turn-pause-ms <u32>] [--sdp <str>] [--agent-id <id>] [--channel-id <id>] [--voice-server-json '<json>']` (`16,000 Hz` mono `<= 600s` / `<= 19,200,044` B STT; `<= 1,000`-char TTS, speeds `[0.75, 1.0, 1.25, 1.5, 2.0]`; `<= 65,536`-byte SDP & pauses `[1500, 2000, 3000, 5000]` ms Live Voice; `--voice-server-json` parses `VoiceServerSettings` [`address`, `hasApiKey`, `routes`] and strictly rejects `"apiKey"` on read)
+     - `bridge-sync --platform slack|discord|telegram|whatsapp --direction inbound|outbound [--agent-id <id>] [--workspace-id <id>] --payload '<json>' [--allowed-roles '<json_le_50>'] [--allowed-senders '<json_le_200>'] [--own-number true|false]`
+   - **Canonical JSON `data` Keys**:
+     - `workflow`: `id`, `revision`, `node_count`, `step_count` (`9` non-annotation steps), `edge_count`, `loop_edges[]`, `run_id`, `status` (`"completed"|"awaiting_approval"|"approval"|"stopped"|"failed"`), `steps[]` (`node_id`, `kind`, `status`, `branch`, `output`), `outputs`.
+     - `routine` & `webhook`: `id`, `run_id`, `interval_seconds` (`>= 180`), `next_run_at`, `active` (`bool`), `status` (`"completed"|"quiet_suppressed"`), `notified` (`bool`), `quiet_item_type` (`"routine_quiet_answer"|null`), `open_waits_count` (`<= 20`), `waits[]`, `webhook_verified` (`bool`), `matched_filters` (`bool`).
+     - `crm`: `tables_count` (`13`), `builtin_statuses` (`["lead","customer","former"]`), `synced_customers`, `synced_plans`, `synced_payments`, `proposal_id`, `status` (`"pending_approval"|"pending"|"committed"|"rejected"`), `approval_required` (`true`), `committed_id`, `agent_view` (`customers[]`, `redacted_fields[]`).
+     - `site`: `site_id`, `slug`, `url`, `status` (`"active"|"deleted"`), `file_count` (`<= 20`), `total_bytes` (`<= 2097152`), `expires_in_days` (`30`), `expires_at`, `replaced` (`bool`), `deleted` (`bool`).
+     - `marketplace`: `tab`, `tabs` (`["apps","agents","skills"]`), `items[]`, `empty_state` (`bool`), `alpha_fallback` (`"fishing"`), `plush_asset` (`"fishing.webm" | "fishing-still.webp"`).
+     - `html_media`: `mode`, `sandboxed` (`true`), `csp_header` (`"sandbox allow-scripts allow-forms"`), `csp_enforced` (`true`), `openbot_page` (`bool`), `frame_height`, `preview_width`, `bubbles_meta`, `rpc_result` (`type`: `"message"|"context"|"open-link"|"refused"`, `text`, `url`), `backdrop`, `media_kind`, `cost_credits`, `approval_threshold` (`50`), `approval_required` (`bool`), `outcome` (`"generated"|"declined"|"short"|"unavailable"`), `charged_credits`, `remaining_balance`.
+     - `voice`: `stt_providers` (`8`), `stt_models[]`, `selected_stt_model`, `retired` (`bool`), `live_preview` (`bool`), `tts_providers` (`7`), `tts_models[]`, `selected_tts_model`, `next_speed` (`f64`), `voice_agent_id`, `live_voices` (`25`), `selected_live_voice`, `session_id`, `answer_sdp`, `webrtc_ready` (`bool`), `voice_server` (`hasApiKey: bool`, zero `apiKey`).
+     - `bridge`: `platform`, `direction`, `decision` (`"allow"|"save"|"pair"|"ignore"|"refused"`), `mapped_thread_id`, `delivered` (`bool`), `replied` (`bool`), `saved_history_only` (`bool`), `pairing_code`.
+
+8. **`openbot serve --data-dir <dir> --bind 127.0.0.1:0 [--team-token <tok>]`** (`OB-F01`, `OB-F11`, `OB-F13`, `OB-F20`)
+   - **Startup Single-Line `stdout` & Automation Files Contract**:
+     - Emits `{"team_api_url":"http://127.0.0.1:<p1>","automation_url":"http://127.0.0.1:<p2>","automation_token":"<0600_secret_token>"}` and atomically writes `<data_dir>/automation/{token,headers,url}` with mode `0600` inside `0700` `<data_dir>/automation`.
+   - **Team API Endpoints (`team_api_url`)**:
+     - `GET /v1/health` -> `200 {"ok": true, "status": "healthy", "schema_version": 69}`
+     - `GET /v1/capabilities` & `GET /v1/compatibility` -> `200 {"api_versions": ["v1",...,"v10"], "protocol": {"minimum": 1, "maximum": 10}, "providers": [18 AgentProviderIds], "capabilities": [<309 (>=220) capability slugs>]}` (honors `OpenBot-Protocol-Version: 1..10`, emits `v10` `OpenBot-Capabilities` + `OpenBot-Absent-Capabilities` delta headers, and rejects unsupported protocol versions `0`/`99` with `400`/`426`)
+     - `GET /v1/agents` & `POST /v1/agents` -> `200 / 201` (`400`/`422` on malformed JSON or blank name; `401` when `--team-token` is set and `Authorization: Bearer <tok>` is missing/invalid)
+     - `GET /v1/channels` & `POST /v1/channels` -> `200 / 201` (`400`/`422` on `> 100` members)
+     - `GET /v1/events` (`Accept: text/event-stream`) -> `200` `text/event-stream` emitting `event: ready|agent.created|channel.created|channel.updated|message.posted\ndata: {...}\n\n`
+   - **Loopback Automation Server (`automation_url`, `0600` token file)**:
+     - `GET /v1/agents` (`200`) and `POST /run` (plus `/v1/agents/{agent_id}/routines/{routine_id}/run` -> `200`/`202 {"run_id": "...", "delivery_id": "..."}`)
+     - **Exact Guard Order**: (1) `Host != "127.0.0.1:<p2>"` OR any `Origin` header present -> `403 Forbidden`; (2) missing or mismatched `Authorization: Bearer <token>` -> `401 Unauthorized`; (3) missing agent -> `404`, or `agent.allow_automation == false` -> `403 Forbidden`; (4) `payload.len() > 4,000` chars or body `> 32 KiB` -> `413 Payload Too Large`; (5) `> 30` runs within `3600s` rolling window per agent -> `429 Too Many Requests` (`{"error": "rate_limit_exceeded", "limit_per_hour": 30}`).
+
+9. **`openbot ui-probe --scenario <name_or_json> --data-dir <dir> --json`** (`OB-F03`..`OB-F05`, `OB-F14`..`OB-F20`)
+   - **Invocation Semantics**: `--scenario <name>` runs the canonical default probe for `<name>`; `--scenario '{"scenario":"<name>", ...params}'` supplies deterministic input/mutation parameters (`conversation-virtualized` `ui_block_response` parses `UiBlockResponse` `{"actionId": "...", "values"?: {...}, "text"?: "..."}`; `composer-queue-sidepanel` `attachments` accepts `AttachmentSummary` or `{"name", "size"|"bytes", "kind"}`; `desktop-os-surfaces` `island_current`/`island_next` accept full `DynamicIslandPresentation` or compact `{"mode", "serverId", "requestId"?}` probe descriptors; `island_preference` parses `DynamicIslandPreference`). Malformed JSON syntax, unknown scenario names, or out-of-bounds domain parameters return `CliError::Validation` (`"validation_error"`, exit `2`) or `CliError::Forbidden` (`"forbidden"`, exit `4`) with zero Rust panics.
+   - **Per-Scenario Input & Output Schema Matrix**:
+
+     | Scenario (`scenario`) | Supported JSON Input Keys (`params`) | Canonical JSON `data` Output Fields |
+     |---|---|---|
+     | `openbot-shell` | `platform` (`"linux"\|"darwin"\|"win32"`), `window_width_px`, `server_view` (`"rail"\|"menu"`), `drag_sidebar_px`, `toggle_cmd_b`, `pin_pages`, `hide_items`, `sidebar_layout`, `sidebar_pins`, `search_caret_x`, `searching`, `setup_suggestion_id`, `setup_purpose`, `reduced_motion` | `openbot_shell` (or top-level): `page_rail_count` (`11`), `page_rail_pages` (`11` ids), `pinnable_pages` (`7` ids), `pinned_pages`, `hideable_items` (`["credits","marketplace","help"]`), `hidden_items`, `usage_ring_spec` (`{"size_px":34,"stroke_px":2.25,"spacing_px":4.5}`), `server_rail_px` (`56\|64\|72\|0`), `hidden_server_preview_limit` (`4`), `beam_duration_ms` (`1400\|0`), `sidebar_width_px` (`[128,400]`), `sidebar_compact` (`bool`), `sidebar_compact_px` (`88`), `sidebar_closed` (`bool`), `sidebar_effective_px` (`0\|88\|128..400`), `sidebar_clamp_px` (`[128,400]`), `sidebar_group_order` (`["pinned","waiting","unread","sections","hidden"]`), `folder_levels_max` (`3`), `resolved_folder_depths`, `global_search_plush` (`{"gaze_x":float,"gaze_y":float,"idle_ms":500,"look_px":4,"animated":bool}`), `first_agent_setup` (`{"face_count":12,"eye_scale":1.25,"color_choices":17,"suggestions_count":6,"matched_suggestion":str\|null}`), `agent_settings_min_px` (`360`), `persisted_files`. |
+     | `conversation-virtualized` | `message_text`, `message_length`, `streaming`, `expand_message`, `inject_corrupt_row`, `voice_speed`, `cycle_voice_speed`, `steps`, `trace_spans`, `subagents`, `ui_block_spec`, `ui_block_response`, `hold_duration_ms`, `reduced_motion` | `conversation` (or top-level): `stream_timings_ms` (`{"step_ms":40,"fade_ms":300,"catch_up_ms":400}`), `collapsed` (`bool`), `preview_length` (`<= 3000`), `preview_surrogate_valid` (`bool`), `show_more_available` (`bool`), `row_boundary_isolated` (`bool`), `sibling_rows_rendered` (`int`), `rich_renderers` (`["markdown","katex","mermaid","data_table","comparison_table","code_block","lightbox","voice_player"]`), `voice_player` (`{"bar_count":40,"seek_step_sec":0.5,"speeds":[0.75,1.0,1.25,1.5,2.0],"next_speed":float}`), `agent_steps` (`{"max_height_px":220,"summary":str,"strikethrough_count":int,"failed_error_expandable":bool}`), `trace_waterfall` (`{"span_kinds":["model","tool","waiting","handoff"],"speed_levels":["1","2","5","10"],"span_count":int}`), `subagent_dock` (`{"in_ms":340,"out_ms":260,"running":int,"finished":int}`), `ui_block` (`{"valid":bool,"type":str,"hold_accepted":bool,"secret_redacted_in_storage":bool,"vault_masked_fields":list[str]}`). |
+     | `composer-queue-sidepanel` | `trigger` (`"@"`\|`"$"`), `query`, `in_channel`, `skills`, `mcp_servers`, `paste_length`, `attachments`, `custom_pi_text_only`, `allow_images_click`, `active_turn_routine`, `press_tab_steer`, `voice_pill`, `side_panel_panes`, `side_splits`, `split_share`, `split_height_px`, `maximize_side_panel` | `composer_probe` (or top-level): `at_sections` (`["agents","files","tabs","threads","messages"]`), `everyone_shown` (`bool`), `messages_debounce_ms` (`150`), `messages_min_query` (`3`), `dollar_items`, `skill_problems`, `pasted_as_file` (`bool`), `pasted_file_name` (`"pasted-text.txt"\|null`), `inline_text_length` (`int`), `image_model_warning` (`bool`), `image_inputs_enabled` (`bool`), `queue_panel` (`{"can_steer":bool,"steer_refused":bool,"steered_on_tab":bool}`), `voice_pill` (`{"phase":str,"talk_mode":str,"bars":12,"live":bool}`), `side_panel` (`{"default_width_px":360,"available_panes":["browser","files","threads","settings","question","subagent"],"active_splits":list[str],"max_splits":2,"split_min_px":120,"main_group_min_px":160,"maximized":bool}`). |
+     | `channel-conversation-recovery` | `channel_id`, `members_count`, `lead_agent_id`, `icon`, `image_url`, `simulate_broken_image`, `routing_events`, `working_ids`, `leaving_ids`, `stopped_tasks`, `archived`, `attempt_member_drag_reorder` | `channel_ui` (or top-level): `lead_crown_agent_id`, `member_drag_reorder_supported` (`false`), `icon_catalog_count` (`20`), `resolved_icon`, `header_row_faces` (`<= 3`), `cluster_faces`, `cluster_plus_pill`, `image_fallback_active` (`bool`), `merged_routing_rows` (`[{"action":str,"agent_ids":list[str]}]`), `activity_indicator` (`{"overlap_px":-8,"active_faces":int,"leaving_faces":int}`), `awaiting_replies_shown` (`bool`), `stopped_tasks_banner` (`{"shown":bool,"actions":["Continue","Reassign","Cancel"],"reassign_candidates":list[str]}`), `read_only` (`bool`), `reactions_enabled` (`false`), `pins_enabled` (`false`). |
+     | `workflow-canvas-pages` | `workflow_graph`, `tidy_layout`, `export_workflow`, `import_workflow`, `calendar_view` (`"month"\|"week"\|"day"`), `calendar_date`, `timezone`, `agent_tasks_count`, `marketplace_tab`, `marketplace_query`, `video_alpha_pixel`, `reduced_motion`, `settings_tab`, `chat_window`, `shortcut_overrides`, `platform` | `pages_probe` (or top-level): `workflow_canvas` (`{"node_kinds":list[str] (12),"step_kinds_count":9,"annotation_kinds":["text","note","shape"],"loop_edges":list[str],"minimap":true,"hud":true,"tidy_applied":bool,"exported_format":"openbot.workflow","exported_version":1}`), `routine_calendar` (`{"window_days":44,"view":str,"visible_days":int,"day_cell_limit":int,"upcoming_limit":6}`), `tasks_panel` (`{"max_per_agent":50,"count":int}`), `library_panel` (`{"views":["mosaic","list"],"marquee_selection":true}`), `marketplace` (`{"tabs":["agents","skills","apps"],"no_match_asset":"fishing.webm"\|"fishing-still.webp"}`), `crm_page` (`{"tables_count":13}`), `app_settings_tabs` (`14` on main, `12` on `chat_window`), `resolved_settings_tab`, `server_settings_sections` (`18`), `shortcuts` (`{"configurable_count":11,"fixed_count":4,"resolved":dict}`). |
+     | `desktop-os-surfaces` | `main_width_px`, `working_agents_count`, `attempt_close_main`, `chat_window_agent_id`, `chat_window_width_px`, `delete_chat_window_agent`, `island_current`, `island_next`, `island_interacting`, `island_typing`, `island_preference`, `island_inline_reply`, `dock_seats_count`, `dock_idle_ms`, `dock_popover_open`, `browser_dock_island`, `browser_dock_elapsed_ms`, `cua_active`, `cua_idle_ms`, `crash_timestamps_ms`, `recovery_request_url` | `os_surfaces` (or top-level): `surfaces` (`["Main","ChatWindow","DynamicIsland","AgentDock","BrowserDock","CUA","Recovery"]`), `main_window` (`{"min_width_px":960,"min_height_px":640,"bg_hex":"#0b0d0e","auto_zoomed":bool,"close_guard_prompted":bool,"close_guard_buttons":["Keep Running","Quit","Cancel"]}`), `chat_window` (`{"min_width_px":380,"rails_hidden":true,"sidebar_hidden":true,"auto_closed":bool}`), `dynamic_island` (`{"width_px":192,"height_px":32,"compact_height_px":int,"mode":str,"priority":int,"critical_lock":bool,"locked":bool,"queued_mode":str\|null,"spring_open":[0.5,0.8],"spring_close":[0.45,1.0]}`), `agent_dock` (`{"max_seats":24,"tuck_delay_ms":900,"strip_px":4,"tucked":bool}`), `browser_dock` (`{"reply_close_ms":6000,"open":bool,"needs_answer":bool}`), `cua` (`{"poll_ms":33,"corner_radius_px":12,"idle_timeout_ms":60000,"visible":bool,"cursor_active":bool}`), `recovery` (`{"triggered":bool,"plush_character":"cloe","actions":["retry","previous-version","latest-version","export-diagnostics","open-data-folder","quit"],"external_url_blocked":bool}`). |
+     | `workspace-routing` / `workspace-switch-theme-isolation` / `telegram-bidirectional-fusion` | `switch_sequence`, `shortcut` (`"Cmd+0"\|"Cmd+Shift+O"\|"Cmd+1".."Cmd+9"`), `avatar_specs`, `sync_agents_to_telegram`, `tdesktop_mode` (`"Night"\|"Tinted"\|"Day"\|"Classic"`) | `active_panel` (`"Chats"\|"OpenBot"`), `nav_destination`, `openbot_shell` (`page_rail_count:11`, `server_rail_px:64`, `sidebar_width_px:280`, `sidebar_clamp_px:[128,400]`, ...), `telegram_baseline` (`{"nav_rail_px":52,"chat_sidebar_px":288,"sidebar_row_px":62,"bubble_min_max_px":[160,430],"inspector_px":320,"composer_min_max_px":[44,192],"shortcuts_preserved":true,"cmd_1_to_9":["Chats","Folders","Calls","TaskCenter","McpTools","TalkMode","SavedMessages","Settings","Browser"],"palette_untouched":true,"tdesktop_cycle":["Night","Tinted","Day","Classic"]}`), `bidirectional` (`{"projected_agent_peers":int,"projected_channel_peers":int,"mention_candidates":list[str],"avatar_engines":dict[str,str]}`). |
+     | `crew-pile-physics` / `crew-pile-reduced-motion-and-broken-url` / `theme-hot-reload` / `theme-sweep-reduced-motion` / `avatar-horizon-cull` / `avatar-mid-morph` | Named scenarios (or `{"scenario":"..."}`) | `crew_pile` (`step_hz:240`, `solver_iterations:4`, `body_count:8..64`, `characters`, `breathe_period_sec:3.2`), `crew_pile_reduced` (`max_squash:0.0`, `max_tilt:0.0`, `all_faces_idle:true`, `failed_url_fallback:true`), `hot_reload` (`watcher_triggered:true`, `active_canvas`), `horizon_gaze` (`culled_at_0_02:true`, `alpha_at_0_06:0.5`), `mid_morph` (`snapped_to_rest:false`, `max_pose_jump:<0.05`). |
+
+   - **Canonical `ui-probe` JSON `data` Envelope**:
+     ```json
+     {
+       "scenario": "workspace-routing",
+       "active_panel": "OpenBot",
+       "nav_destination": "OpenBot",
+       "openbot_shell": {
+         "page_rail_count": 11, "server_rail_px": 64, "sidebar_width_px": 280, "sidebar_compact_px": 88,
+         "sidebar_clamp_px": [128, 400], "side_panel_splits": ["browser", "files"],
+         "dynamic_island": { "width_px": 192, "height_px": 32, "critical_lock": true, "locked": true },
+         "agent_dock": { "tuck_delay_ms": 900, "strip_px": 4 },
+         "surfaces": ["Main", "ChatWindow", "DynamicIsland", "AgentDock", "BrowserDock", "CUA", "Recovery"]
+       },
+       "telegram_baseline": {
+         "nav_rail_px": 52, "chat_sidebar_px": 288, "sidebar_row_px": 62, "bubble_min_max_px": [160, 430],
+         "inspector_px": 320, "composer_min_max_px": [44, 192],
+         "shortcuts_preserved": true, "palette_untouched": true,
+         "cmd_1_to_9": ["Chats", "Folders", "Calls", "TaskCenter", "McpTools", "TalkMode", "SavedMessages", "Settings", "Browser"],
+         "tdesktop_cycle": ["Night", "Tinted", "Day", "Classic"]
+       }
+     }
+     ```
+
+---
+
+### 11.4 Python E2E Harness (`tests/e2e_openbot/harness.py`), RAII Isolation & Reference Math Oracles
+
+`tests/e2e_openbot/harness.py` (re-exported by `tests/e2e_openbot/__init__.py`) provides a 100% Python standard-library test harness with unified aliases across `E2E-M1` and `E2E-M2`:
+
+- **RAII Sandbox (`TempOpenBotEnv` / `OpenBotE2EEnv`)**:
+  - Allocates `tempfile.TemporaryDirectory(prefix="openbot_e2e_")` containing isolated `data/` (`0o700`), `OpenBot/` (`Agents/`, `Shared/Data/`, `Downloads/`), and `config/OpenBot/themes/`.
+  - Exposes `run_cli`, `run_cli_json`, `run_cli_raw`, `run_cli_expect_error` (requires `returncode != 0` and rejects `clap`/CLI parser usage errors unless `allow_cli_parse_error=True`), `run_cli_expect_rejection` (supports `returncode != 0` or structured tool refusal `accepted == False` / `ok == False` / `state == "paused"` when `allow_soft_refusal=True`, while also rejecting CLI parser errors unless `allow_cli_parse_error=True`), `start_server`, `open_sqlite`, `query_sqlite`, and `write_fixture`.
+  - `__exit__` terminates every `OpenBotServerSession` (`LiveServerHandle`) via `os.killpg(pgid, SIGTERM -> SIGKILL)`, closes tracked `sqlite3.Connection` handles, and deletes the temporary root.
+- **Live Server & SSE (`OpenBotServerSession` / `LiveServerHandle` & `SseStreamClient`)**:
+  - Spawns `openbot serve --data-dir <dir> --bind 127.0.0.1:0` in a dedicated process group (`start_new_session=True`), parses startup JSON, waits for `GET /v1/health == 200`, and exposes `http_team`, `http_automation` (supporting negative `token`, `include_origin`, and `custom_host` probes), `automation_run`, and incremental `open_sse("/v1/events")`.
+- **Defensive Envelope & Casing Helpers**:
+  - `unwrap_payload`, `unwrap_entity` (extracts nested `{"agent"|"channel"|"task"|"packet": ...}` dicts if wrapped, else falls back cleanly to unwrapped `data`), `pick`, `require_field`, `extract_list`, and `extract_error_info` transparently handle `ok_envelope` vs direct JSON and `snake_case` vs `camelCase` field names while enforcing strict concrete value & type assertions.
+- **Closed-Form Reference Math & Crypto Oracles**:
+  - `fnv1a_32_utf16` & `stable_index` (`0x811c9dc5`, prime `0x01000193` over UTF-16 code units).
+  - `resolve_bloub_avatar_profile_oracle` (`coerce_empty_to_openbot = False` so `""` resolves raw `""` -> `(plush, capsule, excite, #e8483f)`; `% 11` silhouette lookup with index-`7` `"goutte"` replacement via `${seed}:shape:replacement` `% 10`, 8 `AUTOMATIC_COLORS`, `:flat:<n>` and `:<named>:(face|flat):<n>` overrides).
+  - `nearest_avatar_hue_oracle` (`saturation < 0.15 -> None`, circular hue distance across 10 `AVATAR_HUES`).
+  - `mulberry32_blink_schedule_oracle` (`seed = 24301`, `P[0] = 1.4s`, double-blink at `9.687224s` / `9.927224s`).
+  - `plush_srgb_tint_pixel_oracle` (`GREY = 0.55`, `gamma = 0.6`, `sheen = 0.08`).
+  - `oklab_readable_chat_bg_oracle` (`light: L >= 0.95, C <= 0.02`; `dark: L <= 0.30, C <= 0.05`).
+  - `dm_thread_id_oracle` (`"dm-" + sha256(sorted_a + "\0" + sorted_b)[:32]`) & `webhook_hmac_sha256_oracle`.
+
+---
+
+### 11.5 Suite Runner & 7-Gate AST Self-Audit (`scripts/run_openbot_e2e_suite.py`)
+
+```bash
+# Audit E2E-M1 (OB-F01..OB-F10: 60 T1 + 60 T2 = 120 tests)
+python3 scripts/run_openbot_e2e_suite.py --self-audit --self-audit-features OB-F01..OB-F10
+
+# Audit full 4-Tier suite (OB-F01..OB-F20: >= 100 T1 + >= 100 T2 + >= 20 T3 + >= 10 T4 = >= 230 tests)
+python3 scripts/run_openbot_e2e_suite.py --self-audit
+
+# Execute Tiers 1-4 + Baseline non-regression gate and emit machine-readable JSON report
+python3 scripts/run_openbot_e2e_suite.py --all --json-out target/openbot_e2e_report.json
+```
+
+`--self-audit` enforces **7 mandatory static AST & registry gates** before certification:
+1. **SA-1 (`py_compile` & Dynamic Module Import)**: Compiles `scripts/run_openbot_e2e_suite.py` and `tests/e2e_openbot/*.py` and imports `sorted(glob("tier*.py"))` into `TEST_REGISTRY`.
+2. **SA-2 (`TEST_INFRA.md` Prefix Bit-Exactness)**: Verifies `sha256(TEST_INFRA.md[:152875]) == "daa96e4165085964ccd552ca1d6213166e70d7a5bd43f4d3f37dc573711ce8ff"` and presence of `## 11.`.
+3. **SA-3 (Zero Unregistered or Skipped Tests)**: Rejects any `def test_*` without `@e2e_test(...)` and any `skip` / `xfail` / `SkipTest` construct.
+4. **SA-4 (Zero Trivial Assertions)**: Rejects empty bodies, `assert True` / constant conditions, and reflexive `x == x`; requires `>= 2` concrete assertions/checks per test.
+5. **SA-5 (100% CLI / HTTP Call-Graph Reachability)**: Intra-module AST call-graph analysis (`depth <= 3`) proves every `@e2e_test` invokes at least one real CLI/HTTP boundary method (`run_cli*`, `start_server`, `http_team`, `http_automation`, `automation_run`, `open_sse`).
+6. **SA-6 (100% RAII Temp-Dir Isolation)**: Proves every test uses `TempOpenBotEnv` (`env` arg or `with TempOpenBotEnv`) and zero hardcoded `/tmp/` literals exist outside `harness.py`.
+7. **SA-7 (Quantitative Tier & Per-Feature Thresholds)**: Enforces `>= 5` T1 + `>= 5` T2 per target feature (`>= 100` T1, `>= 100` T2, `>= 20` T3, `>= 10` T4, `>= 230` total in full mode).
+
+`--baseline` acquires `cargo_build.lock` via `fcntl.flock`, stages `dist/GPUI Telegram.app/Contents/MacOS/gpui_telegram_desktop` via `python3 scripts/package_release.py --skip-clean` if missing (`Gate 6.7`), executes `scripts/verify_ledger_closure.py` (`--ci-without-upstream --skip-cargo` when upstream C++ tree is unmounted), runs `gpui_telegram_desktop` baseline Rust test suites, and always executes `python3 scripts/clean_build_garbage.py` in `finally:`. Exit codes: `0` (all passed), `1` (test/audit/baseline failure), `2` (invalid `--filter` regex, usage error, empty filter, or `BinaryNotReadyError`).
+
+---
+
+### 11.6 Complete `OB-F01`..`OB-F20` Feature-to-Tier Traceability Matrix & `TEST_READY.md` Gate
+
+| Feature ID | Feature Name | Impl Milestone | Primary Entry Points | Tier 1 (Happy) | Tier 2 (Boundary/Neg) | Tier 3 & Tier 4 |
+|---|---|---|---|---|---|---|
+| `OB-F01` | Contracts, Schemas & FNV-1a Seed Grammar | M1 | `avatar-eval`, `agent`, `serve` | `>= 5` (`6` in `tier1_f01_f05.py`) | `>= 5` (`6` in `tier2_f01_f05.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F02` | Event-Sourced SQLite `openbot.db` (v69) & `agent-data.db` | M1 | `agent`, `channel`, `tools`, `sqlite3` | `>= 5` (`6` in `tier1_f01_f05.py`) | `>= 5` (`6` in `tier2_f01_f05.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F03` | 2D Parametric `BloubBot` Avatar Engine & Motion | M2 | `avatar-eval`, `ui-probe` | `>= 5` (`6` in `tier1_f01_f05.py`) | `>= 5` (`6` in `tier2_f01_f05.py`) | `tier3_pairwise.py` |
+| `OB-F04` | 3D Felt `PlushBot`, Moods, Clusters, Normalizer & `CrewPile` | M2 | `avatar-eval`, `ui-probe` | `>= 5` (`6` in `tier1_f01_f05.py`) | `>= 5` (`6` in `tier2_f01_f05.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F05` | OpenBot Theme Tokens, Watcher, Shaders & Backdrops | M2 | `theme-eval`, `ui-probe` | `>= 5` (`6` in `tier1_f01_f05.py`) | `>= 5` (`6` in `tier2_f01_f05.py`) | `tier3_pairwise.py` |
+| `OB-F06` | Agent Lifecycle, AI Profile Gen & 18-Provider Harnesses | M3 | `agent`, `chat` | `>= 5` (`6` in `tier1_f06_f10.py`) | `>= 5` (`6` in `tier2_f06_f10.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F07` | `DrainScheduler`, Side Threads, Compaction, `Mailbox` & DMs | M3 | `chat` | `>= 5` (`6` in `tier1_f06_f10.py`) | `>= 5` (`6` in `tier2_f06_f10.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F08` | Group-Chat (`Channel`) Lifecycle, `@mention` & Lead Router | M3 | `channel` | `>= 5` (`6` in `tier1_f06_f10.py`) | `>= 5` (`6` in `tier2_f06_f10.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F09` | Group-Chat Delegation, `channel_reply`, Loop Guards & Contexts | M3 | `channel` | `>= 5` (`6` in `tier1_f06_f10.py`) | `>= 5` (`6` in `tier2_f06_f10.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F10` | Tool Catalog, 3-Tier Memory, Skills, MCP, Browser & Vault | M3 | `tools` | `>= 5` (`6` in `tier1_f06_f10.py`) | `>= 5` (`6` in `tier2_f06_f10.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F11` | Routines, 12-Node Workflows & Loopback Scripts API | M4 | `platform`, `serve` (`/run`) | `>= 5` (`tier1_f11_f15.py`) | `>= 5` (`tier2_f11_f15.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F12` | CRM, Static Sites, Marketplace, HTML Widgets & Credit Media | M4 | `platform` | `>= 5` (`tier1_f11_f15.py`) | `>= 5` (`tier2_f11_f15.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F13` | Voice (STT/TTS/Live), Chat Bridges & `/v1/*` Team API | M4 | `platform`, `serve` (`/v1/*`, SSE) | `>= 5` (`tier1_f11_f15.py`) | `>= 5` (`tier2_f11_f15.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F14` | 1:1 OpenBot Shell, Rails, Reorderable Sidebar & Studio | M5 | `ui-probe` (`openbot-shell`) | `>= 5` (`tier1_f11_f15.py`) | `>= 5` (`tier2_f11_f15.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F15` | Virtualized Conversation, `AgentSteps`, `TraceWaterfall` & `ask_ui` | M5 | `ui-probe`, `chat` | `>= 5` (`tier1_f11_f15.py`) | `>= 5` (`tier2_f11_f15.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F16` | Rich `@`/`$` Composer, Steerable `QueuePanel`, `VoicePill` & `SidePanel` | M5 | `ui-probe`, `chat` | `>= 5` (`tier1_f16_f20.py`) | `>= 5` (`tier2_f16_f20.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F17` | Multi-Bot `ChannelConversation` UI & Loop Recovery | M5 | `ui-probe`, `channel` | `>= 5` (`tier1_f16_f20.py`) | `>= 5` (`tier2_f16_f20.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F18` | `WorkflowCanvas`, `RoutineCalendar`, `Marketplace`, `CRM` & Settings | M5 | `ui-probe`, `platform` | `>= 5` (`tier1_f16_f20.py`) | `>= 5` (`tier2_f16_f20.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F19` | 7 Desktop OS Surfaces (`DynamicIsland`, `AgentDock`, `BrowserDock`, `CUA`) | M5 | `ui-probe` (`desktop-os-surfaces`) | `>= 5` (`tier1_f16_f20.py`) | `>= 5` (`tier2_f16_f20.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+| `OB-F20` | Dual-Surface Fusion, CLI/Headless Probe & Baseline Preservation | M5 | `ui-probe`, `serve`, `--baseline` | `>= 5` (`tier1_f16_f20.py`) | `>= 5` (`tier2_f16_f20.py`) | `tier3_pairwise.py`, `tier4_scenarios.py` |
+
+Upon completion of `E2E-M2`, `TEST_READY.md` registers the complete `>= 230`-test OpenBot 4-Tier inventory alongside all existing GPUI Telegram suites, gating Milestone `M6` Phase 1 (`100%` pass across Tiers 1–4 + `--baseline` + `verify_ledger_closure.py`) before Phase 2 Tier 5 white-box adversarial hardening.

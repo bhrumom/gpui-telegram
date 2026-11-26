@@ -1,12 +1,14 @@
 # TEST_READY CERTIFICATION REPORT
-## GPUI Telegram Desktop 1:1 UI/UX & Live Cloud Backend Alignment
+> **OPENBOT_E2E_SUITE_STATUS**: `READY` — OpenBot 1:1 Pure-Rust + GPUI Fusion 4-Tier Opaque-Box E2E Suite (`276` registered tests across `OB-F01`..`OB-F20`) is complete and published for Milestone `M6` Phase 1 execution (`§ 7.1`–`§ 7.3` below). All baseline GPUI Telegram v1.0.0 certification suites (`166 / 166`) below are preserved bit-for-bit as mandatory regression gates.
 
-- **Target Release**: GPUI Telegram Desktop v1.0.0-RELEASE
-- **Publication Date**: 2026-11-08
-- **Milestone**: Milestone 4: Final Full E2E Automated Verification & Adversarial Coverage Hardening
-- **Target Backend**: Live Telegram Cloud VM `http://34.46.77.133:8080` (Rust Axum 8080) & AI Gateway `http://34.46.77.133:8788`
+## Baseline Section: GPUI Telegram Desktop 1:1 UI/UX & Live Cloud Backend Alignment
+
+- **Target Release**: GPUI Telegram Desktop v1.0.0-RELEASE + OpenBot 1:1 Rust/GPUI Fusion
+- **Publication Date**: 2026-11-08 (Baseline) / 2026-11-25 (OpenBot Fusion In Progress)
+- **Milestone**: Milestone 4 (Baseline Certified) / Milestone 6 (OpenBot E2E Pending)
+- **Target Backend**: Live Telegram Cloud VM `http://34.46.77.133:8080` (Rust Axum 8080) & AI Gateway `http://34.46.77.133:8788` + Local OpenBot `/v1/*` Team API
 - **Presentation Layer**: Headless GPUI 0.2.2 Desktop Client (`crates/gpui_telegram_desktop`)
-- **Status**: **CERTIFIED READY (100.0% PASS — 166 / 166 AUTOMATED TESTS — ZERO DUMMY FACADES — ZERO CONSTANT ASSERTIONS)**
+- **Baseline Status**: **BASELINE CERTIFIED (166 / 166 BASELINE TESTS) — AWAITING OPENBOT TIERS 1–4 COMPLETION**
 - **Governing Specifications**:
   * Authoritative User Request: `/Users/bhrum/Documents/ChatGPT/.agents/teamwork/ORIGINAL_REQUEST.md` (§R1–§R3)
   * Project Architecture & Interface Contracts: `/Users/bhrum/Documents/ChatGPT/PROJECT.md`
@@ -190,3 +192,91 @@ All 15 authoritative features (F1 to F15), 4 architectural panes, live cloud bac
 The software meets all requirements of `ORIGINAL_REQUEST.md`, `PROJECT.md`, `TEST_INFRA.md`, and `AGENTS.md`.
 
 **FINAL VERDICT: CERTIFIED AS TEST_READY FOR PRODUCTION PACKAGING.**
+
+---
+
+# E2E Test Suite Ready — OpenBot 1:1 Pure-Rust + GPUI Fusion (4-Tier Opaque-Box Suite)
+
+> **Honest Suite & Milestone Status**: All **`276`** OpenBot 1:1 Pure-Rust + GPUI Fusion opaque-box E2E tests (`120` Tier 1 + `120` Tier 2 + `24` Tier 3 + `12` Tier 4 across `OB-F01`..`OB-F20`) are authored in `tests/e2e_openbot/tier*.py`, dynamically registered in `TEST_REGISTRY`, and verified `PASS` under the 7-gate static AST & coverage self-audit (`python3 scripts/run_openbot_e2e_suite.py --self-audit`) as well as an isolated contract-compliant mock CLI/HTTP probe harness. Because Implementation Milestones `M1`–`M5` (`crates/openbot_*`, `gpui_telegram_desktop`, and `gpui-telegram-cli openbot`) are concurrently building, **zero live Rust binary runtime timestamps are fabricated here**; full live binary runtime execution (`100%` pass across all `276` OpenBot tests + `166` Baseline tests + `verify_ledger_closure.py`) is the mandatory Milestone `M6` Phase 1 release gate.
+
+---
+
+## 7.1 OpenBot Test Runner Invocations & Exit Code Semantics
+
+All OpenBot E2E invocations execute through `scripts/run_openbot_e2e_suite.py` using 100% Python 3.10+ standard library and isolated `TempOpenBotEnv` (`tempfile.TemporaryDirectory`) RAII sandboxes:
+
+1. **7-Gate Static AST & Registry Self-Audit (`SA-1`..`SA-7`)**:
+   ```bash
+   PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/run_openbot_e2e_suite.py --self-audit
+   ```
+2. **Per-Tier Opaque-Box Suite Execution (`gpui-telegram-cli openbot` + `openbot serve`)**:
+   ```bash
+   # Tier 1: Isolated Happy-Path Feature Coverage (120 tests, 6/feature across OB-F01..OB-F20)
+   python3 scripts/run_openbot_e2e_suite.py --tier 1 -v
+
+   # Tier 2: Boundary, Corner & Negative Refusal Coverage (120 tests, 6/feature across OB-F01..OB-F20)
+   python3 scripts/run_openbot_e2e_suite.py --tier 2 -v
+
+   # Tier 3: Cross-Feature Pairwise Combinations (24 tests, TEST-T3-PAIR-01..24)
+   python3 scripts/run_openbot_e2e_suite.py --tier 3 -v
+
+   # Tier 4: Real-World End-to-End Operational Scenarios (12 scenarios, TEST-T4-SCENARIO-01..12)
+   python3 scripts/run_openbot_e2e_suite.py --tier 4 -v
+
+   # Scoped feature, regex filter, or explicit CLI binary override
+   python3 scripts/run_openbot_e2e_suite.py --feature OB-F08 --tier 1,2,3 -v
+   python3 scripts/run_openbot_e2e_suite.py --filter "TEST-T3-PAIR-04" --bin target/debug/gpui-telegram-cli -v
+   ```
+3. **Preserved GPUI Telegram Baseline Non-Regression Gate (`cargo_build.lock` + `dist/` stage + `verify_ledger_closure.py` + desktop Cargo suites + `clean_build_garbage.py`)**:
+   ```bash
+   python3 scripts/run_openbot_e2e_suite.py --baseline -v
+   ```
+4. **Combined Milestone `M6` Phase 1 Master Gate (Tiers 1–4 + Baseline + Machine-Readable JSON Report)**:
+   ```bash
+   python3 scripts/run_openbot_e2e_suite.py --all --json-out target/openbot_e2e_report.json
+   ```
+5. **Runner Exit Code Contract**:
+   - `0`: All selected gates (`--self-audit`, `--tier 1..4`, and/or `--baseline`) passed with zero failures and zero Rust panics (`returncode != 101`, no `SIGABRT`/`SIGSEGV` or `panicked at`).
+   - `1`: One or more E2E test assertions, AST self-audit gates (`SA-1`..`SA-7`), or baseline ledger/Cargo checks failed.
+   - `2`: Runner usage error, invalid `--filter` regex, empty test selection, or `BinaryNotReadyError` when `gpui-telegram-cli` has not been compiled yet.
+
+---
+
+## 7.2 4-Tier Coverage Summary Table (`276` OpenBot + `166` Baseline = `442` Combined)
+
+| Tier / Gate | Suite Modules / Scripts | Spec Floor | Registered Tests | Feature Scope | AST Self-Audit |
+|---|---|---:|---:|---|---|
+| **Tier 1 — Happy Path** | `tier1_f01_f05.py` (`30`), `tier1_f06_f10.py` (`30`), `tier1_f11_f15.py` (`30`), `tier1_f16_f20.py` (`30`) | `>= 100` (`>= 5`/feat) | **120** (`6`/feat) | `OB-F01`..`OB-F20` | **PASS** |
+| **Tier 2 — Boundary & Negative** | `tier2_f01_f05.py` (`30`), `tier2_f06_f10.py` (`30`), `tier2_f11_f15.py` (`30`), `tier2_f16_f20.py` (`30`) | `>= 100` (`>= 5`/feat) | **120** (`6`/feat) | `OB-F01`..`OB-F20` | **PASS** |
+| **Tier 3 — Pairwise Combinations** | `tier3_pairwise.py` (`TEST-T3-PAIR-01`..`24`) | `>= 20` (`>= 2` feats/test) | **24** (`3..5`/feat) | `OB-F01`..`OB-F20` | **PASS** |
+| **Tier 4 — Real-World Scenarios** | `tier4_scenarios.py` (`TEST-T4-SCENARIO-01`..`12`) | `>= 10` workflows | **12** (`2..6`/feat) | `OB-F01`..`OB-F20` | **PASS** |
+| **OpenBot E2E Subtotal** | `tests/e2e_openbot/tier*.py` | **`>= 230`** | **276** | All `20` OpenBot Features | **PASS (`SA-1`..`SA-7`)** |
+| **Preserved Baseline Gate** | Suites `2.1`–`2.8` + `--baseline` (`verify_ledger_closure.py`) | `166` + `3,441` ledger | **166** | `F1`–`F15` + C++ Shards `01`–`28` | **CERTIFIED** |
+| **Combined Grand Total** | `scripts/run_openbot_e2e_suite.py --all` | `>= 396` | **442** | Dual-Surface Seamless Fusion | **GATE READY** |
+
+---
+
+## 7.3 Complete `OB-F01`..`OB-F20` Feature Traceability Checklist
+
+| Feature ID & Name | Milestone | Tier 1 Happy-Path (`6`) | Tier 2 Boundary/Neg (`6`) | Tier 3 Pairwise IDs (`TEST-T3-*`) | Tier 4 Scenario IDs (`TEST-T4-*`) | Primary Opaque-Box Entry Points |
+|---|:---:|---|---|---|---|---|
+| `OB-F01` Contracts, Schemas & FNV-1a Seed Grammar | M1 | `TEST-T1-OB-F01-01..06` | `TEST-T2-OB-F01-01..06` | `PAIR-01, 09, 20` | `SCENARIO-02, 05, 12` | `avatar-eval`, `agent`, `serve` (`/v1/capabilities`) |
+| `OB-F02` Event-Sourced SQLite `openbot.db` (v69) & `agent-data.db` | M1 | `TEST-T1-OB-F02-01..06` | `TEST-T2-OB-F02-01..06` | `PAIR-02, 10, 15` | `SCENARIO-01, 02, 04, 06, 12` | `agent`, `channel`, `tools agent-data-exec`, `sqlite3` |
+| `OB-F03` 2D Parametric `BloubBot` Avatar Engine & Motion | M2 | `TEST-T1-OB-F03-01..06` | `TEST-T2-OB-F03-01..06` | `PAIR-09, 11, 23` | `SCENARIO-05, 12` | `avatar-eval --style flat`, `ui-probe` (`avatar-*`) |
+| `OB-F04` 3D Felt `PlushBot`, Moods, Clusters, Normalizer & `CrewPile` | M2 | `TEST-T1-OB-F04-01..06` | `TEST-T2-OB-F04-01..06` | `PAIR-01, 11, 24` | `SCENARIO-05, 09, 11` | `avatar-eval --style plush`, `ui-probe` (`crew-pile-*`) |
+| `OB-F05` OpenBot Theme Tokens, Live JSON Watcher, Shaders & Backdrops | M2 | `TEST-T1-OB-F05-01..06` | `TEST-T2-OB-F05-01..06` | `PAIR-06, 09, 16` | `SCENARIO-05, 09` | `theme-eval`, `ui-probe` (`theme-hot-reload`) |
+| `OB-F06` Agent Lifecycle, AI Profile Gen & 18-Provider Harnesses | M3 | `TEST-T1-OB-F06-01..06` | `TEST-T2-OB-F06-01..06` | `PAIR-08, 10, 17` | `SCENARIO-01, 06, 07, 09` | `agent`, `chat send` (`--simulate-primary-rate-limit`) |
+| `OB-F07` `DrainScheduler`, Side Threads, Compaction, `Mailbox` & DMs | M3 | `TEST-T1-OB-F07-01..06` | `TEST-T2-OB-F07-01..06` | `PAIR-08, 12, 14, 22` | `SCENARIO-02, 08` | `chat` (`queue-*`, `branch`, `side-question`, `compact`, `dm-*`, `mailbox-send`) |
+| `OB-F08` Group-Chat (`Channel`) Lifecycle, `@mention` & Lead Router | M3 | `TEST-T1-OB-F08-01..06` | `TEST-T2-OB-F08-01..06` | `PAIR-01, 02, 03, 04, 23` | `SCENARIO-01, 02, 11` | `channel` (`create`, `update`, `list --rank-mentions`, `post`) |
+| `OB-F09` Group-Chat Delegation, `channel_reply`, Loop Guards & Contexts | M3 | `TEST-T1-OB-F09-01..06` | `TEST-T2-OB-F09-01..06` | `PAIR-03, 13, 14` | `SCENARIO-01, 11` | `channel` (`assign`, `transfer`, `reply`, `result`, `reassign`, `history-packet`) |
+| `OB-F10` `~121` Tool Catalog, 3-Tier Memory, Skills, MCP, Browser & Vault | M3 | `TEST-T1-OB-F10-01..06` | `TEST-T2-OB-F10-01..06` | `PAIR-02, 03, 07, 08` | `SCENARIO-01, 03, 04, 06, 07, 12` | `tools` (`call`, `memory-*`, `skill-save`, `mcp-register`, `browser-run`, `vault-secret`, `fill-card`, `link-payment`, `takeover`) |
+| `OB-F11` Routines, 12-Node Workflows & Loopback Local Scripts API | M4 | `TEST-T1-OB-F11-01..06` | `TEST-T2-OB-F11-01..06` | `PAIR-04, 05, 19` | `SCENARIO-03, 10` | `platform` (`workflow-*`, `routine-*`, `webhook-post`), `serve` (`/run`) |
+| `OB-F12` CRM, Static Sites, Marketplace, HTML Widgets & Credit Media | M4 | `TEST-T1-OB-F12-01..06` | `TEST-T2-OB-F12-01..06` | `PAIR-15, 16, 17` | `SCENARIO-04, 06, 07, 09` | `platform` (`crm-*`, `site-*`, `marketplace-search`, `html-render`) |
+| `OB-F13` Voice (STT/TTS/WebRTC Live Voice), Chat Bridges & `/v1/*` Team API | M4 | `TEST-T1-OB-F13-01..06` | `TEST-T2-OB-F13-01..06` | `PAIR-04, 14, 18, 20` | `SCENARIO-02, 05, 09, 10` | `platform` (`voice-eval`, `bridge-sync`), `serve` (`/v1/*`, `/v1/events` SSE) |
+| `OB-F14` 1:1 OpenBot Shell, Rails, Reorderable Sidebar & Agent Studio | M5 | `TEST-T1-OB-F14-01..06` | `TEST-T2-OB-F14-01..06` | `PAIR-06, 10, 21, 22` | `SCENARIO-05, 06` | `ui-probe --scenario openbot-shell` |
+| `OB-F15` Virtualized Conversation, `AgentSteps`, `TraceWaterfall` & `ask_ui` | M5 | `TEST-T1-OB-F15-01..06` | `TEST-T2-OB-F15-01..06` | `PAIR-07, 12, 16, 22` | `SCENARIO-03, 04, 08` | `ui-probe --scenario conversation-virtualized`, `chat` (`react`, `pin`) |
+| `OB-F16` Rich `@`/`$` Composer, Steerable `QueuePanel`, `VoicePill` & `SidePanel` | M5 | `TEST-T1-OB-F16-01..06` | `TEST-T2-OB-F16-01..06` | `PAIR-12, 18, 21, 23` | `SCENARIO-07, 08, 09` | `ui-probe --scenario composer-queue-sidepanel`, `chat queue-*` |
+| `OB-F17` Multi-Bot `ChannelConversation` UI & Loop Recovery | M5 | `TEST-T1-OB-F17-01..06` | `TEST-T2-OB-F17-01..06` | `PAIR-01, 13, 23, 24` | `SCENARIO-01, 11` | `ui-probe --scenario channel-conversation-recovery`, `channel` (`archive`, `restore`, `reassign`) |
+| `OB-F18` `WorkflowCanvas`, `RoutineCalendar`, `Marketplace`, `CRM` & Settings | M5 | `TEST-T1-OB-F18-01..06` | `TEST-T2-OB-F18-01..06` | `PAIR-15, 17, 19, 24` | `SCENARIO-03, 04, 10` | `ui-probe --scenario workflow-canvas-pages` |
+| `OB-F19` 7 Desktop OS Surfaces (`DynamicIsland`, `AgentDock`, `BrowserDock`, `CUA`) | M5 | `TEST-T1-OB-F19-01..06` | `TEST-T2-OB-F19-01..06` | `PAIR-05, 07, 11, 21` | `SCENARIO-03, 07, 12` | `ui-probe --scenario desktop-os-surfaces` |
+| `OB-F20` Dual-Surface Fusion, CLI/Headless Probe & Baseline Preservation | M5 | `TEST-T1-OB-F20-01..06` | `TEST-T2-OB-F20-01..06` | `PAIR-05, 06, 20, 24` | `SCENARIO-02, 05, 10, 12` | `ui-probe` (`workspace-routing`, `telegram-bidirectional-fusion`), `serve`, `--baseline` |
