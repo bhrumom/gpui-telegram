@@ -1409,6 +1409,8 @@ async fn body_feed_controls_algo_tuner_post_interactions_polls_and_signals(mut a
             let st = &cw.read(cx).state;
             !st.bookmark_in_flight.contains_key(&target_pid)
                 && !st.bookmark_dirty.contains(&target_pid)
+                && !st.post_repost_in_flight.contains_key(&target_pid)
+                && !st.post_repost_pending_toggle.contains(&target_pid)
                 && st.find_post(&target_pid).is_some_and(|p| {
                     p.viewer_liked
                         && p.viewer_reposted
@@ -1454,11 +1456,13 @@ async fn body_feed_controls_algo_tuner_post_interactions_polls_and_signals(mut a
     });
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx)
-                .state
-                .find_post(&poll_pid)
-                .and_then(|p| p.poll.as_ref())
-                .is_some_and(|poll| poll.viewer_voted_option_ids.contains(&opt_id))
+            let st = &cw.read(cx).state;
+            !st.poll_vote_in_flight.contains_key(&poll_pid)
+                && !st.poll_vote_dirty.contains(&poll_pid)
+                && st
+                    .find_post(&poll_pid)
+                    .and_then(|p| p.poll.as_ref())
+                    .is_some_and(|poll| poll.viewer_voted_option_ids.contains(&opt_id))
         })
         .await,
         "Poll vote must persist and reconcile"
@@ -2148,24 +2152,39 @@ async fn body_f16_remediation_regressions(mut app: AsyncApp) {
     });
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.find_post(&mp_id).and_then(|p| p.poll.as_ref())
-                .is_some_and(|p| p.viewer_voted_option_ids == vec![opt1.clone()])
+            let st = &cw.read(cx).state;
+            !st.poll_vote_in_flight.contains_key(&mp_id)
+                && !st.poll_vote_dirty.contains(&mp_id)
+                && st
+                    .find_post(&mp_id)
+                    .and_then(|p| p.poll.as_ref())
+                    .is_some_and(|p| p.viewer_voted_option_ids == vec![opt1.clone()])
         }).await,
         "first multi-select option must be recorded"
     );
     let _ = cw.update(&mut app, |w, cx| w.vote_poll(mp_id.clone(), opt2.clone(), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.find_post(&mp_id).and_then(|p| p.poll.as_ref())
-                .is_some_and(|p| p.viewer_voted_option_ids.contains(&opt1) && p.viewer_voted_option_ids.contains(&opt2))
+            let st = &cw.read(cx).state;
+            !st.poll_vote_in_flight.contains_key(&mp_id)
+                && !st.poll_vote_dirty.contains(&mp_id)
+                && st
+                    .find_post(&mp_id)
+                    .and_then(|p| p.poll.as_ref())
+                    .is_some_and(|p| p.viewer_voted_option_ids.contains(&opt1) && p.viewer_voted_option_ids.contains(&opt2))
         }).await,
         "R2-MAJOR-6: second click on multi-select poll must add opt2 while keeping opt1"
     );
     let _ = cw.update(&mut app, |w, cx| w.vote_poll(mp_id.clone(), opt1.clone(), cx));
     assert!(
         pump_until(&mut app, Duration::from_secs(3), |cx| {
-            cw.read(cx).state.find_post(&mp_id).and_then(|p| p.poll.as_ref())
-                .is_some_and(|p| !p.viewer_voted_option_ids.contains(&opt1) && p.viewer_voted_option_ids == vec![opt2.clone()])
+            let st = &cw.read(cx).state;
+            !st.poll_vote_in_flight.contains_key(&mp_id)
+                && !st.poll_vote_dirty.contains(&mp_id)
+                && st
+                    .find_post(&mp_id)
+                    .and_then(|p| p.poll.as_ref())
+                    .is_some_and(|p| !p.viewer_voted_option_ids.contains(&opt1) && p.viewer_voted_option_ids == vec![opt2.clone()])
         }).await,
         "R2-MAJOR-6: re-clicking opt1 on multi-select poll must toggle opt1 off while keeping opt2"
     );

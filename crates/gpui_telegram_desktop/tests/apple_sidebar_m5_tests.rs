@@ -1107,7 +1107,7 @@ fn test_m5_guardrails_icons_nav_rail_chat_sidebar_and_game_polish() {
     assert_eq!(
         nav.items.len(),
         13,
-        "9 legacy destinations + Browser + Community + OrcaBots + OrcaIde"
+        "9 legacy destinations + upstream Browser + Community + OrcaBots + OrcaIde"
     );
     assert_eq!(NAV_RAIL_WIDTH, 52.0);
     assert_eq!(DEFAULT_WIDTH, 288.0);

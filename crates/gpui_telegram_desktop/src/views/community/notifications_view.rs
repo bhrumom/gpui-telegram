@@ -125,6 +125,7 @@ impl CommunityWorkspace {
         self.state.notifications_gen = self.state.notifications_gen.wrapping_add(1);
         let my_gen = self.state.notifications_gen;
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         self.state.notifications_loading = false;
         let nid_cb = notif_id.clone();
         let facade = self.facade.clone();
@@ -139,36 +140,56 @@ impl CommunityWorkspace {
                     .await
             })
             .await;
-            if let Ok(Ok(resp)) = res {
-                let _ = weak.update(app, |this, cx| {
-                    if this.state.actor_switch_gen != my_actor_gen {
-                        return;
-                    }
-                    let mut patched_stale = false;
-                    for n in &mut this.state.notifications {
-                        if n.notif_id == nid_cb && !n.is_read {
-                            n.is_read = true;
-                            patched_stale = true;
+            let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    return;
+                }
+                match res {
+                    Ok(Ok(resp)) => {
+                        let mut patched_stale = false;
+                        for n in &mut this.state.notifications {
+                            if n.notif_id == nid_cb && !n.is_read {
+                                n.is_read = true;
+                                patched_stale = true;
+                            }
                         }
+                        let unread = resp.unread_count.min(u32::MAX as u64) as u32;
+                        if this.state.notifications_gen == my_gen {
+                            this.state.notifications_loading = false;
+                            this.state.unread_notifications = unread;
+                            this.emit_action(
+                                CommunityWorkspaceAction::UnreadCountChanged(unread),
+                                cx,
+                            );
+                        } else if this.state.notifications_loading {
+                            this.load_notifications(cx);
+                        } else if patched_stale || unread < this.state.unread_notifications {
+                            let clamped = this.state.unread_notifications.min(unread);
+                            this.state.unread_notifications = clamped;
+                            this.emit_action(
+                                CommunityWorkspaceAction::UnreadCountChanged(clamped),
+                                cx,
+                            );
+                        }
+                        cx.notify();
                     }
-                    let unread = resp.unread_count.min(u32::MAX as u64) as u32;
-                    if this.state.notifications_gen == my_gen {
-                        this.state.notifications_loading = false;
-                        this.state.unread_notifications = unread;
-                        this.emit_action(CommunityWorkspaceAction::UnreadCountChanged(unread), cx);
-                    } else if this.state.notifications_loading {
-                        this.load_notifications(cx);
-                    } else if patched_stale || unread < this.state.unread_notifications {
-                        let clamped = this.state.unread_notifications.min(unread);
-                        this.state.unread_notifications = clamped;
+                    Ok(Err(e)) => {
                         this.emit_action(
-                            CommunityWorkspaceAction::UnreadCountChanged(clamped),
+                            CommunityWorkspaceAction::ShowToast {
+                                text: e.to_string(),
+                                is_error: true,
+                            },
                             cx,
                         );
+                        this.load_notifications(cx);
                     }
-                    cx.notify();
-                });
-            }
+                    Err(_) => {
+                        this.load_notifications(cx);
+                    }
+                }
+            });
         })
         .detach();
     }

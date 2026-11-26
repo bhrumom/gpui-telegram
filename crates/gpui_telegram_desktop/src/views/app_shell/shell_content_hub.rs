@@ -7,11 +7,14 @@ use gpui::{
 };
 use gpui_telegram_client::net::http_client::HttpClientError;
 use gpui_telegram_core::core::deep_links::parse_apple_deep_link;
+use gpui_telegram_media::media::audio::{MusicPlaybackState, MusicTrackEntry};
 use gpui_telegram_proto::contracts::chats::CreateChatRequest;
 use gpui_telegram_proto::creations::{
-    AppStoreMiniAppEntry, CatalogSortMode, CreationKind, CreationReviewStatus, CreationVisibility,
-    ReviewDecision, ReviewDecisionRequest, SubmitReviewRequest, UpdateCreationRequest,
-    UserCreationDto, CREATOR_STUDIO_BOT_USERNAME, CREATOR_STUDIO_BOT_USER_ID,
+    AppStoreMiniAppEntry, CatalogSortMode, CreateCreationReviewRequest, CreationKind,
+    CreationPayload, CreationReviewStatus, CreationVisibility, MusicUserState, ReviewDecision,
+    ReviewDecisionRequest, SubmitGameScoreRequest, SubmitReviewRequest, UpdateCreationRequest,
+    UpsertCreationStateRequest, UserCreationDto, CREATOR_STUDIO_BOT_USERNAME,
+    CREATOR_STUDIO_BOT_USER_ID,
 };
 use gpui_telegram_proto::miniapp_contracts::MiniAppLaunchMode;
 
@@ -20,8 +23,9 @@ use crate::views::app_shell::modal_container::{macos_modal_backdrop_rgba, macos_
 use crate::views::app_shell::shell_truth::SessionRequestFence;
 use crate::views::apple_sidebar::{AppleSidebarEvent, AppleSidebarSection};
 use crate::views::content_hub::{
-    render_publish_review_modal_body, render_quick_creations_drawer, ContentHubEvent,
-    ContentHubInputTarget, ContentHubSection, PublishModalField, ReviewerAccessState,
+    build_music_track_entries_from_creation, render_publish_review_modal_body,
+    render_quick_creations_drawer, ContentHubEvent, ContentHubInputTarget, ContentHubSection,
+    GameStatus, PublishModalField, ReviewerAccessState,
 };
 use crate::views::nav_rail::NavDestination;
 use crate::views::shell::{ActiveWorkspacePanel, AppShell};
@@ -37,6 +41,10 @@ pub struct ShellContentHubState {
     pub review_queue_request_gen: u64,
     pub detail_request_gen: u64,
     pub audit_request_gen: u64,
+    pub reviews_request_gen: u64,
+    pub leaderboard_request_gen: u64,
+    pub music_tick_gen: u64,
+    pub game_tick_gen: u64,
     pub creator_bot_chat_in_flight: bool,
 }
 
@@ -87,6 +95,26 @@ impl ShellContentHubState {
         self.audit_request_gen
     }
 
+    pub fn bump_reviews_gen(&mut self) -> u64 {
+        self.reviews_request_gen = self.reviews_request_gen.wrapping_add(1);
+        self.reviews_request_gen
+    }
+
+    pub fn bump_leaderboard_gen(&mut self) -> u64 {
+        self.leaderboard_request_gen = self.leaderboard_request_gen.wrapping_add(1);
+        self.leaderboard_request_gen
+    }
+
+    pub fn bump_music_tick_gen(&mut self) -> u64 {
+        self.music_tick_gen = self.music_tick_gen.wrapping_add(1);
+        self.music_tick_gen
+    }
+
+    pub fn bump_game_tick_gen(&mut self) -> u64 {
+        self.game_tick_gen = self.game_tick_gen.wrapping_add(1);
+        self.game_tick_gen
+    }
+
     pub fn reset_generations(&mut self) {
         self.bump_creations_gen();
         self.bump_catalog_gen_for(ContentHubSection::Books);
@@ -96,6 +124,10 @@ impl ShellContentHubState {
         self.bump_review_queue_gen();
         self.bump_detail_gen();
         self.bump_audit_gen();
+        self.bump_reviews_gen();
+        self.bump_leaderboard_gen();
+        self.bump_music_tick_gen();
+        self.bump_game_tick_gen();
         self.creator_bot_chat_in_flight = false;
     }
 }
@@ -731,6 +763,14 @@ impl AppShell {
             self.clear_all_ime_preedits(cx);
         }
         if should_clear_ime {
+            if self.active_panel == ActiveWorkspacePanel::Browser {
+                let occluded = self.has_browser_visual_occlusion_overlay(cx);
+                if let Some(ref bw) = self.browser_workspace {
+                    if bw.read(cx).is_externally_occluded() != occluded {
+                        bw.update(cx, |w, wcx| w.set_occluded(occluded, wcx));
+                    }
+                }
+            }
             cx.notify();
         }
     }
@@ -797,6 +837,9 @@ impl AppShell {
             ContentHubEvent::OpenCreatorBotWithCommand(cmd) => {
                 self.open_creator_studio_bot_chat(Some(cmd.as_str()), cx);
             }
+            ContentHubEvent::OpenPublishModalForCreation(creation) => {
+                self.open_publish_review_modal_for_creation(creation.clone(), cx);
+            }
             ContentHubEvent::OpenCreationDetail {
                 section,
                 creation_id,
@@ -816,6 +859,9 @@ impl AppShell {
                     h.set_section(*section);
                     h.selected_creation_id = Some(creation_id.clone());
                     h.active_action_hint = action.clone();
+                    h.active_reviews.clear();
+                    h.active_leaderboard.clear();
+                    h.review_status_notice = None;
                     if h.selected_catalog_item
                         .as_ref()
                         .is_none_or(|c| c.creation_id != *creation_id)
@@ -830,7 +876,12 @@ impl AppShell {
                     }
                     hcx.notify();
                 });
+                self.maybe_apply_hub_action_hint(cx);
                 self.fetch_creation_detail_fenced(creation_id.clone(), cx);
+                self.fetch_creation_reviews_fenced(creation_id.clone(), cx);
+                if *section == ContentHubSection::Games {
+                    self.fetch_game_leaderboard_fenced(creation_id.clone(), cx);
+                }
                 cx.notify();
             }
             ContentHubEvent::SaveCreationDraft { creation_id, req } => {
@@ -862,6 +913,40 @@ impl AppShell {
             }
             ContentHubEvent::SubmitReviewDecision { creation_id, req } => {
                 self.submit_review_decision_fenced(creation_id.clone(), req.clone(), cx);
+            }
+            ContentHubEvent::UpsertCreationState { creation_id, req } => {
+                self.upsert_creation_state_fenced(creation_id.clone(), req.clone(), cx);
+            }
+            ContentHubEvent::LoadCreationReviews { creation_id } => {
+                self.fetch_creation_reviews_fenced(creation_id.clone(), cx);
+            }
+            ContentHubEvent::SubmitCreationReview { creation_id, req } => {
+                self.submit_creation_review_fenced(creation_id.clone(), req.clone(), cx);
+            }
+            ContentHubEvent::LoadGameLeaderboard { creation_id } => {
+                self.fetch_game_leaderboard_fenced(creation_id.clone(), cx);
+            }
+            ContentHubEvent::SubmitGameScore { creation_id, req } => {
+                self.submit_game_score_fenced(creation_id.clone(), req.clone(), cx);
+            }
+            ContentHubEvent::PlayMusicCreation {
+                creation,
+                track_index,
+                shuffle,
+            } => {
+                self.play_music_creation_in_hub(creation.clone(), *track_index, *shuffle, cx);
+            }
+            ContentHubEvent::PlayMusicRadio { genre_filter } => {
+                self.play_music_radio_in_hub(genre_filter.clone(), cx);
+            }
+            ContentHubEvent::MusicTransportChanged => {
+                self.sync_music_playback_loop(cx);
+            }
+            ContentHubEvent::LaunchGameSession { creation } => {
+                self.launch_game_session_in_hub(creation.clone(), cx);
+            }
+            ContentHubEvent::CloseGameSession => {
+                self.content_hub_state.bump_game_tick_gen();
             }
             ContentHubEvent::LaunchMiniApp {
                 bot_username,
@@ -1398,6 +1483,7 @@ impl AppShell {
                         shell.clear_all_ime_preedits(cx);
                     }
                     shell.sync_apple_sidebar_badges(cx);
+                    shell.maybe_apply_hub_action_hint(cx);
                 }
                 cx.notify();
             });
@@ -2348,9 +2434,14 @@ impl AppShell {
         } else {
             self.refresh_content_hub_catalog(section, cx);
         }
-        if needs_detail_fetch {
-            if let Some(cid) = link.creation_id {
-                self.fetch_creation_detail_fenced(cid, cx);
+        if let Some(cid) = link.creation_id {
+            self.maybe_apply_hub_action_hint(cx);
+            if needs_detail_fetch {
+                self.fetch_creation_detail_fenced(cid.clone(), cx);
+            }
+            self.fetch_creation_reviews_fenced(cid.clone(), cx);
+            if section == ContentHubSection::Games {
+                self.fetch_game_leaderboard_fenced(cid, cx);
             }
         }
         cx.notify();
@@ -2499,5 +2590,593 @@ impl AppShell {
             });
             cx.notify();
         }
+    }
+}
+
+impl AppShell {
+    /// Applies a pending deep-link or quick-CTA action hint (`read` / `play` / `install`)
+    /// once the full `selected_detail_creation` DTO is available in `ContentHubWorkspace`.
+    pub fn maybe_apply_hub_action_hint(&mut self, cx: &mut Context<Self>) {
+        let (action_opt, detail_opt) = {
+            let h = self.content_hub.read(cx);
+            (
+                h.active_action_hint.clone(),
+                h.selected_detail_creation.clone(),
+            )
+        };
+        let (Some(action), Some(detail)) = (action_opt, detail_opt) else {
+            return;
+        };
+        let normalized = action.trim().to_ascii_lowercase();
+        match (detail.kind, normalized.as_str()) {
+            (CreationKind::Book, "read") => {
+                let opened_req = self.content_hub.update(cx, |h, hcx| {
+                    h.active_action_hint = None;
+                    if h.open_book_reader_for_creation(&detail) {
+                        hcx.notify();
+                        h.book_reader
+                            .as_ref()
+                            .map(|r| (r.creation_id.clone(), r.to_upsert_state_request()))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((cid, req)) = opened_req {
+                    self.upsert_creation_state_fenced(cid, req, cx);
+                }
+            }
+            (CreationKind::Music, "play") => {
+                self.content_hub.update(cx, |h, _| {
+                    h.active_action_hint = None;
+                });
+                self.play_music_creation_in_hub(detail, 0, false, cx);
+            }
+            (CreationKind::Game, "play") => {
+                self.content_hub.update(cx, |h, _| {
+                    h.active_action_hint = None;
+                });
+                self.launch_game_session_in_hub(detail, cx);
+            }
+            (CreationKind::App, "install") => {
+                self.content_hub.update(cx, |h, _| {
+                    h.active_action_hint = None;
+                });
+                self.upsert_creation_state_fenced(
+                    detail.creation_id.clone(),
+                    UpsertCreationStateRequest {
+                        in_library: Some(true),
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Persists a user creation state update (reading progress/bookmarks, music loved/position,
+    /// game save state, app install state) to the server and local SQLite cache.
+    pub fn upsert_creation_state_fenced(
+        &mut self,
+        creation_id: String,
+        req: UpsertCreationStateRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        // Optimistic local mirror update so UI toggles feel instant
+        self.content_hub.update(cx, |h, hcx| {
+            let inferred_kind = h
+                .find_catalog_item(&creation_id)
+                .map(|i| i.kind)
+                .or_else(|| h.find_my_creation(&creation_id).map(|c| c.kind))
+                .unwrap_or(CreationKind::Book);
+            let entry = h
+                .my_creation_states
+                .entry(creation_id.clone())
+                .or_insert_with(|| gpui_telegram_proto::creations::UserCreationStateDto {
+                    creation_id: creation_id.clone(),
+                    user_id: self.session_sync.user_id.unwrap_or(0) as i64,
+                    kind: inferred_kind,
+                    in_library: false,
+                    favorite: false,
+                    progress_percent: 0.0,
+                    state_json: serde_json::json!({}),
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                });
+            if let Some(in_lib) = req.in_library {
+                entry.in_library = in_lib;
+            }
+            if let Some(fav) = req.favorite {
+                entry.favorite = fav;
+            }
+            if let Some(pct) = req.progress_percent {
+                entry.progress_percent = pct;
+            }
+            if let Some(ref sj) = req.state_json {
+                entry.state_json = sj.clone();
+            }
+            entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+            hcx.notify();
+        });
+
+        let Some(fence) = build_hub_fence(self, self.content_hub_state.creations_request_gen)
+        else {
+            return;
+        };
+        let client = self.client.clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = client.upsert_creation_state(&creation_id, &req).await;
+            let _ = weak.update(app, |shell, cx| {
+                if !hub_session_fence_matches(&fence, shell) {
+                    return;
+                }
+                if let Ok(saved) = res {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        h.my_creation_states.insert(saved.creation_id.clone(), saved);
+                        hcx.notify();
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Loads published community reviews for `creation_id`.
+    pub fn fetch_creation_reviews_fenced(
+        &mut self,
+        creation_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        let req_gen = self.content_hub_state.bump_reviews_gen();
+        let Some(fence) = build_hub_fence(self, req_gen) else {
+            return;
+        };
+        let client = self.client.clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = client.list_creation_reviews(&creation_id, Some(50), Some(0)).await;
+            let _ = weak.update(app, |shell, cx| {
+                if !hub_fence_matches(&fence, shell, shell.content_hub_state.reviews_request_gen) {
+                    return;
+                }
+                if let Ok(resp) = res {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        if h.selected_creation_id.as_deref() == Some(creation_id.as_str()) {
+                            h.active_reviews = resp.items;
+                            if let Some(ref mut d) = h.selected_detail_creation {
+                                if d.creation_id == creation_id {
+                                    d.rating_avg = resp.rating_avg;
+                                    d.rating_count = resp.rating_count;
+                                }
+                            }
+                            hcx.notify();
+                        }
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Submits a 1–5 star rating and review for a published creation and refreshes its ratings.
+    pub fn submit_creation_review_fenced(
+        &mut self,
+        creation_id: String,
+        req: CreateCreationReviewRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        let Some(fence) = build_hub_fence(self, self.content_hub_state.reviews_request_gen) else {
+            return;
+        };
+        let client = self.client.clone();
+        let lang = self.active_lang_id().to_string();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = client.submit_creation_review(&creation_id, &req).await;
+            let _ = weak.update(app, |shell, cx| {
+                if !hub_session_fence_matches(&fence, shell) {
+                    return;
+                }
+                match res {
+                    Ok(saved_rev) => {
+                        shell.content_hub.update(cx, |h, hcx| {
+                            h.is_submitting_review = false;
+                            h.review_draft_title.clear();
+                            h.review_draft_body.clear();
+                            h.review_status_notice = Some(
+                                tr_str(&lang, "评论已发布", "Review submitted").to_string(),
+                            );
+                            if let Some(existing) = h
+                                .active_reviews
+                                .iter_mut()
+                                .find(|r| r.user_id == saved_rev.user_id)
+                            {
+                                *existing = saved_rev;
+                            } else {
+                                h.active_reviews.insert(0, saved_rev);
+                            }
+                            hcx.notify();
+                        });
+                        shell.fetch_creation_reviews_fenced(creation_id.clone(), cx);
+                        if let ActiveWorkspacePanel::ContentHub(sec) = shell.active_panel {
+                            shell.refresh_content_hub_catalog(sec, cx);
+                        }
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        shell.content_hub.update(cx, |h, hcx| {
+                            h.is_submitting_review = false;
+                            h.review_status_notice = Some(msg.clone());
+                            hcx.notify();
+                        });
+                        shell.show_toast(msg, 2800, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches the cloud high-score leaderboard for a published game creation.
+    pub fn fetch_game_leaderboard_fenced(
+        &mut self,
+        creation_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        let req_gen = self.content_hub_state.bump_leaderboard_gen();
+        let Some(fence) = build_hub_fence(self, req_gen) else {
+            return;
+        };
+        let client = self.client.clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = client.get_game_leaderboard(&creation_id, Some(20)).await;
+            let _ = weak.update(app, |shell, cx| {
+                if !hub_fence_matches(
+                    &fence,
+                    shell,
+                    shell.content_hub_state.leaderboard_request_gen,
+                ) {
+                    return;
+                }
+                if let Ok(resp) = res {
+                    shell.content_hub.update(cx, |h, hcx| {
+                        if h.selected_creation_id.as_deref() == Some(creation_id.as_str()) {
+                            h.active_leaderboard = resp.items;
+                            hcx.notify();
+                        }
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Submits a game high score to the server leaderboard and refreshes the live table.
+    pub fn submit_game_score_fenced(
+        &mut self,
+        creation_id: String,
+        req: SubmitGameScoreRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        let Some(fence) = build_hub_fence(self, self.content_hub_state.leaderboard_request_gen)
+        else {
+            return;
+        };
+        let client = self.client.clone();
+        let lang = self.active_lang_id().to_string();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = client.submit_game_score(&creation_id, &req).await;
+            let _ = weak.update(app, |shell, cx| {
+                if !hub_session_fence_matches(&fence, shell) {
+                    return;
+                }
+                match res {
+                    Ok(entry) => {
+                        shell.show_toast(
+                            format!(
+                                "{} #{} ({})",
+                                tr_str(&lang, "高分已上榜", "Score ranked"),
+                                entry.rank,
+                                entry.score
+                            ),
+                            2400,
+                            cx,
+                        );
+                        shell.fetch_game_leaderboard_fenced(creation_id, cx);
+                    }
+                    Err(err) => {
+                        shell.show_toast(err.to_string(), 2600, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Synthesizes tracks for a music creation via pure-Rust `synthesize_music_track_wav()`,
+    /// loads them into `MusicTransportEngine`, starts playback, and starts the progress tick loop.
+    pub fn play_music_creation_in_hub(
+        &mut self,
+        creation: UserCreationDto,
+        track_index: usize,
+        shuffle: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = build_music_track_entries_from_creation(&creation);
+        if entries.is_empty() {
+            return;
+        }
+        let target_idx = track_index.min(entries.len() - 1);
+        let cid = creation.creation_id.clone();
+        let first_track_id = entries.get(target_idx).map(|t| t.track_id.clone());
+
+        self.content_hub.update(cx, |h, hcx| {
+            h.music_engine.set_queue(entries);
+            h.music_engine.set_shuffle(shuffle);
+            let _ = h.music_engine.play_index(target_idx);
+            h.music_now_playing_creation_id = Some(cid.clone());
+            hcx.notify();
+        });
+
+        // Persist last-played music state
+        let prev_loved = self
+            .content_hub
+            .read(cx)
+            .my_creation_states
+            .get(&cid)
+            .is_some_and(|s| s.favorite);
+        let prev_plays = self
+            .content_hub
+            .read(cx)
+            .my_creation_states
+            .get(&cid)
+            .and_then(|s| serde_json::from_value::<MusicUserState>(s.state_json.clone()).ok())
+            .map(|m| m.play_count)
+            .unwrap_or(0);
+        let music_state = MusicUserState {
+            loved: prev_loved,
+            in_library: true,
+            last_track_id: first_track_id,
+            last_position_ms: 0,
+            play_count: prev_plays + 1,
+            last_played_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        if creation.review_status == CreationReviewStatus::Published {
+            self.upsert_creation_state_fenced(
+                cid,
+                UpsertCreationStateRequest {
+                    in_library: Some(true),
+                    favorite: None,
+                    progress_percent: None,
+                    state_json: serde_json::to_value(music_state).ok(),
+                },
+                cx,
+            );
+        }
+        self.sync_music_playback_loop(cx);
+        cx.notify();
+    }
+
+    /// Builds a shuffled radio queue from published public music catalog items and plays immediately.
+    pub fn play_music_radio_in_hub(&mut self, genre_filter: Option<String>, cx: &mut Context<Self>) {
+        let mut queue: Vec<MusicTrackEntry> = Vec::new();
+        {
+            let h = self.content_hub.read(cx);
+            for item in &h.music_catalog {
+                if let Some(ref gf) = genre_filter {
+                    let matched = item
+                        .genres
+                        .iter()
+                        .chain(item.tags.iter())
+                        .any(|g| g.to_ascii_lowercase().contains(&gf.to_ascii_lowercase()));
+                    if !matched {
+                        continue;
+                    }
+                }
+                if let Some(CreationPayload::Music(ref mp)) = item.payload {
+                    let artist = if mp.artist.trim().is_empty() {
+                        item.author_display_name.as_str()
+                    } else {
+                        mp.artist.as_str()
+                    };
+                    for tr in &mp.tracks {
+                        queue.push(
+                            crate::views::content_hub::synthesize_entry_from_track(
+                                &item.creation_id,
+                                artist,
+                                &item.title,
+                                mp.bpm,
+                                tr,
+                            ),
+                        );
+                    }
+                } else {
+                    let mut entry = MusicTrackEntry::clock_only(
+                        format!("{}_radio", item.creation_id),
+                        item.title.clone(),
+                        item.author_display_name.clone(),
+                        item.title.clone(),
+                        45_000,
+                        Vec::new(),
+                    );
+                    entry.creation_id = Some(item.creation_id.clone());
+                    queue.push(entry);
+                }
+            }
+        }
+        if queue.is_empty() && genre_filter.is_some() {
+            // Fall back to all published music when specific genre station has no tracks yet
+            self.play_music_radio_in_hub(None, cx);
+            return;
+        }
+        if queue.is_empty() {
+            let lang = self.active_lang_id();
+            self.show_toast(
+                tr_str(lang, "暂无可播放的公开音乐电台曲目", "No published music tracks for radio yet"),
+                2200,
+                cx,
+            );
+            return;
+        }
+        let first_cid = queue.first().and_then(|t| t.creation_id.clone());
+        self.content_hub.update(cx, |h, hcx| {
+            h.music_engine.set_queue(queue);
+            h.music_engine.set_shuffle(true);
+            let _ = h.music_engine.play_index(0);
+            h.music_now_playing_creation_id = first_cid;
+            hcx.notify();
+        });
+        self.sync_music_playback_loop(cx);
+        cx.notify();
+    }
+
+    /// Starts (or stops) the fenced periodic playback clock driving `MusicTransportEngine::tick_ms`.
+    pub fn sync_music_playback_loop(&mut self, cx: &mut Context<Self>) {
+        let playing = self.content_hub.read(cx).music_engine.state() == MusicPlaybackState::Playing;
+        let tick_gen = self.content_hub_state.bump_music_tick_gen();
+        if !playing || !self.is_authenticated {
+            return;
+        }
+        let Some(fence) = build_hub_fence(self, tick_gen) else {
+            return;
+        };
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            loop {
+                app.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let keep_going = weak
+                    .update(app, |shell, cx| {
+                        if !hub_fence_matches(&fence, shell, shell.content_hub_state.music_tick_gen)
+                        {
+                            return false;
+                        }
+                        let still_playing = shell.content_hub.update(cx, |h, hcx| {
+                            if h.music_engine.state() != MusicPlaybackState::Playing {
+                                return false;
+                            }
+                            let next_state = h.music_engine.tick_ms(150);
+                            h.music_now_playing_creation_id = h
+                                .music_engine
+                                .current_track()
+                                .and_then(|t| t.creation_id.clone());
+                            hcx.notify();
+                            next_state == MusicPlaybackState::Playing
+                        });
+                        still_playing
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Launches a `MiniGameRuntime` session inside `ContentHubWorkspace` (or `BotAttachWebView` for `MiniAppHtml`).
+    pub fn launch_game_session_in_hub(
+        &mut self,
+        creation: UserCreationDto,
+        cx: &mut Context<Self>,
+    ) {
+        let seed = (chrono::Utc::now().timestamp_millis() as u64).wrapping_add(1337);
+        let launched = self.content_hub.update(cx, |h, hcx| {
+            let ok = h.launch_game_for_creation(&creation, seed);
+            if ok {
+                hcx.notify();
+            }
+            ok
+        });
+        if launched {
+            self.start_game_tick_loop_if_needed(cx);
+        }
+        cx.notify();
+    }
+
+    /// Drives real-time `MiniGameRuntime::step(dt_ms)` ticks for `ArcadeDodge`, `SnakeGrid`, and timed games.
+    pub fn start_game_tick_loop_if_needed(&mut self, cx: &mut Context<Self>) {
+        let (needs_ticks, tick_ms) = {
+            let h = self.content_hub.read(cx);
+            match h.active_game.as_ref() {
+                Some(s) => (s.needs_realtime_ticks(), s.recommended_tick_ms()),
+                None => (false, 100),
+            }
+        };
+        let tick_gen = self.content_hub_state.bump_game_tick_gen();
+        if !needs_ticks || !self.is_authenticated {
+            return;
+        }
+        let Some(fence) = build_hub_fence(self, tick_gen) else {
+            return;
+        };
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            loop {
+                app.background_executor()
+                    .timer(std::time::Duration::from_millis(tick_ms))
+                    .await;
+                let keep_going = weak
+                    .update(app, |shell, cx| {
+                        if !hub_fence_matches(&fence, shell, shell.content_hub_state.game_tick_gen) {
+                            return false;
+                        }
+                        let mut emit_score: Option<(String, SubmitGameScoreRequest)> = None;
+                        let mut emit_state: Option<(String, UpsertCreationStateRequest)> = None;
+                        let still_running = shell.content_hub.update(cx, |h, hcx| {
+                            let Some(ref mut s) = h.active_game else {
+                                return false;
+                            };
+                            if !s.needs_realtime_ticks() {
+                                return s.snapshot().status == GameStatus::Paused;
+                            }
+                            let prev_status = s.snapshot().status;
+                            let next = s.step(tick_ms);
+                            if matches!(next.status, GameStatus::Won | GameStatus::GameOver)
+                                && prev_status != next.status
+                            {
+                                emit_state =
+                                    Some((s.creation_id.clone(), s.to_upsert_state_request()));
+                                if s.is_published && s.supports_leaderboard && !s.score_submitted {
+                                    if let Some(req) = s.to_submit_score_request() {
+                                        s.score_submitted = true;
+                                        emit_score = Some((s.creation_id.clone(), req));
+                                    }
+                                }
+                            }
+                            hcx.notify();
+                            matches!(next.status, GameStatus::Playing | GameStatus::Paused)
+                        });
+                        if let Some((cid, req)) = emit_state {
+                            shell.upsert_creation_state_fenced(cid, req, cx);
+                        }
+                        if let Some((cid, req)) = emit_score {
+                            shell.submit_game_score_fenced(cid, req, cx);
+                        }
+                        still_running
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 }

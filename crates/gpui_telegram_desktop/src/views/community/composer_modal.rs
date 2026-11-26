@@ -29,8 +29,8 @@ use super::shared_widgets::{
     render_input_display,
 };
 use super::state::{
-    ActiveCommunityInput, CommunityModal, CommunityPopover, CommunityWorkspaceAction,
-    ComposerFormatTab, ComposerMediaDraft, ComposerModalState,
+    ActiveCommunityInput, CommunityModal, CommunityPopover, CommunityRoute,
+    CommunityWorkspaceAction, ComposerFormatTab, ComposerMediaDraft, ComposerModalState,
 };
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
@@ -248,6 +248,9 @@ impl CommunityWorkspace {
         initial_community: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.community_slug = initial_community;
         self.state.composer = st;
@@ -259,6 +262,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_from_quick_post(&mut self, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.title = self.state.quick_post_title.clone();
         st.body = self.state.quick_post_body.clone();
@@ -275,6 +281,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_quote(&mut self, origin: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.tab = ComposerFormatTab::Quote;
         st.quoted_post_id = Some(origin.post_id.clone());
@@ -288,6 +297,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_crosspost(&mut self, origin: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.tab = ComposerFormatTab::Crosspost;
         st.crosspost_of_id = Some(origin.post_id.clone());
@@ -301,6 +313,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_edit(&mut self, post: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.editing_post_id = Some(post.post_id.clone());
         st.tab = match post.format {
@@ -626,6 +641,9 @@ impl CommunityWorkspace {
     }
 
     pub fn resume_draft_into_composer(&mut self, draft: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let prev_drafts = self.state.composer.drafts.clone();
         self.open_composer_edit(draft, cx);
         self.state.composer.drafts = prev_drafts;
@@ -638,6 +656,15 @@ impl CommunityWorkspace {
             status: Some(PostStatus::Published),
             ..Default::default()
         };
+        let post_edit_entry = self
+            .state
+            .post_edit_entity_save_seq
+            .entry(post_id.clone())
+            .or_insert(0);
+        *post_edit_entry = post_edit_entry.wrapping_add(1);
+        let my_post_edit_seq = *post_edit_entry;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
@@ -646,26 +673,57 @@ impl CommunityWorkspace {
                 facade.update_post(&pid, &req).await
             })
             .await;
-            let _ = weak.update(app, |this, cx| match res {
-                Ok(Ok(_)) => {
-                    this.state.composer.drafts.retain(|d| d.post_id != post_id);
-                    let lang = this.language_id.clone();
-                    this.emit_action(
-                        CommunityWorkspaceAction::ShowToast {
-                            text: tr_str(&lang, "草稿已立即发布！", "Draft published!").to_string(),
-                            is_error: false,
-                        },
-                        cx,
-                    );
-                    this.load_feed(cx);
+            let _ = weak.update(app, |this, cx| {
+                let is_latest_post_edit = this
+                    .state
+                    .post_edit_entity_save_seq
+                    .get(&post_id)
+                    .copied()
+                    == Some(my_post_edit_seq);
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    if let Ok(Ok(updated)) = res {
+                        if is_latest_post_edit {
+                            this.state.patch_edited_post_metadata(&updated);
+                        }
+                        this.reload_detail_if_loading_post(&updated.post_id, true, cx);
+                        cx.notify();
+                    }
+                    return;
                 }
-                Ok(Err(e)) => {
-                    this.emit_action(
-                        CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
-                        cx,
-                    );
+                match res {
+                    Ok(Ok(updated)) => {
+                        if is_latest_post_edit {
+                            this.state.patch_edited_post_metadata(&updated);
+                            this.state.composer.drafts.retain(|d| d.post_id != post_id);
+                        }
+                        let was_feed_loading =
+                            this.state.feed_loading || this.state.feed_loading_more;
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
+                        if this.state.composer.drafts_loading {
+                            this.load_composer_drafts(cx);
+                        }
+                        let lang = this.language_id.clone();
+                        this.emit_action(
+                            CommunityWorkspaceAction::ShowToast {
+                                text: tr_str(&lang, "草稿已立即发布！", "Draft published!").to_string(),
+                                is_error: false,
+                            },
+                            cx,
+                        );
+                        if !was_feed_loading {
+                            this.load_feed(cx);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        this.emit_action(
+                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
+                            cx,
+                        );
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             });
         })
         .detach();
@@ -1049,6 +1107,16 @@ impl CommunityWorkspace {
             };
             self.state.composer.submitting = true;
             self.state.composer.validation_error = None;
+            let post_edit_entry = self
+                .state
+                .post_edit_entity_save_seq
+                .entry(edit_id.clone())
+                .or_insert(0);
+            *post_edit_entry = post_edit_entry.wrapping_add(1);
+            let my_post_edit_seq = *post_edit_entry;
+            let edit_id_cb = edit_id.clone();
+            let my_actor_gen = self.state.actor_switch_gen;
+            let expected_actor_id = self.state.active_actor_id.clone();
             let facade = self.facade.clone();
             let handle = facade.runtime_handle().clone();
             cx.notify();
@@ -1058,11 +1126,40 @@ impl CommunityWorkspace {
                 })
                 .await;
                 let _ = weak.update(app, |this, cx| {
+                    let is_latest_post_edit = this
+                        .state
+                        .post_edit_entity_save_seq
+                        .get(&edit_id_cb)
+                        .copied()
+                        == Some(my_post_edit_seq);
+                    if this.state.actor_switch_gen != my_actor_gen
+                        || this.state.active_actor_id != expected_actor_id
+                    {
+                        if let Ok(Ok(updated)) = res {
+                            if is_latest_post_edit {
+                                this.state.patch_edited_post_metadata(&updated);
+                            }
+                            this.reload_detail_if_loading_post(&updated.post_id, true, cx);
+                            cx.notify();
+                        }
+                        return;
+                    }
                     this.state.composer.submitting = false;
                     let lang = this.language_id.clone();
                     match res {
                         Ok(Ok(updated)) => {
-                            this.state.visit_post_mut(&updated.post_id, |p| *p = updated.clone());
+                            let updated_pid = updated.post_id.clone();
+                            if is_latest_post_edit {
+                                this.state.patch_edited_post_metadata(&updated);
+                            }
+                            let was_feed_loading =
+                                this.state.feed_loading || this.state.feed_loading_more;
+                            this.reload_detail_if_loading_post(&updated_pid, true, cx);
+                            if this.state.composer.drafts_loading
+                                || this.state.composer.show_drafts_drawer
+                            {
+                                this.load_composer_drafts(cx);
+                            }
                             this.close_composer_modal(cx);
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast {
@@ -1071,7 +1168,9 @@ impl CommunityWorkspace {
                                 },
                                 cx,
                             );
-                            this.load_feed(cx);
+                            if !was_feed_loading {
+                                this.load_feed(cx);
+                            }
                         }
                         Ok(Err(e)) => {
                             this.state.composer.validation_error = Some(e.to_string());
@@ -1098,6 +1197,8 @@ impl CommunityWorkspace {
         };
         self.state.composer.submitting = true;
         self.state.composer.validation_error = None;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -1107,6 +1208,16 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    if let Ok(Ok(resp)) = res {
+                        if requested_status == PostStatus::Published {
+                            this.reload_detail_if_loading_post(&resp.post.post_id, true, cx);
+                        }
+                    }
+                    return;
+                }
                 this.state.composer.submitting = false;
                 let lang = this.language_id.clone();
                 match res {
@@ -1142,15 +1253,23 @@ impl CommunityWorkspace {
                         if requested_status == PostStatus::Published {
                             this.load_feed(cx);
                             if let Some(slug) = resp.post.community_slug.clone() {
-                                if this
+                                let viewing_comm = matches!(
+                                    &this.state.route,
+                                    CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&slug)
+                                ) || this
                                     .state
                                     .community_detail
                                     .as_ref()
-                                    .is_some_and(|d| d.community.slug.eq_ignore_ascii_case(&slug))
-                                {
+                                    .is_some_and(|d| d.community.slug.eq_ignore_ascii_case(&slug));
+                                if viewing_comm {
                                     this.load_community_page(slug, cx);
                                 }
                             }
+                        }
+                        if this.state.composer.drafts_loading
+                            || this.state.composer.show_drafts_drawer
+                        {
+                            this.load_composer_drafts(cx);
                         }
                     }
                     Ok(Err(e)) => {

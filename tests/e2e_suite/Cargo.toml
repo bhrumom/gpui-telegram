@@ -111,3 +111,27 @@ path = "tests/community_e2e_tier3.rs"
 [[test]]
 name = "community_e2e_tier4"
 path = "tests/community_e2e_tier4.rs"
+
+[[test]]
+name = "apple_sidebar_tier1_feature"
+path = "tests/apple_sidebar_tier1_feature.rs"
+
+[[test]]
+name = "apple_sidebar_tier2_boundary"
+path = "tests/apple_sidebar_tier2_boundary.rs"
+
+[[test]]
+name = "apple_sidebar_tier3_cross_feature"
+path = "tests/apple_sidebar_tier3_cross_feature.rs"
+
+[[test]]
+name = "apple_sidebar_tier4_scenarios"
+path = "tests/apple_sidebar_tier4_scenarios.rs"
+
+[[test]]
+name = "apple_sidebar_ui_e2e"
+path = "tests/apple_sidebar_ui_e2e.rs"
+
+[[test]]
+name = "apple_sidebar_tier5_hardening"
+path = "tests/apple_sidebar_tier5_hardening.rs"

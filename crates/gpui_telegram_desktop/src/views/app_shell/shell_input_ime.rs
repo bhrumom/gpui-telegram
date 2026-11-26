@@ -1138,7 +1138,34 @@ impl AppShell {
                     }
                 });
             }
-            ShellInputTarget::Absorbed => {}
+            ShellInputTarget::Absorbed => {
+                if matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_))
+                    && !self.has_blocking_modal_or_fullscreen_overlay_for_shortcuts(cx)
+                    && !self.sidebar.read(cx).is_account_popover_open
+                    && self.content_hub.read(cx).active_game.is_some()
+                {
+                    let game_input = match clean.to_ascii_lowercase().as_str() {
+                        "w" => Some(crate::views::content_hub::GameInput::MoveUp),
+                        "s" => Some(crate::views::content_hub::GameInput::MoveDown),
+                        "a" => Some(crate::views::content_hub::GameInput::MoveLeft),
+                        "d" => Some(crate::views::content_hub::GameInput::MoveRight),
+                        " " => Some(crate::views::content_hub::GameInput::PrimaryAction),
+                        "1" => Some(crate::views::content_hub::GameInput::SelectOption(0)),
+                        "2" => Some(crate::views::content_hub::GameInput::SelectOption(1)),
+                        "3" => Some(crate::views::content_hub::GameInput::SelectOption(2)),
+                        "4" => Some(crate::views::content_hub::GameInput::SelectOption(3)),
+                        _ => None,
+                    };
+                    if let Some(inp) = game_input {
+                        self.content_hub.update(cx, |h, hcx| {
+                            if let Some(ref mut session) = h.active_game {
+                                session.apply_input(inp);
+                                hcx.notify();
+                            }
+                        });
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -1490,6 +1517,52 @@ impl AppShell {
             self.sync_apple_sidebar_to_active_panel(cx);
             self.reconcile_chat_scoped_toasts(cx);
             return true;
+        }
+        if matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_)) {
+            let closed_game_state = self.content_hub.update(cx, |h, hcx| {
+                if let Some(session) = h.active_game.take() {
+                    let st = (session.creation_id.clone(), session.to_upsert_state_request());
+                    hcx.notify();
+                    Some(st)
+                } else {
+                    None
+                }
+            });
+            if let Some((cid, req)) = closed_game_state {
+                self.content_hub_state.bump_game_tick_gen();
+                self.upsert_creation_state_fenced(cid, req, cx);
+                return true;
+            }
+            let closed_reader_state = self.content_hub.update(cx, |h, hcx| {
+                if let Some(reader) = h.book_reader.take() {
+                    let st = (reader.creation_id.clone(), reader.to_upsert_state_request());
+                    hcx.notify();
+                    Some(st)
+                } else {
+                    None
+                }
+            });
+            if let Some((cid, req)) = closed_reader_state {
+                self.upsert_creation_state_fenced(cid, req, cx);
+                return true;
+            }
+            let closed_detail = self.content_hub.update(cx, |h, hcx| {
+                if h.selected_creation_id.is_some()
+                    || h.selected_detail_creation.is_some()
+                    || h.selected_catalog_item.is_some()
+                {
+                    h.selected_creation_id = None;
+                    h.selected_catalog_item = None;
+                    h.selected_detail_creation = None;
+                    hcx.notify();
+                    true
+                } else {
+                    false
+                }
+            });
+            if closed_detail {
+                return true;
+            }
         }
         if self.active_panel == ActiveWorkspacePanel::Community {
             if self.sidebar.read(cx).search_focused {
@@ -2288,8 +2361,11 @@ impl AppShell {
                 });
                 if handled {
                     if key == "enter"
-                        && active_target
-                            != crate::views::content_hub::ContentHubInputTarget::QuickDrawerSearch
+                        && matches!(
+                            active_target,
+                            crate::views::content_hub::ContentHubInputTarget::CatalogSearch
+                                | crate::views::content_hub::ContentHubInputTarget::CreationsSearch
+                        )
                     {
                         if let ActiveWorkspacePanel::ContentHub(sec) = self.active_panel {
                             self.refresh_content_hub_catalog(sec, cx);
@@ -2576,7 +2652,63 @@ impl AppShell {
                     _ => false,
                 }
             }
-            ShellInputTarget::Absorbed => false,
+            ShellInputTarget::Absorbed => {
+                if matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_))
+                    && !self.has_blocking_modal_or_fullscreen_overlay_for_shortcuts(cx)
+                    && !self.sidebar.read(cx).is_account_popover_open
+                {
+                    if self.content_hub.read(cx).active_game.is_some() {
+                        let game_input = match key {
+                            "up" | "arrowup" => Some(crate::views::content_hub::GameInput::MoveUp),
+                            "down" | "arrowdown" => {
+                                Some(crate::views::content_hub::GameInput::MoveDown)
+                            }
+                            "left" | "arrowleft" => {
+                                Some(crate::views::content_hub::GameInput::MoveLeft)
+                            }
+                            "right" | "arrowright" => {
+                                Some(crate::views::content_hub::GameInput::MoveRight)
+                            }
+                            "enter" => Some(crate::views::content_hub::GameInput::Confirm),
+                            "space" => Some(crate::views::content_hub::GameInput::PrimaryAction),
+                            _ => None,
+                        };
+                        if let Some(inp) = game_input {
+                            self.content_hub.update(cx, |h, hcx| {
+                                if let Some(ref mut session) = h.active_game {
+                                    session.apply_input(inp);
+                                    hcx.notify();
+                                }
+                            });
+                            cx.notify();
+                            return true;
+                        }
+                    } else if self.content_hub.read(cx).book_reader.is_some() {
+                        let synced = self.content_hub.update(cx, |h, hcx| {
+                            let Some(ref mut reader) = h.book_reader else {
+                                return None;
+                            };
+                            let turned = match key {
+                                "left" | "arrowleft" => reader.prev_page(),
+                                "right" | "arrowright" => reader.next_page(),
+                                _ => return None,
+                            };
+                            if turned {
+                                hcx.notify();
+                                Some((reader.creation_id.clone(), reader.to_upsert_state_request()))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((cid, req)) = synced {
+                            self.upsert_creation_state_fenced(cid, req, cx);
+                            cx.notify();
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
         }
     }
 

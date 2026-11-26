@@ -3,8 +3,15 @@
 pub mod game_runtime;
 pub use game_runtime::*;
 
+pub mod app_store_view;
 pub mod apple_primitives;
+pub mod book_reader;
+pub mod books_view;
 pub mod creations_view;
+pub mod game_runtime_sheet;
+pub mod games_view;
+pub mod music_player_bar;
+pub mod music_view;
 pub mod publish_review_modal;
 
 use std::collections::HashMap;
@@ -14,30 +21,35 @@ use gpui::*;
 use gpui_telegram_core::core::deep_links::{AppleDeepLink, AppleDeepLinkSection};
 use gpui_telegram_media::media::audio::MusicTransportEngine;
 use gpui_telegram_proto::creations::{
-    AppStoreCatalogResponse, AppStoreMiniAppEntry, CatalogSortMode, CreationKind,
-    CreationReviewStatus, PublicCatalogItemDto, ReviewDecisionRequest, SubmitReviewRequest,
-    UpdateCreationRequest, UserCreationDto, UserCreationStateDto,
+    AppStoreCatalogResponse, AppStoreMiniAppEntry, CatalogSortMode, CreateCreationReviewRequest,
+    CreationKind, CreationPayload, CreationReviewEntryDto, CreationReviewStatus,
+    GameLeaderboardEntryDto, PublicCatalogItemDto, ReviewDecisionRequest, SubmitGameScoreRequest,
+    SubmitReviewRequest, UpdateCreationRequest, UpsertCreationStateRequest, UserCreationDto,
+    UserCreationStateDto,
 };
 
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::{
-    macos_primary_pill_btn, macos_secondary_pill_btn,
-};
+use crate::theme::TdesktopThemePalette;
+use crate::views::app_shell::modal_container::macos_primary_pill_btn;
 
 pub use apple_primitives::EditableFieldState;
+pub use book_reader::{
+    BookReaderFontFamily, BookReaderState, BookReaderTheme, DEFAULT_READER_FONT_SIZE,
+    MAX_READER_FONT_SIZE, MIN_READER_FONT_SIZE,
+};
 pub use creations_view::{
     render_my_creations_view, render_quick_creations_drawer, QUICK_DRAWER_WIDTH,
 };
+pub use game_runtime_sheet::{extract_game_payload, ActiveGameSession};
+pub use music_player_bar::{build_music_track_entries_from_creation, synthesize_entry_from_track};
 pub use publish_review_modal::{
     render_publish_review_modal_body, PublishModalField, PublishReviewModalState,
     ReviewerAccessState,
 };
 
 use apple_primitives::{
-    apple_grouped_card, cover_artwork_box, creation_kind_accent, creation_kind_label,
-    empty_state_card_shell, filter_pill, hero_banner, rating_pill, render_editable_field_box,
+    apple_grouped_card, apple_shelf_header, render_editable_field_box,
 };
 
 /// Top-level creative vertical or personal cloud studio section mounted inside `ContentHubWorkspace`.
@@ -99,6 +111,8 @@ pub enum ContentHubInputTarget {
     CatalogSearch,
     CreationsSearch,
     QuickDrawerSearch,
+    ReviewTitle,
+    ReviewBody,
 }
 
 /// Typed events emitted by `ContentHubWorkspace` to `AppShell` (`shell_content_hub.rs`).
@@ -114,6 +128,7 @@ pub enum ContentHubEvent {
         creation_id: String,
         action: Option<String>,
     },
+    OpenPublishModalForCreation(UserCreationDto),
     SaveCreationDraft {
         creation_id: String,
         req: UpdateCreationRequest,
@@ -139,6 +154,37 @@ pub enum ContentHubEvent {
         creation_id: String,
         req: ReviewDecisionRequest,
     },
+    UpsertCreationState {
+        creation_id: String,
+        req: UpsertCreationStateRequest,
+    },
+    LoadCreationReviews {
+        creation_id: String,
+    },
+    SubmitCreationReview {
+        creation_id: String,
+        req: CreateCreationReviewRequest,
+    },
+    LoadGameLeaderboard {
+        creation_id: String,
+    },
+    SubmitGameScore {
+        creation_id: String,
+        req: SubmitGameScoreRequest,
+    },
+    PlayMusicCreation {
+        creation: UserCreationDto,
+        track_index: usize,
+        shuffle: bool,
+    },
+    PlayMusicRadio {
+        genre_filter: Option<String>,
+    },
+    MusicTransportChanged,
+    LaunchGameSession {
+        creation: UserCreationDto,
+    },
+    CloseGameSession,
     LaunchMiniApp {
         bot_username: String,
         short_name: String,
@@ -151,13 +197,19 @@ pub enum ContentHubEvent {
 }
 
 /// Primary Apple Content Hub workspace entity holding synced cloud creations, vertical catalogs,
-/// headless-safe `MusicTransportEngine`, Quick Creations Drawer state, and `PublishReviewModalState`.
+/// embedded Apple Books reader, headless-safe `MusicTransportEngine`, interactive `ActiveGameSession`,
+/// Quick Creations Drawer state, and `PublishReviewModalState`.
 pub struct ContentHubWorkspace {
     pub active_section: ContentHubSection,
     pub active_sub_tab: String,
     pub active_action_hint: Option<String>,
     pub quick_drawer_open: bool,
     pub music_engine: MusicTransportEngine,
+    pub music_lyrics_open: bool,
+    pub music_queue_open: bool,
+    pub music_now_playing_creation_id: Option<String>,
+    pub book_reader: Option<BookReaderState>,
+    pub active_game: Option<ActiveGameSession>,
     pub my_creations: Vec<UserCreationDto>,
     pub my_creations_revision: i64,
     pub deleted_creation_revisions: HashMap<String, i64>,
@@ -171,6 +223,14 @@ pub struct ContentHubWorkspace {
     pub selected_creation_id: Option<String>,
     pub selected_catalog_item: Option<PublicCatalogItemDto>,
     pub selected_detail_creation: Option<UserCreationDto>,
+    pub selected_genre_filter: Option<String>,
+    pub active_reviews: Vec<CreationReviewEntryDto>,
+    pub active_leaderboard: Vec<GameLeaderboardEntryDto>,
+    pub review_draft_rating: u8,
+    pub review_draft_title: EditableFieldState,
+    pub review_draft_body: EditableFieldState,
+    pub is_submitting_review: bool,
+    pub review_status_notice: Option<String>,
     pub catalog_search: EditableFieldState,
     pub creations_search: EditableFieldState,
     pub quick_drawer_search: EditableFieldState,
@@ -200,6 +260,11 @@ impl ContentHubWorkspace {
             active_action_hint: None,
             quick_drawer_open: false,
             music_engine: MusicTransportEngine::new(),
+            music_lyrics_open: false,
+            music_queue_open: false,
+            music_now_playing_creation_id: None,
+            book_reader: None,
+            active_game: None,
             my_creations: Vec::new(),
             my_creations_revision: 0,
             deleted_creation_revisions: HashMap::new(),
@@ -213,6 +278,14 @@ impl ContentHubWorkspace {
             selected_creation_id: None,
             selected_catalog_item: None,
             selected_detail_creation: None,
+            selected_genre_filter: None,
+            active_reviews: Vec::new(),
+            active_leaderboard: Vec::new(),
+            review_draft_rating: 5,
+            review_draft_title: EditableFieldState::default(),
+            review_draft_body: EditableFieldState::default(),
+            is_submitting_review: false,
+            review_status_notice: None,
             catalog_search: EditableFieldState::default(),
             creations_search: EditableFieldState::default(),
             quick_drawer_search: EditableFieldState::default(),
@@ -251,6 +324,12 @@ impl ContentHubWorkspace {
             self.selected_creation_id = None;
             self.selected_catalog_item = None;
             self.selected_detail_creation = None;
+            self.selected_genre_filter = None;
+            self.book_reader = None;
+            self.active_game = None;
+            self.active_reviews.clear();
+            self.active_leaderboard.clear();
+            self.review_status_notice = None;
             self.is_loading_catalog = false;
             if self.active_input != ContentHubInputTarget::QuickDrawerSearch {
                 self.active_input = ContentHubInputTarget::None;
@@ -266,9 +345,10 @@ impl ContentHubWorkspace {
         match self.active_input {
             ContentHubInputTarget::None => false,
             ContentHubInputTarget::QuickDrawerSearch => self.quick_drawer_open,
-            ContentHubInputTarget::CatalogSearch | ContentHubInputTarget::CreationsSearch => {
-                in_content_hub
-            }
+            ContentHubInputTarget::CatalogSearch
+            | ContentHubInputTarget::CreationsSearch
+            | ContentHubInputTarget::ReviewTitle
+            | ContentHubInputTarget::ReviewBody => in_content_hub,
         }
     }
 
@@ -284,6 +364,8 @@ impl ContentHubWorkspace {
         self.catalog_search.set_ime_preedit(None);
         self.creations_search.set_ime_preedit(None);
         self.quick_drawer_search.set_ime_preedit(None);
+        self.review_draft_title.set_ime_preedit(None);
+        self.review_draft_body.set_ime_preedit(None);
     }
 
     fn active_field(&self) -> Option<&EditableFieldState> {
@@ -292,6 +374,8 @@ impl ContentHubWorkspace {
             ContentHubInputTarget::CatalogSearch => Some(&self.catalog_search),
             ContentHubInputTarget::CreationsSearch => Some(&self.creations_search),
             ContentHubInputTarget::QuickDrawerSearch => Some(&self.quick_drawer_search),
+            ContentHubInputTarget::ReviewTitle => Some(&self.review_draft_title),
+            ContentHubInputTarget::ReviewBody => Some(&self.review_draft_body),
         }
     }
 
@@ -301,6 +385,8 @@ impl ContentHubWorkspace {
             ContentHubInputTarget::CatalogSearch => Some(&mut self.catalog_search),
             ContentHubInputTarget::CreationsSearch => Some(&mut self.creations_search),
             ContentHubInputTarget::QuickDrawerSearch => Some(&mut self.quick_drawer_search),
+            ContentHubInputTarget::ReviewTitle => Some(&mut self.review_draft_title),
+            ContentHubInputTarget::ReviewBody => Some(&mut self.review_draft_body),
         }
     }
 
@@ -345,6 +431,8 @@ impl ContentHubWorkspace {
             self.catalog_search.set_ime_preedit(None);
             self.creations_search.set_ime_preedit(None);
             self.quick_drawer_search.set_ime_preedit(None);
+            self.review_draft_title.set_ime_preedit(None);
+            self.review_draft_body.set_ime_preedit(None);
         } else if let Some(field) = self.active_field_mut() {
             field.set_ime_preedit(preedit);
         }
@@ -354,6 +442,8 @@ impl ContentHubWorkspace {
         let had = self.catalog_search.ime_preedit.is_some()
             || self.creations_search.ime_preedit.is_some()
             || self.quick_drawer_search.ime_preedit.is_some()
+            || self.review_draft_title.ime_preedit.is_some()
+            || self.review_draft_body.ime_preedit.is_some()
             || self.publish_modal.has_any_preedit();
         if had {
             self.set_active_input_ime_preedit(None);
@@ -695,6 +785,20 @@ impl ContentHubWorkspace {
             {
                 self.selected_detail_creation = None;
             }
+            if self
+                .book_reader
+                .as_ref()
+                .is_some_and(|r| r.creation_id == cid)
+            {
+                self.book_reader = None;
+            }
+            if self
+                .active_game
+                .as_ref()
+                .is_some_and(|g| g.creation_id == cid)
+            {
+                self.active_game = None;
+            }
             if self.publish_modal.target_creation_id.as_deref() == Some(cid.as_str()) {
                 self.publish_modal.target_creation_id = None;
                 self.publish_modal.base_creation = None;
@@ -776,11 +880,25 @@ impl ContentHubWorkspace {
             self.selected_catalog_item = None;
             removed = true;
         }
-        if self.selected_creation_id.as_deref() == Some(creation_id)
-            && self.find_my_creation(creation_id).is_none()
-        {
-            self.selected_creation_id = None;
-            self.selected_detail_creation = None;
+        if self.find_my_creation(creation_id).is_none() {
+            if self.selected_creation_id.as_deref() == Some(creation_id) {
+                self.selected_creation_id = None;
+                self.selected_detail_creation = None;
+            }
+            if self
+                .book_reader
+                .as_ref()
+                .is_some_and(|r| r.creation_id == creation_id)
+            {
+                self.book_reader = None;
+            }
+            if self
+                .active_game
+                .as_ref()
+                .is_some_and(|g| g.creation_id == creation_id)
+            {
+                self.active_game = None;
+            }
         }
         removed
     }
@@ -832,6 +950,11 @@ impl ContentHubWorkspace {
         self.selected_creation_id = link.creation_id.clone();
         self.selected_catalog_item = None;
         self.selected_detail_creation = None;
+        self.book_reader = None;
+        self.active_game = None;
+        self.active_reviews.clear();
+        self.active_leaderboard.clear();
+        self.review_status_notice = None;
         if let Some(cid) = link.creation_id.as_deref() {
             if let Some(cat) = self.find_catalog_item(cid).cloned() {
                 self.selected_catalog_item = Some(cat);
@@ -842,9 +965,38 @@ impl ContentHubWorkspace {
         }
     }
 
+    pub fn open_book_reader_for_creation(&mut self, creation: &UserCreationDto) -> bool {
+        let payload = match &creation.payload {
+            CreationPayload::Book(bp) => bp.clone(),
+            _ => return false,
+        };
+        let saved = self.my_creation_states.get(&creation.creation_id);
+        self.book_reader = Some(BookReaderState::open(
+            creation,
+            payload,
+            saved,
+            self.palette,
+        ));
+        true
+    }
+
+    pub fn launch_game_for_creation(&mut self, creation: &UserCreationDto, seed: u64) -> bool {
+        let Some(payload) = extract_game_payload(creation) else {
+            return false;
+        };
+        let saved = self.my_creation_states.get(&creation.creation_id);
+        self.active_game = Some(ActiveGameSession::launch(creation, &payload, saved, seed));
+        true
+    }
+
     pub fn reset_for_logout_or_account_switch(&mut self) {
         self.music_engine.stop();
         self.music_engine.clear_queue();
+        self.music_lyrics_open = false;
+        self.music_queue_open = false;
+        self.music_now_playing_creation_id = None;
+        self.book_reader = None;
+        self.active_game = None;
         self.active_section = ContentHubSection::Books;
         self.active_sub_tab = ContentHubSection::Books.default_sub_tab().to_string();
         self.active_action_hint = None;
@@ -862,6 +1014,14 @@ impl ContentHubWorkspace {
         self.selected_creation_id = None;
         self.selected_catalog_item = None;
         self.selected_detail_creation = None;
+        self.selected_genre_filter = None;
+        self.active_reviews.clear();
+        self.active_leaderboard.clear();
+        self.review_draft_rating = 5;
+        self.review_draft_title.clear();
+        self.review_draft_body.clear();
+        self.is_submitting_review = false;
+        self.review_status_notice = None;
         self.catalog_search.clear();
         self.creations_search.clear();
         self.quick_drawer_search.clear();
@@ -878,7 +1038,7 @@ impl ContentHubWorkspace {
 }
 
 impl ContentHubWorkspace {
-    fn active_catalog_items(&self, section: ContentHubSection) -> Vec<PublicCatalogItemDto> {
+    pub(crate) fn active_catalog_items(&self, section: ContentHubSection) -> Vec<PublicCatalogItemDto> {
         let base: Vec<PublicCatalogItemDto> = match section {
             ContentHubSection::Books => self.books_catalog.clone(),
             ContentHubSection::Music => self.music_catalog.clone(),
@@ -918,517 +1078,349 @@ impl ContentHubWorkspace {
         }
     }
 
-    fn render_vertical_hub(
-        &mut self,
-        section: ContentHubSection,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let pal = self.palette;
-        let lang = self.language_id.clone();
-        let search_focused = self.active_input == ContentHubInputTarget::CatalogSearch;
-        let search_field = self.catalog_search.clone();
-        let sort_mode = self.sort_mode;
-        let items = self.active_catalog_items(section);
-        let selected_id = self.selected_creation_id.clone();
-        let selected_detail = self
+    pub(crate) fn resolve_selected_detail_creation(&self) -> Option<UserCreationDto> {
+        let selected_id = self.selected_creation_id.as_deref()?;
+        if let Some(detail) = self
             .selected_detail_creation
             .as_ref()
-            .filter(|d| selected_id.as_deref() == Some(d.creation_id.as_str()))
-            .cloned();
-        let selected_cat = self
+            .filter(|d| d.creation_id == selected_id)
+        {
+            return Some(detail.clone());
+        }
+        let cat = self
             .selected_catalog_item
             .as_ref()
-            .filter(|c| selected_id.as_deref() == Some(c.creation_id.as_str()))
-            .cloned();
-        let miniapps: Vec<AppStoreMiniAppEntry> = if section == ContentHubSection::AppStore {
-            if !self.appstore_catalog.mini_apps.is_empty() {
-                self.appstore_catalog.mini_apps.clone()
-            } else {
-                self.local_miniapps_fallback.clone()
-            }
-        } else {
-            Vec::new()
-        };
+            .filter(|c| c.creation_id == selected_id)?;
+        let fallback_payload = cat.payload.clone().unwrap_or_else(|| match cat.kind {
+            CreationKind::Book => CreationPayload::Book(gpui_telegram_proto::creations::BookPayload {
+                author: cat.author_display_name.clone(),
+                series_name: None,
+                series_index: None,
+                blurb: cat.summary.clone(),
+                estimated_read_mins: 5,
+                word_count: cat.summary.chars().count() as u32,
+                chapters: Vec::new(),
+            }),
+            CreationKind::Music => CreationPayload::Music(gpui_telegram_proto::creations::MusicPayload {
+                artist: cat.author_display_name.clone(),
+                album_title: cat.title.clone(),
+                release_year: 2026,
+                primary_genre: cat.genres.first().cloned().unwrap_or_default(),
+                mood_tags: cat.tags.clone(),
+                bpm: 112,
+                musical_key: "C Major".to_string(),
+                time_signature: "4/4".to_string(),
+                total_duration_secs: 60,
+                tracks: Vec::new(),
+            }),
+            CreationKind::Game => CreationPayload::Game(gpui_telegram_proto::creations::GamePayload {
+                developer: cat.author_display_name.clone(),
+                category: gpui_telegram_proto::creations::GameCategory::Puzzle,
+                controls_hint: String::new(),
+                rules_markdown: cat.summary.clone(),
+                engine_kind: gpui_telegram_proto::creations::GameEngineKind::TriviaQuiz,
+                supports_leaderboard: true,
+                estimated_session_mins: 5,
+                spec: gpui_telegram_proto::creations::GameSpec::TriviaQuiz {
+                    time_limit_secs: None,
+                    questions: Vec::new(),
+                },
+                achievements: Vec::new(),
+            }),
+            CreationKind::App => CreationPayload::App(gpui_telegram_proto::creations::AppStoreListingPayload {
+                developer_name: cat.author_display_name.clone(),
+                version_string: format!("v{}.0", cat.published_version),
+                release_notes: String::new(),
+                category: cat.genres.first().cloned().unwrap_or_else(|| "Utilities".to_string()),
+                long_description: cat.summary.clone(),
+                screenshots: Vec::new(),
+                size_label: "Cloud App".to_string(),
+                price_label: "Free".to_string(),
+                permissions: Vec::new(),
+                linked_miniapp: None,
+                ui_schema_json: None,
+            }),
+        });
+        Some(UserCreationDto {
+            creation_id: cat.creation_id.clone(),
+            owner_user_id: cat.owner_user_id,
+            creator_bot_user_id: None,
+            creator_chat_id: None,
+            kind: cat.kind,
+            title: cat.title.clone(),
+            subtitle: cat.subtitle.clone(),
+            summary: cat.summary.clone(),
+            author_display_name: cat.author_display_name.clone(),
+            language: cat.language.clone(),
+            genres: cat.genres.clone(),
+            tags: cat.tags.clone(),
+            cover: cat.cover.clone(),
+            age_rating: cat.age_rating.clone(),
+            payload: fallback_payload,
+            version: cat.published_version,
+            cloud_revision: 0,
+            review_status: CreationReviewStatus::Published,
+            visibility: gpui_telegram_proto::creations::CreationVisibility::Public,
+            has_live_published_version: true,
+            published_version: Some(cat.published_version),
+            rejection_reason: None,
+            review_notes: None,
+            submitted_at_ms: None,
+            reviewed_at_ms: None,
+            published_at_ms: Some(cat.published_at_ms),
+            created_at_ms: cat.published_at_ms,
+            updated_at_ms: cat.updated_at_ms,
+            deleted_at_ms: None,
+            rating_avg: cat.rating_avg,
+            rating_count: cat.rating_count,
+            engagement_count: cat.engagement_count,
+            save_or_install_count: cat.save_or_install_count,
+        })
+    }
+}
 
-        let (kicker, title, subtitle, grad_start, grad_end, icon, create_kind) = match section {
-            ContentHubSection::Books => (
-                tr_str(&lang, "APPLE BOOKS 风格书库", "APPLE BOOKS"),
-                tr_str(&lang, "图书与互动阅读", "Books & Reading"),
-                tr_str(
-                    &lang,
-                    "探索已审核公开上架的原创图书，或使用 @CreatorStudioBot 创作新书。",
-                    "Discover published community books or craft your own with @CreatorStudioBot.",
-                ),
-                "#FF9500",
-                "#FF5E3A",
-                IconName::HubBooks,
-                Some(CreationKind::Book),
-            ),
-            ContentHubSection::Music => (
-                tr_str(&lang, "APPLE MUSIC 风格乐库", "APPLE MUSIC"),
-                tr_str(&lang, "音乐与原创专辑", "Music & Albums"),
-                tr_str(
-                    &lang,
-                    "浏览公开上架的合成曲目与歌词专辑，随时播放与收藏。",
-                    "Browse published synthesized albums and tracks with synced lyrics.",
-                ),
-                "#FA2D48",
-                "#A21CAF",
-                IconName::HubMusic,
-                Some(CreationKind::Music),
-            ),
-            ContentHubSection::Games => (
-                tr_str(&lang, "APPLE GAMES & ARCADE", "APPLE GAMES & ARCADE"),
-                tr_str(&lang, "游戏与街机排行", "Games & Arcade"),
-                tr_str(
-                    &lang,
-                    "即点即玩已审核上架的益智、问答与街机小游戏，挑战云端排行榜。",
-                    "Play published puzzles, trivia, and arcade games with cloud leaderboards.",
-                ),
-                "#5856D6",
-                "#007AFF",
-                IconName::HubGames,
-                Some(CreationKind::Game),
-            ),
-            ContentHubSection::AppStore | ContentHubSection::MyCreations => (
-                tr_str(&lang, "APPLE APP STORE 统一商店", "APPLE APP STORE"),
-                tr_str(&lang, "发现应用、小程序与精选创作", "Today · Apps & Featured Works"),
-                tr_str(
-                    &lang,
-                    "汇集公开上架应用、已发布 Mini Apps 以及精选图书、音乐与游戏。",
-                    "Unified storefront of published apps, Mini Apps, and featured books, music & games.",
-                ),
-                "#007AFF",
-                "#34C759",
-                IconName::HubAppStore,
-                None,
-            ),
-        };
+/// Shared Apple-style Ratings & Reviews panel rendered across Books, Music, Games, and App Store detail views.
+pub(crate) fn render_community_reviews_panel(
+    ws: &mut ContentHubWorkspace,
+    creation_id: &str,
+    can_review: bool,
+    accent_rgb: u32,
+    cx: &mut Context<ContentHubWorkspace>,
+) -> AnyElement {
+    let pal = ws.palette;
+    let lang = ws.language_id.clone();
+    let reviews = ws.active_reviews.clone();
+    let draft_rating = ws.review_draft_rating.clamp(1, 5);
+    let title_field = ws.review_draft_title.clone();
+    let body_field = ws.review_draft_body.clone();
+    let title_focused = ws.active_input == ContentHubInputTarget::ReviewTitle;
+    let body_focused = ws.active_input == ContentHubInputTarget::ReviewBody;
+    let notice = ws.review_status_notice.clone();
+    let cid = creation_id.to_string();
 
-        let sort_options: &[(CatalogSortMode, &'static str, &'static str, &'static str)] = &[
-            (CatalogSortMode::Featured, "hub-sort-featured", "精选", "Featured"),
-            (CatalogSortMode::Popular, "hub-sort-popular", "热门", "Popular"),
-            (CatalogSortMode::TopRated, "hub-sort-rated", "高分", "Top Rated"),
-            (CatalogSortMode::Newest, "hub-sort-newest", "最新", "Newest"),
-        ];
-
-        let (cover_w, cover_h) = if section == ContentHubSection::Books {
-            (72.0, 108.0)
-        } else {
-            (84.0, 84.0)
-        };
-
-        div()
-            .id("content-hub-vertical-root")
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .child(
+    apple_grouped_card(pal)
+        .p(px(16.0))
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(apple_shelf_header(
+            tr_str(&lang, "评分与评论", "Ratings & Reviews"),
+            Some(format!(
+                "{} {}",
+                reviews.len(),
+                tr_str(&lang, "条评论", "reviews")
+            )),
+            pal,
+        ))
+        .when(can_review, |el| {
+            let cid_submit = cid.clone();
+            el.child(
                 div()
-                    .px(px(24.0))
-                    .py(px(14.0))
-                    .border_b_1()
-                    .border_color(pal.separator_rgba())
+                    .p(px(12.0))
+                    .rounded(px(10.0))
+                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.04))
                     .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(10.0))
+                    .flex_col()
+                    .gap(px(8.0))
                     .child(
-                        div().w(px(280.0)).child(
-                            render_editable_field_box(
-                                "content-hub-catalog-search-input",
-                                &search_field,
-                                tr_str(&lang, "搜索公开上架内容…", "Search published catalog…"),
-                                search_focused,
-                                false,
-                                pal,
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child(tr_str(&lang, "打分：", "Tap to Rate:")),
                             )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.focus_input(ContentHubInputTarget::CatalogSearch, cx);
-                                }),
-                            ),
+                            .children((1u8..=5u8).map(|star| {
+                                let filled = star <= draft_rating;
+                                div()
+                                    .id(SharedString::from(format!("review-star-{star}")))
+                                    .cursor_pointer()
+                                    .px(px(4.0))
+                                    .text_size(px(16.0))
+                                    .text_color(rgb(if filled { 0xFF9F0A } else { pal.text_secondary }))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.review_draft_rating = star;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(if filled { "★" } else { "☆" })
+                            })),
+                    )
+                    .child(
+                        render_editable_field_box(
+                            "content-hub-review-title-input",
+                            &title_field,
+                            tr_str(&lang, "评论标题（可选）", "Review Title (optional)"),
+                            title_focused,
+                            false,
+                            pal,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.focus_input(ContentHubInputTarget::ReviewTitle, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        render_editable_field_box(
+                            "content-hub-review-body-input",
+                            &body_field,
+                            tr_str(&lang, "写下你对这部作品的评价…", "Write a review…"),
+                            body_focused,
+                            true,
+                            pal,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.focus_input(ContentHubInputTarget::ReviewBody, cx);
+                            }),
                         ),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
-                            .children(sort_options.iter().map(|(mode, pill_id, zh, en)| {
-                                let m = *mode;
-                                filter_pill(*pill_id, tr_str(&lang, zh, en), sort_mode == m, pal)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.sort_mode = m;
-                                            cx.emit(ContentHubEvent::RefreshCatalog(section));
-                                            cx.notify();
-                                        }),
-                                    )
-                            }))
+                            .justify_between()
+                            .gap(px(8.0))
                             .child(
-                                macos_secondary_pill_btn(
-                                    "content-hub-refresh-catalog-btn",
-                                    tr_str(&lang, "刷新", "Refresh"),
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(accent_rgb))
+                                    .child(notice.unwrap_or_default()),
+                            )
+                            .child(
+                                macos_primary_pill_btn(
+                                    "content-hub-review-submit-btn",
+                                    tr_str(&lang, "发表评论", "Submit Review"),
                                     pal,
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |_this, _, _, cx| {
-                                        cx.emit(ContentHubEvent::RefreshCatalog(section));
+                                    cx.listener(move |this, _, _, cx| {
+                                        let body = this.review_draft_body.text.trim().to_string();
+                                        if body.is_empty() {
+                                            this.review_status_notice = Some(
+                                                tr_str(
+                                                    &this.language_id,
+                                                    "请先填写评论内容",
+                                                    "Please write a review comment first",
+                                                )
+                                                .to_string(),
+                                            );
+                                            cx.notify();
+                                            return;
+                                        }
+                                        let title = {
+                                            let t = this.review_draft_title.text.trim().to_string();
+                                            (!t.is_empty()).then_some(t)
+                                        };
+                                        this.is_submitting_review = true;
+                                        this.review_status_notice = None;
+                                        cx.emit(ContentHubEvent::SubmitCreationReview {
+                                            creation_id: cid_submit.clone(),
+                                            req: CreateCreationReviewRequest {
+                                                rating: this.review_draft_rating.clamp(1, 5),
+                                                title,
+                                                body,
+                                            },
+                                        });
+                                        cx.notify();
                                     }),
                                 ),
                             ),
                     ),
             )
-            .child(
+        })
+        .when(reviews.is_empty(), |el| {
+            el.child(
                 div()
-                    .id("content-hub-vertical-scroll")
-                    .flex_1()
-                    .w_full()
-                    .overflow_y_scroll()
-                    .p(px(24.0))
+                    .text_size(px(12.0))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        &lang,
+                        "暂无社区评价，欢迎留下第一条评论。",
+                        "No community reviews yet — be the first to rate this creation.",
+                    )),
+            )
+        })
+        .when(!reviews.is_empty(), |el| {
+            el.children(reviews.iter().take(12).map(|rev| {
+                let stars: String = (0..5)
+                    .map(|i| if i < rev.rating as usize { '★' } else { '☆' })
+                    .collect();
+                div()
+                    .p(px(10.0))
+                    .rounded(px(9.0))
+                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.04))
                     .flex()
                     .flex_col()
-                    .gap(px(16.0))
-                    .child(hero_banner(
-                        "content-hub-hero-banner",
-                        kicker,
-                        title,
-                        subtitle,
-                        grad_start,
-                        grad_end,
-                        icon,
-                        pal,
-                    ))
-                    .when_some(selected_detail.or_else(|| {
-                        selected_cat.as_ref().map(|c| {
-                            UserCreationDto {
-                                creation_id: c.creation_id.clone(),
-                                owner_user_id: c.owner_user_id,
-                                creator_bot_user_id: None,
-                                creator_chat_id: None,
-                                kind: c.kind,
-                                title: c.title.clone(),
-                                subtitle: c.subtitle.clone(),
-                                summary: c.summary.clone(),
-                                author_display_name: c.author_display_name.clone(),
-                                language: c.language.clone(),
-                                genres: c.genres.clone(),
-                                tags: c.tags.clone(),
-                                cover: c.cover.clone(),
-                                age_rating: c.age_rating.clone(),
-                                payload: c.payload.clone().unwrap_or_else(|| {
-                                    gpui_telegram_proto::creations::CreationPayload::Book(
-                                        gpui_telegram_proto::creations::BookPayload {
-                                            author: c.author_display_name.clone(),
-                                            series_name: None,
-                                            series_index: None,
-                                            blurb: c.summary.clone(),
-                                            estimated_read_mins: 5,
-                                            word_count: 100,
-                                            chapters: Vec::new(),
-                                        },
-                                    )
-                                }),
-                                version: c.published_version,
-                                cloud_revision: 0,
-                                review_status: CreationReviewStatus::Published,
-                                visibility: gpui_telegram_proto::creations::CreationVisibility::Public,
-                                has_live_published_version: true,
-                                published_version: Some(c.published_version),
-                                rejection_reason: None,
-                                review_notes: None,
-                                submitted_at_ms: None,
-                                reviewed_at_ms: None,
-                                published_at_ms: Some(c.published_at_ms),
-                                created_at_ms: c.published_at_ms,
-                                updated_at_ms: c.updated_at_ms,
-                                deleted_at_ms: None,
-                                rating_avg: c.rating_avg,
-                                rating_count: c.rating_count,
-                                engagement_count: c.engagement_count,
-                                save_or_install_count: c.save_or_install_count,
-                            }
-                        })
-                    }), |el, detail| {
-                        let accent = creation_kind_accent(detail.kind);
-                        let action_label = self
-                            .active_action_hint
-                            .as_deref()
-                            .unwrap_or("open")
-                            .to_string();
-                        el.child(
-                            apple_grouped_card(pal)
-                                .p(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(14.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(12.0))
-                                        .child(cover_artwork_box(&detail.cover, 60.0, 60.0, 12.0, accent))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap(px(3.0))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(16.0))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(rgb(pal.text_primary))
-                                                        .child(detail.title.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.0))
-                                                        .text_color(rgb(pal.text_secondary))
-                                                        .child(format!(
-                                                            "{} · {} · action={}",
-                                                            creation_kind_label(detail.kind, &lang),
-                                                            detail.author_display_name,
-                                                            action_label
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.0))
-                                                        .text_color(rgb(pal.text_secondary))
-                                                        .child(detail.summary.clone()),
-                                                ),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("content-hub-detail-close-btn")
-                                        .cursor_pointer()
-                                        .w(px(28.0))
-                                        .h(px(28.0))
-                                        .rounded(px(7.0))
-                                        .hover(move |s| s.bg(pal.row_hover_rgba()))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.selected_creation_id = None;
-                                                this.selected_catalog_item = None;
-                                                this.selected_detail_creation = None;
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(tg_icon(IconName::Close, 14.0, pal.icon_fg)),
-                                ),
-                        )
-                    })
-                    .when(!miniapps.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .text_size(px(15.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_primary))
-                                        .child(tr_str(&lang, "精选 Mini Apps", "Featured Mini Apps")),
-                                )
-                                .child(div().flex().flex_wrap().gap(px(10.0)).children(
-                                    miniapps.iter().map(|app| {
-                                        let bot_un = app.bot_username.clone();
-                                        let short = app.short_name.clone();
-                                        let web_url = (!app.web_url.trim().is_empty())
-                                            .then(|| app.web_url.clone());
-                                        apple_grouped_card(pal)
-                                            .w(px(260.0))
-                                            .p(px(12.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(10.0))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(0.0))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(2.0))
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(13.0))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(rgb(pal.text_primary))
-                                                            .child(app.title.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.0))
-                                                            .text_color(rgb(pal.text_secondary))
-                                                            .child(app.description.clone()),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "appstore-launch-miniapp-{}-{}",
-                                                        app.bot_username, app.short_name
-                                                    )))
-                                                    .cursor_pointer()
-                                                    .px(px(10.0))
-                                                    .py(px(4.0))
-                                                    .rounded(px(999.0))
-                                                    .bg(rgb(pal.accent))
-                                                    .text_size(px(11.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(pal.active_button_fg))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |_this, _, _, cx| {
-                                                            cx.emit(ContentHubEvent::LaunchMiniApp {
-                                                                bot_username: bot_un.clone(),
-                                                                short_name: short.clone(),
-                                                                web_url: web_url.clone(),
-                                                            });
-                                                        }),
-                                                    )
-                                                    .child(tr_str(&lang, "打开", "Open")),
-                                            )
-                                    }),
-                                )),
-                        )
-                    })
-                    .when(items.is_empty() && miniapps.is_empty(), |el| {
-                        let cta = macos_primary_pill_btn(
-                            "content-hub-empty-bot-cta",
-                            tr_str(&lang, "用 @CreatorStudioBot 创作", "Create with @CreatorStudioBot"),
-                            pal,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::OpenCreatorBot(create_kind));
-                            }),
-                        );
-                        el.child(empty_state_card_shell(
-                            icon,
-                            tr_str(&lang, "暂无公开上架作品", "No Published Works Yet"),
-                            tr_str(
-                                &lang,
-                                "创作者通过 @CreatorStudioBot 创作并审核上架后，作品会立即展示在这里。",
-                                "Published creations approved for the public catalog appear here automatically.",
-                            ),
-                            cta,
-                            pal,
-                        ))
-                    })
-                    .when(!items.is_empty(), |el| {
-                        el.child(div().flex().flex_wrap().gap(px(14.0)).children(items.iter().map(
-                            |item| {
-                                let cid = item.creation_id.clone();
-                                let item_clone = item.clone();
-                                let accent = creation_kind_accent(item.kind);
-                                let is_sel = selected_id.as_deref() == Some(cid.as_str());
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
                                 div()
-                                    .id(SharedString::from(format!("catalog-card-{cid}")))
-                                    .cursor_pointer()
-                                    .w(px(280.0))
-                                    .rounded(px(12.0))
-                                    .bg(pal.card_surface_rgba())
-                                    .border_1()
-                                    .border_color(if is_sel {
-                                        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.72)
-                                    } else {
-                                        pal.separator_rgba()
-                                    })
-                                    .p(px(12.0))
-                                    .flex()
-                                    .items_start()
-                                    .gap(px(12.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.selected_creation_id = Some(cid.clone());
-                                            this.selected_catalog_item = Some(item_clone.clone());
-                                            if this
-                                                .selected_detail_creation
-                                                .as_ref()
-                                                .is_some_and(|d| d.creation_id != cid)
-                                            {
-                                                this.selected_detail_creation =
-                                                    this.find_my_creation(&cid).cloned();
-                                            }
-                                            cx.emit(ContentHubEvent::OpenCreationDetail {
-                                                section,
-                                                creation_id: cid.clone(),
-                                                action: Some("open".to_string()),
-                                            });
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(cover_artwork_box(
-                                        &item.cover,
-                                        cover_w,
-                                        cover_h,
-                                        10.0,
-                                        accent,
-                                    ))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.0))
-                                            .child(
-                                                div()
-                                                    .text_size(px(14.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(pal.text_primary))
-                                                    .child(item.title.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(pal.text_secondary))
-                                                    .child(item.author_display_name.clone()),
-                                            )
-                                            .child(rating_pill(
-                                                item.rating_avg,
-                                                item.rating_count,
-                                                pal,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(pal.text_secondary))
-                                                    .child(item.summary.clone()),
-                                            ),
-                                    )
-                            },
-                        )))
-                    }),
-            )
-            .into_any_element()
-    }
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.text_primary))
+                                    .child(rev.title.clone().unwrap_or_else(|| {
+                                        if rev.author_display_name.trim().is_empty() {
+                                            format!("User {}", rev.user_id)
+                                        } else {
+                                            rev.author_display_name.clone()
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0xFF9F0A))
+                                    .child(stars),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(pal.text_secondary))
+                            .child(rev.body.clone()),
+                    )
+            }))
+        })
+        .into_any_element()
 }
 
 impl Render for ContentHubWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette;
-        let body = match self.active_section {
-            ContentHubSection::MyCreations => render_my_creations_view(self, cx),
-            other => self.render_vertical_hub(other, cx),
+        let show_music_bar = self.music_engine.current_track().is_some()
+            || (self.active_section == ContentHubSection::Music
+                && self.active_game.is_none()
+                && self.book_reader.is_none());
+
+        let body = if self.active_game.is_some() {
+            game_runtime_sheet::render_game_runtime_sheet(self, cx)
+        } else if self.book_reader.is_some() {
+            book_reader::render_book_reader(self, cx)
+        } else {
+            match self.active_section {
+                ContentHubSection::Books => books_view::render_books_hub_view(self, cx),
+                ContentHubSection::Music => music_view::render_music_hub_view(self, cx),
+                ContentHubSection::Games => games_view::render_games_hub_view(self, cx),
+                ContentHubSection::AppStore => app_store_view::render_app_store_hub_view(self, cx),
+                ContentHubSection::MyCreations => render_my_creations_view(self, cx),
+            }
         };
+
         div()
             .id("content-hub-workspace")
             .size_full()
@@ -1436,6 +1428,9 @@ impl Render for ContentHubWorkspace {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(body)
+            .child(div().flex_1().min_h(px(0.0)).w_full().overflow_hidden().child(body))
+            .when(show_music_bar, |el| {
+                el.child(music_player_bar::render_music_player_bar(self, cx))
+            })
     }
 }

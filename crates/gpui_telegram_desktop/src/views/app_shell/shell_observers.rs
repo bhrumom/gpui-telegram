@@ -204,6 +204,16 @@ impl AppShell {
                         .ime_preedit
                         .as_deref()
                         .is_some_and(|p| !p.is_empty()),
+                    ContentHubInputTarget::ReviewTitle => h
+                        .review_draft_title
+                        .ime_preedit
+                        .as_deref()
+                        .is_some_and(|p| !p.is_empty()),
+                    ContentHubInputTarget::ReviewBody => h
+                        .review_draft_body
+                        .ime_preedit
+                        .as_deref()
+                        .is_some_and(|p| !p.is_empty()),
                     ContentHubInputTarget::None => false,
                 };
                 (

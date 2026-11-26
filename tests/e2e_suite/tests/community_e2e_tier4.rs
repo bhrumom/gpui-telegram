@@ -2121,7 +2121,7 @@ async fn body_t4_10(mut app: AsyncApp) {
     }
     assert_eq!(nav_destination_for_shortcut_digit("9"), Some(NavDestination::Browser));
     assert_eq!(nav_destination_for_shortcut_digit("0"), None);
-    assert_eq!(NavRail::new().items.len(), 11, "NavRail must contain exactly 11 destinations including Community");
+    assert_eq!(NavRail::new().items.len(), 13, "NavRail must contain exactly 13 destinations including Community, OrcaBots, and OrcaIde");
 
     // 3. Boot Live Server & Verify Non-Owner Act-As 403 Security Boundary
     let rt = new_t4_tokio_rt();
