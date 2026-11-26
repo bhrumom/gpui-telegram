@@ -1273,37 +1273,100 @@ impl CommunityWorkspace {
     }
 
     pub fn vote_post(&mut self, post_id: String, clicked_dir: i8, cx: &mut Context<Self>) {
-        let (next_dir, rollback) = self.state.apply_optimistic_vote(&post_id, clicked_dir);
-        let my_actor_gen = self.state.actor_switch_gen;
-        let my_vote_gen = {
-            let entry = self.state.post_vote_gen.entry(post_id.clone()).or_insert(0);
-            *entry = entry.wrapping_add(1);
-            *entry
+        let (next_dir, snap) = self.state.apply_optimistic_vote(&post_id, clicked_dir);
+        if !self.state.post_vote_last_synced.contains_key(&post_id) {
+            if let Some(orig) = snap {
+                self.state
+                    .post_vote_last_synced
+                    .insert(post_id.clone(), orig);
+            }
+        }
+        self.state
+            .post_vote_pending_dir
+            .insert(post_id.clone(), next_dir);
+        cx.notify();
+        if self.state.post_vote_in_flight.contains_key(&post_id) {
+            self.state.post_vote_dirty.insert(post_id);
+            return;
+        }
+        self.flush_post_vote_sync(post_id, cx);
+    }
+
+    fn flush_post_vote_sync(&mut self, post_id: String, cx: &mut Context<Self>) {
+        let Some(target_dir) = self.state.post_vote_pending_dir.get(&post_id).copied() else {
+            self.state.post_vote_dirty.remove(&post_id);
+            self.state.post_vote_last_synced.remove(&post_id);
+            return;
         };
+        self.state.post_vote_dirty.remove(&post_id);
+        self.state.post_vote_flight_seq = self.state.post_vote_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.post_vote_flight_seq;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .post_vote_in_flight
+            .insert(post_id.clone(), my_flight_seq);
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
-        cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
                 facade
-                    .vote_post(&pid, &VoteRequest { direction: next_dir })
+                    .vote_post(&pid, &VoteRequest { direction: target_dir })
                     .await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
-                    || this.state.post_vote_gen.get(&post_id).copied() != Some(my_vote_gen)
+                    || this.state.active_actor_id != expected_actor_id
                 {
                     return;
                 }
+                if this.state.post_vote_in_flight.get(&post_id).copied() != Some(my_flight_seq) {
+                    return;
+                }
+                this.state.post_vote_in_flight.remove(&post_id);
                 match res {
                     Ok(Ok(resp)) => {
+                        this.state.post_vote_last_synced.insert(
+                            post_id.clone(),
+                            (resp.direction, resp.upvotes, resp.downvotes, resp.score),
+                        );
+                        let is_dirty = this.state.post_vote_dirty.remove(&post_id);
+                        if is_dirty
+                            && this
+                                .state
+                                .post_vote_pending_dir
+                                .get(&post_id)
+                                .copied()
+                                .is_some_and(|want| want != target_dir)
+                        {
+                            this.flush_post_vote_sync(post_id, cx);
+                            return;
+                        }
                         this.state.reconcile_vote(&resp);
                         this.reload_detail_if_loading_post(&post_id, cx);
+                        this.state.post_vote_pending_dir.remove(&post_id);
+                        this.state.post_vote_last_synced.remove(&post_id);
                     }
-                    _ => {
-                        if let Some(snap) = rollback {
+                    Ok(Err(e)) => {
+                        this.state.post_vote_dirty.remove(&post_id);
+                        this.state.post_vote_pending_dir.remove(&post_id);
+                        if let Some(snap) = this.state.post_vote_last_synced.remove(&post_id) {
+                            this.state.rollback_vote(&post_id, snap);
+                        }
+                        this.emit_action(
+                            CommunityWorkspaceAction::ShowToast {
+                                text: e.to_string(),
+                                is_error: true,
+                            },
+                            cx,
+                        );
+                    }
+                    Err(_) => {
+                        this.state.post_vote_dirty.remove(&post_id);
+                        this.state.post_vote_pending_dir.remove(&post_id);
+                        if let Some(snap) = this.state.post_vote_last_synced.remove(&post_id) {
                             this.state.rollback_vote(&post_id, snap);
                         }
                     }
@@ -1696,11 +1759,17 @@ impl CommunityWorkspace {
         self.state.automod_dirty.clear();
         self.state.automod_reset_draft_pending.clear();
         self.state.automod_last_synced.clear();
-        self.state.post_vote_gen.clear();
+        self.state.post_vote_in_flight.clear();
+        self.state.post_vote_dirty.clear();
+        self.state.post_vote_pending_dir.clear();
+        self.state.post_vote_last_synced.clear();
         self.state.post_like_in_flight.clear();
         self.state.post_like_pending_toggle.clear();
         self.state.post_like_last_synced.clear();
-        self.state.comment_vote_gen.clear();
+        self.state.comment_vote_in_flight.clear();
+        self.state.comment_vote_dirty.clear();
+        self.state.comment_vote_pending_dir.clear();
+        self.state.comment_vote_last_synced.clear();
         self.state.comment_like_in_flight.clear();
         self.state.comment_like_pending_toggle.clear();
         self.state.comment_like_last_synced.clear();
@@ -1759,6 +1828,7 @@ impl CommunityWorkspace {
         self.state.list_membership_dirty.clear();
         self.state.list_membership_needs_feed_reload.clear();
         self.state.list_membership_last_synced.clear();
+        self.state.list_membership_toggle_seq.clear();
         self.state.list_deleting.clear();
         self.state.list_editor.submitting = false;
         let next_actor_id = self.state.active_actor_id.clone();
@@ -2325,7 +2395,17 @@ impl CommunityWorkspace {
                                 this.state.actor_block_pending_target.get(&aid)
                             {
                                 prof.actor.is_blocked = want_blocked;
-                                if want_blocked {
+                                if want_blocked
+                                    || this
+                                        .state
+                                        .actor_block_last_synced
+                                        .get(&aid)
+                                        .is_some_and(|&(_, f)| !f)
+                                    || this
+                                        .state
+                                        .find_actor(&aid)
+                                        .is_some_and(|a| !a.is_following)
+                                {
                                     prof.actor.is_following = false;
                                 }
                             }

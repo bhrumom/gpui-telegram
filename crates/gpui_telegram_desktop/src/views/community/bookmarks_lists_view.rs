@@ -619,8 +619,11 @@ impl CommunityWorkspace {
                 cx.notify();
                 return;
             }
-            self.state.list_membership_dirty.remove(lid);
         }
+        let my_list_toggle_seq = editing_id
+            .as_ref()
+            .and_then(|lid| self.state.list_membership_toggle_seq.get(lid).copied())
+            .unwrap_or(0);
         self.state.list_editor.submitting = true;
         self.state.list_editor.error = None;
         self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
@@ -685,13 +688,32 @@ impl CommunityWorkspace {
                             let edited_gone = this.state.list_deleting.contains(lid)
                                 || !this.state.lists.iter().any(|x| &x.list_id == lid);
                             if !edited_gone {
+                                let edited_toggled_since_submit = this
+                                    .state
+                                    .list_membership_toggle_seq
+                                    .get(lid)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    != my_list_toggle_seq;
                                 let edited_was_in_flight =
                                     this.state.list_membership_in_flight.contains_key(lid);
                                 let edited_was_dirty =
                                     this.state.list_membership_dirty.contains(lid);
-                                let preserve_optimistic_toggle =
-                                    this.state.lists_gen != my_lists_gen
-                                        && (edited_was_in_flight || edited_was_dirty);
+                                let preserve_optimistic_toggle = edited_toggled_since_submit
+                                    || edited_was_in_flight
+                                    || edited_was_dirty;
+                                let prev_toggle_fields = this
+                                    .state
+                                    .lists
+                                    .iter()
+                                    .find(|x| &x.list_id == lid)
+                                    .map(|prev| {
+                                        (
+                                            prev.is_pinned,
+                                            prev.member_actor_ids.clone(),
+                                            prev.community_slugs.clone(),
+                                        )
+                                    });
                                 if this.state.lists_gen == my_lists_gen {
                                     if let Some(l) = lists {
                                         this.state.merge_refreshed_lists(l.lists);
@@ -702,18 +724,48 @@ impl CommunityWorkspace {
                                 {
                                     let mut reconciled = saved.clone();
                                     if preserve_optimistic_toggle {
-                                        let prev = &this.state.lists[pos];
-                                        reconciled.is_pinned = prev.is_pinned;
-                                        reconciled.member_actor_ids =
-                                            prev.member_actor_ids.clone();
-                                        reconciled.community_slugs = prev.community_slugs.clone();
+                                        if let Some((prev_pinned, prev_members, prev_slugs)) =
+                                            prev_toggle_fields.as_ref()
+                                        {
+                                            reconciled.is_pinned = *prev_pinned;
+                                            reconciled.member_actor_ids = prev_members.clone();
+                                            reconciled.community_slugs = prev_slugs.clone();
+                                        }
                                     }
                                     this.state.lists[pos] = reconciled;
-                                    if edited_was_in_flight {
-                                        // A quick-toggle flight is still running; mark dirty so once it
-                                        // settles it flushes the reconciled authoritative state.
-                                        this.state.list_membership_dirty.insert(lid.clone());
-                                    } else if !edited_was_dirty {
+                                    if preserve_optimistic_toggle {
+                                        let preserved_differs_from_saved =
+                                            prev_toggle_fields.as_ref().is_some_and(
+                                                |(prev_pinned, prev_members, prev_slugs)| {
+                                                    *prev_pinned != saved.is_pinned
+                                                        || prev_members != &saved.member_actor_ids
+                                                        || prev_slugs != &saved.community_slugs
+                                                },
+                                            );
+                                        if edited_was_in_flight {
+                                            // A quick-toggle flight is still running; mark dirty so once it
+                                            // settles it flushes the reconciled authoritative state.
+                                            this.state.list_membership_dirty.insert(lid.clone());
+                                        } else if preserved_differs_from_saved || edited_was_dirty {
+                                            if prev_toggle_fields.as_ref().is_some_and(
+                                                |(_, prev_members, prev_slugs)| {
+                                                    prev_members != &saved.member_actor_ids
+                                                        || prev_slugs != &saved.community_slugs
+                                                },
+                                            ) {
+                                                this.state
+                                                    .list_membership_needs_feed_reload
+                                                    .insert(lid.clone());
+                                            }
+                                            this.flush_list_sync(lid.clone(), cx);
+                                        } else {
+                                            this.state.list_membership_dirty.remove(lid);
+                                            this.state
+                                                .list_membership_needs_feed_reload
+                                                .remove(lid);
+                                            this.state.list_membership_last_synced.remove(lid);
+                                        }
+                                    } else {
                                         this.state.list_membership_dirty.remove(lid);
                                         this.state.list_membership_needs_feed_reload.remove(lid);
                                         this.state.list_membership_last_synced.remove(lid);
@@ -835,6 +887,7 @@ impl CommunityWorkspace {
                         this.state.list_membership_dirty.remove(&list_id);
                         this.state.list_membership_needs_feed_reload.remove(&list_id);
                         this.state.list_membership_last_synced.remove(&list_id);
+                        this.state.list_membership_toggle_seq.remove(&list_id);
                         this.state.lists.retain(|l| l.list_id != list_id);
                         if this.state.selected_list_id.as_deref() == Some(list_id.as_str()) {
                             this.state.selected_list_id =
@@ -948,6 +1001,12 @@ impl CommunityWorkspace {
             return;
         }
         self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
+        let toggle_seq = self
+            .state
+            .list_membership_toggle_seq
+            .entry(list_id.clone())
+            .or_insert(0);
+        *toggle_seq = toggle_seq.wrapping_add(1);
         if reload_feed {
             self.state
                 .list_membership_needs_feed_reload

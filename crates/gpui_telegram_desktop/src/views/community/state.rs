@@ -798,12 +798,20 @@ pub struct CommunityWorkspaceState {
     pub copied_code_msg: Option<u64>,
     pub poll_breakdown_by_post: HashMap<String, PollBreakdownMode>,
     pub hidden_post_ids: HashSet<String>,
-    pub post_vote_gen: HashMap<String, u64>,
+    pub post_vote_flight_seq: u64,
+    pub post_vote_in_flight: HashMap<String, u64>,
+    pub post_vote_dirty: HashSet<String>,
+    pub post_vote_pending_dir: HashMap<String, i8>,
+    pub post_vote_last_synced: HashMap<String, (i8, i64, i64, i64)>,
     pub post_like_flight_seq: u64,
     pub post_like_in_flight: HashMap<String, u64>,
     pub post_like_pending_toggle: HashSet<String>,
     pub post_like_last_synced: HashMap<String, (bool, u64)>,
-    pub comment_vote_gen: HashMap<String, u64>,
+    pub comment_vote_flight_seq: u64,
+    pub comment_vote_in_flight: HashMap<String, u64>,
+    pub comment_vote_dirty: HashSet<String>,
+    pub comment_vote_pending_dir: HashMap<String, i8>,
+    pub comment_vote_last_synced: HashMap<String, (i8, i64, i64, i64)>,
     pub comment_like_flight_seq: u64,
     pub comment_like_in_flight: HashMap<String, u64>,
     pub comment_like_pending_toggle: HashSet<String>,
@@ -926,6 +934,7 @@ pub struct CommunityWorkspaceState {
     pub list_membership_dirty: HashSet<String>,
     pub list_membership_needs_feed_reload: HashSet<String>,
     pub list_membership_last_synced: HashMap<String, (bool, Vec<String>, Vec<String>)>,
+    pub list_membership_toggle_seq: HashMap<String, u64>,
     pub list_deleting: HashSet<String>,
     pub list_editor_open: bool,
     pub list_editor: ListEditorDraft,
@@ -1035,12 +1044,20 @@ impl Default for CommunityWorkspaceState {
             copied_code_msg: None,
             poll_breakdown_by_post: HashMap::new(),
             hidden_post_ids: HashSet::new(),
-            post_vote_gen: HashMap::new(),
+            post_vote_flight_seq: 0,
+            post_vote_in_flight: HashMap::new(),
+            post_vote_dirty: HashSet::new(),
+            post_vote_pending_dir: HashMap::new(),
+            post_vote_last_synced: HashMap::new(),
             post_like_flight_seq: 0,
             post_like_in_flight: HashMap::new(),
             post_like_pending_toggle: HashSet::new(),
             post_like_last_synced: HashMap::new(),
-            comment_vote_gen: HashMap::new(),
+            comment_vote_flight_seq: 0,
+            comment_vote_in_flight: HashMap::new(),
+            comment_vote_dirty: HashSet::new(),
+            comment_vote_pending_dir: HashMap::new(),
+            comment_vote_last_synced: HashMap::new(),
             comment_like_flight_seq: 0,
             comment_like_in_flight: HashMap::new(),
             comment_like_pending_toggle: HashSet::new(),
@@ -1147,6 +1164,7 @@ impl Default for CommunityWorkspaceState {
             list_membership_dirty: HashSet::new(),
             list_membership_needs_feed_reload: HashSet::new(),
             list_membership_last_synced: HashMap::new(),
+            list_membership_toggle_seq: HashMap::new(),
             list_deleting: HashSet::new(),
             list_editor_open: false,
             list_editor: ListEditorDraft::default(),
@@ -1775,7 +1793,10 @@ impl CommunityWorkspaceState {
         self.bookmark_last_synced.remove(post_id);
         self.bookmark_cached_items.remove(post_id);
         self.bookmark_recent_overrides.remove(post_id);
-        self.post_vote_gen.remove(post_id);
+        self.post_vote_in_flight.remove(post_id);
+        self.post_vote_dirty.remove(post_id);
+        self.post_vote_pending_dir.remove(post_id);
+        self.post_vote_last_synced.remove(post_id);
         self.post_like_in_flight.remove(post_id);
         self.post_like_pending_toggle.remove(post_id);
         self.post_like_last_synced.remove(post_id);

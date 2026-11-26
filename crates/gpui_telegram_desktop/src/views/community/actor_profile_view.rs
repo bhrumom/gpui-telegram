@@ -339,8 +339,11 @@ impl CommunityWorkspace {
                         }
                         this.state.actor_block_pending_target.remove(&actor_id);
                         this.state.actor_block_last_synced.remove(&actor_id);
-                        this.state
-                            .reconcile_mute_block(&actor_id, None, Some(target_blocked));
+                        this.state.restore_block_and_follow(
+                            &actor_id,
+                            target_blocked,
+                            committed_following,
+                        );
                         if this.state.profile_loading {
                             if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
                                 this.load_actor_profile(h, cx);

@@ -133,6 +133,9 @@ fn dispatch_headless_target(target: &str, use_underscore_exit: bool) -> ! {
         "test_m5_r6_online_mute_block_like_and_comment_single_flight_races" => {
             |app| Box::pin(body_r6_online_mute_block_like_and_comment_single_flight_races(app))
         }
+        "test_m5_r7_online_consistency_races_all_5_fixes" => {
+            |app| Box::pin(body_r7_online_consistency_races_all_5_fixes(app))
+        }
         other => {
             eprintln!("unknown community M5 headless gpui test target: {other}");
             exit_headless_child(101, use_underscore_exit);
@@ -6364,6 +6367,7 @@ fn spawn_r6_single_flight_server(
                     res
                 } else if method == "POST" && path == comment_vote_path {
                     let req: VoteRequest = serde_json::from_slice(body_bytes).expect("parse vote");
+                    cvote_dir.store(req.direction, Ordering::SeqCst);
                     let seq = cvote_rx.fetch_add(1, Ordering::SeqCst);
                     let resp = VoteResponse {
                         target_id: comment_id.clone(),
@@ -6372,7 +6376,6 @@ fn spawn_r6_single_flight_server(
                         downvotes: i64::from(req.direction == -1),
                         score: i64::from(req.direction),
                     };
-                    cvote_dir.store(req.direction, Ordering::SeqCst);
                     if seq == 0 {
                         let delay = cvote_delay.load(Ordering::SeqCst);
                         if delay > 0 {
@@ -6760,7 +6763,7 @@ async fn body_r6_online_mute_block_like_and_comment_single_flight_races(mut app:
         );
     });
 
-    // 3d. Comment vote rapid +1(delayed 180ms) -> -1(fast): comment_vote_gen fences stale +1 response!
+    // 3d. Comment vote rapid +1(delayed 180ms) -> -1(fast): single-flight serializes +1 then -1!
     srv.comment_vote_first_delay_ms.store(180, Ordering::SeqCst);
     let _ = cw.update(&mut app, |w, cx| {
         w.vote_comment_action(comment_id.clone(), 1, cx);
@@ -6776,8 +6779,11 @@ async fn body_r6_online_mute_block_like_and_comment_single_flight_races(mut app:
         w.vote_comment_action(comment_id.clone(), -1, cx);
     });
     assert!(
-        pump_until(&mut app, Duration::from_secs(5), |_| {
-            srv.comment_vote_completed.load(Ordering::SeqCst) >= 2
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.comment_vote_in_flight.is_empty()
+                && st.comment_vote_dirty.is_empty()
+                && srv.comment_vote_completed.load(Ordering::SeqCst) >= 2
         })
         .await,
         "S2C-3b: both comment votes (including delayed +1) must complete"
@@ -6787,7 +6793,7 @@ async fn body_r6_online_mute_block_like_and_comment_single_flight_races(mut app:
         let c = w.state.find_comment(&comment_id).expect("comment present");
         assert_eq!(
             c.viewer_vote, -1,
-            "S2C-3b: comment_vote_gen must fence delayed +1 so UI stays -1"
+            "S2C-3b: single-flight comment vote must converge UI to -1"
         );
         assert_eq!(c.score, -1);
         assert_eq!(srv.comment_vote_dir.load(Ordering::SeqCst), -1);
@@ -6825,6 +6831,1174 @@ async fn body_r6_online_mute_block_like_and_comment_single_flight_races(mut app:
     });
     drop(rt_holder);
 }
+
+struct R7ConsistencyServerState {
+    // Fix 1: Block->Unblock vs load_actor_profile
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    following: Arc<std::sync::atomic::AtomicBool>,
+    profile_get_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    profile_get_received: Arc<std::sync::atomic::AtomicUsize>,
+    profile_get_completed: Arc<std::sync::atomic::AtomicUsize>,
+    block_set_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    block_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    block_in_flight_max: Arc<std::sync::atomic::AtomicUsize>,
+    block_set_completed: Arc<std::sync::atomic::AtomicUsize>,
+    block_remove_completed: Arc<std::sync::atomic::AtomicUsize>,
+
+    // Fix 2 & Fix 3: PostDetail Case B + Post/Comment single-flight votes + Comment like/edit/award
+    detail_get_next_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    detail_get_received: Arc<std::sync::atomic::AtomicUsize>,
+    detail_get_completed: Arc<std::sync::atomic::AtomicUsize>,
+
+    post_vote_dir: Arc<std::sync::atomic::AtomicI8>,
+    post_vote_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    post_vote_fail_500: Arc<std::sync::atomic::AtomicBool>,
+    post_vote_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    post_vote_in_flight_max: Arc<std::sync::atomic::AtomicUsize>,
+    post_vote_received: Arc<std::sync::atomic::AtomicUsize>,
+    post_vote_completed: Arc<std::sync::atomic::AtomicUsize>,
+
+    comment_vote_dir: Arc<std::sync::atomic::AtomicI8>,
+    comment_vote_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    comment_vote_fail_500: Arc<std::sync::atomic::AtomicBool>,
+    comment_vote_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    comment_vote_in_flight_max: Arc<std::sync::atomic::AtomicUsize>,
+    comment_vote_received: Arc<std::sync::atomic::AtomicUsize>,
+    comment_vote_completed: Arc<std::sync::atomic::AtomicUsize>,
+
+    comment_liked: Arc<std::sync::atomic::AtomicBool>,
+    comment_likes_count: Arc<std::sync::atomic::AtomicU64>,
+    comment_like_completed: Arc<std::sync::atomic::AtomicUsize>,
+    comment_body: Arc<std::sync::Mutex<String>>,
+    comment_awards_count: Arc<std::sync::atomic::AtomicU32>,
+
+    // Fix 4 & Fix 5: 2F_3D & 2F_3F list editor races
+    lists: Arc<std::sync::Mutex<Vec<CommunityListDto>>>,
+    lists_get_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    lists_get_received: Arc<std::sync::atomic::AtomicUsize>,
+    lists_get_completed: Arc<std::sync::atomic::AtomicUsize>,
+    list_toggle_patch_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    list_editor_patch_fail_500: Arc<std::sync::atomic::AtomicBool>,
+    list_editor_patch_completed: Arc<std::sync::atomic::AtomicUsize>,
+    list_toggle_patch_completed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn spawn_r7_consistency_server(
+    rt_handle: &tokio::runtime::Handle,
+    owner_id: String,
+    bot_id: String,
+    post_id: String,
+    comment_id: String,
+) -> (std::net::SocketAddr, R7ConsistencyServerState, AbortOnDrop) {
+    use gpui_telegram_proto::community_contracts::{
+        AwardResponse, GiveAwardRequest, PostAwardDto, UpdateCommentRequest,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let seed_lists = vec![
+        CommunityListDto {
+            list_id: "list_ed_toggle".to_string(),
+            owner_actor_id: owner_id.clone(),
+            name: "Original Name".to_string(),
+            description: "2F_3D target".to_string(),
+            kind: CommunityListKind::Mixed,
+            is_private: false,
+            is_pinned: false,
+            member_actor_ids: Vec::new(),
+            community_slugs: Vec::new(),
+            created_at_ms: 1_750_000_000_001,
+            updated_at_ms: 1_750_000_000_001,
+        },
+        CommunityListDto {
+            list_id: "list_ed_500".to_string(),
+            owner_actor_id: owner_id.clone(),
+            name: "Editor 500 List".to_string(),
+            description: "2F_3F target".to_string(),
+            kind: CommunityListKind::Mixed,
+            is_private: false,
+            is_pinned: false,
+            member_actor_ids: Vec::new(),
+            community_slugs: Vec::new(),
+            created_at_ms: 1_750_000_000_002,
+            updated_at_ms: 1_750_000_000_002,
+        },
+    ];
+
+    let state = R7ConsistencyServerState {
+        blocked: Arc::new(AtomicBool::new(false)),
+        following: Arc::new(AtomicBool::new(true)),
+        profile_get_delay_ms: Arc::new(AtomicU64::new(0)),
+        profile_get_received: Arc::new(AtomicUsize::new(0)),
+        profile_get_completed: Arc::new(AtomicUsize::new(0)),
+        block_set_delay_ms: Arc::new(AtomicU64::new(0)),
+        block_in_flight: Arc::new(AtomicUsize::new(0)),
+        block_in_flight_max: Arc::new(AtomicUsize::new(0)),
+        block_set_completed: Arc::new(AtomicUsize::new(0)),
+        block_remove_completed: Arc::new(AtomicUsize::new(0)),
+
+        detail_get_next_delay_ms: Arc::new(AtomicU64::new(0)),
+        detail_get_received: Arc::new(AtomicUsize::new(0)),
+        detail_get_completed: Arc::new(AtomicUsize::new(0)),
+
+        post_vote_dir: Arc::new(AtomicI8::new(0)),
+        post_vote_delay_ms: Arc::new(AtomicU64::new(0)),
+        post_vote_fail_500: Arc::new(AtomicBool::new(false)),
+        post_vote_in_flight: Arc::new(AtomicUsize::new(0)),
+        post_vote_in_flight_max: Arc::new(AtomicUsize::new(0)),
+        post_vote_received: Arc::new(AtomicUsize::new(0)),
+        post_vote_completed: Arc::new(AtomicUsize::new(0)),
+
+        comment_vote_dir: Arc::new(AtomicI8::new(0)),
+        comment_vote_delay_ms: Arc::new(AtomicU64::new(0)),
+        comment_vote_fail_500: Arc::new(AtomicBool::new(false)),
+        comment_vote_in_flight: Arc::new(AtomicUsize::new(0)),
+        comment_vote_in_flight_max: Arc::new(AtomicUsize::new(0)),
+        comment_vote_received: Arc::new(AtomicUsize::new(0)),
+        comment_vote_completed: Arc::new(AtomicUsize::new(0)),
+
+        comment_liked: Arc::new(AtomicBool::new(false)),
+        comment_likes_count: Arc::new(AtomicU64::new(0)),
+        comment_like_completed: Arc::new(AtomicUsize::new(0)),
+        comment_body: Arc::new(std::sync::Mutex::new(
+            "Initial r7 comment body".to_string(),
+        )),
+        comment_awards_count: Arc::new(AtomicU32::new(0)),
+
+        lists: Arc::new(std::sync::Mutex::new(seed_lists)),
+        lists_get_delay_ms: Arc::new(AtomicU64::new(0)),
+        lists_get_received: Arc::new(AtomicUsize::new(0)),
+        lists_get_completed: Arc::new(AtomicUsize::new(0)),
+        list_toggle_patch_delay_ms: Arc::new(AtomicU64::new(0)),
+        list_editor_patch_fail_500: Arc::new(AtomicBool::new(false)),
+        list_editor_patch_completed: Arc::new(AtomicUsize::new(0)),
+        list_toggle_patch_completed: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let blocked = Arc::clone(&state.blocked);
+    let following = Arc::clone(&state.following);
+    let prof_delay = Arc::clone(&state.profile_get_delay_ms);
+    let prof_rx = Arc::clone(&state.profile_get_received);
+    let prof_done = Arc::clone(&state.profile_get_completed);
+    let blk_delay = Arc::clone(&state.block_set_delay_ms);
+    let blk_if = Arc::clone(&state.block_in_flight);
+    let blk_if_max = Arc::clone(&state.block_in_flight_max);
+    let blk_set_done = Arc::clone(&state.block_set_completed);
+    let blk_rem_done = Arc::clone(&state.block_remove_completed);
+
+    let det_delay = Arc::clone(&state.detail_get_next_delay_ms);
+    let det_rx = Arc::clone(&state.detail_get_received);
+    let det_done = Arc::clone(&state.detail_get_completed);
+
+    let pvote_dir = Arc::clone(&state.post_vote_dir);
+    let pvote_delay = Arc::clone(&state.post_vote_delay_ms);
+    let pvote_fail = Arc::clone(&state.post_vote_fail_500);
+    let pvote_if = Arc::clone(&state.post_vote_in_flight);
+    let pvote_if_max = Arc::clone(&state.post_vote_in_flight_max);
+    let pvote_rx = Arc::clone(&state.post_vote_received);
+    let pvote_done = Arc::clone(&state.post_vote_completed);
+
+    let cvote_dir = Arc::clone(&state.comment_vote_dir);
+    let cvote_delay = Arc::clone(&state.comment_vote_delay_ms);
+    let cvote_fail = Arc::clone(&state.comment_vote_fail_500);
+    let cvote_if = Arc::clone(&state.comment_vote_in_flight);
+    let cvote_if_max = Arc::clone(&state.comment_vote_in_flight_max);
+    let cvote_rx = Arc::clone(&state.comment_vote_received);
+    let cvote_done = Arc::clone(&state.comment_vote_completed);
+
+    let cliked = Arc::clone(&state.comment_liked);
+    let clikes_cnt = Arc::clone(&state.comment_likes_count);
+    let clike_done = Arc::clone(&state.comment_like_completed);
+    let cbody = Arc::clone(&state.comment_body);
+    let cawards = Arc::clone(&state.comment_awards_count);
+
+    let lists = Arc::clone(&state.lists);
+    let lg_delay = Arc::clone(&state.lists_get_delay_ms);
+    let lg_rx = Arc::clone(&state.lists_get_received);
+    let lg_done = Arc::clone(&state.lists_get_completed);
+    let lt_delay = Arc::clone(&state.list_toggle_patch_delay_ms);
+    let le_fail = Arc::clone(&state.list_editor_patch_fail_500);
+    let le_done = Arc::clone(&state.list_editor_patch_completed);
+    let lt_done = Arc::clone(&state.list_toggle_patch_completed);
+
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind r7 mock");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    let addr = std_listener.local_addr().expect("local_addr");
+
+    let join = rt_handle.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener).expect("from_std");
+        let owner_actor = mock_actor_dto(&owner_id, ActorKind::Human, "r7_owner", "R7 Owner");
+
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let owner_id = owner_id.clone();
+            let bot_id = bot_id.clone();
+            let post_id = post_id.clone();
+            let comment_id = comment_id.clone();
+            let owner_actor = owner_actor.clone();
+
+            let blocked = Arc::clone(&blocked);
+            let following = Arc::clone(&following);
+            let prof_delay = Arc::clone(&prof_delay);
+            let prof_rx = Arc::clone(&prof_rx);
+            let prof_done = Arc::clone(&prof_done);
+            let blk_delay = Arc::clone(&blk_delay);
+            let blk_if = Arc::clone(&blk_if);
+            let blk_if_max = Arc::clone(&blk_if_max);
+            let blk_set_done = Arc::clone(&blk_set_done);
+            let blk_rem_done = Arc::clone(&blk_rem_done);
+
+            let det_delay = Arc::clone(&det_delay);
+            let det_rx = Arc::clone(&det_rx);
+            let det_done = Arc::clone(&det_done);
+
+            let pvote_dir = Arc::clone(&pvote_dir);
+            let pvote_delay = Arc::clone(&pvote_delay);
+            let pvote_fail = Arc::clone(&pvote_fail);
+            let pvote_if = Arc::clone(&pvote_if);
+            let pvote_if_max = Arc::clone(&pvote_if_max);
+            let pvote_rx = Arc::clone(&pvote_rx);
+            let pvote_done = Arc::clone(&pvote_done);
+
+            let cvote_dir = Arc::clone(&cvote_dir);
+            let cvote_delay = Arc::clone(&cvote_delay);
+            let cvote_fail = Arc::clone(&cvote_fail);
+            let cvote_if = Arc::clone(&cvote_if);
+            let cvote_if_max = Arc::clone(&cvote_if_max);
+            let cvote_rx = Arc::clone(&cvote_rx);
+            let cvote_done = Arc::clone(&cvote_done);
+
+            let cliked = Arc::clone(&cliked);
+            let clikes_cnt = Arc::clone(&clikes_cnt);
+            let clike_done = Arc::clone(&clike_done);
+            let cbody = Arc::clone(&cbody);
+            let cawards = Arc::clone(&cawards);
+
+            let lists = Arc::clone(&lists);
+            let lg_delay = Arc::clone(&lg_delay);
+            let lg_rx = Arc::clone(&lg_rx);
+            let lg_done = Arc::clone(&lg_done);
+            let lt_delay = Arc::clone(&lt_delay);
+            let le_fail = Arc::clone(&le_fail);
+            let le_done = Arc::clone(&le_done);
+            let lt_done = Arc::clone(&lt_done);
+
+            tokio::spawn(async move {
+                let mut buf = Vec::with_capacity(4096);
+                let mut tmp = [0u8; 2048];
+                let header_end = loop {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                            if buf.len() > 65536 {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let head_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let mut lines = head_str.lines();
+                let req_line = lines.next().unwrap_or("");
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET").to_string();
+                let full_target = parts.next().unwrap_or("/");
+                let (path, _query) = full_target
+                    .split_once('?')
+                    .map(|(p, q)| (p.to_string(), q.to_string()))
+                    .unwrap_or_else(|| (full_target.to_string(), String::new()));
+
+                let mut content_len: usize = 0;
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                while buf.len() < header_end + content_len {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let body_bytes = &buf[header_end..(header_end + content_len).min(buf.len())];
+
+                let post_detail_path = format!("/api/v1/community/posts/{post_id}");
+                let post_vote_path = format!("/api/v1/community/posts/{post_id}/vote");
+                let comment_path = format!("/api/v1/community/comments/{comment_id}");
+                let comment_vote_path = format!("/api/v1/community/comments/{comment_id}/vote");
+                let comment_like_path = format!("/api/v1/community/comments/{comment_id}/like");
+                let comment_award_path = format!("/api/v1/community/comments/{comment_id}/award");
+
+                let build_post = || {
+                    let mut p = mock_post_dto(&post_id, &owner_id, false, None, 0);
+                    let pv = pvote_dir.load(Ordering::SeqCst);
+                    p.viewer_vote = pv;
+                    p.upvotes = i64::from(pv == 1);
+                    p.downvotes = i64::from(pv == -1);
+                    p.score = i64::from(pv);
+                    p
+                };
+                let build_comment = || {
+                    let mut c = mock_comment_dto(&comment_id, &post_id, &owner_id);
+                    let cv = cvote_dir.load(Ordering::SeqCst);
+                    c.viewer_vote = cv;
+                    c.upvotes = i64::from(cv == 1);
+                    c.downvotes = i64::from(cv == -1);
+                    c.score = i64::from(cv);
+                    c.viewer_liked = cliked.load(Ordering::SeqCst);
+                    c.likes_count = clikes_cnt.load(Ordering::SeqCst);
+                    c.body = cbody.lock().unwrap().clone();
+                    let aw_n = cawards.load(Ordering::SeqCst);
+                    if aw_n > 0 {
+                        c.awards = vec![PostAwardDto {
+                            award_id: format!("aw_r7_{aw_n}"),
+                            award_kind: "gold".to_string(),
+                            icon_emoji: "🏆".to_string(),
+                            giver_actor_id: owner_id.clone(),
+                            giver_handle: "r7_owner".to_string(),
+                            message: None,
+                            created_at_ms: 1_750_000_001_000,
+                        }];
+                    }
+                    c
+                };
+
+                let (status, body) = if method == "GET" && path == "/api/v1/community/identities" {
+                    let resp = CommunityIdentitiesResponse {
+                        active_actor_id: owner_id.clone(),
+                        human_actor: Some(owner_actor.clone()),
+                        bot_actors: Vec::new(),
+                        all_actors: vec![owner_actor.clone()],
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST" && path == "/api/v1/community/identities/human" {
+                    ("200 OK", serde_json::to_string(&owner_actor).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/actors/r7_bot" {
+                    let mut actor = mock_actor_dto(&bot_id, ActorKind::Bot, "r7_bot", "R7 Bot");
+                    actor.is_blocked = blocked.load(Ordering::SeqCst);
+                    actor.is_following = following.load(Ordering::SeqCst);
+                    prof_rx.fetch_add(1, Ordering::SeqCst);
+                    let delay = prof_delay.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    prof_done.fetch_add(1, Ordering::SeqCst);
+                    let resp = ActorProfileResponse {
+                        actor,
+                        recent_posts: Vec::new(),
+                        recent_comments: Vec::new(),
+                        moderated_communities: Vec::new(),
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if (method == "POST" || method == "DELETE")
+                    && path == "/api/v1/community/mutes-blocks"
+                {
+                    let cur = blk_if.fetch_add(1, Ordering::SeqCst) + 1;
+                    blk_if_max.fetch_max(cur, Ordering::SeqCst);
+                    let res = if method == "POST" {
+                        let delay = blk_delay.swap(0, Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        blocked.store(true, Ordering::SeqCst);
+                        following.store(false, Ordering::SeqCst);
+                        blk_set_done.fetch_add(1, Ordering::SeqCst);
+                        let dto = CommunityMuteBlockDto {
+                            id: "mb_r7_blk".to_string(),
+                            owner_actor_id: owner_id.clone(),
+                            target_kind: MuteBlockTargetKind::Actor,
+                            target_value: bot_id.clone(),
+                            action: MuteBlockActionKind::Block,
+                            reason: None,
+                            created_at_ms: 1_750_000_000_000,
+                        };
+                        ("200 OK", serde_json::to_string(&dto).unwrap())
+                    } else {
+                        blocked.store(false, Ordering::SeqCst);
+                        blk_rem_done.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "200 OK",
+                            serde_json::to_string(&DeleteEntityResponse {
+                                id: bot_id.clone(),
+                                deleted: true,
+                            })
+                            .unwrap(),
+                        )
+                    };
+                    blk_if.fetch_sub(1, Ordering::SeqCst);
+                    res
+                } else if method == "GET" && path == post_detail_path {
+                    // Snapshot BEFORE optional delay so Case B slow GET returns stale pre-mutation state!
+                    let resp = PostDetailResponse {
+                        post: build_post(),
+                        thread_chain: Vec::new(),
+                        quote_chain: Vec::new(),
+                        comments: vec![build_comment()],
+                        total_comments: 1,
+                    };
+                    let delay = det_delay.swap(0, Ordering::SeqCst);
+                    det_rx.fetch_add(1, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    det_done.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST" && path == post_vote_path {
+                    let req: VoteRequest =
+                        serde_json::from_slice(body_bytes).expect("parse post vote");
+                    let cur = pvote_if.fetch_add(1, Ordering::SeqCst) + 1;
+                    pvote_if_max.fetch_max(cur, Ordering::SeqCst);
+                    let delay = pvote_delay.swap(0, Ordering::SeqCst);
+                    pvote_rx.fetch_add(1, Ordering::SeqCst);
+                    // Pre-commit delay simulates network/handler arrival reordering!
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let res = if pvote_fail.load(Ordering::SeqCst) {
+                        pvote_done.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "500 Internal Server Error",
+                            r#"{"error":"post_vote_500"}"#.to_string(),
+                        )
+                    } else {
+                        pvote_dir.store(req.direction, Ordering::SeqCst);
+                        pvote_done.fetch_add(1, Ordering::SeqCst);
+                        let resp = VoteResponse {
+                            target_id: post_id.clone(),
+                            direction: req.direction,
+                            upvotes: i64::from(req.direction == 1),
+                            downvotes: i64::from(req.direction == -1),
+                            score: i64::from(req.direction),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    };
+                    pvote_if.fetch_sub(1, Ordering::SeqCst);
+                    res
+                } else if method == "POST" && path == comment_vote_path {
+                    let req: VoteRequest =
+                        serde_json::from_slice(body_bytes).expect("parse comment vote");
+                    let cur = cvote_if.fetch_add(1, Ordering::SeqCst) + 1;
+                    cvote_if_max.fetch_max(cur, Ordering::SeqCst);
+                    let delay = cvote_delay.swap(0, Ordering::SeqCst);
+                    cvote_rx.fetch_add(1, Ordering::SeqCst);
+                    // Pre-commit delay simulates network/handler arrival reordering!
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let res = if cvote_fail.load(Ordering::SeqCst) {
+                        cvote_done.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "500 Internal Server Error",
+                            r#"{"error":"comment_vote_500"}"#.to_string(),
+                        )
+                    } else {
+                        cvote_dir.store(req.direction, Ordering::SeqCst);
+                        cvote_done.fetch_add(1, Ordering::SeqCst);
+                        let resp = VoteResponse {
+                            target_id: comment_id.clone(),
+                            direction: req.direction,
+                            upvotes: i64::from(req.direction == 1),
+                            downvotes: i64::from(req.direction == -1),
+                            score: i64::from(req.direction),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    };
+                    cvote_if.fetch_sub(1, Ordering::SeqCst);
+                    res
+                } else if method == "POST" && path == comment_like_path {
+                    let now = !cliked.load(Ordering::SeqCst);
+                    cliked.store(now, Ordering::SeqCst);
+                    let cnt = u64::from(now);
+                    clikes_cnt.store(cnt, Ordering::SeqCst);
+                    clike_done.fetch_add(1, Ordering::SeqCst);
+                    let resp = ToggleActionResponse {
+                        target_id: comment_id.clone(),
+                        active: now,
+                        count: cnt,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "PATCH" && path == comment_path {
+                    let req: UpdateCommentRequest =
+                        serde_json::from_slice(body_bytes).expect("parse comment edit");
+                    *cbody.lock().unwrap() = req.body;
+                    let mut c = build_comment();
+                    c.updated_at_ms = 1_750_000_001_000;
+                    ("200 OK", serde_json::to_string(&c).unwrap())
+                } else if method == "POST" && path == comment_award_path {
+                    let req: GiveAwardRequest =
+                        serde_json::from_slice(body_bytes).expect("parse comment award");
+                    let n = cawards.fetch_add(1, Ordering::SeqCst) + 1;
+                    let resp = AwardResponse {
+                        target_id: comment_id.clone(),
+                        awards: vec![PostAwardDto {
+                            award_id: format!("aw_r7_{n}"),
+                            award_kind: req.award_kind,
+                            icon_emoji: "🏆".to_string(),
+                            giver_actor_id: owner_id.clone(),
+                            giver_handle: "r7_owner".to_string(),
+                            message: None,
+                            created_at_ms: 1_750_000_001_000,
+                        }],
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/lists" {
+                    let snap = lists.lock().unwrap().clone();
+                    let delay = lg_delay.swap(0, Ordering::SeqCst);
+                    lg_rx.fetch_add(1, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    lg_done.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        serde_json::to_string(&CommunityListsResponse { lists: snap }).unwrap(),
+                    )
+                } else if method == "PATCH" && path.starts_with("/api/v1/community/lists/") {
+                    let lid = path.trim_start_matches("/api/v1/community/lists/").to_string();
+                    let req: UpdateCommunityListRequest =
+                        serde_json::from_slice(body_bytes).unwrap_or_default();
+                    let is_editor_patch = req.name.is_some();
+                    if is_editor_patch && le_fail.load(Ordering::SeqCst) {
+                        le_done.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "500 Internal Server Error",
+                            r#"{"error":"list_editor_500"}"#.to_string(),
+                        )
+                    } else {
+                        if !is_editor_patch {
+                            let delay = lt_delay.swap(0, Ordering::SeqCst);
+                            if delay > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                            }
+                        }
+                        let mut guard = lists.lock().unwrap();
+                        if let Some(l) = guard.iter_mut().find(|x| x.list_id == lid) {
+                            if let Some(n) = req.name {
+                                l.name = n;
+                            }
+                            if let Some(d) = req.description {
+                                l.description = d;
+                            }
+                            if let Some(k) = req.kind {
+                                l.kind = k;
+                            }
+                            if let Some(priv_) = req.is_private {
+                                l.is_private = priv_;
+                            }
+                            if let Some(p) = req.is_pinned {
+                                l.is_pinned = p;
+                            }
+                            if let Some(m) = req.member_actor_ids {
+                                l.member_actor_ids = m;
+                            }
+                            if let Some(s) = req.community_slugs {
+                                l.community_slugs = s;
+                            }
+                            let out = serde_json::to_string(l).unwrap();
+                            drop(guard);
+                            if is_editor_patch {
+                                le_done.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                lt_done.fetch_add(1, Ordering::SeqCst);
+                            }
+                            ("200 OK", out)
+                        } else {
+                            ("404 Not Found", r#"{"error":"not_found"}"#.to_string())
+                        }
+                    }
+                } else if method == "GET" && path == "/api/v1/community/feed" {
+                    let resp = FeedResponseDto {
+                        items: vec![FeedItemDto {
+                            post: build_post(),
+                            explanation: None,
+                            rank_score: 1.0,
+                            is_exploration_slot: false,
+                        }],
+                        next_cursor: None,
+                        ..Default::default()
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if path == "/api/v1/community/communities" {
+                    ("200 OK", serde_json::to_string(&ListCommunitiesResponse::default()).unwrap())
+                } else if path == "/api/v1/community/notifications" {
+                    ("200 OK", serde_json::to_string(&NotificationsListResponse::default()).unwrap())
+                } else if path == "/api/v1/community/trending" {
+                    ("200 OK", serde_json::to_string(&TrendingResponse::default()).unwrap())
+                } else if path == "/api/v1/community/algo-prefs" {
+                    ("200 OK", serde_json::to_string(&AlgoPreferencesDto::default()).unwrap())
+                } else {
+                    ("200 OK", "{}".to_string())
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    (addr, state, AbortOnDrop(join))
+}
+
+#[test]
+fn test_m5_r7_online_consistency_races_all_5_fixes() {
+    run_in_headless_subprocess("test_m5_r7_online_consistency_races_all_5_fixes");
+}
+
+async fn body_r7_online_consistency_races_all_5_fixes(mut app: AsyncApp) {
+    use std::sync::atomic::Ordering;
+
+    let dir = TempDir::new().expect("r7 consistency tempdir");
+    let rt_dir = TempDir::new().expect("r7 consistency rt tempdir");
+    let rt_holder = TelegramClient::open_with_dir(
+        ClientConfig {
+            server_url: "http://127.0.0.1:9".to_string(),
+            max_reconnect_attempts: 0,
+            ..Default::default()
+        },
+        rt_dir.path(),
+    )
+    .expect("open rt holder");
+    let owner_id = "u:907001".to_string();
+    let bot_id = "b:907001".to_string();
+    let post_id = "p_r7_cons_1".to_string();
+    let comment_id = "c_r7_cons_1".to_string();
+    let (addr, srv, _server_guard) = spawn_r7_consistency_server(
+        rt_holder.runtime().handle(),
+        owner_id.clone(),
+        bot_id.clone(),
+        post_id.clone(),
+        comment_id.clone(),
+    );
+
+    let client = Arc::new(
+        TelegramClient::open_with_dir(
+            ClientConfig {
+                server_url: format!("http://{addr}"),
+                max_reconnect_attempts: 0,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .expect("open r7 client"),
+    );
+    let auth = test_auth(907001, "r7_owner");
+    client.set_auth_session(auth.clone());
+    let client_win = Arc::clone(&client);
+    let auth_win = auth.clone();
+    let shell = app
+        .update(|cx| {
+            let _rt_guard = client_win.runtime().enter();
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client_win.clone(), cx);
+                s.apply_authenticated_session(auth_win.clone(), cx);
+                s
+            })
+        })
+        .expect("mount r7 AppShell");
+    let _ = shell.update(&mut app, |s, cx| s.open_community_workspace(cx));
+    let cw = shell
+        .read_with(&app, |s, _| s.community_workspace.clone().unwrap())
+        .unwrap();
+
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.feed_loading
+                && st.identities.is_some()
+                && st.feed_items.iter().any(|it| it.post.post_id == post_id)
+        })
+        .await,
+        "R7 host must bootstrap feed"
+    );
+
+    // ------------------------------------------------------------------
+    // Fix 1 (S2A-5b-6): Block -> Unblock while is_following==true racing load_actor_profile
+    // ------------------------------------------------------------------
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_actor_profile("r7_bot".to_string(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == bot_id && p.actor.is_following)
+        })
+        .await
+    );
+    let prof_rx_before = srv.profile_get_received.load(Ordering::SeqCst);
+    let prof_done_before = srv.profile_get_completed.load(Ordering::SeqCst);
+    srv.profile_get_delay_ms.store(90, Ordering::SeqCst);
+    srv.block_set_delay_ms.store(220, Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.load_actor_profile("r7_bot".to_string(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |_| {
+            srv.profile_get_received.load(Ordering::SeqCst) > prof_rx_before
+        })
+        .await,
+        "S2A-5b-6: load_actor_profile must capture pre-Block snapshot"
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.toggle_block_actor(bot_id.clone(), false, cx);
+        w.toggle_block_actor(bot_id.clone(), true, cx);
+        assert!(w.state.actor_block_in_flight.contains_key(&bot_id));
+        assert!(w.state.actor_block_dirty.contains(&bot_id));
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            srv.profile_get_completed.load(Ordering::SeqCst) > prof_done_before
+                && !cw.read(cx).state.profile_loading
+        })
+        .await,
+        "S2A-5b-6: stale load_actor_profile must settle mid-flight"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        let a = &w.state.actor_profile.as_ref().unwrap().actor;
+        assert!(
+            !a.is_blocked && !a.is_following,
+            "S2A-5b-6: mid-flight load_actor_profile must NEVER flash is_following=true"
+        );
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.actor_block_in_flight.is_empty()
+                && st.actor_block_dirty.is_empty()
+                && srv.block_set_completed.load(Ordering::SeqCst) == 1
+                && srv.block_remove_completed.load(Ordering::SeqCst) == 1
+        })
+        .await,
+        "S2A-5b-6: Block -> Unblock flights must settle sequentially"
+    );
+    assert_eq!(srv.block_in_flight_max.load(Ordering::SeqCst), 1);
+    let _ = cw.read_with(&app, |w, _| {
+        let a = &w.state.actor_profile.as_ref().unwrap().actor;
+        assert!(
+            !a.is_blocked
+                && !a.is_following
+                && !srv.blocked.load(Ordering::SeqCst)
+                && !srv.following.load(Ordering::SeqCst),
+            "S2A-5b-6: UI and server must converge to (blk=false, fol=false)"
+        );
+    });
+
+    // ------------------------------------------------------------------
+    // Fix 2 (S2C-4f): Comment vote, like, edit & award Case B vs slow load_post_detail
+    // ------------------------------------------------------------------
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_post_detail(post_id.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == post_id && d.comments.len() == 1)
+        })
+        .await
+    );
+    let det_rx_before = srv.detail_get_received.load(Ordering::SeqCst);
+    let det_done_before = srv.detail_get_completed.load(Ordering::SeqCst);
+    srv.detail_get_next_delay_ms.store(260, Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.load_post_detail(post_id.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |_| {
+            srv.detail_get_received.load(Ordering::SeqCst) > det_rx_before
+        })
+        .await,
+        "S2C-4f: slow load_post_detail must capture stale comment snapshot"
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_comment_action(comment_id.clone(), 1, cx);
+        w.toggle_comment_like_action(comment_id.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st.comment_vote_in_flight.is_empty()
+                && st.comment_like_in_flight.is_empty()
+                && srv.comment_vote_completed.load(Ordering::SeqCst) >= 1
+                && srv.comment_like_completed.load(Ordering::SeqCst) >= 1
+                && srv.detail_get_completed.load(Ordering::SeqCst) >= det_done_before + 2
+        })
+        .await,
+        "S2C-4f: comment vote/like Case B must trigger reload_detail_if_loading_post"
+    );
+    assert!(
+        srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_before + 2,
+        "S2C-4f: detail_calls must be >= 2 after Case B reload"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        let c = w.state.find_comment(&comment_id).expect("comment present");
+        assert_eq!(c.viewer_vote, 1);
+        assert_eq!(c.score, 1);
+        assert!(c.viewer_liked);
+        assert_eq!(c.likes_count, 1);
+        assert_eq!(srv.comment_vote_dir.load(Ordering::SeqCst), 1);
+        assert!(srv.comment_liked.load(Ordering::SeqCst));
+    });
+
+    // Also verify edit & award Case B reload_detail_if_loading_post
+    let det_rx_edit = srv.detail_get_received.load(Ordering::SeqCst);
+    let det_done_edit = srv.detail_get_completed.load(Ordering::SeqCst);
+    srv.detail_get_next_delay_ms.store(240, Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.load_post_detail(post_id.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |_| {
+            srv.detail_get_received.load(Ordering::SeqCst) > det_rx_edit
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.start_edit_comment(comment_id.clone(), "Edited Case B body".to_string(), cx);
+        w.submit_edit_comment(cx);
+        w.give_comment_award_action(comment_id.clone(), "gold".to_string(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && srv.comment_awards_count.load(Ordering::SeqCst) >= 1
+                && srv.detail_get_completed.load(Ordering::SeqCst) >= det_done_edit + 2
+        })
+        .await
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        let c = w.state.find_comment(&comment_id).expect("comment present");
+        assert_eq!(c.body, "Edited Case B body");
+        assert_eq!(c.awards.len(), 1);
+        assert_eq!(c.awards[0].award_kind, "gold");
+    });
+
+    // ------------------------------------------------------------------
+    // Fix 3 (S2C-3c-1, S2C-3c-2, S2C-4d, S2C-4e): Single-flight + last_synced for vote_post & vote_comment_action
+    // ------------------------------------------------------------------
+    // 3A. Establish post vote (1, 1), then rapid +1 -> -1 under HTTP 500 -> rolls back to (1, 1)
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_post(post_id.clone(), 1, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            cw.read(cx).state.post_vote_in_flight.is_empty()
+                && srv.post_vote_completed.load(Ordering::SeqCst) == 1
+        })
+        .await
+    );
+    srv.post_vote_in_flight_max.store(0, Ordering::SeqCst);
+    srv.post_vote_fail_500.store(true, Ordering::SeqCst);
+    srv.post_vote_delay_ms.store(120, Ordering::SeqCst);
+    let pv_done_500 = srv.post_vote_completed.load(Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_post(post_id.clone(), 1, cx);
+        w.vote_post(post_id.clone(), -1, cx);
+        assert!(w.state.post_vote_in_flight.contains_key(&post_id));
+        assert!(w.state.post_vote_dirty.contains(&post_id));
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_vote_in_flight.is_empty()
+                && st.post_vote_dirty.is_empty()
+                && srv.post_vote_completed.load(Ordering::SeqCst) > pv_done_500
+        })
+        .await
+    );
+    assert_eq!(srv.post_vote_in_flight_max.load(Ordering::SeqCst), 1);
+    let _ = cw.read_with(&app, |w, _| {
+        let p = w.state.find_post(&post_id).expect("post present");
+        assert_eq!(
+            (p.viewer_vote, p.score),
+            (1, 1),
+            "S2C-3c-1: rapid +1->-1 HTTP 500 must roll back to server truth (1, 1)"
+        );
+        assert_eq!(srv.post_vote_dir.load(Ordering::SeqCst), 1);
+    });
+
+    // 3B. vote_post pre-commit delayed reorder +1(180ms) -> -1(fast)
+    srv.post_vote_in_flight_max.store(0, Ordering::SeqCst);
+    srv.post_vote_fail_500.store(false, Ordering::SeqCst);
+    srv.post_vote_delay_ms.store(180, Ordering::SeqCst);
+    let pv_rx_reord = srv.post_vote_received.load(Ordering::SeqCst);
+    let pv_done_reord = srv.post_vote_completed.load(Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_post(post_id.clone(), 1, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |_| {
+            srv.post_vote_received.load(Ordering::SeqCst) > pv_rx_reord
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_post(post_id.clone(), -1, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_vote_in_flight.is_empty()
+                && st.post_vote_dirty.is_empty()
+                && srv.post_vote_completed.load(Ordering::SeqCst) >= pv_done_reord + 2
+        })
+        .await
+    );
+    assert_eq!(
+        srv.post_vote_in_flight_max.load(Ordering::SeqCst),
+        1,
+        "S2C-3c-2: single-flight vote_post must have in_flight_max == 1"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        let p = w.state.find_post(&post_id).expect("post present");
+        assert_eq!((p.viewer_vote, p.score), (-1, -1));
+        assert_eq!(srv.post_vote_dir.load(Ordering::SeqCst), -1);
+    });
+
+    // 3C. vote_comment_action rapid +1 -> -1 under HTTP 500 -> rolls back to server truth (1, 1)
+    srv.comment_vote_in_flight_max.store(0, Ordering::SeqCst);
+    srv.comment_vote_fail_500.store(true, Ordering::SeqCst);
+    srv.comment_vote_delay_ms.store(120, Ordering::SeqCst);
+    let cv_done_500 = srv.comment_vote_completed.load(Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_comment_action(comment_id.clone(), 1, cx);
+        w.vote_comment_action(comment_id.clone(), -1, cx);
+        assert!(w.state.comment_vote_in_flight.contains_key(&comment_id));
+        assert!(w.state.comment_vote_dirty.contains(&comment_id));
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            st.comment_vote_in_flight.is_empty()
+                && st.comment_vote_dirty.is_empty()
+                && srv.comment_vote_completed.load(Ordering::SeqCst) > cv_done_500
+        })
+        .await
+    );
+    assert_eq!(srv.comment_vote_in_flight_max.load(Ordering::SeqCst), 1);
+    let _ = cw.read_with(&app, |w, _| {
+        let c = w.state.find_comment(&comment_id).expect("comment present");
+        assert_eq!(
+            (c.viewer_vote, c.score),
+            (1, 1),
+            "S2C-4d: comment vote rapid +1->-1 HTTP 500 must roll back to server truth (1, 1)"
+        );
+        assert_eq!(srv.comment_vote_dir.load(Ordering::SeqCst), 1);
+    });
+
+    // 3D. vote_comment_action pre-commit delayed reorder +1(180ms) -> -1(fast)
+    srv.comment_vote_in_flight_max.store(0, Ordering::SeqCst);
+    srv.comment_vote_fail_500.store(false, Ordering::SeqCst);
+    srv.comment_vote_delay_ms.store(180, Ordering::SeqCst);
+    let cv_rx_reord = srv.comment_vote_received.load(Ordering::SeqCst);
+    let cv_done_reord = srv.comment_vote_completed.load(Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_comment_action(comment_id.clone(), 1, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |_| {
+            srv.comment_vote_received.load(Ordering::SeqCst) > cv_rx_reord
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.vote_comment_action(comment_id.clone(), -1, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.comment_vote_in_flight.is_empty()
+                && st.comment_vote_dirty.is_empty()
+                && srv.comment_vote_completed.load(Ordering::SeqCst) >= cv_done_reord + 2
+        })
+        .await
+    );
+    assert_eq!(
+        srv.comment_vote_in_flight_max.load(Ordering::SeqCst),
+        1,
+        "S2C-4e: single-flight vote_comment_action must have in_flight_max == 1"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        let c = w.state.find_comment(&comment_id).expect("comment present");
+        assert_eq!((c.viewer_vote, c.score), (-1, -1));
+        assert_eq!(srv.comment_vote_dir.load(Ordering::SeqCst), -1);
+    });
+
+    // ------------------------------------------------------------------
+    // Fix 4 (2F_3D): submit_list_editor racing fast-settled pin + actor toggle + subsequent community toggle
+    // ------------------------------------------------------------------
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::BookmarksLists, cx);
+        w.set_bookmarks_section(BookmarksListsSection::Lists, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.saved_loading && st.lists.iter().any(|l| l.list_id == "list_ed_toggle")
+        })
+        .await
+    );
+    let lg_rx_2f3d = srv.lists_get_received.load(Ordering::SeqCst);
+    let lg_done_2f3d = srv.lists_get_completed.load(Ordering::SeqCst);
+    srv.lists_get_delay_ms.store(240, Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        let target = w
+            .state
+            .lists
+            .iter()
+            .find(|l| l.list_id == "list_ed_toggle")
+            .cloned()
+            .expect("list_ed_toggle present");
+        w.open_edit_list_form(target, cx);
+        w.state.list_editor.name = "Renamed List".to_string();
+        w.submit_list_editor(cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |_| {
+            srv.list_editor_patch_completed.load(Ordering::SeqCst) >= 1
+                && srv.lists_get_received.load(Ordering::SeqCst) > lg_rx_2f3d
+        })
+        .await,
+        "2F_3D: editor PATCH must commit and enter delayed GET /lists"
+    );
+    let lt_before_2f3d = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.toggle_list_pinned("list_ed_toggle".to_string(), true, cx);
+        w.toggle_selected_list_actor("list_ed_toggle".to_string(), "u:300".to_string(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) >= lt_before_2f3d + 1
+        })
+        .await,
+        "2F_3D: fast quick-toggles must settle before delayed GET /lists returns"
+    );
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_editor.submitting
+                && srv.lists_get_completed.load(Ordering::SeqCst) > lg_done_2f3d
+                && st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+        })
+        .await,
+        "2F_3D: delayed submit_list_editor and any re-flush must settle"
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.toggle_selected_list_community("list_ed_toggle".to_string(), "rust".to_string(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            st.list_membership_in_flight.is_empty() && st.list_membership_dirty.is_empty()
+        })
+        .await
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        let ui = w
+            .state
+            .lists
+            .iter()
+            .find(|l| l.list_id == "list_ed_toggle")
+            .expect("list_ed_toggle in UI");
+        let guard = srv.lists.lock().unwrap();
+        let sv = guard
+            .iter()
+            .find(|l| l.list_id == "list_ed_toggle")
+            .expect("list_ed_toggle on server");
+        assert_eq!(ui.name, "Renamed List");
+        assert!(ui.is_pinned);
+        assert_eq!(ui.member_actor_ids, vec!["u:300".to_string()]);
+        assert_eq!(ui.community_slugs, vec!["rust".to_string()]);
+        assert_eq!(sv.name, "Renamed List");
+        assert!(sv.is_pinned);
+        assert_eq!(sv.member_actor_ids, vec!["u:300".to_string()]);
+        assert_eq!(sv.community_slugs, vec!["rust".to_string()]);
+    });
+
+    // ------------------------------------------------------------------
+    // Fix 5 (2F_3F): submit_list_editor HTTP 500 while Flight 1 in-flight + u:300 dirty
+    // ------------------------------------------------------------------
+    let lt_before_2f3f = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    let le_before_2f3f = srv.list_editor_patch_completed.load(Ordering::SeqCst);
+    srv.list_toggle_patch_delay_ms.store(180, Ordering::SeqCst);
+    srv.list_editor_patch_fail_500.store(true, Ordering::SeqCst);
+    let _ = cw.update(&mut app, |w, cx| {
+        let target = w
+            .state
+            .lists
+            .iter()
+            .find(|l| l.list_id == "list_ed_500")
+            .cloned()
+            .expect("list_ed_500 present");
+        w.open_edit_list_form(target, cx);
+        w.state.list_editor.name = "Should Fail 500".to_string();
+        w.toggle_list_pinned("list_ed_500".to_string(), true, cx);
+        w.toggle_selected_list_actor("list_ed_500".to_string(), "u:300".to_string(), cx);
+        assert!(w.state.list_membership_in_flight.contains_key("list_ed_500"));
+        assert!(w.state.list_membership_dirty.contains("list_ed_500"));
+        w.submit_list_editor(cx);
+        assert!(
+            w.state.list_membership_dirty.contains("list_ed_500"),
+            "2F_3F: submit_list_editor must NEVER eagerly remove list_membership_dirty pre-RPC"
+        );
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_editor.submitting
+                && st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+                && srv.list_editor_patch_completed.load(Ordering::SeqCst) > le_before_2f3f
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) >= lt_before_2f3f + 2
+        })
+        .await,
+        "2F_3F: Flight 1 and dirty Flight 2 must both flush despite editor HTTP 500"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        assert!(
+            w.state.list_editor.error.is_some(),
+            "2F_3F: failed editor PATCH must report error"
+        );
+        let ui = w
+            .state
+            .lists
+            .iter()
+            .find(|l| l.list_id == "list_ed_500")
+            .expect("list_ed_500 in UI");
+        let guard = srv.lists.lock().unwrap();
+        let sv = guard
+            .iter()
+            .find(|l| l.list_id == "list_ed_500")
+            .expect("list_ed_500 on server");
+        assert!(ui.is_pinned && ui.member_actor_ids == vec!["u:300".to_string()]);
+        assert!(sv.is_pinned && sv.member_actor_ids == vec!["u:300".to_string()]);
+    });
+
+    drop(rt_holder);
+}
+
 
 
 
