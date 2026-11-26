@@ -87,6 +87,9 @@ jobs:
           cargo nextest run --profile ci \
             -p gpui_telegram_core \
             -p gpui_telegram_proto \
+            -p orca_core \
+            -p orca_bots \
+            -p orca_ide \
             -p fabushi_remote_engine \
             -p gpui_telegram_server \
             -p gpui_telegram_client \
@@ -134,6 +137,9 @@ jobs:
           cargo nextest run --profile ci \
             -p gpui_telegram_core \
             -p gpui_telegram_proto \
+            -p orca_core \
+            -p orca_bots \
+            -p orca_ide \
             -p fabushi_remote_engine \
             -p gpui_telegram_media \
             -p gpui_telegram_webrtc \
@@ -204,6 +210,7 @@ jobs:
           cargo test --profile ci -p fabushi_remote_engine --test engine_tests
           cargo test --profile ci -p gpui_telegram_client --lib config::tests
           cargo test --profile ci -p gpui_telegram_community --features sqlite --lib
+          cargo test --profile ci -p orca_core --lib
           cargo build --profile ci --bin gpui_telegram_desktop --bin fabushi --bin fabushi-remote-daemon
       - name: Clean Temp Garbage
         shell: bash
