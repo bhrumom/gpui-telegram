@@ -3539,6 +3539,7 @@ dependencies = [
  "mahayana-host-runtime",
  "mahayana-node-agent-coordinator",
  "objc",
+ "openbot_contracts",
  "parking_lot",
  "qrcode",
  "raw-window-handle",
@@ -5766,7 +5767,6 @@ dependencies = [
  "uuid",
 ]
 
-
 [[package]]
 name = "openbot_storage"
 version = "1.6.15"
@@ -5783,7 +5783,6 @@ dependencies = [
  "thiserror 2.0.21",
  "uuid",
 ]
-
 
 [[package]]
 name = "openssl-probe"

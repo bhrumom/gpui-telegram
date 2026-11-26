@@ -40,3 +40,11 @@ pub mod payments;
 pub use payments::*;
 pub mod statistics;
 pub use statistics::*;
+
+pub mod openbot_palette;
+pub use openbot_palette::{
+    AppThemePalette, ChatBackdropScene, OpenBotColorScheme, OpenBotPalette, ThemeDirectoryWatcher,
+    ThemeEvalReport, ThemeEvalRequest, ThemeHotReloadProbeReport, ThemePaletteError,
+    ThemeSweepReducedMotionProbeReport, evaluate_theme_spec, probe_theme_hot_reload,
+    probe_theme_sweep_reduced_motion,
+};

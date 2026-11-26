@@ -73,12 +73,190 @@ pub fn render_fabushi_shape_avatar(
             .child(initials);
     }
 
+    if let Some(openbot_div) =
+        render_openbot_prefixed_avatar(norm, format!("#{:06x}", bg_hex & 0xFF_FFFF), label, GrokPersonaState::Idle, size_px, pal_paper_default())
+    {
+        return openbot_div;
+    }
+
     render_grok_bot_avatar(GrokBotAvatarProps::new(
         label,
         shape,
         format!("#{:06X}", bg_hex & 0xFF_FFFF),
         size_px,
     ))
+}
+
+const fn pal_paper_default() -> &'static str {
+    crate::components::bloub_avatar::DEFAULT_PAPER
+}
+
+fn grok_persona_to_openbot_mood(state: GrokPersonaState) -> openbot_contracts::avatar::AvatarMood {
+    use openbot_contracts::avatar::AvatarMood;
+    match state {
+        GrokPersonaState::Sleeping | GrokPersonaState::Drowsy | GrokPersonaState::PoweringDown => {
+            AvatarMood::Asleep
+        }
+        GrokPersonaState::Thinking
+        | GrokPersonaState::Searching
+        | GrokPersonaState::Working
+        | GrokPersonaState::Writing
+        | GrokPersonaState::Sending
+        | GrokPersonaState::Uploading => AvatarMood::Working,
+        GrokPersonaState::Loading | GrokPersonaState::Spawning | GrokPersonaState::Receiving => {
+            AvatarMood::Connecting
+        }
+        GrokPersonaState::Notifying
+        | GrokPersonaState::Alerting
+        | GrokPersonaState::Listening
+        | GrokPersonaState::Dictating => AvatarMood::Waiting,
+        GrokPersonaState::Sad | GrokPersonaState::Scared | GrokPersonaState::Angry => {
+            AvatarMood::Failed
+        }
+        GrokPersonaState::Happy
+        | GrokPersonaState::Laughing
+        | GrokPersonaState::Celebrate
+        | GrokPersonaState::Proud
+        | GrokPersonaState::Excited => AvatarMood::Responded,
+        _ => AvatarMood::Idle,
+    }
+}
+
+fn is_usable_custom_avatar_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(rest) = trimmed.strip_prefix("data:") {
+        let Some((_, b64)) = rest.split_once(";base64,") else {
+            return false;
+        };
+        use base64::Engine as _;
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            return false;
+        };
+        return image::guess_format(&raw).is_ok();
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with("file://") {
+        let fs_path = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+        return std::path::Path::new(fs_path).is_file();
+    }
+    trimmed.starts_with("http://") || trimmed.starts_with("https://")
+}
+
+fn is_openbot_prefixed_shape(shape: &str) -> bool {
+    let lower = shape.trim().to_ascii_lowercase();
+    lower == "bloub"
+        || lower == "plush"
+        || lower.starts_with("bloub:")
+        || lower.starts_with("plush:")
+}
+
+fn render_openbot_prefixed_avatar(
+    raw_shape: &str,
+    color_hex: String,
+    label: &str,
+    persona_state: GrokPersonaState,
+    size_px: f32,
+    paper_hex: &str,
+) -> Option<Div> {
+    use crate::components::bloub_avatar::{
+        BloubBotEngine, PlushCharacterId, PlushFeltRenderer, bloub_shape_to_engine,
+        bloub_to_engine_shape, render_flat_bloub_element, render_plush_avatar_element,
+        render_plush_seed_avatar, small_size_eye_scale,
+    };
+    use openbot_contracts::avatar::{
+        BloubShape, avatar_mood_presentation, bloub_avatar_profile, plush_mood_presentation,
+        seeded_expression,
+    };
+
+    let trimmed = raw_shape.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let mood = grok_persona_to_openbot_mood(persona_state);
+    let explicit_hex = openbot_contracts::avatar::is_avatar_color(&color_hex).then_some(color_hex.as_str());
+
+    if lower == "bloub" || lower.starts_with("bloub:") {
+        let suffix = trimmed
+            .split_once(':')
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("");
+        let suffix_lower = suffix.to_ascii_lowercase();
+        let mood_pres = avatar_mood_presentation(mood);
+        if let Some(bloub_shape) = BloubShape::parse(&suffix_lower) {
+            let seed = if label.trim().is_empty() {
+                &suffix_lower
+            } else {
+                label.trim()
+            };
+            let expr = mood_pres.expression.unwrap_or_else(|| seeded_expression(seed));
+            let engine = BloubBotEngine::new(
+                bloub_to_engine_shape(bloub_shape),
+                expr,
+                mood_pres.state.to_parametric(),
+            );
+            let sample = engine.sample(0.0, true);
+            let ink = explicit_hex.unwrap_or("#e8483f");
+            return Some(render_flat_bloub_element(&sample, ink, paper_hex, size_px));
+        }
+        let seed = if suffix.is_empty() { label.trim() } else { suffix };
+        let profile = bloub_avatar_profile(seed, None, explicit_hex);
+        let expr = mood_pres.expression.unwrap_or(profile.expression);
+        let engine = BloubBotEngine::new(
+            bloub_to_engine_shape(profile.shape),
+            expr,
+            mood_pres.state.to_parametric(),
+        );
+        let sample = engine.sample(0.0, true);
+        return Some(render_flat_bloub_element(&sample, &profile.color, paper_hex, size_px));
+    }
+
+    if lower == "plush" || lower.starts_with("plush:") {
+        let suffix = trimmed
+            .split_once(':')
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("");
+        let suffix_lower = suffix.to_ascii_lowercase();
+        let mood_pres = plush_mood_presentation(mood);
+        if let Some(ch) = PlushCharacterId::parse(&suffix_lower) {
+            let mut renderer = PlushFeltRenderer::for_character(ch, mood_pres.state);
+            if let Some(expr) = mood_pres.expression {
+                renderer.set_expression(expr);
+            }
+            renderer.set_eye_scale(small_size_eye_scale(size_px));
+            let sample = renderer.sample_plush_frame(0.0, true);
+            return Some(render_plush_avatar_element(&sample, size_px));
+        }
+        if let Some(bloub_shape) = BloubShape::parse(&suffix_lower) {
+            let seed = if label.trim().is_empty() {
+                &suffix_lower
+            } else {
+                label.trim()
+            };
+            let expr = mood_pres.expression.unwrap_or_else(|| seeded_expression(seed));
+            let ink = explicit_hex.unwrap_or("#e8483f");
+            let mut renderer = PlushFeltRenderer::new(
+                bloub_shape_to_engine(bloub_shape),
+                ink,
+                expr,
+                mood_pres.state,
+            );
+            renderer.set_eye_scale(small_size_eye_scale(size_px));
+            let sample = renderer.sample_plush_frame(0.0, true);
+            return Some(render_plush_avatar_element(&sample, size_px));
+        }
+        let seed = if suffix.is_empty() { label.trim() } else { suffix };
+        return Some(render_plush_seed_avatar(
+            seed,
+            None,
+            explicit_hex,
+            mood,
+            0.0,
+            true,
+            size_px,
+        ));
+    }
+
+    None
 }
 
 pub struct Avatar {
@@ -160,6 +338,41 @@ impl Render for Avatar {
             .as_deref()
             .and_then(parse_fabushi_hex_color)
             .unwrap_or(self.color);
+
+        let usable_url = self
+            .avatar_url
+            .as_deref()
+            .filter(|u| is_usable_custom_avatar_url(u));
+
+        if let Some(shape) = &self.shape {
+            if is_openbot_prefixed_shape(shape) && usable_url.is_none() {
+                let hex_color = format!("#{:06x}", resolved_color & 0xFF_FFFF);
+                let paper_hex = format!("#{:06x}", pal.dialogs_bg & 0xFF_FFFF);
+                if let Some(openbot_el) = render_openbot_prefixed_avatar(
+                    shape,
+                    hex_color,
+                    &self.label,
+                    self.persona_state,
+                    self.size,
+                    &paper_hex,
+                ) {
+                    return openbot_el.when(self.is_online, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .w(px(dot_size))
+                                .h(px(dot_size))
+                                .rounded_full()
+                                .bg(rgb(pal.online_dot_fg))
+                                .border_2()
+                                .border_color(rgb(pal.dialogs_bg)),
+                        )
+                    });
+                }
+            }
+        }
 
         if let (Some(shape), None) = (&self.shape, &self.avatar_url) {
             if !shape.trim().eq_ignore_ascii_case("classic") {

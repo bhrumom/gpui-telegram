@@ -29,3 +29,9 @@ pub use thinking_bubble::ThinkingBubble;
 pub use tool_permission_dock::ToolPermissionDock;
 pub use vnc_canvas::VncCanvas;
 pub use voice_bubble_player::VoiceBubblePlayer;
+
+pub mod bloub_avatar;
+pub use bloub_avatar::{
+    AvatarEvalError, AvatarEvalReport, AvatarEvalRequest, AvatarImageNormalizer, BloubBotEngine,
+    ChannelAvatarCluster, CrewPile, CrewPilePhysics, PlushFeltRenderer, evaluate_avatar_spec,
+};
