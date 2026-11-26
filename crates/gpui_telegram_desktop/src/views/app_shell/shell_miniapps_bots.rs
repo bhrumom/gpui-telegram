@@ -7,7 +7,9 @@ use gpui_telegram_proto::miniapp_contracts::{
     FabushiBotSummaryDto, MiniAppControlMode, MiniAppLaunchMode, MiniAppTakeoverEvent,
 };
 
-use crate::components::bots::bot_attach_web_view::{BotAttachWebView, BotWebViewPendingAction};
+use crate::components::bots::bot_attach_web_view::{
+    BotAttachWebView, BotWebViewInputTarget, BotWebViewPendingAction,
+};
 use crate::i18n::tr_str;
 use crate::views::app_shell::shell_actions::resolve_active_target_chat_id;
 use crate::views::app_shell::shell_truth::{proto_keyboard_to_stage, ClientCallFence};
@@ -209,7 +211,24 @@ impl AppShell {
             w.set_language(lang);
             w
         });
-        cx.observe(&ent, |shell: &mut AppShell, ov: Entity<BotAttachWebView>, cx: &mut Context<AppShell>| {
+        let mut prev_miniapp_input: Option<BotWebViewInputTarget> = None;
+        let mut prev_miniapp_visible = false;
+        cx.observe(&ent, move |shell: &mut AppShell, ov: Entity<BotAttachWebView>, cx: &mut Context<AppShell>| {
+            let (cur_visible, cur_input) = {
+                let w = ov.read(cx);
+                (
+                    w.is_open && !shell.miniapps.is_miniapp_minimized,
+                    w.focused_input.clone(),
+                )
+            };
+            if prev_miniapp_visible
+                && prev_miniapp_input.is_some()
+                && (cur_input != prev_miniapp_input || !cur_visible)
+            {
+                shell.clear_ime_if_miniapp_unoccluded(cx);
+            }
+            prev_miniapp_visible = cur_visible;
+            prev_miniapp_input = cur_input;
             shell.drain_miniapp_overlay_actions(&ov, cx);
         })
         .detach();
@@ -241,9 +260,24 @@ impl AppShell {
             b.set_detected_coding_providers(detected, Some(device_id));
             b
         });
+        let mut prev_state = (false, false, false, false, 0u8);
         cx.observe(
             &ent,
-            |shell: &mut AppShell, box_ent: Entity<CreateManagedBotBoxPeers>, cx: &mut Context<AppShell>| {
+            move |shell: &mut AppShell, box_ent: Entity<CreateManagedBotBoxPeers>, cx: &mut Context<AppShell>| {
+                let cur_state = {
+                    let b = box_ent.read(cx);
+                    (
+                        b.is_visible,
+                        b.is_ai_mode,
+                        b.is_fabushi_mode,
+                        b.is_coding_agent_mode,
+                        b.active_field,
+                    )
+                };
+                if (prev_state.0 || cur_state.0) && cur_state != prev_state {
+                    shell.clear_ime_if_create_bot_box_unoccluded(cx);
+                }
+                prev_state = cur_state;
                 shell.drain_create_bot_box_actions(&box_ent, cx);
             },
         )
@@ -255,6 +289,8 @@ impl AppShell {
     /// Opens the natural-language bot and Mini-App creator modal.
     pub fn open_nl_creator_modal(&mut self, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        self.blur_composer_and_cancel_ime(cx);
         let box_ent = self.ensure_create_bot_box(cx);
         box_ent.update(cx, |b, b_cx| {
             b.open_ai_creator();
@@ -263,9 +299,13 @@ impl AppShell {
         self.enter_compose_or_modal_isolation(cx);
         self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
-        self.sidebar.update(cx, |s, _| {
+        self.sidebar.update(cx, |s, scx| {
+            let changed = s.is_account_popover_open || s.search_focused;
             s.is_account_popover_open = false;
             s.search_focused = false;
+            if changed {
+                scx.notify();
+            }
         });
         cx.notify();
     }
@@ -273,6 +313,8 @@ impl AppShell {
     /// Opens the first-class Fabushi Bot creator modal (isolated workspace + Hermes agent).
     pub fn open_fabushi_creator_modal(&mut self, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        self.blur_composer_and_cancel_ime(cx);
         let box_ent = self.ensure_create_bot_box(cx);
         box_ent.update(cx, |b, b_cx| {
             b.open_fabushi_creator();
@@ -281,9 +323,13 @@ impl AppShell {
         self.enter_compose_or_modal_isolation(cx);
         self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
-        self.sidebar.update(cx, |s, _| {
+        self.sidebar.update(cx, |s, scx| {
+            let changed = s.is_account_popover_open || s.search_focused;
             s.is_account_popover_open = false;
             s.search_focused = false;
+            if changed {
+                scx.notify();
+            }
         });
         cx.notify();
     }
@@ -291,6 +337,8 @@ impl AppShell {
     /// Opens the Local Coding Agent Bot creator modal and triggers provider detection.
     pub fn open_coding_agent_creator_modal(&mut self, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
+        self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        self.blur_composer_and_cancel_ime(cx);
         let box_ent = self.ensure_create_bot_box(cx);
         box_ent.update(cx, |b, b_cx| {
             b.open_coding_agent_creator();
@@ -299,9 +347,13 @@ impl AppShell {
         self.enter_compose_or_modal_isolation(cx);
         self.refresh_detected_coding_providers(cx);
         self.main_menu_drawer.update(cx, |m, _| m.close());
-        self.sidebar.update(cx, |s, _| {
+        self.sidebar.update(cx, |s, scx| {
+            let changed = s.is_account_popover_open || s.search_focused;
             s.is_account_popover_open = false;
             s.search_focused = false;
+            if changed {
+                scx.notify();
+            }
         });
         cx.notify();
     }
@@ -325,6 +377,7 @@ impl AppShell {
                 )
             });
         if closed {
+            self.clear_ime_if_create_bot_box_unoccluded(cx);
             self.miniapps.create_bot_box = None;
             if !self.is_compose_or_creation_modal_active(cx) {
                 self.exit_compose_or_modal_isolation(true, cx);
@@ -380,6 +433,7 @@ impl AppShell {
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
                             if modal_still_open {
+                                shell.clear_ime_if_create_bot_box_unoccluded(cx);
                                 shell.miniapps.create_bot_box = None;
                                 if cid > 0 {
                                     shell.open_or_select_chat(
@@ -455,6 +509,7 @@ impl AppShell {
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
                             if modal_still_open {
+                                shell.clear_ime_if_create_bot_box_unoccluded(cx);
                                 shell.miniapps.create_bot_box = None;
                                 if cid > 0 {
                                     shell.open_or_select_chat(
@@ -552,6 +607,7 @@ impl AppShell {
                             shell.refresh_chats(cx);
                             shell.refresh_miniapps_catalog(None, cx);
                             if modal_still_open {
+                                shell.clear_ime_if_create_bot_box_unoccluded(cx);
                                 shell.miniapps.create_bot_box = None;
                                 if let Some(cid) = created.companion_chat_id.filter(|&id| id > 0) {
                                     shell.open_or_select_chat(
@@ -603,15 +659,20 @@ impl AppShell {
                     self.miniapps.bump_launch_generation();
                     self.miniapps.is_miniapp_minimized = false;
                     self.miniapps.floating_pip_status = None;
-                    self.miniapps.miniapp_overlay = None;
+                    if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+                        ov.update(cx, |w, _| w.close());
+                    }
+                    self.clear_ime_if_miniapp_unoccluded(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::Minimize => {
                     self.miniapps.is_miniapp_minimized = true;
                     overlay.update(cx, |w, wcx| {
                         w.minimize();
+                        w.focused_input = None;
                         wcx.notify();
                     });
+                    self.clear_ime_if_miniapp_unoccluded(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::Reload {
@@ -808,17 +869,21 @@ impl AppShell {
                     self.miniapps.is_miniapp_minimized = true;
                     overlay.update(cx, |w, wcx| {
                         w.minimize();
+                        w.focused_input = None;
                         wcx.notify();
                     });
+                    self.clear_ime_if_miniapp_unoccluded(cx);
                     self.open_bot_profile_popup(&bot_un, cx);
                     self.reconcile_chat_scoped_toasts(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::OpenMiniAppTos => {
                     self.occlude_browser_for_overlay(cx);
+                    self.prepare_for_lower_z_overlay_open(cx);
                     self.miniapps.is_miniapp_minimized = true;
                     overlay.update(cx, |w, wcx| {
                         w.minimize();
+                        w.focused_input = None;
                         wcx.notify();
                     });
                     self.miniapps.miniapp_tos_modal_open = true;
@@ -826,6 +891,9 @@ impl AppShell {
                     cx.notify();
                 }
                 BotWebViewPendingAction::OpenTelegramLink(raw_link) => {
+                    if self.try_handle_or_swallow_apple_deep_link(&raw_link, false, cx) {
+                        continue;
+                    }
                     let active_chat = resolve_active_target_chat_id(
                         self.stage.read(cx).active_chat_id,
                         self.sidebar.read(cx).active_chat_id,
@@ -853,8 +921,10 @@ impl AppShell {
                             self.miniapps.is_miniapp_minimized = true;
                             overlay.update(cx, |w, wcx| {
                                 w.minimize();
+                                w.focused_input = None;
                                 wcx.notify();
                             });
+                            self.clear_ime_if_miniapp_unoccluded(cx);
                             self.open_bot_profile_popup(&clean, cx);
                             self.reconcile_chat_scoped_toasts(cx);
                             cx.notify();
@@ -868,8 +938,10 @@ impl AppShell {
                     self.miniapps.is_miniapp_minimized = true;
                     overlay.update(cx, |w, wcx| {
                         w.minimize();
+                        w.focused_input = None;
                         wcx.notify();
                     });
+                    self.clear_ime_if_miniapp_unoccluded(cx);
                     if companion_chat_id > 0 {
                         self.open_or_select_chat(
                             companion_chat_id as u64,
@@ -884,6 +956,9 @@ impl AppShell {
                     cx.notify();
                 }
                 BotWebViewPendingAction::OpenInBrowser { path } => {
+                    if self.try_handle_or_swallow_apple_deep_link(&path, false, cx) {
+                        continue;
+                    }
                     let base = self.client.config.server_url.trim_end_matches('/');
                     let full_url = if path.starts_with("http://") || path.starts_with("https://") {
                         path
@@ -910,7 +985,10 @@ impl AppShell {
                     self.miniapps.bump_launch_generation();
                     self.miniapps.is_miniapp_minimized = false;
                     self.miniapps.floating_pip_status = None;
-                    self.miniapps.miniapp_overlay = None;
+                    if let Some(ov) = self.miniapps.miniapp_overlay.take() {
+                        ov.update(cx, |w, _| w.close());
+                    }
+                    self.clear_ime_if_miniapp_unoccluded(cx);
                     let Some(fence) = fence.clone() else {
                         continue;
                     };
@@ -1000,7 +1078,10 @@ impl AppShell {
                                         shell.miniapps.bump_launch_generation();
                                         shell.miniapps.is_miniapp_minimized = false;
                                         shell.miniapps.floating_pip_status = None;
-                                        shell.miniapps.miniapp_overlay = None;
+                                        if let Some(ov) = shell.miniapps.miniapp_overlay.take() {
+                                            ov.update(cx, |w, _| w.close());
+                                        }
+                                        shell.clear_ime_if_miniapp_unoccluded(cx);
                                     }
                                     if let Some(ref toast) = toast_opt {
                                         if let Some(cid) = source_cid {
@@ -1117,6 +1198,7 @@ impl AppShell {
                             w.ui_schema.title.clone(),
                         )
                     };
+                    self.prepare_for_miniapp_overlay_open(cx);
                     self.miniapps.is_miniapp_minimized = false;
                     self.miniapps.floating_pip_status =
                         Some(crate::views::app_shell::shell_state::FloatingPipStatus {
@@ -1188,12 +1270,16 @@ impl AppShell {
                         w.is_floating_pip = true;
                         w.pip_live_preview = true;
                         w.is_open = false;
+                        w.focused_input = None;
+                        w.set_native_webview_allow_focus(false);
                         wcx.notify();
                     });
+                    self.clear_ime_if_miniapp_unoccluded(cx);
                     cx.notify();
                 }
                 BotWebViewPendingAction::ExpandFromFloatingPip => {
                     self.occlude_browser_for_overlay(cx);
+                    self.prepare_for_miniapp_overlay_open(cx);
                     self.miniapps.is_miniapp_minimized = false;
                     overlay.update(cx, |w, wcx| {
                         w.is_floating_pip = false;
@@ -1224,6 +1310,9 @@ impl AppShell {
         );
         match btn_type {
             InlineButtonType::WebApp(url) => {
+                if self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                    return;
+                }
                 let sender_uid = self
                     .stage
                     .read(cx)
@@ -1248,6 +1337,9 @@ impl AppShell {
                 }
             }
             InlineButtonType::Url(url) => {
+                if self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                    return;
+                }
                 if !self.launch_miniapp_from_uri(
                     &url,
                     active_chat,
@@ -1271,13 +1363,18 @@ impl AppShell {
                     .map(|s| s.trim().trim_start_matches('@').to_string())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "BotFather".to_string());
+                let focus_composer = self.can_focus_chat_composer(cx);
                 self.composer.update(cx, |c, c_cx| {
                     c.prefill_inline_bot_query(&bot_uname, &q);
+                    c.is_input_focused = focus_composer;
                     c_cx.notify();
                 });
                 cx.notify();
             }
             InlineButtonType::Callback(data) => {
+                if self.try_handle_or_swallow_apple_deep_link(&data, true, cx) {
+                    return;
+                }
                 let trimmed = data.trim().to_string();
                 if trimmed.is_empty() {
                     return;
@@ -1396,6 +1493,9 @@ impl AppShell {
 
     /// Copies an external URL, opens it in the system browser, and shows a localized toast.
     pub fn open_external_url_with_toast(&mut self, url: &str, cx: &mut Context<Self>) {
+        if self.try_handle_or_swallow_apple_deep_link(url, false, cx) {
+            return;
+        }
         let lang = self.active_lang_id();
         let trimmed = url.trim();
         if trimmed.is_empty() {

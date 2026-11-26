@@ -30,6 +30,8 @@ pub enum MainMenuCommand {
     McpTools,
     RemoteComputer,
     CodeScene,
+    Browser,
+    Community,
     Settings,
     ToggleNightMode,
     WalletAndStars,
@@ -290,6 +292,18 @@ impl Render for MainMenuDrawer {
                 zh: "代码场景",
                 en: "Code Scene",
                 cmd: MainMenuCommand::CodeScene,
+            },
+            MenuRowEntry::Action {
+                icon: IconName::ScreenShare,
+                zh: "内置浏览器",
+                en: "Built-in Browser",
+                cmd: MainMenuCommand::Browser,
+            },
+            MenuRowEntry::Action {
+                icon: IconName::CommunityGlobe,
+                zh: "社区 · Reddit × X",
+                en: "Community · Reddit × X",
+                cmd: MainMenuCommand::Community,
             },
             MenuRowEntry::Divider,
             MenuRowEntry::Action {

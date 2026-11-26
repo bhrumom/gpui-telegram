@@ -8,6 +8,7 @@ license.workspace = true
 gpui_telegram_core = { workspace = true }
 gpui_telegram_proto = { workspace = true }
 gpui_telegram_code_scene = { workspace = true }
+gpui_telegram_community = { workspace = true, features = ["sqlite"] }
 gpui_telegram_media = { workspace = true }
 fabushi_remote_engine = { workspace = true }
 serde = { workspace = true }
@@ -43,3 +44,6 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
 mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }
 mahayana-host-runtime = { path = "../../inherited/host" }
+
+[dev-dependencies]
+axum = { workspace = true }

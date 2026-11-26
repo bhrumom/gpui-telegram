@@ -25,8 +25,13 @@ Thumbs.db
 *.swo
 *.log
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Local runs, release binaries, and upload staging
 /.agents/
 /artifacts/
 /dist/
 /crates/gpui_telegram_server/data/
+__pycache__/

@@ -48,7 +48,8 @@ use crate::views::stage::stage_bars::{
     APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT, APPLE_STAGE_TOP_BAR_HEIGHT,
 };
 use crate::views::stage::wallpaper::{
-    render_empty_history_placeholder, render_empty_no_chat_pill, render_themed_wallpaper,
+    render_empty_history_placeholder, render_empty_no_chat_pill, render_loading_history_skeleton,
+    render_syncing_workspace_placeholder, render_themed_wallpaper,
 };
 pub use crate::views::stage::cards::*;
 
@@ -439,6 +440,7 @@ pub struct ConversationStage {
     pub pending_call_request: bool,
     pub pending_video_call: bool,
     pub pending_media_url: Option<(String, bool)>,
+    pub pending_open_url: Option<String>,
     pub pending_media_viewer: Option<(Vec<(String, bool, Option<String>)>, usize)>,
     pub pending_iv_url: Option<(String, String)>,
     pub pending_bot_action: Option<String>,
@@ -502,6 +504,7 @@ pub struct ConversationStage {
     pub drag_area: HistoryDragArea,
     pub focus_handle: Option<FocusHandle>,
     pub search_open: bool,
+    pub search_focus_seq: u64,
     pub search_query: String,
     pub search_match_ids: Vec<u64>,
     pub search_match_cursor: usize,
@@ -537,6 +540,12 @@ pub struct ConversationStage {
     pub permission_dock: ToolPermissionDock,
     pub group_member_tiles: Vec<(String, u32)>,
     pub bot_hues_by_user_id: HashMap<u64, String>,
+    /// True while fetching message history for an active chat that has no cached messages yet.
+    pub is_loading_history: bool,
+    /// True while the initial authenticated workspace dialog list is syncing on a cold cache.
+    pub is_loading_workspace: bool,
+    /// Chat IDs whose history has been confirmed loaded from server or persistent cache in this session.
+    pub loaded_history_chats: HashSet<u64>,
 }
 
 impl ConversationStage {
@@ -555,6 +564,7 @@ impl ConversationStage {
             pending_call_request: false,
             pending_video_call: false,
             pending_media_url: None,
+            pending_open_url: None,
             pending_media_viewer: None,
             pending_iv_url: None,
             pending_bot_action: None,
@@ -618,6 +628,7 @@ impl ConversationStage {
             drag_area: HistoryDragArea::new(),
             focus_handle: None,
             search_open: false,
+            search_focus_seq: 0,
             search_query: String::new(),
             search_match_ids: Vec::new(),
             search_match_cursor: 0,
@@ -653,6 +664,9 @@ impl ConversationStage {
             permission_dock: ToolPermissionDock::new(0),
             group_member_tiles: Vec::new(),
             bot_hues_by_user_id: HashMap::new(),
+            is_loading_history: false,
+            is_loading_workspace: false,
+            loaded_history_chats: HashSet::new(),
         };
         stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
         stage
@@ -783,7 +797,11 @@ impl ConversationStage {
         self.pending_stage_action = None;
         self.permission_dock.sync_requests(Vec::new());
         self.group_member_tiles.clear();
+        self.bot_hues_by_user_id.clear();
         self.clear_all_bot_card_drafts();
+        self.is_loading_history = false;
+        self.is_loading_workspace = false;
+        self.loaded_history_chats.clear();
     }
 
     pub fn sync_measured_row_heights(&mut self) -> bool {
@@ -912,6 +930,9 @@ impl ConversationStage {
 
         // 1. Cleanly load history without cross-chat bleeding
         self.messages = self.chat_histories.get(&chat_id).cloned().unwrap_or_default();
+        if !self.messages.is_empty() || self.loaded_history_chats.contains(&chat_id) {
+            self.is_loading_history = false;
+        }
         self.row_height_cache.mark_dirty();
 
         // 2. Cleanly load pinned banner without cross-chat bleeding + sync multi-pin tracker
@@ -1524,10 +1545,18 @@ impl Render for ConversationStage {
                     .flex()
                     .flex_col()
                     .when(!has_active_chat && total_msgs == 0 && bot_desc_card.is_none(), |el| {
-                        el.child(render_empty_no_chat_pill(&self.palette, &self.lang_id))
+                        if self.is_loading_workspace {
+                            el.child(render_syncing_workspace_placeholder(&self.palette, &self.lang_id))
+                        } else {
+                            el.child(render_empty_no_chat_pill(&self.palette, &self.lang_id))
+                        }
                     })
                     .when(has_active_chat && total_msgs == 0 && bot_desc_card.is_none(), |el| {
-                        el.child(render_empty_history_placeholder(&self.palette, &self.lang_id))
+                        if self.is_loading_history {
+                            el.child(render_loading_history_skeleton(&self.palette, &self.lang_id))
+                        } else {
+                            el.child(render_empty_history_placeholder(&self.palette, &self.lang_id))
+                        }
                     })
                     .when_some(bot_desc_card, |el, card| el.child(card))
                     .when(top_spacer_height > 0.0, |el| {
@@ -1691,7 +1720,7 @@ impl Render for ConversationStage {
                         },
                     )
                     .when(
-                        self.is_bot_chat
+                        (self.is_bot_chat || self.is_group_chat)
                             && !self.bot_activity_state.is_empty()
                             && !self.bot_activity_state.eq_ignore_ascii_case("idle"),
                         |el| {

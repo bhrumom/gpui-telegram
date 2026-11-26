@@ -9,8 +9,9 @@ use gpui_telegram_client::net::http_client::AddContactHttpRequest;
 use crate::i18n::tr_str;
 use crate::views::app_shell::shell_actions::map_stage_media_to_gallery;
 use crate::views::app_shell::shell_truth::{
-    apply_fenced_chat_list_response, apply_fenced_history_response_preserving, derive_initials,
-    overlay_rich_message_metadata, SessionRequestFence,
+    apply_fenced_chat_list_response, apply_fenced_history_response_preserving,
+    build_cached_history_models, derive_initials, overlay_rich_message_metadata,
+    SessionRequestFence,
 };
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::chat_sidebar::{
@@ -195,6 +196,8 @@ impl AppShell {
                     let server_chat_id = resp.chat_id.max(0) as u64;
                     let mut selected_peer: Option<DialogItemModel> = None;
                     shell.sidebar.update(cx, |sb, sb_cx| {
+                        sb.group_chat_ids.remove(&local_dialog_id);
+                        sb.group_chat_ids.insert(server_chat_id);
                         if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == local_dialog_id) {
                             d.id = server_chat_id;
                             selected_peer = Some(d.clone());
@@ -213,9 +216,11 @@ impl AppShell {
                                 &d.avatar_initials,
                                 d.avatar_color,
                             );
+                            st.is_group_chat = true;
                             st_cx.notify();
                         });
                     }
+                    let _ = shell.client.subscribe_chat(server_chat_id as i64);
                     shell.reconcile_chat_scoped_toasts(cx);
                     if shell.stage.read(cx).active_chat_id == Some(server_chat_id) {
                         shell.load_historical_messages(server_chat_id, cx);
@@ -319,6 +324,27 @@ impl AppShell {
         };
         self.session_sync.chat_list_request_generation =
             self.session_sync.chat_list_request_generation.wrapping_add(1);
+        self.session_sync.chat_list_in_flight_since = Some(std::time::Instant::now());
+
+        let show_loading_skeleton = {
+            let sb = self.sidebar.read(cx);
+            sb.dialogs.is_empty() && !sb.has_synced_dialogs
+        };
+        if show_loading_skeleton {
+            self.sidebar.update(cx, |sb, sb_cx| {
+                if !sb.is_loading_dialogs {
+                    sb.is_loading_dialogs = true;
+                    sb_cx.notify();
+                }
+            });
+            self.stage.update(cx, |st, st_cx| {
+                if st.active_chat_id.is_none() && !st.is_loading_workspace {
+                    st.is_loading_workspace = true;
+                    st_cx.notify();
+                }
+            });
+        }
+
         let fence = SessionRequestFence {
             auth_generation: self.session_sync.auth_generation,
             request_generation: self.session_sync.chat_list_request_generation,
@@ -330,15 +356,17 @@ impl AppShell {
             if !call_fence.preflight_ui(&weak_shell, app).await {
                 return;
             }
-            let res = call_fence.client.http_client.get_chats(&call_fence.token).await;
-            let rich_chats = if call_fence.preflight_ui(&weak_shell, app).await {
-                call_fence.client.hermes.list_chats_rich(&call_fence.token).await.ok()
-            } else {
-                return;
-            };
+            let (res, rich_res) = futures::join!(
+                call_fence.client.http_client.get_chats(&call_fence.token),
+                call_fence.client.hermes.list_chats_rich(&call_fence.token),
+            );
+            let rich_chats = rich_res.ok();
             let _ = weak_shell.update(app, |shell, cx| {
                 if !call_fence.is_valid(shell) {
                     return;
+                }
+                if shell.session_sync.chat_list_request_generation == fence.request_generation {
+                    shell.session_sync.chat_list_in_flight_since = None;
                 }
                 match res {
                     Ok(chats) => {
@@ -408,6 +436,10 @@ impl AppShell {
                             ok
                         });
                         if applied {
+                            shell.client.local_store.replace_cached_dialog_summaries(&chats);
+                            if let Some(ref rich_list) = rich_chats {
+                                shell.client.local_store.replace_cached_rich_chats(rich_list);
+                            }
                             shell.reconcile_chat_scoped_toasts(cx);
                             if let Some(ref rich_list) = rich_chats {
                                 for rc in rich_list {
@@ -425,6 +457,7 @@ impl AppShell {
                             if let Some(selected_id) = shell.sidebar.read(cx).active_chat_id {
                                 shell.sync_selected_chat_inspector_and_stage(selected_id, cx);
                             }
+                            shell.prefetch_top_chat_histories(cx);
                             shell.refresh_miniapps_catalog(None, cx);
                         }
                     }
@@ -436,6 +469,18 @@ impl AppShell {
                             shell.session_sync.session_token.as_deref(),
                             shell.session_sync.user_id,
                         ) {
+                            shell.sidebar.update(cx, |sb, sb_cx| {
+                                if sb.is_loading_dialogs {
+                                    sb.is_loading_dialogs = false;
+                                    sb_cx.notify();
+                                }
+                            });
+                            shell.stage.update(cx, |st, st_cx| {
+                                if st.is_loading_workspace {
+                                    st.is_loading_workspace = false;
+                                    st_cx.notify();
+                                }
+                            });
                             shell.show_non_chat_toast(
                                 format!(
                                     "{}: {}",
@@ -458,6 +503,150 @@ impl AppShell {
         .detach();
     }
 
+    /// Telegram-style background prefetcher: warms the latest messages of the top visible dialogs
+    /// into `LocalStore` and `stage.chat_histories` with bounded concurrency so opening recent chats
+    /// is instant even after a fresh login.
+    pub fn prefetch_top_chat_histories(&mut self, cx: &mut Context<Self>) {
+        let Some(call_fence) = self.capture_client_fence() else {
+            return;
+        };
+        let Some(self_uid) = self.session_sync.user_id else {
+            return;
+        };
+        let active_chat_id = self.stage.read(cx).active_chat_id;
+        let candidates: Vec<(u64, String, String, u32)> = {
+            let sb = self.sidebar.read(cx);
+            let st = self.stage.read(cx);
+            let mut ordered: Vec<&DialogItemModel> = sb.dialogs.iter().filter(|d| d.is_pinned).collect();
+            ordered.extend(sb.dialogs.iter().filter(|d| !d.is_pinned));
+            ordered
+                .into_iter()
+                .filter(|d| {
+                    Some(d.id) != active_chat_id
+                        && !self.session_sync.prefetched_history_chats.contains(&d.id)
+                        && !st.loaded_history_chats.contains(&d.id)
+                        && st.chat_histories.get(&d.id).map_or(true, |h| h.is_empty())
+                        && self
+                            .client
+                            .local_store
+                            .get_cached_chat_history(d.id)
+                            .map_or(true, |snap| snap.messages.is_empty())
+                })
+                .take(8)
+                .map(|d| (d.id, d.peer_name.clone(), d.avatar_initials.clone(), d.avatar_color))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        for (cid, _, _, _) in &candidates {
+            self.session_sync.prefetched_history_chats.insert(*cid);
+        }
+
+        cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
+            // Yield initial startup bandwidth to active chat & primary panels before warming
+            // background dialog histories (matches Telegram Desktop preload cadence).
+            app.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            for chunk in candidates.chunks(3) {
+                if !call_fence.preflight_ui(&weak_shell, app).await {
+                    return;
+                }
+                let batch_futs = chunk.iter().map(|(cid, peer_name, peer_init, peer_color)| {
+                    let fence = call_fence.clone();
+                    let cid = *cid;
+                    let peer_name = peer_name.clone();
+                    let peer_init = peer_init.clone();
+                    let peer_color = *peer_color;
+                    async move {
+                        let (msgs_res, rich_res) = futures::join!(
+                            fence.client.get_chat_messages_for_session(
+                                &fence.token,
+                                fence.client_epoch,
+                                cid,
+                                Some(50),
+                            ),
+                            fence.client.hermes_messages_history_rich_with_token(
+                                &fence.token,
+                                fence.client_epoch,
+                                cid as i64,
+                                Some(50),
+                            ),
+                        );
+                        (cid, peer_name, peer_init, peer_color, msgs_res.ok(), rich_res.ok())
+                    }
+                });
+                let results = futures::future::join_all(batch_futs).await;
+                let keep_going = weak_shell
+                    .update(app, |shell, cx| {
+                        if !call_fence.is_valid(shell) {
+                            return false;
+                        }
+                        let mut active_updated = false;
+                        for (cid, peer_name, peer_init, peer_color, msgs_opt, rich_opt) in results {
+                            let Some(msgs) = msgs_opt else {
+                                continue;
+                            };
+                            let rich_slice = rich_opt.as_deref().unwrap_or(&[]);
+                            shell
+                                .client
+                                .local_store
+                                .replace_cached_chat_history(cid, &msgs, rich_slice);
+
+                            let still_in_sidebar = shell
+                                .sidebar
+                                .read(cx)
+                                .dialogs
+                                .iter()
+                                .any(|d| d.id == cid);
+                            if !still_in_sidebar {
+                                continue;
+                            }
+                            let models = build_cached_history_models(
+                                &msgs,
+                                rich_slice,
+                                self_uid,
+                                &peer_name,
+                                &peer_init,
+                                peer_color,
+                            );
+                            shell.stage.update(cx, |st, st_cx| {
+                                let should_seed = st
+                                    .chat_histories
+                                    .get(&cid)
+                                    .map_or(true, |h| h.is_empty());
+                                if st.active_chat_id == Some(cid) {
+                                    if st.messages.is_empty() {
+                                        st.messages = models.clone();
+                                        st.chat_histories.insert(cid, models);
+                                        st.loaded_history_chats.insert(cid);
+                                        st.is_loading_history = false;
+                                        st.row_height_cache.rebuild_prefix_sums(&st.messages);
+                                        st.scroll_to_bottom();
+                                        st_cx.notify();
+                                        active_updated = true;
+                                    }
+                                } else if should_seed {
+                                    st.chat_histories.insert(cid, models);
+                                    st.loaded_history_chats.insert(cid);
+                                }
+                            });
+                        }
+                        if active_updated {
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Fetches historical messages from the backend for `chat_id` under a session/generation fence.
     pub fn load_historical_messages(&mut self, chat_id: u64, cx: &mut Context<Self>) {
         let (Some(token), Some(uid)) = (
@@ -474,6 +663,20 @@ impl AppShell {
         };
         self.session_sync.history_request_generation =
             self.session_sync.history_request_generation.wrapping_add(1);
+        self.session_sync.history_in_flight_chat = Some((chat_id, std::time::Instant::now()));
+
+        self.stage.update(cx, |st, st_cx| {
+            if st.active_chat_id == Some(chat_id)
+                && st.messages.is_empty()
+                && !st.loaded_history_chats.contains(&chat_id)
+                && !st.show_bot_start_bar
+                && !st.is_loading_history
+            {
+                st.is_loading_history = true;
+                st_cx.notify();
+            }
+        });
+
         let fence = SessionRequestFence {
             auth_generation: self.session_sync.auth_generation,
             request_generation: self.session_sync.history_request_generation,
@@ -485,35 +688,35 @@ impl AppShell {
             if !call_fence.preflight_ui(&weak_shell, app).await {
                 return;
             }
-            let res = call_fence
-                .client
-                .get_chat_messages_for_session(
+            let (res, rich_res) = futures::join!(
+                call_fence.client.get_chat_messages_for_session(
                     &call_fence.token,
                     call_fence.client_epoch,
                     chat_id,
                     Some(50),
-                )
-                .await;
-            let rich_msgs = if call_fence.preflight_ui(&weak_shell, app).await {
-                call_fence
-                    .client
-                    .hermes_messages_history_rich_with_token(
-                        &call_fence.token,
-                        call_fence.client_epoch,
-                        chat_id as i64,
-                        Some(50),
-                    )
-                    .await
-                    .ok()
-            } else {
-                return;
-            };
+                ),
+                call_fence.client.hermes_messages_history_rich_with_token(
+                    &call_fence.token,
+                    call_fence.client_epoch,
+                    chat_id as i64,
+                    Some(50),
+                ),
+            );
+            let rich_msgs = rich_res.ok();
             let _ = weak_shell.update(app, |shell, cx| {
                 if !call_fence.is_valid(shell) {
                     return;
                 }
+                if shell.session_sync.history_request_generation == fence.request_generation {
+                    shell.session_sync.history_in_flight_chat = None;
+                }
                 match res {
                     Ok(msgs) => {
+                        shell.client.local_store.replace_cached_chat_history(
+                            chat_id,
+                            &msgs,
+                            rich_msgs.as_deref().unwrap_or(&[]),
+                        );
                         let exp_pairs: Vec<(u64, i64)> = msgs
                             .iter()
                             .filter_map(|m| {
@@ -539,6 +742,7 @@ impl AppShell {
                                 (cid == chat_id && cnt > 0).then_some(mid)
                             })
                             .collect();
+                        let msgs_for_bg = msgs.clone();
                         let ok = shell.sidebar.update(cx, |sb, sb_cx| {
                             shell.stage.update(sb_cx, |st, st_cx| {
                                 let res = apply_fenced_history_response_preserving(
@@ -567,6 +771,21 @@ impl AppShell {
                                     }
                                     sb.recompute_folder_badges();
                                     st_cx.notify();
+                                } else if st.active_chat_id != Some(chat_id) {
+                                    // User switched rapidly to another chat within the same valid session:
+                                    // retain the completed fetch in background `chat_histories` for 0ms return.
+                                    if let Some(dlg) = sb.dialogs.iter().find(|d| d.id == chat_id) {
+                                        let models = build_cached_history_models(
+                                            &msgs_for_bg,
+                                            rich_msgs.as_deref().unwrap_or(&[]),
+                                            fence.user_id,
+                                            &dlg.peer_name,
+                                            &dlg.avatar_initials,
+                                            dlg.avatar_color,
+                                        );
+                                        st.chat_histories.insert(chat_id, models);
+                                        st.loaded_history_chats.insert(chat_id);
+                                    }
                                 }
                                 res
                             })
@@ -587,25 +806,33 @@ impl AppShell {
                             shell.session_sync.history_request_generation,
                             shell.session_sync.session_token.as_deref(),
                             shell.session_sync.user_id,
-                        ) && shell.active_panel == ActiveWorkspacePanel::Chats
-                            && !(shell.theme_state.palette.is_apple_style()
-                                && shell.sidebar.read(cx).is_plus_menu_open)
-                            && shell.stage.read(cx).active_chat_id == Some(chat_id)
-                        {
-                            shell.show_chat_toast(
-                                chat_id,
-                                format!(
-                                    "{}: {}",
-                                    tr_str(
-                                        shell.active_lang_id(),
-                                        "加载聊天记录失败",
-                                        "Failed to load history"
+                        ) {
+                            shell.stage.update(cx, |st, st_cx| {
+                                if st.active_chat_id == Some(chat_id) && st.is_loading_history {
+                                    st.is_loading_history = false;
+                                    st_cx.notify();
+                                }
+                            });
+                            if shell.active_panel == ActiveWorkspacePanel::Chats
+                                && !(shell.theme_state.palette.is_apple_style()
+                                    && shell.sidebar.read(cx).is_plus_menu_open)
+                                && shell.stage.read(cx).active_chat_id == Some(chat_id)
+                            {
+                                shell.show_chat_toast(
+                                    chat_id,
+                                    format!(
+                                        "{}: {}",
+                                        tr_str(
+                                            shell.active_lang_id(),
+                                            "加载聊天记录失败",
+                                            "Failed to load history"
+                                        ),
+                                        err
                                     ),
-                                    err
-                                ),
-                                3200,
-                                cx,
-                            );
+                                    3200,
+                                    cx,
+                                );
+                            }
                         }
                     }
                 }

@@ -197,7 +197,7 @@ impl ToolsetId {
             Self::SessionSearch => "Full-text and CJK fallback search across past conversation sessions",
             Self::Workspace => "Workspace file checkpoint inspection and atomic turn rollback",
             Self::Voice => "Full-duplex Voice / Talk Mode coordinator state control",
-            Self::PlatformIm => "Native platform IM messaging, channels, topics, reactions, pins, polls, MiniApps, and Code Scene creation & publishing",
+            Self::PlatformIm => "Native platform IM messaging, channels, topics, reactions, pins, polls, MiniApps, Community, and Code Scene creation & publishing",
         }
     }
 }
@@ -1095,7 +1095,7 @@ impl HermesToolContext {
 
 /// Complete catalog of all 58 Hermes tools across all 28 toolsets.
 pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
-    vec![
+    let mut specs = vec![
         // 1. Core (3)
         HermesToolSpec::new(
             "toolset_list",
@@ -2984,7 +2984,194 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             ToolRiskLevel::ReadOnly,
             true,
         ),
-    ]
+        HermesToolSpec::new(
+            "create_book",
+            ToolsetId::PlatformIm,
+            "Create a rich multi-chapter book draft saved to the caller's private cloud creations (Apple Books format, ready for review submission).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Book title (1..=120 chars)." },
+                    "subtitle": { "type": "string" },
+                    "summary": { "type": "string", "description": "Book synopsis (10..=2000 chars for review readiness)." },
+                    "author": { "type": "string", "description": "Optional author display name; defaults to caller's user profile name." },
+                    "language": { "type": "string", "description": "BCP-47 language tag (e.g. zh-CN, en-US)." },
+                    "genres": { "type": "array", "items": { "type": "string" } },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "series_name": { "type": "string" },
+                    "series_index": { "type": "integer", "minimum": 1, "maximum": u32::MAX },
+                    "blurb": { "type": "string" },
+                    "cover": { "type": "object" },
+                    "chapters": {
+                        "type": "array",
+                        "description": "Optional chapters (BookChapter objects or simplified { title, content/paragraphs } objects). Auto-synthesized into readable multi-chapter content if omitted.",
+                        "items": { "type": "object" }
+                    }
+                },
+                "required": ["title"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "create_music",
+            ToolsetId::PlatformIm,
+            "Compose a playable music creation draft saved to the caller's private cloud creations (Apple Music format with melody, chords, synced lyrics, optional synthesized WAV audio & 5-bit waveform).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Track or album title (1..=120 chars)." },
+                    "subtitle": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "artist": { "type": "string" },
+                    "album_title": { "type": "string" },
+                    "primary_genre": { "type": "string" },
+                    "mood_tags": { "type": "array", "items": { "type": "string" } },
+                    "bpm": { "type": "integer", "minimum": 30, "maximum": 300 },
+                    "musical_key": { "type": "string" },
+                    "time_signature": { "type": "string" },
+                    "language": { "type": "string" },
+                    "genres": { "type": "array", "items": { "type": "string" } },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "cover": { "type": "object" },
+                    "tracks": {
+                        "type": "array",
+                        "description": "Optional structured MusicTrack array; if omitted, synthesizes a complete playable track with melody, chords, synced lyrics, WAV audio in CAS, and 5-bit waveform.",
+                        "items": { "type": "object" }
+                    },
+                    "synthesize_audio": { "type": "boolean", "description": "Synthesize real PCM/WAV + 5-bit waveform into CAS (default true)." }
+                },
+                "required": ["title"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "create_game",
+            ToolsetId::PlatformIm,
+            "Build a playable mini-game draft saved to the caller's private cloud creations (Apple Games format supporting grid_puzzle, trivia_quiz, interactive_fiction, arcade_dodge, snake_grid, card_match, mini_app_html).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Game title (1..=120 chars)." },
+                    "subtitle": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "developer": { "type": "string" },
+                    "category": { "type": "string", "enum": ["puzzle", "arcade", "trivia", "text_adventure", "strategy", "rhythm", "card_match"] },
+                    "engine_kind": { "type": "string", "enum": ["grid_puzzle", "trivia_quiz", "interactive_fiction", "arcade_dodge", "snake_grid", "card_match", "mini_app_html"] },
+                    "controls_hint": { "type": "string" },
+                    "rules_markdown": { "type": "string" },
+                    "supports_leaderboard": { "type": "boolean" },
+                    "estimated_session_mins": { "type": "integer", "minimum": 1, "maximum": u32::MAX },
+                    "language": { "type": "string" },
+                    "genres": { "type": "array", "items": { "type": "string" } },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "cover": { "type": "object" },
+                    "spec": { "type": "object", "description": "Optional tagged GameSpec matching engine_kind; auto-synthesized as a playable spec if omitted." },
+                    "achievements": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["title"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "update_my_creation",
+            ToolsetId::PlatformIm,
+            "Update metadata or payload of one of the caller's own cloud creations (supports optimistic locking via expected_revision).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "creation_id": { "type": "string" },
+                    "expected_revision": { "type": "integer", "minimum": 0, "maximum": i64::MAX },
+                    "title": { "type": "string" },
+                    "subtitle": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "author_display_name": { "type": "string" },
+                    "language": { "type": "string" },
+                    "genres": { "type": "array", "items": { "type": "string" } },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "cover": { "type": "object" },
+                    "age_rating": { "type": "string" },
+                    "visibility": { "type": "string", "enum": ["private", "unlisted", "public"] },
+                    "payload": { "type": "object" }
+                },
+                "required": ["creation_id"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "list_my_creations",
+            ToolsetId::PlatformIm,
+            "List ONLY the caller's own cloud creations, optionally filtered by kind, review status, or search query.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["all", "book", "music", "game", "app"] },
+                    "status": { "type": "string", "enum": ["all", "draft", "pending_review", "published", "rejected", "unpublished"] },
+                    "q": { "type": "string" },
+                    "query": { "type": "string" }
+                }
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "submit_creation_for_review",
+            ToolsetId::PlatformIm,
+            "Validate and submit one of the caller's own cloud creations for publishing review (transitions Draft/Rejected/Published-update to PendingReview; returns structured validation_errors if incomplete).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "creation_id": { "type": "string" },
+                    "visibility": { "type": "string", "enum": ["public", "unlisted"] },
+                    "notes": { "type": "string" }
+                },
+                "required": ["creation_id"]
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "search_public_catalog",
+            ToolsetId::PlatformIm,
+            "Search the physically isolated public published catalog across Books, Music, Games, and App Store (published + public creations only).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "q": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["all", "book", "music", "game", "app"] },
+                    "genre": { "type": "string" },
+                    "sort": { "type": "string", "enum": ["featured", "popular", "top_rated", "newest"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": i64::MAX }
+                }
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "recommend_public_creations",
+            ToolsetId::PlatformIm,
+            "Get ranked public published content recommendations with canonical tg://apple/<section>/<creation_id> deep links (published + public creations only).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "q": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["all", "book", "music", "game", "app"] },
+                    "genre": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+                }
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+    ];
+    specs.extend(crate::community_tools::community_tool_specs());
+    specs
 }
 
 pub fn find_tool_spec(name: &str) -> Option<HermesToolSpec> {
@@ -3513,13 +3700,23 @@ fn validate_json_against_schema_type(val: &Value, prop_schema: &Value, key: &str
     if !type_ok {
         return Err(format!("Argument '{key}' has invalid type"));
     }
-    if let Some(n) = val.as_i64() {
-        if let Some(min) = prop_schema.get("minimum").and_then(Value::as_i64) {
+    let int_val = val
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| val.as_u64().map(i128::from));
+    if let Some(n) = int_val {
+        let min_bound = prop_schema
+            .get("minimum")
+            .and_then(|v| v.as_i64().map(i128::from).or_else(|| v.as_u64().map(i128::from)));
+        if let Some(min) = min_bound {
             if n < min {
                 return Err(format!("Argument '{key}' ({n}) is below minimum {min}"));
             }
         }
-        if let Some(max) = prop_schema.get("maximum").and_then(Value::as_i64) {
+        let max_bound = prop_schema
+            .get("maximum")
+            .and_then(|v| v.as_i64().map(i128::from).or_else(|| v.as_u64().map(i128::from)));
+        if let Some(max) = max_bound {
             if n > max {
                 return Err(format!("Argument '{key}' ({n}) exceeds maximum {max}"));
             }
@@ -3681,6 +3878,57 @@ fn validate_platform_im_args(spec_name: &str, args: &Value) -> Result<(), String
                 return Err("code_scene_remix requires non-empty 'scene_id' and 'prompt'".into());
             }
         }
+        "create_book" | "create_music" | "create_game" => {
+            let has_title = obj
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_title {
+                return Err(format!("{spec_name} requires non-empty 'title'"));
+            }
+            if spec_name == "create_music" {
+                if let Some(bpm_val) = obj.get("bpm").filter(|v| !v.is_null()) {
+                    let Some(bpm) = bpm_val.as_i64() else {
+                        return Err("create_music 'bpm' must be an integer between 30 and 300".into());
+                    };
+                    if !(30..=300).contains(&bpm) {
+                        return Err("create_music 'bpm' must be between 30 and 300".into());
+                    }
+                }
+            }
+        }
+        "update_my_creation" | "submit_creation_for_review" => {
+            let has_id = obj
+                .get("creation_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_id {
+                return Err(format!("{spec_name} requires non-empty 'creation_id'"));
+            }
+            if spec_name == "update_my_creation" {
+                if let Some(rev_val) = obj.get("expected_revision").filter(|v| !v.is_null()) {
+                    if !rev_val.as_i64().is_some_and(|n| n >= 0) {
+                        return Err(
+                            "update_my_creation 'expected_revision' must be a non-negative 64-bit integer"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        "search_public_catalog" => {
+            if let Some(off_val) = obj.get("offset").filter(|v| !v.is_null()) {
+                if !off_val.as_i64().is_some_and(|n| n >= 0) {
+                    return Err(
+                        "search_public_catalog 'offset' must be a non-negative 64-bit integer"
+                            .into(),
+                    );
+                }
+            }
+        }
+        _ if crate::community_tools::is_community_tool(spec_name) => {
+            crate::community_tools::validate_community_tool_args(spec_name, args)?;
+        }
         _ => {}
     }
     Ok(())
@@ -3747,20 +3995,22 @@ async fn execute_platform_im_tool(
         );
     };
 
-    if let Some(ctx_chat_id) = ctx.chat_id {
-        if let Some(obj) = args.as_object_mut() {
-            if let Some(explicit_val) = obj.get("chat_id").filter(|v| !v.is_null()) {
-                if explicit_val.as_i64() != Some(ctx_chat_id) {
-                    return HermesToolResult::err(
-                        spec_name,
-                        format!(
-                            "Cross-chat target mismatch: tool context is pinned to chat {ctx_chat_id}, got {explicit_val}"
-                        ),
-                    );
+    if !crate::community_tools::is_community_tool(spec_name) {
+        if let Some(ctx_chat_id) = ctx.chat_id {
+            if let Some(obj) = args.as_object_mut() {
+                if let Some(explicit_val) = obj.get("chat_id").filter(|v| !v.is_null()) {
+                    if explicit_val.as_i64() != Some(ctx_chat_id) {
+                        return HermesToolResult::err(
+                            spec_name,
+                            format!(
+                                "Cross-chat target mismatch: tool context is pinned to chat {ctx_chat_id}, got {explicit_val}"
+                            ),
+                        );
+                    }
                 }
-            }
-            if !obj.contains_key("chat_id") || obj.get("chat_id").is_some_and(Value::is_null) {
-                obj.insert("chat_id".to_string(), json!(ctx_chat_id));
+                if !obj.contains_key("chat_id") || obj.get("chat_id").is_some_and(Value::is_null) {
+                    obj.insert("chat_id".to_string(), json!(ctx_chat_id));
+                }
             }
         }
     }
@@ -3775,50 +4025,68 @@ async fn execute_platform_im_tool(
 
     match bridge.execute_im_tool(spec_name, &args, caller).await {
         Ok(val) => {
-            let mut res = HermesToolResult::ok(
-                spec_name,
-                serde_json::to_string_pretty(&val).unwrap_or_default(),
-                Some(val.clone()),
-            );
-            if matches!(spec_name, "code_scene_publish" | "code_scene_remix") {
-                if let Some(sid) = val
-                    .get("scene_id")
+            let pretty = serde_json::to_string_pretty(&val).unwrap_or_default();
+            if val.get("success") == Some(&Value::Bool(false)) {
+                let err_msg = val
+                    .get("message")
                     .and_then(Value::as_str)
-                    .or_else(|| val.pointer("/asset/scene_id").and_then(Value::as_str))
-                    .or_else(|| {
-                        val.pointer("/published/asset/scene_id")
-                            .and_then(Value::as_str)
-                    })
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    let sid_str = sid.to_string();
-                    res = res.with_inline_buttons(vec![
-                        HermesInlineButton {
-                            label: "▶ 打开代码场景".to_string(),
-                            callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Open(
-                                sid_str.clone(),
-                            )
-                            .to_payload(),
-                        },
-                        HermesInlineButton {
-                            label: "✨ Remix 改编".to_string(),
-                            callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Remix(
-                                sid_str.clone(),
-                            )
-                            .to_payload(),
-                        },
-                        HermesInlineButton {
-                            label: "↗ 分享".to_string(),
-                            callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Share(
-                                sid_str,
-                            )
-                            .to_payload(),
-                        },
-                    ]);
+                    .or_else(|| val.get("error").and_then(Value::as_str))
+                    .unwrap_or("Platform IM tool reported failure")
+                    .to_string();
+                HermesToolResult {
+                    tool_call_id: String::new(),
+                    tool_name: spec_name.to_string(),
+                    success: false,
+                    output: pretty,
+                    structured: Some(val),
+                    artifacts: Vec::new(),
+                    ui_actions: Vec::new(),
+                    inline_buttons: Vec::new(),
+                    duration_ms: 0,
+                    error: Some(err_msg),
                 }
+            } else {
+                let mut res = HermesToolResult::ok(spec_name, pretty, Some(val.clone()));
+                if matches!(spec_name, "code_scene_publish" | "code_scene_remix") {
+                    if let Some(sid) = val
+                        .get("scene_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| val.pointer("/asset/scene_id").and_then(Value::as_str))
+                        .or_else(|| {
+                            val.pointer("/published/asset/scene_id")
+                                .and_then(Value::as_str)
+                        })
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let sid_str = sid.to_string();
+                        res = res.with_inline_buttons(vec![
+                            HermesInlineButton {
+                                label: "▶ 打开代码场景".to_string(),
+                                callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Open(
+                                    sid_str.clone(),
+                                )
+                                .to_payload(),
+                            },
+                            HermesInlineButton {
+                                label: "✨ Remix 改编".to_string(),
+                                callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Remix(
+                                    sid_str.clone(),
+                                )
+                                .to_payload(),
+                            },
+                            HermesInlineButton {
+                                label: "↗ 分享".to_string(),
+                                callback_data: gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Share(
+                                    sid_str,
+                                )
+                                .to_payload(),
+                            },
+                        ]);
+                    }
+                }
+                res
             }
-            res
         }
         Err(err) => HermesToolResult::err(spec_name, err),
     }
@@ -4208,5 +4476,186 @@ mod tests {
         assert_eq!(recorded.lock().unwrap().len(), 18);
         assert_eq!(recorded.lock().unwrap()[0].1["chat_id"], 555);
         assert!(HermesToolExecutor::execute("webmcp_call_tool", json!({ "bot_username": "b", "short_name": "app", "tool_name": "   " }), &ctx).await.success == false);
+    }
+
+    #[tokio::test]
+    async fn test_platform_im_creation_and_catalog_tools_dispatch_via_bridge() {
+        assert_eq!(ToolsetId::all().len(), 29);
+
+        let expected_names = [
+            "create_book",
+            "create_music",
+            "create_game",
+            "update_my_creation",
+            "list_my_creations",
+            "submit_creation_for_review",
+            "search_public_catalog",
+            "recommend_public_creations",
+        ];
+        for name in expected_names {
+            let spec = find_tool_spec(name).unwrap_or_else(|| panic!("Missing spec for {name}"));
+            assert_eq!(spec.toolset, ToolsetId::PlatformIm);
+        }
+
+        struct CreationMockBridge(Arc<Mutex<Vec<(String, Value, PlatformImCaller)>>>);
+        impl PlatformImBridge for CreationMockBridge {
+            fn execute_im_tool<'a>(
+                &'a self,
+                tool_name: &'a str,
+                args: &'a Value,
+                caller: PlatformImCaller,
+            ) -> BoxFuture<'a, std::result::Result<Value, String>> {
+                Box::pin(async move {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((tool_name.to_string(), args.clone(), caller));
+                    if tool_name == "submit_creation_for_review"
+                        && args.get("creation_id").and_then(Value::as_str) == Some("cr_invalid")
+                    {
+                        return Ok(json!({
+                            "success": false,
+                            "submitted": false,
+                            "creation_id": "cr_invalid",
+                            "error": "validation_failed",
+                            "message": "Creation failed review validation",
+                            "validation_errors": ["summary must be at least 10 characters"]
+                        }));
+                    }
+                    Ok(json!({ "success": true, "tool": tool_name }))
+                })
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let bridge = Arc::new(CreationMockBridge(recorded.clone()));
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let ctx = HermesToolContext::new(dir.path())
+            .with_chat_and_bot(Some(888), Some(777_020))
+            .with_user_id(Some(42))
+            .with_platform_im_bridge(bridge);
+
+        let valid_calls = [
+            ("create_book", json!({ "title": "Star Atlas", "summary": "Deep space exploration stories." })),
+            ("create_music", json!({ "title": "Midnight Synth", "bpm": 118 })),
+            ("create_game", json!({ "title": "Orbit Puzzle", "engine_kind": "grid_puzzle", "category": "puzzle" })),
+            ("update_my_creation", json!({ "creation_id": "cr_1", "title": "Star Atlas v2", "expected_revision": 1 })),
+            ("list_my_creations", json!({ "kind": "book", "status": "draft", "q": "Star" })),
+            ("submit_creation_for_review", json!({ "creation_id": "cr_1", "visibility": "public" })),
+            ("search_public_catalog", json!({ "query": "Star", "kind": "all", "sort": "featured", "limit": 10 })),
+            ("recommend_public_creations", json!({ "query": "Synth", "kind": "music", "limit": 5 })),
+        ];
+
+        for (name, args) in &valid_calls {
+            let res = HermesToolExecutor::execute(name, args.clone(), &ctx).await;
+            assert!(res.success, "{name} failed: {}", res.output);
+        }
+        assert_eq!(recorded.lock().unwrap().len(), 8);
+        assert_eq!(recorded.lock().unwrap()[0].2.user_id, Some(42));
+        assert_eq!(recorded.lock().unwrap()[0].2.bot_id, Some(777_020));
+
+        // Structured success=false passthrough preserves validation_errors
+        let fail_res = HermesToolExecutor::execute(
+            "submit_creation_for_review",
+            json!({ "creation_id": "cr_invalid" }),
+            &ctx,
+        )
+        .await;
+        assert!(!fail_res.success);
+        assert!(fail_res.error.is_some());
+        let structured = fail_res.structured.expect("structured validation payload");
+        assert_eq!(structured["error"], "validation_failed");
+        assert_eq!(
+            structured["validation_errors"][0],
+            "summary must be at least 10 characters"
+        );
+
+        // Schema & semantic rejections
+        assert!(!HermesToolExecutor::execute("create_book", json!({ "title": "   " }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("create_music", json!({ "title": "" }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("create_music", json!({ "title": "Bad BPM", "bpm": 20 }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("create_music", json!({ "title": "Bad BPM", "bpm": 320 }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("create_game", json!({ "title": "  " }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("update_my_creation", json!({ "creation_id": "  " }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("submit_creation_for_review", json!({ "creation_id": "" }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("search_public_catalog", json!({ "kind": "invalid_vertical" }), &ctx).await.success);
+        assert!(!HermesToolExecutor::execute("recommend_public_creations", json!({ "limit": 99 }), &ctx).await.success);
+    }
+
+    #[tokio::test]
+    async fn test_platform_im_u64_max_schema_bounds_rejected_before_bridge() {
+        assert_eq!(ToolsetId::all().len(), 29);
+
+        struct NeverCalledBridge(Arc<Mutex<Vec<String>>>);
+        impl PlatformImBridge for NeverCalledBridge {
+            fn execute_im_tool<'a>(
+                &'a self,
+                tool_name: &'a str,
+                _args: &'a Value,
+                _caller: PlatformImCaller,
+            ) -> BoxFuture<'a, std::result::Result<Value, String>> {
+                Box::pin(async move {
+                    self.0.lock().unwrap().push(tool_name.to_string());
+                    Ok(json!({ "success": true }))
+                })
+            }
+        }
+
+        let called = Arc::new(Mutex::new(Vec::new()));
+        let bridge = Arc::new(NeverCalledBridge(called.clone()));
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let ctx = HermesToolContext::new(dir.path())
+            .with_chat_and_bot(Some(888), Some(777_020))
+            .with_user_id(Some(42))
+            .with_platform_im_bridge(bridge);
+
+        let rejected_cases = [
+            ("recommend_public_creations", json!({ "limit": u64::MAX })),
+            ("search_public_catalog", json!({ "limit": u64::MAX })),
+            ("search_public_catalog", json!({ "offset": u64::MAX })),
+            ("search_public_catalog", json!({ "limit": (i64::MAX as u64) + 1 })),
+            (
+                "update_my_creation",
+                json!({ "creation_id": "cr_1", "expected_revision": u64::MAX, "title": "Nope" }),
+            ),
+            (
+                "update_my_creation",
+                json!({ "creation_id": "cr_1", "expected_revision": (i64::MAX as u64) + 1, "title": "Nope" }),
+            ),
+            (
+                "update_my_creation",
+                json!({ "creation_id": "cr_1", "expected_revision": -1, "title": "Nope" }),
+            ),
+            (
+                "update_my_creation",
+                json!({ "creation_id": "cr_1", "expected_revision": "wrong_rev_string", "title": "Nope" }),
+            ),
+            (
+                "create_music",
+                json!({ "title": "Overflow BPM", "bpm": u64::MAX }),
+            ),
+            (
+                "create_book",
+                json!({ "title": "Overflow Series", "series_index": u64::MAX }),
+            ),
+            (
+                "create_game",
+                json!({ "title": "Overflow Mins", "estimated_session_mins": u64::MAX }),
+            ),
+        ];
+
+        for (tool, args) in &rejected_cases {
+            let res = HermesToolExecutor::execute(tool, args.clone(), &ctx).await;
+            assert!(
+                !res.success,
+                "{tool} with {args} MUST be rejected by schema validation, got: {}",
+                res.output
+            );
+        }
+        assert!(
+            called.lock().unwrap().is_empty(),
+            "Bridge must never be invoked for schema-invalid u64::MAX/bounds calls, got: {:?}",
+            called.lock().unwrap()
+        );
     }
 }

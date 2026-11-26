@@ -21,7 +21,7 @@ use crate::views::app_shell::shell_truth::{
 use crate::views::chat_sidebar::DialogDeliveryStatus;
 use crate::views::shell::AppShell;
 use crate::views::stage::cards::{
-    DeliveryStatus, MessageContent, MessageDirection, MessageItemModel,
+    DeliveryStatus, MessageContent, MessageDirection, MessageItemModel, ReplyReference,
 };
 
 impl AppShell {
@@ -82,6 +82,38 @@ impl AppShell {
         let my_color = peer_avatar_color(my_user_id);
         let now_ts = format_authoritative_timestamp(Some(chrono::Utc::now().timestamp_millis()));
 
+        let reply_ref: Option<ReplyReference> = if clear_composer_draft {
+            let mut from_composer = None;
+            self.composer.update(cx, |c, c_cx| {
+                if let Some((rid, sender, snippet)) = c.replying_to.take() {
+                    from_composer = Some(ReplyReference {
+                        message_id: rid,
+                        sender_name: sender,
+                        snippet,
+                    });
+                    c_cx.notify();
+                }
+            });
+            let mut from_stage = None;
+            self.stage.update(cx, |st, st_cx| {
+                if let Some(pending) = st.pending_reply.take() {
+                    from_stage = Some(pending);
+                    st_cx.notify();
+                }
+            });
+            from_composer.or(from_stage)
+        } else {
+            None
+        };
+        let reply_to_id = reply_ref
+            .as_ref()
+            .and_then(|r| i64::try_from(r.message_id).ok())
+            .filter(|&id| id > 0);
+        let quote_text = reply_ref
+            .as_ref()
+            .map(|r| r.snippet.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         self.stage.update(cx, |st, st_cx| {
             st.add_message(MessageItemModel {
                 id: msg_id,
@@ -92,7 +124,7 @@ impl AppShell {
                 direction: MessageDirection::Outgoing,
                 timestamp: now_ts.clone(),
                 delivery_status: DeliveryStatus::Sending,
-                reply_to: None,
+                reply_to: reply_ref.clone(),
                 reactions: vec![],
                 content: MessageContent::Text {
                     text: text.clone(),
@@ -112,6 +144,18 @@ impl AppShell {
                     .iter()
                     .any(|d| d.id == active_chat_id && d.folder == "Bots")
         };
+        let is_group_or_channel = self
+            .session_sync
+            .rich_chats_by_id
+            .get(&active_chat_id)
+            .is_some_and(|rc| rc.is_group || rc.is_channel)
+            || self.sidebar.read(cx).dialogs.iter().any(|d| {
+                d.id == active_chat_id
+                    && (d.folder.eq_ignore_ascii_case("Groups")
+                        || d.folder.eq_ignore_ascii_case("Channels"))
+            })
+            || (self.stage.read(cx).active_chat_id == Some(active_chat_id)
+                && self.stage.read(cx).is_group_chat);
         self.sidebar.update(cx, |sb, sb_cx| {
             if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == active_chat_id) {
                 d.last_message = super::shell_pts_updates::format_sidebar_preview(&text);
@@ -152,8 +196,8 @@ impl AppShell {
                     text.clone(),
                 )),
                 entities: Vec::new(),
-                reply_to: None,
-                quote_text: None,
+                reply_to: reply_to_id,
+                quote_text,
                 topic_id: None,
                 client_nonce: Some(msg_id),
                 forward_from_chat_id: None,
@@ -243,10 +287,11 @@ impl AppShell {
             .detach();
         }
 
-        let is_ai_bot = is_bot_dialog
-            || self.is_chat_bot(active_chat_id, cx)
-            || peer_name.contains("Autonomous Agent")
-            || peer_name.contains("Bot");
+        let is_ai_bot = !is_group_or_channel
+            && (is_bot_dialog
+                || self.is_chat_bot(active_chat_id, cx)
+                || peer_name.contains("Autonomous Agent")
+                || peer_name.contains("Bot"));
 
         if let Some(target) = fabushi_target.filter(|_| run_local_fabushi) {
             self.spawn_local_fabushi_turn(active_chat_id, target, None, text, cx);
@@ -380,6 +425,50 @@ impl AppShell {
             sb_cx.notify();
         });
         if server_id > 0 {
+            let confirmed_text_and_sender = {
+                let st = self.stage.read(cx);
+                let found = if st.active_chat_id == Some(chat_id) {
+                    st.messages.iter().find(|m| m.id == server_id)
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    st.chat_histories
+                        .get(&chat_id)
+                        .and_then(|h| h.iter().find(|m| m.id == server_id))
+                });
+                found.and_then(|m| match &m.content {
+                    MessageContent::Text { text, .. } => Some((m.sender_id, text.clone())),
+                    _ => None,
+                })
+            };
+            if let Some((sender_id, text)) = confirmed_text_and_sender {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                self.client.local_store.upsert_cached_historical_message(
+                    chat_id,
+                    gpui_telegram_client::HistoricalMessage {
+                        message_id: server_id,
+                        sender_id,
+                        text: text.clone(),
+                        content: None,
+                        date: Some(now_ms),
+                        reply_to: None,
+                        is_outgoing: Some(true),
+                        reply_to_info: None,
+                        reactions: Vec::new(),
+                        ttl_seconds: None,
+                        expires_at_ms: None,
+                        send_as_peer_id: None,
+                        reactions_authoritative: false,
+                    },
+                );
+                self.client.local_store.update_cached_dialog_preview(
+                    chat_id,
+                    super::shell_pts_updates::format_sidebar_preview(&text),
+                    now_ms,
+                    None,
+                );
+            }
             if let Some(queued) = self.session_sync.pending_nonce_reactions.remove(&local_id) {
                 for (emoji, is_added) in queued {
                     self.dispatch_reaction_mutation(chat_id, server_id, emoji, is_added, cx);

@@ -2241,6 +2241,10 @@ impl BotTurnFloorFence {
         self.floor.validate_turn_nonce(&self.agent_id, &self.nonce)
             == gpui_telegram_agent::TurnDeliveryIntake::Accepted
     }
+
+    pub(crate) fn renew_lease(&self) -> bool {
+        self.floor.renew_lease(&self.agent_id, &self.nonce)
+    }
 }
 
 pub(crate) struct BotStreamTurnParams {
@@ -2256,6 +2260,7 @@ pub(crate) struct BotStreamTurnParams {
     pub companion_apps: Vec<MiniAppRecord>,
     pub help_bot_commands_suffix: Option<String>,
     pub floor_fence: Option<BotTurnFloorFence>,
+    pub is_explicitly_addressed: bool,
 }
 
 fn attach_companion_webapp_button(
@@ -2292,40 +2297,50 @@ fn is_explicitly_addressed_in_group_prompt(
     prompt: &str,
 ) -> bool {
     let mentions = crate::server::extract_at_mentions(prompt);
-    if mentions.is_empty() {
-        return false;
-    }
-    let bot_username = state
-        .fabushi_bots
-        .get_by_user_id(bot_user_id.0 as i64)
+    let inst = state.fabushi_bots.get_by_user_id(bot_user_id.0 as i64);
+    let reg = state.db.get_bot_by_user_id(bot_user_id.0 as i64).ok().flatten();
+    let user = state.db.get_user(bot_user_id).ok().flatten();
+
+    let bot_username = inst
+        .as_ref()
         .map(|i| i.settings().username)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            state
-                .db
-                .get_bot_by_user_id(bot_user_id.0 as i64)
-                .ok()
-                .flatten()
-                .map(|b| b.username)
-        })
-        .or_else(|| {
-            state
-                .db
-                .get_user(bot_user_id)
-                .ok()
-                .flatten()
-                .and_then(|u| u.username)
-        })
+        .or_else(|| reg.as_ref().map(|b| b.username.clone()).filter(|s| !s.trim().is_empty()))
+        .or_else(|| user.as_ref().and_then(|u| u.username.clone()))
         .unwrap_or_default();
+    let mut display_labels: Vec<String> = Vec::new();
+    if let Some(ref i) = inst {
+        let n = i.profile().name;
+        if !n.trim().is_empty() {
+            display_labels.push(n.trim().to_string());
+        }
+    }
+    if let Some(ref b) = reg {
+        if !b.display_name.trim().is_empty() {
+            display_labels.push(b.display_name.trim().to_string());
+        }
+    }
+    if let Some(ref u) = user {
+        if !u.first_name.trim().is_empty() {
+            display_labels.push(u.first_name.trim().to_string());
+        }
+    }
     let bot_id_str = bot_user_id.0.to_string();
 
-    mentions.iter().any(|tok| {
+    if mentions.iter().any(|tok| {
         let lower = tok.to_lowercase();
         matches!(lower.as_str(), "all" | "everyone" | "here" | "所有人")
             || (!agent_label.is_empty() && tok.eq_ignore_ascii_case(agent_label))
             || (!bot_username.is_empty() && tok.eq_ignore_ascii_case(&bot_username))
+            || display_labels.iter().any(|lbl| lbl.eq_ignore_ascii_case(tok))
             || tok == &bot_id_str
-    })
+    }) {
+        return true;
+    }
+
+    display_labels
+        .iter()
+        .any(|lbl| crate::server::text_has_at_mention_label(prompt, lbl))
 }
 
 fn should_suppress_group_outbound_reply(
@@ -2333,9 +2348,10 @@ fn should_suppress_group_outbound_reply(
     params: &BotStreamTurnParams,
     consumer: &StreamConsumerState,
     is_group_chat: bool,
+    allow_stay_silent: bool,
     agent_label: &str,
 ) -> bool {
-    if !is_group_chat {
+    if !is_group_chat || !allow_stay_silent {
         return false;
     }
     if consumer.terminal_error.is_some() || consumer.approval_notice.is_some() {
@@ -2343,31 +2359,31 @@ fn should_suppress_group_outbound_reply(
     }
 
     let clean_candidate = strip_state_patches_for_display(consumer.raw_answer_text());
-    let explicitly_addressed = is_explicitly_addressed_in_group_prompt(
-        state,
-        params.bot_user_id,
-        agent_label,
-        &params.prompt,
-    );
-    let recent_room_messages: Vec<String> = if explicitly_addressed {
-        Vec::new()
-    } else {
-        state
-            .db
-            .list_messages_with_topic(params.chat_id, None, None, 10)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|rec| rec.sender_id != params.sender_id && rec.sender_id != params.bot_user_id)
-            .filter_map(|rec| {
-                crate::messaging::pipeline::MessagePipeline::record_to_item(&rec)
-                    .ok()
-                    .map(|item| crate::server::extract_message_content_text(&item.content))
-            })
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .take(6)
-            .collect()
-    };
+    let explicitly_addressed = params.is_explicitly_addressed
+        || is_explicitly_addressed_in_group_prompt(
+            state,
+            params.bot_user_id,
+            agent_label,
+            &params.prompt,
+        );
+    if explicitly_addressed {
+        return false;
+    }
+    let recent_room_messages: Vec<String> = state
+        .db
+        .list_messages_with_topic(params.chat_id, None, None, 10)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|rec| rec.sender_id != params.sender_id && rec.sender_id != params.bot_user_id)
+        .filter_map(|rec| {
+            crate::messaging::pipeline::MessagePipeline::record_to_item(&rec)
+                .ok()
+                .map(|item| crate::server::extract_message_content_text(&item.content))
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(6)
+        .collect();
 
     let verdict = gpui_telegram_agent::evaluate_outbound_turn_review(
         &gpui_telegram_agent::OutboundTurnReviewInput {
@@ -2384,9 +2400,6 @@ fn should_suppress_group_outbound_reply(
                 consumer.tool_steps.is_empty()
                     && consumer.thinking_buf.trim().is_empty()
                     && params.help_bot_commands_suffix.is_none()
-            }
-            gpui_telegram_agent::OutboundReviewReason::DuplicateEcho if explicitly_addressed => {
-                false
             }
             _ => {
                 tracing::info!(
@@ -2409,6 +2422,7 @@ fn flush_streamed_bot_message(
     consumer: &mut StreamConsumerState,
     is_final: bool,
     is_group_chat: bool,
+    allow_stay_silent: bool,
     agent_label: &str,
 ) {
     if let Some(ref fence) = params.floor_fence {
@@ -2423,14 +2437,22 @@ fn flush_streamed_bot_message(
         }
     }
 
-    // In group rooms, buffer intermediate drafts until completion so `[PASS]` stay-silent
-    // responses, duplicate echoes, or preempted turns never leak noisy messages into the room.
-    if is_group_chat && !is_final {
+    // Only buffer intermediate drafts when stay-silent `[PASS]` / duplicate-echo suppression is
+    // permitted (multi-bot peer overlap). Single-bot groups, explicitly addressed bots, and
+    // primary responders to a human stream live progress immediately.
+    if is_group_chat && allow_stay_silent && !is_final {
         return;
     }
 
     if is_final
-        && should_suppress_group_outbound_reply(state, params, consumer, is_group_chat, agent_label)
+        && should_suppress_group_outbound_reply(
+            state,
+            params,
+            consumer,
+            is_group_chat,
+            allow_stay_silent,
+            agent_label,
+        )
     {
         return;
     }
@@ -2654,6 +2676,7 @@ pub(crate) async fn execute_bot_turn_streamed(
 
     let mut room_groups = Vec::new();
     let mut room_peer_labels: Vec<String> = Vec::new();
+    let mut other_ai_bots_in_room = 0usize;
     if let Ok(member_ids) = state.db.get_chat_members(params.chat_id) {
         let bot_members: Vec<AgentAddress> = member_ids
             .iter()
@@ -2675,6 +2698,20 @@ pub(crate) async fn execute_bot_turn_streamed(
             for uid in &member_ids {
                 if *uid == params.bot_user_id {
                     continue;
+                }
+                if uid.0 != crate::db::miniapp_store::BOTFATHER_USER_ID {
+                    let is_bot_member = state.fabushi_bots.get_by_user_id(uid.0 as i64).is_some()
+                        || state.db.get_user(*uid).ok().flatten().is_some_and(|u| u.is_bot)
+                        || state.db.get_bot_by_user_id(uid.0 as i64).ok().flatten().is_some();
+                    let is_standard = state
+                        .db
+                        .get_bot_by_user_id(uid.0 as i64)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|b| b.is_standard_bot);
+                    if is_bot_member && !is_standard {
+                        other_ai_bots_in_room += 1;
+                    }
                 }
                 if let Some(inst) = state.fabushi_bots.get_by_user_id(uid.0 as i64) {
                     let prof = inst.profile();
@@ -2704,6 +2741,48 @@ pub(crate) async fn execute_bot_turn_streamed(
         }
     }
 
+    let sender_is_bot = state
+        .db
+        .get_user(params.sender_id)
+        .ok()
+        .flatten()
+        .is_some_and(|u| u.is_bot);
+    let explicitly_addressed = params.is_explicitly_addressed
+        || is_explicitly_addressed_in_group_prompt(
+            state,
+            params.bot_user_id,
+            &agent_label,
+            &params.prompt,
+        );
+    let another_bot_already_replied = if is_group_chat && other_ai_bots_in_room > 0 && !sender_is_bot {
+        let recent_desc = state
+            .db
+            .list_messages_with_topic(params.chat_id, None, None, 10)
+            .unwrap_or_default();
+        if let Some(user_idx) = recent_desc
+            .iter()
+            .position(|rec| rec.sender_id == params.sender_id)
+        {
+            recent_desc[..user_idx].iter().any(|rec| {
+                rec.sender_id != params.bot_user_id
+                    && state
+                        .db
+                        .get_user(rec.sender_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|u| u.is_bot)
+            })
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let allow_stay_silent = is_group_chat
+        && other_ai_bots_in_room > 0
+        && !explicitly_addressed
+        && (sender_is_bot || another_bot_already_replied);
+
     let group_prompt_ctx = if is_group_chat {
         let (is_winding_down, remaining_hops) = if let Some(ref fence) = params.floor_fence {
             (fence.is_winding_down, fence.remaining_hops)
@@ -2732,7 +2811,7 @@ pub(crate) async fn execute_bot_turn_streamed(
     let mentioned_teammates = state
         .fabushi_bots
         .collect_mentioned_teammates(params.bot_user_id.0 as i64, &params.prompt);
-    let (fabushi_sp, profile_delta_prefix) = if bot_inst.is_some() || group_prompt_ctx.is_some() {
+    let (mut fabushi_sp, profile_delta_prefix) = if bot_inst.is_some() || group_prompt_ctx.is_some() {
         let (sp, delta) = state.fabushi_bots.build_turn_system_prompt_with_group_context(
             params.bot_user_id.0 as i64,
             params.chat_id.0,
@@ -2752,6 +2831,13 @@ pub(crate) async fn execute_bot_turn_streamed(
     } else {
         (enriched_sp, None)
     };
+    if is_group_chat && !allow_stay_silent {
+        let direct_note = "## Direct Group Turn Assignment\nYou have been selected to reply directly to the user's latest message in this group chat. Respond clearly and helpfully right now; do NOT output `[PASS]`, `<PASS/>`, or `NO_REPLY`.";
+        fabushi_sp = Some(match fabushi_sp {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{direct_note}"),
+            _ => direct_note.to_string(),
+        });
+    }
 
     let caller_scope = build_caller_scope(state, params.sender_id);
     let owns_bot = caller_owns_bot_or_admin(state, params.sender_id, params.bot_user_id.0).is_ok();
@@ -2864,12 +2950,13 @@ pub(crate) async fn execute_bot_turn_streamed(
                 &mut err_consumer,
                 true,
                 is_group_chat,
+                allow_stay_silent,
                 &agent_label,
             );
             state
-        .webmcp_broker
-        .mark_idle_for_bot(params.sender_id, params.bot_user_id);
-    typing_guard.finish();
+                .webmcp_broker
+                .mark_idle_for_bot(params.sender_id, params.bot_user_id);
+            typing_guard.finish();
             return;
         }
     };
@@ -2905,8 +2992,15 @@ pub(crate) async fn execute_bot_turn_streamed(
 
     enum LoopWake {
         FlushTimer,
+        LeaseRenew,
         Event(Option<HermesEvent>),
     }
+
+    let mut lease_renew_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        Duration::from_secs(10),
+    );
+    lease_renew_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         if params.floor_fence.as_ref().is_some_and(|f| !f.is_active()) {
@@ -2922,6 +3016,7 @@ pub(crate) async fn execute_bot_turn_streamed(
         };
         let wake = tokio::select! {
             _ = sleep_fut => LoopWake::FlushTimer,
+            _ = lease_renew_interval.tick() => LoopWake::LeaseRenew,
             ev = rx.recv() => LoopWake::Event(ev),
         };
         if params.floor_fence.as_ref().is_some_and(|f| !f.is_active()) {
@@ -2929,6 +3024,14 @@ pub(crate) async fn execute_bot_turn_streamed(
             break;
         }
         match wake {
+            LoopWake::LeaseRenew => {
+                if let Some(ref fence) = params.floor_fence {
+                    if !fence.renew_lease() {
+                        preempted = true;
+                        break;
+                    }
+                }
+            }
             LoopWake::FlushTimer => {
                 flush_streamed_bot_message(
                     state,
@@ -2936,11 +3039,15 @@ pub(crate) async fn execute_bot_turn_streamed(
                     &mut consumer,
                     false,
                     is_group_chat,
+                    allow_stay_silent,
                     &agent_label,
                 );
             }
             LoopWake::Event(None) => break,
             LoopWake::Event(Some(first_ev)) => {
+                if let Some(ref fence) = params.floor_fence {
+                    let _ = fence.renew_lease();
+                }
                 update_bot_activity(&first_ev, &mut last_activity);
                 let mut flush_now = consumer.apply_event(first_ev);
                 while let Ok(next_ev) = rx.try_recv() {
@@ -2973,6 +3080,7 @@ pub(crate) async fn execute_bot_turn_streamed(
                         &mut consumer,
                         true,
                         is_group_chat,
+                        allow_stay_silent,
                         &agent_label,
                     );
                     break;
@@ -2987,6 +3095,7 @@ pub(crate) async fn execute_bot_turn_streamed(
                         &mut consumer,
                         false,
                         is_group_chat,
+                        allow_stay_silent,
                         &agent_label,
                     );
                 }
@@ -3017,6 +3126,7 @@ pub(crate) async fn execute_bot_turn_streamed(
             &mut consumer,
             true,
             is_group_chat,
+            allow_stay_silent,
             &agent_label,
         );
     }
@@ -8555,9 +8665,18 @@ mod tests {
             companion_apps: vec![app.clone()],
             help_bot_commands_suffix: None,
             floor_fence: None,
+            is_explicitly_addressed: false,
         };
 
-        flush_streamed_bot_message(&state, &params, &mut consumer, true, false, "patch_guard");
+        flush_streamed_bot_message(
+            &state,
+            &params,
+            &mut consumer,
+            true,
+            false,
+            false,
+            "patch_guard",
+        );
 
         // Verify state was NOT mutated by [STATE_PATCH]
         let saved_state = state

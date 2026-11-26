@@ -1201,6 +1201,21 @@ async fn body_appshell_nav_browser_mount_address_typing_and_close(mut app: Async
     .await;
     assert!(reopened, "NavRail::select(Browser) must re-open BrowserWorkspace");
 
+    // 5. Cmd+Shift+B toggles Browser off/on, and MainMenuCommand::Browser opens BrowserWorkspace
+    app.update(|cx| {
+        shell.update(cx, |s, scx| {
+            assert!(s.handle_shortcut_key("b", true, scx));
+            assert_eq!(s.active_panel, ActiveWorkspacePanel::Chats);
+            assert!(s.handle_shortcut_key("b", true, scx));
+            assert_eq!(s.active_panel, ActiveWorkspacePanel::Browser);
+            s.activate_nav_destination(NavDestination::Chats, scx);
+            assert_eq!(s.active_panel, ActiveWorkspacePanel::Chats);
+            s.handle_main_menu_command(MainMenuCommand::Browser, scx);
+            assert_eq!(s.active_panel, ActiveWorkspacePanel::Browser);
+        });
+    })
+    .unwrap();
+
     app.update(|_cx| drop(shell)).unwrap();
     drop(web);
     drop(client);

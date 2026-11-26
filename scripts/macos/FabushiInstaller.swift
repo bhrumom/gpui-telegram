@@ -10,7 +10,7 @@ final class InstallerWindowController: NSWindowController {
     private var isInstalling = false
 
     private let appVersion: String = {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.6.11"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.6.15"
     }()
 
     init() {

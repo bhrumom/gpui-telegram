@@ -1,20 +1,36 @@
 use crate::db::miniapp_store::MiniAppRecord;
-use crate::db::{ChatMemberRecord, ChatRecord, ForumTopicRecord, ServerDatabase};
+use crate::db::{ChatMemberRecord, ChatRecord, CreationOpError, ForumTopicRecord, ServerDatabase};
+use crate::media::cas_store::CasStore;
 use crate::messaging::pipeline::MessagePipeline;
 use crate::miniapp_webmcp::{
     MiniAppWebMcpBroker, DEFAULT_TAKEOVER_WAIT_TIMEOUT, DEFAULT_WEBMCP_RPC_TIMEOUT,
 };
+use crate::routes::creator_bot::{
+    build_default_game_payload, build_default_music_payload, compute_book_word_count,
+    default_category_for_engine, default_cover_for_kind, default_engine_for_category,
+    detect_language, emit_user_creation_changed_to_hub, ensure_bot_summary,
+    parse_book_chapters_or_default, resolve_owner_display_name, sanitize_recommendation_reason,
+    synthesize_and_store_music_tracks,
+};
 use crate::search::hybrid_memory::HybridMemoryEngine;
 use crate::search::schema::{SearchDocument, SearchQueryParams};
 use crate::search::tantivy_indexer::TantivyIndexer;
+use crate::search::PublicCatalogSearchService;
 use crate::server::{extract_message_content_text, AppState};
 use crate::sync::pts_engine::PtsEngine;
 use crate::ws::GatewayHub;
 use chrono::Utc;
 use gpui_telegram_agent::hermes::toolsets::{BoxFuture, PlatformImBridge, PlatformImCaller};
+use gpui_telegram_core::core::deep_links::{AppleDeepLink, AppleDeepLinkSection};
 use gpui_telegram_core::types::{ChatId, MsgId, PeerId, TopicId, UserId};
 use gpui_telegram_proto::cards::GenerativeCard;
 use gpui_telegram_proto::contracts::ForumTopicDto;
+use gpui_telegram_proto::creations::{
+    BookPayload, CatalogSortMode, CoverArtwork, CreateCreationRequest, CreationKind,
+    CreationPayload, CreationReviewStatus, CreationVisibility, GameAchievementDef, GameCategory,
+    GameEngineKind, GamePayload, GameSpec, MusicPayload, MusicTrack, SubmitReviewRequest,
+    UpdateCreationRequest, UserCreationDto,
+};
 use gpui_telegram_proto::message::{MessageContent, MessageItem, ReplyHeader};
 use gpui_telegram_proto::miniapp_contracts::{
     MiniAppActionRequest, MiniAppManifestDto, MiniAppUiSchema, MiniAppWebMcpCommand,
@@ -81,7 +97,10 @@ pub struct ServerPlatformImBridge {
     webmcp_broker: Weak<MiniAppWebMcpBroker>,
     code_scene: Arc<crate::routes::code_scene::CodeSceneRuntimeState>,
     fabushi_bots: Weak<gpui_telegram_agent::fabushi_bot::FabushiBotHost>,
+    community_search: Weak<gpui_telegram_community::CommunitySearchIndexer>,
+    community_bot_guard: Weak<gpui_telegram_community::BotLoopGuard>,
     state_weak: Arc<OnceLock<Weak<AppState>>>,
+    cas: Option<Weak<CasStore>>,
 }
 
 impl ServerPlatformImBridge {
@@ -96,6 +115,8 @@ impl ServerPlatformImBridge {
         webmcp_broker: Weak<MiniAppWebMcpBroker>,
         code_scene: Arc<crate::routes::code_scene::CodeSceneRuntimeState>,
         fabushi_bots: Weak<gpui_telegram_agent::fabushi_bot::FabushiBotHost>,
+        community_search: Weak<gpui_telegram_community::CommunitySearchIndexer>,
+        community_bot_guard: Weak<gpui_telegram_community::BotLoopGuard>,
         state_weak: Arc<OnceLock<Weak<AppState>>>,
     ) -> Self {
         Self {
@@ -108,7 +129,45 @@ impl ServerPlatformImBridge {
             webmcp_broker,
             code_scene,
             fabushi_bots,
+            community_search,
+            community_bot_guard,
             state_weak,
+            cas: None,
+        }
+    }
+
+    pub fn with_cas(mut self, cas: Weak<CasStore>) -> Self {
+        self.cas = Some(cas);
+        self
+    }
+
+    fn resolve_cas(&self) -> Option<Arc<CasStore>> {
+        self.cas
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .or_else(|| {
+                self.state_weak
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .map(|s| Arc::clone(&s.cas))
+            })
+    }
+
+    /// Strict owner pinning for private cloud creation mutations/reads:
+    /// NEVER falls back to `caller.bot_id` and NEVER trusts an `owner_user_id` argument.
+    fn require_authenticated_owner(caller: &PlatformImCaller) -> Result<UserId, String> {
+        caller
+            .user_id
+            .filter(|&u| u > 0)
+            .map(UserId)
+            .ok_or_else(|| {
+                "Authenticated user_id is required for private cloud creation operations".into()
+            })
+    }
+
+    fn emit_creation_changed(&self, dto: &UserCreationDto) {
+        if let Some(hub) = self.gateway_hub.upgrade() {
+            emit_user_creation_changed_to_hub(&hub, dto);
         }
     }
 
@@ -575,6 +634,828 @@ impl ServerPlatformImBridge {
             "state": next_state,
         }))
     }
+
+    fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(format!("'{key}' must be a string")),
+        }
+    }
+
+    fn optional_query_alias<'a>(args: &'a Value) -> Result<Option<&'a str>, String> {
+        let primary = Self::optional_string_arg(args, "query")?;
+        let fallback = Self::optional_string_arg(args, "q")?;
+        Ok(primary
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| fallback.filter(|s| !s.trim().is_empty()))
+            .or(primary)
+            .or(fallback))
+    }
+
+    fn parse_string_vec(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+        let Some(v) = args.get(key).filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let arr = v
+            .as_array()
+            .ok_or_else(|| format!("'{key}' must be an array of strings"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let s = item
+                .as_str()
+                .ok_or_else(|| format!("All items in '{key}' must be strings"))?
+                .trim();
+            if !s.is_empty() {
+                out.push(s.to_string());
+            }
+        }
+        Ok(Some(out))
+    }
+
+    fn parse_optional_creation_kind(args: &Value) -> Result<Option<CreationKind>, String> {
+        let Some(val) = args.get("kind").filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let raw = val
+            .as_str()
+            .ok_or_else(|| "'kind' must be a string".to_string())?
+            .trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+            return Ok(None);
+        }
+        if raw.eq_ignore_ascii_case("apps") {
+            return Ok(Some(CreationKind::App));
+        }
+        CreationKind::parse(raw)
+            .map(Some)
+            .ok_or_else(|| format!("Invalid kind '{raw}'"))
+    }
+
+    fn map_creation_op_err(err: CreationOpError) -> String {
+        match err {
+            CreationOpError::NotFound => "Creation not found".to_string(),
+            CreationOpError::Forbidden(msg) => format!("forbidden: {msg}"),
+            CreationOpError::RevisionConflict { expected, current } => {
+                format!("revision_conflict: expected revision {expected}, current is {current}")
+            }
+            CreationOpError::InvalidState { code, message } => format!("{code}: {message}"),
+            CreationOpError::ValidationFailed(errors) => {
+                format!("validation_failed: {}", errors.join("; "))
+            }
+            CreationOpError::BadRequest { code, message } => format!("{code}: {message}"),
+            CreationOpError::Db(e) => format!("database_error: {e}"),
+        }
+    }
+
+    fn creation_deep_link(creation_id: &str) -> String {
+        AppleDeepLink::for_creation(AppleDeepLinkSection::Creations, creation_id).to_uri()
+    }
+
+    fn exec_create_book(
+        &self,
+        args: &Value,
+        caller: &PlatformImCaller,
+        now_ms: i64,
+    ) -> Result<Value, String> {
+        let owner_uid = Self::require_authenticated_owner(caller)?;
+        let title = Self::optional_string_arg(args, "title")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "'title' is required".to_string())?;
+        let subtitle = Self::optional_string_arg(args, "subtitle")?
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let summary = match Self::optional_string_arg(args, "summary")? {
+            Some(s) => s.trim().to_string(),
+            None => ensure_bot_summary(title, None, CreationKind::Book),
+        };
+        let author = Self::optional_string_arg(args, "author")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| resolve_owner_display_name(&self.db, owner_uid));
+        let language = Self::optional_string_arg(args, "language")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| detect_language(&format!("{title} {summary}")));
+        let genres = Self::parse_string_vec(args, "genres")?
+            .unwrap_or_else(|| vec!["Fiction".into(), "Originals".into()]);
+        let tags = Self::parse_string_vec(args, "tags")?
+            .unwrap_or_else(|| vec!["bot-created".into(), "book".into()]);
+        let cover = match args.get("cover").filter(|v| !v.is_null()) {
+            Some(v) => serde_json::from_value::<CoverArtwork>(v.clone())
+                .map_err(|e| format!("Invalid 'cover': {e}"))?,
+            None => default_cover_for_kind(CreationKind::Book),
+        };
+        let chapters = parse_book_chapters_or_default(
+            args.get("chapters"),
+            title,
+            &summary,
+            &author,
+            &language,
+        )?;
+        let (word_count, estimated_read_mins) = compute_book_word_count(&chapters);
+        let series_name = Self::optional_string_arg(args, "series_name")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let series_index = match args.get("series_index").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .filter(|&n| n >= 1)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        "'series_index' must be a positive 32-bit integer".to_string()
+                    })?;
+                Some(n)
+            }
+            None => None,
+        };
+        let blurb = Self::optional_string_arg(args, "blurb")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| summary.clone());
+
+        let book_payload = BookPayload {
+            author: author.clone(),
+            series_name,
+            series_index,
+            blurb,
+            estimated_read_mins,
+            word_count,
+            chapters,
+        };
+        let req = CreateCreationRequest {
+            kind: CreationKind::Book,
+            title: title.to_string(),
+            subtitle,
+            summary,
+            author_display_name: author,
+            language,
+            genres,
+            tags,
+            cover,
+            age_rating: "4+".into(),
+            visibility: CreationVisibility::Private,
+            creator_bot_user_id: caller.bot_id,
+            creator_chat_id: caller.chat_id,
+            payload: CreationPayload::Book(book_payload),
+        };
+        let dto = self
+            .db
+            .create_user_creation(owner_uid, &req, now_ms)
+            .map_err(Self::map_creation_op_err)?;
+        self.emit_creation_changed(&dto);
+        let deep_link = Self::creation_deep_link(&dto.creation_id);
+        Ok(json!({
+            "success": true,
+            "creation_id": dto.creation_id,
+            "kind": dto.kind.as_str(),
+            "title": dto.title,
+            "review_status": dto.review_status.as_str(),
+            "visibility": dto.visibility.as_str(),
+            "cloud_revision": dto.cloud_revision,
+            "version": dto.version,
+            "deep_link": deep_link,
+            "creation": dto,
+        }))
+    }
+
+    async fn exec_create_music(
+        &self,
+        args: &Value,
+        caller: &PlatformImCaller,
+        now_ms: i64,
+    ) -> Result<Value, String> {
+        let owner_uid = Self::require_authenticated_owner(caller)?;
+        let title = Self::optional_string_arg(args, "title")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "'title' is required".to_string())?;
+        let subtitle = Self::optional_string_arg(args, "subtitle")?
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let summary = match Self::optional_string_arg(args, "summary")? {
+            Some(s) => s.trim().to_string(),
+            None => ensure_bot_summary(title, None, CreationKind::Music),
+        };
+        let artist = Self::optional_string_arg(args, "artist")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| resolve_owner_display_name(&self.db, owner_uid));
+        let language = Self::optional_string_arg(args, "language")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| detect_language(&format!("{title} {summary}")));
+        let bpm = match args.get("bpm").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .ok_or_else(|| "'bpm' must be an integer between 30 and 300".to_string())?;
+                if !(30..=300).contains(&n) {
+                    return Err("'bpm' must be between 30 and 300".to_string());
+                }
+                n as u16
+            }
+            None => 108,
+        };
+        let musical_key = Self::optional_string_arg(args, "musical_key")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let primary_genre = Self::optional_string_arg(args, "primary_genre")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let album_title_opt = Self::optional_string_arg(args, "album_title")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let time_signature_opt = Self::optional_string_arg(args, "time_signature")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let mut music_payload = if let Some(tracks_val) = args.get("tracks").filter(|v| !v.is_null())
+        {
+            let tracks: Vec<MusicTrack> = serde_json::from_value(tracks_val.clone())
+                .map_err(|e| format!("Invalid 'tracks': {e}"))?;
+            let total_duration_secs: u32 = tracks
+                .iter()
+                .fold(0u32, |acc, t| acc.saturating_add(t.duration_secs));
+            MusicPayload {
+                artist: artist.clone(),
+                album_title: album_title_opt.unwrap_or(title).to_string(),
+                release_year: Utc::now().format("%Y").to_string().parse::<u16>().unwrap_or(2026),
+                primary_genre: primary_genre.unwrap_or("Electronic").to_string(),
+                mood_tags: Self::parse_string_vec(args, "mood_tags")?
+                    .unwrap_or_else(|| vec!["Original".into()]),
+                bpm,
+                musical_key: musical_key.unwrap_or("C major").to_string(),
+                time_signature: time_signature_opt.unwrap_or("4/4").to_string(),
+                total_duration_secs,
+                tracks,
+            }
+        } else {
+            let mut built = build_default_music_payload(
+                title,
+                &summary,
+                &artist,
+                bpm,
+                musical_key,
+                primary_genre,
+                &language,
+                (owner_uid.0 ^ (now_ms as u64)).wrapping_add(31),
+            );
+            if let Some(album) = album_title_opt {
+                built.album_title = album.to_string();
+            }
+            if let Some(ts) = time_signature_opt {
+                built.time_signature = ts.to_string();
+            }
+            if let Some(moods) = Self::parse_string_vec(args, "mood_tags")? {
+                built.mood_tags = moods;
+            }
+            built
+        };
+
+        let synthesize_audio = match args.get("synthesize_audio").filter(|v| !v.is_null()) {
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| "'synthesize_audio' must be a boolean".to_string())?,
+            None => true,
+        };
+        let cas_opt = self.resolve_cas();
+        let audio_media_file_ids = if synthesize_audio {
+            synthesize_and_store_music_tracks(
+                &self.db,
+                cas_opt.as_deref(),
+                owner_uid,
+                &mut music_payload,
+                now_ms,
+            )
+            .await
+        } else {
+            Vec::new()
+        };
+
+        let genres = Self::parse_string_vec(args, "genres")?
+            .unwrap_or_else(|| vec![music_payload.primary_genre.clone(), "Originals".into()]);
+        let tags = Self::parse_string_vec(args, "tags")?
+            .unwrap_or_else(|| vec!["bot-created".into(), "music".into()]);
+        let cover = match args.get("cover").filter(|v| !v.is_null()) {
+            Some(v) => serde_json::from_value::<CoverArtwork>(v.clone())
+                .map_err(|e| format!("Invalid 'cover': {e}"))?,
+            None => default_cover_for_kind(CreationKind::Music),
+        };
+
+        let req = CreateCreationRequest {
+            kind: CreationKind::Music,
+            title: title.to_string(),
+            subtitle,
+            summary,
+            author_display_name: artist,
+            language,
+            genres,
+            tags,
+            cover,
+            age_rating: "4+".into(),
+            visibility: CreationVisibility::Private,
+            creator_bot_user_id: caller.bot_id,
+            creator_chat_id: caller.chat_id,
+            payload: CreationPayload::Music(music_payload),
+        };
+        let dto = self
+            .db
+            .create_user_creation(owner_uid, &req, now_ms)
+            .map_err(Self::map_creation_op_err)?;
+        self.emit_creation_changed(&dto);
+        let deep_link = Self::creation_deep_link(&dto.creation_id);
+        Ok(json!({
+            "success": true,
+            "creation_id": dto.creation_id,
+            "kind": dto.kind.as_str(),
+            "title": dto.title,
+            "review_status": dto.review_status.as_str(),
+            "visibility": dto.visibility.as_str(),
+            "cloud_revision": dto.cloud_revision,
+            "version": dto.version,
+            "audio_media_file_ids": audio_media_file_ids,
+            "deep_link": deep_link,
+            "creation": dto,
+        }))
+    }
+
+    fn exec_create_game(
+        &self,
+        args: &Value,
+        caller: &PlatformImCaller,
+        now_ms: i64,
+    ) -> Result<Value, String> {
+        let owner_uid = Self::require_authenticated_owner(caller)?;
+        let title = Self::optional_string_arg(args, "title")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "'title' is required".to_string())?;
+        let subtitle = Self::optional_string_arg(args, "subtitle")?
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let summary = match Self::optional_string_arg(args, "summary")? {
+            Some(s) => s.trim().to_string(),
+            None => ensure_bot_summary(title, None, CreationKind::Game),
+        };
+        let developer = Self::optional_string_arg(args, "developer")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| resolve_owner_display_name(&self.db, owner_uid));
+        let language = Self::optional_string_arg(args, "language")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| detect_language(&format!("{title} {summary}")));
+
+        let explicit_category = match args.get("category").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let raw = v
+                    .as_str()
+                    .ok_or_else(|| "'category' must be a string".to_string())?
+                    .trim();
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(
+                        GameCategory::parse(raw)
+                            .ok_or_else(|| format!("Invalid game category '{raw}'"))?,
+                    )
+                }
+            }
+            None => None,
+        };
+        let explicit_engine = match args.get("engine_kind").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let raw = v
+                    .as_str()
+                    .ok_or_else(|| "'engine_kind' must be a string".to_string())?
+                    .trim();
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(
+                        GameEngineKind::parse(raw)
+                            .ok_or_else(|| format!("Invalid game engine_kind '{raw}'"))?,
+                    )
+                }
+            }
+            None => None,
+        };
+
+        let mut game_payload: GamePayload =
+            if let Some(spec_val) = args.get("spec").filter(|v| !v.is_null()) {
+                let spec: GameSpec = serde_json::from_value(spec_val.clone())
+                    .map_err(|e| format!("Invalid 'spec': {e}"))?;
+                let spec_engine = spec.engine_kind();
+                if let Some(exp) = explicit_engine {
+                    if exp != spec_engine {
+                        return Err(format!(
+                            "engine_kind '{}' does not match spec type '{}'",
+                            exp.as_str(),
+                            spec_engine.as_str()
+                        ));
+                    }
+                }
+                let category = explicit_category
+                    .unwrap_or_else(|| default_category_for_engine(spec_engine));
+                let mut base = build_default_game_payload(
+                    title,
+                    &summary,
+                    &developer,
+                    category,
+                    spec_engine,
+                    &language,
+                );
+                base.engine_kind = spec_engine;
+                base.spec = spec;
+                base
+            } else {
+                let engine_kind = explicit_engine
+                    .or_else(|| explicit_category.map(default_engine_for_category))
+                    .unwrap_or(GameEngineKind::GridPuzzle);
+                let category = explicit_category
+                    .unwrap_or_else(|| default_category_for_engine(engine_kind));
+                build_default_game_payload(
+                    title,
+                    &summary,
+                    &developer,
+                    category,
+                    engine_kind,
+                    &language,
+                )
+            };
+
+        if let Some(hint) = Self::optional_string_arg(args, "controls_hint")? {
+            game_payload.controls_hint = hint.trim().to_string();
+        }
+        if let Some(rules) = Self::optional_string_arg(args, "rules_markdown")? {
+            game_payload.rules_markdown = rules.trim().to_string();
+        }
+        if let Some(v) = args.get("supports_leaderboard").filter(|v| !v.is_null()) {
+            game_payload.supports_leaderboard = v
+                .as_bool()
+                .ok_or_else(|| "'supports_leaderboard' must be a boolean".to_string())?;
+        }
+        if let Some(v) = args.get("estimated_session_mins").filter(|v| !v.is_null()) {
+            let mins = v
+                .as_i64()
+                .filter(|&n| n >= 1)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    "'estimated_session_mins' must be a positive 32-bit integer".to_string()
+                })?;
+            game_payload.estimated_session_mins = mins;
+        }
+        if let Some(ach_val) = args.get("achievements").filter(|v| !v.is_null()) {
+            let achs: Vec<GameAchievementDef> = serde_json::from_value(ach_val.clone())
+                .map_err(|e| format!("Invalid 'achievements': {e}"))?;
+            game_payload.achievements = achs;
+        }
+
+        let genres = Self::parse_string_vec(args, "genres")?
+            .unwrap_or_else(|| vec![game_payload.category.as_str().to_string(), "Arcade".into()]);
+        let tags = Self::parse_string_vec(args, "tags")?
+            .unwrap_or_else(|| vec!["bot-created".into(), "game".into()]);
+        let cover = match args.get("cover").filter(|v| !v.is_null()) {
+            Some(v) => serde_json::from_value::<CoverArtwork>(v.clone())
+                .map_err(|e| format!("Invalid 'cover': {e}"))?,
+            None => default_cover_for_kind(CreationKind::Game),
+        };
+
+        let req = CreateCreationRequest {
+            kind: CreationKind::Game,
+            title: title.to_string(),
+            subtitle,
+            summary,
+            author_display_name: developer,
+            language,
+            genres,
+            tags,
+            cover,
+            age_rating: "4+".into(),
+            visibility: CreationVisibility::Private,
+            creator_bot_user_id: caller.bot_id,
+            creator_chat_id: caller.chat_id,
+            payload: CreationPayload::Game(game_payload),
+        };
+        let dto = self
+            .db
+            .create_user_creation(owner_uid, &req, now_ms)
+            .map_err(Self::map_creation_op_err)?;
+        self.emit_creation_changed(&dto);
+        let deep_link = Self::creation_deep_link(&dto.creation_id);
+        Ok(json!({
+            "success": true,
+            "creation_id": dto.creation_id,
+            "kind": dto.kind.as_str(),
+            "title": dto.title,
+            "review_status": dto.review_status.as_str(),
+            "visibility": dto.visibility.as_str(),
+            "cloud_revision": dto.cloud_revision,
+            "version": dto.version,
+            "deep_link": deep_link,
+            "creation": dto,
+        }))
+    }
+
+    fn exec_update_my_creation(
+        &self,
+        args: &Value,
+        caller: &PlatformImCaller,
+        now_ms: i64,
+    ) -> Result<Value, String> {
+        let owner_uid = Self::require_authenticated_owner(caller)?;
+        let creation_id = Self::optional_string_arg(args, "creation_id")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "'creation_id' is required".to_string())?;
+        let cover = match args.get("cover").filter(|v| !v.is_null()) {
+            Some(v) => Some(
+                serde_json::from_value::<CoverArtwork>(v.clone())
+                    .map_err(|e| format!("Invalid 'cover': {e}"))?,
+            ),
+            None => None,
+        };
+        let visibility = match args.get("visibility").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let raw = v
+                    .as_str()
+                    .ok_or_else(|| "'visibility' must be a string".to_string())?
+                    .trim();
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(
+                        CreationVisibility::parse(raw)
+                            .ok_or_else(|| format!("Invalid visibility '{raw}'"))?,
+                    )
+                }
+            }
+            None => None,
+        };
+        let payload = match args.get("payload").filter(|v| !v.is_null()) {
+            Some(v) => Some(
+                serde_json::from_value::<CreationPayload>(v.clone())
+                    .map_err(|e| format!("Invalid 'payload': {e}"))?,
+            ),
+            None => None,
+        };
+        let expected_revision = match args.get("expected_revision").filter(|v| !v.is_null()) {
+            Some(v) => Some(
+                v.as_i64()
+                    .filter(|&n| n >= 0)
+                    .ok_or_else(|| {
+                        "'expected_revision' must be a non-negative 64-bit integer".to_string()
+                    })?,
+            ),
+            None => None,
+        };
+        let req = UpdateCreationRequest {
+            expected_revision,
+            title: Self::optional_string_arg(args, "title")?.map(|s| s.trim().to_string()),
+            subtitle: Self::optional_string_arg(args, "subtitle")?.map(|s| s.trim().to_string()),
+            summary: Self::optional_string_arg(args, "summary")?.map(|s| s.trim().to_string()),
+            author_display_name: Self::optional_string_arg(args, "author_display_name")?
+                .map(|s| s.trim().to_string()),
+            language: Self::optional_string_arg(args, "language")?.map(|s| s.trim().to_string()),
+            genres: Self::parse_string_vec(args, "genres")?,
+            tags: Self::parse_string_vec(args, "tags")?,
+            cover,
+            age_rating: Self::optional_string_arg(args, "age_rating")?
+                .map(|s| s.trim().to_string()),
+            visibility,
+            payload,
+        };
+        let dto = self
+            .db
+            .update_user_creation(creation_id, owner_uid, &req, now_ms)
+            .map_err(Self::map_creation_op_err)?;
+        self.emit_creation_changed(&dto);
+        let deep_link = Self::creation_deep_link(&dto.creation_id);
+        Ok(json!({
+            "success": true,
+            "creation_id": dto.creation_id,
+            "cloud_revision": dto.cloud_revision,
+            "version": dto.version,
+            "review_status": dto.review_status.as_str(),
+            "deep_link": deep_link,
+            "creation": dto,
+        }))
+    }
+
+    fn exec_list_my_creations(
+        &self,
+        args: &Value,
+        caller: &PlatformImCaller,
+    ) -> Result<Value, String> {
+        let owner_uid = Self::require_authenticated_owner(caller)?;
+        let kind_opt = Self::parse_optional_creation_kind(args)?;
+        let status_opt = match args.get("status").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let raw = v
+                    .as_str()
+                    .ok_or_else(|| "'status' must be a string".to_string())?
+                    .trim();
+                if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+                    None
+                } else {
+                    Some(
+                        CreationReviewStatus::parse(raw)
+                            .ok_or_else(|| format!("Invalid status '{raw}'"))?,
+                    )
+                }
+            }
+            None => None,
+        };
+        let query_opt = Self::optional_query_alias(args)?
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let resp = self
+            .db
+            .list_my_creations(owner_uid, kind_opt, status_opt, query_opt)
+            .map_err(|e| e.to_string())?;
+        let items_with_links: Vec<Value> = resp
+            .items
+            .iter()
+            .map(|dto| {
+                let mut val = serde_json::to_value(dto).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "deep_link".to_string(),
+                        json!(Self::creation_deep_link(&dto.creation_id)),
+                    );
+                }
+                val
+            })
+            .collect();
+        Ok(json!({
+            "success": true,
+            "count": items_with_links.len(),
+            "latest_revision": resp.latest_revision,
+            "items": items_with_links,
+        }))
+    }
+
+    fn exec_submit_creation_for_review(
+        &self,
+        args: &Value,
+        caller: &PlatformImCaller,
+        now_ms: i64,
+    ) -> Result<Value, String> {
+        let owner_uid = Self::require_authenticated_owner(caller)?;
+        let creation_id = Self::optional_string_arg(args, "creation_id")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "'creation_id' is required".to_string())?;
+        let visibility = match args.get("visibility").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let raw = v
+                    .as_str()
+                    .ok_or_else(|| "'visibility' must be a string".to_string())?
+                    .trim();
+                if raw.is_empty() {
+                    Some(CreationVisibility::Public)
+                } else {
+                    Some(
+                        CreationVisibility::parse(raw)
+                            .ok_or_else(|| format!("Invalid visibility '{raw}'"))?,
+                    )
+                }
+            }
+            None => Some(CreationVisibility::Public),
+        };
+        let notes = Self::optional_string_arg(args, "notes")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let req = SubmitReviewRequest { visibility, notes };
+
+        match self
+            .db
+            .submit_creation_for_review(creation_id, owner_uid, &req, now_ms)
+        {
+            Ok(dto) => {
+                self.emit_creation_changed(&dto);
+                let deep_link = Self::creation_deep_link(&dto.creation_id);
+                Ok(json!({
+                    "success": true,
+                    "submitted": true,
+                    "creation_id": dto.creation_id,
+                    "review_status": dto.review_status.as_str(),
+                    "cloud_revision": dto.cloud_revision,
+                    "validation_errors": [],
+                    "deep_link": deep_link,
+                    "creation": dto,
+                }))
+            }
+            Err(CreationOpError::ValidationFailed(errors)) => Ok(json!({
+                "success": false,
+                "submitted": false,
+                "creation_id": creation_id,
+                "error": "validation_failed",
+                "message": "Creation failed review validation",
+                "validation_errors": errors,
+            })),
+            Err(other) => Err(Self::map_creation_op_err(other)),
+        }
+    }
+
+    fn exec_search_public_catalog(&self, args: &Value) -> Result<Value, String> {
+        let kind_opt = Self::parse_optional_creation_kind(args)?;
+        let query_opt = Self::optional_query_alias(args)?;
+        let genre_opt = Self::optional_string_arg(args, "genre")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let sort = match args.get("sort").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let raw = v
+                    .as_str()
+                    .ok_or_else(|| "'sort' must be a string".to_string())?
+                    .trim();
+                if raw.is_empty() {
+                    CatalogSortMode::Featured
+                } else {
+                    CatalogSortMode::parse(raw).ok_or_else(|| format!("Invalid sort '{raw}'"))?
+                }
+            }
+            None => CatalogSortMode::Featured,
+        };
+        let limit = match args.get("limit").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .filter(|&n| (1..=100).contains(&n))
+                    .ok_or_else(|| "'limit' must be an integer between 1 and 100".to_string())?;
+                n as usize
+            }
+            None => 20,
+        };
+        let offset = match args.get("offset").filter(|v| !v.is_null()) {
+            Some(v) => v
+                .as_i64()
+                .filter(|&n| n >= 0)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| "'offset' must be a non-negative 64-bit integer".to_string())?,
+            None => 0,
+        };
+
+        // Layer 4 Zero-Leak Guarantee: EXCLUSIVELY query PublicCatalogSearchService.
+        let catalog = PublicCatalogSearchService::new(Arc::clone(&self.db));
+        let resp = catalog
+            .search_catalog(kind_opt, query_opt, genre_opt, sort, limit, offset)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "success": true,
+            "total": resp.total,
+            "count": resp.items.len(),
+            "items": resp.items,
+        }))
+    }
+
+    fn exec_recommend_public_creations(&self, args: &Value) -> Result<Value, String> {
+        let kind_opt = Self::parse_optional_creation_kind(args)?;
+        let query_opt = Self::optional_query_alias(args)?;
+        let genre_opt = Self::optional_string_arg(args, "genre")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let limit = match args.get("limit").filter(|v| !v.is_null()) {
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .filter(|&n| (1..=50).contains(&n))
+                    .ok_or_else(|| "'limit' must be an integer between 1 and 50".to_string())?;
+                n as usize
+            }
+            None => 10,
+        };
+
+        // Layer 4 Zero-Leak Guarantee: EXCLUSIVELY query PublicCatalogSearchService.
+        let catalog = PublicCatalogSearchService::new(Arc::clone(&self.db));
+        let mut resp = catalog
+            .recommend(query_opt, kind_opt, genre_opt, limit)
+            .map_err(|e| e.to_string())?;
+        for item in &mut resp.items {
+            item.reason = sanitize_recommendation_reason(&item.reason);
+        }
+        Ok(json!({
+            "success": true,
+            "count": resp.items.len(),
+            "items": resp.items,
+        }))
+    }
 }
 
 impl PlatformImBridge for ServerPlatformImBridge {
@@ -585,8 +1466,21 @@ impl PlatformImBridge for ServerPlatformImBridge {
         caller: PlatformImCaller,
     ) -> BoxFuture<'a, Result<Value, String>> {
         Box::pin(async move {
-            let caller_uid = self.resolve_caller_user(&caller)?;
             let now_ms = Utc::now().timestamp_millis();
+            if gpui_telegram_agent::is_community_tool(tool_name) {
+                let ctx = crate::routes::community::hermes_bridge::CommunityBridgeContext {
+                    db: &self.db,
+                    gateway_hub: &self.gateway_hub,
+                    community_search: &self.community_search,
+                    community_bot_guard: &self.community_bot_guard,
+                    state_weak: &self.state_weak,
+                };
+                return crate::routes::community::hermes_bridge::execute_community_im_tool(
+                    &ctx, tool_name, args, &caller, now_ms,
+                );
+            }
+
+            let caller_uid = self.resolve_caller_user(&caller)?;
 
             match tool_name {
                 "send_message" => {
@@ -2421,6 +3315,16 @@ impl PlatformImBridge for ServerPlatformImBridge {
                         "scenes": list.assets,
                     }))
                 }
+                "create_book" => self.exec_create_book(args, &caller, now_ms),
+                "create_music" => self.exec_create_music(args, &caller, now_ms).await,
+                "create_game" => self.exec_create_game(args, &caller, now_ms),
+                "update_my_creation" => self.exec_update_my_creation(args, &caller, now_ms),
+                "list_my_creations" => self.exec_list_my_creations(args, &caller),
+                "submit_creation_for_review" => {
+                    self.exec_submit_creation_for_review(args, &caller, now_ms)
+                }
+                "search_public_catalog" => self.exec_search_public_catalog(args),
+                "recommend_public_creations" => self.exec_recommend_public_creations(args),
                 other => Err(format!("Unsupported PlatformIm tool '{other}'")),
             }
         })

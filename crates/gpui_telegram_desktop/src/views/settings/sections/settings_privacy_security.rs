@@ -262,12 +262,21 @@ impl SettingsPrivacySecuritySections {
             ek.zeroize();
         }
         self.session_emergency_kit = None;
+        self.two_factor_editing = false;
+        self.two_factor_password_draft.zeroize();
+        if let Some(Some(ref mut pw)) = self.pending_2fa_action {
+            pw.zeroize();
+        }
+        self.pending_2fa_action = None;
         self.recovery_key_editing = false;
         self.recovery_key_draft.zeroize();
         self.recovery_key_ime_preedit = None;
         self.pending_device_sync_requests.clear();
         self.saved_credentials.clear();
         self.pending_vault_action = None;
+        self.pending_nav_section = None;
+        self.pending_edit_privacy_category = None;
+        self.pending_save_settings = false;
     }
 
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) { self.palette = palette; }
@@ -1128,7 +1137,7 @@ impl Render for SettingsPrivacySecuritySections {
                                                         cx.listener(|this, _e, _w, cx| {
                                                             this.pending_2fa_action = Some(None);
                                                             this.two_factor_editing = false;
-                                                            this.two_factor_password_draft.clear();
+                                                            this.two_factor_password_draft.zeroize();
                                                             cx.notify();
                                                         }),
                                                     )
@@ -1152,7 +1161,7 @@ impl Render for SettingsPrivacySecuritySections {
                                                             let pw = this.two_factor_password_draft.trim().to_string();
                                                             this.pending_2fa_action = Some(Some(pw));
                                                             this.two_factor_editing = false;
-                                                            this.two_factor_password_draft.clear();
+                                                            this.two_factor_password_draft.zeroize();
                                                             cx.notify();
                                                         }
                                                     }),

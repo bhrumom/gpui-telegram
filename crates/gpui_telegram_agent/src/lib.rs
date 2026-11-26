@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod code_scene_bot;
+pub mod community_tools;
 pub mod computer;
 pub mod fabushi_bot;
 pub mod hermes;
@@ -61,6 +62,9 @@ pub use code_scene_bot::{
     active_remote_target, build_code_scene_generative_card, detect_code_scene_chat_intent,
     parse_scene_slash_args, CodeSceneBotGenerator, CodeSceneBoxFuture, CodeSceneChatIntent,
     CodeSceneGenOutcome, CodeSceneLlmBackend, ProviderRouterBackend, SceneSlashAction,
+};
+pub use community_tools::{
+    community_tool_specs, is_community_tool, validate_community_tool_args, COMMUNITY_TOOL_NAMES,
 };
 pub use computer::{
     parse_cloud_credentials_from_prompt, redact_cloud_secrets, AgentCloudServerConfigInput,

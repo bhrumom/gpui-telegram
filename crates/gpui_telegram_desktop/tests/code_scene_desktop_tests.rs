@@ -156,7 +156,7 @@ fn test_code_scene_icon_nav_and_sidebar_hard_invariants() {
     assert!(svg_str.contains("<svg") && svg_str.contains("</svg>"));
 
     let rail = NavRail::new();
-    assert_eq!(rail.items.len(), 11);
+    assert_eq!(rail.items.len(), 12);
     let cs_item = rail
         .items
         .iter()
@@ -635,6 +635,26 @@ async fn body_app_shell_code_scene_navigation_and_cards(app: AsyncApp) {
                     .asset
                     .scene_id,
                 first_scene_id
+            );
+
+            // AppleAppSidebar entry selects CodeScene & highlights cleanly across Books/Chats
+            s.select_apple_sidebar_section(
+                gpui_telegram_desktop::views::AppleSidebarSection::Chats,
+                scx,
+            );
+            assert_eq!(s.active_panel, ActiveWorkspacePanel::Chats);
+            assert_eq!(
+                s.apple_sidebar.read(scx).active_section,
+                gpui_telegram_desktop::views::AppleSidebarSection::Chats
+            );
+            s.select_apple_sidebar_section(
+                gpui_telegram_desktop::views::AppleSidebarSection::CodeScene,
+                scx,
+            );
+            assert_eq!(s.active_panel, ActiveWorkspacePanel::CodeScene);
+            assert_eq!(
+                s.apple_sidebar.read(scx).active_section,
+                gpui_telegram_desktop::views::AppleSidebarSection::CodeScene
             );
 
             // Logout tears down CodeSceneWorkspace cleanly

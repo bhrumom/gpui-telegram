@@ -9,8 +9,11 @@ use crate::components::ui::TextInputController;
 use crate::theme::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::settings::sections::{
-    settings_ai_providers::SettingsAiProvidersEvent,
-    settings_computers::SettingsComputersEvent,
+    settings_ai_providers::{AiProviderField, SettingsAiProvidersEvent},
+    settings_computers::{
+        AssistInputField, CloudFormField, SettingsComputersEvent, SettingsComputersPage,
+        SettingsComputersTab,
+    },
     settings_folders::ChatFolderItem,
     settings_information::ProfileEditField,
     settings_local_passcode::AutoLockTimeout,
@@ -151,8 +154,32 @@ pub enum SettingsRouterEvent {
     SelectLanguage(&'static str),
     ToggleLanguage,
     Navigated(SettingsSectionType),
+    ActiveInputFieldChanged,
     CheckForUpdates,
     TriggerOneClickUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyEditField {
+    TwoFactorPassword,
+    RecoveryKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsActiveInputKey {
+    Information(ProfileEditField),
+    Privacy(PrivacyEditField),
+    FoldersTitle,
+    ComputersCloudForm {
+        field: CloudFormField,
+        form_gen: u64,
+    },
+    ComputersAssist(AssistInputField),
+    AiProviders {
+        field: AiProviderField,
+        editor_gen: u64,
+    },
+    SearchQuery,
 }
 
 /// Manages settings navigation stack, modal rendering, and lazy instantiation of all settings sections.
@@ -190,6 +217,7 @@ pub struct SettingsRouter {
     pub settings_ai_providers: Option<Entity<SettingsAiProvidersSections>>,
     pub settings_search: Option<Entity<SettingsSearch>>,
     pub update_snapshot: Option<DesktopUpdateSnapshot>,
+    pub(super) last_active_input_key: Option<SettingsActiveInputKey>,
 }
 
 impl EventEmitter<SettingsRouterEvent> for SettingsRouter {}
@@ -289,6 +317,7 @@ impl SettingsRouter {
             settings_ai_providers: None,
             settings_search: None,
             update_snapshot: None,
+            last_active_input_key: None,
         }
     }
 
@@ -718,8 +747,10 @@ impl SettingsRouter {
             self.standalone_computers_mode = false;
         }
         if entering_settings_modal {
+            self.clear_all_preedits(cx);
             self.settings_stack.clear();
             self.settings_section = target;
+            self.last_active_input_key = self.current_active_input_key(cx);
             cx.emit(SettingsRouterEvent::Navigated(target));
             cx.notify();
             return;
@@ -727,10 +758,12 @@ impl SettingsRouter {
         if self.settings_section == target {
             return;
         }
+        self.clear_all_preedits(cx);
         if self.settings_stack.last().copied() != Some(self.settings_section) {
             self.settings_stack.push(self.settings_section);
         }
         self.settings_section = target;
+        self.last_active_input_key = self.current_active_input_key(cx);
         cx.emit(SettingsRouterEvent::Navigated(target));
         cx.notify();
     }
@@ -766,7 +799,9 @@ impl SettingsRouter {
             }
         }
         if let Some(prev) = self.settings_stack.pop() {
+            self.clear_all_preedits(cx);
             self.settings_section = prev;
+            self.last_active_input_key = self.current_active_input_key(cx);
             cx.emit(SettingsRouterEvent::Navigated(prev));
             cx.notify();
             true
@@ -775,7 +810,9 @@ impl SettingsRouter {
                 .settings_section
                 .parent_section()
                 .unwrap_or(SettingsSectionType::Main);
+            self.clear_all_preedits(cx);
             self.settings_section = parent;
+            self.last_active_input_key = self.current_active_input_key(cx);
             cx.emit(SettingsRouterEvent::Navigated(parent));
             cx.notify();
             true
@@ -788,10 +825,114 @@ impl SettingsRouter {
     /// Resets section and navigation stack and emits `SettingsRouterEvent::CloseRequested`.
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.stop_mic_test_if_active(cx);
+        self.clear_all_preedits(cx);
         self.standalone_computers_mode = false;
         self.settings_section = SettingsSectionType::Main;
         self.settings_stack.clear();
+        self.last_active_input_key = None;
         cx.emit(SettingsRouterEvent::CloseRequested);
+        cx.notify();
+    }
+
+    /// Stops any active mic test, clears section preedits, and resets the navigation stack
+    /// back to `Main` without emitting `SettingsRouterEvent::CloseRequested`.
+    pub fn close_silent(&mut self, cx: &mut Context<Self>) {
+        self.stop_mic_test_if_active(cx);
+        self.clear_all_preedits(cx);
+        let changed =
+            self.settings_section != SettingsSectionType::Main || !self.settings_stack.is_empty();
+        self.settings_section = SettingsSectionType::Main;
+        self.settings_stack.clear();
+        self.last_active_input_key = None;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Zeroizes plaintext secret drafts, clears preedits & search/profile drafts, stops any active
+    /// mic test, resets navigation stack to `Main`, and drops all 25 lazily-materialized section
+    /// entities across logout / account-switch / server-URL boundaries while preserving app-wide
+    /// `palette`, `lang_id`, `is_chinese_locale`, `preferences`, and `update_snapshot`.
+    pub fn reset_for_logout_or_account_switch(&mut self, cx: &mut Context<Self>) {
+        self.stop_mic_test_if_active(cx);
+        self.clear_all_preedits(cx);
+        if let Some(sp) = self.settings_privacy.take() {
+            sp.update(cx, |sec, _| sec.clear_session_custody_state());
+        }
+        if let Some(sc) = self.settings_computers.take() {
+            sc.update(cx, |sec, _| {
+                sec.assist_custom_code_draft.zeroize();
+                sec.assist_target_id_draft.zeroize();
+                sec.assist_target_code_draft.zeroize();
+                sec.form_credential.zeroize();
+                sec.assist_focus = AssistInputField::None;
+                sec.form_focus = CloudFormField::None;
+                sec.pending_event = None;
+            });
+        }
+        if let Some(ap) = self.settings_ai_providers.take() {
+            ap.update(cx, |sec, _| {
+                sec.draft_api_key.zeroize();
+                sec.import_raw_draft.zeroize();
+                sec.active_field = AiProviderField::None;
+                sec.pending_event = None;
+            });
+        }
+        if let Some(ss) = self.settings_search.take() {
+            ss.update(cx, |sec, _| {
+                sec.set_query("");
+                sec.recent_entry_ids.clear();
+                sec.selected_index = 0;
+                sec.pending_selected_section = None;
+            });
+        }
+        if let Some(si) = self.settings_information.take() {
+            si.update(cx, |sec, _| {
+                sec.first_name.clear();
+                sec.last_name.clear();
+                sec.bio.clear();
+                sec.username.clear();
+                sec.phone.clear();
+                sec.birthday = None;
+                sec.accounts.clear();
+                sec.active_field = ProfileEditField::None;
+                sec.pending_save_profile = false;
+                sec.pending_logout = false;
+                sec.status_message = None;
+            });
+        }
+        if let Some(sf) = self.settings_folders.take() {
+            sf.update(cx, |sec, _| {
+                sec.folders.clear();
+                sec.new_folder_title.clear();
+                sec.is_editing_title = false;
+                sec.selected_folder_id = None;
+                sec.pending_create_folder = false;
+                sec.pending_created_folder = None;
+            });
+        }
+        self.settings_main = None;
+        self.settings_notifications = None;
+        self.settings_notif_reactions = None;
+        self.settings_notif_type = None;
+        self.settings_blocked_peers = None;
+        self.settings_active_sessions = None;
+        self.settings_local_passcode = None;
+        self.settings_passkeys = None;
+        self.settings_global_ttl = None;
+        self.settings_websites = None;
+        self.settings_chat = None;
+        self.settings_advanced = None;
+        self.settings_local_storage = None;
+        self.settings_power_saving = None;
+        self.settings_calls = None;
+        self.settings_credits = None;
+        self.settings_premium = None;
+        self.settings_shortcuts = None;
+        self.settings_business = None;
+        self.settings_section = SettingsSectionType::Main;
+        self.settings_stack.clear();
+        self.last_active_input_key = None;
         cx.notify();
     }
 
@@ -815,35 +956,79 @@ impl SettingsRouter {
         cx.emit(SettingsRouterEvent::ToggleLanguage);
     }
 
-    /// Returns `true` when the active settings section currently focuses a text input field.
-    pub fn is_input_active(&self, cx: &App) -> bool {
+    /// Returns the canonical active input identity for the currently focused settings field, if any.
+    pub fn current_active_input_key(&self, cx: &App) -> Option<SettingsActiveInputKey> {
         match self.settings_section {
             SettingsSectionType::Information => self
                 .settings_information
                 .as_ref()
-                .is_some_and(|si| si.read(cx).active_field != ProfileEditField::None),
-            SettingsSectionType::PrivacySecurity => self
-                .settings_privacy
-                .as_ref()
-                .is_some_and(|sp| {
-                    let r = sp.read(cx);
-                    r.two_factor_editing || r.recovery_key_editing
-                }),
+                .map(|si| si.read(cx).active_field)
+                .filter(|&f| f != ProfileEditField::None)
+                .map(SettingsActiveInputKey::Information),
+            SettingsSectionType::PrivacySecurity => self.settings_privacy.as_ref().and_then(|sp| {
+                let r = sp.read(cx);
+                if r.recovery_key_editing {
+                    Some(SettingsActiveInputKey::Privacy(PrivacyEditField::RecoveryKey))
+                } else if r.two_factor_editing {
+                    Some(SettingsActiveInputKey::Privacy(
+                        PrivacyEditField::TwoFactorPassword,
+                    ))
+                } else {
+                    None
+                }
+            }),
             SettingsSectionType::Folders => self
                 .settings_folders
                 .as_ref()
-                .is_some_and(|sf| sf.read(cx).is_editing_title),
-            SettingsSectionType::Computers => self
-                .settings_computers
-                .as_ref()
-                .is_some_and(|sc| sc.read(cx).is_input_active()),
-            SettingsSectionType::AiProviders => self
-                .settings_ai_providers
-                .as_ref()
-                .is_some_and(|ap| ap.read(cx).is_input_active()),
-            SettingsSectionType::Search => true,
-            _ => false,
+                .filter(|sf| sf.read(cx).is_editing_title)
+                .map(|_| SettingsActiveInputKey::FoldersTitle),
+            SettingsSectionType::Computers => self.settings_computers.as_ref().and_then(|sc| {
+                let r = sc.read(cx);
+                if r.page == SettingsComputersPage::CloudForm
+                    && r.form_focus != CloudFormField::None
+                {
+                    Some(SettingsActiveInputKey::ComputersCloudForm {
+                        field: r.form_focus,
+                        form_gen: r.form_session_gen,
+                    })
+                } else if r.page == SettingsComputersPage::Overview
+                    && r.overview_tab == SettingsComputersTab::RemoteAssist
+                    && r.assist_focus != AssistInputField::None
+                {
+                    Some(SettingsActiveInputKey::ComputersAssist(r.assist_focus))
+                } else {
+                    None
+                }
+            }),
+            SettingsSectionType::AiProviders => {
+                self.settings_ai_providers.as_ref().and_then(|ap| {
+                    let r = ap.read(cx);
+                    (r.active_field != AiProviderField::None).then_some(
+                        SettingsActiveInputKey::AiProviders {
+                            field: r.active_field,
+                            editor_gen: r.editor_session_gen,
+                        },
+                    )
+                })
+            }
+            SettingsSectionType::Search => Some(SettingsActiveInputKey::SearchQuery),
+            _ => None,
         }
+    }
+
+    pub(super) fn sync_active_input_key(&mut self, cx: &mut Context<Self>) {
+        let cur = self.current_active_input_key(cx);
+        let prev = self.last_active_input_key;
+        self.last_active_input_key = cur;
+        if prev.is_some() && cur != prev {
+            self.clear_all_preedits(cx);
+            cx.emit(SettingsRouterEvent::ActiveInputFieldChanged);
+        }
+    }
+
+    /// Returns `true` when the active settings section currently focuses a text input field.
+    pub fn is_input_active(&self, cx: &App) -> bool {
+        self.current_active_input_key(cx).is_some()
     }
 
     /// Returns `(committed, preedit)` for the active settings text input if one is focused.
@@ -904,8 +1089,11 @@ impl SettingsRouter {
         preedit: Option<&str>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.is_input_active(cx) {
+        let Some(cur_key) = self.current_active_input_key(cx) else {
             return false;
+        };
+        if preedit.is_some_and(|s| !s.is_empty()) {
+            self.last_active_input_key = Some(cur_key);
         }
         match self.settings_section {
             SettingsSectionType::PrivacySecurity => {
@@ -937,6 +1125,46 @@ impl SettingsRouter {
         }
     }
 
+    /// Clears IME preedit across any already-instantiated settings section without lazy allocation.
+    pub fn clear_all_preedits(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if let Some(sp) = self.settings_privacy.clone() {
+            if sp.read(cx).recovery_key_ime_preedit.is_some() {
+                sp.update(cx, |sp, sp_cx| {
+                    sp.recovery_key_ime_preedit = None;
+                    sp_cx.notify();
+                });
+                changed = true;
+            }
+        }
+        if let Some(sc) = self.settings_computers.clone() {
+            if sc.update(cx, |sc, sc_cx| sc.clear_all_preedits(sc_cx)) {
+                changed = true;
+            }
+        }
+        if let Some(ap) = self.settings_ai_providers.clone() {
+            let ctrl_opt = ap.read(cx).ime_controller.clone();
+            if let Some(ctrl) = ctrl_opt {
+                let needs_clear = {
+                    let r = ctrl.read(cx);
+                    r.ime_preedit.is_some()
+                        || r.just_committed_ime
+                        || r.last_ime_commit_at.is_some()
+                };
+                if needs_clear {
+                    ctrl.update(cx, |c, _| {
+                        c.clear_ime_state();
+                    });
+                    ap.update(cx, |_, ap_cx| ap_cx.notify());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// Clears the active settings input field and returns `true` if a settings input was active.
     pub fn clear_active_input(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.is_input_active(cx) {
@@ -957,7 +1185,7 @@ impl SettingsRouter {
                         sp.recovery_key_draft.zeroize();
                         sp.recovery_key_ime_preedit = None;
                     } else {
-                        sp.two_factor_password_draft.clear();
+                        sp.two_factor_password_draft.zeroize();
                     }
                     sp_cx.notify();
                 });
@@ -1116,7 +1344,7 @@ impl SettingsRouter {
                         let pw = sp.two_factor_password_draft.trim().to_string();
                         sp.pending_2fa_action = Some(Some(pw));
                         sp.two_factor_editing = false;
-                        sp.two_factor_password_draft.clear();
+                        sp.two_factor_password_draft.zeroize();
                         sp_cx.notify();
                     }
                 });
@@ -1186,6 +1414,7 @@ impl SettingsRouter {
             }
             _ => return None,
         };
+        self.sync_active_input_key(cx);
         cx.notify();
         Some(handled)
     }

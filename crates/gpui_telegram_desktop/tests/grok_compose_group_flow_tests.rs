@@ -499,3 +499,68 @@ fn bot_to_group_chat_switch_isolates_inspector_bio_copied_feedback_and_stage_toa
         vec![("类型".to_string(), "群组".to_string())]
     );
 }
+
+#[test]
+fn group_chat_reply_to_forwarding_and_bot_activity_non_corruption_contracts() {
+    // 1. Runtime stage invariant: bot thinking activity in a group preserves is_group_chat
+    //    and never flips is_bot_chat = true.
+    let mut stage = ConversationStage::new();
+    stage.set_chat(303, "RustBot, FinBot", "3 members", "RF", 0x2AABEE);
+    stage.is_group_chat = true;
+    stage.set_bot_activity("thinking", Some("RustBot 正在思考...".to_string()));
+    assert!(stage.is_group_chat);
+    assert!(!stage.is_bot_chat);
+    assert_eq!(stage.bot_activity_state, "thinking");
+    assert_eq!(
+        stage.bot_activity_detail.as_deref(),
+        Some("RustBot 正在思考...")
+    );
+
+    // 2. Source contracts across desktop shell files.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let ws_sync_src =
+        std::fs::read_to_string(manifest_dir.join("src/views/app_shell/shell_ws_sync.rs"))
+            .expect("read shell_ws_sync.rs");
+    assert!(
+        ws_sync_src.contains("c.replying_to.take()"),
+        "append_outgoing_text_inner must consume composer.replying_to"
+    );
+    assert!(
+        ws_sync_src.contains("reply_to: reply_to_id"),
+        "RichSendMessageRequest must forward reply_to_id"
+    );
+    assert!(
+        ws_sync_src.contains("let is_ai_bot = !is_group_or_channel"),
+        "Group titles containing 'Bot' must not flip is_bot_chat = true"
+    );
+
+    let pts_src =
+        std::fs::read_to_string(manifest_dir.join("src/views/app_shell/shell_pts_updates.rs"))
+            .expect("read shell_pts_updates.rs");
+    assert!(
+        pts_src.contains("if !is_group_or_channel {\n                            sb.bot_ids.insert(target_chat_u64);"),
+        "BotActivityChanged must not insert group chats into sidebar.bot_ids"
+    );
+    assert!(
+        pts_src.contains("if !is_group_or_channel && !st.is_group_chat {\n                                st.is_bot_chat = true;"),
+        "BotActivityChanged must not flip stage.is_bot_chat in group chats"
+    );
+
+    let stage_src =
+        std::fs::read_to_string(manifest_dir.join("src/views/conversation_stage.rs"))
+            .expect("read conversation_stage.rs");
+    assert!(
+        stage_src.contains("(self.is_bot_chat || self.is_group_chat)"),
+        "ConversationStage must render bot thinking indicator in group chats"
+    );
+
+    let stage_actions_src =
+        std::fs::read_to_string(manifest_dir.join("src/views/app_shell/shell_stage_actions.rs"))
+            .expect("read shell_stage_actions.rs");
+    assert!(
+        stage_actions_src.contains("self.client.subscribe_chat(chat_id as i64)"),
+        "Selecting a chat must subscribe the WebSocket gateway to chat_id"
+    );
+}
+

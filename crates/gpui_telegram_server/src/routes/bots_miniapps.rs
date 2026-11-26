@@ -2622,37 +2622,48 @@ pub fn ensure_companion_bot_dm_with_welcome(
         let reg_opt = state.db.get_bot_by_user_id(bot_user_id.0 as i64).ok().flatten();
         let is_standard = reg_opt.as_ref().is_some_and(|r| r.is_standard_bot);
         if !is_standard {
-            let (welcome_text, kb) = if bot_user_id.0 == BOTFATHER_USER_ID {
-                (build_botfather_welcome_text(), build_botfather_welcome_keyboard())
-            } else if let Some(reg) = reg_opt {
-                if let Some(cfg) = reg.coding_agent_config() {
-                    build_coding_agent_status_card_and_kb(state, &reg, &cfg)
-                } else {
-                    let apps = state
-                        .db
-                        .list_mini_apps_for_bot(bot_user_id.0 as i64)
-                        .unwrap_or_default();
-                    build_companion_bot_welcome_text_and_keyboard(
-                        &reg.display_name,
-                        &reg.username,
-                        &reg.description,
-                        &apps,
-                    )
-                }
+            if bot_user_id.0 == gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID as u64 {
+                let welcome = crate::routes::creator_bot::build_creator_studio_welcome_reply();
+                let _ = crate::routes::creator_bot::send_creator_bot_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_user_id,
+                    welcome,
+                    None,
+                );
             } else {
-                let user = state.db.get_user(bot_user_id).ok().flatten();
-                let title = user
-                    .as_ref()
-                    .map(|u| u.first_name.as_str())
-                    .unwrap_or("AI Assistant");
-                let uname = user
-                    .as_ref()
-                    .and_then(|u| u.username.as_deref())
-                    .unwrap_or("bot");
-                let bio = user.as_ref().and_then(|u| u.bio.as_deref()).unwrap_or("");
-                build_companion_bot_welcome_text_and_keyboard(title, uname, bio, &[])
-            };
-            let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome_text, kb);
+                let (welcome_text, kb) = if bot_user_id.0 == BOTFATHER_USER_ID {
+                    (build_botfather_welcome_text(), build_botfather_welcome_keyboard())
+                } else if let Some(reg) = reg_opt {
+                    if let Some(cfg) = reg.coding_agent_config() {
+                        build_coding_agent_status_card_and_kb(state, &reg, &cfg)
+                    } else {
+                        let apps = state
+                            .db
+                            .list_mini_apps_for_bot(bot_user_id.0 as i64)
+                            .unwrap_or_default();
+                        build_companion_bot_welcome_text_and_keyboard(
+                            &reg.display_name,
+                            &reg.username,
+                            &reg.description,
+                            &apps,
+                        )
+                    }
+                } else {
+                    let user = state.db.get_user(bot_user_id).ok().flatten();
+                    let title = user
+                        .as_ref()
+                        .map(|u| u.first_name.as_str())
+                        .unwrap_or("AI Assistant");
+                    let uname = user
+                        .as_ref()
+                        .and_then(|u| u.username.as_deref())
+                        .unwrap_or("bot");
+                    let bio = user.as_ref().and_then(|u| u.bio.as_deref()).unwrap_or("");
+                    build_companion_bot_welcome_text_and_keyboard(title, uname, bio, &[])
+                };
+                let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome_text, kb);
+            }
         }
     }
 
@@ -2751,6 +2762,30 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
     topic_id: Option<TopicId>,
     floor_fence: Option<crate::routes::hermes::BotTurnFloorFence>,
 ) {
+    handle_ai_bot_reply_with_options(
+        state,
+        chat_id,
+        sender_id,
+        bot_user_id,
+        text,
+        topic_id,
+        floor_fence,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_ai_bot_reply_with_options(
+    state: &Arc<AppState>,
+    chat_id: ChatId,
+    sender_id: UserId,
+    bot_user_id: UserId,
+    text: &str,
+    topic_id: Option<TopicId>,
+    floor_fence: Option<crate::routes::hermes::BotTurnFloorFence>,
+    is_explicitly_addressed: bool,
+) {
     let _ = state.self_weak.set(Arc::downgrade(state));
     if floor_fence.as_ref().is_some_and(|f| !f.is_active()) {
         return;
@@ -2761,6 +2796,25 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
         let (reply, kb) = handle_botfather_message(state, chat_id, sender_id, text).await;
         if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
             let _ = send_bot_chat_reply_in_topic(state, chat_id, bot_user_id, &reply, kb, topic_id);
+        }
+        typing_guard.finish();
+        return;
+    }
+    if bot_user_id.0 == gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID as u64 {
+        let typing_guard =
+            crate::routes::hermes::BotTypingGuard::start(Arc::clone(state), chat_id, bot_user_id);
+        let reply = crate::routes::creator_bot::handle_creator_studio_message(
+            state, chat_id, sender_id, text,
+        )
+        .await;
+        if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+            let _ = crate::routes::creator_bot::send_creator_bot_reply_in_topic(
+                state,
+                chat_id,
+                bot_user_id,
+                reply,
+                topic_id,
+            );
         }
         typing_guard.finish();
         return;
@@ -2797,11 +2851,24 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
         .list_cloud_storage(sender_id.0 as i64, bot_user_id.0 as i64)
         .unwrap_or_default();
 
-    let trimmed = text.trim();
-    let lower = trimmed.to_ascii_lowercase();
+    let effective_trimmed = reg_bot
+        .as_ref()
+        .map(|b| strip_leading_bot_mention(text, b))
+        .unwrap_or_else(|| text.trim());
+    let lower = effective_trimmed.to_ascii_lowercase();
+    let matches_bot_slash = |cmd: &str, bot: &BotRegistryRecord| -> bool {
+        let base = format!("/{cmd}");
+        if lower == base {
+            return true;
+        }
+        let un = bot.username.trim().trim_start_matches('@').to_ascii_lowercase();
+        let aid = bot.agent_id.trim().to_ascii_lowercase();
+        (!un.is_empty() && lower == format!("{base}@{un}"))
+            || (!aid.is_empty() && lower == format!("{base}@{aid}"))
+    };
 
     if let Some(ref b) = reg_bot {
-        if lower == "/start" {
+        if matches_bot_slash("start", b) {
             let typing_guard = crate::routes::hermes::BotTypingGuard::start(
                 Arc::clone(state),
                 chat_id,
@@ -2821,7 +2888,14 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
             welcome.push_str("\n\n");
             welcome.push_str(&live_runtime);
             if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
-                let _ = send_bot_chat_reply(state, chat_id, bot_user_id, &welcome, kb);
+                let _ = send_bot_chat_reply_in_topic(
+                    state,
+                    chat_id,
+                    bot_user_id,
+                    &welcome,
+                    kb,
+                    topic_id,
+                );
             }
             typing_guard.finish();
             return;
@@ -3308,7 +3382,7 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
     }
 
     let help_bot_commands_suffix = reg_bot.as_ref().and_then(|b| {
-        if lower == "/help" {
+        if matches_bot_slash("help", b) {
             let cmds: Vec<BotCommandSpec> =
                 serde_json::from_str(&b.commands_json).unwrap_or_default();
             let mut lines = vec![format!(
@@ -3348,6 +3422,7 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
             companion_apps: apps,
             help_bot_commands_suffix,
             floor_fence,
+            is_explicitly_addressed,
         },
     )
     .await;
@@ -3536,10 +3611,25 @@ fn strip_leading_bot_mention<'a>(raw: &'a str, reg_bot: &BotRegistryRecord) -> &
         return trimmed;
     }
     let after_at = &trimmed[1..];
+    let display = reg_bot.display_name.trim();
+    if !display.is_empty() && after_at.len() > display.len() {
+        if let Some(prefix) = after_at.get(..display.len()) {
+            if prefix.eq_ignore_ascii_case(display) {
+                let tail = &after_at[display.len()..];
+                if tail.starts_with(char::is_whitespace) {
+                    let rest = tail.trim();
+                    if !rest.is_empty() {
+                        return rest;
+                    }
+                }
+            }
+        }
+    }
     let split_idx = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
     let token = &after_at[..split_idx];
     if token.eq_ignore_ascii_case(&reg_bot.username)
         || (!reg_bot.agent_id.trim().is_empty() && token.eq_ignore_ascii_case(&reg_bot.agent_id))
+        || (!display.is_empty() && token.eq_ignore_ascii_case(display))
     {
         let rest = after_at[split_idx..].trim();
         if !rest.is_empty() {
@@ -5765,6 +5855,33 @@ pub async fn miniapps_installed(auth: AuthBearer, State(state): State<Arc<AppSta
     }
 }
 
+/// GET /api/v1/bots
+pub async fn bots_list(auth: AuthBearer, State(state): State<Arc<AppState>>) -> Response {
+    let is_admin = crate::routes::hermes::caller_is_admin(&state, auth.user_id);
+    let uid = auth.user_id.0 as i64;
+    match state.db.list_all_bots() {
+        Ok(records) => {
+            let bots: Vec<BotRegistryEntry> = records
+                .iter()
+                .filter(|b| {
+                    is_admin
+                        || b.is_official
+                        || b.owner_user_id == uid
+                        || state.db.bot_has_published_miniapp(b.bot_user_id)
+                        || state.db.user_has_dm_with_bot(uid, b.bot_user_id)
+                })
+                .map(|b| bot_record_to_entry_for_viewer(&state, b, uid))
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({ "bots": bots, "total": bots.len() })),
+            )
+                .into_response()
+        }
+        Err(e) => map_telegram_err(e),
+    }
+}
+
 /// GET /api/v1/bots/my
 pub async fn bots_my(auth: AuthBearer, State(state): State<Arc<AppState>>) -> Response {
     match state.db.list_bots_by_owner(auth.user_id.0 as i64) {
@@ -7880,6 +7997,13 @@ pub async fn chat_callback(
             }),
         )
             .into_response();
+    }
+
+    if let Some(rest) = data.strip_prefix("orca:") {
+        return crate::routes::orca_telegram_bridge::handle_orca_chat_callback(
+            &state, cid, auth.user_id, &req, rest,
+        )
+        .await;
     }
 
     let bot_member = members

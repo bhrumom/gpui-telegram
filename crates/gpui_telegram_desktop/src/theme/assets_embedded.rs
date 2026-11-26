@@ -124,6 +124,23 @@ define_icons! {
     extra {
         ArrowUp => "arrow_up.svg",
         CodeScene => "code_scene.svg",
+        HubBooks => "hub_books.svg",
+        HubMusic => "hub_music.svg",
+        HubGames => "hub_games.svg",
+        HubAppStore => "hub_appstore.svg",
+        HubCreations => "hub_creations.svg",
+        HubPublish => "hub_publish.svg",
+        HubSparkles => "hub_sparkles.svg",
+        CommunityGlobe => "community_globe.svg",
+        UpvoteArrow => "community_upvote.svg",
+        DownvoteArrow => "community_downvote.svg",
+        Repost => "community_repost.svg",
+        Bookmark => "community_bookmark.svg",
+        FlameTrending => "community_trending.svg",
+        ShieldMod => "community_mod_shield.svg",
+        SparkleAlgo => "community_algo_spark.svg",
+        CommunityAward => "community_award.svg",
+        CommunityThread => "community_thread.svg",
     }
 }
 

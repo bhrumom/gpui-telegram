@@ -34,22 +34,22 @@ impl AppShell {
     ) -> Entity<CodeSceneWorkspace> {
         let was_outside = self.active_panel != ActiveWorkspacePanel::CodeScene;
         if was_outside {
-            self.ime.clear_preedit();
+            self.clear_ime_and_blur_content_hub_for_transition(true, cx);
             self.bot_browser.ime_preedit_input_gen = None;
         }
         self.hide_browser_native_webview(cx);
+        self.leave_community_panel_if_active(cx);
+        self.cleanup_settings_panel_if_active(cx);
         self.active_panel = ActiveWorkspacePanel::CodeScene;
-        self.last_handled_nav_dest = Some(NavDestination::CodeScene);
-        self.nav_rail.update(cx, |r, rcx| {
-            r.set_active_destination(NavDestination::CodeScene);
-            rcx.notify();
-        });
+        self.sync_nav_rail_destination_silent(NavDestination::CodeScene, cx);
+        self.sync_apple_sidebar_to_active_panel(cx);
         self.sidebar.update(cx, |sb, scx| {
+            sb.cancel_compose_mode();
             if sb.search_focused {
                 sb.search_focused = false;
-                scx.notify();
             }
             sb.is_account_popover_open = false;
+            scx.notify();
         });
         self.composer.update(cx, |c, ccx| {
             if c.is_input_focused {

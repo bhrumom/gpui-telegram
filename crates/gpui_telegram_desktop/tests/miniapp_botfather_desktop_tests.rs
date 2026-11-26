@@ -218,6 +218,13 @@ fn dispatch_headless_target(target: &str) -> ! {
                 )
             })
         }
+        "test_headless_gpui_bot_webmcp_floating_pip_preserves_composer_input" => {
+            Runner::Async(|app| {
+                Box::pin(
+                    headless_body_bot_webmcp_floating_pip_preserves_composer_input(app),
+                )
+            })
+        }
         other => {
             eprintln!("unknown headless gpui test target: {other}");
             std::process::exit(101);
@@ -5114,5 +5121,366 @@ async fn headless_body_plus_compose_send_to_unstarted_bot_delivers_message(app: 
     })
     .expect("verify normal unstarted bot blocking outside + compose");
 }
+
+#[test]
+fn test_bot_attach_webview_allows_native_webview_keyboard_focus_policy() {
+    use gpui_telegram_desktop::components::bots::bot_attach_web_view::{
+        MiniAppPopupButton, MiniAppPopupState,
+    };
+
+    let mut view = BotAttachWebView::new();
+    assert!(
+        !view.allows_native_webview_keyboard_focus(),
+        "closed BotAttachWebView must never allow native WKWebView keyboard focus"
+    );
+
+    view.launch(
+        AttachBotEntry {
+            bot_id: 600_777,
+            name: "Fabushi".to_string(),
+            short_name: "fabushi".to_string(),
+            allowed_peer_types: peer_types::BOT,
+            in_main_menu: true,
+            in_attach_menu: true,
+            disclaimer_required: false,
+            request_write_access: false,
+        },
+        "https://example.test/miniapp",
+    );
+    assert!(
+        view.allows_native_webview_keyboard_focus(),
+        "open unoccluded Mini App sheet with accepted disclaimer should allow native WKWebView focus"
+    );
+
+    // Floating PiP (both live preview and collapsed/parked) MUST ALWAYS refuse native focus.
+    view.is_open = false;
+    view.is_floating_pip = true;
+    view.pip_live_preview = true;
+    assert!(
+        !view.allows_native_webview_keyboard_focus(),
+        "Floating PiP live preview must NEVER allow native WKWebView to steal firstResponder"
+    );
+    view.pip_live_preview = false;
+    assert!(!view.allows_native_webview_keyboard_focus());
+
+    // Re-open full sheet and verify every occluding/internal-input condition blocks native focus.
+    view.is_open = true;
+    view.is_floating_pip = false;
+    assert!(view.allows_native_webview_keyboard_focus());
+
+    view.is_loading = true;
+    assert!(!view.allows_native_webview_keyboard_focus());
+    view.is_loading = false;
+
+    view.disclaimer_accepted = false;
+    assert!(!view.allows_native_webview_keyboard_focus());
+    view.disclaimer_accepted = true;
+
+    view.external_modal_occluding = true;
+    assert!(!view.allows_native_webview_keyboard_focus());
+    view.external_modal_occluding = false;
+
+    view.write_access_prompt_open = true;
+    assert!(!view.allows_native_webview_keyboard_focus());
+    view.write_access_prompt_open = false;
+
+    view.menu_open = true;
+    assert!(!view.allows_native_webview_keyboard_focus());
+    view.menu_open = false;
+
+    view.confirm_close_open = true;
+    assert!(!view.allows_native_webview_keyboard_focus());
+    view.confirm_close_open = false;
+
+    view.custom_popup = Some(MiniAppPopupState {
+        title: "Notice".to_string(),
+        message: "Confirm?".to_string(),
+        buttons: vec![MiniAppPopupButton {
+            id: "ok".to_string(),
+            btn_type: "ok".to_string(),
+            text: "OK".to_string(),
+        }],
+    });
+    assert!(!view.allows_native_webview_keyboard_focus());
+    view.custom_popup = None;
+
+    view.focused_input = Some(BotWebViewInputTarget::CopilotPrompt);
+    assert!(!view.allows_native_webview_keyboard_focus());
+
+    // Minimizing must clear focused_input and disallow native focus.
+    view.minimize();
+    assert!(view.focused_input.is_none());
+    assert!(!view.is_open);
+    assert!(!view.allows_native_webview_keyboard_focus());
+}
+
+#[test]
+fn test_headless_gpui_bot_webmcp_floating_pip_preserves_composer_input() {
+    run_in_headless_subprocess(
+        "test_headless_gpui_bot_webmcp_floating_pip_preserves_composer_input",
+    );
+}
+
+async fn headless_body_bot_webmcp_floating_pip_preserves_composer_input(app: AsyncApp) {
+    use gpui_telegram_desktop::views::browser::{ActiveBrowserInput, BrowserEngineKind};
+    use gpui_telegram_desktop::views::shell::ActiveWorkspacePanel;
+    use gpui_telegram_proto::miniapp_contracts::{MiniAppControlMode, MiniAppWebMcpCommand};
+
+    let seed_client = new_isolated_client("http://127.0.0.1:9".to_string());
+    let (base_url, _recorded_http, _mock_state) = spawn_parity_mock_http_server(
+        &seed_client,
+        ParityMockState {
+            chat_created: true,
+            chat_id: 600_000_777,
+            allows_write_to_pm: true,
+            app_tos_accepted: true,
+            is_blocked: false,
+            has_started_chat: true,
+            launched_once: false,
+        },
+    );
+    let client = new_isolated_client(base_url);
+    let bot_cid = 600_000_777u64;
+    let bot_uid = 600_777u64;
+
+    let shell = app
+        .update(|cx| {
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.is_authenticated = true;
+                s.session_sync.user_id = Some(100_001);
+                s.session_sync.session_token = Some("tok_webmcp_pip_focus".to_string());
+                s.miniapps.accepted_app_tos_bots.insert(bot_uid);
+                s.session_sync.rich_chats_by_id.insert(
+                    bot_cid,
+                    HermesRichChatDto {
+                        chat_id: bot_cid as i64,
+                        title: "全球法布施".to_string(),
+                        is_bot: true,
+                        peer_user_id: Some(bot_uid),
+                        peer_username: Some("fabushi_bot".to_string()),
+                        menu_button_text: Some("全球法布施".to_string()),
+                        menu_button_url: Some("gpui-miniapp://fabushi_bot/fabushi".to_string()),
+                        has_mini_app: true,
+                        ..Default::default()
+                    },
+                );
+                s.sidebar.update(cx, |sb, _| {
+                    sb.select_dialog(bot_cid);
+                });
+                s.stage.update(cx, |st, _| {
+                    st.set_chat(bot_cid, "全球法布施", "bot", "法", 0x7b1fa2);
+                    st.show_bot_start_bar = false;
+                });
+                s
+            })
+        })
+        .expect("mount shell for WebMCP Floating PiP composer focus test");
+
+    // 1. Bot operates Mini App via WebMCP -> launches silently into Floating PiP live preview.
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            s.launch_miniapp_for_webmcp(
+                MiniAppWebMcpCommand {
+                    request_id: "req_pip_focus_1".to_string(),
+                    bot_user_id: bot_uid as i64,
+                    bot_username: "fabushi_bot".to_string(),
+                    short_name: "fabushi".to_string(),
+                    app_title: "全球法布施".to_string(),
+                    chat_id: bot_cid as i64,
+                    operation: "invoke_tool".to_string(),
+                    tool_name: Some("page_fill".to_string()),
+                    arguments: json!({ "selector": "input", "value": "金刚经" }),
+                    status_message: Some("AI 正在填写小程序表单".to_string()),
+                },
+                cx,
+            );
+            assert!(
+                !s.should_native_webview_own_keyboard(cx),
+                "Floating PiP Mini App must never own macOS keyboard focus while launching"
+            );
+        });
+    })
+    .expect("trigger launch_miniapp_for_webmcp");
+
+    // Wait for mock /launch HTTP completion and queued WebMCP execution.
+    for _ in 0..50 {
+        app.background_executor()
+            .timer(std::time::Duration::from_millis(20))
+            .await;
+        let ready = app
+            .update(|cx| {
+                shell
+                    .read(cx)
+                    .miniapps
+                    .miniapp_overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.read(cx).launch_context.is_some())
+            })
+            .unwrap();
+        if ready {
+            break;
+        }
+    }
+
+    // 2. While Mini App is floating in live PiP after bot operation, host GPUIView must retain
+    //    keyboard ownership and chat composer MUST accept text and editing keys normally.
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            let ov = s
+                .miniapps
+                .miniapp_overlay
+                .clone()
+                .expect("miniapp_overlay must stay mounted in Floating PiP");
+            {
+                let w = ov.read(cx);
+                assert!(!w.is_open);
+                assert!(w.is_floating_pip);
+                assert!(w.pip_live_preview);
+                assert!(!w.allows_native_webview_keyboard_focus());
+            }
+            assert!(
+                !s.should_native_webview_own_keyboard(cx),
+                "Floating PiP live preview must NOT own keyboard focus after bot WebMCP runs"
+            );
+            s.composer.update(cx, |c, ccx| {
+                c.is_input_focused = true;
+                ccx.notify();
+            });
+            s.insert_committed_text("继续发愿", cx);
+            s.insert_committed_text(" 108遍", cx);
+            assert_eq!(s.composer.read(cx).text(), "继续发愿 108遍");
+            assert!(s.handle_non_char_key("backspace", false, cx));
+            assert_eq!(s.composer.read(cx).text(), "继续发愿 108");
+
+            // Bot returns to Idle while Mini App remains floating in PiP.
+            ov.update(cx, |w, wcx| {
+                w.apply_control_status(MiniAppControlMode::Idle, "AI 操作完成", None);
+                wcx.notify();
+            });
+            assert!(!s.should_native_webview_own_keyboard(cx));
+            s.insert_committed_text("遍", cx);
+            assert_eq!(s.composer.read(cx).text(), "继续发愿 108遍");
+        });
+    })
+    .expect("verify composer typing while Mini App is in Floating PiP");
+
+    // 3. Expanding into full Mini App sheet grants native WKWebView keyboard ownership,
+    //    modals/sidebar-search revoke it, and switching back to Floating PiP restores host focus.
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            let ov = s.miniapps.miniapp_overlay.clone().unwrap();
+            s.miniapps.is_miniapp_minimized = false;
+            ov.update(cx, |w, wcx| {
+                w.is_open = true;
+                w.is_floating_pip = false;
+                w.is_loading = false;
+                w.disclaimer_accepted = true;
+                wcx.notify();
+            });
+            assert!(
+                s.should_native_webview_own_keyboard(cx),
+                "Open unoccluded Mini App sheet should allow native WKWebView keyboard focus"
+            );
+
+            // Top modal or sidebar search immediately revokes native WKWebView keyboard ownership.
+            s.miniapps.miniapp_tos_modal_open = true;
+            assert!(!s.should_native_webview_own_keyboard(cx));
+            s.miniapps.miniapp_tos_modal_open = false;
+            assert!(s.should_native_webview_own_keyboard(cx));
+
+            s.sidebar.update(cx, |sb, _| sb.search_focused = true);
+            assert!(!s.should_native_webview_own_keyboard(cx));
+            s.sidebar.update(cx, |sb, _| sb.search_focused = false);
+            assert!(s.should_native_webview_own_keyboard(cx));
+        });
+
+        let ov = shell.read(cx).miniapps.miniapp_overlay.clone().unwrap();
+
+        // Switch back to Floating PiP (even if focused_input was set) -> triggers AppShell observer,
+        // clears focused_input, and restores composer typing immediately.
+        ov.update(cx, |w, wcx| {
+            w.focused_input = Some(BotWebViewInputTarget::CopilotPrompt);
+            w.pending_actions
+                .push_back(BotWebViewPendingAction::SwitchToFloatingPip);
+            wcx.notify();
+        });
+    })
+    .expect("trigger SwitchToFloatingPip observer notification");
+
+    app.update(|cx| {
+        let ov = shell.read(cx).miniapps.miniapp_overlay.clone().unwrap();
+        {
+            let w = ov.read(cx);
+            assert!(w.is_floating_pip);
+            assert!(!w.is_open);
+            assert!(w.focused_input.is_none());
+        }
+        shell.update(cx, |s, cx| {
+            assert!(!s.should_native_webview_own_keyboard(cx));
+            s.insert_committed_text("！", cx);
+            assert_eq!(s.composer.read(cx).text(), "继续发愿 108遍！");
+        });
+
+        // Collapse PiP (park 1x1) -> composer remains editable.
+        ov.update(cx, |w, wcx| {
+            w.pip_live_preview = false;
+            w.park_native_webview_for_pip();
+            wcx.notify();
+        });
+        shell.update(cx, |s, cx| {
+            assert!(!s.should_native_webview_own_keyboard(cx));
+            s.insert_committed_text(" OK", cx);
+            assert_eq!(s.composer.read(cx).text(), "继续发愿 108遍！ OK");
+        });
+
+        // Close Floating PiP -> triggers AppShell observer to close & tear down overlay.
+        ov.update(cx, |w, wcx| {
+            w.pending_actions.push_back(BotWebViewPendingAction::Close);
+            wcx.notify();
+        });
+    })
+    .expect("verify SwitchToFloatingPip, collapse, and trigger Close observer");
+
+    app.update(|cx| {
+        shell.update(cx, |s, cx| {
+            assert!(s.miniapps.miniapp_overlay.is_none());
+            assert!(!s.should_native_webview_own_keyboard(cx));
+            s.insert_committed_text("!", cx);
+            assert_eq!(s.composer.read(cx).text(), "继续发愿 108遍！ OK!");
+
+            // 4. Verify BrowserWorkspace WKWebView keyboard ownership transitions cleanly too.
+            let bw = s.open_browser_workspace(cx);
+            bw.update(cx, |w, wcx| {
+                w.active_engine = BrowserEngineKind::WkWebView;
+                w.set_workspace_visible(true, wcx);
+                w.set_occluded(false, wcx);
+                w.set_active_input(ActiveBrowserInput::None, None, wcx);
+            });
+            assert!(
+                s.should_native_webview_own_keyboard(cx),
+                "Active unoccluded Browser WKWebView with no GPUI input focused should own keyboard"
+            );
+            bw.update(cx, |w, wcx| {
+                w.set_active_input(ActiveBrowserInput::AddressBar, None, wcx);
+            });
+            assert!(
+                !s.should_native_webview_own_keyboard(cx),
+                "Focusing Browser AddressBar must return keyboard ownership to host GPUIView"
+            );
+            bw.update(cx, |w, wcx| {
+                w.set_active_input(ActiveBrowserInput::None, None, wcx);
+            });
+            assert!(s.should_native_webview_own_keyboard(cx));
+            s.active_panel = ActiveWorkspacePanel::Chats;
+            assert!(
+                !s.should_native_webview_own_keyboard(cx),
+                "Leaving Browser panel back to Chats must immediately return keyboard ownership to host GPUIView"
+            );
+        });
+    })
+    .expect("verify close cleanup and BrowserWorkspace keyboard ownership");
+}
+
 
 

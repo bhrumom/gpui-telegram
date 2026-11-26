@@ -9,9 +9,10 @@ use crate::views::boxes::peers::create_managed_bot_box::CreateManagedBotBoxPeers
 use crate::views::settings::SettingsRouter;
 use crate::views::tdesktop_theme::resolve_desktop_palette;
 use crate::views::{
-    BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, CodeSceneWorkspace,
-    ComputerWorkbench, ContextInspector, ConversationStage, GlobalTasksWorkspace, IvViewer,
-    MainMenuDrawer, MediaViewer, NavRail,
+    AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
+    CodeSceneWorkspace, CommunityWorkspace, ComputerWorkbench, ContentHubWorkspace,
+    ContextInspector, ConversationStage, GlobalTasksWorkspace, IvViewer, MainMenuDrawer,
+    MediaViewer, NavRail,
 };
 
 /// Maps persisted app preferences and optional desktop mode override into a full theme palette.
@@ -107,6 +108,8 @@ pub fn toggle_desktop_theme_mode(current: TdesktopThemeMode) -> TdesktopThemeMod
 /// Immutable slice of all desktop view entities managed by `AppShell` for dynamic theme/locale sync.
 pub struct ShellThemeTargets<'a> {
     pub nav_rail: &'a Entity<NavRail>,
+    pub apple_sidebar: &'a Entity<AppleAppSidebar>,
+    pub content_hub: &'a Entity<ContentHubWorkspace>,
     pub main_menu_drawer: &'a Entity<MainMenuDrawer>,
     pub sidebar: &'a Entity<ChatSidebar>,
     pub stage: &'a Entity<ConversationStage>,
@@ -116,6 +119,7 @@ pub struct ShellThemeTargets<'a> {
     pub tasks_workspace: &'a Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<&'a Entity<BrowserWorkspace>>,
     pub code_scene_workspace: Option<&'a Entity<CodeSceneWorkspace>>,
+    pub community_workspace: Option<&'a Entity<CommunityWorkspace>>,
     pub talk_mode_overlay: Option<&'a Entity<CallOverlay>>,
     pub computer_overlay: Option<&'a Entity<ComputerWorkbench>>,
     pub media_viewer_overlay: Option<&'a Entity<MediaViewer>>,
@@ -150,6 +154,8 @@ pub fn propagate_theme_and_locale<V: 'static>(
         palette,
         lang_id,
         targets.nav_rail,
+        targets.apple_sidebar,
+        targets.content_hub,
         targets.main_menu_drawer,
         targets.sidebar,
         targets.inspector,
@@ -185,6 +191,11 @@ pub fn propagate_theme_and_locale<V: 'static>(
     }
     if let Some(code_scene) = targets.code_scene_workspace {
         code_scene.update(cx, |w, wcx| {
+            w.sync_theme_and_locale(palette.clone(), lang_id, wcx);
+        });
+    }
+    if let Some(community) = targets.community_workspace {
+        community.update(cx, |w, wcx| {
             w.sync_theme_and_locale(palette.clone(), lang_id, wcx);
         });
     }

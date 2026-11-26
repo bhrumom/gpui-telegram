@@ -727,6 +727,47 @@ impl BrowserWorkspace {
         }
     }
 
+    pub fn has_pending_webview_focus_claim(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            !self.is_workspace_occluded()
+                && self.active_engine == BrowserEngineKind::WkWebView
+                && self
+                    .wkwebview
+                    .as_ref()
+                    .is_some_and(|wv| !wv.is_hidden() && wv.has_pending_became_first_responder())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    pub fn consume_webview_focus_claim(&mut self, cx: &mut Context<Self>) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let claimed = self
+                .wkwebview
+                .as_ref()
+                .is_some_and(|wv| wv.take_became_first_responder());
+            if claimed
+                && !self.is_workspace_occluded()
+                && self.active_engine == BrowserEngineKind::WkWebView
+                && self.active_input != ActiveBrowserInput::None
+            {
+                self.assign_active_input(ActiveBrowserInput::None);
+                cx.notify();
+                return true;
+            }
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+            false
+        }
+    }
+
     pub fn set_native_webview_hidden(&mut self, hidden: bool) {
         #[cfg(target_os = "macos")]
         if let Some(ref mut wv) = self.wkwebview {
@@ -812,6 +853,14 @@ impl BrowserWorkspace {
     ) {
         let is_non_none = target != ActiveBrowserInput::None;
         self.assign_active_input(target);
+        if is_non_none {
+            #[cfg(target_os = "macos")]
+            if let Some(ref wv) = self.wkwebview {
+                wv.clear_became_first_responder();
+                wv.blur_active_dom_element();
+                wv.restore_parent_first_responder();
+            }
+        }
         if is_non_none && window.is_some() {
             self.last_set_active_input_had_window = true;
         }
@@ -2792,6 +2841,16 @@ impl BrowserWorkspace {
                     }
                     self.apply_recorded_dom_action(dom_ev);
                 }
+                WkWebViewEvent::BecameFirstResponder => {
+                    if let Some(ref wv) = self.wkwebview {
+                        wv.clear_became_first_responder();
+                    }
+                    if !self.is_workspace_occluded()
+                        && self.active_input != ActiveBrowserInput::None
+                    {
+                        self.assign_active_input(ActiveBrowserInput::None);
+                    }
+                }
                 WkWebViewEvent::BridgeMessage { .. } => {}
             }
         }
@@ -2857,6 +2916,7 @@ impl BrowserWorkspace {
         }
         self.drain_wkwebview_events(cx);
         if let Some(ref mut wv) = self.wkwebview {
+            wv.set_allow_first_responder(visible);
             wv.sync_bounds(bounds, visible);
         }
     }

@@ -275,7 +275,6 @@ fn render_media_thumb_tile(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _e, _w, cx| {
-                this.pending_media_open = Some((url.clone(), is_vid));
                 this.pending_action = Some(InspectorAction::OpenMedia {
                     url: url.clone(),
                     is_video: is_vid,

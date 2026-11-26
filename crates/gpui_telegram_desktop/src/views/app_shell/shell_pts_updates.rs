@@ -870,6 +870,19 @@ impl AppShell {
                     });
                     if chat_u64 > 0 && target_id > 0 {
                         let preview_snippet = format_sidebar_preview(&text);
+                        self.client.local_store.update_cached_historical_message_text(
+                            chat_u64,
+                            target_id,
+                            text.clone(),
+                        );
+                        if is_latest_message {
+                            self.client.local_store.update_cached_dialog_preview(
+                                chat_u64,
+                                preview_snippet.clone(),
+                                chrono::Utc::now().timestamp_millis(),
+                                None,
+                            );
+                        }
                         self.sidebar.update(cx, |sb, sb_cx| {
                             if let Some(dialog) = sb.dialogs.iter_mut().find(|d| d.id == chat_u64) {
                                 let is_streaming_placeholder = dialog.last_message.is_empty()
@@ -914,6 +927,10 @@ impl AppShell {
                     self.client
                         .local_store
                         .delete_messages(ChatId(chat_u64 as i64), &tombstone.message_ids);
+                    let del_ids: Vec<u64> = ids_to_delete.iter().copied().collect();
+                    self.client
+                        .local_store
+                        .delete_cached_historical_messages(chat_u64, &del_ids);
                 }
 
                 self.stage.update(cx, |st, st_cx| {
@@ -961,7 +978,9 @@ impl AppShell {
                                 sb_cx.notify();
                             });
                             self.stage.update(cx, |st, st_cx| {
-                                if st.active_chat_id == Some(target_chat_u64) && st.is_bot_chat {
+                                if st.active_chat_id == Some(target_chat_u64)
+                                    && (st.is_bot_chat || st.is_group_chat)
+                                {
                                     st.set_bot_activity("idle", None);
                                     st_cx.notify();
                                 }
@@ -986,7 +1005,9 @@ impl AppShell {
                                     sb_cx.notify();
                                 });
                                 self.stage.update(cx, |st, st_cx| {
-                                    if st.active_chat_id == Some(target_chat_u64) && st.is_bot_chat {
+                                    if st.active_chat_id == Some(target_chat_u64)
+                                        && (st.is_bot_chat || st.is_group_chat)
+                                    {
                                         if st.bot_activity_state.eq_ignore_ascii_case("idle") {
                                             st.set_bot_activity("thinking", indicator);
                                             st_cx.notify();
@@ -1419,14 +1440,30 @@ impl AppShell {
                                 .unwrap_or_else(|| "AI 正在思考...".to_string()),
                         })
                     };
+                    let is_group_or_channel = self
+                        .session_sync
+                        .rich_chats_by_id
+                        .get(&target_chat_u64)
+                        .is_some_and(|rc| rc.is_group || rc.is_channel)
+                        || self.sidebar.read(cx).dialogs.iter().any(|d| {
+                            d.id == target_chat_u64
+                                && (d.folder.eq_ignore_ascii_case("Groups")
+                                    || d.folder.eq_ignore_ascii_case("Channels"))
+                        })
+                        || (self.stage.read(cx).active_chat_id == Some(target_chat_u64)
+                            && self.stage.read(cx).is_group_chat);
                     self.sidebar.update(cx, |sb, sb_cx| {
-                        sb.bot_ids.insert(target_chat_u64);
+                        if !is_group_or_channel {
+                            sb.bot_ids.insert(target_chat_u64);
+                        }
                         sb.set_typing(target_chat_u64, sidebar_indicator);
                         sb_cx.notify();
                     });
                     self.stage.update(cx, |st, st_cx| {
                         if st.active_chat_id == Some(target_chat_u64) {
-                            st.is_bot_chat = true;
+                            if !is_group_or_channel && !st.is_group_chat {
+                                st.is_bot_chat = true;
+                            }
                             st.set_bot_activity(&state, detail);
                             st_cx.notify();
                         }
@@ -1486,6 +1523,49 @@ impl AppShell {
                     }
                 }
                 cx.notify();
+            }
+            UpdateEvent::UserCreationChanged {
+                creation_id,
+                owner_user_id,
+                kind,
+                review_status,
+                cloud_revision,
+            } => {
+                self.handle_ws_user_creation_changed(
+                    creation_id,
+                    owner_user_id,
+                    kind,
+                    review_status,
+                    cloud_revision,
+                    cx,
+                );
+            }
+            UpdateEvent::PublicCatalogChanged {
+                creation_id,
+                kind,
+                action,
+            } => {
+                self.handle_ws_public_catalog_changed(creation_id, kind, action, cx);
+            }
+            UpdateEvent::CommunityEvent {
+                event_kind,
+                community_id,
+                post_id,
+                comment_id,
+                actor_id,
+                payload_json,
+                timestamp_ms,
+            } => {
+                self.handle_community_ws_event(
+                    event_kind,
+                    community_id,
+                    post_id,
+                    comment_id,
+                    actor_id,
+                    payload_json,
+                    timestamp_ms,
+                    cx,
+                );
             }
             _ => {}
         }
@@ -1631,6 +1711,9 @@ impl AppShell {
                         st.message_expirations.insert(server_id, exp);
                     }
                 }
+                if !is_outgoing && st.bot_activity_state.eq_ignore_ascii_case("thinking") {
+                    st.set_bot_activity("idle", None);
+                }
                 st.add_message(model.clone());
                 st_cx.notify();
             });
@@ -1679,6 +1762,41 @@ impl AppShell {
             sb.recompute_folder_badges();
             sb_cx.notify();
         });
+
+        if chat_u64 > 0 && server_id > 0 {
+            let ts_ms = msg.date.timestamp_millis();
+            self.client.local_store.upsert_cached_historical_message(
+                chat_u64,
+                gpui_telegram_client::HistoricalMessage {
+                    message_id: server_id,
+                    sender_id: msg.sender_id.0,
+                    text: raw_text.clone(),
+                    content: serde_json::to_value(&msg.content).ok(),
+                    date: Some(ts_ms),
+                    reply_to: msg
+                        .reply_to
+                        .as_ref()
+                        .and_then(|r| u64::try_from(r.reply_to_msg_id.0).ok()),
+                    is_outgoing: Some(is_outgoing),
+                    reply_to_info: None,
+                    reactions: Vec::new(),
+                    ttl_seconds: msg.ttl_seconds,
+                    expires_at_ms: expires_at_opt,
+                    send_as_peer_id: None,
+                    reactions_authoritative: false,
+                },
+            );
+            self.client.local_store.update_cached_dialog_preview(
+                chat_u64,
+                sidebar_preview.clone(),
+                ts_ms,
+                if !is_current_chat && !is_outgoing {
+                    Some(1)
+                } else {
+                    None
+                },
+            );
+        }
 
         let dialog_info = self
             .sidebar
@@ -1802,6 +1920,14 @@ impl AppShell {
                 if self.rtc_talk.active_call_id.as_deref() == Some(call_id.as_str()) {
                     self.rtc_talk.active_call_id = None;
                     self.rtc_talk.talk_mode_overlay = None;
+                    self.clear_ime_if_below_z5_unoccluded(cx);
+                    self.reset_nav_destination_if(
+                        &[
+                            crate::views::nav_rail::NavDestination::TalkMode,
+                            crate::views::nav_rail::NavDestination::Calls,
+                        ],
+                        cx,
+                    );
                 }
                 self.sync_calls_history(cx);
             }
@@ -1818,6 +1944,7 @@ impl AppShell {
             }
             "ringing" | "initiated" => {
                 if self.rtc_talk.talk_mode_overlay.is_none() && !call_id.is_empty() {
+                    self.prepare_for_media_or_call_overlay_open(cx);
                     self.rtc_talk.active_call_id = Some(call_id);
                     let pal = self.theme_state.palette;
                     let lang = self.active_lang_id();
@@ -1847,8 +1974,17 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Resolves deep link URLs (such as `tg://chat?id={id}`) and switches to the destination chat.
+    /// Resolves deep link URLs (such as `tg://apple/*` or `tg://chat?id={id}`) and switches to the destination.
     pub fn handle_deep_link(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return false;
+        }
+        if self.handle_apple_deep_link(url, cx) {
+            return true;
+        }
+        if crate::views::app_shell::shell_content_hub::is_apple_deep_link_candidate(url) {
+            return false;
+        }
         let link_info = crate::views::app_shell::window_session_controller_link_info::WindowSessionControllerLinkInfo::parse_deep_link(url);
         match link_info {
             crate::views::app_shell::window_session_controller_link_info::LinkInfoType::Peer(peer) => {

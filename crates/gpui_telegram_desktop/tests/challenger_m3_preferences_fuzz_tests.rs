@@ -51,7 +51,7 @@ impl Drop for AdversarialTempDir {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 type LibcModeT = u16;
 #[cfg(all(unix, not(target_os = "macos")))]
 type LibcModeT = u32;

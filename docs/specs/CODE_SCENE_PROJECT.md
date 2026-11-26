@@ -64,13 +64,13 @@ Every feature discovered across Step 0 Surveys (`explorer_cs_survey_1`, `explore
 
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|--------------|--------|
-| M1 | Contracts, `CodeSceneScript` VM Runtime & 18-Asset Real-Code Seed Library | `CS-F01`, `CS-F02`, `CS-F03`, `CS-F04` (`gpui_telegram_proto`, new `crates/gpui_telegram_code_scene` lang+runtime+seeds) | none | DONE (`965e621a969896cd1b62a21597a66034`, 5/5 PASS, proto 113/113, code_scene 23/23, 81/81 challenger probes) |
+| M1 | Contracts, `CodeSceneScript` VM Runtime & 18-Asset Real-Code Seed Library | `CS-F01`, `CS-F02`, `CS-F03`, `CS-F04` (`gpui_telegram_proto`, new `crates/gpui_telegram_code_scene` lang+runtime+seeds) | none | DONE (`965e621a969896cd1b62a21597a66034`, 5/5 PASS, proto 41/41, code_scene 23/23, 81/81 challenger probes) |
 | M2 | 5-Stage Douyin Recommendation Engine, Feed Session & AI Code Synthesizer | `CS-F05`, `CS-F06`, `CS-F07`, `CS-F08` (`crates/gpui_telegram_code_scene` reco+eval+feed_session+synth) | M1 | DONE (`bbeb6dfeaf2716640f5e4b9be6807ad4`, 5/5 PASS, 51/51 tests, NDCG@10=0.8284, HR@5=1.00, pivot=1 refresh, ILD=0.8147) |
-| M3 | Server Persistence (`V42`), REST API, Client Local-First Cache & AI Bot Publishing | `CS-F09`, `CS-F10`, `CS-F11` (`gpui_telegram_agent`, `gpui_telegram_server`, `gpui_telegram_client`) | M1, M2 | IN_PROGRESS (`93a43e12254e94104dd23c49ecb4cd6d`) |
-| M4 | Hybrid 60fps GPUI `CodeSceneViewport`, Douyin Feed UI & Slide-Over Drawers | `CS-F12`, `CS-F13`, `CS-F14` (`crates/gpui_telegram_desktop/src/views/code_scene/*` + headless GPUI tests) | M1, M2, M3 | PLANNED |
-| M5 | Left Sidebar Entry, `AppShell` Mounting, IME/Focus & Chat Interoperability | `CS-F15` (sidebar, `NavRail`, `AppShell`, `shell_code_scene.rs`, `IconName::EXTRA`, chat cards, full regression verification) | M4 | PLANNED |
-| E2E | Parallel Opaque-Box E2E Testing Track | Requirement-driven 4-Tier opaque-box E2E harness & test suite (`CODE_SCENE_TEST_INFRA.md` -> `CODE_SCENE_TEST_READY.md`) | Parallel | DONE (`3caf9452cd71a8c43a613156f536940e`, 5/5 PASS, 188 tests T1-T4, 14/14 mutations killed) |
-| M6 | Final Milestone: E2E Tiers 1-4 Pass + Tier 5 Adversarial Hardening | Phase 1: pass 100% E2E Tiers 1-4 + repo regression + ledger closure; Phase 2: white-box Challenger-led Tier 5 adversarial hardening | M5, E2E | PLANNED |
+| M3 | Server Persistence (`V44`), REST API, Client Local-First Cache & AI Bot Publishing | `CS-F09`, `CS-F10`, `CS-F11` (`gpui_telegram_agent`, `gpui_telegram_server`, `gpui_telegram_client`) | M1, M2 | DONE (agent 5/5, server 9/9, client 16/16, live 188/188 E2E PASS; merged cleanly as V44 after Community V42 & Creations V43) |
+| M4 | Hybrid 60fps GPUI `CodeSceneViewport`, Douyin Feed UI & Slide-Over Drawers | `CS-F12`, `CS-F13`, `CS-F14` (`crates/gpui_telegram_desktop/src/views/code_scene/*` + headless GPUI tests) | M1, M2, M3 | DONE (3-layer BGRA8+vector+div 60fps viewport, Douyin gestures/HUD, Comments/Code Editor/Creator/AI Bot Studio drawers) |
+| M5 | Left Sidebar Entry (`AppleAppSidebar` + `ChatSidebar`), `AppShell` Mounting, IME/Focus & Chat Interoperability | `CS-F15` (`AppleAppSidebar`, `ChatSidebar`, `NavRail`, `AppShell`, `shell_code_scene.rs`, `IconName::EXTRA`, chat cards) | M4 | DONE (headless GPUI tests + full desktop regression PASS) |
+| E2E | Parallel Opaque-Box E2E Testing Track | Requirement-driven 4-Tier opaque-box E2E harness & test suite (`tests/e2e/code_scene/*`) | Parallel | DONE (188/188 live spawned-server tests PASS, 14/14 mutations killed) |
+| M6 | Final Milestone: Unified Merged Verification, CI & Release | Unified verification across all crates + live E2E + `origin/main` integration | M5, E2E | DONE (workspace 26/26 check, proto 46/46, code_scene 51/51, agent 8/8, server V44 9/9, client 16/16, desktop 83/83, live E2E 188/188 PASS) |
 
 ---
 

@@ -109,9 +109,9 @@ async fn test_code_scene_v42_migration_fk_safe_idempotent_seeding() {
         .db
         .pool()
         .with_reader(|conn| {
-            let v42: bool = conn
+            let v44: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = 42)",
+                    "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = 44)",
                     [],
                     |r| r.get(0),
                 )
@@ -143,13 +143,13 @@ async fn test_code_scene_v42_migration_fk_safe_idempotent_seeding() {
             let vers: i64 = conn
                 .query_row("SELECT COUNT(*) FROM code_scene_versions", [], |r| r.get(0))
                 .unwrap();
-            Ok((v42, fk, tables, bots, scenes, vers))
+            Ok((v44, fk, tables, bots, scenes, vers))
         })
         .unwrap();
 
-    assert!(has_v42, "MIGRATION_V42_CODE_SCENE must be recorded at version 42");
+    assert!(has_v42, "MIGRATION_V42_CODE_SCENE must be recorded at version 44");
     assert_eq!(fk_on, 1, "PRAGMA foreign_keys must be ON");
-    assert_eq!(table_count, 9, "All 9 V42 STRICT tables must exist");
+    assert_eq!(table_count, 9, "All 9 Code Scene STRICT tables must exist");
     assert_eq!(bot_user_count, OFFICIAL_CODE_SCENE_BOTS.len() as i64);
     assert_eq!(seed_count, official_seed_assets().len() as i64);
     assert_eq!(ver_count, official_seed_assets().len() as i64);

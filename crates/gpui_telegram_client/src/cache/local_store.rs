@@ -2,7 +2,12 @@ use crate::cache::code_scene_sqlite::{
     CachedCodeSceneComment, CachedCodeSceneRecord, CodeSceneLocalSocialEntry,
     CodeSceneSocialRelationKind, LocalCodeSceneDraft, TelemetryOutboxRecord,
 };
-use crate::cache::sqlite_cache::{CachedMediaEntry, SqliteClientCache};
+use crate::cache::sqlite_cache::{
+    sort_public_catalog_items, sort_user_creation_states, sort_user_creations,
+    CachedChatHistorySnapshot, CachedMediaEntry, SqliteClientCache, META_CREATIONS_LAST_REVISION,
+};
+use crate::net::hermes_client::{HermesRichChatDto, HermesRichMessageDto};
+use crate::net::http_client::{ChatSummary, HistoricalMessage};
 use gpui_telegram_code_scene::UserInterestProfile;
 use gpui_telegram_core::error::Result;
 use gpui_telegram_core::types::{ChatId, MessageId, UserId};
@@ -10,7 +15,12 @@ use gpui_telegram_proto::automation_apps::{AutomationAppDetail, InstalledAutomat
 use gpui_telegram_proto::code_scene_contracts::{
     CodeSceneAssetDto, CodeSceneCommentSort, SceneBehaviorEventDto,
 };
+use gpui_telegram_proto::contracts::auth::ContactDto;
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
+use gpui_telegram_proto::creations::{
+    CreationKind, CreationReviewStatus, PublicCatalogItemDto, UserCreationDto,
+    UserCreationStateDto,
+};
 use gpui_telegram_proto::message::{MessageContent, MessageItem, ReactionCount};
 use gpui_telegram_proto::{PollCard, TodoCard};
 use parking_lot::RwLock;
@@ -18,6 +28,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
+
+const MAX_CACHED_HISTORY_MESSAGES_PER_CHAT: usize = 100;
+const META_KEY_LAST_ACTIVE_CHAT_ID: &str = "last_active_chat_id";
+const META_KEY_USER_DISPLAY_NAME: &str = "cached_user_display_name";
 
 #[derive(Debug, Default)]
 struct LocalCacheState {
@@ -33,6 +47,11 @@ struct LocalCacheState {
     read_outbox_max: HashMap<ChatId, MessageId>,
     media_entries: HashMap<String, CachedMediaEntry>,
     mem_media_bytes: HashMap<String, Vec<u8>>,
+    user_creations: HashMap<String, UserCreationDto>,
+    creations_last_revision: i64,
+    user_creation_states: HashMap<String, UserCreationStateDto>,
+    public_catalog: HashMap<String, (PublicCatalogItemDto, i64)>,
+    cache_meta: HashMap<String, String>,
     installed_automation_apps: HashMap<String, InstalledAutomationApp>,
     cached_automation_apps: HashMap<String, AutomationAppDetail>,
     code_scenes_cache: HashMap<String, CachedCodeSceneRecord>,
@@ -42,6 +61,12 @@ struct LocalCacheState {
     code_scene_drafts: HashMap<String, LocalCodeSceneDraft>,
     code_scene_social: HashMap<(i64, CodeSceneSocialRelationKind, String), CodeSceneLocalSocialEntry>,
     code_scene_comments: HashMap<String, Vec<CachedCodeSceneComment>>,
+    cached_dialog_summaries: Vec<ChatSummary>,
+    cached_rich_chats: HashMap<u64, HermesRichChatDto>,
+    cached_chat_histories: HashMap<u64, CachedChatHistorySnapshot>,
+    cached_contacts: Vec<ContactDto>,
+    last_active_chat_id: Option<u64>,
+    cached_user_display_name: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -87,6 +112,14 @@ impl LocalStore {
         let chat_ttls = db.load_chat_ttls()?;
         let (read_inbox_max, read_outbox_max) = db.load_read_states()?;
         let media_entries = db.load_media_index()?;
+        let user_creations = db.load_all_user_creations()?;
+        let creations_last_revision = db.load_creations_last_revision()?;
+        let user_creation_states = db.load_user_creation_states_map()?;
+        let public_catalog = db.load_public_catalog_entries()?;
+        let mut cache_meta = HashMap::new();
+        if let Ok(Some(raw_rev)) = db.get_meta(META_CREATIONS_LAST_REVISION) {
+            cache_meta.insert(META_CREATIONS_LAST_REVISION.to_string(), raw_rev);
+        }
         let installed_automation_apps = db.load_installed_automation_apps()?;
         let cached_automation_apps = db.load_cached_automation_apps()?;
         let code_scenes_cache = db.load_cached_code_scenes()?;
@@ -101,6 +134,18 @@ impl LocalStore {
         let code_scene_drafts = db.load_code_scene_drafts()?;
         let code_scene_social = db.load_code_scene_social()?;
         let code_scene_comments = db.load_code_scene_comments()?;
+        let cached_dialog_summaries = db.load_cached_dialog_summaries().unwrap_or_default();
+        let cached_rich_chats = db.load_cached_rich_chats().unwrap_or_default();
+        let cached_chat_histories = db.load_cached_chat_histories().unwrap_or_default();
+        let cached_contacts = db.load_cached_contacts().unwrap_or_default();
+        let last_active_chat_id = db
+            .load_meta_value(META_KEY_LAST_ACTIVE_CHAT_ID)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&id| id > 0);
+        let cached_user_display_name = db
+            .load_meta_value(META_KEY_USER_DISPLAY_NAME)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let state = LocalCacheState {
             owner_scope,
             messages,
@@ -114,6 +159,11 @@ impl LocalStore {
             read_outbox_max,
             media_entries,
             mem_media_bytes: HashMap::new(),
+            user_creations,
+            creations_last_revision,
+            user_creation_states,
+            public_catalog,
+            cache_meta,
             installed_automation_apps,
             cached_automation_apps,
             code_scenes_cache,
@@ -123,6 +173,12 @@ impl LocalStore {
             code_scene_drafts,
             code_scene_social,
             code_scene_comments,
+            cached_dialog_summaries,
+            cached_rich_chats,
+            cached_chat_histories,
+            cached_contacts,
+            last_active_chat_id,
+            cached_user_display_name,
         };
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
@@ -232,6 +288,11 @@ impl LocalStore {
             guard.pinned_ids.clear();
             guard.read_inbox_max.clear();
             guard.read_outbox_max.clear();
+            guard.user_creations.clear();
+            guard.creations_last_revision = 0;
+            guard.user_creation_states.clear();
+            guard.public_catalog.clear();
+            guard.cache_meta.clear();
             guard.installed_automation_apps.clear();
             guard.cached_automation_apps.clear();
             guard.code_scenes_cache.clear();
@@ -242,6 +303,12 @@ impl LocalStore {
             guard.code_scene_social.clear();
             guard.code_scene_comments.clear();
             guard.mem_media_bytes.clear();
+            guard.cached_dialog_summaries.clear();
+            guard.cached_rich_chats.clear();
+            guard.cached_chat_histories.clear();
+            guard.cached_contacts.clear();
+            guard.last_active_chat_id = None;
+            guard.cached_user_display_name = None;
         }
         if let Some(db) = &self.sqlite {
             db.clear_all();
@@ -388,10 +455,14 @@ impl LocalStore {
     }
 
     pub fn clear_chat_messages(&self, chat_id: ChatId) {
+        let cid_u64 = u64::try_from(chat_id.0).ok().filter(|&id| id > 0);
         let ids: Vec<MessageId> = {
             let mut guard = self.state.write();
             guard.pinned_ids.remove(&chat_id);
             guard.message_reactions.retain(|&(cid, _), _| cid != chat_id);
+            if let Some(cid) = cid_u64 {
+                guard.cached_chat_histories.remove(&cid);
+            }
             guard
                 .messages
                 .remove(&chat_id)
@@ -405,14 +476,39 @@ impl LocalStore {
                 db.delete_message(chat_id, id);
             }
             db.clear_chat_reactions(chat_id);
+            if let Some(cid) = cid_u64 {
+                db.delete_cached_chat_history(cid);
+            }
         }
     }
 
     pub fn remove_chat(&self, chat_id: ChatId) {
         self.clear_chat_messages(chat_id);
-        let mut guard = self.state.write();
-        guard.chats.remove(&chat_id);
-        guard.drafts.remove(&chat_id);
+        let cid_u64 = u64::try_from(chat_id.0).ok().filter(|&id| id > 0);
+        let clear_last_active = {
+            let mut guard = self.state.write();
+            guard.chats.remove(&chat_id);
+            guard.drafts.remove(&chat_id);
+            if let Some(cid) = cid_u64 {
+                guard.cached_dialog_summaries.retain(|c| c.chat_id != cid);
+                guard.cached_rich_chats.remove(&cid);
+                if guard.last_active_chat_id == Some(cid) {
+                    guard.last_active_chat_id = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if let (Some(db), Some(cid)) = (&self.sqlite, cid_u64) {
+            db.delete_cached_dialog_summary(cid);
+            db.delete_cached_rich_chat(cid);
+            if clear_last_active {
+                db.save_meta_value(META_KEY_LAST_ACTIVE_CHAT_ID, None);
+            }
+        }
     }
 
     pub fn get_reactions(&self, chat_id: ChatId, message_id: MessageId) -> Option<Vec<ReactionCount>> {
@@ -954,6 +1050,558 @@ impl LocalStore {
                 .cmp(&a.updated_at_ms)
                 .then_with(|| a.app_id.cmp(&b.app_id))
         });
+        items
+    }
+
+    pub fn replace_cached_dialog_summaries(&self, chats: &[ChatSummary]) {
+        {
+            let mut guard = self.state.write();
+            guard.cached_dialog_summaries = chats.to_vec();
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_cached_dialog_summaries(chats);
+        }
+    }
+
+    pub fn get_cached_dialog_summaries(&self) -> Vec<ChatSummary> {
+        self.state.read().cached_dialog_summaries.clone()
+    }
+
+    pub fn update_cached_dialog_preview(
+        &self,
+        chat_id: u64,
+        last_message: String,
+        updated_at_ms: i64,
+        unread_delta: Option<i32>,
+    ) {
+        let updated_list = {
+            let mut guard = self.state.write();
+            if let Some(pos) = guard
+                .cached_dialog_summaries
+                .iter()
+                .position(|c| c.chat_id == chat_id)
+            {
+                let mut item = guard.cached_dialog_summaries.remove(pos);
+                item.last_message = Some(last_message);
+                item.updated_at = Some(updated_at_ms);
+                if let Some(delta) = unread_delta {
+                    if delta > 0 {
+                        item.unread_count = item.unread_count.saturating_add(delta as u32);
+                    } else if delta == 0 {
+                        item.unread_count = 0;
+                    }
+                }
+                guard.cached_dialog_summaries.insert(0, item);
+                Some(guard.cached_dialog_summaries.clone())
+            } else {
+                None
+            }
+        };
+        if let (Some(db), Some(list)) = (&self.sqlite, updated_list) {
+            db.replace_cached_dialog_summaries(&list);
+        }
+    }
+
+    pub fn replace_cached_rich_chats(&self, chats: &[HermesRichChatDto]) {
+        {
+            let mut guard = self.state.write();
+            guard.cached_rich_chats.clear();
+            for rc in chats {
+                if rc.chat_id > 0 {
+                    guard.cached_rich_chats.insert(rc.chat_id as u64, rc.clone());
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_cached_rich_chats(chats);
+        }
+    }
+
+    pub fn upsert_cached_rich_chat(&self, rc: HermesRichChatDto) {
+        if rc.chat_id <= 0 {
+            return;
+        }
+        self.state
+            .write()
+            .cached_rich_chats
+            .insert(rc.chat_id as u64, rc.clone());
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_rich_chat(&rc);
+        }
+    }
+
+    pub fn get_cached_rich_chats(&self) -> HashMap<u64, HermesRichChatDto> {
+        self.state.read().cached_rich_chats.clone()
+    }
+
+    pub fn replace_cached_chat_history(
+        &self,
+        chat_id: u64,
+        messages: &[HistoricalMessage],
+        rich_messages: &[HermesRichMessageDto],
+    ) {
+        if chat_id == 0 {
+            return;
+        }
+        let capped_msgs: Vec<HistoricalMessage> = if messages.len() > MAX_CACHED_HISTORY_MESSAGES_PER_CHAT {
+            messages[messages.len() - MAX_CACHED_HISTORY_MESSAGES_PER_CHAT..].to_vec()
+        } else {
+            messages.to_vec()
+        };
+        let keep_ids: std::collections::HashSet<i64> = capped_msgs
+            .iter()
+            .map(|m| m.message_id as i64)
+            .collect();
+        let capped_rich: Vec<HermesRichMessageDto> = rich_messages
+            .iter()
+            .filter(|r| keep_ids.contains(&r.message_id))
+            .cloned()
+            .collect();
+        let snap = CachedChatHistorySnapshot {
+            messages: capped_msgs,
+            rich_messages: capped_rich,
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        self.state
+            .write()
+            .cached_chat_histories
+            .insert(chat_id, snap.clone());
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_chat_history(chat_id, &snap);
+        }
+    }
+
+    pub fn upsert_cached_historical_message(&self, chat_id: u64, msg: HistoricalMessage) {
+        if chat_id == 0 || msg.message_id == 0 {
+            return;
+        }
+        let updated_snap = {
+            let mut guard = self.state.write();
+            let entry = guard.cached_chat_histories.entry(chat_id).or_default();
+            if let Some(existing) = entry
+                .messages
+                .iter_mut()
+                .find(|m| m.message_id == msg.message_id)
+            {
+                *existing = msg;
+            } else {
+                entry.messages.push(msg);
+                if entry.messages.len() > MAX_CACHED_HISTORY_MESSAGES_PER_CHAT {
+                    let drop_n = entry.messages.len() - MAX_CACHED_HISTORY_MESSAGES_PER_CHAT;
+                    entry.messages.drain(0..drop_n);
+                }
+            }
+            entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+            entry.clone()
+        };
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_chat_history(chat_id, &updated_snap);
+        }
+    }
+
+    pub fn update_cached_historical_message_text(
+        &self,
+        chat_id: u64,
+        message_id: u64,
+        new_text: String,
+    ) {
+        if chat_id == 0 || message_id == 0 {
+            return;
+        }
+        let updated_snap = {
+            let mut guard = self.state.write();
+            guard.cached_chat_histories.get_mut(&chat_id).and_then(|snap| {
+                let target = snap
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.message_id == message_id)?;
+                target.text = new_text;
+                snap.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                Some(snap.clone())
+            })
+        };
+        if let (Some(db), Some(snap)) = (&self.sqlite, updated_snap) {
+            db.upsert_cached_chat_history(chat_id, &snap);
+        }
+    }
+
+    pub fn delete_cached_historical_messages(&self, chat_id: u64, message_ids: &[u64]) {
+        if chat_id == 0 || message_ids.is_empty() {
+            return;
+        }
+        let updated_snap = {
+            let mut guard = self.state.write();
+            guard.cached_chat_histories.get_mut(&chat_id).and_then(|snap| {
+                let before = snap.messages.len();
+                snap.messages.retain(|m| !message_ids.contains(&m.message_id));
+                snap.rich_messages.retain(|r| {
+                    u64::try_from(r.message_id).map_or(true, |id| !message_ids.contains(&id))
+                });
+                if snap.messages.len() != before {
+                    snap.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                    Some(snap.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let (Some(db), Some(snap)) = (&self.sqlite, updated_snap) {
+            db.upsert_cached_chat_history(chat_id, &snap);
+        }
+    }
+
+    pub fn get_cached_chat_history(&self, chat_id: u64) -> Option<CachedChatHistorySnapshot> {
+        self.state.read().cached_chat_histories.get(&chat_id).cloned()
+    }
+
+    pub fn list_cached_chat_histories(&self) -> HashMap<u64, CachedChatHistorySnapshot> {
+        self.state.read().cached_chat_histories.clone()
+    }
+
+    pub fn replace_cached_contacts(&self, contacts: &[ContactDto]) {
+        {
+            let mut guard = self.state.write();
+            guard.cached_contacts = contacts.to_vec();
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_cached_contacts(contacts);
+        }
+    }
+
+    pub fn get_cached_contacts(&self) -> Vec<ContactDto> {
+        self.state.read().cached_contacts.clone()
+    }
+
+    pub fn set_last_active_chat_id(&self, chat_id: Option<u64>) {
+        let normalized = chat_id.filter(|&id| id > 0);
+        self.state.write().last_active_chat_id = normalized;
+        if let Some(db) = &self.sqlite {
+            let val = normalized.map(|id| id.to_string());
+            db.save_meta_value(META_KEY_LAST_ACTIVE_CHAT_ID, val.as_deref());
+        }
+    }
+
+    pub fn get_last_active_chat_id(&self) -> Option<u64> {
+        self.state.read().last_active_chat_id
+    }
+
+    pub fn set_cached_user_display_name(&self, name: Option<String>) {
+        let normalized = name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.state.write().cached_user_display_name = normalized.clone();
+        if let Some(db) = &self.sqlite {
+            db.save_meta_value(META_KEY_USER_DISPLAY_NAME, normalized.as_deref());
+        }
+    }
+
+    pub fn get_cached_user_display_name(&self) -> Option<String> {
+        self.state.read().cached_user_display_name.clone()
+    }
+}
+
+fn should_apply_creation_update(
+    existing: Option<&UserCreationDto>,
+    incoming: &UserCreationDto,
+) -> bool {
+    match existing {
+        None => true,
+        Some(prev) => {
+            incoming.cloud_revision > prev.cloud_revision
+                || (incoming.cloud_revision == prev.cloud_revision
+                    && (prev.deleted_at_ms.is_none() || incoming.deleted_at_ms.is_some()))
+        }
+    }
+}
+
+impl LocalStore {
+    pub fn get_cache_meta(&self, key: &str) -> Option<String> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(val) = db.get_meta(key) {
+                return val;
+            }
+        }
+        self.state.read().cache_meta.get(key).cloned()
+    }
+
+    pub fn set_cache_meta(&self, key: &str, value: &str) {
+        {
+            let mut guard = self.state.write();
+            guard.cache_meta.insert(key.to_string(), value.to_string());
+            if key == META_CREATIONS_LAST_REVISION {
+                guard.creations_last_revision = value.trim().parse::<i64>().unwrap_or(0).max(0);
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.set_meta(key, value);
+        }
+    }
+
+    pub fn delete_cache_meta(&self, key: &str) {
+        {
+            let mut guard = self.state.write();
+            guard.cache_meta.remove(key);
+            if key == META_CREATIONS_LAST_REVISION {
+                guard.creations_last_revision = 0;
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.delete_meta(key);
+        }
+    }
+
+    pub fn creations_last_revision(&self) -> i64 {
+        if let Some(db) = &self.sqlite {
+            if let Ok(rev) = db.creations_last_revision() {
+                return rev;
+            }
+        }
+        self.state.read().creations_last_revision
+    }
+
+    pub fn save_creations_last_revision(&self, revision: i64) {
+        let clamped = revision.max(0);
+        let next_rev = {
+            let mut guard = self.state.write();
+            guard.creations_last_revision = guard.creations_last_revision.max(clamped);
+            let next = guard.creations_last_revision;
+            guard
+                .cache_meta
+                .insert(META_CREATIONS_LAST_REVISION.to_string(), next.to_string());
+            next
+        };
+        if let Some(db) = &self.sqlite {
+            let _ = db.save_creations_last_revision(next_rev);
+            if let Ok(db_rev) = db.creations_last_revision() {
+                let mut guard = self.state.write();
+                guard.creations_last_revision = guard.creations_last_revision.max(db_rev);
+                let synced = guard.creations_last_revision;
+                guard
+                    .cache_meta
+                    .insert(META_CREATIONS_LAST_REVISION.to_string(), synced.to_string());
+            }
+        }
+    }
+
+    pub fn upsert_user_creations(&self, items: &[UserCreationDto]) {
+        if items.is_empty() {
+            return;
+        }
+        {
+            let mut guard = self.state.write();
+            for item in items {
+                let existing = guard.user_creations.get(&item.creation_id);
+                if should_apply_creation_update(existing, item) {
+                    guard
+                        .user_creations
+                        .insert(item.creation_id.clone(), item.clone());
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_user_creations(items);
+        }
+    }
+
+    pub fn apply_creations_sync_delta(
+        &self,
+        latest_revision: i64,
+        items: &[UserCreationDto],
+    ) -> i64 {
+        let mut next_rev = {
+            let mut guard = self.state.write();
+            let mut max_item_rev: i64 = 0;
+            for item in items {
+                max_item_rev = max_item_rev.max(item.cloud_revision.max(0));
+                let existing = guard.user_creations.get(&item.creation_id);
+                if should_apply_creation_update(existing, item) {
+                    guard
+                        .user_creations
+                        .insert(item.creation_id.clone(), item.clone());
+                }
+            }
+            let updated_rev = guard
+                .creations_last_revision
+                .max(latest_revision.max(0))
+                .max(max_item_rev);
+            guard.creations_last_revision = updated_rev;
+            guard.cache_meta.insert(
+                META_CREATIONS_LAST_REVISION.to_string(),
+                updated_rev.to_string(),
+            );
+            updated_rev
+        };
+        if let Some(db) = &self.sqlite {
+            if let Ok(db_rev) = db.apply_creations_sync_delta(latest_revision, items) {
+                next_rev = next_rev.max(db_rev);
+                let mut guard = self.state.write();
+                guard.creations_last_revision = guard.creations_last_revision.max(next_rev);
+                let synced = guard.creations_last_revision;
+                guard
+                    .cache_meta
+                    .insert(META_CREATIONS_LAST_REVISION.to_string(), synced.to_string());
+            }
+        }
+        next_rev
+    }
+
+    pub fn load_user_creations(
+        &self,
+        kind: Option<CreationKind>,
+        status: Option<CreationReviewStatus>,
+    ) -> Vec<UserCreationDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(items) = db.load_user_creations(kind, status) {
+                return items;
+            }
+        }
+        let guard = self.state.read();
+        let mut items: Vec<UserCreationDto> = guard
+            .user_creations
+            .values()
+            .filter(|item| item.deleted_at_ms.is_none())
+            .filter(|item| kind.map_or(true, |k| item.kind == k))
+            .filter(|item| status.map_or(true, |s| item.review_status == s))
+            .cloned()
+            .collect();
+        sort_user_creations(&mut items);
+        items
+    }
+
+    pub fn get_user_creation(&self, creation_id: &str) -> Option<UserCreationDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(found) = db.get_user_creation(creation_id) {
+                return found;
+            }
+        }
+        self.state
+            .read()
+            .user_creations
+            .get(creation_id)
+            .filter(|item| item.deleted_at_ms.is_none())
+            .cloned()
+    }
+
+    pub fn upsert_user_creation_state(&self, state: UserCreationStateDto) {
+        {
+            let mut guard = self.state.write();
+            let should_apply = guard
+                .user_creation_states
+                .get(&state.creation_id)
+                .map_or(true, |prev| state.updated_at_ms >= prev.updated_at_ms);
+            if should_apply {
+                guard
+                    .user_creation_states
+                    .insert(state.creation_id.clone(), state.clone());
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_user_creation_state(&state);
+        }
+    }
+
+    pub fn upsert_user_creation_states(&self, states: &[UserCreationStateDto]) {
+        if states.is_empty() {
+            return;
+        }
+        {
+            let mut guard = self.state.write();
+            for state in states {
+                let should_apply = guard
+                    .user_creation_states
+                    .get(&state.creation_id)
+                    .map_or(true, |prev| state.updated_at_ms >= prev.updated_at_ms);
+                if should_apply {
+                    guard
+                        .user_creation_states
+                        .insert(state.creation_id.clone(), state.clone());
+                }
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_user_creation_states(states);
+        }
+    }
+
+    pub fn load_user_creation_states(&self) -> Vec<UserCreationStateDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(items) = db.load_user_creation_states() {
+                return items;
+            }
+        }
+        let mut items: Vec<UserCreationStateDto> = self
+            .state
+            .read()
+            .user_creation_states
+            .values()
+            .cloned()
+            .collect();
+        sort_user_creation_states(&mut items);
+        items
+    }
+
+    pub fn get_user_creation_state(&self, creation_id: &str) -> Option<UserCreationStateDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(found) = db.get_user_creation_state(creation_id) {
+                return found;
+            }
+        }
+        self.state
+            .read()
+            .user_creation_states
+            .get(creation_id)
+            .cloned()
+    }
+
+    pub fn upsert_public_catalog_items(&self, items: &[PublicCatalogItemDto]) {
+        if items.is_empty() {
+            return;
+        }
+        let cached_at_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut guard = self.state.write();
+            for item in items {
+                guard
+                    .public_catalog
+                    .insert(item.creation_id.clone(), (item.clone(), cached_at_ms));
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            let _ = db.upsert_public_catalog_items(items, cached_at_ms);
+        }
+    }
+
+    pub fn remove_public_catalog_item(&self, creation_id: &str) -> bool {
+        let mut removed = {
+            let mut guard = self.state.write();
+            guard.public_catalog.remove(creation_id).is_some()
+        };
+        if let Some(db) = &self.sqlite {
+            if let Ok(db_removed) = db.remove_public_catalog_item(creation_id) {
+                removed = removed || db_removed;
+            }
+        }
+        removed
+    }
+
+    pub fn load_public_catalog_items(
+        &self,
+        kind: Option<CreationKind>,
+    ) -> Vec<PublicCatalogItemDto> {
+        if let Some(db) = &self.sqlite {
+            if let Ok(items) = db.load_public_catalog_items(kind) {
+                return items;
+            }
+        }
+        let guard = self.state.read();
+        let mut items: Vec<PublicCatalogItemDto> = guard
+            .public_catalog
+            .values()
+            .map(|(item, _)| item)
+            .filter(|item| kind.map_or(true, |k| item.kind == k))
+            .cloned()
+            .collect();
+        sort_public_catalog_items(&mut items);
         items
     }
 

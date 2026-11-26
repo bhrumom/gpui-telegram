@@ -7,4 +7,4 @@ pub use code_scene_sqlite::{
     CodeSceneSocialRelationKind, LocalCodeSceneDraft, TelemetryOutboxRecord,
 };
 pub use local_store::LocalStore;
-pub use sqlite_cache::CachedMediaEntry;
+pub use sqlite_cache::{CachedChatHistorySnapshot, CachedMediaEntry};

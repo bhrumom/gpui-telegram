@@ -4,6 +4,7 @@ use gpui_telegram_core::types::{ChatId, MessageId, PeerId, UserId, UserStatus};
 use gpui_telegram_proto::contracts::{
     CallSignalRequest, ChatFolderDto, DraftDto, ForumTopicDto, StoryDto,
 };
+use gpui_telegram_proto::creations::{CreationKind, CreationReviewStatus};
 use gpui_telegram_proto::message::{MessageItem, ReactionCount};
 use gpui_telegram_proto::miniapp_contracts::{MiniAppControlMode, MiniAppWebMcpCommand};
 use gpui_telegram_proto::sync::{ChatActionEvent, TypingEvent, UpdateEvent};
@@ -108,6 +109,27 @@ pub enum ClientDomainEvent {
         active_tool: Option<String>,
     },
     CodingHostCommand(CodingHostCommand),
+    UserCreationChanged {
+        creation_id: String,
+        owner_user_id: i64,
+        kind: CreationKind,
+        review_status: CreationReviewStatus,
+        cloud_revision: i64,
+    },
+    PublicCatalogChanged {
+        creation_id: String,
+        kind: CreationKind,
+        action: String,
+    },
+    CommunityEvent {
+        event_kind: String,
+        community_id: Option<String>,
+        post_id: Option<String>,
+        comment_id: Option<String>,
+        actor_id: Option<String>,
+        payload_json: String,
+        timestamp_ms: i64,
+    },
     ChatAction {
         chat_id: Option<ChatId>,
         action: ChatActionEvent,
@@ -130,6 +152,23 @@ pub enum ClientDomainEvent {
     Pong {
         nonce: u64,
     },
+}
+
+impl ClientDomainEvent {
+    /// Parses `payload_json` when this event is `ClientDomainEvent::CommunityEvent`.
+    /// Returns `None` for non-community events, empty payloads, or invalid JSON without panicking.
+    pub fn community_payload_json(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::CommunityEvent { payload_json, .. } => {
+                let trimmed = payload_json.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                serde_json::from_str::<serde_json::Value>(trimmed).ok()
+            }
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn peer_id_to_chat_id(peer: PeerId) -> ChatId {
@@ -354,6 +393,72 @@ pub(crate) fn apply_update_event(
         UpdateEvent::CodingHostCommand(cmd) => {
             out_events.push(ClientDomainEvent::CodingHostCommand(cmd));
         }
+        UpdateEvent::UserCreationChanged {
+            creation_id,
+            owner_user_id,
+            kind,
+            review_status,
+            cloud_revision,
+        } => {
+            out_events.push(ClientDomainEvent::UserCreationChanged {
+                creation_id,
+                owner_user_id,
+                kind,
+                review_status,
+                cloud_revision,
+            });
+        }
+        UpdateEvent::PublicCatalogChanged {
+            creation_id,
+            kind,
+            action,
+        } => {
+            if action.trim().eq_ignore_ascii_case("removed") {
+                store.remove_public_catalog_item(&creation_id);
+            }
+            out_events.push(ClientDomainEvent::PublicCatalogChanged {
+                creation_id,
+                kind,
+                action,
+            });
+        }
+        UpdateEvent::CommunityEvent {
+            event_kind,
+            community_id,
+            post_id,
+            comment_id,
+            actor_id,
+            payload_json,
+            timestamp_ms,
+        } => {
+            let normalized_kind = event_kind.trim();
+            if normalized_kind.is_empty() {
+                tracing::warn!(
+                    timestamp_ms,
+                    "Dropping malformed CommunityEvent frame with empty event_kind"
+                );
+                return;
+            }
+            if !payload_json.trim().is_empty()
+                && serde_json::from_str::<serde_json::Value>(&payload_json).is_err()
+            {
+                tracing::warn!(
+                    event_kind = normalized_kind,
+                    timestamp_ms,
+                    "Dropping malformed CommunityEvent frame with invalid payload_json"
+                );
+                return;
+            }
+            out_events.push(ClientDomainEvent::CommunityEvent {
+                event_kind: normalized_kind.to_string(),
+                community_id: community_id.filter(|s| !s.trim().is_empty()),
+                post_id: post_id.filter(|s| !s.trim().is_empty()),
+                comment_id: comment_id.filter(|s| !s.trim().is_empty()),
+                actor_id: actor_id.filter(|s| !s.trim().is_empty()),
+                payload_json,
+                timestamp_ms,
+            });
+        }
     }
 }
 
@@ -452,5 +557,230 @@ mod tests {
             ClientDomainEvent::CodingHostCommand(mapped) => assert_eq!(mapped, &cmd),
             other => panic!("expected CodingHostCommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_ws_frame_emits_user_creation_changed_without_advancing_cursor() {
+        let store = LocalStore::new();
+        let sync = ClientSyncCoordinator::new();
+        store.save_creations_last_revision(3);
+        let mut events = Vec::new();
+
+        apply_ws_frame(
+            &store,
+            &sync,
+            Some(UserId(42)),
+            WsServerFrame::Update(UpdateEvent::UserCreationChanged {
+                creation_id: "cr_book_1".to_string(),
+                owner_user_id: 42,
+                kind: CreationKind::Book,
+                review_status: CreationReviewStatus::Published,
+                cloud_revision: 9,
+            }),
+            &mut events,
+        );
+
+        assert_eq!(store.creations_last_revision(), 3);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientDomainEvent::UserCreationChanged {
+                creation_id,
+                owner_user_id,
+                kind,
+                review_status,
+                cloud_revision,
+            } => {
+                assert_eq!(creation_id, "cr_book_1");
+                assert_eq!(*owner_user_id, 42);
+                assert_eq!(*kind, CreationKind::Book);
+                assert_eq!(*review_status, CreationReviewStatus::Published);
+                assert_eq!(*cloud_revision, 9);
+            }
+            other => panic!("expected UserCreationChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_ws_frame_dispatches_community_event_update_and_pts_push() {
+        let store = LocalStore::new();
+        let sync = ClientSyncCoordinator::new();
+        let mut events = Vec::new();
+
+        let update_frame = WsServerFrame::Update(UpdateEvent::CommunityEvent {
+            event_kind: "  post_created  ".to_string(),
+            community_id: Some("comm_rust".to_string()),
+            post_id: Some("post_1".to_string()),
+            comment_id: Some("   ".to_string()),
+            actor_id: Some("b:42".to_string()),
+            payload_json: r#"{"score":7,"title":"Hello"}"#.to_string(),
+            timestamp_ms: 1_730_000_001_000,
+        });
+        let gaps = apply_ws_frame(&store, &sync, Some(UserId(1)), update_frame, &mut events);
+        assert!(gaps.is_empty());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientDomainEvent::CommunityEvent {
+                event_kind,
+                community_id,
+                post_id,
+                comment_id,
+                actor_id,
+                timestamp_ms,
+                ..
+            } => {
+                assert_eq!(event_kind, "post_created");
+                assert_eq!(community_id.as_deref(), Some("comm_rust"));
+                assert_eq!(post_id.as_deref(), Some("post_1"));
+                assert_eq!(comment_id.as_deref(), None);
+                assert_eq!(actor_id.as_deref(), Some("b:42"));
+                assert_eq!(*timestamp_ms, 1_730_000_001_000);
+            }
+            other => panic!("expected CommunityEvent, got {other:?}"),
+        }
+        let parsed = events[0]
+            .community_payload_json()
+            .expect("valid JSON payload");
+        assert_eq!(parsed["score"], 7);
+
+        let pts_frame = WsServerFrame::PtsPush(gpui_telegram_proto::sync::PtsUpdate {
+            chat_id: ChatId(99),
+            pts: 1,
+            pts_count: 1,
+            timestamp_ms: 1_730_000_002_000,
+            event: UpdateEvent::CommunityEvent {
+                event_kind: "future_v99_event".to_string(),
+                community_id: None,
+                post_id: Some("post_2".to_string()),
+                comment_id: None,
+                actor_id: None,
+                payload_json: String::new(),
+                timestamp_ms: 1_730_000_002_000,
+            },
+        });
+        let mut pts_events = Vec::new();
+        let _ = apply_ws_frame(&store, &sync, Some(UserId(1)), pts_frame, &mut pts_events);
+        assert_eq!(pts_events.len(), 1);
+        assert!(pts_events[0].community_payload_json().is_none());
+        match &pts_events[0] {
+            ClientDomainEvent::CommunityEvent { event_kind, .. } => {
+                assert_eq!(event_kind, "future_v99_event");
+            }
+            other => panic!("expected forward-compatible CommunityEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_ws_frame_emits_public_catalog_changed_and_evicts_on_removed() {
+        use gpui_telegram_proto::creations::{CoverArtwork, PublicCatalogItemDto};
+        use gpui_telegram_proto::sync::PtsUpdate;
+
+        let store = LocalStore::new();
+        let sync = ClientSyncCoordinator::new();
+        store.upsert_public_catalog_items(&[PublicCatalogItemDto {
+            creation_id: "cr_game_7".to_string(),
+            owner_user_id: 10,
+            kind: CreationKind::Game,
+            title: "Star Maze".to_string(),
+            subtitle: String::new(),
+            summary: "Puzzle".to_string(),
+            author_display_name: "Alice".to_string(),
+            language: "en".to_string(),
+            genres: vec!["puzzle".to_string()],
+            tags: vec![],
+            cover: CoverArtwork::default(),
+            age_rating: "4+".to_string(),
+            published_version: 1,
+            published_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            rating_avg: 4.5,
+            rating_count: 2,
+            engagement_count: 10,
+            save_or_install_count: 5,
+            featured_rank: Some(1),
+            deep_link: "tg://apple/games/cr_game_7".to_string(),
+            payload: None,
+        }]);
+        assert_eq!(store.load_public_catalog_items(Some(CreationKind::Game)).len(), 1);
+
+        let mut events = Vec::new();
+        apply_ws_frame(
+            &store,
+            &sync,
+            Some(UserId(10)),
+            WsServerFrame::PtsPush(PtsUpdate {
+                chat_id: ChatId(1),
+                pts: 1,
+                pts_count: 1,
+                event: UpdateEvent::PublicCatalogChanged {
+                    creation_id: "cr_game_7".to_string(),
+                    kind: CreationKind::Game,
+                    action: "removed".to_string(),
+                },
+                timestamp_ms: 1_000,
+            }),
+            &mut events,
+        );
+
+        assert!(store.load_public_catalog_items(Some(CreationKind::Game)).is_empty());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientDomainEvent::PublicCatalogChanged {
+                creation_id,
+                kind,
+                action,
+            } => {
+                assert_eq!(creation_id, "cr_game_7");
+                assert_eq!(*kind, CreationKind::Game);
+                assert_eq!(action, "removed");
+            }
+            other => panic!("expected PublicCatalogChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_ws_frame_drops_malformed_community_events_without_poisoning_subsequent_frames() {
+        let store = LocalStore::new();
+        let sync = ClientSyncCoordinator::new();
+        let mut events = Vec::new();
+
+        // 1. Empty event_kind -> dropped cleanly
+        let empty_kind = WsServerFrame::Update(UpdateEvent::CommunityEvent {
+            event_kind: "   ".to_string(),
+            community_id: None,
+            post_id: None,
+            comment_id: None,
+            actor_id: None,
+            payload_json: r#"{"ok":true}"#.to_string(),
+            timestamp_ms: 10,
+        });
+        apply_ws_frame(&store, &sync, None, empty_kind, &mut events);
+        assert!(events.is_empty());
+
+        // 2. Corrupted payload_json -> dropped cleanly without panic
+        let bad_json = WsServerFrame::Update(UpdateEvent::CommunityEvent {
+            event_kind: "comment_created".to_string(),
+            community_id: None,
+            post_id: Some("p1".to_string()),
+            comment_id: Some("c1".to_string()),
+            actor_id: None,
+            payload_json: "{broken json".to_string(),
+            timestamp_ms: 11,
+        });
+        apply_ws_frame(&store, &sync, None, bad_json, &mut events);
+        assert!(events.is_empty());
+
+        // 3. Subsequent valid frame still dispatches cleanly
+        let valid = WsServerFrame::Update(UpdateEvent::CommunityEvent {
+            event_kind: "vote_updated".to_string(),
+            community_id: None,
+            post_id: Some("p1".to_string()),
+            comment_id: None,
+            actor_id: Some("u:7".to_string()),
+            payload_json: r#"{"score":42}"#.to_string(),
+            timestamp_ms: 12,
+        });
+        apply_ws_frame(&store, &sync, None, valid, &mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].community_payload_json().unwrap()["score"], 42);
     }
 }

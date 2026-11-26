@@ -1,5 +1,6 @@
 use crate::cache::LocalStore;
 use crate::client_dispatch::{apply_ws_frame, ClientDomainEvent};
+use crate::community_runtime::{CommunityClientFacade, LocalCommunityRuntime};
 use crate::config::ClientConfig;
 use crate::e2ee::{E2eeManager, E2eeStore};
 use crate::media_transfer::{ChunkedTransferManager, FileTransferStore};
@@ -27,13 +28,20 @@ use crate::net::{
     RegisterLocalComputerRequest, RemoteComputerCommandRequest, RemoteComputerCommandResult,
     RemoteComputerOp, TailnetEngine, TailnetIdentity, TailnetNetMap, TailnetNodeStatus,
     UpdateBotComputerRequest, UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
-    ApproveDeviceSyncRequest, ArchiveLocalBotReplyRequest, ArchiveLocalBotReplyResponse,
-    AssistStartRequest, AssistStartResponse,
-    DeviceSyncActionResponse, DeviceSyncRequestBody, DeviceSyncRequestResponse,
-    DeviceSyncStatusResponse, McpOAuthGrantsResponse, PendingDeviceSyncListResponse,
-    RemoteAssistConfigDto, RemoteSessionsResponse, UpsertUserVaultItemRequest,
-    UpsertUserVaultItemResponse, UserVaultEnvelopeResponse, UserVaultKeyEnvelopeDto,
-    UserVaultSyncPullResponse, WsChannel, WsTransport,
+    AppStoreCatalogResponse, ApproveDeviceSyncRequest, ArchiveLocalBotReplyRequest,
+    ArchiveLocalBotReplyResponse, AssistStartRequest, AssistStartResponse, BotInlineQueryResponse,
+    CatalogQueryResponse, CatalogRecommendResponse, CatalogSortMode, CreateCreationRequest,
+    CreateCreationReviewRequest, CreationAuditListResponse, CreationKind, CreationListResponse,
+    CreationReviewEntryDto, CreationReviewStatus, CreationReviewsResponse, CreationSyncResponse,
+    CreationVisibility, DeviceSyncActionResponse, DeviceSyncRequestBody,
+    DeviceSyncRequestResponse,
+    DeviceSyncStatusResponse, GameLeaderboardEntryDto, GameLeaderboardResponse,
+    McpOAuthGrantsResponse, PendingDeviceSyncListResponse, PublicCatalogItemDto,
+    RemoteAssistConfigDto, RemoteSessionsResponse, ReviewDecisionRequest, SubmitGameScoreRequest,
+    SubmitReviewRequest, SubmitReviewResponse, UpdateCreationRequest, UpsertCreationStateRequest,
+    UpsertUserVaultItemRequest, UpsertUserVaultItemResponse, UserCreationDto,
+    UserCreationStateDto, UserCreationStatesResponse, UserVaultEnvelopeResponse,
+    UserVaultKeyEnvelopeDto, UserVaultSyncPullResponse, WsChannel, WsTransport,
 };
 use crate::outbox::{NetworkState, NetworkStatusListener, OutboxStore, OutboxWorker, TokenProvider};
 use crate::sync::ClientSyncCoordinator;
@@ -63,6 +71,7 @@ pub struct TelegramClient {
     pub network_listener: Arc<NetworkStatusListener>,
     pub chunked_transfers: Arc<ChunkedTransferManager>,
     pub e2ee: Arc<E2eeManager>,
+    community: CommunityClientFacade,
     runtime: Arc<Runtime>,
     auth_session: Arc<RwLock<Option<AuthResponse>>>,
     auth_token: Arc<RwLock<Option<String>>>,
@@ -76,15 +85,16 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self::with_store(config, LocalStore::new())
+        Self::try_with_store(config, LocalStore::new())
+            .expect("Failed to initialize in-memory TelegramClient")
     }
 
     pub fn open_with_dir(config: ClientConfig, cache_dir: impl AsRef<Path>) -> Result<Self> {
         let store = LocalStore::open_with_dir(cache_dir)?;
-        Ok(Self::with_store(config, store))
+        Self::try_with_store(config, store)
     }
 
-    fn with_store(config: ClientConfig, local_store: LocalStore) -> Self {
+    fn try_with_store(config: ClientConfig, local_store: LocalStore) -> Result<Self> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -200,6 +210,19 @@ impl TelegramClient {
             }));
         }
 
+        let local_community = match local_store.cache_dir() {
+            Some(dir) => LocalCommunityRuntime::open_in_dir(&dir)?,
+            None => LocalCommunityRuntime::open_in_memory()?,
+        };
+        let community = CommunityClientFacade::new(
+            http_client.clone(),
+            runtime.handle().clone(),
+            Arc::clone(&auth_token),
+            Arc::clone(&auth_session),
+            Arc::clone(&session_epoch),
+            Arc::new(local_community),
+        );
+
         let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
         let persisted_max = local_store.max_outbox_nonce();
         let safe_max = (i64::MAX as u64).saturating_sub(1_000_000);
@@ -208,7 +231,7 @@ impl TelegramClient {
             .max(persisted_max.saturating_add(1))
             .min(i64::MAX as u64);
 
-        Self {
+        Ok(Self {
             config,
             local_store,
             sync_coordinator,
@@ -222,6 +245,7 @@ impl TelegramClient {
             network_listener,
             chunked_transfers,
             e2ee,
+            community,
             runtime,
             auth_session,
             auth_token,
@@ -231,7 +255,7 @@ impl TelegramClient {
             next_client_msg_offset: Arc::new(AtomicU32::new(1)),
             ws_listener_attached: Arc::new(AtomicBool::new(false)),
             session_epoch,
-        }
+        })
     }
 
     pub fn new_with_url(server_url: String) -> Self {
@@ -522,14 +546,31 @@ impl TelegramClient {
     }
 
     pub fn set_auth_session(&self, session: AuthResponse) {
-        let prev_user_id = self.current_user_id();
+        let (prev_user_id, prev_token) = {
+            let tok_guard = self.auth_token.read();
+            let sess_guard = self.auth_session.read();
+            let uid = sess_guard.as_ref().map(|s| s.user_id);
+            let tok = tok_guard
+                .clone()
+                .or_else(|| sess_guard.as_ref().map(|s| s.token.clone()));
+            (uid, tok)
+        };
         let is_user_switch =
             prev_user_id.is_some_and(|prev| prev != session.user_id && session.user_id > 0);
+        let changed = prev_user_id != Some(session.user_id)
+            || prev_token.as_deref() != Some(session.token.as_str());
         if is_user_switch {
             self.clear_session();
+        } else if changed {
+            self.bump_session_epoch();
         }
         self.local_store
             .bind_account_scope(&self.config.server_url, session.user_id);
+        self.community.bind_account_scope(
+            session.user_id,
+            &session.username,
+            session.first_name.as_deref(),
+        );
         {
             let mut tok_guard = self.auth_token.write();
             let mut sess_guard = self.auth_session.write();
@@ -537,7 +578,10 @@ impl TelegramClient {
             let cur_tok = tok_guard
                 .as_deref()
                 .or_else(|| sess_guard.as_ref().map(|s| s.token.as_str()));
-            if cur_uid != Some(session.user_id) || cur_tok != Some(session.token.as_str()) {
+            if !is_user_switch
+                && !changed
+                && (cur_uid != Some(session.user_id) || cur_tok != Some(session.token.as_str()))
+            {
                 self.bump_session_epoch();
             }
             *tok_guard = Some(session.token.clone());
@@ -545,6 +589,33 @@ impl TelegramClient {
             self.ws_transport.set_token(Some(session.token));
         }
         self.outbox.start(self.runtime.handle());
+    }
+
+    pub fn update_auth_profile(
+        &self,
+        expected_user_id: u64,
+        username: String,
+        first_name: Option<String>,
+        created_at: Option<String>,
+        expires_at: Option<String>,
+    ) {
+        let mut sess_guard = self.auth_session.write();
+        if let Some(ref mut sess) = *sess_guard {
+            if sess.user_id == expected_user_id {
+                if !username.trim().is_empty() {
+                    sess.username = username;
+                }
+                if first_name.is_some() {
+                    sess.first_name = first_name;
+                }
+                if created_at.is_some() {
+                    sess.created_at = created_at;
+                }
+                if expires_at.is_some() {
+                    sess.expires_at = expires_at;
+                }
+            }
+        }
     }
 
     pub fn set_token(&self, token: Option<String>) {
@@ -589,6 +660,7 @@ impl TelegramClient {
         }
         self.outbox.clear_session_state();
         self.chunked_transfers.clear_session_state();
+        self.community.clear_session_state();
         self.e2ee.store().clear();
         self.sync_coordinator.clear();
         self.pending_events.lock().clear();
@@ -700,6 +772,10 @@ impl TelegramClient {
 
     pub fn hermes(&self) -> &HermesClient {
         &self.hermes
+    }
+
+    pub fn community(&self) -> &CommunityClientFacade {
+        &self.community
     }
 
     pub fn hermes_status(
@@ -3098,6 +3174,595 @@ impl TelegramClient {
             let (expected_epoch, token) = pinned?;
             self.ensure_pinned_session(expected_epoch, &token)?;
             self.code_scene.ai_remix(&token, req).await
+        }
+    }
+}
+
+impl TelegramClient {
+    fn is_owned_by_current_user(&self, owner_user_id: i64) -> bool {
+        self.current_user_id()
+            .map_or(false, |uid| uid as i64 == owner_user_id)
+    }
+
+    fn is_not_foreign_creation(&self, owner_user_id: i64) -> bool {
+        self.current_user_id()
+            .map_or(true, |uid| uid as i64 == owner_user_id)
+    }
+
+    fn evict_non_public_catalog_items(&self, items: &[UserCreationDto]) {
+        for item in items {
+            if item.deleted_at_ms.is_some()
+                || !item.has_live_published_version
+                || item.visibility != CreationVisibility::Public
+            {
+                self.local_store
+                    .remove_public_catalog_item(&item.creation_id);
+            }
+        }
+    }
+
+    pub async fn create_creation(
+        &self,
+        req: &CreateCreationRequest,
+    ) -> std::result::Result<UserCreationDto, HttpClientError> {
+        let token = self.require_token()?;
+        let created = self.http_client.create_creation(&token, req).await?;
+        if self.is_not_foreign_creation(created.owner_user_id) {
+            self.local_store.upsert_user_creations(&[created.clone()]);
+        }
+        Ok(created)
+    }
+
+    pub async fn list_my_creations(
+        &self,
+        kind: Option<CreationKind>,
+        status: Option<CreationReviewStatus>,
+        q: Option<&str>,
+    ) -> std::result::Result<CreationListResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .list_my_creations(&token, kind, status, q)
+            .await?;
+        let own_items: Vec<UserCreationDto> = resp
+            .items
+            .iter()
+            .filter(|item| self.is_not_foreign_creation(item.owner_user_id))
+            .cloned()
+            .collect();
+        if !own_items.is_empty() {
+            self.local_store.upsert_user_creations(&own_items);
+        }
+        Ok(resp)
+    }
+
+    pub async fn sync_creations(
+        &self,
+        since_revision: Option<i64>,
+    ) -> std::result::Result<CreationSyncResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .sync_creations(&token, since_revision)
+            .await?;
+        let own_items: Vec<UserCreationDto> = resp
+            .items
+            .iter()
+            .filter(|item| self.is_not_foreign_creation(item.owner_user_id))
+            .cloned()
+            .collect();
+        self.local_store
+            .apply_creations_sync_delta(resp.latest_revision, &own_items);
+        self.evict_non_public_catalog_items(&resp.items);
+        Ok(resp)
+    }
+
+    pub async fn get_creation(
+        &self,
+        creation_id: &str,
+    ) -> std::result::Result<UserCreationDto, HttpClientError> {
+        let token = self.require_token()?;
+        let item = self.http_client.get_creation(&token, creation_id).await?;
+        if self.is_owned_by_current_user(item.owner_user_id) {
+            self.local_store.upsert_user_creations(&[item.clone()]);
+        }
+        Ok(item)
+    }
+
+    pub async fn update_creation(
+        &self,
+        creation_id: &str,
+        req: &UpdateCreationRequest,
+    ) -> std::result::Result<UserCreationDto, HttpClientError> {
+        let token = self.require_token()?;
+        let updated = self
+            .http_client
+            .update_creation(&token, creation_id, req)
+            .await?;
+        if self.is_not_foreign_creation(updated.owner_user_id) {
+            self.local_store.upsert_user_creations(&[updated.clone()]);
+        }
+        Ok(updated)
+    }
+
+    pub async fn delete_creation(
+        &self,
+        creation_id: &str,
+    ) -> std::result::Result<UserCreationDto, HttpClientError> {
+        let token = self.require_token()?;
+        let deleted = self
+            .http_client
+            .delete_creation(&token, creation_id)
+            .await?;
+        if self.is_not_foreign_creation(deleted.owner_user_id) {
+            self.local_store.upsert_user_creations(&[deleted.clone()]);
+        }
+        self.local_store
+            .remove_public_catalog_item(&deleted.creation_id);
+        Ok(deleted)
+    }
+
+    pub async fn submit_creation_for_review(
+        &self,
+        creation_id: &str,
+        req: Option<&SubmitReviewRequest>,
+    ) -> std::result::Result<SubmitReviewResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .submit_creation_for_review(&token, creation_id, req)
+            .await?;
+        if self.is_not_foreign_creation(resp.creation.owner_user_id) {
+            self.local_store
+                .upsert_user_creations(&[resp.creation.clone()]);
+        }
+        Ok(resp)
+    }
+
+    pub async fn withdraw_creation_review(
+        &self,
+        creation_id: &str,
+    ) -> std::result::Result<UserCreationDto, HttpClientError> {
+        let token = self.require_token()?;
+        let updated = self
+            .http_client
+            .withdraw_creation_review(&token, creation_id)
+            .await?;
+        if self.is_not_foreign_creation(updated.owner_user_id) {
+            self.local_store.upsert_user_creations(&[updated.clone()]);
+        }
+        Ok(updated)
+    }
+
+    pub async fn unpublish_creation(
+        &self,
+        creation_id: &str,
+    ) -> std::result::Result<UserCreationDto, HttpClientError> {
+        let token = self.require_token()?;
+        let updated = self
+            .http_client
+            .unpublish_creation(&token, creation_id)
+            .await?;
+        if self.is_owned_by_current_user(updated.owner_user_id) {
+            self.local_store.upsert_user_creations(&[updated.clone()]);
+        }
+        self.local_store
+            .remove_public_catalog_item(&updated.creation_id);
+        Ok(updated)
+    }
+
+    pub async fn get_creation_audit(
+        &self,
+        creation_id: &str,
+    ) -> std::result::Result<CreationAuditListResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .get_creation_audit(&token, creation_id)
+            .await
+    }
+
+    pub async fn list_review_queue(
+        &self,
+        status: Option<CreationReviewStatus>,
+        kind: Option<CreationKind>,
+    ) -> std::result::Result<CreationListResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .list_review_queue(&token, status, kind)
+            .await
+    }
+
+    pub async fn submit_review_decision(
+        &self,
+        creation_id: &str,
+        req: &ReviewDecisionRequest,
+    ) -> std::result::Result<UserCreationDto, HttpClientError> {
+        let token = self.require_token()?;
+        let decided = self
+            .http_client
+            .submit_review_decision(&token, creation_id, req)
+            .await?;
+        if self.is_owned_by_current_user(decided.owner_user_id) {
+            self.local_store.upsert_user_creations(&[decided.clone()]);
+        }
+        if decided.deleted_at_ms.is_some()
+            || !decided.has_live_published_version
+            || decided.visibility != CreationVisibility::Public
+        {
+            self.local_store
+                .remove_public_catalog_item(&decided.creation_id);
+        }
+        Ok(decided)
+    }
+
+    pub async fn search_public_catalog(
+        &self,
+        kind: Option<CreationKind>,
+        q: Option<&str>,
+        genre: Option<&str>,
+        sort: Option<CatalogSortMode>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> std::result::Result<CatalogQueryResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .search_public_catalog(&token, kind, q, genre, sort, limit, offset)
+            .await?;
+        if !resp.items.is_empty() {
+            self.local_store.upsert_public_catalog_items(&resp.items);
+        }
+        Ok(resp)
+    }
+
+    pub async fn list_catalog_books(
+        &self,
+        q: Option<&str>,
+        genre: Option<&str>,
+        sort: Option<CatalogSortMode>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> std::result::Result<CatalogQueryResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .list_catalog_books(&token, q, genre, sort, limit, offset)
+            .await?;
+        if !resp.items.is_empty() {
+            self.local_store.upsert_public_catalog_items(&resp.items);
+        }
+        Ok(resp)
+    }
+
+    pub async fn list_catalog_music(
+        &self,
+        q: Option<&str>,
+        genre: Option<&str>,
+        sort: Option<CatalogSortMode>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> std::result::Result<CatalogQueryResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .list_catalog_music(&token, q, genre, sort, limit, offset)
+            .await?;
+        if !resp.items.is_empty() {
+            self.local_store.upsert_public_catalog_items(&resp.items);
+        }
+        Ok(resp)
+    }
+
+    pub async fn list_catalog_games(
+        &self,
+        q: Option<&str>,
+        genre: Option<&str>,
+        sort: Option<CatalogSortMode>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> std::result::Result<CatalogQueryResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .list_catalog_games(&token, q, genre, sort, limit, offset)
+            .await?;
+        if !resp.items.is_empty() {
+            self.local_store.upsert_public_catalog_items(&resp.items);
+        }
+        Ok(resp)
+    }
+
+    pub async fn list_catalog_appstore(
+        &self,
+        q: Option<&str>,
+        genre: Option<&str>,
+        sort: Option<CatalogSortMode>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> std::result::Result<AppStoreCatalogResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .list_catalog_appstore(&token, q, genre, sort, limit, offset)
+            .await?;
+        let mut combined = Vec::with_capacity(
+            resp.featured.len() + resp.apps.len() + resp.cross_vertical.len(),
+        );
+        combined.extend(resp.featured.iter().cloned());
+        combined.extend(resp.apps.iter().cloned());
+        combined.extend(resp.cross_vertical.iter().cloned());
+        if !combined.is_empty() {
+            self.local_store.upsert_public_catalog_items(&combined);
+        }
+        Ok(resp)
+    }
+
+    pub async fn recommend_public_catalog(
+        &self,
+        q: Option<&str>,
+        kind: Option<CreationKind>,
+        genre: Option<&str>,
+        limit: Option<usize>,
+    ) -> std::result::Result<CatalogRecommendResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .recommend_public_catalog(&token, q, kind, genre, limit)
+            .await
+    }
+
+    pub async fn upsert_creation_state(
+        &self,
+        creation_id: &str,
+        req: &UpsertCreationStateRequest,
+    ) -> std::result::Result<UserCreationStateDto, HttpClientError> {
+        let token = self.require_token()?;
+        let saved = self
+            .http_client
+            .upsert_creation_state(&token, creation_id, req)
+            .await?;
+        self.local_store.upsert_user_creation_state(saved.clone());
+        Ok(saved)
+    }
+
+    pub async fn list_my_creation_states(
+        &self,
+        kind: Option<CreationKind>,
+    ) -> std::result::Result<UserCreationStatesResponse, HttpClientError> {
+        let token = self.require_token()?;
+        let resp = self
+            .http_client
+            .list_my_creation_states(&token, kind)
+            .await?;
+        if !resp.items.is_empty() {
+            self.local_store.upsert_user_creation_states(&resp.items);
+        }
+        Ok(resp)
+    }
+
+    pub async fn submit_creation_review(
+        &self,
+        creation_id: &str,
+        req: &CreateCreationReviewRequest,
+    ) -> std::result::Result<CreationReviewEntryDto, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .submit_creation_review(&token, creation_id, req)
+            .await
+    }
+
+    pub async fn list_creation_reviews(
+        &self,
+        creation_id: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> std::result::Result<CreationReviewsResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .list_creation_reviews(&token, creation_id, limit, offset)
+            .await
+    }
+
+    pub async fn submit_game_score(
+        &self,
+        creation_id: &str,
+        req: &SubmitGameScoreRequest,
+    ) -> std::result::Result<GameLeaderboardEntryDto, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .submit_game_score(&token, creation_id, req)
+            .await
+    }
+
+    pub async fn get_game_leaderboard(
+        &self,
+        creation_id: &str,
+        limit: Option<usize>,
+    ) -> std::result::Result<GameLeaderboardResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .get_game_leaderboard(&token, creation_id, limit)
+            .await
+    }
+
+    pub async fn query_bot_inline(
+        &self,
+        bot_username: &str,
+        query: &str,
+        kind: Option<CreationKind>,
+        limit: Option<usize>,
+    ) -> std::result::Result<BotInlineQueryResponse, HttpClientError> {
+        let token = self.require_token()?;
+        self.http_client
+            .query_bot_inline(&token, bot_username, query, kind, limit)
+            .await
+    }
+
+    pub fn load_cached_my_creations(
+        &self,
+        kind: Option<CreationKind>,
+        status: Option<CreationReviewStatus>,
+    ) -> Vec<UserCreationDto> {
+        self.local_store.load_user_creations(kind, status)
+    }
+
+    pub async fn sync_my_creations_with_cache(
+        &self,
+    ) -> std::result::Result<Vec<UserCreationDto>, HttpClientError> {
+        let token = self.require_token()?;
+        let since = self.local_store.creations_last_revision().max(0);
+        match self.http_client.sync_creations(&token, Some(since)).await {
+            Ok(delta) => {
+                let own_items: Vec<UserCreationDto> = delta
+                    .items
+                    .iter()
+                    .filter(|item| self.is_not_foreign_creation(item.owner_user_id))
+                    .cloned()
+                    .collect();
+                self.local_store
+                    .apply_creations_sync_delta(delta.latest_revision, &own_items);
+                self.evict_non_public_catalog_items(&delta.items);
+                Ok(self.local_store.load_user_creations(None, None))
+            }
+            Err(HttpClientError::Network(_)) | Err(HttpClientError::Proxy(_)) => {
+                Ok(self.local_store.load_user_creations(None, None))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    pub fn load_cached_my_creation_states(&self) -> Vec<UserCreationStateDto> {
+        self.local_store.load_user_creation_states()
+    }
+
+    pub async fn sync_my_creation_states_with_cache(
+        &self,
+        kind: Option<CreationKind>,
+    ) -> std::result::Result<Vec<UserCreationStateDto>, HttpClientError> {
+        let token = self.require_token()?;
+        match self.http_client.list_my_creation_states(&token, kind).await {
+            Ok(resp) => {
+                if !resp.items.is_empty() {
+                    self.local_store.upsert_user_creation_states(&resp.items);
+                }
+                Ok(resp.items)
+            }
+            Err(HttpClientError::Network(_)) | Err(HttpClientError::Proxy(_)) => {
+                let mut cached = self.local_store.load_user_creation_states();
+                if let Some(k) = kind {
+                    cached.retain(|s| s.kind == k);
+                }
+                Ok(cached)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    pub fn load_cached_public_catalog(
+        &self,
+        kind: Option<CreationKind>,
+    ) -> Vec<PublicCatalogItemDto> {
+        self.local_store.load_public_catalog_items(kind)
+    }
+
+    pub async fn sync_public_catalog_with_cache(
+        &self,
+        kind: Option<CreationKind>,
+        q: Option<&str>,
+        genre: Option<&str>,
+        sort: Option<CatalogSortMode>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> std::result::Result<Vec<PublicCatalogItemDto>, HttpClientError> {
+        let token = self.require_token()?;
+        match self
+            .http_client
+            .search_public_catalog(&token, kind, q, genre, sort, limit, offset)
+            .await
+        {
+            Ok(resp) => {
+                if !resp.items.is_empty() {
+                    self.local_store.upsert_public_catalog_items(&resp.items);
+                }
+                Ok(resp.items)
+            }
+            Err(HttpClientError::Network(_)) | Err(HttpClientError::Proxy(_)) => {
+                let mut cached = self.local_store.load_public_catalog_items(kind);
+                if let Some(q_norm) = q.map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase)
+                {
+                    cached.retain(|item| {
+                        item.title.to_lowercase().contains(&q_norm)
+                            || item.subtitle.to_lowercase().contains(&q_norm)
+                            || item.summary.to_lowercase().contains(&q_norm)
+                            || item.author_display_name.to_lowercase().contains(&q_norm)
+                            || item
+                                .genres
+                                .iter()
+                                .any(|g| g.to_lowercase().contains(&q_norm))
+                            || item
+                                .tags
+                                .iter()
+                                .any(|t| t.to_lowercase().contains(&q_norm))
+                    });
+                }
+                if let Some(g_norm) =
+                    genre.map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase)
+                {
+                    cached.retain(|item| {
+                        item.genres
+                            .iter()
+                            .any(|g| g.trim().to_lowercase() == g_norm)
+                    });
+                }
+                if let Some(mode) = sort {
+                    match mode {
+                        CatalogSortMode::Featured => {
+                            cached.sort_by(|a, b| {
+                                a.featured_rank
+                                    .unwrap_or(u32::MAX)
+                                    .cmp(&b.featured_rank.unwrap_or(u32::MAX))
+                                    .then_with(|| b.published_at_ms.cmp(&a.published_at_ms))
+                                    .then_with(|| a.creation_id.cmp(&b.creation_id))
+                            });
+                        }
+                        CatalogSortMode::Popular => {
+                            cached.sort_by(|a, b| {
+                                b.engagement_count
+                                    .cmp(&a.engagement_count)
+                                    .then_with(|| {
+                                        b.save_or_install_count.cmp(&a.save_or_install_count)
+                                    })
+                                    .then_with(|| b.published_at_ms.cmp(&a.published_at_ms))
+                                    .then_with(|| a.creation_id.cmp(&b.creation_id))
+                            });
+                        }
+                        CatalogSortMode::TopRated => {
+                            cached.sort_by(|a, b| {
+                                b.rating_avg
+                                    .total_cmp(&a.rating_avg)
+                                    .then_with(|| b.rating_count.cmp(&a.rating_count))
+                                    .then_with(|| b.published_at_ms.cmp(&a.published_at_ms))
+                                    .then_with(|| a.creation_id.cmp(&b.creation_id))
+                            });
+                        }
+                        CatalogSortMode::Newest => {
+                            cached.sort_by(|a, b| {
+                                b.published_at_ms
+                                    .cmp(&a.published_at_ms)
+                                    .then_with(|| b.updated_at_ms.cmp(&a.updated_at_ms))
+                                    .then_with(|| a.creation_id.cmp(&b.creation_id))
+                            });
+                        }
+                    }
+                }
+                let start = offset.unwrap_or(0);
+                let sliced: Vec<PublicCatalogItemDto> = if let Some(lim) = limit {
+                    cached.into_iter().skip(start).take(lim).collect()
+                } else {
+                    cached.into_iter().skip(start).collect()
+                };
+                Ok(sliced)
+            }
+            Err(other) => Err(other),
         }
     }
 }

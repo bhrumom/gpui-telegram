@@ -133,18 +133,9 @@ pub fn parse_markdown_spans(line: &str) -> Vec<RichTextSpan> {
     while i < n {
         let rest = &line[i..];
 
-        // 1. Detect URLs (http:// or https://)
-        if rest.starts_with("https://") || rest.starts_with("http://") {
-            let mut end = i;
-            while end < n && !line[end..].chars().next().map(|c| c.is_whitespace()).unwrap_or(true) {
-                end += line[end..].chars().next().unwrap().len_utf8();
-            }
-            let mut url = &line[i..end];
-            // Trim trailing punctuation (.,!?;:))
-            while !url.is_empty() && [b'.', b',', b'!', b'?', b';', b':', b')'].contains(&url.as_bytes()[url.len() - 1]) {
-                url = &url[..url.len() - 1];
-                end -= 1;
-            }
+        // 1. Detect URLs (http://, https://, or case-insensitive tg://)
+        if let Some(url) = crate::views::stage::entities::extract_bare_url_prefix(rest) {
+            let end = i + url.len();
             if i > plain_start {
                 spans.push(RichTextSpan {
                     text: line[plain_start..i].to_string(),

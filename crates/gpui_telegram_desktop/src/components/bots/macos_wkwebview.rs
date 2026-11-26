@@ -937,6 +937,7 @@ pub enum WkWebViewEvent {
         url: String,
     },
     RecordedDomAction(RecordedDomEvent),
+    BecameFirstResponder,
 }
 
 fn normalize_sensitivity_text(raw: &str) -> (String, String) {
@@ -1235,6 +1236,9 @@ pub struct SharedWebViewState {
     pub dom_recording_enabled: AtomicBool,
     pub allow_file_urls: AtomicBool,
     pub load_popups_in_same_tab: AtomicBool,
+    pub allow_first_responder: AtomicBool,
+    pub ignore_hit_test: AtomicBool,
+    pub became_first_responder: AtomicBool,
     pub event_queue: Arc<Mutex<VecDeque<WkWebViewEvent>>>,
     pub wakeup_tx: UnboundedSender<()>,
 }
@@ -1255,6 +1259,9 @@ impl SharedWebViewState {
             dom_recording_enabled: AtomicBool::new(config.enable_dom_recorder),
             allow_file_urls: AtomicBool::new(config.allow_file_urls),
             load_popups_in_same_tab: AtomicBool::new(config.load_popups_in_same_tab),
+            allow_first_responder: AtomicBool::new(false),
+            ignore_hit_test: AtomicBool::new(true),
+            became_first_responder: AtomicBool::new(false),
             event_queue: Arc::new(Mutex::new(VecDeque::new())),
             wakeup_tx,
         }
@@ -1684,6 +1691,10 @@ extern "C" fn did_receive_script_message(
         if !state.shared.alive.load(Ordering::Acquire) {
             return;
         }
+        if !state.shared.allow_first_responder.load(Ordering::Acquire) {
+            let msg_webview: *mut Object = msg_send![message, webView];
+            restore_superview_first_responder_for_webview(msg_webview);
+        }
         let body: *mut Object = msg_send![message, body];
         match state.mode {
             ScriptHandlerMode::TelegramBridge => {
@@ -1771,6 +1782,207 @@ extern "C" fn shared_ivar_dealloc(this: &mut Object, _cmd: Sel) {
         }
         let _: () = msg_send![super(this, class!(NSObject)), dealloc];
     }
+}
+
+/// Ensures the host GPUI `NSView` owns `NSWindow.firstResponder` so keyboard and macOS IME
+/// events (`keyDown:`, `NSTextInputClient`) route back to GPUI after native `WKWebView` activity.
+pub fn restore_gpui_first_responder(window: &Window) {
+    if is_headless_or_offline_test_env() {
+        return;
+    }
+    let Ok(win_handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let parent_ns_view = match win_handle.as_raw() {
+        RawWindowHandle::AppKit(appkit) => appkit.ns_view.as_ptr() as *mut Object,
+        _ => return,
+    };
+    if parent_ns_view.is_null() {
+        return;
+    }
+    unsafe {
+        let ns_window: *mut Object = msg_send![parent_ns_view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let current_fr: *mut Object = msg_send![ns_window, firstResponder];
+        if current_fr != parent_ns_view {
+            let _: BOOL = msg_send![ns_window, makeFirstResponder: parent_ns_view];
+        }
+    }
+}
+
+unsafe fn restore_parent_first_responder_if_owned_by_webview(
+    parent_ns_view: *mut Object,
+    webview: *mut Object,
+) {
+    if parent_ns_view.is_null() {
+        return;
+    }
+    unsafe {
+        let ns_window: *mut Object = msg_send![parent_ns_view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let current_fr: *mut Object = msg_send![ns_window, firstResponder];
+        if current_fr == parent_ns_view {
+            return;
+        }
+        let should_restore = if current_fr.is_null() || current_fr == ns_window {
+            true
+        } else if !webview.is_null() {
+            if current_fr == webview {
+                true
+            } else {
+                let is_ns_view: BOOL = msg_send![current_fr, isKindOfClass: class!(NSView)];
+                if is_ns_view != NO {
+                    let is_desc: BOOL = msg_send![current_fr, isDescendantOf: webview];
+                    is_desc != NO
+                } else {
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if should_restore {
+            let _: BOOL = msg_send![ns_window, makeFirstResponder: parent_ns_view];
+        }
+    }
+}
+
+unsafe fn restore_superview_first_responder_for_webview(webview: *mut Object) {
+    if webview.is_null() {
+        return;
+    }
+    unsafe {
+        let superview: *mut Object = msg_send![webview, superview];
+        if superview.is_null() {
+            return;
+        }
+        restore_parent_first_responder_if_owned_by_webview(superview, webview);
+    }
+}
+
+extern "C" fn gpui_wkwebview_accepts_first_responder(this: &Object, _cmd: Sel) -> BOOL {
+    unsafe {
+        if let Some(shared) = get_shared_from_ivar(this) {
+            if !shared.allow_first_responder.load(Ordering::Acquire) {
+                return NO;
+            }
+        }
+        if let Some(wk_cls) = Class::get("WKWebView") {
+            msg_send![super(this, wk_cls), acceptsFirstResponder]
+        } else {
+            NO
+        }
+    }
+}
+
+extern "C" fn gpui_wkwebview_become_first_responder(this: &Object, _cmd: Sel) -> BOOL {
+    unsafe {
+        if let Some(shared) = get_shared_from_ivar(this) {
+            if !shared.allow_first_responder.load(Ordering::Acquire) {
+                return NO;
+            }
+        }
+        let accepted: BOOL = if let Some(wk_cls) = Class::get("WKWebView") {
+            msg_send![super(this, wk_cls), becomeFirstResponder]
+        } else {
+            NO
+        };
+        if accepted != NO {
+            if let Some(shared) = get_shared_from_ivar(this) {
+                if shared.alive.load(Ordering::Acquire) {
+                    shared.became_first_responder.store(true, Ordering::Release);
+                    shared.push_event(WkWebViewEvent::BecameFirstResponder);
+                }
+            }
+        }
+        accepted
+    }
+}
+
+extern "C" fn gpui_wkwebview_hit_test(this: &Object, _cmd: Sel, point: CgPoint) -> *mut Object {
+    unsafe {
+        if let Some(shared) = get_shared_from_ivar(this) {
+            if shared.ignore_hit_test.load(Ordering::Acquire) {
+                return ptr::null_mut();
+            }
+        }
+        if let Some(wk_cls) = Class::get("WKWebView") {
+            msg_send![super(this, wk_cls), hitTest: point]
+        } else {
+            ptr::null_mut()
+        }
+    }
+}
+
+extern "C" fn gpui_wkwebview_mouse_down(this: &Object, _cmd: Sel, event: *mut Object) {
+    unsafe {
+        let allow_fr = get_shared_from_ivar(this)
+            .map(|s| s.allow_first_responder.load(Ordering::Acquire))
+            .unwrap_or(true);
+        if let Some(wk_cls) = Class::get("WKWebView") {
+            let _: () = msg_send![super(this, wk_cls), mouseDown: event];
+        }
+        if !allow_fr {
+            restore_superview_first_responder_for_webview(this as *const Object as *mut Object);
+        }
+    }
+}
+
+extern "C" fn gpui_wkwebview_dealloc(this: &mut Object, _cmd: Sel) {
+    unsafe {
+        let ptr: *mut c_void = *this.get_ivar(SHARED_IVAR_NAME);
+        if !ptr.is_null() {
+            drop(Arc::from_raw(ptr as *const SharedWebViewState));
+            this.set_ivar(SHARED_IVAR_NAME, ptr::null_mut::<c_void>());
+        }
+        if let Some(wk_cls) = Class::get("WKWebView") {
+            let _: () = msg_send![super(this, wk_cls), dealloc];
+        }
+    }
+}
+
+fn get_or_register_wkwebview_class() -> Option<&'static Class> {
+    static REGISTER_ONCE: Once = Once::new();
+    REGISTER_ONCE.call_once(|| {
+        if Class::get("GPUIWKWebView").is_some() {
+            return;
+        }
+        let Some(superclass) = Class::get("WKWebView") else {
+            return;
+        };
+        let Some(mut decl) = ClassDecl::new("GPUIWKWebView", superclass) else {
+            return;
+        };
+        decl.add_ivar::<*mut c_void>(SHARED_IVAR_NAME);
+        unsafe {
+            decl.add_method(
+                sel!(acceptsFirstResponder),
+                gpui_wkwebview_accepts_first_responder as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(becomeFirstResponder),
+                gpui_wkwebview_become_first_responder as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(hitTest:),
+                gpui_wkwebview_hit_test as extern "C" fn(&Object, Sel, CgPoint) -> *mut Object,
+            );
+            decl.add_method(
+                sel!(mouseDown:),
+                gpui_wkwebview_mouse_down as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(dealloc),
+                gpui_wkwebview_dealloc as extern "C" fn(&mut Object, Sel),
+            );
+        }
+        decl.register();
+    });
+    Class::get("GPUIWKWebView")
 }
 
 unsafe fn sync_shared_nav_snapshot(shared: &SharedWebViewState, webview: *mut Object) {
@@ -1930,6 +2142,9 @@ extern "C" fn nav_did_finish(
         if let Some(shared) = get_shared_from_ivar(this) {
             if !shared.alive.load(Ordering::Acquire) {
                 return;
+            }
+            if !shared.allow_first_responder.load(Ordering::Acquire) {
+                restore_superview_first_responder_for_webview(webview);
             }
             *shared.last_nav_error.write() = None;
             shared.is_loading.store(false, Ordering::Release);
@@ -2807,7 +3022,7 @@ impl EmbeddedWkWebView {
         if parent_ns_view.is_null() {
             return None;
         }
-        let wk_cls = Class::get("WKWebView")?;
+        let wk_cls = get_or_register_wkwebview_class().or_else(|| Class::get("WKWebView"))?;
         let cfg_cls = Class::get("WKWebViewConfiguration")?;
         let script_cls = Class::get("WKUserScript")?;
         let handler_cls = get_or_register_script_handler_class()?;
@@ -2962,6 +3177,15 @@ impl EmbeddedWkWebView {
                 let _: () = msg_send![ucc, release];
                 return None;
             }
+            if let Some(sub_cls) = Class::get("GPUIWKWebView") {
+                let is_sub: BOOL = msg_send![webview, isKindOfClass: sub_cls];
+                if is_sub != NO {
+                    (*webview).set_ivar(
+                        SHARED_IVAR_NAME,
+                        Arc::into_raw(Arc::clone(&shared)) as *mut c_void,
+                    );
+                }
+            }
 
             let nav_delegate: *mut Object = msg_send![nav_cls, new];
             if !nav_delegate.is_null() {
@@ -3021,6 +3245,7 @@ impl EmbeddedWkWebView {
 
             let _: () = msg_send![webview, setHidden: YES];
             let _: () = msg_send![parent_ns_view, addSubview: webview];
+            restore_parent_first_responder_if_owned_by_webview(parent_ns_view, webview);
 
             WEBVIEW_REGISTRY.with(|reg| {
                 reg.borrow_mut().insert(
@@ -3217,14 +3442,88 @@ impl EmbeddedWkWebView {
         self.is_hidden
     }
 
+    pub fn restore_parent_first_responder(&self) {
+        unsafe {
+            restore_parent_first_responder_if_owned_by_webview(self.parent_ns_view, self.webview);
+        }
+    }
+
+    pub fn blur_active_dom_element(&self) {
+        self.evaluate_js(
+            "(function(){try{if(document.activeElement&&typeof document.activeElement.blur==='function'){document.activeElement.blur();}}catch(_){}})();",
+        );
+    }
+
+    pub fn set_allow_first_responder(&mut self, allow: bool) {
+        let prev = self
+            .shared
+            .allow_first_responder
+            .swap(allow, Ordering::AcqRel);
+        if !allow {
+            self.shared
+                .became_first_responder
+                .store(false, Ordering::Release);
+            if prev {
+                self.blur_active_dom_element();
+            }
+            self.restore_parent_first_responder();
+        }
+    }
+
+    pub fn has_pending_became_first_responder(&self) -> bool {
+        self.shared.became_first_responder.load(Ordering::Acquire)
+    }
+
+    pub fn take_became_first_responder(&self) -> bool {
+        self.shared
+            .became_first_responder
+            .swap(false, Ordering::AcqRel)
+    }
+
+    pub fn clear_became_first_responder(&self) {
+        self.shared
+            .became_first_responder
+            .store(false, Ordering::Release);
+    }
+
     pub fn set_hidden(&mut self, hidden: bool) {
-        if self.webview.is_null() || self.is_hidden == hidden {
+        if self.webview.is_null() {
             return;
         }
-        self.is_hidden = hidden;
-        unsafe {
-            let flag: BOOL = if hidden { YES } else { NO };
-            let _: () = msg_send![self.webview, setHidden: flag];
+        if hidden {
+            let was_allowed = self
+                .shared
+                .allow_first_responder
+                .swap(false, Ordering::AcqRel);
+            self.shared.ignore_hit_test.store(true, Ordering::Release);
+            self.shared
+                .became_first_responder
+                .store(false, Ordering::Release);
+            if was_allowed {
+                self.blur_active_dom_element();
+            }
+            self.restore_parent_first_responder();
+            if self.is_hidden {
+                return;
+            }
+            self.is_hidden = true;
+            unsafe {
+                let flag: BOOL = YES;
+                let _: () = msg_send![self.webview, setHidden: flag];
+            }
+            self.restore_parent_first_responder();
+            return;
+        }
+        self.shared.ignore_hit_test.store(false, Ordering::Release);
+        if self.is_hidden {
+            self.is_hidden = false;
+            unsafe {
+                let flag: BOOL = NO;
+                let _: () = msg_send![self.webview, setHidden: flag];
+            }
+        }
+        if !self.shared.allow_first_responder.load(Ordering::Acquire) {
+            self.restore_parent_first_responder();
         }
     }
 
@@ -3234,6 +3533,24 @@ impl EmbeddedWkWebView {
         if self.webview.is_null() || self.parent_ns_view.is_null() {
             return;
         }
+        let was_allowed = self
+            .shared
+            .allow_first_responder
+            .swap(false, Ordering::AcqRel);
+        let was_ignoring_hit = self.shared.ignore_hit_test.swap(true, Ordering::AcqRel);
+        self.shared
+            .became_first_responder
+            .store(false, Ordering::Release);
+        if !self.is_hidden
+            && self.last_frame == Some((0.0, 0.0, 1.0, 1.0))
+            && !was_allowed
+            && was_ignoring_hit
+        {
+            self.restore_parent_first_responder();
+            return;
+        }
+        self.blur_active_dom_element();
+        self.restore_parent_first_responder();
         unsafe {
             let rect = CgRect {
                 origin: CgPoint { x: 0.0, y: 0.0 },
@@ -3250,6 +3567,7 @@ impl EmbeddedWkWebView {
             self.is_hidden = false;
             self.last_frame = Some((0.0, 0.0, 1.0, 1.0));
         }
+        self.restore_parent_first_responder();
     }
 
     /// Synchronizes child `WKWebView` frame and visibility against GPUI canvas `bounds` (top-left origin).
@@ -3263,6 +3581,7 @@ impl EmbeddedWkWebView {
             self.set_hidden(true);
             return;
         }
+        self.shared.ignore_hit_test.store(false, Ordering::Release);
         unsafe {
             let parent_bounds: CgRect = msg_send![self.parent_ns_view, bounds];
             let x = parent_bounds.origin.x + f64::from(f32::from(bounds.origin.x));
@@ -3361,9 +3680,21 @@ impl EmbeddedWkWebView {
 
     pub fn destroy(&mut self) {
         self.shared.alive.store(false, Ordering::Release);
+        self.shared
+            .allow_first_responder
+            .store(false, Ordering::Release);
+        self.shared.ignore_hit_test.store(true, Ordering::Release);
+        self.shared
+            .became_first_responder
+            .store(false, Ordering::Release);
         self.shared.nav_notify.notify_waiters();
         if self.webview.is_null() {
             return;
+        }
+        let parent_view = self.parent_ns_view;
+        let webview_ptr = self.webview;
+        unsafe {
+            restore_parent_first_responder_if_owned_by_webview(parent_view, webview_ptr);
         }
         let id = self.shared.id;
         let handles_opt = WEBVIEW_REGISTRY.with(|reg| reg.borrow_mut().remove(&id));
@@ -3420,6 +3751,9 @@ impl EmbeddedWkWebView {
                 let _: () = msg_send![self.webview, removeFromSuperview];
                 let _: () = msg_send![self.webview, release];
             }
+        }
+        unsafe {
+            restore_parent_first_responder_if_owned_by_webview(parent_view, ptr::null_mut());
         }
         self.webview = ptr::null_mut();
         self.parent_ns_view = ptr::null_mut();
@@ -3488,6 +3822,14 @@ impl MacOsWkWebView {
 
     pub fn set_hidden(&mut self, hidden: bool) {
         self.inner.set_hidden(hidden);
+    }
+
+    pub fn set_allow_first_responder(&mut self, allow: bool) {
+        self.inner.set_allow_first_responder(allow);
+    }
+
+    pub fn restore_parent_first_responder(&self) {
+        self.inner.restore_parent_first_responder();
     }
 
     /// Parks the WebView at a 1x1 near-transparent live frame during Floating PiP mode so

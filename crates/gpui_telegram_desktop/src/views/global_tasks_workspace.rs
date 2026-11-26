@@ -394,6 +394,9 @@ impl GlobalTasksWorkspace {
     }
 
     pub fn set_tab(&mut self, tab: TasksWorkspaceTab) {
+        if self.tab != tab {
+            self.active_input = StudioInputTarget::None;
+        }
         self.tab = tab;
         self.active_tab = match tab {
             TasksWorkspaceTab::Tasks | TasksWorkspaceTab::Approvals => 0,

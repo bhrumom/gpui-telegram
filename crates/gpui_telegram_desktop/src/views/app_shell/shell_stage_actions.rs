@@ -29,7 +29,7 @@ use crate::views::app_shell::shell_theme::{
     compute_shell_palette, propagate_theme_and_locale, tdesktop_mode_to_app_theme, ShellThemeTargets,
 };
 use crate::views::app_shell::shell_truth::{
-    derive_initials, select_authoritative_dialog, ClientCallFence,
+    build_cached_history_models, derive_initials, select_authoritative_dialog, ClientCallFence,
 };
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::composer::field_autocomplete::MentionRow;
@@ -223,13 +223,14 @@ fn attach_media_viewer_overlay(
     cx: &mut Context<AppShell>,
 ) {
     shell.occlude_browser_for_overlay(cx);
+    shell.prepare_for_media_or_call_overlay_open(cx);
     viewer.apply_theme(shell.theme_state.palette, lang);
     let overlay = cx.new(|_| viewer);
     cx.observe(
         &overlay,
         |shell: &mut AppShell, ov: gpui::Entity<MediaViewer>, cx: &mut Context<AppShell>| {
             if ov.read(cx).should_close {
-                shell.hide_media_viewer();
+                shell.close_media_viewer(cx);
                 cx.notify();
             }
         },
@@ -323,6 +324,8 @@ impl AppShell {
         self.theme_state.palette = pal;
         let targets = ShellThemeTargets {
             nav_rail: &self.nav_rail,
+            apple_sidebar: &self.apple_sidebar,
+            content_hub: &self.content_hub,
             main_menu_drawer: &self.main_menu_drawer,
             sidebar: &self.sidebar,
             stage: &self.stage,
@@ -332,6 +335,7 @@ impl AppShell {
             tasks_workspace: &self.tasks_workspace,
             browser_workspace: self.browser_workspace.as_ref(),
             code_scene_workspace: self.code_scene_workspace.as_ref(),
+            community_workspace: self.community_workspace.as_ref(),
             talk_mode_overlay: self.rtc_talk.talk_mode_overlay.as_ref(),
             computer_overlay: self.overlays.computer_overlay.as_ref(),
             media_viewer_overlay: self.overlays.media_viewer_overlay.as_ref(),
@@ -342,6 +346,30 @@ impl AppShell {
             create_bot_box: self.miniapps.create_bot_box.as_ref(),
         };
         propagate_theme_and_locale(targets, &pal, lang, cx);
+        if self.theme_state.palette.is_apple_style()
+            && self.active_panel != ActiveWorkspacePanel::Chats
+            && self.sidebar.read(cx).is_plus_menu_open
+        {
+            self.sidebar.update(cx, |sb, scx| {
+                sb.cancel_compose_mode();
+                scx.notify();
+            });
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
+                self.exit_compose_or_modal_isolation(true, cx);
+            } else {
+                self.sync_compose_state_to_composer(true, cx);
+            }
+            if self.active_panel == ActiveWorkspacePanel::Browser {
+                let occluded = self.has_browser_visual_occlusion_overlay(cx);
+                if let Some(ref bw) = self.browser_workspace {
+                    bw.update(cx, |w, wcx| {
+                        w.set_occluded(occluded, wcx);
+                    });
+                }
+            }
+        }
     }
 
     /// Updates active theme mode, accent color, and wallpaper selection and persists preferences.
@@ -352,6 +380,7 @@ impl AppShell {
         wallpaper: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let was_apple = self.theme_state.palette.is_apple_style();
         self.theme_state.theme_mode = mode;
         if let Some(a) = accent {
             self.theme_state.accent_color = Some(a);
@@ -365,6 +394,23 @@ impl AppShell {
             p.appearance.theme_mode = mapped;
             p.appearance.chat_preset = mode.as_name().to_string();
         });
+        let now_apple = self.theme_state.palette.is_apple_style();
+        if was_apple && !now_apple && self.sidebar.read(cx).is_plus_menu_open {
+            if !self.has_blocking_modal_or_fullscreen_overlay_for_shortcuts(cx) {
+                self.clear_all_ime_preedits(cx);
+            }
+            self.sidebar.update(cx, |sb, sb_cx| {
+                sb.cancel_compose_mode();
+                sb_cx.notify();
+            });
+            if self.composer.read(cx).is_compose_isolated
+                && !self.is_compose_or_creation_modal_active(cx)
+            {
+                self.exit_compose_or_modal_isolation(true, cx);
+            } else {
+                self.sync_compose_state_to_composer(true, cx);
+            }
+        }
     }
 
     /// Flushes any pending unsaved composer draft for `chat_id` immediately (e.g. on chat switch).
@@ -951,13 +997,41 @@ impl AppShell {
         let mut selected = false;
         let mut max_msg_id = 0i64;
         let rich_meta_opt = self.session_sync.rich_chats_by_id.get(&chat_id).cloned();
+        let self_uid = self.session_sync.user_id.unwrap_or(0);
+        let lang_for_sync = self.active_lang_id().to_string();
+        let cached_history_snap = self.client.local_store.get_cached_chat_history(chat_id);
         self.sidebar.update(cx, |sb, sb_cx| {
-            let dlg_flags = sb.dialogs.iter().find(|d| d.id == chat_id).map(|d| (d.is_muted, d.is_pinned));
+            let dlg_info = sb
+                .dialogs
+                .iter()
+                .find(|d| d.id == chat_id)
+                .map(|d| (d.is_muted, d.is_pinned, d.peer_name.clone(), d.avatar_initials.clone(), d.avatar_color));
             self.stage.update(sb_cx, |st, st_cx| {
-                self.inspector.update(st_cx, |insp, _| {
+                let had_stage_focus = st.search_open || st.active_bot_card_field.is_some();
+                // Hydrate persisted SQLite history into `chat_histories` BEFORE `set_chat` so
+                // previously visited or prefetched chats paint with full messages on Frame 0.
+                if st.chat_histories.get(&chat_id).map_or(true, |h| h.is_empty()) {
+                    if let (Some(snap), Some((_, _, peer_name, peer_init, peer_color))) =
+                        (&cached_history_snap, &dlg_info)
+                    {
+                        if !snap.messages.is_empty() {
+                            let models = build_cached_history_models(
+                                &snap.messages,
+                                &snap.rich_messages,
+                                self_uid,
+                                peer_name,
+                                peer_init,
+                                *peer_color,
+                            );
+                            st.chat_histories.insert(chat_id, models);
+                        }
+                    }
+                }
+                self.inspector.update(st_cx, |insp, insp_cx| {
+                    let had_insp_focus = insp.is_bot_input_active();
                     selected = select_authoritative_dialog(sb, st, insp, chat_id);
                     if selected {
-                        if let Some((muted, pinned)) = dlg_flags {
+                        if let Some((muted, pinned, _, _, _)) = dlg_info {
                             st.is_muted_chat = muted;
                             st.is_pinned_chat = pinned;
                         } else if let Some(ref rc) = rich_meta_opt {
@@ -966,7 +1040,33 @@ impl AppShell {
                         }
                         if let Some(ref rc) = rich_meta_opt {
                             st.is_peer_blocked = rc.is_blocked;
+                            st.is_bot_chat = rc.is_bot;
+                            st.is_group_chat = rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3);
+                            st.is_saved_messages = rc.chat_type == 5
+                                || rc.kind.as_deref() == Some("saved")
+                                || (rc.chat_type == 0
+                                    && rc.peer_user_id.is_none()
+                                    && rc.members_count <= 1
+                                    && !rc.is_bot);
                             st.message_ttl_seconds = rc.message_ttl_seconds;
+                            if st.is_group_chat
+                                && rc.members_count > 0
+                                && st.chat_subtitle.trim().is_empty()
+                            {
+                                st.chat_subtitle = if lang_for_sync.starts_with("zh") {
+                                    format!("{} 位成员", rc.members_count)
+                                } else {
+                                    format!("{} members", rc.members_count)
+                                };
+                            }
+                        }
+                        if st.messages.is_empty()
+                            && !st.loaded_history_chats.contains(&chat_id)
+                            && !st.show_bot_start_bar
+                        {
+                            st.is_loading_history = true;
+                        } else {
+                            st.is_loading_history = false;
                         }
                         max_msg_id = st.messages.iter().map(|m| m.id as i64).max().unwrap_or(0);
                         let (_, media, files, links, voices) = map_stage_media_to_gallery(&st.messages);
@@ -977,9 +1077,14 @@ impl AppShell {
                         {
                             insp.profile.avatar_initials = fixed_init;
                         }
+                        if had_insp_focus && !insp.is_bot_input_active() {
+                            insp_cx.notify();
+                        }
                     }
                 });
-                if selected && prev_chat_id != Some(chat_id) {
+                let stage_focus_cleared =
+                    had_stage_focus && !(st.search_open || st.active_bot_card_field.is_some());
+                if selected && (prev_chat_id != Some(chat_id) || stage_focus_cleared) {
                     st_cx.notify();
                 }
             });
@@ -987,7 +1092,9 @@ impl AppShell {
         if !selected {
             return;
         }
+        self.client.local_store.set_last_active_chat_id(Some(chat_id));
         if prev_chat_id != Some(chat_id) {
+            let _ = self.client.subscribe_chat(chat_id as i64);
             if let Some(prev) = prev_chat_id {
                 if self.window_runtime.controller.clear_toasts_for_chat(prev) {
                     self.schedule_current_toast_dismiss(cx);
@@ -1053,7 +1160,14 @@ impl AppShell {
                     .filter(|&&id| id > 0)
                     .map(|id| id.to_string())
             });
-        self.load_historical_messages(chat_id, cx);
+        let history_fresh_in_flight = prev_chat_id == Some(chat_id)
+            && self
+                .session_sync
+                .history_in_flight_chat
+                .is_some_and(|(id, t)| id == chat_id && t.elapsed() < std::time::Duration::from_secs(3));
+        if !history_fresh_in_flight {
+            self.load_historical_messages(chat_id, cx);
+        }
         self.sync_composer_and_inspector_miniapp_state(cx);
         self.sync_active_bot_computer_to_inspector(cx);
         self.sync_fabushi_bots_to_views(cx);
@@ -1071,20 +1185,38 @@ impl AppShell {
             if !call_fence.preflight_ui(&weak, app).await {
                 return;
             }
-            let details = call_fence
-                .client
-                .get_chat_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
-                .await
-                .ok();
+            let cid_i64 = chat_id as i64;
+            let (
+                details_res,
+                rich_chat_res,
+                members_res,
+                invites_res,
+                pins_res,
+                draft_res,
+                stats_res,
+                send_as_res,
+            ) = futures::join!(
+                call_fence.client.get_chat_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.hermes.get_chat_rich(&call_fence.token, cid_i64),
+                call_fence.client.get_chat_members_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.list_invites_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.list_pinned_messages_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.get_draft_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.get_channel_statistics_with_token(&call_fence.token, call_fence.client_epoch, cid_i64),
+                call_fence.client.http_client.get_send_as_peers(&call_fence.token, cid_i64),
+            );
+            let details = details_res.ok();
+            let rich_chat = rich_chat_res.ok();
+            let members = members_res.ok();
+            let invites = invites_res.ok();
+            let pins = pins_res.ok();
+            let draft = draft_res.ok().flatten();
+            let stats = stats_res.ok();
+            let send_as_dto = send_as_res.ok();
+
             if !call_fence.preflight_ui(&weak, app).await {
                 return;
             }
-            let rich_chat = call_fence
-                .client
-                .hermes
-                .get_chat_rich(&call_fence.token, chat_id as i64)
-                .await
-                .ok();
             let rc_is_bot_flag = rich_chat.as_ref().is_some_and(|rc| rc.is_bot) || sb_is_bot;
             let bot_target = if rc_is_bot_flag {
                 rich_chat
@@ -1102,114 +1234,53 @@ impl AppShell {
             } else {
                 None
             };
-            let bot_profile = if let Some(ref target) = bot_target {
-                if !call_fence.preflight_ui(&weak, app).await {
-                    return;
-                }
-                call_fence
-                    .client
-                    .get_bot_public_profile_with_token(
-                        &call_fence.token,
-                        call_fence.client_epoch,
-                        target,
-                    )
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let members = call_fence
-                .client
-                .get_chat_members_with_token(
-                    &call_fence.token,
-                    call_fence.client_epoch,
-                    chat_id as i64,
-                )
-                .await
-                .ok();
             let approvals_bot_id = active_bot_id_for_approvals.or_else(|| {
                 rich_chat
                     .as_ref()
                     .filter(|rc| rc.is_bot)
                     .and_then(|rc| rc.peer_user_id)
             });
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let pending_approvals = call_fence
-                .client
-                .hermes
-                .list_approvals_for_bot(&call_fence.token, approvals_bot_id)
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let invites = call_fence
-                .client
-                .list_invites_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let pins = call_fence
-                .client
-                .list_pinned_messages_with_token(
-                    &call_fence.token,
-                    call_fence.client_epoch,
-                    chat_id as i64,
-                )
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let draft = call_fence
-                .client
-                .get_draft_with_token(&call_fence.token, call_fence.client_epoch, chat_id as i64)
-                .await
-                .ok()
-                .flatten();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let stats = call_fence
-                .client
-                .get_channel_statistics_with_token(
-                    &call_fence.token,
-                    call_fence.client_epoch,
-                    chat_id as i64,
-                )
-                .await
-                .ok();
-            if !call_fence.preflight_ui(&weak, app).await {
-                return;
-            }
-            let send_as_dto = call_fence
-                .client
-                .http_client
-                .get_send_as_peers(&call_fence.token, chat_id as i64)
-                .await
-                .ok();
-            if max_msg_id > 0 {
-                if !call_fence.preflight_ui(&weak, app).await {
-                    return;
+
+            let bot_profile_fut = async {
+                if let Some(ref target) = bot_target {
+                    call_fence
+                        .client
+                        .get_bot_public_profile_with_token(
+                            &call_fence.token,
+                            call_fence.client_epoch,
+                            target,
+                        )
+                        .await
+                        .ok()
+                } else {
+                    None
                 }
-                let _ = call_fence
+            };
+            let approvals_fut = async {
+                call_fence
                     .client
-                    .mark_chat_read_with_token(
-                        &call_fence.token,
-                        call_fence.client_epoch,
-                        chat_id as i64,
-                        max_msg_id,
-                        None,
-                    )
-                    .await;
-            }
+                    .hermes
+                    .list_approvals_for_bot(&call_fence.token, approvals_bot_id)
+                    .await
+                    .ok()
+            };
+            let mark_read_fut = async {
+                if max_msg_id > 0 {
+                    let _ = call_fence
+                        .client
+                        .mark_chat_read_with_token(
+                            &call_fence.token,
+                            call_fence.client_epoch,
+                            cid_i64,
+                            max_msg_id,
+                            None,
+                        )
+                        .await;
+                }
+            };
+            let (bot_profile, pending_approvals, _) =
+                futures::join!(bot_profile_fut, approvals_fut, mark_read_fut);
+
             let _ = weak.update(app, |shell, cx| {
                 if !call_fence.is_valid(shell) {
                     return;
@@ -1221,6 +1292,7 @@ impl AppShell {
                     }
                 }
                 if let Some(ref rc) = rich_chat {
+                    shell.client.local_store.upsert_cached_rich_chat(rc.clone());
                     shell.session_sync.rich_chats_by_id.insert(chat_id, rc.clone());
                     if let Some(pid) = rc.peer_user_id.filter(|&pid| pid > 0) {
                         shell.session_sync.chat_peer_user_ids.insert(chat_id, pid);
@@ -1579,6 +1651,9 @@ impl AppShell {
 
     /// Dispatches Hermes inline callback commands, approvals, Talk Mode, Remote Computer, Code Scene, or Mini-Apps.
     pub fn execute_hermes_inline_callback(&mut self, raw_action: String, cx: &mut Context<Self>) {
+        if self.try_handle_or_swallow_apple_deep_link(&raw_action, true, cx) {
+            return;
+        }
         let trimmed = raw_action.trim().to_string();
         let lower = trimmed.to_ascii_lowercase();
         let lang = self.active_lang_id();
@@ -1634,7 +1709,11 @@ impl AppShell {
         }
 
         if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("url:") {
-            let url = trimmed.trim_start_matches("url:").to_string();
+            let url = if lower.starts_with("url:") {
+                trimmed.get(4..).unwrap_or("").trim().to_string()
+            } else {
+                trimmed.clone()
+            };
             cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
             self.show_toast(
                 format!("{}: {}", tr_str(lang, "已复制链接", "Copied URL"), url),
@@ -1771,7 +1850,7 @@ impl AppShell {
         );
         let (
             (call_v, call_vid),
-            (media_single, media_gal, iv_url),
+            (media_single, open_url_req, media_gal, iv_url),
             (edit_req, fwd_ids, del_ids, pin_req, tr_id, poll_vote, react_reqs),
             (voice_play, dl_req, drops, open_prof),
             (clear_hist, export_chat, toggle_mute, change_wallpaper, toggle_pin_chat, set_ttl_secs, toggle_block_peer, delete_or_leave_chat),
@@ -1779,7 +1858,7 @@ impl AppShell {
         ) = self.stage.update(cx, |st, _| {
             (
                 (mem::take(&mut st.pending_call_request), mem::take(&mut st.pending_video_call)),
-                (st.pending_media_url.take(), st.pending_media_viewer.take(), st.pending_iv_url.take()),
+                (st.pending_media_url.take(), st.pending_open_url.take(), st.pending_media_viewer.take(), st.pending_iv_url.take()),
                 (
                     st.pending_edit_message.take(), st.pending_forward_message_ids.take(),
                     st.pending_delete_message_ids.take(), st.pending_pin_toggle.take(),
@@ -1824,36 +1903,92 @@ impl AppShell {
                 );
             }
         }
+        if let Some(url) = open_url_req {
+            if !self.try_handle_or_swallow_apple_deep_link(&url, false, cx)
+                && !self.handle_deep_link(&url, cx)
+                && !self.launch_miniapp_from_uri(
+                    &url,
+                    active_chat,
+                    MiniAppLaunchMode::DirectLink,
+                    cx,
+                )
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+                self.show_toast(
+                    format!("{}: {}", tr_str(lang, "已复制链接", "Copied URL"), url),
+                    2400,
+                    cx,
+                );
+            }
+        }
         if let Some((items, idx)) = media_gal {
-            let mv_items = items
-                .into_iter()
-                .enumerate()
-                .map(|(i, (url, is_video, caption))| MediaViewerItem {
-                    id: i as u64 + 1, url, is_video, caption,
-                    sender_name: String::new(), date: String::new(), duration_secs: None,
-                })
-                .collect();
-            attach_media_viewer_overlay(self, MediaViewer::from_gallery(mv_items, idx), lang, cx);
+            let active_url = items
+                .get(idx)
+                .map(|(u, _, _)| u.clone())
+                .or_else(|| media_single.as_ref().map(|(u, _)| u.clone()));
+            let handled_active = active_url
+                .as_deref()
+                .is_some_and(|u| self.try_handle_or_swallow_apple_deep_link(u, false, cx));
+            if !handled_active {
+                let mut adjusted_idx = 0usize;
+                let mut mv_items = Vec::new();
+                for (orig_i, (url, is_video, caption)) in items.into_iter().enumerate() {
+                    if crate::views::app_shell::shell_content_hub::is_apple_deep_link_candidate(&url)
+                    {
+                        continue;
+                    }
+                    if orig_i == idx {
+                        adjusted_idx = mv_items.len();
+                    }
+                    mv_items.push(MediaViewerItem {
+                        id: mv_items.len() as u64 + 1,
+                        url,
+                        is_video,
+                        caption,
+                        sender_name: String::new(),
+                        date: String::new(),
+                        duration_secs: None,
+                    });
+                }
+                if !mv_items.is_empty() {
+                    attach_media_viewer_overlay(
+                        self,
+                        MediaViewer::from_gallery(mv_items, adjusted_idx),
+                        lang,
+                        cx,
+                    );
+                }
+            }
         } else if let Some((url, is_vid)) = media_single {
-            attach_media_viewer_overlay(self, MediaViewer::new(url, is_vid), lang, cx);
+            if !self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                attach_media_viewer_overlay(self, MediaViewer::new(url, is_vid), lang, cx);
+            }
         }
         if let Some((url, title)) = iv_url {
-            self.occlude_browser_for_overlay(cx);
-            let pal = self.theme_state.palette;
-            let overlay = cx.new(|_| { let mut iv = IvViewer::new(url, title); iv.apply_theme(pal, lang); iv });
-            cx.observe(&overlay, |shell: &mut AppShell, ov: gpui::Entity<IvViewer>, cx: &mut Context<AppShell>| {
-                let (close, share) = ov.update(cx, |v, _| (v.should_close, v.pending_share_url.take()));
-                if let Some(u) = share {
-                    shell.append_non_composer_outgoing_text(u, cx);
-                }
-                if close {
-                    shell.overlays.iv_viewer_overlay = None;
-                    cx.notify();
-                }
-            })
-            .detach();
-            self.overlays.iv_viewer_overlay = Some(overlay);
-            self.reconcile_chat_scoped_toasts(cx);
+            if !self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                self.occlude_browser_for_overlay(cx);
+                self.prepare_for_media_or_call_overlay_open(cx);
+                let pal = self.theme_state.palette;
+                let overlay = cx.new(|_| { let mut iv = IvViewer::new(url, title); iv.apply_theme(pal, lang); iv });
+                cx.observe(&overlay, |shell: &mut AppShell, ov: gpui::Entity<IvViewer>, cx: &mut Context<AppShell>| {
+                    let (close, share) = ov.update(cx, |v, _| (v.should_close, v.pending_share_url.take()));
+                    if let Some(u) = share {
+                        if !shell.try_handle_or_swallow_apple_deep_link(&u, false, cx) {
+                            shell.append_non_composer_outgoing_text(u, cx);
+                        }
+                    }
+                    if close {
+                        shell.overlays.iv_viewer_overlay = None;
+                        shell.clear_ime_if_below_z5_unoccluded(cx);
+                        cx.notify();
+                    }
+                })
+                .detach();
+                self.overlays.iv_viewer_overlay = Some(overlay);
+                self.reconcile_chat_scoped_toasts(cx);
+            }
         }
         if let Some((mid, existing)) = edit_req {
             self.composer.update(cx, |c, _| c.begin_edit(mid, existing));
@@ -1958,7 +2093,12 @@ impl AppShell {
             }
         }
         if let Some((url, name)) = dl_req {
-            if let Some(fence) = self.capture_client_fence() {
+            let fence = if self.try_handle_or_swallow_apple_deep_link(&url, false, cx) {
+                None
+            } else {
+                self.capture_client_fence()
+            };
+            if let Some(fence) = fence {
                 let origin_chat = active_chat;
                 let captured_panel = self.active_panel;
                 let captured_plus_open = self.sidebar.read(cx).is_plus_menu_open;

@@ -5,6 +5,7 @@ members = [
     "crates/gpui_telegram_core",
     "crates/gpui_telegram_proto",
     "crates/gpui_telegram_code_scene",
+    "crates/gpui_telegram_community",
     "crates/gpui_telegram_media",
     "crates/gpui_telegram_webrtc",
     "crates/gpui_telegram_agent",
@@ -19,6 +20,9 @@ members = [
     "crates/fabushi_miniapp",
     "crates/magpie_gateway",
     "crates/bot-browser",
+    "crates/orca_core",
+    "crates/orca_bots",
+    "crates/orca_ide",
     "tests/e2e_magpie_gateway",
     "tests/e2e_suite",
 
@@ -42,7 +46,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.6.11"
+version = "1.6.15"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Teamwork GPUI Telegram Contributors"]
@@ -53,6 +57,7 @@ rust-version = "1.85"
 gpui_telegram_core = { path = "crates/gpui_telegram_core" }
 gpui_telegram_proto = { path = "crates/gpui_telegram_proto" }
 gpui_telegram_code_scene = { path = "crates/gpui_telegram_code_scene" }
+gpui_telegram_community = { path = "crates/gpui_telegram_community" }
 gpui_telegram_media = { path = "crates/gpui_telegram_media" }
 gpui_telegram_webrtc = { path = "crates/gpui_telegram_webrtc" }
 gpui_telegram_agent = { path = "crates/gpui_telegram_agent" }
@@ -67,6 +72,9 @@ fabushi_remote_daemon = { path = "crates/fabushi_remote_daemon" }
 fabushi_miniapp = { path = "crates/fabushi_miniapp" }
 magpie_gateway = { path = "crates/magpie_gateway" }
 bot-browser = { path = "crates/bot-browser" }
+orca_core = { path = "crates/orca_core" }
+orca_bots = { path = "crates/orca_bots" }
+orca_ide = { path = "crates/orca_ide" }
 
 # --- Inherited Domain Crates ---
 fabushi-messaging-core = { path = "inherited/mahayana-messaging" }
