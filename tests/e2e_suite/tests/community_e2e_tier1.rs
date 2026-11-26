@@ -3043,7 +3043,7 @@ async fn body_f15_01(mut app: AsyncApp) {
     let (host, _) = open_offline_community_host(&mut app, 1440.0, 900.0, 8151, "f15_01", false).await;
     let shell = host.shell.clone();
 
-    assert_eq!(NavRail::new().items.len(), 11, "NavRail must contain 11 items including Community");
+    assert_eq!(NavRail::new().items.len(), 13, "NavRail must contain 13 items including Community, OrcaBots, and OrcaIde");
 
     // 1. Expanded ChatSidebar
     let _ = shell.update(&mut app, |s, cx| {
