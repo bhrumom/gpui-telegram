@@ -432,6 +432,23 @@ def test_t1_ob_f17_05_channel_stopped_tasks_continue_reassign_cancel(env: TempOp
     )
     assert require_field(reassigned, "owner_agent_id", expected_type=str) == a3
 
+    # Upstream openbot/src/backend/channel-service.ts:L995-L1030: continue/reassign move the
+    # task to queued/running; user cancel strictly requires a stopped (paused|failed) task first.
+    env.run_cli_expect_rejection(
+        "channel",
+        "cancel",
+        "--channel-id",
+        cid,
+        "--task-id",
+        tid,
+        error_contains=("stopped", "paused", "failed"),
+    )
+
+    stopped = unwrap_entity(
+        env.run_cli_json("channel", "stop", "--channel-id", cid, "--task-id", tid), "task"
+    )
+    assert require_field(stopped, "state", expected_type=str) == "paused"
+
     cancelled = unwrap_entity(
         env.run_cli_json("channel", "cancel", "--channel-id", cid, "--task-id", tid), "task"
     )

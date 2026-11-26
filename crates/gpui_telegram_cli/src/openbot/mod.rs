@@ -6,7 +6,7 @@
 //! 3. `ui-probe` — Deterministic 15-scenario headless GPUI UI probe (`OB-F03`..`OB-F20`)
 //! 4. `agent` — 9 agent lifecycle & provider harness actions (`OB-F06`)
 //! 5. `chat` — 17 scheduler, queue, thread, reaction, pin, DM, mailbox & interrupt actions (`OB-F07`)
-//! 6. `channel` — 16 multi-bot group-chat & delegation actions (`OB-F08`, `OB-F09`)
+//! 6. `channel` — 17 multi-bot group-chat & delegation actions (`OB-F08`, `OB-F09`, `OB-F17`)
 //! 7. `tools` — 14 tool catalog, memory, SQL, skill, MCP, browser & vault actions (`OB-F10`)
 //! 8. `platform` — 13 workflow, routine, webhook, CRM, site, marketplace, HTML, voice & bridge actions (`OB-F11`..`OB-F13`)
 //! 9. `serve` — Live `/v1/*` Team API HTTP/SSE + loopback automation server (`OB-F11`, `OB-F13`, `OB-F20`)
@@ -695,7 +695,7 @@ fn openbot_help_text(subcommand: Option<&str>, action: Option<&str>) -> String {
            ui-probe      Run any of the 15 headless OpenBot GPUI UI & dual-surface probes\n\
            agent         Manage agents (create|list|get|update|delete|duplicate|generate-profile|export|import)\n\
            chat          1:1 chat, queue, branching, side-question, reactions, pins, DMs & mailbox\n\
-           channel       Multi-bot group channels (create|list|get|update|archive|restore|delete|post|assign|transfer|reply|result|cancel|continue|reassign|history-packet)\n\
+           channel       Multi-bot group channels (create|list|get|update|archive|restore|delete|post|assign|transfer|reply|result|stop|cancel|continue|reassign|history-packet)\n\
            tools         Tool catalog, memory, shared agent-data SQL, skills, MCP, browser & vault\n\
            platform      Workflows, routines, webhooks, CRM, static sites, marketplace, HTML, voice & bridges\n\
            serve         Start live /v1/* Team API HTTP/SSE and loopback automation servers\n"

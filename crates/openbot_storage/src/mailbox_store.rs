@@ -1863,8 +1863,20 @@ impl MailboxStore {
     }
 
     pub fn list_queue(&self, agent_id: &str) -> QueueSnapshot {
+        self.list_queue_filtered(agent_id, false)
+    }
+
+    pub fn list_queue_including_welcome(&self, agent_id: &str) -> QueueSnapshot {
+        self.list_queue_filtered(agent_id, true)
+    }
+
+    fn list_queue_filtered(&self, agent_id: &str, include_welcome: bool) -> QueueSnapshot {
         let guard = self.inner.mutable.lock();
-        let exec_ids = execution_message_ids(&guard.state.messages);
+        let exec_ids = if include_welcome {
+            non_welcome_execution_message_ids(&guard.state.messages)
+        } else {
+            execution_message_ids(&guard.state.messages)
+        };
         let positions = compute_queued_positions(&guard.state.deliveries);
         let msgs = messages_by_id(&guard.state.messages);
         let welcome = guard.state.deliveries.iter().any(|d| {
@@ -4452,6 +4464,14 @@ fn execution_message_ids(messages: &[StoredMailboxMessage]) -> HashSet<String> {
         .collect()
 }
 
+fn non_welcome_execution_message_ids(messages: &[StoredMailboxMessage]) -> HashSet<String> {
+    messages
+        .iter()
+        .filter(|m| m.channel_id.is_some() || m.messaging.is_some() || m.task_id.is_some())
+        .map(|m| m.id.clone())
+        .collect()
+}
+
 fn lane_of_delivery(
     d: &StoredMailboxDelivery,
     msgs: &HashMap<&str, &StoredMailboxMessage>,
@@ -5117,5 +5137,64 @@ mod tests {
             })
             .unwrap();
         assert_eq!(mailbox_events, 1);
+    }
+
+    #[test]
+    fn list_queue_vs_list_queue_including_welcome_filters_welcome_and_task_lanes() {
+        let tmp = ScopedTestDir::new("openbot_mailbox_welcome_queue");
+        let db = OpenBotDatabase::open(tmp.0.join("data").join("openbot.db")).unwrap();
+        let store = MailboxStore::open(db, tmp.0.join("OpenBot").join("Shared")).unwrap();
+
+        let welcome_receipt = store
+            .enqueue(EnqueueInput {
+                sender: Some(QueueSender::User),
+                recipient_agent_ids: vec!["agent-w".to_string()],
+                text: "Welcome prompt calling openbot.ask_user".to_string(),
+                welcome: true,
+                agent_setup: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let _task_receipt = store
+            .enqueue(EnqueueInput {
+                sender: Some(QueueSender::User),
+                recipient_agent_ids: vec!["agent-w".to_string()],
+                text: "Side task delivery".to_string(),
+                task_id: Some("side-task-1".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let normal_receipt = store
+            .enqueue(EnqueueInput {
+                sender: Some(QueueSender::User),
+                recipient_agent_ids: vec!["agent-w".to_string()],
+                text: "Normal user message".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let standard = store.list_queue("agent-w");
+        assert_eq!(standard.welcome, Some(true));
+        assert_eq!(standard.deliveries.len(), 1);
+        assert_eq!(standard.deliveries[0].id, normal_receipt.deliveries[0].id);
+
+        let with_welcome = store.list_queue_including_welcome("agent-w");
+        assert_eq!(with_welcome.welcome, Some(true));
+        assert_eq!(with_welcome.deliveries.len(), 2);
+        assert_eq!(
+            with_welcome.deliveries[0].id,
+            welcome_receipt.deliveries[0].id
+        );
+        assert!(with_welcome.deliveries[0].text.contains("openbot.ask_user"));
+        assert_eq!(
+            with_welcome.deliveries[1].id,
+            normal_receipt.deliveries[0].id
+        );
+        assert!(
+            with_welcome
+                .deliveries
+                .iter()
+                .all(|d| d.text != "Side task delivery")
+        );
     }
 }

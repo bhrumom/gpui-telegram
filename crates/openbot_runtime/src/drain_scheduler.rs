@@ -1158,7 +1158,7 @@ impl DrainScheduler {
 
     pub fn queue_list(&self, agent_id: &str) -> RuntimeResult<QueueListOutcome> {
         let agent = self.require_agent(agent_id)?;
-        let snapshot = self.mailbox.list_queue(&agent.id);
+        let snapshot = self.mailbox.list_queue_including_welcome(&agent.id);
         let paused = self.mailbox.is_queue_paused(&agent.id);
         let active_turn_id = self.active_turn_id_for_agent(&agent.id, None)?;
         let (welcome_msgs, steered_deliveries) = self.enrich_queue_metadata(&agent.id)?;

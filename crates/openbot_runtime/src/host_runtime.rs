@@ -81,6 +81,7 @@ impl OpenBotHostRuntime {
             Arc::clone(&compactor),
             Arc::clone(&attention),
         )?;
+        agents.attach_mailbox(scheduler.mailbox().clone());
         let channels = ChannelService::new(database.clone(), Arc::clone(&providers))?;
         let tool_catalog = Arc::new(ToolCatalog::new());
         let skills = SkillService::open(database.clone(), &data_dir)?;

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -24,8 +24,8 @@ use openbot_contracts::limits::{INPUT_LIMITS, is_bounded_string, is_uuid_v4, utf
 use openbot_contracts::providers::{AgentProviderId, is_agent_model};
 use openbot_contracts::queue::QueueSender;
 use openbot_storage::{
-    AgentStore, EnqueueInput, OpenBotDatabase, OrchestrationEventInput, now_rfc3339_millis,
-    workspace_metadata_fingerprint, write_json_file_atomically,
+    AgentStore, EnqueueInput, MailboxStore, OpenBotDatabase, OrchestrationEventInput,
+    now_rfc3339_millis, workspace_metadata_fingerprint, write_json_file_atomically,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -245,6 +245,7 @@ pub struct AgentLifecycleService {
     openbot_root: PathBuf,
     store: AgentStore,
     providers: Arc<ProviderRuntimeManager>,
+    mailbox: RwLock<Option<MailboxStore>>,
     duplication_lock: Mutex<()>,
 }
 
@@ -263,8 +264,15 @@ impl AgentLifecycleService {
             openbot_root,
             store,
             providers,
+            mailbox: RwLock::new(None),
             duplication_lock: Mutex::new(()),
         }))
+    }
+
+    /// Attaches the shared `MailboxStore` so `generate_profile(save=true)` welcome deliveries
+    /// stay coherent with `DrainScheduler`'s in-memory mailbox snapshot as well as SQLite.
+    pub fn attach_mailbox(&self, mailbox: MailboxStore) {
+        *self.mailbox.write().unwrap_or_else(|e| e.into_inner()) = Some(mailbox);
     }
 
     pub fn agent_store(&self) -> &AgentStore {
@@ -557,7 +565,15 @@ impl AgentLifecycleService {
             })?,
         };
 
-        let mailbox = self.database.mailbox_store()?;
+        let mailbox = match self
+            .mailbox
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(shared) => shared,
+            None => self.database.mailbox_store()?,
+        };
         let receipt = mailbox.enqueue(EnqueueInput {
             sender: Some(QueueSender::User),
             recipient_agent_ids: vec![agent.id.clone()],

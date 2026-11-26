@@ -362,7 +362,11 @@ def test_t1_ob_f11_04_webhook_hmac_sha256_and_rfc6901_filter(env: TempOpenBotEnv
     )
     assert require_field(bare_res, "webhook_verified", expected_type=bool) is True
     runs = env.query_sqlite("SELECT * FROM projection_routine_runs")
-    assert any(str(r.get("source") or "") == "webhook" for r in runs)
+    # Upstream v69 projection_routine_runs column is `run_source` (0035-routine-run-source.ts:L8)
+    assert any(
+        str(r.get("run_source") or "") == "webhook" and str(r.get("run_kind") or "") == "manual"
+        for r in runs
+    )
 
 
 @e2e_test(
@@ -542,7 +546,14 @@ def test_t1_ob_f12_01_crm_stripe_sync_and_13_sqlite_tables(env: TempOpenBotEnv) 
     builtin_ids = {str(r.get("status_id") or r.get("id")) for r in statuses if r.get("label") is None}
     assert {"lead", "customer", "former"}.issubset(builtin_ids)
     cust_rows = env.query_sqlite("SELECT * FROM crm_customers")
-    assert any("cus_101" in str(r.get("customer_id") or r.get("id") or r.get("external_id")) for r in cust_rows)
+    # Upstream v69 crm_customers enforces CHECK(length(customer_id) = 32) and stores Stripe refs in stripe_customer_id/source_ref (0063-crm.ts:L62-L88)
+    assert any(
+        len(str(r.get("customer_id") or "")) == 32
+        and str(r.get("stripe_customer_id") or "") == "cus_101"
+        and str(r.get("source_ref") or "") == "stripe:cus_101"
+        and bool(r.get("source_id"))
+        for r in cust_rows
+    )
     env.check_sqlite_integrity("openbot")
 
 

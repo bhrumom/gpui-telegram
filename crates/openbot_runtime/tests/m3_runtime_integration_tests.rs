@@ -217,7 +217,16 @@ fn ob_f06_muse_refusal_duplication_import_export_privilege_guard_and_cap() {
         })
         .expect("generate_profile save");
     let src = generated.agent.expect("saved generated agent");
-    assert!(generated.welcome_delivery_id.is_some());
+    let welcome_delivery_id = generated
+        .welcome_delivery_id
+        .clone()
+        .expect("welcome_delivery_id");
+    let welcome_queue = host.scheduler().queue_list(&src.id).expect("queue_list");
+    assert!(welcome_queue.welcome);
+    assert_eq!(welcome_queue.items.len(), 1);
+    assert!(welcome_queue.items[0].welcome);
+    assert_eq!(welcome_queue.items[0].delivery_id, welcome_delivery_id);
+    assert!(welcome_queue.items[0].text.contains("openbot.ask_user"));
 
     // 2. Privilege-widening refusal via direct AgentLifecycleService AND OpenBotToolRouter
     let restricted = make_agent(&host, "RestrictedBot");

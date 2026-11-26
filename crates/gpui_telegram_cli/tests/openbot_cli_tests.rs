@@ -740,3 +740,82 @@ async fn test_tools_platform_and_live_serve_cli_flows() {
 
     servers.shutdown().await.expect("clean serve shutdown");
 }
+
+#[tokio::test]
+async fn test_channel_stop_before_cancel_lifecycle() {
+    let dir = TempDir::new().expect("tempdir");
+
+    let a1 = run_json(&dir, &["agent", "create", "--name", "StopLead"]).await["agent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a2 = run_json(&dir, &["agent", "create", "--name", "StopPeer"]).await["agent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let members = format!("{a1},{a2}");
+    let ch = run_json(
+        &dir,
+        &[
+            "channel",
+            "create",
+            "--name",
+            "StopRoom",
+            "--members",
+            &members,
+            "--lead",
+            &a1,
+        ],
+    )
+    .await;
+    let cid = ch["channel"]["id"].as_str().unwrap().to_string();
+
+    let posted = run_json(
+        &dir,
+        &[
+            "channel",
+            "post",
+            "--channel-id",
+            &cid,
+            "--text",
+            "Investigate active stop lifecycle",
+            "--router-mock",
+            r#"{"agentIds":["m1"]}"#,
+            "--hold-running",
+        ],
+    )
+    .await;
+    let tid = posted["tasks"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(posted["tasks"][0]["state"], "running");
+
+    // User cancel on an active (non-stopped) task must be refused per upstream channel-service.ts
+    let cancel_before_stop = run_cli_with_args(&args_with_dir(
+        &dir,
+        &["channel", "cancel", "--channel-id", &cid, "--task-id", &tid],
+    ))
+    .await
+    .unwrap_err();
+    assert_domain_error(&cancel_before_stop, 2);
+    let err_lower = cancel_before_stop.to_string().to_ascii_lowercase();
+    assert!(err_lower.contains("stopped") && err_lower.contains("paused"));
+
+    // Stopping the active task transitions it to paused
+    let stopped = run_json(
+        &dir,
+        &["channel", "stop", "--channel-id", &cid, "--task-id", &tid],
+    )
+    .await;
+    assert_eq!(stopped["task"]["id"], tid);
+    assert_eq!(stopped["task"]["state"], "paused");
+
+    // Cancelling after stop transitions the paused task to cancelled
+    let cancelled = run_json(
+        &dir,
+        &["channel", "cancel", "--channel-id", &cid, "--task-id", &tid],
+    )
+    .await;
+    assert_eq!(cancelled["accepted"], true);
+    assert_eq!(cancelled["task"]["id"], tid);
+    assert_eq!(cancelled["task"]["state"], "cancelled");
+}
+

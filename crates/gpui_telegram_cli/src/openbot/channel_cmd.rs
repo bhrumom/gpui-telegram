@@ -1,4 +1,4 @@
-//! `openbot channel <action>` handler covering all 16 multi-bot group-chat actions (`OB-F02`, `OB-F08`, `OB-F09`, `OB-F17`).
+//! `openbot channel <action>` handler covering all 17 multi-bot group-chat actions (`OB-F02`, `OB-F08`, `OB-F09`, `OB-F17`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -165,6 +165,12 @@ pub fn flag_spec(action: &str) -> Result<FlagSpec, CliError> {
             bool_flags: &[],
             opt_bool_flags: &[],
             required_flags: &["--channel-id", "--task-id", "--agent-id", "--text"],
+        }),
+        "stop" => Ok(FlagSpec {
+            value_flags: &["--channel-id", "--task-id", "--operation-id"],
+            bool_flags: &[],
+            opt_bool_flags: &[],
+            required_flags: &["--channel-id", "--task-id"],
         }),
         "cancel" => Ok(FlagSpec {
             value_flags: &[
@@ -565,6 +571,13 @@ fn run_channel_workflow_action(
             };
             let out = chs.result(input).map_err(map_runtime_error)?;
             to_json_val(out, "channel result")
+        }
+        "stop" => {
+            let cid = flags.require("--channel-id")?;
+            let tid = flags.require("--task-id")?;
+            let op_id = flags.get("--operation-id");
+            let task = chs.stop_task(cid, tid, op_id).map_err(map_runtime_error)?;
+            Ok(json!({ "task": task }))
         }
         "cancel" => {
             let input = ChannelCancelInput {
