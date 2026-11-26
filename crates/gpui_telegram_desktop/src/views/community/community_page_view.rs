@@ -88,7 +88,8 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.community_loading = false;
-                if let Ok(Ok(feed)) = res {
+                if let Ok(Ok(mut feed)) = res {
+                    this.state.overlay_in_flight_feed_items(&mut feed.items);
                     this.state.community_posts = feed.items;
                     this.state.community_next_cursor = feed.next_cursor;
                 }
@@ -130,7 +131,8 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.community_loading_more = false;
-                if let Ok(Ok(feed)) = res {
+                if let Ok(Ok(mut feed)) = res {
+                    this.state.overlay_in_flight_feed_items(&mut feed.items);
                     let existing: HashSet<String> = this
                         .state
                         .community_posts
@@ -329,6 +331,15 @@ impl CommunityWorkspace {
                                 }
                             }
                         }
+                        let on_same_comm_route = matches!(
+                            &this.state.route,
+                            CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&reload_slug)
+                        );
+                        if on_same_comm_route
+                            && (this.state.community_loading || !still_same_comm_gen)
+                        {
+                            this.load_community_page(reload_slug, cx);
+                        }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: tr_str(&lang, "社区 Wiki 新版本已保存！", "Community Wiki revision saved!").to_string(),
@@ -336,12 +347,14 @@ impl CommunityWorkspace {
                             },
                             cx,
                         );
+                        cx.notify();
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
                             cx,
                         );
+                        cx.notify();
                     }
                     Err(_) => {
                         cx.notify();
@@ -426,6 +439,7 @@ impl CommunityWorkspace {
         };
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
+        let reload_slug = slug.clone();
         cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
@@ -445,12 +459,43 @@ impl CommunityWorkspace {
                     Ok(Ok(updated)) => {
                         this.state.community_new_rule_title.clear();
                         this.state.community_new_rule_desc.clear();
+                        if let Some(pos) = this
+                            .state
+                            .communities
+                            .iter()
+                            .position(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
+                        {
+                            this.state.communities[pos] = updated.clone();
+                        }
+                        if let Some(ref mut mc) = this.state.mod_community {
+                            if mc.slug.eq_ignore_ascii_case(&updated.slug) {
+                                *mc = updated.clone();
+                            }
+                        }
                         if still_same_comm_gen {
                             if let Some(ref mut det) = this.state.community_detail {
                                 if det.community.slug.eq_ignore_ascii_case(&updated.slug) {
                                     det.community = updated;
                                 }
                             }
+                        }
+                        let on_same_comm_route = matches!(
+                            &this.state.route,
+                            CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&reload_slug)
+                        );
+                        if on_same_comm_route
+                            && (this.state.community_loading || !still_same_comm_gen)
+                        {
+                            this.load_community_page(reload_slug.clone(), cx);
+                        }
+                        if this.state.mod_loading
+                            && this
+                                .state
+                                .mod_slug
+                                .as_deref()
+                                .is_some_and(|s| s.eq_ignore_ascii_case(&reload_slug))
+                        {
+                            this.load_mod_queue(reload_slug, cx);
                         }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
@@ -459,12 +504,14 @@ impl CommunityWorkspace {
                             },
                             cx,
                         );
+                        cx.notify();
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
                             cx,
                         );
+                        cx.notify();
                     }
                     Err(_) => {
                         cx.notify();
@@ -581,12 +628,20 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok((created, list))) => {
                         if this.state.communities_gen == my_comm_gen {
-                            if let Some(l) = list {
+                            if let Some(mut l) = list {
+                                for comm in &mut l.communities {
+                                    this.state.overlay_in_flight_community_mutations(comm);
+                                }
                                 this.state.communities = l.communities;
-                            } else if !this.state.communities.iter().any(|c| c.slug == created.slug)
-                            {
-                                this.state.communities.insert(0, created.clone());
                             }
+                        }
+                        if !this
+                            .state
+                            .communities
+                            .iter()
+                            .any(|c| c.slug.eq_ignore_ascii_case(&created.slug))
+                        {
+                            this.state.communities.insert(0, created.clone());
                         }
                         this.close_create_community_modal(cx);
                         this.emit_action(

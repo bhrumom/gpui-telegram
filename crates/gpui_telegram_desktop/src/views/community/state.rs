@@ -5,14 +5,13 @@ use std::collections::{HashMap, HashSet};
 use gpui_telegram_client::CommunityRuntimeMode;
 use gpui_telegram_proto::community_contracts::{
     ActorFilter, ActorProfileResponse, AlgoPreferencesDto, AutoModActionKind, AutoModRuleDto,
-    AwardResponse,
-    BookmarkResponse, BotAutonomyMode, CommentSort, CommunityActorDto, CommunityCommentDto,
-    CommunityDetailResponse, CommunityListDto, CommunityListKind, CommunityNotificationDto,
-    CommunityNotificationKind, CommunityPostDto, CommunitySearchResultDto, CommunitySearchSort,
-    CommunitySearchTab, FeedItemDto, FeedSort, FeedTab, FollowActionResponse,
-    JoinCommunityResponse, ModLogEntryDto, ModQueueItemDto, ModQueueStatus, PollDto,
-    PostDetailResponse, RepostResponse, SubCommunityDto, TimeWindow, ToggleActionResponse,
-    TrendingTopicDto, VoteResponse,
+    AwardResponse, BookmarkResponse, BotAutonomyMode, CommentSort, CommunityActorDto,
+    CommunityCommentDto, CommunityDetailResponse, CommunityListDto, CommunityListKind,
+    CommunityMemberRole, CommunityNotificationDto, CommunityNotificationKind, CommunityPostDto,
+    CommunitySearchResultDto, CommunitySearchSort, CommunitySearchTab, FeedItemDto, FeedSort,
+    FeedTab, FollowActionResponse, JoinCommunityResponse, ModLogEntryDto, ModQueueItemDto,
+    ModQueueStatus, PollDto, PostAwardDto, PostDetailResponse, RepostResponse, SubCommunityDto,
+    TimeWindow, ToggleActionResponse, TrendingTopicDto, VoteResponse,
 };
 
 use crate::views::composer::formatting_bar::TextStyleKind;
@@ -806,7 +805,18 @@ pub struct CommunityWorkspaceState {
     pub post_like_flight_seq: u64,
     pub post_like_in_flight: HashMap<String, u64>,
     pub post_like_pending_toggle: HashSet<String>,
+    pub post_like_pending_liked: HashMap<String, bool>,
     pub post_like_last_synced: HashMap<String, (bool, u64)>,
+    pub post_repost_flight_seq: u64,
+    pub post_repost_in_flight: HashMap<String, u64>,
+    pub post_repost_pending_toggle: HashSet<String>,
+    pub post_repost_pending_target: HashMap<String, bool>,
+    pub post_repost_last_synced: HashMap<String, (bool, u64)>,
+    pub poll_vote_flight_seq: u64,
+    pub poll_vote_in_flight: HashMap<String, u64>,
+    pub poll_vote_dirty: HashSet<String>,
+    pub poll_vote_pending_options: HashMap<String, Vec<String>>,
+    pub poll_vote_last_synced: HashMap<String, PollDto>,
     pub comment_vote_flight_seq: u64,
     pub comment_vote_in_flight: HashMap<String, u64>,
     pub comment_vote_dirty: HashSet<String>,
@@ -815,6 +825,7 @@ pub struct CommunityWorkspaceState {
     pub comment_like_flight_seq: u64,
     pub comment_like_in_flight: HashMap<String, u64>,
     pub comment_like_pending_toggle: HashSet<String>,
+    pub comment_like_pending_liked: HashMap<String, bool>,
     pub comment_like_last_synced: HashMap<String, (bool, u64)>,
 
     // Left Nav & Right Rail caches
@@ -871,6 +882,11 @@ pub struct CommunityWorkspaceState {
     pub community_loading: bool,
     pub community_error: Option<String>,
     pub community_gen: u64,
+    pub community_join_flight_seq: u64,
+    pub community_join_in_flight: HashMap<String, u64>,
+    pub community_join_dirty: HashSet<String>,
+    pub community_join_pending_target: HashMap<String, bool>,
+    pub community_join_last_synced: HashMap<String, (bool, u64, Option<CommunityMemberRole>)>,
 
     // F20 Actor Profile & Edit Profile modal state
     pub actor_profile: Option<ActorProfileResponse>,
@@ -888,7 +904,13 @@ pub struct CommunityWorkspaceState {
     pub actor_block_in_flight: HashMap<String, u64>,
     pub actor_block_dirty: HashSet<String>,
     pub actor_block_pending_target: HashMap<String, bool>,
+    pub actor_block_chain_had_block: HashSet<String>,
     pub actor_block_last_synced: HashMap<String, (bool, bool)>,
+    pub actor_follow_flight_seq: u64,
+    pub actor_follow_in_flight: HashMap<String, u64>,
+    pub actor_follow_dirty: HashSet<String>,
+    pub actor_follow_pending_target: HashMap<String, bool>,
+    pub actor_follow_last_synced: HashMap<String, (bool, u64)>,
 
     // F21 Explore & Search state
     pub search_result: Option<CommunitySearchResultDto>,
@@ -1052,7 +1074,18 @@ impl Default for CommunityWorkspaceState {
             post_like_flight_seq: 0,
             post_like_in_flight: HashMap::new(),
             post_like_pending_toggle: HashSet::new(),
+            post_like_pending_liked: HashMap::new(),
             post_like_last_synced: HashMap::new(),
+            post_repost_flight_seq: 0,
+            post_repost_in_flight: HashMap::new(),
+            post_repost_pending_toggle: HashSet::new(),
+            post_repost_pending_target: HashMap::new(),
+            post_repost_last_synced: HashMap::new(),
+            poll_vote_flight_seq: 0,
+            poll_vote_in_flight: HashMap::new(),
+            poll_vote_dirty: HashSet::new(),
+            poll_vote_pending_options: HashMap::new(),
+            poll_vote_last_synced: HashMap::new(),
             comment_vote_flight_seq: 0,
             comment_vote_in_flight: HashMap::new(),
             comment_vote_dirty: HashSet::new(),
@@ -1061,6 +1094,7 @@ impl Default for CommunityWorkspaceState {
             comment_like_flight_seq: 0,
             comment_like_in_flight: HashMap::new(),
             comment_like_pending_toggle: HashSet::new(),
+            comment_like_pending_liked: HashMap::new(),
             comment_like_last_synced: HashMap::new(),
             communities: Vec::new(),
             communities_gen: 0,
@@ -1109,6 +1143,11 @@ impl Default for CommunityWorkspaceState {
             community_loading: false,
             community_error: None,
             community_gen: 0,
+            community_join_flight_seq: 0,
+            community_join_in_flight: HashMap::new(),
+            community_join_dirty: HashSet::new(),
+            community_join_pending_target: HashMap::new(),
+            community_join_last_synced: HashMap::new(),
             actor_profile: None,
             profile_tab: ActorProfileTab::Posts,
             edit_profile: EditProfileDraft::default(),
@@ -1124,7 +1163,13 @@ impl Default for CommunityWorkspaceState {
             actor_block_in_flight: HashMap::new(),
             actor_block_dirty: HashSet::new(),
             actor_block_pending_target: HashMap::new(),
+            actor_block_chain_had_block: HashSet::new(),
             actor_block_last_synced: HashMap::new(),
+            actor_follow_flight_seq: 0,
+            actor_follow_in_flight: HashMap::new(),
+            actor_follow_dirty: HashSet::new(),
+            actor_follow_pending_target: HashMap::new(),
+            actor_follow_last_synced: HashMap::new(),
             search_result: None,
             search_tab: CommunitySearchTab::Top,
             search_sort: CommunitySearchSort::Relevance,
@@ -1640,31 +1685,28 @@ impl CommunityWorkspaceState {
     }
 
     /// Optimistically applies a vote toggle (`1 | -1`, toggling to `0`) on a comment.
+    /// Derives baseline from `comment_vote_pending_dir` first (Universal Invariant 1).
     pub fn apply_optimistic_comment_vote(
         &mut self,
         comment_id: &str,
         clicked_dir: i8,
     ) -> (i8, Option<(i8, i64, i64, i64)>) {
-        let mut snap = None;
-        let mut next_dir = clicked_dir;
-        if let Some(c) = self.find_comment(comment_id) {
-            snap = Some((c.viewer_vote, c.upvotes, c.downvotes, c.score));
-            next_dir = if c.viewer_vote == clicked_dir { 0 } else { clicked_dir };
-        }
+        let snap = self
+            .find_comment(comment_id)
+            .map(|c| (c.viewer_vote, c.upvotes, c.downvotes, c.score));
+        let baseline_dir = self
+            .comment_vote_pending_dir
+            .get(comment_id)
+            .copied()
+            .or_else(|| snap.map(|s| s.0))
+            .unwrap_or(0);
+        let next_dir = if baseline_dir == clicked_dir {
+            0
+        } else {
+            clicked_dir
+        };
         self.visit_comment_mut(comment_id, |c| {
-            let prev = c.viewer_vote;
-            if prev == 1 {
-                c.upvotes = (c.upvotes - 1).max(0);
-            } else if prev == -1 {
-                c.downvotes = (c.downvotes - 1).max(0);
-            }
-            if next_dir == 1 {
-                c.upvotes += 1;
-            } else if next_dir == -1 {
-                c.downvotes += 1;
-            }
-            c.score = c.upvotes - c.downvotes;
-            c.viewer_vote = next_dir;
+            apply_vote_target_to_comment(c, next_dir);
         });
         (next_dir, snap)
     }
@@ -1687,20 +1729,28 @@ impl CommunityWorkspaceState {
         });
     }
 
-    pub fn apply_optimistic_comment_like(&mut self, comment_id: &str) -> Option<(bool, u64)> {
+    pub fn apply_optimistic_comment_like_target(
+        &mut self,
+        comment_id: &str,
+        target_liked: bool,
+    ) -> Option<(bool, u64)> {
         let snap = self
             .find_comment(comment_id)
             .map(|c| (c.viewer_liked, c.likes_count));
         self.visit_comment_mut(comment_id, |c| {
-            if c.viewer_liked {
-                c.viewer_liked = false;
-                c.likes_count = c.likes_count.saturating_sub(1);
-            } else {
-                c.viewer_liked = true;
-                c.likes_count = c.likes_count.saturating_add(1);
-            }
+            apply_like_target_to_comment(c, target_liked);
         });
         snap
+    }
+
+    pub fn apply_optimistic_comment_like(&mut self, comment_id: &str) -> Option<(bool, u64)> {
+        let baseline_liked = self
+            .comment_like_pending_liked
+            .get(comment_id)
+            .copied()
+            .or_else(|| self.find_comment(comment_id).map(|c| c.viewer_liked))
+            .unwrap_or(false);
+        self.apply_optimistic_comment_like_target(comment_id, !baseline_liked)
     }
 
     pub fn rollback_comment_like(&mut self, comment_id: &str, snap: (bool, u64)) {
@@ -1719,7 +1769,7 @@ impl CommunityWorkspaceState {
 
     pub fn reconcile_comment_awards(&mut self, resp: &AwardResponse) {
         self.visit_comment_mut(&resp.target_id, |c| {
-            c.awards = resp.awards.clone();
+            merge_awards_monotonic(&mut c.awards, &resp.awards);
         });
     }
 
@@ -1799,36 +1849,42 @@ impl CommunityWorkspaceState {
         self.post_vote_last_synced.remove(post_id);
         self.post_like_in_flight.remove(post_id);
         self.post_like_pending_toggle.remove(post_id);
+        self.post_like_pending_liked.remove(post_id);
         self.post_like_last_synced.remove(post_id);
+        self.post_repost_in_flight.remove(post_id);
+        self.post_repost_pending_toggle.remove(post_id);
+        self.post_repost_pending_target.remove(post_id);
+        self.post_repost_last_synced.remove(post_id);
+        self.poll_vote_in_flight.remove(post_id);
+        self.poll_vote_dirty.remove(post_id);
+        self.poll_vote_pending_options.remove(post_id);
+        self.poll_vote_last_synced.remove(post_id);
     }
 
     /// Optimistically applies a vote toggle (`1 | -1`, toggling to `0` if already active).
+    /// Derives baseline from `post_vote_pending_dir` first (Universal Invariant 1).
     /// Returns `(new_direction, rollback_snapshot)` when the post exists locally.
     pub fn apply_optimistic_vote(
         &mut self,
         post_id: &str,
         clicked_dir: i8,
     ) -> (i8, Option<(i8, i64, i64, i64)>) {
-        let mut snap = None;
-        let mut next_dir = clicked_dir;
-        if let Some(p) = self.find_post(post_id) {
-            snap = Some((p.viewer_vote, p.upvotes, p.downvotes, p.score));
-            next_dir = if p.viewer_vote == clicked_dir { 0 } else { clicked_dir };
-        }
+        let snap = self
+            .find_post(post_id)
+            .map(|p| (p.viewer_vote, p.upvotes, p.downvotes, p.score));
+        let baseline_dir = self
+            .post_vote_pending_dir
+            .get(post_id)
+            .copied()
+            .or_else(|| snap.map(|s| s.0))
+            .unwrap_or(0);
+        let next_dir = if baseline_dir == clicked_dir {
+            0
+        } else {
+            clicked_dir
+        };
         self.visit_post_mut(post_id, |post| {
-            let prev = post.viewer_vote;
-            if prev == 1 {
-                post.upvotes = (post.upvotes - 1).max(0);
-            } else if prev == -1 {
-                post.downvotes = (post.downvotes - 1).max(0);
-            }
-            if next_dir == 1 {
-                post.upvotes += 1;
-            } else if next_dir == -1 {
-                post.downvotes += 1;
-            }
-            post.score = post.upvotes - post.downvotes;
-            post.viewer_vote = next_dir;
+            apply_vote_target_to_post(post, next_dir);
         });
         (next_dir, snap)
     }
@@ -1851,18 +1907,28 @@ impl CommunityWorkspaceState {
         });
     }
 
-    pub fn apply_optimistic_like(&mut self, post_id: &str) -> Option<(bool, u64)> {
-        let snap = self.find_post(post_id).map(|p| (p.viewer_liked, p.likes_count));
+    pub fn apply_optimistic_like_target(
+        &mut self,
+        post_id: &str,
+        target_liked: bool,
+    ) -> Option<(bool, u64)> {
+        let snap = self
+            .find_post(post_id)
+            .map(|p| (p.viewer_liked, p.likes_count));
         self.visit_post_mut(post_id, |post| {
-            if post.viewer_liked {
-                post.viewer_liked = false;
-                post.likes_count = post.likes_count.saturating_sub(1);
-            } else {
-                post.viewer_liked = true;
-                post.likes_count = post.likes_count.saturating_add(1);
-            }
+            apply_like_target_to_post(post, target_liked);
         });
         snap
+    }
+
+    pub fn apply_optimistic_like(&mut self, post_id: &str) -> Option<(bool, u64)> {
+        let baseline_liked = self
+            .post_like_pending_liked
+            .get(post_id)
+            .copied()
+            .or_else(|| self.find_post(post_id).map(|p| p.viewer_liked))
+            .unwrap_or(false);
+        self.apply_optimistic_like_target(post_id, !baseline_liked)
     }
 
     pub fn rollback_like(&mut self, post_id: &str, snap: (bool, u64)) {
@@ -1876,6 +1942,27 @@ impl CommunityWorkspaceState {
         self.visit_post_mut(&resp.target_id, |post| {
             post.viewer_liked = resp.active;
             post.likes_count = resp.count;
+        });
+    }
+
+    pub fn apply_optimistic_repost_target(
+        &mut self,
+        post_id: &str,
+        target_reposted: bool,
+    ) -> Option<(bool, u64)> {
+        let snap = self
+            .find_post(post_id)
+            .map(|p| (p.viewer_reposted, p.reposts_count));
+        self.visit_post_mut(post_id, |post| {
+            apply_repost_target_to_post(post, target_reposted);
+        });
+        snap
+    }
+
+    pub fn rollback_repost(&mut self, post_id: &str, snap: (bool, u64)) {
+        self.visit_post_mut(post_id, |post| {
+            post.viewer_reposted = snap.0;
+            post.reposts_count = snap.1;
         });
     }
 
@@ -1914,6 +2001,12 @@ impl CommunityWorkspaceState {
         }
     }
 
+    pub fn apply_optimistic_poll_options(&mut self, post_id: &str, option_ids: &[String]) {
+        self.visit_post_mut(post_id, |post| {
+            apply_poll_target_to_post(post, option_ids);
+        });
+    }
+
     pub fn reconcile_poll(&mut self, post_id: &str, poll: PollDto) {
         self.visit_post_mut(post_id, |post| {
             post.poll = Some(poll.clone());
@@ -1922,8 +2015,89 @@ impl CommunityWorkspaceState {
 
     pub fn reconcile_awards(&mut self, resp: &AwardResponse) {
         self.visit_post_mut(&resp.target_id, |post| {
-            post.awards = resp.awards.clone();
+            merge_awards_monotonic(&mut post.awards, &resp.awards);
         });
+    }
+
+    pub fn find_community(&self, slug: &str) -> Option<&SubCommunityDto> {
+        self.community_detail
+            .as_ref()
+            .map(|d| &d.community)
+            .filter(|c| c.slug.eq_ignore_ascii_case(slug))
+            .or_else(|| {
+                self.communities
+                    .iter()
+                    .find(|c| c.slug.eq_ignore_ascii_case(slug))
+            })
+            .or_else(|| {
+                self.mod_community
+                    .as_ref()
+                    .filter(|c| c.slug.eq_ignore_ascii_case(slug))
+            })
+            .or_else(|| {
+                self.search_result.as_ref().and_then(|sr| {
+                    sr.communities
+                        .iter()
+                        .find(|c| c.slug.eq_ignore_ascii_case(slug))
+                })
+            })
+    }
+
+    /// Optimistically updates ONLY `is_joined` and `member_count` across caches.
+    /// NEVER grants `viewer_role` optimistically (preserves `2D JOIN-RACE` security invariant).
+    pub fn apply_optimistic_join(&mut self, slug: &str, target_joined: bool) {
+        let apply = |c: &mut SubCommunityDto| {
+            if c.slug.eq_ignore_ascii_case(slug) && c.is_joined != target_joined {
+                if target_joined {
+                    c.member_count = c.member_count.saturating_add(1);
+                } else {
+                    c.member_count = c.member_count.saturating_sub(1);
+                }
+                c.is_joined = target_joined;
+            }
+        };
+        for c in &mut self.communities {
+            apply(c);
+        }
+        if let Some(ref mut det) = self.community_detail {
+            apply(&mut det.community);
+        }
+        if let Some(ref mut mc) = self.mod_community {
+            apply(mc);
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for c in &mut sr.communities {
+                apply(c);
+            }
+        }
+    }
+
+    pub fn rollback_join(
+        &mut self,
+        slug: &str,
+        snap: (bool, u64, Option<CommunityMemberRole>),
+    ) {
+        let apply = |c: &mut SubCommunityDto| {
+            if c.slug.eq_ignore_ascii_case(slug) {
+                c.is_joined = snap.0;
+                c.member_count = snap.1;
+                c.viewer_role = snap.2;
+            }
+        };
+        for c in &mut self.communities {
+            apply(c);
+        }
+        if let Some(ref mut det) = self.community_detail {
+            apply(&mut det.community);
+        }
+        if let Some(ref mut mc) = self.mod_community {
+            apply(mc);
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for c in &mut sr.communities {
+                apply(c);
+            }
+        }
     }
 
     pub fn reconcile_join(&mut self, resp: &JoinCommunityResponse) {
@@ -1959,6 +2133,60 @@ impl CommunityWorkspaceState {
         }
     }
 
+    pub fn apply_optimistic_follow(&mut self, actor_id: &str, target_follow: bool) {
+        let apply = |a: &mut CommunityActorDto| {
+            if a.actor_id == actor_id && a.is_following != target_follow {
+                if target_follow {
+                    a.followers_count = a.followers_count.saturating_add(1);
+                } else {
+                    a.followers_count = a.followers_count.saturating_sub(1);
+                }
+                a.is_following = target_follow;
+            }
+        };
+        for a in &mut self.recommended_actors {
+            apply(a);
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            apply(&mut prof.actor);
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for a in &mut sr.actors {
+                apply(a);
+            }
+        }
+        if let Some(ref mut det) = self.community_detail {
+            for m in &mut det.moderators {
+                apply(m);
+            }
+        }
+    }
+
+    pub fn rollback_follow(&mut self, actor_id: &str, snap: (bool, u64)) {
+        let apply = |a: &mut CommunityActorDto| {
+            if a.actor_id == actor_id {
+                a.is_following = snap.0;
+                a.followers_count = snap.1;
+            }
+        };
+        for a in &mut self.recommended_actors {
+            apply(a);
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            apply(&mut prof.actor);
+        }
+        if let Some(ref mut sr) = self.search_result {
+            for a in &mut sr.actors {
+                apply(a);
+            }
+        }
+        if let Some(ref mut det) = self.community_detail {
+            for m in &mut det.moderators {
+                apply(m);
+            }
+        }
+    }
+
     pub fn reconcile_follow(&mut self, resp: &FollowActionResponse) {
         for a in &mut self.recommended_actors {
             if a.actor_id == resp.actor_id {
@@ -1980,6 +2208,14 @@ impl CommunityWorkspaceState {
                 }
             }
         }
+        if let Some(ref mut det) = self.community_detail {
+            for m in &mut det.moderators {
+                if m.actor_id == resp.actor_id {
+                    m.is_following = resp.is_following;
+                    m.followers_count = resp.followers_count;
+                }
+            }
+        }
     }
 
     pub fn find_actor(&self, actor_id: &str) -> Option<&CommunityActorDto> {
@@ -1996,6 +2232,11 @@ impl CommunityWorkspaceState {
                 self.search_result
                     .as_ref()
                     .and_then(|sr| sr.actors.iter().find(|a| a.actor_id == actor_id))
+            })
+            .or_else(|| {
+                self.community_detail
+                    .as_ref()
+                    .and_then(|det| det.moderators.iter().find(|a| a.actor_id == actor_id))
             })
     }
 
@@ -2029,6 +2270,11 @@ impl CommunityWorkspaceState {
                 apply(a);
             }
         }
+        if let Some(ref mut det) = self.community_detail {
+            for m in &mut det.moderators {
+                apply(m);
+            }
+        }
     }
 
     pub fn restore_block_and_follow(
@@ -2054,15 +2300,224 @@ impl CommunityWorkspaceState {
                 apply(a);
             }
         }
+        if let Some(ref mut det) = self.community_detail {
+            for m in &mut det.moderators {
+                apply(m);
+            }
+        }
     }
 
-    /// Replaces `self.lists` with a freshly fetched snapshot while excluding lists currently
-    /// being deleted and preserving optimistic `(is_pinned, member_actor_ids, community_slugs)`
-    /// for any list with an active or pending single-flight sync.
-    pub fn merge_refreshed_lists(&mut self, mut fresh: Vec<CommunityListDto>) {
-        if !self.list_deleting.is_empty() {
-            fresh.retain(|item| !self.list_deleting.contains(&item.list_id));
+    /// Universal Case A overlay for a single post DTO: preserves active single-flight
+    /// vote, like, repost, poll-vote, and bookmark targets using pure idempotent delta math.
+    pub fn overlay_in_flight_post_mutations(&self, post: &mut CommunityPostDto) {
+        let vote_target = if self.post_vote_in_flight.contains_key(post.post_id.as_str())
+            || self.post_vote_dirty.contains(post.post_id.as_str())
+        {
+            self.post_vote_pending_dir
+                .get(post.post_id.as_str())
+                .copied()
+        } else {
+            None
+        };
+        if let Some(dir) = vote_target {
+            apply_vote_target_to_post(post, dir);
         }
+        let like_target = if self.post_like_in_flight.contains_key(post.post_id.as_str())
+            || self.post_like_pending_toggle.contains(post.post_id.as_str())
+        {
+            self.post_like_pending_liked
+                .get(post.post_id.as_str())
+                .copied()
+        } else {
+            None
+        };
+        if let Some(liked) = like_target {
+            apply_like_target_to_post(post, liked);
+        }
+        let repost_target = if self.post_repost_in_flight.contains_key(post.post_id.as_str())
+            || self.post_repost_pending_toggle.contains(post.post_id.as_str())
+        {
+            self.post_repost_pending_target
+                .get(post.post_id.as_str())
+                .copied()
+        } else {
+            None
+        };
+        if let Some(reposted) = repost_target {
+            apply_repost_target_to_post(post, reposted);
+        }
+        let poll_target = if self.poll_vote_in_flight.contains_key(post.post_id.as_str())
+            || self.poll_vote_dirty.contains(post.post_id.as_str())
+        {
+            self.poll_vote_pending_options
+                .get(post.post_id.as_str())
+                .map(Vec::as_slice)
+        } else {
+            None
+        };
+        if let Some(options) = poll_target {
+            apply_poll_target_to_post(post, options);
+        }
+        if self.bookmark_in_flight.contains_key(post.post_id.as_str())
+            || self.bookmark_dirty.contains(post.post_id.as_str())
+        {
+            if let Some((target_bk, target_folder)) =
+                self.bookmark_pending_target.get(post.post_id.as_str())
+            {
+                let was = post.viewer_bookmarked;
+                if !was && *target_bk {
+                    post.bookmarks_count = post.bookmarks_count.saturating_add(1);
+                } else if was && !*target_bk {
+                    post.bookmarks_count = post.bookmarks_count.saturating_sub(1);
+                }
+                post.viewer_bookmarked = *target_bk;
+                post.viewer_bookmark_folder = target_folder.clone();
+            }
+        }
+    }
+
+    /// Universal Case A overlay for a slice of feed items (O(1) fast path when idle).
+    pub fn overlay_in_flight_feed_items(&self, items: &mut [FeedItemDto]) {
+        if self.post_vote_in_flight.is_empty()
+            && self.post_vote_dirty.is_empty()
+            && self.post_like_in_flight.is_empty()
+            && self.post_like_pending_toggle.is_empty()
+            && self.post_repost_in_flight.is_empty()
+            && self.post_repost_pending_toggle.is_empty()
+            && self.poll_vote_in_flight.is_empty()
+            && self.poll_vote_dirty.is_empty()
+            && self.bookmark_in_flight.is_empty()
+            && self.bookmark_dirty.is_empty()
+        {
+            return;
+        }
+        for it in items {
+            self.overlay_in_flight_post_mutations(&mut it.post);
+        }
+    }
+
+    /// Universal Case A overlay for a comment tree (O(1) fast path when idle).
+    pub fn overlay_in_flight_comments(&self, comments: &mut [CommunityCommentDto]) {
+        if self.comment_vote_in_flight.is_empty()
+            && self.comment_vote_dirty.is_empty()
+            && self.comment_like_in_flight.is_empty()
+            && self.comment_like_pending_toggle.is_empty()
+        {
+            return;
+        }
+        for c in comments {
+            let vote_target = if self.comment_vote_in_flight.contains_key(c.comment_id.as_str())
+                || self.comment_vote_dirty.contains(c.comment_id.as_str())
+            {
+                self.comment_vote_pending_dir
+                    .get(c.comment_id.as_str())
+                    .copied()
+            } else {
+                None
+            };
+            if let Some(dir) = vote_target {
+                apply_vote_target_to_comment(c, dir);
+            }
+            let like_target = if self.comment_like_in_flight.contains_key(c.comment_id.as_str())
+                || self.comment_like_pending_toggle.contains(c.comment_id.as_str())
+            {
+                self.comment_like_pending_liked
+                    .get(c.comment_id.as_str())
+                    .copied()
+            } else {
+                None
+            };
+            if let Some(liked) = like_target {
+                apply_like_target_to_comment(c, liked);
+            }
+            if !c.children.is_empty() {
+                self.overlay_in_flight_comments(&mut c.children);
+            }
+        }
+    }
+
+    /// Universal Case A overlay for a full `PostDetailResponse` (post, chains, and comment tree).
+    pub fn overlay_in_flight_post_detail(&self, det: &mut PostDetailResponse) {
+        self.overlay_in_flight_post_mutations(&mut det.post);
+        for p in &mut det.thread_chain {
+            self.overlay_in_flight_post_mutations(p);
+        }
+        for p in &mut det.quote_chain {
+            self.overlay_in_flight_post_mutations(p);
+        }
+        self.overlay_in_flight_comments(&mut det.comments);
+    }
+
+    /// Universal Case A overlay for an actor DTO (mute, block + `S2A-5b-6f` chain guard, follow).
+    pub fn overlay_in_flight_actor_mutations(&self, actor: &mut CommunityActorDto) {
+        let aid = actor.actor_id.as_str();
+        if self.actor_mute_in_flight.contains_key(aid) || self.actor_mute_dirty.contains(aid) {
+            if let Some(&want_muted) = self.actor_mute_pending_target.get(aid) {
+                actor.is_muted = want_muted;
+            }
+        }
+        let block_active =
+            self.actor_block_in_flight.contains_key(aid) || self.actor_block_dirty.contains(aid);
+        if block_active {
+            if let Some(&want_blocked) = self.actor_block_pending_target.get(aid) {
+                actor.is_blocked = want_blocked;
+                if want_blocked
+                    || self.actor_block_chain_had_block.contains(aid)
+                    || self
+                        .actor_block_last_synced
+                        .get(aid)
+                        .is_some_and(|&(_, f)| !f)
+                {
+                    actor.is_following = false;
+                }
+            }
+        }
+        if !actor.is_blocked
+            && !self.actor_block_chain_had_block.contains(aid)
+            && (self.actor_follow_in_flight.contains_key(aid)
+                || self.actor_follow_dirty.contains(aid))
+        {
+            if let Some(&want_follow) = self.actor_follow_pending_target.get(aid) {
+                if actor.is_following != want_follow {
+                    if want_follow {
+                        actor.followers_count = actor.followers_count.saturating_add(1);
+                    } else {
+                        actor.followers_count = actor.followers_count.saturating_sub(1);
+                    }
+                    actor.is_following = want_follow;
+                }
+            }
+        }
+    }
+
+    /// Universal Case A overlay for a community DTO (join/leave without granting `viewer_role`).
+    pub fn overlay_in_flight_community_mutations(&self, comm: &mut SubCommunityDto) {
+        if self.community_join_in_flight.is_empty() && self.community_join_dirty.is_empty() {
+            return;
+        }
+        let slug_key = comm.slug.to_ascii_lowercase();
+        if self.community_join_in_flight.contains_key(&slug_key)
+            || self.community_join_dirty.contains(&slug_key)
+        {
+            if let Some(&want_joined) = self.community_join_pending_target.get(&slug_key) {
+                if comm.is_joined != want_joined {
+                    if want_joined {
+                        comm.member_count = comm.member_count.saturating_add(1);
+                    } else {
+                        comm.member_count = comm.member_count.saturating_sub(1);
+                    }
+                    comm.is_joined = want_joined;
+                }
+            }
+        }
+    }
+
+    /// Replaces `self.lists` with a freshly fetched snapshot while preserving optimistic
+    /// `(is_pinned, member_actor_ids, community_slugs)` for any list with an active or pending
+    /// single-flight sync. Lists currently in `list_deleting` are NOT prematurely dropped before
+    /// `DELETE` settles (R8-3: preserves list + deferred toggles on DELETE HTTP 500; `2F_2`
+    /// remains fenced by `lists_gen` + `delete_list_action` `Ok(Ok)` `lists.retain`).
+    pub fn merge_refreshed_lists(&mut self, mut fresh: Vec<CommunityListDto>) {
         if !self.list_membership_in_flight.is_empty() || !self.list_membership_dirty.is_empty() {
             for item in &mut fresh {
                 if self.list_membership_in_flight.contains_key(&item.list_id)
@@ -2081,8 +2536,9 @@ impl CommunityWorkspaceState {
 
     /// Replaces `self.saved_items` with a freshly fetched snapshot while preserving:
     /// 1. Order 2 post-settlement overrides (`bookmark_recent_overrides` with `ov.epoch > started_bookmark_epoch`)
-    ///    that committed while this `load_saved_posts` was still awaiting `list_lists()`, and
-    /// 2. Order 1 currently in-flight or dirty optimistic bookmark targets.
+    ///    that committed while this `load_saved_posts` was still awaiting `list_lists()`,
+    /// 2. Order 1 currently in-flight or dirty optimistic bookmark targets, and
+    /// 3. Active single-flight vote/like/repost/poll mutations on saved posts.
     pub fn merge_refreshed_saved_items(
         &mut self,
         mut fresh: Vec<FeedItemDto>,
@@ -2139,9 +2595,97 @@ impl CommunityWorkspaceState {
             }
         }
 
+        self.overlay_in_flight_feed_items(&mut fresh);
         self.saved_items = fresh;
         if !self.saved_loading {
             self.bookmark_recent_overrides.clear();
         }
     }
+}
+
+fn apply_vote_target_to_post(post: &mut CommunityPostDto, target_dir: i8) {
+    let prev = post.viewer_vote;
+    if prev == target_dir {
+        return;
+    }
+    if prev == 1 {
+        post.upvotes = (post.upvotes - 1).max(0);
+    } else if prev == -1 {
+        post.downvotes = (post.downvotes - 1).max(0);
+    }
+    if target_dir == 1 {
+        post.upvotes += 1;
+    } else if target_dir == -1 {
+        post.downvotes += 1;
+    }
+    post.score = post.upvotes - post.downvotes;
+    post.viewer_vote = target_dir;
+}
+
+fn apply_like_target_to_post(post: &mut CommunityPostDto, target_liked: bool) {
+    if post.viewer_liked != target_liked {
+        if target_liked {
+            post.likes_count = post.likes_count.saturating_add(1);
+        } else {
+            post.likes_count = post.likes_count.saturating_sub(1);
+        }
+        post.viewer_liked = target_liked;
+    }
+}
+
+fn apply_repost_target_to_post(post: &mut CommunityPostDto, target_reposted: bool) {
+    if post.viewer_reposted != target_reposted {
+        if target_reposted {
+            post.reposts_count = post.reposts_count.saturating_add(1);
+        } else {
+            post.reposts_count = post.reposts_count.saturating_sub(1);
+        }
+        post.viewer_reposted = target_reposted;
+    }
+}
+
+fn apply_poll_target_to_post(post: &mut CommunityPostDto, target_options: &[String]) {
+    if let Some(ref mut poll) = post.poll {
+        poll.viewer_voted_option_ids = target_options.to_vec();
+    }
+}
+
+fn apply_vote_target_to_comment(c: &mut CommunityCommentDto, target_dir: i8) {
+    let prev = c.viewer_vote;
+    if prev == target_dir {
+        return;
+    }
+    if prev == 1 {
+        c.upvotes = (c.upvotes - 1).max(0);
+    } else if prev == -1 {
+        c.downvotes = (c.downvotes - 1).max(0);
+    }
+    if target_dir == 1 {
+        c.upvotes += 1;
+    } else if target_dir == -1 {
+        c.downvotes += 1;
+    }
+    c.score = c.upvotes - c.downvotes;
+    c.viewer_vote = target_dir;
+}
+
+fn apply_like_target_to_comment(c: &mut CommunityCommentDto, target_liked: bool) {
+    if c.viewer_liked != target_liked {
+        if target_liked {
+            c.likes_count = c.likes_count.saturating_add(1);
+        } else {
+            c.likes_count = c.likes_count.saturating_sub(1);
+        }
+        c.viewer_liked = target_liked;
+    }
+}
+
+fn merge_awards_monotonic(existing: &mut Vec<PostAwardDto>, incoming: &[PostAwardDto]) {
+    let mut merged = incoming.to_vec();
+    for old in existing.iter() {
+        if !old.award_id.is_empty() && !merged.iter().any(|a| a.award_id == old.award_id) {
+            merged.push(old.clone());
+        }
+    }
+    *existing = merged;
 }

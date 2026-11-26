@@ -23,7 +23,7 @@ use super::shared_widgets::{
     format_compact_count, render_actor_avatar, render_actor_badge_row, render_input_display,
 };
 use super::state::{
-    ActiveCommunityInput, BotStudioEditDraft, CommunityWorkspaceAction,
+    ActiveCommunityInput, BotStudioEditDraft, CommunityRoute, CommunityWorkspaceAction,
 };
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
@@ -570,6 +570,7 @@ impl CommunityWorkspace {
         self.state.bot_studio_edit.error = None;
         self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
         let my_id_gen = self.state.identities_gen;
+        let actor_id_cb = actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -582,8 +583,15 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                this.state.bot_studio_edit.saving = false;
                 let lang = this.language_id.clone();
+                let still_selected = this
+                    .state
+                    .bot_studio_selected_bot_id
+                    .as_deref()
+                    == Some(actor_id_cb.as_str());
+                if still_selected {
+                    this.state.bot_studio_edit.saving = false;
+                }
                 match res {
                     Ok((Ok(updated), ids)) => {
                         if this.state.identities_gen == my_id_gen {
@@ -591,7 +599,19 @@ impl CommunityWorkspace {
                                 this.state.identities = Some(i);
                             }
                         }
-                        this.select_bot_for_studio(updated, cx);
+                        if let Some(ref mut prof) = this.state.actor_profile {
+                            if prof.actor.actor_id == updated.actor_id {
+                                prof.actor = updated.clone();
+                            }
+                        }
+                        if this.state.profile_loading {
+                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
+                                this.load_actor_profile(h, cx);
+                            }
+                        }
+                        if still_selected {
+                            this.select_bot_for_studio(updated, cx);
+                        }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: tr_str(&lang, "Bot 资料与外观已更新", "Bot profile & avatar updated")
@@ -602,10 +622,14 @@ impl CommunityWorkspace {
                         );
                     }
                     Ok((Err(e), _)) => {
-                        this.state.bot_studio_edit.error = Some(e.to_string());
+                        if still_selected {
+                            this.state.bot_studio_edit.error = Some(e.to_string());
+                        }
                     }
                     Err(e) => {
-                        this.state.bot_studio_edit.error = Some(e);
+                        if still_selected {
+                            this.state.bot_studio_edit.error = Some(e);
+                        }
                     }
                 }
                 cx.notify();
@@ -668,6 +692,8 @@ impl CommunityWorkspace {
         };
         self.state.bot_studio_test_submitting = true;
         self.state.bot_studio_test_feedback = None;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let prev_actor = self.facade.active_actor_id();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -682,11 +708,18 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                this.state.bot_studio_test_submitting = false;
+                // CRITICAL: Always restore facade's active_actor_id to the CURRENT workspace
+                // actor BEFORE early-returning on an actor_switch_gen mismatch!
                 if !this.state.active_actor_id.is_empty() {
                     this.facade
                         .set_active_actor_id(Some(this.state.active_actor_id.clone()));
                 }
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    return;
+                }
+                this.state.bot_studio_test_submitting = false;
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(created)) => {
@@ -702,6 +735,9 @@ impl CommunityWorkspace {
                                 is_exploration_slot: false,
                             },
                         );
+                        if this.state.feed_loading {
+                            this.load_feed(cx);
+                        }
                         let msg = if lang.starts_with("zh") {
                             format!("Bot 测试帖子已发布 ({pid})")
                         } else {
@@ -776,6 +812,8 @@ impl CommunityWorkspace {
         };
         self.state.bot_studio_test_submitting = true;
         self.state.bot_studio_test_feedback = None;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let jump_pid = post_id.clone();
@@ -797,9 +835,17 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    return;
+                }
                 this.state.bot_studio_test_submitting = false;
                 match res {
                     Ok(Ok(resp)) => {
+                        if resp.triggered {
+                            this.reload_detail_if_loading_post(&jump_pid, cx);
+                        }
                         this.state.bot_studio_test_last_post_id = Some(jump_pid);
                         let is_err = !resp.triggered;
                         let msg = if resp.triggered {

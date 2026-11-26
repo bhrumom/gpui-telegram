@@ -136,6 +136,9 @@ fn dispatch_headless_target(target: &str, use_underscore_exit: bool) -> ! {
         "test_m5_r7_online_consistency_races_all_5_fixes" => {
             |app| Box::pin(body_r7_online_consistency_races_all_5_fixes(app))
         }
+        "test_m5_r8_universal_consistency_and_secondary_mutations" => {
+            |app| Box::pin(body_r8_universal_consistency_and_secondary_mutations(app))
+        }
         other => {
             eprintln!("unknown community M5 headless gpui test target: {other}");
             exit_headless_child(101, use_underscore_exit);
@@ -1810,13 +1813,13 @@ async fn body_f19_community_page(mut app: AsyncApp) {
         // Also verify Join / Leave toggles cleanly
         w.toggle_join_community(seeded_slug.clone(), !joined_before, cx);
     });
+    let seeded_slug_key = seeded_slug.to_ascii_lowercase();
     assert!(
         pump_until(&mut app, Duration::from_secs(4), |cx| {
-            cw.read(cx)
-                .state
-                .community_detail
-                .as_ref()
-                .is_some_and(|d| {
+            let st = &cw.read(cx).state;
+            !st.community_join_in_flight.contains_key(&seeded_slug_key)
+                && !st.community_join_dirty.contains(&seeded_slug_key)
+                && st.community_detail.as_ref().is_some_and(|d| {
                     d.community.slug == seeded_slug && d.community.is_joined == !joined_before
                 })
         })
@@ -7998,6 +8001,3268 @@ async fn body_r7_online_consistency_races_all_5_fixes(mut app: AsyncApp) {
 
     drop(rt_holder);
 }
+
+// ============================================================================
+// Wave r8 — Universal 4-Invariant Consistency & Secondary Mutations Regression Suite
+// ============================================================================
+
+struct R8MockState {
+    owner_id: String,
+    alt_id: String,
+    bot_b_id: String,
+    bob_id: String,
+    charlie_id: String,
+    post_id: String,
+    mpoll_id: String,
+    draft_id: String,
+    comment_id: String,
+    slug: String,
+
+    // Actors (bob mute/block/follow + bot edits)
+    bob_muted: std::sync::atomic::AtomicBool,
+    bob_blocked: std::sync::atomic::AtomicBool,
+    bob_following: std::sync::atomic::AtomicBool,
+    bob_followers_count: std::sync::atomic::AtomicU64,
+    bot_a_display_name: std::sync::Mutex<String>,
+    profile_get_delay_ms: std::sync::atomic::AtomicU64,
+    profile_get_received: std::sync::atomic::AtomicUsize,
+    profile_get_completed: std::sync::atomic::AtomicUsize,
+    mute_delay_ms: std::sync::atomic::AtomicU64,
+    mute_fail_500: std::sync::atomic::AtomicBool,
+    mute_completed: std::sync::atomic::AtomicUsize,
+    block_delay_ms: std::sync::atomic::AtomicU64,
+    block_fail_500: std::sync::atomic::AtomicBool,
+    block_completed: std::sync::atomic::AtomicUsize,
+    follow_delay_ms: std::sync::atomic::AtomicU64,
+    follow_fail_500: std::sync::atomic::AtomicBool,
+    follow_in_flight: std::sync::atomic::AtomicUsize,
+    follow_in_flight_max: std::sync::atomic::AtomicUsize,
+    follow_received: std::sync::atomic::AtomicUsize,
+    follow_completed: std::sync::atomic::AtomicUsize,
+    actor_patch_delay_ms: std::sync::atomic::AtomicU64,
+    actor_patch_completed: std::sync::atomic::AtomicUsize,
+
+    // Posts, Polls, Comments, Awards, Bookmarks, Feed, Drafts
+    post_body: std::sync::Mutex<String>,
+    post_deleted: std::sync::atomic::AtomicBool,
+    post_vote_dir: std::sync::atomic::AtomicI8,
+    post_vote_delay_ms: std::sync::atomic::AtomicU64,
+    post_vote_fail_500: std::sync::atomic::AtomicBool,
+    post_vote_completed: std::sync::atomic::AtomicUsize,
+    post_liked: std::sync::atomic::AtomicBool,
+    post_like_delay_ms: std::sync::atomic::AtomicU64,
+    post_like_fail_500: std::sync::atomic::AtomicBool,
+    post_like_completed: std::sync::atomic::AtomicUsize,
+    post_reposted: std::sync::atomic::AtomicBool,
+    post_repost_delay_ms: std::sync::atomic::AtomicU64,
+    post_repost_fail_500: std::sync::atomic::AtomicBool,
+    post_repost_in_flight: std::sync::atomic::AtomicUsize,
+    post_repost_in_flight_max: std::sync::atomic::AtomicUsize,
+    post_repost_received: std::sync::atomic::AtomicUsize,
+    post_repost_completed: std::sync::atomic::AtomicUsize,
+    post_bookmarked: std::sync::atomic::AtomicBool,
+    post_bookmark_delay_ms: std::sync::atomic::AtomicU64,
+    post_bookmark_fail_500: std::sync::atomic::AtomicBool,
+    post_bookmark_completed: std::sync::atomic::AtomicUsize,
+    post_awards: std::sync::Mutex<Vec<gpui_telegram_proto::community_contracts::PostAwardDto>>,
+    post_award_delay_ms: std::sync::atomic::AtomicU64,
+    post_award_completed: std::sync::atomic::AtomicUsize,
+    single_poll_voted: std::sync::Mutex<Vec<String>>,
+    multi_poll_voted: std::sync::Mutex<Vec<String>>,
+    poll_vote_delay_ms: std::sync::atomic::AtomicU64,
+    poll_vote_fail_500: std::sync::atomic::AtomicBool,
+    poll_vote_in_flight: std::sync::atomic::AtomicUsize,
+    poll_vote_in_flight_max: std::sync::atomic::AtomicUsize,
+    poll_vote_received: std::sync::atomic::AtomicUsize,
+    poll_vote_completed: std::sync::atomic::AtomicUsize,
+    comment_vote_dir: std::sync::atomic::AtomicI8,
+    comment_vote_delay_ms: std::sync::atomic::AtomicU64,
+    comment_vote_fail_500: std::sync::atomic::AtomicBool,
+    comment_vote_completed: std::sync::atomic::AtomicUsize,
+    comment_liked: std::sync::atomic::AtomicBool,
+    comment_like_delay_ms: std::sync::atomic::AtomicU64,
+    comment_like_fail_500: std::sync::atomic::AtomicBool,
+    comment_like_completed: std::sync::atomic::AtomicUsize,
+    detail_get_delay_ms: std::sync::atomic::AtomicU64,
+    detail_get_received: std::sync::atomic::AtomicUsize,
+    detail_get_completed: std::sync::atomic::AtomicUsize,
+    feed_get_delay_ms: std::sync::atomic::AtomicU64,
+    feed_get_received: std::sync::atomic::AtomicUsize,
+    feed_get_completed: std::sync::atomic::AtomicUsize,
+    drafts_get_delay_ms: std::sync::atomic::AtomicU64,
+    drafts_get_received: std::sync::atomic::AtomicUsize,
+    drafts_get_completed: std::sync::atomic::AtomicUsize,
+    draft_published: std::sync::atomic::AtomicBool,
+    extra_posts: std::sync::Mutex<Vec<CommunityPostDto>>,
+    create_post_delay_ms: std::sync::atomic::AtomicU64,
+    create_post_completed: std::sync::atomic::AtomicUsize,
+    update_post_delay_ms: std::sync::atomic::AtomicU64,
+    update_post_completed: std::sync::atomic::AtomicUsize,
+    delete_post_delay_ms: std::sync::atomic::AtomicU64,
+    delete_post_completed: std::sync::atomic::AtomicUsize,
+    create_comment_delay_ms: std::sync::atomic::AtomicU64,
+    create_comment_completed: std::sync::atomic::AtomicUsize,
+    signal_delay_ms: std::sync::atomic::AtomicU64,
+    signal_completed: std::sync::atomic::AtomicUsize,
+    summon_delay_ms: std::sync::atomic::AtomicU64,
+    summon_completed: std::sync::atomic::AtomicUsize,
+
+    // Community, Wiki, Rules, Join, Mod Queue, AutoMod
+    comm_joined: std::sync::atomic::AtomicBool,
+    comm_members: std::sync::atomic::AtomicU64,
+    comm_wiki: std::sync::Mutex<String>,
+    comm_wiki_rev: std::sync::atomic::AtomicU32,
+    comm_rules: std::sync::Mutex<Vec<gpui_telegram_proto::community_contracts::CommunityRuleDto>>,
+    comm_automod_rules: std::sync::Mutex<Vec<AutoModRuleDto>>,
+    comm_get_delay_ms: std::sync::atomic::AtomicU64,
+    comm_get_received: std::sync::atomic::AtomicUsize,
+    comm_get_completed: std::sync::atomic::AtomicUsize,
+    join_delay_ms: std::sync::atomic::AtomicU64,
+    join_fail_500: std::sync::atomic::AtomicBool,
+    join_in_flight: std::sync::atomic::AtomicUsize,
+    join_in_flight_max: std::sync::atomic::AtomicUsize,
+    join_received: std::sync::atomic::AtomicUsize,
+    join_completed: std::sync::atomic::AtomicUsize,
+    comm_patch_delay_ms: std::sync::atomic::AtomicU64,
+    comm_patch_fail_500: std::sync::atomic::AtomicBool,
+    comm_patch_completed: std::sync::atomic::AtomicUsize,
+    wiki_put_delay_ms: std::sync::atomic::AtomicU64,
+    wiki_put_completed: std::sync::atomic::AtomicUsize,
+    mod_queue_items: std::sync::Mutex<Vec<gpui_telegram_proto::community_contracts::ModQueueItemDto>>,
+    mod_queue_get_delay_ms: std::sync::atomic::AtomicU64,
+    mod_queue_get_received: std::sync::atomic::AtomicUsize,
+    mod_queue_get_completed: std::sync::atomic::AtomicUsize,
+    mod_action_delay_ms: std::sync::atomic::AtomicU64,
+    mod_action_completed: std::sync::atomic::AtomicUsize,
+
+    // Lists
+    lists: std::sync::Mutex<Vec<CommunityListDto>>,
+    lists_get_delay_ms: std::sync::atomic::AtomicU64,
+    lists_get_received: std::sync::atomic::AtomicUsize,
+    lists_get_completed: std::sync::atomic::AtomicUsize,
+    list_editor_patch_delay_ms: std::sync::atomic::AtomicU64,
+    list_editor_patch_completed: std::sync::atomic::AtomicUsize,
+    list_toggle_patch_delay_ms: std::sync::atomic::AtomicU64,
+    list_toggle_patch_fail_500: std::sync::atomic::AtomicBool,
+    list_toggle_patch_received: std::sync::atomic::AtomicUsize,
+    list_toggle_patch_completed: std::sync::atomic::AtomicUsize,
+    list_delete_delay_ms: std::sync::atomic::AtomicU64,
+    list_delete_fail_500: std::sync::atomic::AtomicBool,
+    list_delete_received: std::sync::atomic::AtomicUsize,
+    list_delete_completed: std::sync::atomic::AtomicUsize,
+
+    // Notifications
+    notifs: std::sync::Mutex<Vec<CommunityNotificationDto>>,
+    notifs_get_completed: std::sync::atomic::AtomicUsize,
+    notif_read_fail_500: std::sync::atomic::AtomicBool,
+    notif_read_override_unread: std::sync::atomic::AtomicI64,
+    notif_read_completed: std::sync::atomic::AtomicUsize,
+    fail_second_flight: std::sync::atomic::AtomicBool,
+}
+
+fn should_fail_r8(
+    fail_500: &std::sync::atomic::AtomicBool,
+    fail_second: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if fail_500.load(Ordering::SeqCst) {
+        return true;
+    }
+    if fail_second.swap(false, Ordering::SeqCst) {
+        fail_500.store(true, Ordering::SeqCst);
+        return false;
+    }
+    false
+}
+
+impl R8MockState {
+    fn build_post(&self) -> CommunityPostDto {
+        use gpui_telegram_proto::community_contracts::{CommunityPollOptionDto, PollDto};
+        use std::sync::atomic::Ordering;
+        let mut p = mock_post_dto(
+            &self.post_id,
+            &self.owner_id,
+            self.post_bookmarked.load(Ordering::SeqCst),
+            if self.post_bookmarked.load(Ordering::SeqCst) {
+                Some("All")
+            } else {
+                None
+            },
+            u64::from(self.post_bookmarked.load(Ordering::SeqCst)),
+        );
+        p.body = self.post_body.lock().unwrap().clone();
+        p.community_slug = Some(self.slug.clone());
+        let pv = self.post_vote_dir.load(Ordering::SeqCst);
+        p.viewer_vote = pv;
+        p.upvotes = i64::from(pv == 1);
+        p.downvotes = i64::from(pv == -1);
+        p.score = i64::from(pv);
+        let pl = self.post_liked.load(Ordering::SeqCst);
+        p.viewer_liked = pl;
+        p.likes_count = u64::from(pl);
+        let pr = self.post_reposted.load(Ordering::SeqCst);
+        p.viewer_reposted = pr;
+        p.reposts_count = u64::from(pr);
+        p.awards = self.post_awards.lock().unwrap().clone();
+        let voted = self.single_poll_voted.lock().unwrap().clone();
+        p.poll = Some(PollDto {
+            poll_id: "poll_r8_single".to_string(),
+            question: "Single choice?".to_string(),
+            options: vec![
+                CommunityPollOptionDto {
+                    option_id: "opt_a".to_string(),
+                    text: "Option A".to_string(),
+                    all_votes: u64::from(voted.iter().any(|x| x == "opt_a")),
+                    human_votes: u64::from(voted.iter().any(|x| x == "opt_a")),
+                    bot_votes: 0,
+                },
+                CommunityPollOptionDto {
+                    option_id: "opt_b".to_string(),
+                    text: "Option B".to_string(),
+                    all_votes: u64::from(voted.iter().any(|x| x == "opt_b")),
+                    human_votes: u64::from(voted.iter().any(|x| x == "opt_b")),
+                    bot_votes: 0,
+                },
+            ],
+            multi_select: false,
+            expires_at_ms: 1_999_999_999_000,
+            is_closed: false,
+            total_votes: voted.len() as u64,
+            total_human_votes: voted.len() as u64,
+            total_bot_votes: 0,
+            viewer_voted_option_ids: voted,
+        });
+        p
+    }
+
+    fn build_mpoll_post(&self) -> CommunityPostDto {
+        use gpui_telegram_proto::community_contracts::{CommunityPollOptionDto, PollDto};
+        let mut p = mock_post_dto(&self.mpoll_id, &self.owner_id, false, None, 0);
+        p.community_slug = Some(self.slug.clone());
+        let voted = self.multi_poll_voted.lock().unwrap().clone();
+        p.poll = Some(PollDto {
+            poll_id: "poll_r8_multi".to_string(),
+            question: "Multi choice?".to_string(),
+            options: vec![
+                CommunityPollOptionDto {
+                    option_id: "opt_a".to_string(),
+                    text: "Multi A".to_string(),
+                    all_votes: u64::from(voted.iter().any(|x| x == "opt_a")),
+                    human_votes: u64::from(voted.iter().any(|x| x == "opt_a")),
+                    bot_votes: 0,
+                },
+                CommunityPollOptionDto {
+                    option_id: "opt_b".to_string(),
+                    text: "Multi B".to_string(),
+                    all_votes: u64::from(voted.iter().any(|x| x == "opt_b")),
+                    human_votes: u64::from(voted.iter().any(|x| x == "opt_b")),
+                    bot_votes: 0,
+                },
+            ],
+            multi_select: true,
+            expires_at_ms: 1_999_999_999_000,
+            is_closed: false,
+            total_votes: voted.len() as u64,
+            total_human_votes: voted.len() as u64,
+            total_bot_votes: 0,
+            viewer_voted_option_ids: voted,
+        });
+        p
+    }
+
+    fn build_draft_post(&self) -> CommunityPostDto {
+        use std::sync::atomic::Ordering;
+        let mut p = mock_post_dto(&self.draft_id, &self.owner_id, false, None, 0);
+        p.title = Some("Draft Title R8".to_string());
+        p.body = "Draft Body R8".to_string();
+        p.status = if self.draft_published.load(Ordering::SeqCst) {
+            PostStatus::Published
+        } else {
+            PostStatus::Draft
+        };
+        p
+    }
+
+    fn build_comment(&self) -> CommunityCommentDto {
+        use std::sync::atomic::Ordering;
+        let mut c = mock_comment_dto(&self.comment_id, &self.post_id, &self.owner_id);
+        let cv = self.comment_vote_dir.load(Ordering::SeqCst);
+        c.viewer_vote = cv;
+        c.upvotes = i64::from(cv == 1);
+        c.downvotes = i64::from(cv == -1);
+        c.score = i64::from(cv);
+        let cl = self.comment_liked.load(Ordering::SeqCst);
+        c.viewer_liked = cl;
+        c.likes_count = u64::from(cl);
+        c
+    }
+
+    fn build_community(&self, acting_actor: Option<&str>) -> SubCommunityDto {
+        use std::sync::atomic::Ordering;
+        let is_owner = acting_actor.is_none_or(|a| a == self.owner_id);
+        let role = if is_owner {
+            Some(CommunityMemberRole::Mod)
+        } else {
+            None
+        };
+        let mut c = mock_community_dto(&self.slug, &self.owner_id, role);
+        c.is_joined = self.comm_joined.load(Ordering::SeqCst);
+        c.member_count = self.comm_members.load(Ordering::SeqCst);
+        c.wiki_markdown = self.comm_wiki.lock().unwrap().clone();
+        c.wiki_revision = self.comm_wiki_rev.load(Ordering::SeqCst);
+        c.rules = self.comm_rules.lock().unwrap().clone();
+        c.automod_rules = self.comm_automod_rules.lock().unwrap().clone();
+        c
+    }
+}
+
+fn spawn_r8_universal_server(
+    rt_handle: &tokio::runtime::Handle,
+) -> (std::net::SocketAddr, Arc<R8MockState>, AbortOnDrop) {
+    use gpui_telegram_proto::community_contracts::{
+        AwardResponse, CommunityPollVoteRequest, CommunityWikiRevisionDto, CreatePostResponse,
+        FollowActionResponse, GiveAwardRequest, JoinCommunityResponse,
+        MarkNotificationsReadRequest, MarkNotificationsReadResponse, ModActionRequest,
+        ModLogEntryDto, ModQueueItemDto, PostAwardDto, RepostResponse, SummonBotResponse,
+        UpdateCommunityActorRequest, UpdateCommunityWikiRequest, UpdatePostRequest,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let owner_id = "u:908001".to_string();
+    let alt_id = "b:908002".to_string();
+    let bot_b_id = "b:908003".to_string();
+    let bob_id = "u:908010".to_string();
+    let charlie_id = "u:908011".to_string();
+    let post_id = "p_r8_main".to_string();
+    let mpoll_id = "p_r8_mpoll".to_string();
+    let draft_id = "p_r8_draft".to_string();
+    let comment_id = "c_r8_main".to_string();
+    let slug = "r8_lab".to_string();
+
+    let seed_lists = vec![
+        mock_list_dto("l_3e", &owner_id, "Orig 3E"),
+        mock_list_dto("l_3g_b", &owner_id, "Orig B"),
+        mock_list_dto("l_3g", &owner_id, "Orig 3G"),
+        mock_list_dto("l_3g_err", &owner_id, "Orig 3G Err"),
+        mock_list_dto("l_3d_500", &owner_id, "Orig 3D 500"),
+    ];
+    let seed_queue = vec![
+        ModQueueItemDto {
+            item_id: "mq_r8_1".to_string(),
+            community_id: format!("comm_{slug}"),
+            target_kind: "post".to_string(),
+            target_id: post_id.clone(),
+            reporter_actor_id: Some(bob_id.clone()),
+            source: "report".to_string(),
+            reason: "Spam check 1".to_string(),
+            rule_triggered: None,
+            status: ModQueueStatus::Pending,
+            resolved_by_actor_id: None,
+            resolved_at_ms: None,
+            created_at_ms: 1_750_000_000_000,
+        },
+        ModQueueItemDto {
+            item_id: "mq_r8_2".to_string(),
+            community_id: format!("comm_{slug}"),
+            target_kind: "post".to_string(),
+            target_id: post_id.clone(),
+            reporter_actor_id: Some(bob_id.clone()),
+            source: "report".to_string(),
+            reason: "Spam check 2".to_string(),
+            rule_triggered: None,
+            status: ModQueueStatus::Pending,
+            resolved_by_actor_id: None,
+            resolved_at_ms: None,
+            created_at_ms: 1_750_000_001_000,
+        },
+    ];
+    let seed_notifs = vec![
+        CommunityNotificationDto {
+            notif_id: "n_r8_1".to_string(),
+            recipient_actor_id: owner_id.clone(),
+            actor_id: bob_id.clone(),
+            actor_handle: "r8_bob".to_string(),
+            actor_display_name: "R8 Bob".to_string(),
+            actor_kind: ActorKind::Human,
+            kind: CommunityNotificationKind::Reply,
+            target_post_id: Some(post_id.clone()),
+            target_comment_id: None,
+            preview_text: "Unread notif 1".to_string(),
+            is_read: false,
+            created_at_ms: 1_750_000_000_000,
+        },
+        CommunityNotificationDto {
+            notif_id: "n_r8_2".to_string(),
+            recipient_actor_id: owner_id.clone(),
+            actor_id: bob_id.clone(),
+            actor_handle: "r8_bob".to_string(),
+            actor_display_name: "R8 Bob".to_string(),
+            actor_kind: ActorKind::Human,
+            kind: CommunityNotificationKind::Mention,
+            target_post_id: Some(post_id.clone()),
+            target_comment_id: None,
+            preview_text: "Unread notif 2".to_string(),
+            is_read: false,
+            created_at_ms: 1_750_000_001_000,
+        },
+    ];
+
+    let state = Arc::new(R8MockState {
+        owner_id,
+        alt_id,
+        bot_b_id,
+        bob_id,
+        charlie_id,
+        post_id,
+        mpoll_id,
+        draft_id,
+        comment_id,
+        slug,
+        bob_muted: AtomicBool::new(false),
+        bob_blocked: AtomicBool::new(false),
+        bob_following: AtomicBool::new(true),
+        bob_followers_count: AtomicU64::new(5),
+        bot_a_display_name: std::sync::Mutex::new("R8 Bot A".to_string()),
+        profile_get_delay_ms: AtomicU64::new(0),
+        profile_get_received: AtomicUsize::new(0),
+        profile_get_completed: AtomicUsize::new(0),
+        mute_delay_ms: AtomicU64::new(0),
+        mute_fail_500: AtomicBool::new(false),
+        mute_completed: AtomicUsize::new(0),
+        block_delay_ms: AtomicU64::new(0),
+        block_fail_500: AtomicBool::new(false),
+        block_completed: AtomicUsize::new(0),
+        follow_delay_ms: AtomicU64::new(0),
+        follow_fail_500: AtomicBool::new(false),
+        follow_in_flight: AtomicUsize::new(0),
+        follow_in_flight_max: AtomicUsize::new(0),
+        follow_received: AtomicUsize::new(0),
+        follow_completed: AtomicUsize::new(0),
+        actor_patch_delay_ms: AtomicU64::new(0),
+        actor_patch_completed: AtomicUsize::new(0),
+        post_body: std::sync::Mutex::new("Initial R8 post body".to_string()),
+        post_deleted: AtomicBool::new(false),
+        post_vote_dir: AtomicI8::new(0),
+        post_vote_delay_ms: AtomicU64::new(0),
+        post_vote_fail_500: AtomicBool::new(false),
+        post_vote_completed: AtomicUsize::new(0),
+        post_liked: AtomicBool::new(false),
+        post_like_delay_ms: AtomicU64::new(0),
+        post_like_fail_500: AtomicBool::new(false),
+        post_like_completed: AtomicUsize::new(0),
+        post_reposted: AtomicBool::new(false),
+        post_repost_delay_ms: AtomicU64::new(0),
+        post_repost_fail_500: AtomicBool::new(false),
+        post_repost_in_flight: AtomicUsize::new(0),
+        post_repost_in_flight_max: AtomicUsize::new(0),
+        post_repost_received: AtomicUsize::new(0),
+        post_repost_completed: AtomicUsize::new(0),
+        post_bookmarked: AtomicBool::new(false),
+        post_bookmark_delay_ms: AtomicU64::new(0),
+        post_bookmark_fail_500: AtomicBool::new(false),
+        post_bookmark_completed: AtomicUsize::new(0),
+        post_awards: std::sync::Mutex::new(Vec::new()),
+        post_award_delay_ms: AtomicU64::new(0),
+        post_award_completed: AtomicUsize::new(0),
+        single_poll_voted: std::sync::Mutex::new(Vec::new()),
+        multi_poll_voted: std::sync::Mutex::new(Vec::new()),
+        poll_vote_delay_ms: AtomicU64::new(0),
+        poll_vote_fail_500: AtomicBool::new(false),
+        poll_vote_in_flight: AtomicUsize::new(0),
+        poll_vote_in_flight_max: AtomicUsize::new(0),
+        poll_vote_received: AtomicUsize::new(0),
+        poll_vote_completed: AtomicUsize::new(0),
+        comment_vote_dir: AtomicI8::new(0),
+        comment_vote_delay_ms: AtomicU64::new(0),
+        comment_vote_fail_500: AtomicBool::new(false),
+        comment_vote_completed: AtomicUsize::new(0),
+        comment_liked: AtomicBool::new(false),
+        comment_like_delay_ms: AtomicU64::new(0),
+        comment_like_fail_500: AtomicBool::new(false),
+        comment_like_completed: AtomicUsize::new(0),
+        detail_get_delay_ms: AtomicU64::new(0),
+        detail_get_received: AtomicUsize::new(0),
+        detail_get_completed: AtomicUsize::new(0),
+        feed_get_delay_ms: AtomicU64::new(0),
+        feed_get_received: AtomicUsize::new(0),
+        feed_get_completed: AtomicUsize::new(0),
+        drafts_get_delay_ms: AtomicU64::new(0),
+        drafts_get_received: AtomicUsize::new(0),
+        drafts_get_completed: AtomicUsize::new(0),
+        draft_published: AtomicBool::new(false),
+        extra_posts: std::sync::Mutex::new(Vec::new()),
+        create_post_delay_ms: AtomicU64::new(0),
+        create_post_completed: AtomicUsize::new(0),
+        update_post_delay_ms: AtomicU64::new(0),
+        update_post_completed: AtomicUsize::new(0),
+        delete_post_delay_ms: AtomicU64::new(0),
+        delete_post_completed: AtomicUsize::new(0),
+        create_comment_delay_ms: AtomicU64::new(0),
+        create_comment_completed: AtomicUsize::new(0),
+        signal_delay_ms: AtomicU64::new(0),
+        signal_completed: AtomicUsize::new(0),
+        summon_delay_ms: AtomicU64::new(0),
+        summon_completed: AtomicUsize::new(0),
+        comm_joined: AtomicBool::new(false),
+        comm_members: AtomicU64::new(10),
+        comm_wiki: std::sync::Mutex::new("Initial Wiki".to_string()),
+        comm_wiki_rev: AtomicU32::new(1),
+        comm_rules: std::sync::Mutex::new(Vec::new()),
+        comm_automod_rules: std::sync::Mutex::new(Vec::new()),
+        comm_get_delay_ms: AtomicU64::new(0),
+        comm_get_received: AtomicUsize::new(0),
+        comm_get_completed: AtomicUsize::new(0),
+        join_delay_ms: AtomicU64::new(0),
+        join_fail_500: AtomicBool::new(false),
+        join_in_flight: AtomicUsize::new(0),
+        join_in_flight_max: AtomicUsize::new(0),
+        join_received: AtomicUsize::new(0),
+        join_completed: AtomicUsize::new(0),
+        comm_patch_delay_ms: AtomicU64::new(0),
+        comm_patch_fail_500: AtomicBool::new(false),
+        comm_patch_completed: AtomicUsize::new(0),
+        wiki_put_delay_ms: AtomicU64::new(0),
+        wiki_put_completed: AtomicUsize::new(0),
+        mod_queue_items: std::sync::Mutex::new(seed_queue),
+        mod_queue_get_delay_ms: AtomicU64::new(0),
+        mod_queue_get_received: AtomicUsize::new(0),
+        mod_queue_get_completed: AtomicUsize::new(0),
+        mod_action_delay_ms: AtomicU64::new(0),
+        mod_action_completed: AtomicUsize::new(0),
+        lists: std::sync::Mutex::new(seed_lists),
+        lists_get_delay_ms: AtomicU64::new(0),
+        lists_get_received: AtomicUsize::new(0),
+        lists_get_completed: AtomicUsize::new(0),
+        list_editor_patch_delay_ms: AtomicU64::new(0),
+        list_editor_patch_completed: AtomicUsize::new(0),
+        list_toggle_patch_delay_ms: AtomicU64::new(0),
+        list_toggle_patch_fail_500: AtomicBool::new(false),
+        list_toggle_patch_received: AtomicUsize::new(0),
+        list_toggle_patch_completed: AtomicUsize::new(0),
+        list_delete_delay_ms: AtomicU64::new(0),
+        list_delete_fail_500: AtomicBool::new(false),
+        list_delete_received: AtomicUsize::new(0),
+        list_delete_completed: AtomicUsize::new(0),
+        notifs: std::sync::Mutex::new(seed_notifs),
+        notifs_get_completed: AtomicUsize::new(0),
+        notif_read_fail_500: AtomicBool::new(false),
+        notif_read_override_unread: AtomicI64::new(-1),
+        notif_read_completed: AtomicUsize::new(0),
+        fail_second_flight: AtomicBool::new(false),
+    });
+
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind r8 mock");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    let addr = std_listener.local_addr().expect("local_addr");
+    let state_loop = Arc::clone(&state);
+
+    let join = rt_handle.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener).expect("from_std");
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let st = Arc::clone(&state_loop);
+            tokio::spawn(async move {
+                let mut buf = Vec::with_capacity(4096);
+                let mut tmp = [0u8; 2048];
+                let header_end = loop {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                            if buf.len() > 65536 {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let head_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let mut lines = head_str.lines();
+                let req_line = lines.next().unwrap_or("");
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET").to_string();
+                let full_target = parts.next().unwrap_or("/");
+                let (path, query) = full_target
+                    .split_once('?')
+                    .map(|(p, q)| (p.to_string(), q.to_string()))
+                    .unwrap_or_else(|| (full_target.to_string(), String::new()));
+
+                let mut content_len: usize = 0;
+                let mut acting_actor: Option<String> = None;
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        } else if k.trim().eq_ignore_ascii_case("x-community-actor-id") {
+                            acting_actor = Some(v.trim().to_string());
+                        }
+                    }
+                }
+                while buf.len() < header_end + content_len {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let body_bytes = &buf[header_end..(header_end + content_len).min(buf.len())];
+
+                let owner_actor = mock_actor_dto(&st.owner_id, ActorKind::Human, "r8_owner", "R8 Owner");
+                let bot_a_name = st.bot_a_display_name.lock().unwrap().clone();
+                let bot_a_actor = mock_actor_dto(&st.alt_id, ActorKind::Bot, "r8_bot_a", &bot_a_name);
+                let bot_b_actor = mock_actor_dto(&st.bot_b_id, ActorKind::Bot, "r8_bot_b", "R8 Bot B");
+
+                let (status, body) = if method == "GET" && path == "/api/v1/community/identities" {
+                    let resp = CommunityIdentitiesResponse {
+                        active_actor_id: st.owner_id.clone(),
+                        human_actor: Some(owner_actor.clone()),
+                        bot_actors: vec![bot_a_actor.clone(), bot_b_actor.clone()],
+                        all_actors: vec![owner_actor, bot_a_actor, bot_b_actor],
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST" && path == "/api/v1/community/identities/human" {
+                    ("200 OK", serde_json::to_string(&owner_actor).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/actors/r8_bob" {
+                    // Snapshot BEFORE optional delay so Case B slow GET returns stale pre-mutation state!
+                    let mut actor = mock_actor_dto(&st.bob_id, ActorKind::Human, "r8_bob", "R8 Bob");
+                    actor.is_muted = st.bob_muted.load(Ordering::SeqCst);
+                    actor.is_blocked = st.bob_blocked.load(Ordering::SeqCst);
+                    actor.is_following = st.bob_following.load(Ordering::SeqCst);
+                    actor.followers_count = st.bob_followers_count.load(Ordering::SeqCst);
+                    st.profile_get_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.profile_get_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.profile_get_completed.fetch_add(1, Ordering::SeqCst);
+                    let resp = ActorProfileResponse {
+                        actor,
+                        recent_posts: Vec::new(),
+                        recent_comments: Vec::new(),
+                        moderated_communities: Vec::new(),
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/actors/r8_charlie" {
+                    let actor = mock_actor_dto(&st.charlie_id, ActorKind::Human, "r8_charlie", "R8 Charlie");
+                    let resp = ActorProfileResponse {
+                        actor,
+                        recent_posts: Vec::new(),
+                        recent_comments: Vec::new(),
+                        moderated_communities: Vec::new(),
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "PATCH" && path.starts_with("/api/v1/community/actors/") {
+                    let aid = path.trim_start_matches("/api/v1/community/actors/").to_string();
+                    let req: UpdateCommunityActorRequest =
+                        serde_json::from_slice(body_bytes).unwrap_or_default();
+                    let delay = st.actor_patch_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    if aid == st.alt_id {
+                        if let Some(dn) = req.display_name {
+                            *st.bot_a_display_name.lock().unwrap() = dn;
+                        }
+                    }
+                    st.actor_patch_completed.fetch_add(1, Ordering::SeqCst);
+                    let updated = if aid == st.alt_id {
+                        let dn = st.bot_a_display_name.lock().unwrap().clone();
+                        mock_actor_dto(&st.alt_id, ActorKind::Bot, "r8_bot_a", &dn)
+                    } else {
+                        bot_b_actor
+                    };
+                    ("200 OK", serde_json::to_string(&updated).unwrap())
+                } else if (method == "POST" || method == "DELETE")
+                    && path == "/api/v1/community/mutes-blocks"
+                {
+                    let req: MuteBlockRequest = serde_json::from_slice(body_bytes).expect("mb req");
+                    let is_mute = req.action == MuteBlockActionKind::Mute;
+                    let delay = if is_mute {
+                        st.mute_delay_ms.swap(0, Ordering::SeqCst)
+                    } else {
+                        st.block_delay_ms.swap(0, Ordering::SeqCst)
+                    };
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let fail = if is_mute {
+                        should_fail_r8(&st.mute_fail_500, &st.fail_second_flight)
+                    } else {
+                        should_fail_r8(&st.block_fail_500, &st.fail_second_flight)
+                    };
+                    if is_mute {
+                        st.mute_completed.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        st.block_completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if fail {
+                        ("500 Internal Server Error", r#"{"error":"mb_500"}"#.to_string())
+                    } else if method == "POST" {
+                        if is_mute {
+                            st.bob_muted.store(true, Ordering::SeqCst);
+                        } else {
+                            st.bob_blocked.store(true, Ordering::SeqCst);
+                            st.bob_following.store(false, Ordering::SeqCst);
+                        }
+                        let dto = CommunityMuteBlockDto {
+                            id: "mb_r8".to_string(),
+                            owner_actor_id: st.owner_id.clone(),
+                            target_kind: MuteBlockTargetKind::Actor,
+                            target_value: req.target_value,
+                            action: req.action,
+                            reason: None,
+                            created_at_ms: 1_750_000_000_000,
+                        };
+                        ("200 OK", serde_json::to_string(&dto).unwrap())
+                    } else {
+                        if is_mute {
+                            st.bob_muted.store(false, Ordering::SeqCst);
+                        } else {
+                            st.bob_blocked.store(false, Ordering::SeqCst);
+                        }
+                        (
+                            "200 OK",
+                            serde_json::to_string(&DeleteEntityResponse {
+                                id: req.target_value,
+                                deleted: true,
+                            })
+                            .unwrap(),
+                        )
+                    }
+                } else if (method == "POST" || method == "DELETE")
+                    && path.starts_with("/api/v1/community/actors/")
+                    && path.ends_with("/follow")
+                {
+                    let cur = st.follow_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    st.follow_in_flight_max.fetch_max(cur, Ordering::SeqCst);
+                    st.follow_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.follow_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let res = if should_fail_r8(&st.follow_fail_500, &st.fail_second_flight) {
+                        st.follow_completed.fetch_add(1, Ordering::SeqCst);
+                        ("500 Internal Server Error", r#"{"error":"follow_500"}"#.to_string())
+                    } else {
+                        let want = method == "POST";
+                        // Server rejects/ignores follow if blocked (just like SQLite store)
+                        let effective = if st.bob_blocked.load(Ordering::SeqCst) {
+                            false
+                        } else {
+                            let prev = st.bob_following.swap(want, Ordering::SeqCst);
+                            if !prev && want {
+                                st.bob_followers_count.fetch_add(1, Ordering::SeqCst);
+                            } else if prev && !want {
+                                st.bob_followers_count.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            want
+                        };
+                        st.follow_completed.fetch_add(1, Ordering::SeqCst);
+                        let resp = FollowActionResponse {
+                            actor_id: st.bob_id.clone(),
+                            is_following: effective,
+                            followers_count: st.bob_followers_count.load(Ordering::SeqCst),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    };
+                    st.follow_in_flight.fetch_sub(1, Ordering::SeqCst);
+                    res
+                } else if method == "GET" && path == format!("/api/v1/community/posts/{}", st.post_id) {
+                    if st.post_deleted.load(Ordering::SeqCst) {
+                        st.detail_get_received.fetch_add(1, Ordering::SeqCst);
+                        st.detail_get_completed.fetch_add(1, Ordering::SeqCst);
+                        ("404 Not Found", r#"{"error":"deleted"}"#.to_string())
+                    } else {
+                        let resp = PostDetailResponse {
+                            post: st.build_post(),
+                            thread_chain: Vec::new(),
+                            quote_chain: Vec::new(),
+                            comments: vec![st.build_comment()],
+                            total_comments: 1,
+                        };
+                        st.detail_get_received.fetch_add(1, Ordering::SeqCst);
+                        let delay = st.detail_get_delay_ms.swap(0, Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        st.detail_get_completed.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if method == "GET" && path == format!("/api/v1/community/posts/{}", st.mpoll_id) {
+                    let resp = PostDetailResponse {
+                        post: st.build_mpoll_post(),
+                        thread_chain: Vec::new(),
+                        quote_chain: Vec::new(),
+                        comments: Vec::new(),
+                        total_comments: 0,
+                    };
+                    st.detail_get_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.detail_get_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.detail_get_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST" && path == format!("/api/v1/community/posts/{}/vote", st.post_id) {
+                    let req: VoteRequest = serde_json::from_slice(body_bytes).expect("pv req");
+                    let delay = st.post_vote_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.post_vote_completed.fetch_add(1, Ordering::SeqCst);
+                    if should_fail_r8(&st.post_vote_fail_500, &st.fail_second_flight) {
+                        ("500 Internal Server Error", r#"{"error":"pv_500"}"#.to_string())
+                    } else {
+                        st.post_vote_dir.store(req.direction, Ordering::SeqCst);
+                        let resp = VoteResponse {
+                            target_id: st.post_id.clone(),
+                            direction: req.direction,
+                            upvotes: i64::from(req.direction == 1),
+                            downvotes: i64::from(req.direction == -1),
+                            score: i64::from(req.direction),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if method == "POST" && path == format!("/api/v1/community/posts/{}/like", st.post_id) {
+                    let delay = st.post_like_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.post_like_completed.fetch_add(1, Ordering::SeqCst);
+                    if should_fail_r8(&st.post_like_fail_500, &st.fail_second_flight) {
+                        ("500 Internal Server Error", r#"{"error":"pl_500"}"#.to_string())
+                    } else {
+                        let next = !st.post_liked.load(Ordering::SeqCst);
+                        st.post_liked.store(next, Ordering::SeqCst);
+                        let resp = ToggleActionResponse {
+                            target_id: st.post_id.clone(),
+                            active: next,
+                            count: u64::from(next),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if method == "POST" && path == format!("/api/v1/community/posts/{}/repost", st.post_id) {
+                    let cur = st.post_repost_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    st.post_repost_in_flight_max.fetch_max(cur, Ordering::SeqCst);
+                    st.post_repost_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.post_repost_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let res = if should_fail_r8(&st.post_repost_fail_500, &st.fail_second_flight) {
+                        st.post_repost_completed.fetch_add(1, Ordering::SeqCst);
+                        ("500 Internal Server Error", r#"{"error":"repost_500"}"#.to_string())
+                    } else {
+                        let next = !st.post_reposted.load(Ordering::SeqCst);
+                        st.post_reposted.store(next, Ordering::SeqCst);
+                        st.post_repost_completed.fetch_add(1, Ordering::SeqCst);
+                        let resp = RepostResponse {
+                            post_id: st.post_id.clone(),
+                            reposted: next,
+                            reposts_count: u64::from(next),
+                            repost_post_id: None,
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    };
+                    st.post_repost_in_flight.fetch_sub(1, Ordering::SeqCst);
+                    res
+                } else if method == "POST" && path == format!("/api/v1/community/posts/{}/bookmark", st.post_id) {
+                    let req: BookmarkRequest = serde_json::from_slice(body_bytes).expect("bm req");
+                    let delay = st.post_bookmark_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.post_bookmark_completed.fetch_add(1, Ordering::SeqCst);
+                    if should_fail_r8(&st.post_bookmark_fail_500, &st.fail_second_flight) {
+                        ("500 Internal Server Error", r#"{"error":"bm_500"}"#.to_string())
+                    } else {
+                        let bookmarked = !req.remove.unwrap_or(false);
+                        st.post_bookmarked.store(bookmarked, Ordering::SeqCst);
+                        let resp = BookmarkResponse {
+                            post_id: st.post_id.clone(),
+                            bookmarked,
+                            folder: req.folder.unwrap_or_else(|| "All".to_string()),
+                            bookmarks_count: u64::from(bookmarked),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if method == "POST" && path == format!("/api/v1/community/posts/{}/award", st.post_id) {
+                    let req: GiveAwardRequest = serde_json::from_slice(body_bytes).expect("aw req");
+                    let delay = st.post_award_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let mut guard = st.post_awards.lock().unwrap();
+                    let idx = guard.len() + 1;
+                    guard.push(PostAwardDto {
+                        award_id: format!("aw_r8_{idx}"),
+                        award_kind: req.award_kind,
+                        icon_emoji: "🚀".to_string(),
+                        giver_actor_id: acting_actor.clone().unwrap_or_else(|| st.owner_id.clone()),
+                        giver_handle: "r8_owner".to_string(),
+                        message: None,
+                        created_at_ms: 1_750_000_002_000,
+                    });
+                    let awards = guard.clone();
+                    drop(guard);
+                    st.post_award_completed.fetch_add(1, Ordering::SeqCst);
+                    let resp = AwardResponse {
+                        target_id: st.post_id.clone(),
+                        awards,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST"
+                    && (path == format!("/api/v1/community/posts/{}/poll-vote", st.post_id)
+                        || path == format!("/api/v1/community/posts/{}/poll-vote", st.mpoll_id))
+                {
+                    let is_multi = path.contains(&st.mpoll_id);
+                    let req: CommunityPollVoteRequest =
+                        serde_json::from_slice(body_bytes).expect("poll req");
+                    let cur = st.poll_vote_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    st.poll_vote_in_flight_max.fetch_max(cur, Ordering::SeqCst);
+                    st.poll_vote_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.poll_vote_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let res = if should_fail_r8(&st.poll_vote_fail_500, &st.fail_second_flight) {
+                        st.poll_vote_completed.fetch_add(1, Ordering::SeqCst);
+                        ("500 Internal Server Error", r#"{"error":"poll_500"}"#.to_string())
+                    } else {
+                        if is_multi {
+                            *st.multi_poll_voted.lock().unwrap() = req.option_ids;
+                            st.poll_vote_completed.fetch_add(1, Ordering::SeqCst);
+                            let poll = st.build_mpoll_post().poll.unwrap();
+                            ("200 OK", serde_json::to_string(&poll).unwrap())
+                        } else {
+                            *st.single_poll_voted.lock().unwrap() = req.option_ids;
+                            st.poll_vote_completed.fetch_add(1, Ordering::SeqCst);
+                            let poll = st.build_post().poll.unwrap();
+                            ("200 OK", serde_json::to_string(&poll).unwrap())
+                        }
+                    };
+                    st.poll_vote_in_flight.fetch_sub(1, Ordering::SeqCst);
+                    res
+                } else if method == "POST"
+                    && path == format!("/api/v1/community/comments/{}/vote", st.comment_id)
+                {
+                    let req: VoteRequest = serde_json::from_slice(body_bytes).expect("cv req");
+                    let delay = st.comment_vote_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.comment_vote_completed.fetch_add(1, Ordering::SeqCst);
+                    if should_fail_r8(&st.comment_vote_fail_500, &st.fail_second_flight) {
+                        ("500 Internal Server Error", r#"{"error":"cv_500"}"#.to_string())
+                    } else {
+                        st.comment_vote_dir.store(req.direction, Ordering::SeqCst);
+                        let resp = VoteResponse {
+                            target_id: st.comment_id.clone(),
+                            direction: req.direction,
+                            upvotes: i64::from(req.direction == 1),
+                            downvotes: i64::from(req.direction == -1),
+                            score: i64::from(req.direction),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if method == "POST"
+                    && path == format!("/api/v1/community/comments/{}/like", st.comment_id)
+                {
+                    let delay = st.comment_like_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.comment_like_completed.fetch_add(1, Ordering::SeqCst);
+                    if should_fail_r8(&st.comment_like_fail_500, &st.fail_second_flight) {
+                        ("500 Internal Server Error", r#"{"error":"cl_500"}"#.to_string())
+                    } else {
+                        let next = !st.comment_liked.load(Ordering::SeqCst);
+                        st.comment_liked.store(next, Ordering::SeqCst);
+                        let resp = ToggleActionResponse {
+                            target_id: st.comment_id.clone(),
+                            active: next,
+                            count: u64::from(next),
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if method == "POST" && path == "/api/v1/community/posts" {
+                    let req: CreatePostRequest = serde_json::from_slice(body_bytes).expect("cp req");
+                    let delay = st.create_post_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let mut guard = st.extra_posts.lock().unwrap();
+                    let idx = guard.len() + 1;
+                    let mut created = mock_post_dto(
+                        &format!("p_r8_new_{idx}"),
+                        acting_actor.as_deref().unwrap_or(&st.owner_id),
+                        false,
+                        None,
+                        0,
+                    );
+                    created.title = req.title;
+                    created.body = req.body;
+                    created.status = req.status;
+                    created.community_slug = req.community_slug;
+                    guard.insert(0, created.clone());
+                    drop(guard);
+                    st.create_post_completed.fetch_add(1, Ordering::SeqCst);
+                    let resp = CreatePostResponse {
+                        post: created,
+                        thread_posts: Vec::new(),
+                        automod_action: AutoModActionKind::Approve,
+                        automod_note: None,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "PATCH" && path.starts_with("/api/v1/community/posts/") {
+                    let pid = path.trim_start_matches("/api/v1/community/posts/").to_string();
+                    let req: UpdatePostRequest = serde_json::from_slice(body_bytes).expect("up req");
+                    let delay = st.update_post_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let updated = if pid == st.draft_id {
+                        if req.status == Some(PostStatus::Published) {
+                            st.draft_published.store(true, Ordering::SeqCst);
+                        }
+                        st.build_draft_post()
+                    } else {
+                        if let Some(b) = req.body {
+                            *st.post_body.lock().unwrap() = b;
+                        }
+                        st.build_post()
+                    };
+                    st.update_post_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&updated).unwrap())
+                } else if method == "DELETE" && path == format!("/api/v1/community/posts/{}", st.post_id) {
+                    let delay = st.delete_post_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.post_deleted.store(true, Ordering::SeqCst);
+                    st.delete_post_completed.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        serde_json::to_string(&DeleteEntityResponse {
+                            id: st.post_id.clone(),
+                            deleted: true,
+                        })
+                        .unwrap(),
+                    )
+                } else if method == "POST"
+                    && path == format!("/api/v1/community/posts/{}/comments", st.post_id)
+                {
+                    let delay = st.create_comment_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.create_comment_completed.fetch_add(1, Ordering::SeqCst);
+                    let c = st.build_comment();
+                    ("200 OK", serde_json::to_string(&c).unwrap())
+                } else if method == "POST" && path == "/api/v1/community/signals" {
+                    let delay = st.signal_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.signal_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", r#"{"ok":true}"#.to_string())
+                } else if method == "POST"
+                    && path == format!("/api/v1/community/posts/{}/summon-bot", st.post_id)
+                {
+                    let delay = st.summon_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.summon_completed.fetch_add(1, Ordering::SeqCst);
+                    let resp = SummonBotResponse {
+                        summoned_bot_actor_id: st.alt_id.clone(),
+                        triggered: true,
+                        reason: "ok".to_string(),
+                        created_comment: None,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/communities" {
+                    let resp = ListCommunitiesResponse {
+                        communities: vec![st.build_community(acting_actor.as_deref())],
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path == format!("/api/v1/community/communities/{}", st.slug) {
+                    let comm = st.build_community(acting_actor.as_deref());
+                    let resp = CommunityDetailResponse {
+                        community: comm,
+                        pinned_posts: Vec::new(),
+                        wiki_revisions: Vec::new(),
+                        moderators: Vec::new(),
+                    };
+                    st.comm_get_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.comm_get_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.comm_get_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if (method == "POST" || method == "DELETE")
+                    && path == format!("/api/v1/community/communities/{}/join", st.slug)
+                {
+                    let cur = st.join_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    st.join_in_flight_max.fetch_max(cur, Ordering::SeqCst);
+                    st.join_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.join_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let res = if should_fail_r8(&st.join_fail_500, &st.fail_second_flight) {
+                        st.join_completed.fetch_add(1, Ordering::SeqCst);
+                        ("500 Internal Server Error", r#"{"error":"join_500"}"#.to_string())
+                    } else {
+                        let want = method == "POST";
+                        let prev = st.comm_joined.swap(want, Ordering::SeqCst);
+                        if !prev && want {
+                            st.comm_members.fetch_add(1, Ordering::SeqCst);
+                        } else if prev && !want {
+                            st.comm_members.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        st.join_completed.fetch_add(1, Ordering::SeqCst);
+                        let is_owner = acting_actor.as_deref().is_none_or(|a| a == st.owner_id);
+                        let resp = JoinCommunityResponse {
+                            community_slug: st.slug.clone(),
+                            is_joined: want,
+                            member_count: st.comm_members.load(Ordering::SeqCst),
+                            viewer_role: if want && is_owner {
+                                Some(CommunityMemberRole::Mod)
+                            } else if want {
+                                Some(CommunityMemberRole::Member)
+                            } else {
+                                None
+                            },
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    };
+                    st.join_in_flight.fetch_sub(1, Ordering::SeqCst);
+                    res
+                } else if method == "PATCH" && path == format!("/api/v1/community/communities/{}", st.slug) {
+                    let req: UpdateCommunityRequest = serde_json::from_slice(body_bytes).expect("uc req");
+                    let delay = st.comm_patch_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.comm_patch_completed.fetch_add(1, Ordering::SeqCst);
+                    if should_fail_r8(&st.comm_patch_fail_500, &st.fail_second_flight) {
+                        ("500 Internal Server Error", r#"{"error":"comm_patch_500"}"#.to_string())
+                    } else {
+                        if let Some(rules) = req.rules {
+                            *st.comm_rules.lock().unwrap() = rules;
+                        }
+                        if let Some(am) = req.automod_rules {
+                            *st.comm_automod_rules.lock().unwrap() = am;
+                        }
+                        let comm = st.build_community(acting_actor.as_deref());
+                        ("200 OK", serde_json::to_string(&comm).unwrap())
+                    }
+                } else if method == "PUT" && path == format!("/api/v1/community/communities/{}/wiki", st.slug) {
+                    let req: UpdateCommunityWikiRequest =
+                        serde_json::from_slice(body_bytes).expect("wiki req");
+                    let delay = st.wiki_put_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    *st.comm_wiki.lock().unwrap() = req.markdown.clone();
+                    let rev_num = st.comm_wiki_rev.fetch_add(1, Ordering::SeqCst) + 1;
+                    st.wiki_put_completed.fetch_add(1, Ordering::SeqCst);
+                    let rev = CommunityWikiRevisionDto {
+                        revision: rev_num,
+                        markdown: req.markdown,
+                        editor_actor_id: st.owner_id.clone(),
+                        editor_handle: "r8_owner".to_string(),
+                        summary: req.summary,
+                        created_at_ms: 1_750_000_002_000,
+                    };
+                    ("200 OK", serde_json::to_string(&rev).unwrap())
+                } else if method == "GET" && path == format!("/api/v1/community/communities/{}/mod-queue", st.slug) {
+                    let items = st.mod_queue_items.lock().unwrap().clone();
+                    st.mod_queue_get_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.mod_queue_get_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.mod_queue_get_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&ModQueueResponse { items }).unwrap())
+                } else if method == "GET" && path == format!("/api/v1/community/communities/{}/mod-logs", st.slug) {
+                    ("200 OK", serde_json::to_string(&ModLogsResponse { logs: Vec::new() }).unwrap())
+                } else if method == "POST" && path == format!("/api/v1/community/communities/{}/mod-actions", st.slug) {
+                    let req: ModActionRequest = serde_json::from_slice(body_bytes).expect("ma req");
+                    let delay = st.mod_action_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    if let Some(qid) = req.queue_item_id {
+                        st.mod_queue_items.lock().unwrap().retain(|it| it.item_id != qid);
+                    }
+                    st.mod_action_completed.fetch_add(1, Ordering::SeqCst);
+                    let entry = ModLogEntryDto {
+                        log_id: "ml_r8".to_string(),
+                        community_id: format!("comm_{}", st.slug),
+                        moderator_actor_id: st.owner_id.clone(),
+                        moderator_handle: "r8_owner".to_string(),
+                        moderator_kind: ActorKind::Human,
+                        action: req.action,
+                        target_kind: req.target_kind,
+                        target_id: req.target_id,
+                        reason: req.reason,
+                        rule_triggered: None,
+                        created_at_ms: 1_750_000_002_000,
+                    };
+                    ("200 OK", serde_json::to_string(&entry).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/lists" {
+                    st.lists_get_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.lists_get_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let snapshot = st.lists.lock().unwrap().clone();
+                    st.lists_get_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&CommunityListsResponse { lists: snapshot }).unwrap())
+                } else if method == "PATCH" && path.starts_with("/api/v1/community/lists/") {
+                    let lid = path.trim_start_matches("/api/v1/community/lists/").to_string();
+                    let req: UpdateCommunityListRequest =
+                        serde_json::from_slice(body_bytes).expect("list patch");
+                    let is_editor = req.name.is_some();
+                    if is_editor {
+                        let delay = st.list_editor_patch_delay_ms.swap(0, Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                    } else {
+                        st.list_toggle_patch_received.fetch_add(1, Ordering::SeqCst);
+                        let delay = st.list_toggle_patch_delay_ms.swap(0, Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        if st.list_toggle_patch_fail_500.load(Ordering::SeqCst) {
+                            st.list_toggle_patch_completed.fetch_add(1, Ordering::SeqCst);
+                            let resp_bytes = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"error\":\"lt_500_r8\"}";
+                            let _ = sock.write_all(resp_bytes.as_bytes()).await;
+                            let _ = sock.shutdown().await;
+                            return;
+                        }
+                    }
+                    let updated = {
+                        let mut guard = st.lists.lock().unwrap();
+                        let entry = guard
+                            .iter_mut()
+                            .find(|l| l.list_id == lid)
+                            .expect("list exists");
+                        if let Some(n) = req.name {
+                            entry.name = n;
+                        }
+                        if let Some(d) = req.description {
+                            entry.description = d;
+                        }
+                        if let Some(p) = req.is_pinned {
+                            entry.is_pinned = p;
+                        }
+                        if let Some(m) = req.member_actor_ids {
+                            entry.member_actor_ids = m;
+                        }
+                        if let Some(c) = req.community_slugs {
+                            entry.community_slugs = c;
+                        }
+                        entry.clone()
+                    };
+                    if is_editor {
+                        st.list_editor_patch_completed.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        st.list_toggle_patch_completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ("200 OK", serde_json::to_string(&updated).unwrap())
+                } else if method == "DELETE" && path.starts_with("/api/v1/community/lists/") {
+                    let lid = path.trim_start_matches("/api/v1/community/lists/").to_string();
+                    st.list_delete_received.fetch_add(1, Ordering::SeqCst);
+                    let delay = st.list_delete_delay_ms.swap(0, Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    st.list_delete_completed.fetch_add(1, Ordering::SeqCst);
+                    if st.list_delete_fail_500.load(Ordering::SeqCst) {
+                        ("500 Internal Server Error", r#"{"error":"del_500"}"#.to_string())
+                    } else {
+                        st.lists.lock().unwrap().retain(|l| l.list_id != lid);
+                        (
+                            "200 OK",
+                            serde_json::to_string(&DeleteEntityResponse {
+                                id: lid,
+                                deleted: true,
+                            })
+                            .unwrap(),
+                        )
+                    }
+                } else if method == "GET" && path == "/api/v1/community/notifications" {
+                    let items = st.notifs.lock().unwrap().clone();
+                    let unread = items.iter().filter(|n| !n.is_read).count() as u64;
+                    st.notifs_get_completed.fetch_add(1, Ordering::SeqCst);
+                    let resp = NotificationsListResponse {
+                        notifications: items,
+                        unread_count: unread,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST" && path == "/api/v1/community/notifications/read" {
+                    let req: MarkNotificationsReadRequest =
+                        serde_json::from_slice(body_bytes).unwrap_or_default();
+                    st.notif_read_completed.fetch_add(1, Ordering::SeqCst);
+                    if st.notif_read_fail_500.load(Ordering::SeqCst) {
+                        ("500 Internal Server Error", r#"{"error":"notif_500"}"#.to_string())
+                    } else {
+                        let mut guard = st.notifs.lock().unwrap();
+                        let mut marked = 0u64;
+                        match req.notif_ids {
+                            Some(ids) => {
+                                for n in guard.iter_mut() {
+                                    if ids.iter().any(|id| id == &n.notif_id) && !n.is_read {
+                                        n.is_read = true;
+                                        marked += 1;
+                                    }
+                                }
+                            }
+                            None => {
+                                for n in guard.iter_mut() {
+                                    if !n.is_read {
+                                        n.is_read = true;
+                                        marked += 1;
+                                    }
+                                }
+                            }
+                        }
+                        let actual_unread = guard.iter().filter(|n| !n.is_read).count() as u64;
+                        drop(guard);
+                        let ov = st.notif_read_override_unread.swap(-1, Ordering::SeqCst);
+                        let unread_count = if ov >= 0 { ov as u64 } else { actual_unread };
+                        let resp = MarkNotificationsReadResponse {
+                            marked_count: marked,
+                            unread_count,
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if method == "GET" && path == "/api/v1/community/feed" {
+                    let is_actor_posts = query.contains("actor=");
+                    let is_saved = query.contains("tab=saved");
+                    let mut items = Vec::new();
+                    if is_actor_posts {
+                        items.push(FeedItemDto {
+                            post: st.build_draft_post(),
+                            explanation: None,
+                            rank_score: 10.0,
+                            is_exploration_slot: false,
+                        });
+                        st.drafts_get_received.fetch_add(1, Ordering::SeqCst);
+                        let delay = st.drafts_get_delay_ms.swap(0, Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        st.drafts_get_completed.fetch_add(1, Ordering::SeqCst);
+                    } else if is_saved {
+                        if !st.post_deleted.load(Ordering::SeqCst)
+                            && st.post_bookmarked.load(Ordering::SeqCst)
+                        {
+                            items.push(FeedItemDto {
+                                post: st.build_post(),
+                                explanation: None,
+                                rank_score: 100.0,
+                                is_exploration_slot: false,
+                            });
+                        }
+                    } else {
+                        for ep in st.extra_posts.lock().unwrap().iter() {
+                            items.push(FeedItemDto {
+                                post: ep.clone(),
+                                explanation: None,
+                                rank_score: 110.0,
+                                is_exploration_slot: false,
+                            });
+                        }
+                        if !st.post_deleted.load(Ordering::SeqCst) {
+                            items.push(FeedItemDto {
+                                post: st.build_post(),
+                                explanation: None,
+                                rank_score: 100.0,
+                                is_exploration_slot: false,
+                            });
+                        }
+                        items.push(FeedItemDto {
+                            post: st.build_mpoll_post(),
+                            explanation: None,
+                            rank_score: 90.0,
+                            is_exploration_slot: false,
+                        });
+                        st.feed_get_received.fetch_add(1, Ordering::SeqCst);
+                        let delay = st.feed_get_delay_ms.swap(0, Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        st.feed_get_completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let resp = FeedResponseDto {
+                        items,
+                        next_cursor: None,
+                        total_candidates: 0,
+                        applied_preset: Default::default(),
+                        generated_at_ms: 1_750_000_000_000,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/algo-prefs" {
+                    ("200 OK", serde_json::to_string(&AlgoPreferencesDto::default()).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/trending" {
+                    (
+                        "200 OK",
+                        serde_json::to_string(&TrendingResponse {
+                            topics: Vec::new(),
+                            generated_at_ms: 1_750_000_000_000,
+                        })
+                        .unwrap(),
+                    )
+                } else if method == "GET" && path == "/api/v1/community/search" {
+                    ("200 OK", serde_json::to_string(&CommunitySearchResultDto::default()).unwrap())
+                } else {
+                    ("404 Not Found", r#"{"error":"not_found"}"#.to_string())
+                };
+
+                let http = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(http.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    (addr, state, AbortOnDrop(join))
+}
+
+#[test]
+fn test_m5_r8_universal_consistency_and_secondary_mutations() {
+    run_in_headless_subprocess("test_m5_r8_universal_consistency_and_secondary_mutations");
+}
+
+async fn body_r8_universal_consistency_and_secondary_mutations(mut app: AsyncApp) {
+    let dir = TempDir::new().expect("r8 consistency tempdir");
+    let rt_dir = TempDir::new().expect("r8 consistency rt tempdir");
+    let rt_holder = TelegramClient::open_with_dir(
+        ClientConfig {
+            server_url: "http://127.0.0.1:9".to_string(),
+            max_reconnect_attempts: 0,
+            ..Default::default()
+        },
+        rt_dir.path(),
+    )
+    .expect("open r8 rt holder");
+    let (addr, srv, _server_guard) = spawn_r8_universal_server(rt_holder.runtime().handle());
+
+    let client = Arc::new(
+        TelegramClient::open_with_dir(
+            ClientConfig {
+                server_url: format!("http://{addr}"),
+                max_reconnect_attempts: 0,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .expect("open r8 client"),
+    );
+    let auth = test_auth(908001, "r8_owner");
+    client.set_auth_session(auth.clone());
+    let client_win = Arc::clone(&client);
+    let auth_win = auth.clone();
+    let shell = app
+        .update(|cx| {
+            let _rt_guard = client_win.runtime().enter();
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client_win.clone(), cx);
+                s.apply_authenticated_session(auth_win.clone(), cx);
+                s
+            })
+        })
+        .expect("mount r8 AppShell");
+    let _ = shell.update(&mut app, |s, cx| s.open_community_workspace(cx));
+    let cw = shell
+        .read_with(&app, |s, _| s.community_workspace.clone().unwrap())
+        .unwrap();
+
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.feed_loading
+                && st.identities.is_some()
+                && !st.communities.is_empty()
+                && st.feed_items.iter().any(|it| it.post.post_id == srv.post_id)
+        })
+        .await,
+        "R8 host must bootstrap feed, identities, and communities"
+    );
+
+    run_r8_group_a_list_and_automod(&mut app, &cw, &srv).await;
+    run_r8_group_b_case_a_and_error_case_b(&mut app, &cw, &srv).await;
+    run_r8_group_c_four_new_single_flight(&mut app, &cw, &srv).await;
+    run_r8_group_d_award_fences_and_secondary(&mut app, &shell, &cw, &srv).await;
+
+    drop(rt_holder);
+}
+
+async fn run_r8_group_a_list_and_automod(
+    app: &mut AsyncApp,
+    cw: &Entity<CommunityWorkspace>,
+    srv: &Arc<R8MockState>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::BookmarksLists, cx);
+        w.set_bookmarks_section(BookmarksListsSection::Lists, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.saved_loading && st.lists.iter().any(|l| l.list_id == "l_3e")
+        })
+        .await,
+        "Group A: initial lists must load"
+    );
+
+    // T8-A1 (2F_3E / R1 2F_3G Variant A): pre-submit in-flight + dirty quick-toggles settle
+    // during submit_list_editor's delayed GET /lists, followed by community toggle -> 0 data loss.
+    let lt_done_a1 = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    let le_done_a1 = srv.list_editor_patch_completed.load(Ordering::SeqCst);
+    let lg_done_a1 = srv.lists_get_completed.load(Ordering::SeqCst);
+    srv.list_toggle_patch_delay_ms.store(90, Ordering::SeqCst);
+    srv.list_editor_patch_delay_ms.store(30, Ordering::SeqCst);
+    srv.lists_get_delay_ms.store(260, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        let target = w.state.lists.iter().find(|l| l.list_id == "l_3e").cloned().unwrap();
+        w.open_edit_list_form(target, cx);
+        w.state.list_editor.name = "Renamed 3E".to_string();
+        w.toggle_list_pinned("l_3e".to_string(), true, cx);
+        w.toggle_selected_list_actor("l_3e".to_string(), "u:300".to_string(), cx);
+        w.submit_list_editor(cx);
+        // R8-5 mutex check: attempting to open create/edit form while submitting must be ignored!
+        w.open_create_list_form(cx);
+        assert!(
+            w.state.list_editor.submitting && w.state.list_editor.name == "Renamed 3E",
+            "R8-5: open_create_list_form must be blocked while submitting"
+        );
+        let dummy = w.state.lists.iter().find(|l| l.list_id == "l_3g").cloned().unwrap();
+        w.open_edit_list_form(dummy, cx);
+        assert!(
+            w.state.list_editor.submitting && w.state.list_editor.name == "Renamed 3E",
+            "R8-5: open_edit_list_form must be blocked while submitting"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_editor.submitting
+                && st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+                && srv.list_editor_patch_completed.load(Ordering::SeqCst) > le_done_a1
+                && srv.lists_get_completed.load(Ordering::SeqCst) > lg_done_a1
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) >= lt_done_a1 + 2
+        })
+        .await,
+        "T8-A1: editor + pre-submit quick-toggles + any re-flush must settle"
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_selected_list_community("l_3e".to_string(), "rust".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            st.list_membership_in_flight.is_empty() && st.list_membership_dirty.is_empty()
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let ui = w.state.lists.iter().find(|l| l.list_id == "l_3e").unwrap();
+        let sv = srv.lists.lock().unwrap().iter().find(|l| l.list_id == "l_3e").cloned().unwrap();
+        assert_eq!(ui.name, "Renamed 3E");
+        assert!(ui.is_pinned && ui.member_actor_ids == vec!["u:300".to_string()] && ui.community_slugs == vec!["rust".to_string()]);
+        assert_eq!(sv.name, "Renamed 3E");
+        assert!(sv.is_pinned && sv.member_actor_ids == vec!["u:300".to_string()] && sv.community_slugs == vec!["rust".to_string()]);
+    });
+
+    // T8-A2 (R1 2F_3G Variant B): editor commits ("Renamed B", is_pinned=true) -> mid-GET /lists,
+    // quick-toggle fails HTTP 500 & rolls back -> toggle_seq NOT bumped -> editor save NOT reverted!
+    let lg_rx_a2 = srv.lists_get_received.load(Ordering::SeqCst);
+    let lg_done_a2 = srv.lists_get_completed.load(Ordering::SeqCst);
+    let lt_done_a2 = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    srv.lists_get_delay_ms.store(240, Ordering::SeqCst);
+    srv.list_toggle_patch_fail_500.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        let target = w.state.lists.iter().find(|l| l.list_id == "l_3g_b").cloned().unwrap();
+        w.open_edit_list_form(target, cx);
+        w.state.list_editor.name = "Renamed B".to_string();
+        w.state.list_editor.is_pinned = true;
+        w.submit_list_editor(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.lists_get_received.load(Ordering::SeqCst) > lg_rx_a2
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_selected_list_actor("l_3g_b".to_string(), "u:999".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_editor.submitting
+                && st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) > lt_done_a2
+                && srv.lists_get_completed.load(Ordering::SeqCst) > lg_done_a2
+        })
+        .await,
+        "T8-A2: failed quick-toggle + editor GET /lists must settle"
+    );
+    srv.list_toggle_patch_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        let ui = w.state.lists.iter().find(|l| l.list_id == "l_3g_b").unwrap();
+        let sv = srv.lists.lock().unwrap().iter().find(|l| l.list_id == "l_3g_b").cloned().unwrap();
+        assert_eq!(ui.name, "Renamed B");
+        assert!(ui.is_pinned && ui.member_actor_ids.is_empty(), "T8-A2: failed toggle must NOT revert editor is_pinned=true");
+        assert_eq!(sv.name, "Renamed B");
+        assert!(sv.is_pinned && sv.member_actor_ids.is_empty());
+    });
+
+    // T8-A3 (2F_3G delete-500 dirty re-flush + R8-3 merge_refreshed_lists + R8-4 edit during delete-500)
+    let del_done_a3 = srv.list_delete_completed.load(Ordering::SeqCst);
+    let lt_done_a3 = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    srv.list_toggle_patch_delay_ms.store(90, Ordering::SeqCst);
+    srv.list_delete_delay_ms.store(240, Ordering::SeqCst);
+    srv.list_delete_fail_500.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_list_pinned("l_3g".to_string(), true, cx);
+        w.toggle_selected_list_actor("l_3g".to_string(), "u:300".to_string(), cx);
+        w.delete_list_action("l_3g".to_string(), cx);
+        // R8-3: simulate GET /lists finishing while list_deleting contains l_3g
+        let snap = srv.lists.lock().unwrap().clone();
+        w.state.merge_refreshed_lists(snap);
+        assert!(
+            w.state.lists.iter().any(|l| l.list_id == "l_3g"),
+            "R8-3: merge_refreshed_lists must NOT prematurely drop a deleting list before DELETE settles"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_deleting.contains("l_3g")
+                && st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+                && srv.list_delete_completed.load(Ordering::SeqCst) > del_done_a3
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) >= lt_done_a3 + 2
+        })
+        .await,
+        "T8-A3: DELETE 500 must flush deferred dirty toggle Flight 2"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let ui = w.state.lists.iter().find(|l| l.list_id == "l_3g").unwrap();
+        let sv = srv.lists.lock().unwrap().iter().find(|l| l.list_id == "l_3g").cloned().unwrap();
+        assert_eq!(ui.name, "Orig 3G");
+        assert!(ui.is_pinned && ui.member_actor_ids == vec!["u:300".to_string()]);
+        assert!(sv.is_pinned && sv.member_actor_ids == vec!["u:300".to_string()]);
+    });
+
+    // R8-4: submit_list_editor Edit commits while delete_list_action is in-flight, then DELETE returns HTTP 500
+    let del_done_r84 = srv.list_delete_completed.load(Ordering::SeqCst);
+    let le_done_r84 = srv.list_editor_patch_completed.load(Ordering::SeqCst);
+    srv.list_editor_patch_delay_ms.store(60, Ordering::SeqCst);
+    srv.list_delete_delay_ms.store(220, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        let target = w.state.lists.iter().find(|l| l.list_id == "l_3g").cloned().unwrap();
+        w.open_edit_list_form(target, cx);
+        w.state.list_editor.name = "Renamed 3G".to_string();
+        w.submit_list_editor(cx);
+        w.delete_list_action("l_3g".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_editor.submitting
+                && !st.list_deleting.contains("l_3g")
+                && srv.list_editor_patch_completed.load(Ordering::SeqCst) > le_done_r84
+                && srv.list_delete_completed.load(Ordering::SeqCst) > del_done_r84
+        })
+        .await,
+        "R8-4: Edit + DELETE 500 race must settle"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let ui = w.state.lists.iter().find(|l| l.list_id == "l_3g").unwrap();
+        let sv = srv.lists.lock().unwrap().iter().find(|l| l.list_id == "l_3g").cloned().unwrap();
+        assert_eq!(ui.name, "Renamed 3G", "R8-4: UI must preserve committed editor rename after DELETE 500");
+        assert_eq!(sv.name, "Renamed 3G");
+    });
+
+    // T8-A4 (2F_3G delete-500 + Flight 1 HTTP 500): rolls back cleanly to pre-Flight-1 last_synced
+    let del_done_a4 = srv.list_delete_completed.load(Ordering::SeqCst);
+    let lt_done_a4 = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    srv.list_toggle_patch_delay_ms.store(60, Ordering::SeqCst);
+    srv.list_toggle_patch_fail_500.store(true, Ordering::SeqCst);
+    srv.list_delete_delay_ms.store(200, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_list_pinned("l_3g_err".to_string(), true, cx);
+        w.delete_list_action("l_3g_err".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_deleting.contains("l_3g_err")
+                && st.list_membership_in_flight.is_empty()
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) > lt_done_a4
+                && srv.list_delete_completed.load(Ordering::SeqCst) > del_done_a4
+        })
+        .await
+    );
+    srv.list_toggle_patch_fail_500.store(false, Ordering::SeqCst);
+    srv.list_delete_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        let ui = w.state.lists.iter().find(|l| l.list_id == "l_3g_err").unwrap();
+        assert!(!ui.is_pinned, "T8-A4: failed Flight 1 during DELETE 500 must roll back to is_pinned=false");
+    });
+
+    // T8-A5 (2F_3D re-flush HTTP 500 rolls back to saved via seeded list_membership_last_synced)
+    let lg_rx_a5 = srv.lists_get_received.load(Ordering::SeqCst);
+    let lg_done_a5 = srv.lists_get_completed.load(Ordering::SeqCst);
+    let lt_done_a5 = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    srv.lists_get_delay_ms.store(220, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        let target = w.state.lists.iter().find(|l| l.list_id == "l_3d_500").cloned().unwrap();
+        w.open_edit_list_form(target, cx);
+        w.state.list_editor.name = "Saved 3D".to_string();
+        w.submit_list_editor(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.lists_get_received.load(Ordering::SeqCst) > lg_rx_a5
+        })
+        .await
+    );
+    // Quick toggle commits pinned=true while editor GET /lists is delayed, AND server resets back
+    // to editor's saved state? No: trigger re-flush by having toggle commit BEFORE editor PATCH
+    // or seed via fast toggle then failing re-flush:
+    // Actually: if fast toggle commits pinned=true, then we mutate server back to pinned=false before GET /lists
+    // so server_confirmed_toggle has pinned=false while UI has pinned=true -> triggers re-flush which fails 500!
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_list_pinned("l_3d_500".to_string(), true, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            st.list_membership_in_flight.is_empty()
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) > lt_done_a5
+        })
+        .await
+    );
+    // Simulate Order 1 (T_P < E_P < E_G): server list snapshot has saved is_pinned=false, and re-flush fails 500.
+    {
+        let mut guard = srv.lists.lock().unwrap();
+        if let Some(l) = guard.iter_mut().find(|x| x.list_id == "l_3d_500") {
+            l.is_pinned = false;
+        }
+    }
+    let lt_before_reflush = srv.list_toggle_patch_completed.load(Ordering::SeqCst);
+    srv.list_toggle_patch_fail_500.store(true, Ordering::SeqCst);
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_editor.submitting
+                && st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+                && srv.lists_get_completed.load(Ordering::SeqCst) > lg_done_a5
+                && srv.list_toggle_patch_completed.load(Ordering::SeqCst) > lt_before_reflush
+        })
+        .await,
+        "T8-A5: editor re-flush HTTP 500 must settle"
+    );
+    srv.list_toggle_patch_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        let ui = w.state.lists.iter().find(|l| l.list_id == "l_3d_500").unwrap();
+        assert_eq!(ui.name, "Saved 3D");
+        assert!(
+            !ui.is_pinned,
+            "T8-A5: failed re-flush must roll back to server_confirmed_toggle (is_pinned=false)"
+        );
+    });
+
+    // R8-9 (AutoMod F1 OK + F2 500 vs slow load_mod_queue): cross-cache sync + draft reset + Case B reload
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ModQueue(Some(srv.slug.clone())), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.mod_loading && st.mod_community.is_some()
+        })
+        .await
+    );
+    let mq_rx_r89 = srv.mod_queue_get_received.load(Ordering::SeqCst);
+    let cp_done_r89 = srv.comm_patch_completed.load(Ordering::SeqCst);
+    srv.mod_queue_get_delay_ms.store(300, Ordering::SeqCst);
+    srv.comm_patch_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_mod_queue(srv.slug.clone(), cx);
+        w.state.automod_draft.name = "Rule R8-9".to_string();
+        w.state.automod_draft.keywords = "scam".to_string();
+        w.submit_add_automod_rule(cx);
+        let rid = w
+            .state
+            .mod_community
+            .as_ref()
+            .unwrap()
+            .automod_rules
+            .first()
+            .unwrap()
+            .rule_id
+            .clone();
+        // Queue Flight 2 (toggle enabled) while Flight 1 is in-flight
+        w.toggle_automod_rule_enabled(rid, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.automod_draft.saving
+                && st.automod_in_flight.is_empty()
+                && !st.mod_loading
+                && srv.comm_patch_completed.load(Ordering::SeqCst) >= cp_done_r89 + 2
+                && srv.mod_queue_get_received.load(Ordering::SeqCst) >= mq_rx_r89 + 2
+        })
+        .await,
+        "R8-9: AutoMod F1 OK + F2 500 must trigger Case B load_mod_queue and settle"
+    );
+    srv.comm_patch_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(
+            w.state.automod_draft.name.is_empty(),
+            "R8-9: automod_draft must reset immediately when F1 (Add Rule) commits"
+        );
+        let mc = w.state.mod_community.as_ref().unwrap();
+        assert_eq!(mc.automod_rules.len(), 1);
+        assert!(mc.automod_rules[0].enabled, "R8-9: F2 500 rolls back enabled=true from F1");
+        let c_list = w.state.communities.iter().find(|c| c.slug == srv.slug).unwrap();
+        assert_eq!(c_list.automod_rules.len(), 1);
+        assert!(c_list.automod_rules[0].enabled, "R8-9: communities[pos] stays synced with F1");
+    });
+}
+
+async fn run_r8_group_b_case_a_and_error_case_b(
+    app: &mut AsyncApp,
+    cw: &Entity<CommunityWorkspace>,
+    srv: &Arc<R8MockState>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // Open PostDetail for p_r8_main
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.post_id.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.post_id)
+        })
+        .await
+    );
+
+    // T8-B1 (ADV-2a & ADV-2b): vote_post(+1) & vote_comment_action(+1) -> stale load_post_detail
+    // settles mid-Flight-1 -> assert mid_ui == (+1, 1) -> Click 2 (+1 toggle-off) -> final (0, 0), calls==2
+    let pv_before = srv.post_vote_completed.load(Ordering::SeqCst);
+    let cv_before = srv.comment_vote_completed.load(Ordering::SeqCst);
+    let det_done_b1 = srv.detail_get_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(70, Ordering::SeqCst);
+    srv.post_vote_delay_ms.store(220, Ordering::SeqCst);
+    srv.comment_vote_delay_ms.store(220, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.vote_post(srv.post_id.clone(), 1, cx);
+        w.vote_comment_action(srv.comment_id.clone(), 1, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            srv.detail_get_completed.load(Ordering::SeqCst) > det_done_b1
+                && !cw.read(cx).state.detail_loading
+        })
+        .await,
+        "T8-B1: pre-vote load_post_detail must settle mid-Flight-1"
+    );
+    let _ = cw.update(app, |w, cx| {
+        let p = w.state.find_post(&srv.post_id).unwrap();
+        let c = w.state.find_comment(&srv.comment_id).unwrap();
+        assert_eq!((p.viewer_vote, p.score), (1, 1), "ADV-2b: stale load_post_detail must NOT flicker post vote to (0,0)");
+        assert_eq!((c.viewer_vote, c.score), (1, 1), "ADV-2a: stale load_post_detail must NOT flicker comment vote to (0,0)");
+        // Click 2: toggle off back to 0
+        w.vote_post(srv.post_id.clone(), 1, cx);
+        w.vote_comment_action(srv.comment_id.clone(), 1, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_vote_in_flight.is_empty()
+                && st.post_vote_dirty.is_empty()
+                && st.comment_vote_in_flight.is_empty()
+                && st.comment_vote_dirty.is_empty()
+                && srv.post_vote_completed.load(Ordering::SeqCst) >= pv_before + 2
+                && srv.comment_vote_completed.load(Ordering::SeqCst) >= cv_before + 2
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let p = w.state.find_post(&srv.post_id).unwrap();
+        let c = w.state.find_comment(&srv.comment_id).unwrap();
+        assert_eq!((p.viewer_vote, p.score), (0, 0));
+        assert_eq!(srv.post_vote_dir.load(Ordering::SeqCst), 0);
+        assert_eq!((c.viewer_vote, c.score), (0, 0));
+        assert_eq!(srv.comment_vote_dir.load(Ordering::SeqCst), 0);
+    });
+
+    // T8-B2 (ADV-2c Like Case A 2-click): toggle_like & toggle_comment_like_action vs mid-flight load_post_detail
+    let pl_before = srv.post_like_completed.load(Ordering::SeqCst);
+    let cl_before = srv.comment_like_completed.load(Ordering::SeqCst);
+    let det_done_b2 = srv.detail_get_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(70, Ordering::SeqCst);
+    srv.post_like_delay_ms.store(220, Ordering::SeqCst);
+    srv.comment_like_delay_ms.store(220, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.toggle_like(srv.post_id.clone(), cx);
+        w.toggle_comment_like_action(srv.comment_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            srv.detail_get_completed.load(Ordering::SeqCst) > det_done_b2
+                && !cw.read(cx).state.detail_loading
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        let p = w.state.find_post(&srv.post_id).unwrap();
+        let c = w.state.find_comment(&srv.comment_id).unwrap();
+        assert_eq!((p.viewer_liked, p.likes_count), (true, 1), "ADV-2c: stale load_post_detail must NOT flicker post like");
+        assert_eq!((c.viewer_liked, c.likes_count), (true, 1), "ADV-2c: stale load_post_detail must NOT flicker comment like");
+        w.toggle_like(srv.post_id.clone(), cx);
+        w.toggle_comment_like_action(srv.comment_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_like_in_flight.is_empty()
+                && st.post_like_pending_toggle.is_empty()
+                && st.comment_like_in_flight.is_empty()
+                && st.comment_like_pending_toggle.is_empty()
+                && srv.post_like_completed.load(Ordering::SeqCst) >= pl_before + 2
+                && srv.comment_like_completed.load(Ordering::SeqCst) >= cl_before + 2
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let p = w.state.find_post(&srv.post_id).unwrap();
+        let c = w.state.find_comment(&srv.comment_id).unwrap();
+        assert_eq!((p.viewer_liked, p.likes_count), (false, 0));
+        assert!(!srv.post_liked.load(Ordering::SeqCst));
+        assert_eq!((c.viewer_liked, c.likes_count), (false, 0));
+        assert!(!srv.comment_liked.load(Ordering::SeqCst));
+    });
+
+    // T8-B3 (R7-*-F2-500-VS-GET across ALL 7 single-flight error-rollback arms including R8-7 bookmark!)
+    // 1) post_vote F1 OK (+1) + F2 500 (-1) vs slow load_post_detail
+    let det_rx_pv = srv.detail_get_received.load(Ordering::SeqCst);
+    let pv_b3 = srv.post_vote_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.post_vote_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.vote_post(srv.post_id.clone(), 1, cx);
+        w.vote_post(srv.post_id.clone(), -1, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_vote_in_flight.is_empty()
+                && !st.detail_loading
+                && srv.post_vote_completed.load(Ordering::SeqCst) >= pv_b3 + 2
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_pv + 2
+        })
+        .await,
+        "T8-B3 post_vote: F2 500 must trigger Case B detail reload"
+    );
+    srv.post_vote_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(w.state.detail_post.as_ref().unwrap().post.viewer_vote, 1);
+    });
+
+    // 2) post_like F1 OK (true) + F2 500 (false) vs slow load_post_detail
+    let det_rx_pl = srv.detail_get_received.load(Ordering::SeqCst);
+    let pl_b3 = srv.post_like_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.post_like_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.toggle_like(srv.post_id.clone(), cx);
+        w.toggle_like(srv.post_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_like_in_flight.is_empty()
+                && !st.detail_loading
+                && srv.post_like_completed.load(Ordering::SeqCst) >= pl_b3 + 2
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_pl + 2
+        })
+        .await,
+        "T8-B3 post_like: F2 500 must trigger Case B detail reload"
+    );
+    srv.post_like_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.detail_post.as_ref().unwrap().post.viewer_liked);
+    });
+
+    // 3) comment_vote F1 OK (+1) + F2 500 (-1) vs slow load_post_detail
+    let det_rx_cv = srv.detail_get_received.load(Ordering::SeqCst);
+    let cv_b3 = srv.comment_vote_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.comment_vote_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.vote_comment_action(srv.comment_id.clone(), 1, cx);
+        w.vote_comment_action(srv.comment_id.clone(), -1, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.comment_vote_in_flight.is_empty()
+                && !st.detail_loading
+                && srv.comment_vote_completed.load(Ordering::SeqCst) >= cv_b3 + 2
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_cv + 2
+        })
+        .await,
+        "T8-B3 comment_vote: F2 500 must trigger Case B detail reload"
+    );
+    srv.comment_vote_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(w.state.find_comment(&srv.comment_id).unwrap().viewer_vote, 1);
+    });
+
+    // 4) comment_like F1 OK (true) + F2 500 (false) vs slow load_post_detail
+    let det_rx_cl = srv.detail_get_received.load(Ordering::SeqCst);
+    let cl_b3 = srv.comment_like_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.comment_like_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.toggle_comment_like_action(srv.comment_id.clone(), cx);
+        w.toggle_comment_like_action(srv.comment_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.comment_like_in_flight.is_empty()
+                && !st.detail_loading
+                && srv.comment_like_completed.load(Ordering::SeqCst) >= cl_b3 + 2
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_cl + 2
+        })
+        .await,
+        "T8-B3 comment_like: F2 500 must trigger Case B detail reload"
+    );
+    srv.comment_like_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.find_comment(&srv.comment_id).unwrap().viewer_liked);
+    });
+
+    // 5) bookmark (R8-7!) F1 OK (true) + F2 500 (false) vs slow load_post_detail
+    let det_rx_bm = srv.detail_get_received.load(Ordering::SeqCst);
+    let bm_b3 = srv.post_bookmark_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.post_bookmark_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.toggle_bookmark(srv.post_id.clone(), cx);
+        w.toggle_bookmark(srv.post_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.bookmark_in_flight.is_empty()
+                && !st.detail_loading
+                && srv.post_bookmark_completed.load(Ordering::SeqCst) >= bm_b3 + 2
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_bm + 2
+        })
+        .await,
+        "R8-7 bookmark: F2 500 must trigger Case B detail reload"
+    );
+    srv.post_bookmark_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.detail_post.as_ref().unwrap().post.viewer_bookmarked);
+    });
+
+    // 6) mute & 7) block F1 OK + F2 500 vs slow load_actor_profile, plus T8-B4 (S2A-5b-6f)
+    let _ = cw.update(app, |w, cx| {
+        w.open_actor_profile("r8_bob".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == srv.bob_id && p.actor.is_following)
+        })
+        .await
+    );
+
+    // 6) mute F1 OK (true) + F2 500 (false) vs slow load_actor_profile
+    let pr_rx_m = srv.profile_get_received.load(Ordering::SeqCst);
+    let m_b3 = srv.mute_completed.load(Ordering::SeqCst);
+    srv.profile_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.mute_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_actor_profile("r8_bob".to_string(), cx);
+        w.toggle_mute_actor(srv.bob_id.clone(), false, cx);
+        w.toggle_mute_actor(srv.bob_id.clone(), true, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.actor_mute_in_flight.is_empty()
+                && !st.profile_loading
+                && srv.mute_completed.load(Ordering::SeqCst) >= m_b3 + 2
+                && srv.profile_get_received.load(Ordering::SeqCst) >= pr_rx_m + 2
+        })
+        .await,
+        "T8-B3 mute: F2 500 must trigger Case B profile reload"
+    );
+    srv.mute_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.actor_profile.as_ref().unwrap().actor.is_muted);
+    });
+
+    // 7) block F1 OK (true) + F2 500 (false) vs slow load_actor_profile
+    let pr_rx_b = srv.profile_get_received.load(Ordering::SeqCst);
+    let b_b3 = srv.block_completed.load(Ordering::SeqCst);
+    srv.profile_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.block_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_actor_profile("r8_bob".to_string(), cx);
+        w.toggle_block_actor(srv.bob_id.clone(), false, cx);
+        w.toggle_block_actor(srv.bob_id.clone(), true, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.actor_block_in_flight.is_empty()
+                && !st.profile_loading
+                && srv.block_completed.load(Ordering::SeqCst) >= b_b3 + 2
+                && srv.profile_get_received.load(Ordering::SeqCst) >= pr_rx_b + 2
+        })
+        .await,
+        "T8-B3 block: F2 500 must trigger Case B profile reload"
+    );
+    srv.block_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        let a = &w.state.actor_profile.as_ref().unwrap().actor;
+        assert!(a.is_blocked && !a.is_following);
+    });
+
+    // T8-B4 (S2A-5b-6f nav-away-and-back): reset bob to (blocked=false, following=true), then
+    // Block -> Unblock + navigate bob -> charlie -> bob BEFORE Flight 1 settles -> transient_fol == false!
+    srv.bob_blocked.store(false, Ordering::SeqCst);
+    srv.bob_following.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_actor_profile("r8_bob".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == srv.bob_id && !p.actor.is_blocked && p.actor.is_following)
+        })
+        .await
+    );
+    let b_b4 = srv.block_completed.load(Ordering::SeqCst);
+    srv.block_delay_ms.store(240, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_block_actor(srv.bob_id.clone(), false, cx);
+        w.toggle_block_actor(srv.bob_id.clone(), true, cx);
+        // Navigate away to charlie (clears actor_profile for bob!)
+        w.open_actor_profile("r8_charlie".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == srv.charlie_id)
+        })
+        .await
+    );
+    // Navigate BACK to bob BEFORE Flight 1 settles! Server still returns is_following=true!
+    let _ = cw.update(app, |w, cx| {
+        w.open_actor_profile("r8_bob".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == srv.bob_id)
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let a = &w.state.actor_profile.as_ref().unwrap().actor;
+        assert!(
+            !a.is_following,
+            "T8-B4 (S2A-5b-6f): nav-away-and-back during Block->Unblock Flight 1 must NEVER flash is_following=true"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.actor_block_in_flight.is_empty()
+                && st.actor_block_dirty.is_empty()
+                && st.actor_block_chain_had_block.is_empty()
+                && srv.block_completed.load(Ordering::SeqCst) >= b_b4 + 2
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let a = &w.state.actor_profile.as_ref().unwrap().actor;
+        assert!(!a.is_blocked && !a.is_following);
+    });
+}
+
+async fn run_r8_group_c_four_new_single_flight(
+    app: &mut AsyncApp,
+    cw: &Entity<CommunityWorkspace>,
+    srv: &Arc<R8MockState>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // ------------------------------------------------------------------
+    // T8-C1: repost_post single-flight (2-click, 3-click elision, Case A, F1 OK+F2 500 Case B, ABA)
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.post_id.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.detail_loading && cw.read(cx).state.detail_post.is_some()
+        })
+        .await
+    );
+    srv.post_repost_in_flight_max.store(0, Ordering::SeqCst);
+    let rp_done_1 = srv.post_repost_completed.load(Ordering::SeqCst);
+    srv.post_repost_delay_ms.store(120, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.repost_post(srv.post_id.clone(), cx);
+        w.repost_post(srv.post_id.clone(), cx);
+        assert!(w.state.post_repost_in_flight.contains_key(&srv.post_id));
+        assert!(w.state.post_repost_pending_toggle.contains(&srv.post_id));
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_repost_in_flight.is_empty()
+                && st.post_repost_pending_toggle.is_empty()
+                && srv.post_repost_completed.load(Ordering::SeqCst) >= rp_done_1 + 2
+        })
+        .await,
+        "T8-C1: rapid 2-click repost->unrepost must flush sequentially"
+    );
+    assert_eq!(srv.post_repost_in_flight_max.load(Ordering::SeqCst), 1);
+    let _ = cw.read_with(app, |w, _| {
+        let p = w.state.find_post(&srv.post_id).unwrap();
+        assert!(!p.viewer_reposted && p.reposts_count == 0);
+        assert!(!srv.post_reposted.load(Ordering::SeqCst));
+    });
+
+    // 3-click elision (only 1 HTTP call!) + Case A load_post_detail overlay mid-Flight-1
+    let rp_done_3c = srv.post_repost_completed.load(Ordering::SeqCst);
+    let det_done_c1 = srv.detail_get_completed.load(Ordering::SeqCst);
+    srv.post_repost_delay_ms.store(220, Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(60, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.repost_post(srv.post_id.clone(), cx);
+        w.repost_post(srv.post_id.clone(), cx);
+        w.repost_post(srv.post_id.clone(), cx);
+        assert!(!w.state.post_repost_pending_toggle.contains(&srv.post_id), "T8-C1: 3-click parity elides Flight 2");
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            srv.detail_get_completed.load(Ordering::SeqCst) > det_done_c1
+                && !cw.read(cx).state.detail_loading
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert!(
+            w.state.detail_post.as_ref().unwrap().post.viewer_reposted,
+            "T8-C1 Case A: stale load_post_detail must overlay viewer_reposted=true"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            cw.read(cx).state.post_repost_in_flight.is_empty()
+                && srv.post_repost_completed.load(Ordering::SeqCst) == rp_done_3c + 1
+        })
+        .await
+    );
+    assert_eq!(srv.post_repost_completed.load(Ordering::SeqCst), rp_done_3c + 1);
+
+    // Repost F1 OK (false) + F2 500 (true) vs slow load_post_detail -> Case B reload
+    let det_rx_rp = srv.detail_get_received.load(Ordering::SeqCst);
+    let rp_b = srv.post_repost_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.post_repost_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.repost_post(srv.post_id.clone(), cx);
+        w.repost_post(srv.post_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.post_repost_in_flight.is_empty()
+                && !st.detail_loading
+                && srv.post_repost_completed.load(Ordering::SeqCst) >= rp_b + 2
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_rp + 2
+        })
+        .await,
+        "T8-C1 Case B: repost F2 500 must trigger Case B detail reload"
+    );
+    srv.post_repost_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(!w.state.detail_post.as_ref().unwrap().post.viewer_reposted);
+    });
+
+    // ------------------------------------------------------------------
+    // T8-C2: toggle_join_community single-flight (Join->Leave, Case A, F1 OK+F2 500 Case B, 2D JOIN-RACE!)
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.community_loading && cw.read(cx).state.community_detail.is_some()
+        })
+        .await
+    );
+    srv.join_in_flight_max.store(0, Ordering::SeqCst);
+    let j_done_1 = srv.join_completed.load(Ordering::SeqCst);
+    let comm_done_c2 = srv.comm_get_completed.load(Ordering::SeqCst);
+    srv.join_delay_ms.store(180, Ordering::SeqCst);
+    srv.comm_get_delay_ms.store(60, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_community_page(srv.slug.clone(), cx);
+        w.toggle_join_community(srv.slug.clone(), true, cx);
+        w.toggle_join_community(srv.slug.clone(), false, cx);
+        assert!(w.state.community_join_in_flight.contains_key(&srv.slug));
+        assert!(w.state.community_join_dirty.contains(&srv.slug));
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            srv.comm_get_completed.load(Ordering::SeqCst) > comm_done_c2
+                && !cw.read(cx).state.community_loading
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        // Pending target is false -> Case A overlay keeps is_joined=false
+        assert!(!w.state.community_detail.as_ref().unwrap().community.is_joined);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.community_join_in_flight.is_empty()
+                && st.community_join_dirty.is_empty()
+                && srv.join_completed.load(Ordering::SeqCst) >= j_done_1 + 2
+        })
+        .await
+    );
+    assert_eq!(srv.join_in_flight_max.load(Ordering::SeqCst), 1);
+    let _ = cw.read_with(app, |w, _| {
+        let c = &w.state.community_detail.as_ref().unwrap().community;
+        assert!(!c.is_joined && c.member_count == 10);
+        assert!(!srv.comm_joined.load(Ordering::SeqCst));
+    });
+
+    // Join F1 OK (true) + F2 500 (false) vs slow load_community_page -> Case B reload
+    let comm_rx_j = srv.comm_get_received.load(Ordering::SeqCst);
+    let j_b = srv.join_completed.load(Ordering::SeqCst);
+    srv.comm_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.join_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_community_page(srv.slug.clone(), cx);
+        w.toggle_join_community(srv.slug.clone(), true, cx);
+        w.toggle_join_community(srv.slug.clone(), false, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.community_join_in_flight.is_empty()
+                && !st.community_loading
+                && srv.join_completed.load(Ordering::SeqCst) >= j_b + 2
+                && srv.comm_get_received.load(Ordering::SeqCst) >= comm_rx_j + 2
+        })
+        .await,
+        "T8-C2 Case B: join F2 500 must trigger Case B community reload"
+    );
+    srv.join_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.community_detail.as_ref().unwrap().community.is_joined);
+    });
+
+    // 2D JOIN-RACE security check: switch to non-mod alt_id, call toggle_join_community(true)
+    // and assert viewer_role is NEVER optimistically granted!
+    srv.comm_joined.store(false, Ordering::SeqCst);
+    srv.join_delay_ms.store(180, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.switch_active_actor(srv.alt_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading && st.active_actor_id == srv.alt_id
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_join_community(srv.slug.clone(), true, cx);
+        assert!(
+            w.state.community_detail.as_ref().unwrap().community.viewer_role.is_none(),
+            "2D JOIN-RACE: toggle_join_community must NEVER optimistically grant viewer_role"
+        );
+        // Switch back to owner mid-flight -> stale alt_id join callback must be fenced!
+        w.switch_active_actor(srv.owner_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading && st.active_actor_id == srv.owner_id
+        })
+        .await
+    );
+
+    // ------------------------------------------------------------------
+    // T8-C3: toggle_follow_actor single-flight + Cross-Lane Follow -> Block fence!
+    // ------------------------------------------------------------------
+    srv.bob_blocked.store(false, Ordering::SeqCst);
+    srv.bob_following.store(false, Ordering::SeqCst);
+    srv.bob_followers_count.store(5, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.open_actor_profile("r8_bob".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == srv.bob_id && !p.actor.is_following)
+        })
+        .await
+    );
+    // Rapid Follow -> Unfollow single-flight + Case A overlay
+    srv.follow_in_flight_max.store(0, Ordering::SeqCst);
+    let fl_done_1 = srv.follow_completed.load(Ordering::SeqCst);
+    let pr_done_c3 = srv.profile_get_completed.load(Ordering::SeqCst);
+    srv.follow_delay_ms.store(180, Ordering::SeqCst);
+    srv.profile_get_delay_ms.store(60, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_actor_profile("r8_bob".to_string(), cx);
+        w.toggle_follow_actor(srv.bob_id.clone(), true, cx);
+        w.toggle_follow_actor(srv.bob_id.clone(), false, cx);
+        assert!(w.state.actor_follow_in_flight.contains_key(&srv.bob_id));
+        assert!(w.state.actor_follow_dirty.contains(&srv.bob_id));
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            srv.profile_get_completed.load(Ordering::SeqCst) > pr_done_c3
+                && !cw.read(cx).state.profile_loading
+        })
+        .await
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.actor_follow_in_flight.is_empty()
+                && st.actor_follow_dirty.is_empty()
+                && srv.follow_completed.load(Ordering::SeqCst) >= fl_done_1 + 2
+        })
+        .await
+    );
+    assert_eq!(srv.follow_in_flight_max.load(Ordering::SeqCst), 1);
+    let _ = cw.read_with(app, |w, _| {
+        let a = &w.state.actor_profile.as_ref().unwrap().actor;
+        assert!(!a.is_following && a.followers_count == 5);
+    });
+
+    // Follow F1 OK (true) + F2 500 (false) vs slow load_actor_profile -> Case B reload
+    let pr_rx_f = srv.profile_get_received.load(Ordering::SeqCst);
+    let fl_b = srv.follow_completed.load(Ordering::SeqCst);
+    srv.profile_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.follow_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_actor_profile("r8_bob".to_string(), cx);
+        w.toggle_follow_actor(srv.bob_id.clone(), true, cx);
+        w.toggle_follow_actor(srv.bob_id.clone(), false, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.actor_follow_in_flight.is_empty()
+                && !st.profile_loading
+                && srv.follow_completed.load(Ordering::SeqCst) >= fl_b + 2
+                && srv.profile_get_received.load(Ordering::SeqCst) >= pr_rx_f + 2
+        })
+        .await,
+        "T8-C3 Case B: follow F2 500 must trigger Case B profile reload"
+    );
+    srv.follow_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.actor_profile.as_ref().unwrap().actor.is_following);
+    });
+
+    // Cross-Lane Follow -> Block race: slow Follow (220ms) -> fast Block (10ms)
+    srv.bob_following.store(false, Ordering::SeqCst);
+    srv.bob_blocked.store(false, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_actor_profile("r8_bob".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.profile_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| !p.actor.is_following && !p.actor.is_blocked)
+        })
+        .await
+    );
+    let fl_done_xl = srv.follow_completed.load(Ordering::SeqCst);
+    let blk_done_xl = srv.block_completed.load(Ordering::SeqCst);
+    srv.follow_delay_ms.store(220, Ordering::SeqCst);
+    srv.block_delay_ms.store(10, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_follow_actor(srv.bob_id.clone(), true, cx);
+        w.toggle_block_actor(srv.bob_id.clone(), false, cx);
+        assert!(
+            !w.state.actor_follow_in_flight.contains_key(&srv.bob_id),
+            "T8-C3 Cross-Lane: Block must immediately invalidate in-flight Follow token"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.actor_block_in_flight.is_empty()
+                && st.actor_follow_in_flight.is_empty()
+                && srv.block_completed.load(Ordering::SeqCst) > blk_done_xl
+                && srv.follow_completed.load(Ordering::SeqCst) > fl_done_xl
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let a = &w.state.actor_profile.as_ref().unwrap().actor;
+        assert!(
+            a.is_blocked && !a.is_following,
+            "T8-C3 Cross-Lane: delayed Follow response must NEVER set is_following=true onto blocked actor"
+        );
+        assert!(srv.bob_blocked.load(Ordering::SeqCst) && !srv.bob_following.load(Ordering::SeqCst));
+    });
+
+    // ------------------------------------------------------------------
+    // T8-C4: vote_poll single-flight (single-select opt_a->opt_b, multi-select opt_a->opt_b 0 lost update, Case A, F1 OK+F2 500 Case B)
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.post_id.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.detail_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.post_id)
+        })
+        .await
+    );
+    // Single-select rapid opt_a -> opt_b + Case A overlay
+    srv.poll_vote_in_flight_max.store(0, Ordering::SeqCst);
+    let pv_done_s = srv.poll_vote_completed.load(Ordering::SeqCst);
+    let det_done_p = srv.detail_get_completed.load(Ordering::SeqCst);
+    srv.poll_vote_delay_ms.store(180, Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(60, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.vote_poll(srv.post_id.clone(), "opt_a".to_string(), cx);
+        w.vote_poll(srv.post_id.clone(), "opt_b".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            srv.detail_get_completed.load(Ordering::SeqCst) > det_done_p
+                && !cw.read(cx).state.detail_loading
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let voted = &w.state.detail_post.as_ref().unwrap().post.poll.as_ref().unwrap().viewer_voted_option_ids;
+        assert_eq!(voted, &vec!["opt_b".to_string()], "T8-C4 Case A: stale detail must preserve pending opt_b");
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.poll_vote_in_flight.is_empty()
+                && st.poll_vote_dirty.is_empty()
+                && srv.poll_vote_completed.load(Ordering::SeqCst) >= pv_done_s + 2
+        })
+        .await
+    );
+    assert_eq!(srv.poll_vote_in_flight_max.load(Ordering::SeqCst), 1);
+    assert_eq!(*srv.single_poll_voted.lock().unwrap(), vec!["opt_b".to_string()]);
+
+    // Single-select F1 OK (opt_a) + F2 500 (opt_b) vs slow load_post_detail -> Case B reload
+    let det_rx_poll = srv.detail_get_received.load(Ordering::SeqCst);
+    let pv_b = srv.poll_vote_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(320, Ordering::SeqCst);
+    srv.poll_vote_delay_ms.store(60, Ordering::SeqCst);
+    srv.fail_second_flight.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.vote_poll(srv.post_id.clone(), "opt_a".to_string(), cx);
+        w.vote_poll(srv.post_id.clone(), "opt_b".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.poll_vote_in_flight.is_empty()
+                && !st.detail_loading
+                && srv.poll_vote_completed.load(Ordering::SeqCst) >= pv_b + 2
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_poll + 2
+        })
+        .await,
+        "T8-C4 Case B: poll F2 500 must trigger Case B detail reload"
+    );
+    srv.poll_vote_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        let voted = &w.state.detail_post.as_ref().unwrap().post.poll.as_ref().unwrap().viewer_voted_option_ids;
+        assert_eq!(voted, &vec!["opt_a".to_string()]);
+    });
+
+    // Multi-select rapid opt_a -> opt_b (0 lost update!)
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.mpoll_id.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.detail_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.mpoll_id)
+        })
+        .await
+    );
+    srv.poll_vote_in_flight_max.store(0, Ordering::SeqCst);
+    let pv_done_m = srv.poll_vote_completed.load(Ordering::SeqCst);
+    srv.poll_vote_delay_ms.store(120, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.vote_poll(srv.mpoll_id.clone(), "opt_a".to_string(), cx);
+        w.vote_poll(srv.mpoll_id.clone(), "opt_b".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            st.poll_vote_in_flight.is_empty()
+                && st.poll_vote_dirty.is_empty()
+                && srv.poll_vote_completed.load(Ordering::SeqCst) >= pv_done_m + 2
+        })
+        .await,
+        "T8-C4 multi-select rapid opt_a->opt_b must flush sequentially without lost update"
+    );
+    assert_eq!(srv.poll_vote_in_flight_max.load(Ordering::SeqCst), 1);
+    let _ = cw.read_with(app, |w, _| {
+        let voted = &w.state.detail_post.as_ref().unwrap().post.poll.as_ref().unwrap().viewer_voted_option_ids;
+        assert!(
+            voted.contains(&"opt_a".to_string()) && voted.contains(&"opt_b".to_string()),
+            "T8-C4 multi-select UI must contain BOTH opt_a and opt_b, got {voted:?}"
+        );
+        let srv_v = srv.multi_poll_voted.lock().unwrap().clone();
+        assert!(
+            srv_v.contains(&"opt_a".to_string()) && srv_v.contains(&"opt_b".to_string()),
+            "T8-C4 multi-select Server must contain BOTH opt_a and opt_b, got {srv_v:?}"
+        );
+    });
+}
+
+async fn run_r8_group_d_award_fences_and_secondary(
+    app: &mut AsyncApp,
+    shell: &Entity<AppShell>,
+    cw: &Entity<CommunityWorkspace>,
+    srv: &Arc<R8MockState>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // ------------------------------------------------------------------
+    // T8-D1 (ADV-1 give_award): Case B vs slow load_post_detail + actor-switch fence
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.post_id.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.detail_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.post_id)
+        })
+        .await
+    );
+    let det_rx_aw = srv.detail_get_received.load(Ordering::SeqCst);
+    let aw_done = srv.post_award_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.post_award_delay_ms.store(40, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.give_award(srv.post_id.clone(), "rocket".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            !cw.read(cx).state.detail_loading
+                && srv.post_award_completed.load(Ordering::SeqCst) > aw_done
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_aw + 2
+        })
+        .await,
+        "T8-D1 (ADV-1): give_award must trigger Case B detail reload"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let ui_rockets = w
+            .state
+            .detail_post
+            .as_ref()
+            .unwrap()
+            .post
+            .awards
+            .iter()
+            .filter(|a| a.award_kind == "rocket")
+            .count();
+        let srv_rockets = srv
+            .post_awards
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.award_kind == "rocket")
+            .count();
+        assert_eq!(ui_rockets, 1);
+        assert_eq!(srv_rockets, 1);
+    });
+
+    // ------------------------------------------------------------------
+    // T8-D2: Actor-Switch Fence + All 4 Busy-Flag Resets + Bot Studio Facade Restore-Before-Fence
+    // ------------------------------------------------------------------
+    let cp_before = srv.create_post_completed.load(Ordering::SeqCst);
+    let up_before = srv.update_post_completed.load(Ordering::SeqCst);
+    let cc_before = srv.create_comment_completed.load(Ordering::SeqCst);
+    let sig_before = srv.signal_completed.load(Ordering::SeqCst);
+    let sum_before = srv.summon_completed.load(Ordering::SeqCst);
+    let aw_before = srv.post_award_completed.load(Ordering::SeqCst);
+    srv.create_post_delay_ms.store(140, Ordering::SeqCst);
+    srv.update_post_delay_ms.store(140, Ordering::SeqCst);
+    srv.create_comment_delay_ms.store(140, Ordering::SeqCst);
+    srv.signal_delay_ms.store(140, Ordering::SeqCst);
+    srv.summon_delay_ms.store(140, Ordering::SeqCst);
+    srv.post_award_delay_ms.store(140, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        // Trigger busy flags & delayed RPCs under owner_id
+        w.state.quick_post_body = "Delayed quick post".to_string();
+        w.submit_quick_post(cx);
+        assert!(w.state.quick_post_submitting);
+
+        w.state.quote_post_draft = "Delayed quote".to_string();
+        w.submit_quote_post(srv.post_id.clone(), cx);
+
+        w.state.detail_reply_draft = "Delayed reply".to_string();
+        w.submit_detail_reply(cx);
+
+        w.report_post_or_comment(srv.post_id.clone(), None, Some(srv.slug.clone()), "spam".to_string(), cx);
+
+        w.summon_bot_with_options(srv.post_id.clone(), Some(srv.alt_id.clone()), Some("hi".to_string()), None, cx);
+        assert!(w.state.detail_summon_pending);
+
+        w.give_award(srv.post_id.clone(), "gold".to_string(), cx);
+
+        // Composer Edit busy flag
+        let p = srv.build_post();
+        w.open_composer_edit(p, cx);
+        w.state.composer.body = "Delayed edit".to_string();
+        w.submit_composer(PostStatus::Published, cx);
+        assert!(w.state.composer.submitting);
+
+        // Bot Studio test post busy flag (must restore facade.active_actor_id BEFORE early return!)
+        w.state.bot_studio_test_content = "Delayed bot test".to_string();
+        w.run_bot_studio_test_post(srv.bot_b_id.clone(), cx);
+        assert!(w.state.bot_studio_test_submitting);
+
+        // Switch immediately to alt_id! ALL 4 busy flags must reset synchronously!
+        w.switch_active_actor(srv.alt_id.clone(), cx);
+        assert!(!w.state.quick_post_submitting, "T8-D2: quick_post_submitting must reset on actor switch");
+        assert!(!w.state.detail_summon_pending, "T8-D2: detail_summon_pending must reset on actor switch");
+        assert!(!w.state.composer.submitting, "T8-D2: composer.submitting must reset on actor switch");
+        assert!(!w.state.bot_studio_test_submitting, "T8-D2: bot_studio_test_submitting must reset on actor switch");
+    });
+    // Clear toasts right after switch so we can assert ZERO stale toasts leak into alt_id!
+    let _ = shell.update(app, |s, _| {
+        s.window_runtime.controller.current_toast = None;
+        s.window_runtime.controller.toast_queue.clear();
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |_| {
+            srv.create_post_completed.load(Ordering::SeqCst) >= cp_before + 3
+                && srv.update_post_completed.load(Ordering::SeqCst) > up_before
+                && srv.create_comment_completed.load(Ordering::SeqCst) > cc_before
+                && srv.signal_completed.load(Ordering::SeqCst) > sig_before
+                && srv.summon_completed.load(Ordering::SeqCst) > sum_before
+                && srv.post_award_completed.load(Ordering::SeqCst) > aw_before
+        })
+        .await,
+        "T8-D2: all delayed owner RPCs must finish server-side"
+    );
+    app.background_executor().timer(Duration::from_millis(40)).await;
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(w.state.active_actor_id, srv.alt_id);
+        assert_eq!(
+            w.facade.active_actor_id().as_deref(),
+            Some(srv.alt_id.as_str()),
+            "T8-D2 CRITICAL: run_bot_studio_test_post must restore facade active_actor_id to alt_id BEFORE actor_switch_gen early return!"
+        );
+        assert!(
+            w.state.detail_summon_feedback.is_none(),
+            "T8-D2: stale summon feedback must NOT leak into alt_id"
+        );
+    });
+    let _ = shell.read_with(app, |s, _| {
+        let ctrl = &s.window_runtime.controller;
+        let leaked = ctrl
+            .current_toast
+            .iter()
+            .chain(ctrl.toast_queue.iter())
+            .any(|t| {
+                t.text.contains("Post published")
+                    || t.text.contains("Report submitted")
+                    || t.text.contains("Bot summoned")
+                    || t.text.contains("Bot test post")
+                    || t.text.contains("Post saved")
+            });
+        assert!(!leaked, "T8-D2: stale Actor A toasts must NOT leak into Actor B");
+    });
+
+    // Also test publish_draft_now, submit_composer Create, and run_bot_studio_trigger_reply actor-switch fences
+    let cp_before_2 = srv.create_post_completed.load(Ordering::SeqCst);
+    let up_before_2 = srv.update_post_completed.load(Ordering::SeqCst);
+    let sum_before_2 = srv.summon_completed.load(Ordering::SeqCst);
+    srv.create_post_delay_ms.store(120, Ordering::SeqCst);
+    srv.update_post_delay_ms.store(120, Ordering::SeqCst);
+    srv.summon_delay_ms.store(120, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.open_composer_modal(None, cx);
+        w.state.composer.body = "Delayed composer create".to_string();
+        w.submit_composer(PostStatus::Published, cx);
+        w.publish_draft_now(srv.draft_id.clone(), cx);
+        w.state.bot_studio_test_last_post_id = Some(srv.post_id.clone());
+        w.run_bot_studio_trigger_reply(srv.bot_b_id.clone(), cx);
+        w.switch_active_actor(srv.owner_id.clone(), cx);
+        assert!(!w.state.composer.submitting && !w.state.bot_studio_test_submitting);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |_| {
+            srv.create_post_completed.load(Ordering::SeqCst) > cp_before_2
+                && srv.update_post_completed.load(Ordering::SeqCst) > up_before_2
+                && srv.summon_completed.load(Ordering::SeqCst) > sum_before_2
+        })
+        .await
+    );
+    srv.draft_published.store(false, Ordering::SeqCst);
+
+    // ------------------------------------------------------------------
+    // T8-D3: Non-Single-Flight Case B & Secondary-Action Matrix
+    // ------------------------------------------------------------------
+    // 1) save_community_wiki & save_community_rules vs slow load_community_page
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.community_loading && cw.read(cx).state.community_detail.is_some()
+        })
+        .await
+    );
+    let comm_rx_w = srv.comm_get_received.load(Ordering::SeqCst);
+    let wiki_done = srv.wiki_put_completed.load(Ordering::SeqCst);
+    srv.comm_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.wiki_put_delay_ms.store(40, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_community_page(srv.slug.clone(), cx);
+        w.state.community_wiki_draft = "Updated Wiki R8".to_string();
+        w.save_community_wiki(srv.slug.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            !cw.read(cx).state.community_wiki_saving
+                && !cw.read(cx).state.community_loading
+                && srv.wiki_put_completed.load(Ordering::SeqCst) > wiki_done
+                && srv.comm_get_received.load(Ordering::SeqCst) >= comm_rx_w + 2
+        })
+        .await,
+        "T8-D3: save_community_wiki must trigger Case B community reload"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(w.state.community_detail.as_ref().unwrap().community.wiki_markdown, "Updated Wiki R8");
+    });
+
+    let comm_rx_r = srv.comm_get_received.load(Ordering::SeqCst);
+    let cp_done_r = srv.comm_patch_completed.load(Ordering::SeqCst);
+    srv.comm_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.comm_patch_delay_ms.store(40, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_community_page(srv.slug.clone(), cx);
+        w.state.community_new_rule_title = "Rule One R8".to_string();
+        w.add_community_rule(srv.slug.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            !cw.read(cx).state.community_rules_saving
+                && !cw.read(cx).state.community_loading
+                && srv.comm_patch_completed.load(Ordering::SeqCst) > cp_done_r
+                && srv.comm_get_received.load(Ordering::SeqCst) >= comm_rx_r + 2
+        })
+        .await,
+        "T8-D3: save_community_rules must trigger Case B community reload"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w
+            .state
+            .community_detail
+            .as_ref()
+            .unwrap()
+            .community
+            .rules
+            .iter()
+            .any(|r| r.title == "Rule One R8"));
+    });
+
+    // 2) execute_mod_decision & execute_mod_console_action vs mid-flight load_mod_queue (mod_gen bumped!)
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ModQueue(Some(srv.slug.clone())), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.mod_loading && cw.read(cx).state.mod_queue.len() == 2
+        })
+        .await
+    );
+    let ma_done_1 = srv.mod_action_completed.load(Ordering::SeqCst);
+    srv.mod_action_delay_ms.store(120, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.execute_mod_decision(
+            srv.slug.clone(),
+            "mq_r8_1".to_string(),
+            "post".to_string(),
+            srv.post_id.clone(),
+            ModActionKind::Approve,
+            cx,
+        );
+        // Mid-flight load_mod_queue bumps mod_gen! Previously this aborted post-commit reload!
+        w.load_mod_queue(srv.slug.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.mod_loading
+                && srv.mod_action_completed.load(Ordering::SeqCst) > ma_done_1
+                && !st.mod_queue.iter().any(|it| it.item_id == "mq_r8_1")
+        })
+        .await,
+        "T8-D3: execute_mod_decision must reload mod_queue even when mid-flight load_mod_queue bumped mod_gen"
+    );
+    let ma_done_2 = srv.mod_action_completed.load(Ordering::SeqCst);
+    srv.mod_action_delay_ms.store(120, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.execute_mod_console_action(
+            srv.slug.clone(),
+            ModActionKind::Approve,
+            "post".to_string(),
+            srv.post_id.clone(),
+            Some("mq_r8_2".to_string()),
+            cx,
+        );
+        w.load_mod_queue(srv.slug.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.mod_loading
+                && srv.mod_action_completed.load(Ordering::SeqCst) > ma_done_2
+                && st.mod_queue.is_empty()
+        })
+        .await,
+        "T8-D3: execute_mod_console_action must reload mod_queue even when mod_gen bumped"
+    );
+
+    // 3) publish_draft_now vs slow load_composer_drafts (0 draft resurrection)
+    let dr_rx = srv.drafts_get_received.load(Ordering::SeqCst);
+    let up_dr = srv.update_post_completed.load(Ordering::SeqCst);
+    srv.drafts_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.update_post_delay_ms.store(40, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_composer_drafts(cx);
+        w.publish_draft_now(srv.draft_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            !cw.read(cx).state.composer.drafts_loading
+                && srv.update_post_completed.load(Ordering::SeqCst) > up_dr
+                && srv.drafts_get_received.load(Ordering::SeqCst) >= dr_rx + 2
+        })
+        .await,
+        "T8-D3: publish_draft_now must reload drafts when drafts_loading is in-flight"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert!(
+            !w.state.composer.drafts.iter().any(|d| d.post_id == srv.draft_id),
+            "T8-D3: published draft must NOT resurrect"
+        );
+    });
+
+    // 4) submit_quick_post & submit_composer Edit vs slow load_feed / load_post_detail
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::Feed, cx);
+    });
+    assert!(pump_until(app, Duration::from_secs(4), |cx| !cw.read(cx).state.feed_loading).await);
+    let feed_rx_qp = srv.feed_get_received.load(Ordering::SeqCst);
+    let cp_qp = srv.create_post_completed.load(Ordering::SeqCst);
+    srv.feed_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.create_post_delay_ms.store(40, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_feed(cx);
+        w.state.quick_post_body = "Fresh Quick R8".to_string();
+        w.submit_quick_post(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            !cw.read(cx).state.feed_loading
+                && !cw.read(cx).state.quick_post_submitting
+                && srv.create_post_completed.load(Ordering::SeqCst) > cp_qp
+                && srv.feed_get_received.load(Ordering::SeqCst) >= feed_rx_qp + 2
+        })
+        .await,
+        "T8-D3: submit_quick_post must reload feed when feed_loading is in-flight"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.feed_items.iter().any(|it| it.post.body == "Fresh Quick R8"));
+    });
+
+    // submit_composer Edit vs slow load_post_detail
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.post_id.clone()), cx);
+    });
+    assert!(pump_until(app, Duration::from_secs(4), |cx| !cw.read(cx).state.detail_loading).await);
+    let det_rx_ed = srv.detail_get_received.load(Ordering::SeqCst);
+    let up_ed = srv.update_post_completed.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.update_post_delay_ms.store(40, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        let p = srv.build_post();
+        w.open_composer_edit(p, cx);
+        w.state.composer.body = "Edited Body R8".to_string();
+        w.submit_composer(PostStatus::Published, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            !cw.read(cx).state.detail_loading
+                && !cw.read(cx).state.composer.submitting
+                && srv.update_post_completed.load(Ordering::SeqCst) > up_ed
+                && srv.detail_get_received.load(Ordering::SeqCst) >= det_rx_ed + 2
+        })
+        .await,
+        "T8-D3: submit_composer Edit must reload PostDetail when detail_loading is in-flight"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(w.state.detail_post.as_ref().unwrap().post.body, "Edited Body R8");
+    });
+
+    // 5) mark_single_notification_read HTTP 500 resync & mark_all_notifications_read unread > 0 resync
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::Notifications, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.notifications_loading && cw.read(cx).state.unread_notifications == 2
+        })
+        .await
+    );
+    let ng_before_500 = srv.notifs_get_completed.load(Ordering::SeqCst);
+    let nr_before_500 = srv.notif_read_completed.load(Ordering::SeqCst);
+    srv.notif_read_fail_500.store(true, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.mark_single_notification_read("n_r8_1".to_string(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.notifications_loading
+                && srv.notif_read_completed.load(Ordering::SeqCst) > nr_before_500
+                && srv.notifs_get_completed.load(Ordering::SeqCst) > ng_before_500
+        })
+        .await,
+        "T8-D3: mark_single_notification_read HTTP 500 must resync via load_notifications"
+    );
+    srv.notif_read_fail_500.store(false, Ordering::SeqCst);
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(w.state.unread_notifications, 2, "T8-D3: HTTP 500 resync restores unread=2");
+        assert!(w.state.notifications.iter().any(|n| n.notif_id == "n_r8_1" && !n.is_read));
+    });
+
+    // mark_all_notifications_read with unread > 0 mismatch when notifications_gen bumped
+    let ng_before_all = srv.notifs_get_completed.load(Ordering::SeqCst);
+    let nr_before_all = srv.notif_read_completed.load(Ordering::SeqCst);
+    srv.notif_read_override_unread.store(1, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.mark_all_notifications_read(cx);
+        w.state.notifications_gen = w.state.notifications_gen.wrapping_add(1);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.notifications_loading
+                && srv.notif_read_completed.load(Ordering::SeqCst) > nr_before_all
+                && srv.notifs_get_completed.load(Ordering::SeqCst) > ng_before_all
+        })
+        .await,
+        "T8-D3: mark_all_notifications_read must resync when unread > 0 mismatches stale UI"
+    );
+
+    // 6) save_selected_bot_edits switching Bot A -> Bot B mid-save -> 0 selection hijack!
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::BotStudio, cx);
+        let bot_a = w
+            .state
+            .identities
+            .as_ref()
+            .unwrap()
+            .bot_actors
+            .iter()
+            .find(|b| b.actor_id == srv.alt_id)
+            .cloned()
+            .unwrap();
+        let bot_b = w
+            .state
+            .identities
+            .as_ref()
+            .unwrap()
+            .bot_actors
+            .iter()
+            .find(|b| b.actor_id == srv.bot_b_id)
+            .cloned()
+            .unwrap();
+        w.select_bot_for_studio(bot_a, cx);
+        w.state.bot_studio_edit.display_name = "Bot A Renamed".to_string();
+        srv.actor_patch_delay_ms.store(140, Ordering::SeqCst);
+        w.save_selected_bot_edits(cx);
+        // Immediately switch selection to Bot B while Bot A save is in-flight!
+        w.select_bot_for_studio(bot_b, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.bot_studio_edit.saving
+                && srv.actor_patch_completed.load(Ordering::SeqCst) >= 1
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(
+            w.state.bot_studio_selected_bot_id.as_deref(),
+            Some(srv.bot_b_id.as_str()),
+            "T8-D3: save_selected_bot_edits must NOT hijack selection back from Bot B to Bot A"
+        );
+    });
+
+    // 7) delete_post_action vs slow load_feed & slow load_post_detail (!navigate_back) -> 0 ghost resurrection!
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.post_id.clone()), cx);
+    });
+    assert!(pump_until(app, Duration::from_secs(4), |cx| !cw.read(cx).state.detail_loading).await);
+    let del_done = srv.delete_post_completed.load(Ordering::SeqCst);
+    let feed_rx_del = srv.feed_get_received.load(Ordering::SeqCst);
+    srv.detail_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.feed_get_delay_ms.store(260, Ordering::SeqCst);
+    srv.delete_post_delay_ms.store(40, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.load_post_detail(srv.post_id.clone(), cx);
+        w.load_feed(cx);
+        w.delete_post_action(srv.post_id.clone(), false, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && !st.feed_loading
+                && srv.delete_post_completed.load(Ordering::SeqCst) > del_done
+                && srv.feed_get_received.load(Ordering::SeqCst) >= feed_rx_del + 2
+        })
+        .await,
+        "T8-D3: delete_post_action must fence detail_gen & reload feed_loading without resurrecting deleted post"
+    );
+    app.background_executor().timer(Duration::from_millis(60)).await;
+    let _ = cw.read_with(app, |w, _| {
+        assert!(w.state.detail_post.is_none(), "T8-D3: deleted post must NOT resurrect into detail_post");
+        assert!(
+            !w.state.feed_items.iter().any(|it| it.post.post_id == srv.post_id),
+            "T8-D3: deleted post must NOT resurrect into feed_items"
+        );
+    });
+}
+
+
 
 
 

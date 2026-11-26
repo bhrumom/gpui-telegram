@@ -156,9 +156,18 @@ impl CommunityWorkspace {
             );
             return;
         }
-        let detail_pid = self.state.detail_post.as_ref().map(|d| d.post.post_id.clone());
+        let detail_pid = self
+            .state
+            .detail_post
+            .as_ref()
+            .map(|d| d.post.post_id.clone())
+            .or_else(|| match &self.state.route {
+                CommunityRoute::PostDetail(p) => Some(p.clone()),
+                _ => None,
+            });
         let req = UpdateCommentRequest { body };
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -167,7 +176,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
                 match res {
@@ -177,9 +188,7 @@ impl CommunityWorkspace {
                             c.updated_at_ms = updated.updated_at_ms;
                         });
                         this.cancel_edit_comment(cx);
-                        if let Some(pid) = detail_pid.as_deref() {
-                            this.reload_detail_if_loading_post(pid, cx);
-                        }
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         let lang = this.language_id.clone();
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
@@ -233,7 +242,15 @@ impl CommunityWorkspace {
             self.state.comment_vote_last_synced.remove(&comment_id);
             return;
         };
-        let detail_pid = self.state.detail_post.as_ref().map(|d| d.post.post_id.clone());
+        let detail_pid = self
+            .state
+            .detail_post
+            .as_ref()
+            .map(|d| d.post.post_id.clone())
+            .or_else(|| match &self.state.route {
+                CommunityRoute::PostDetail(p) => Some(p.clone()),
+                _ => None,
+            });
         self.state.comment_vote_dirty.remove(&comment_id);
         self.state.comment_vote_flight_seq = self.state.comment_vote_flight_seq.wrapping_add(1);
         let my_flight_seq = self.state.comment_vote_flight_seq;
@@ -282,12 +299,10 @@ impl CommunityWorkspace {
                             this.flush_comment_vote_sync(comment_id, cx);
                             return;
                         }
-                        this.state.reconcile_comment_vote(&resp);
-                        if let Some(pid) = detail_pid.as_deref() {
-                            this.reload_detail_if_loading_post(pid, cx);
-                        }
                         this.state.comment_vote_pending_dir.remove(&comment_id);
                         this.state.comment_vote_last_synced.remove(&comment_id);
+                        this.state.reconcile_comment_vote(&resp);
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         cx.notify();
                     }
                     Ok(Err(e)) => {
@@ -296,6 +311,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.comment_vote_last_synced.remove(&comment_id) {
                             this.state.rollback_comment_vote(&comment_id, snap);
                         }
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -311,6 +327,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.comment_vote_last_synced.remove(&comment_id) {
                             this.state.rollback_comment_vote(&comment_id, snap);
                         }
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         cx.notify();
                     }
                 }
@@ -320,6 +337,18 @@ impl CommunityWorkspace {
     }
 
     pub fn toggle_comment_like_action(&mut self, comment_id: String, cx: &mut Context<Self>) {
+        let baseline_liked = self
+            .state
+            .comment_like_pending_liked
+            .get(&comment_id)
+            .copied()
+            .or_else(|| {
+                self.state
+                    .find_comment(&comment_id)
+                    .map(|c| c.viewer_liked)
+            })
+            .unwrap_or(false);
+        let next_liked = !baseline_liked;
         if !self.state.comment_like_last_synced.contains_key(&comment_id) {
             if let Some(c) = self.state.find_comment(&comment_id) {
                 self.state
@@ -327,7 +356,12 @@ impl CommunityWorkspace {
                     .insert(comment_id.clone(), (c.viewer_liked, c.likes_count));
             }
         }
-        let _ = self.state.apply_optimistic_comment_like(&comment_id);
+        self.state
+            .comment_like_pending_liked
+            .insert(comment_id.clone(), next_liked);
+        let _ = self
+            .state
+            .apply_optimistic_comment_like_target(&comment_id, next_liked);
         cx.notify();
         if self.state.comment_like_in_flight.contains_key(&comment_id) {
             if !self.state.comment_like_pending_toggle.remove(&comment_id) {
@@ -339,7 +373,15 @@ impl CommunityWorkspace {
     }
 
     fn flush_comment_like_sync(&mut self, comment_id: String, cx: &mut Context<Self>) {
-        let detail_pid = self.state.detail_post.as_ref().map(|d| d.post.post_id.clone());
+        let detail_pid = self
+            .state
+            .detail_post
+            .as_ref()
+            .map(|d| d.post.post_id.clone())
+            .or_else(|| match &self.state.route {
+                CommunityRoute::PostDetail(p) => Some(p.clone()),
+                _ => None,
+            });
         self.state.comment_like_flight_seq = self.state.comment_like_flight_seq.wrapping_add(1);
         let my_flight_seq = self.state.comment_like_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
@@ -376,19 +418,20 @@ impl CommunityWorkspace {
                             this.flush_comment_like_sync(comment_id, cx);
                             return;
                         }
-                        this.state.reconcile_comment_like(&resp);
-                        if let Some(pid) = detail_pid.as_deref() {
-                            this.reload_detail_if_loading_post(pid, cx);
-                        }
+                        this.state.comment_like_pending_liked.remove(&comment_id);
                         this.state.comment_like_last_synced.remove(&comment_id);
+                        this.state.reconcile_comment_like(&resp);
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         cx.notify();
                     }
                     Ok(Err(e)) => {
                         this.state.comment_like_pending_toggle.remove(&comment_id);
+                        this.state.comment_like_pending_liked.remove(&comment_id);
                         if let Some(snap) = this.state.comment_like_last_synced.remove(&comment_id)
                         {
                             this.state.rollback_comment_like(&comment_id, snap);
                         }
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -400,10 +443,12 @@ impl CommunityWorkspace {
                     }
                     Err(_) => {
                         this.state.comment_like_pending_toggle.remove(&comment_id);
+                        this.state.comment_like_pending_liked.remove(&comment_id);
                         if let Some(snap) = this.state.comment_like_last_synced.remove(&comment_id)
                         {
                             this.state.rollback_comment_like(&comment_id, snap);
                         }
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         cx.notify();
                     }
                 }
@@ -413,9 +458,18 @@ impl CommunityWorkspace {
     }
 
     pub fn give_comment_award_action(&mut self, comment_id: String, award_kind: String, cx: &mut Context<Self>) {
-        let detail_pid = self.state.detail_post.as_ref().map(|d| d.post.post_id.clone());
+        let detail_pid = self
+            .state
+            .detail_post
+            .as_ref()
+            .map(|d| d.post.post_id.clone())
+            .or_else(|| match &self.state.route {
+                CommunityRoute::PostDetail(p) => Some(p.clone()),
+                _ => None,
+            });
         self.state.active_popover = None;
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let req = GiveAwardRequest { award_kind, message: None };
@@ -426,15 +480,15 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
                 match res {
                     Ok(Ok(resp)) => {
                         this.state.reconcile_comment_awards(&resp);
-                        if let Some(pid) = detail_pid.as_deref() {
-                            this.reload_detail_if_loading_post(pid, cx);
-                        }
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
                         let lang = this.language_id.clone();
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
@@ -459,8 +513,17 @@ impl CommunityWorkspace {
     }
 
     pub fn delete_comment_action(&mut self, comment_id: String, cx: &mut Context<Self>) {
-        let reload_pid = self.state.detail_post.as_ref().map(|d| d.post.post_id.clone());
+        let reload_pid = self
+            .state
+            .detail_post
+            .as_ref()
+            .map(|d| d.post.post_id.clone())
+            .or_else(|| match &self.state.route {
+                CommunityRoute::PostDetail(p) => Some(p.clone()),
+                _ => None,
+            });
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let cid = comment_id.clone();
@@ -470,7 +533,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
                 match res {
@@ -481,10 +546,19 @@ impl CommunityWorkspace {
                         this.state.comment_vote_last_synced.remove(&comment_id);
                         this.state.comment_like_in_flight.remove(&comment_id);
                         this.state.comment_like_pending_toggle.remove(&comment_id);
+                        this.state.comment_like_pending_liked.remove(&comment_id);
                         this.state.comment_like_last_synced.remove(&comment_id);
+                        if let Some(ref mut prof) = this.state.actor_profile {
+                            prof.recent_comments.retain(|c| c.comment_id != comment_id);
+                        }
                         if let Some(pid) = reload_pid {
                             if this.state.route == CommunityRoute::PostDetail(pid.clone()) {
                                 this.load_post_detail(pid, cx);
+                            }
+                        }
+                        if this.state.profile_loading {
+                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
+                                this.load_actor_profile(h, cx);
                             }
                         }
                         let lang = this.language_id.clone();
@@ -542,7 +616,7 @@ impl CommunityWorkspace {
                 }
                 this.state.detail_loading_more_comment_ids.remove(&pcid);
                 match res {
-                    Ok(Ok(resp)) => {
+                    Ok(Ok(mut resp)) => {
                         if resp.has_more {
                             if let Some(next) = resp.next_cursor.filter(|s| !s.trim().is_empty()) {
                                 this.state
@@ -554,6 +628,7 @@ impl CommunityWorkspace {
                         } else {
                             this.state.detail_comment_more_cursors.remove(&pcid);
                         }
+                        this.state.overlay_in_flight_comments(&mut resp.comments);
                         this.state
                             .merge_loaded_comment_children(&pcid, resp.comments, resp.has_more);
                         cx.notify();
@@ -580,7 +655,15 @@ impl CommunityWorkspace {
         action: ModActionKind,
         cx: &mut Context<Self>,
     ) {
-        let reload_pid = self.state.detail_post.as_ref().map(|d| d.post.post_id.clone());
+        let reload_pid = self
+            .state
+            .detail_post
+            .as_ref()
+            .map(|d| d.post.post_id.clone())
+            .or_else(|| match &self.state.route {
+                CommunityRoute::PostDetail(p) => Some(p.clone()),
+                _ => None,
+            });
         let req = ModActionRequest {
             action,
             target_kind: "comment".to_string(),
@@ -590,6 +673,7 @@ impl CommunityWorkspace {
             queue_item_id: None,
         };
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -598,7 +682,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
                 match res {
@@ -646,6 +732,7 @@ impl CommunityWorkspace {
             queue_item_id: None,
         };
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -654,7 +741,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
                 match res {
@@ -686,6 +775,7 @@ impl CommunityWorkspace {
 
     pub fn delete_post_action(&mut self, post_id: String, navigate_back: bool, cx: &mut Context<Self>) {
         let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
@@ -695,14 +785,52 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
                 match res {
                     Ok(Ok(_)) => {
                         this.state.remove_post_from_caches(&post_id);
-                        if this.state.detail_post.as_ref().is_some_and(|d| d.post.post_id == post_id) {
+                        let on_deleted_detail = this
+                            .state
+                            .detail_post
+                            .as_ref()
+                            .is_some_and(|d| d.post.post_id == post_id)
+                            || matches!(&this.state.route, CommunityRoute::PostDetail(id) if id == &post_id);
+                        if on_deleted_detail {
                             this.state.detail_post = None;
+                            this.state.detail_gen = this.state.detail_gen.wrapping_add(1);
+                            this.state.detail_loading = false;
+                        }
+                        // Case B reloads: prevent any in-flight loader from resurrecting the deleted post.
+                        if this.state.feed_loading {
+                            this.load_feed(cx);
+                        }
+                        if this.state.saved_loading {
+                            this.load_saved_posts(cx);
+                        }
+                        if this.state.community_loading {
+                            if let CommunityRoute::CommunityPage(slug) = this.state.route.clone() {
+                                this.load_community_page(slug, cx);
+                            }
+                        }
+                        if this.state.profile_loading {
+                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
+                                this.load_actor_profile(h, cx);
+                            }
+                        }
+                        if this.state.search_loading
+                            && matches!(this.state.route, CommunityRoute::Explore { .. })
+                        {
+                            let q = this.state.explore_search_draft.trim().to_string();
+                            this.execute_search(q, this.state.search_tab, cx);
+                        }
+                        if this.state.list_feed_loading {
+                            if let Some(lid) = this.state.selected_list_id.clone() {
+                                this.load_selected_list_feed(lid, cx);
+                            }
                         }
                         let lang = this.language_id.clone();
                         this.emit_action(
@@ -747,6 +875,8 @@ impl CommunityWorkspace {
             target_actor_id,
             community_slug,
         };
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -755,6 +885,11 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    return;
+                }
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(_)) => this.emit_action(
@@ -831,6 +966,8 @@ impl CommunityWorkspace {
             }),
             parent_comment_id,
         };
+        let my_actor_gen = self.state.actor_switch_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let reload_pid = post_id.clone();
@@ -841,6 +978,11 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    return;
+                }
                 this.state.detail_summon_pending = false;
                 let lang = this.language_id.clone();
                 let still_on_post = this.state.route == CommunityRoute::PostDetail(reload_pid.clone());

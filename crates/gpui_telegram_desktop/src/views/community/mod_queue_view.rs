@@ -191,7 +191,6 @@ impl CommunityWorkspace {
             queue_item_id,
         };
         let my_actor_gen = self.state.actor_switch_gen;
-        let my_mod_gen = self.state.mod_gen;
         let submitter_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -204,7 +203,6 @@ impl CommunityWorkspace {
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != submitter_actor_id
-                    || this.state.mod_gen != my_mod_gen
                 {
                     return;
                 }
@@ -213,7 +211,14 @@ impl CommunityWorkspace {
                     Ok(Ok(_)) => {
                         this.state.mod_reason_draft.clear();
                         this.state.mod_flair_draft.clear();
-                        this.load_mod_queue(reload_slug, cx);
+                        if this
+                            .state
+                            .mod_slug
+                            .as_deref()
+                            .is_some_and(|s| s.eq_ignore_ascii_case(&reload_slug))
+                        {
+                            this.load_mod_queue(reload_slug, cx);
+                        }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: tr_str(&lang, "审核操作已执行", "Moderation action applied")
@@ -445,7 +450,6 @@ impl CommunityWorkspace {
 
     fn persist_automod_rules(&mut self, slug: String, reset_draft: bool, cx: &mut Context<Self>) {
         let slug_key = slug.to_ascii_lowercase();
-        self.state.automod_rules_gen = self.state.automod_rules_gen.wrapping_add(1);
         if reset_draft {
             self.state.automod_reset_draft_pending.insert(slug_key.clone());
         }
@@ -529,17 +533,6 @@ impl CommunityWorkspace {
                         this.state
                             .automod_last_synced
                             .insert(slug_key.clone(), updated.automod_rules.clone());
-                        if is_dirty && still_same_slug {
-                            // Newer optimistic rule toggles arrived mid-flight: preserve optimistic
-                            // `mod_community.automod_rules` and flush latest snapshot strictly next.
-                            this.flush_automod_rules_sync(slug, cx);
-                            return;
-                        }
-                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
-                        this.state.automod_last_synced.remove(&slug_key);
-                        if still_same_slug {
-                            this.state.mod_community = Some(updated.clone());
-                        }
                         if let Some(pos) = this
                             .state
                             .communities
@@ -550,13 +543,27 @@ impl CommunityWorkspace {
                         }
                         if let Some(ref mut cdet) = this.state.community_detail {
                             if cdet.community.slug.eq_ignore_ascii_case(&updated.slug) {
-                                cdet.community = updated;
+                                cdet.community = updated.clone();
                             }
                         }
                         if this.state.automod_reset_draft_pending.remove(&slug_key) {
                             this.state.automod_draft = AutoModRuleDraft::default();
                             if this.state.active_input.is_automod_input() {
                                 this.state.blur_input();
+                            }
+                        }
+                        if is_dirty && still_same_slug {
+                            // Newer optimistic rule toggles arrived mid-flight: preserve optimistic
+                            // `mod_community.automod_rules` and flush latest snapshot strictly next.
+                            this.flush_automod_rules_sync(slug, cx);
+                            return;
+                        }
+                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
+                        this.state.automod_last_synced.remove(&slug_key);
+                        if still_same_slug {
+                            this.state.mod_community = Some(updated);
+                            if this.state.mod_loading {
+                                this.load_mod_queue(slug, cx);
                             }
                         }
                         this.emit_action(
@@ -576,10 +583,26 @@ impl CommunityWorkspace {
                             if still_same_slug {
                                 if let Some(ref mut mc) = this.state.mod_community {
                                     if mc.slug.eq_ignore_ascii_case(&slug) {
-                                        mc.automod_rules = prev_rules;
+                                        mc.automod_rules = prev_rules.clone();
                                     }
                                 }
                             }
+                            if let Some(pos) = this
+                                .state
+                                .communities
+                                .iter()
+                                .position(|c| c.slug.eq_ignore_ascii_case(&slug))
+                            {
+                                this.state.communities[pos].automod_rules = prev_rules.clone();
+                            }
+                            if let Some(ref mut cdet) = this.state.community_detail {
+                                if cdet.community.slug.eq_ignore_ascii_case(&slug) {
+                                    cdet.community.automod_rules = prev_rules;
+                                }
+                            }
+                        }
+                        if this.state.mod_loading && still_same_slug {
+                            this.load_mod_queue(slug, cx);
                         }
                         this.state.automod_draft.error = Some(e.to_string());
                     }
@@ -591,10 +614,26 @@ impl CommunityWorkspace {
                             if still_same_slug {
                                 if let Some(ref mut mc) = this.state.mod_community {
                                     if mc.slug.eq_ignore_ascii_case(&slug) {
-                                        mc.automod_rules = prev_rules;
+                                        mc.automod_rules = prev_rules.clone();
                                     }
                                 }
                             }
+                            if let Some(pos) = this
+                                .state
+                                .communities
+                                .iter()
+                                .position(|c| c.slug.eq_ignore_ascii_case(&slug))
+                            {
+                                this.state.communities[pos].automod_rules = prev_rules.clone();
+                            }
+                            if let Some(ref mut cdet) = this.state.community_detail {
+                                if cdet.community.slug.eq_ignore_ascii_case(&slug) {
+                                    cdet.community.automod_rules = prev_rules;
+                                }
+                            }
+                        }
+                        if this.state.mod_loading && still_same_slug {
+                            this.load_mod_queue(slug, cx);
                         }
                         this.state.automod_draft.error = Some(e);
                     }

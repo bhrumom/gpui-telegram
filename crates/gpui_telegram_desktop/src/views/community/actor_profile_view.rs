@@ -91,13 +91,19 @@ impl CommunityWorkspace {
         if actor_id == self.state.active_actor_id {
             return;
         }
-        let next_muted = !currently_muted;
+        let effective_current = self
+            .state
+            .actor_mute_pending_target
+            .get(&actor_id)
+            .copied()
+            .unwrap_or(currently_muted);
+        let next_muted = !effective_current;
         if !self.state.actor_mute_last_synced.contains_key(&actor_id) {
             let orig_muted = self
                 .state
                 .find_actor(&actor_id)
                 .map(|a| a.is_muted)
-                .unwrap_or(currently_muted);
+                .unwrap_or(effective_current);
             self.state
                 .actor_mute_last_synced
                 .insert(actor_id.clone(), orig_muted);
@@ -179,11 +185,7 @@ impl CommunityWorkspace {
                         this.state.actor_mute_last_synced.remove(&actor_id);
                         this.state
                             .reconcile_mute_block(&actor_id, Some(target_muted), None);
-                        if this.state.profile_loading {
-                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
-                                this.load_actor_profile(h, cx);
-                            }
-                        }
+                        this.reload_actor_route_if_loading(cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: if target_muted {
@@ -207,6 +209,7 @@ impl CommunityWorkspace {
                             .unwrap_or(!target_muted);
                         this.state
                             .reconcile_mute_block(&actor_id, Some(orig_muted), None);
+                        this.reload_actor_route_if_loading(cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -226,6 +229,7 @@ impl CommunityWorkspace {
                             .unwrap_or(!target_muted);
                         this.state
                             .reconcile_mute_block(&actor_id, Some(orig_muted), None);
+                        this.reload_actor_route_if_loading(cx);
                         cx.notify();
                     }
                 }
@@ -243,13 +247,19 @@ impl CommunityWorkspace {
         if actor_id == self.state.active_actor_id {
             return;
         }
-        let next_blocked = !currently_blocked;
+        let effective_current = self
+            .state
+            .actor_block_pending_target
+            .get(&actor_id)
+            .copied()
+            .unwrap_or(currently_blocked);
+        let next_blocked = !effective_current;
         if !self.state.actor_block_last_synced.contains_key(&actor_id) {
             let orig = self
                 .state
                 .find_actor(&actor_id)
                 .map(|a| (a.is_blocked, a.is_following))
-                .unwrap_or((currently_blocked, false));
+                .unwrap_or((effective_current, false));
             self.state
                 .actor_block_last_synced
                 .insert(actor_id.clone(), orig);
@@ -257,6 +267,17 @@ impl CommunityWorkspace {
         self.state
             .actor_block_pending_target
             .insert(actor_id.clone(), next_blocked);
+        if next_blocked {
+            self.state
+                .actor_block_chain_had_block
+                .insert(actor_id.clone());
+            // Cross-lane Follow -> Block fence: invalidate any in-flight follow flight
+            // so a delayed Follow response can NEVER set `is_following = true` onto a blocked actor.
+            self.state.actor_follow_in_flight.remove(&actor_id);
+            self.state.actor_follow_dirty.remove(&actor_id);
+            self.state.actor_follow_pending_target.remove(&actor_id);
+            self.state.actor_follow_last_synced.remove(&actor_id);
+        }
         self.state
             .reconcile_mute_block(&actor_id, None, Some(next_blocked));
         cx.notify();
@@ -271,9 +292,15 @@ impl CommunityWorkspace {
         let Some(target_blocked) = self.state.actor_block_pending_target.get(&actor_id).copied()
         else {
             self.state.actor_block_dirty.remove(&actor_id);
+            self.state.actor_block_chain_had_block.remove(&actor_id);
             self.state.actor_block_last_synced.remove(&actor_id);
             return;
         };
+        if target_blocked {
+            self.state
+                .actor_block_chain_had_block
+                .insert(actor_id.clone());
+        }
         self.state.actor_block_dirty.remove(&actor_id);
         self.state.actor_block_flight_seq = self.state.actor_block_flight_seq.wrapping_add(1);
         let my_flight_seq = self.state.actor_block_flight_seq;
@@ -338,17 +365,14 @@ impl CommunityWorkspace {
                             return;
                         }
                         this.state.actor_block_pending_target.remove(&actor_id);
+                        this.state.actor_block_chain_had_block.remove(&actor_id);
                         this.state.actor_block_last_synced.remove(&actor_id);
                         this.state.restore_block_and_follow(
                             &actor_id,
                             target_blocked,
                             committed_following,
                         );
-                        if this.state.profile_loading {
-                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
-                                this.load_actor_profile(h, cx);
-                            }
-                        }
+                        this.reload_actor_route_if_loading(cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: if target_blocked {
@@ -366,6 +390,7 @@ impl CommunityWorkspace {
                     Ok(Err(e)) => {
                         this.state.actor_block_dirty.remove(&actor_id);
                         this.state.actor_block_pending_target.remove(&actor_id);
+                        this.state.actor_block_chain_had_block.remove(&actor_id);
                         let (orig_blocked, orig_following) = this
                             .state
                             .actor_block_last_synced
@@ -373,6 +398,7 @@ impl CommunityWorkspace {
                             .unwrap_or((!target_blocked, false));
                         this.state
                             .restore_block_and_follow(&actor_id, orig_blocked, orig_following);
+                        this.reload_actor_route_if_loading(cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -385,6 +411,7 @@ impl CommunityWorkspace {
                     Err(_) => {
                         this.state.actor_block_dirty.remove(&actor_id);
                         this.state.actor_block_pending_target.remove(&actor_id);
+                        this.state.actor_block_chain_had_block.remove(&actor_id);
                         let (orig_blocked, orig_following) = this
                             .state
                             .actor_block_last_synced
@@ -392,6 +419,7 @@ impl CommunityWorkspace {
                             .unwrap_or((!target_blocked, false));
                         this.state
                             .restore_block_and_follow(&actor_id, orig_blocked, orig_following);
+                        this.reload_actor_route_if_loading(cx);
                         cx.notify();
                     }
                 }

@@ -258,7 +258,10 @@ impl CommunityWorkspace {
                     if this.state.communities_gen == my_comm_gen
                         && this.state.actor_switch_gen == my_actor_gen
                     {
-                        if let Some(cm) = c {
+                        if let Some(mut cm) = c {
+                            for comm in &mut cm.communities {
+                                this.state.overlay_in_flight_community_mutations(comm);
+                            }
                             this.state.communities = cm.communities;
                         }
                     }
