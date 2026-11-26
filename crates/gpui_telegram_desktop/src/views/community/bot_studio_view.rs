@@ -22,7 +22,9 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use super::shared_widgets::{
     format_compact_count, render_actor_avatar, render_actor_badge_row, render_input_display,
 };
-use super::state::{ActiveCommunityInput, BotStudioEditDraft, CommunityWorkspaceAction};
+use super::state::{
+    ActiveCommunityInput, BotStudioEditDraft, CommunityRoute, CommunityWorkspaceAction,
+};
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
 const PRESET_CAPABILITIES: [&str; 6] = [
@@ -734,7 +736,7 @@ impl CommunityWorkspace {
                     || this.state.active_actor_id != expected_actor_id
                 {
                     if let Ok(Ok(created)) = res {
-                        this.reload_detail_if_loading_post(&created.post.post_id, true, cx);
+                        this.reload_routes_after_cross_actor_published_post(&created.post, cx);
                     }
                     return;
                 }
@@ -859,7 +861,18 @@ impl CommunityWorkspace {
                 {
                     if let Ok(Ok(ref resp)) = res {
                         if resp.triggered {
-                            this.reload_detail_if_loading_post(&jump_pid, true, cx);
+                            this.state.visit_post_mut(&jump_pid, |p| {
+                                p.comments_count = p.comments_count.saturating_add(1);
+                            });
+                            if this.state.route == CommunityRoute::PostDetail(jump_pid.clone()) {
+                                if this.state.feed_loading || this.state.feed_loading_more {
+                                    this.load_feed(cx);
+                                }
+                                this.load_post_detail(jump_pid, cx);
+                            } else {
+                                this.reload_detail_if_loading_post(&jump_pid, true, cx);
+                            }
+                            cx.notify();
                         }
                     }
                     return;
@@ -868,7 +881,17 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok(resp)) => {
                         if resp.triggered {
-                            this.reload_detail_if_loading_post(&jump_pid, true, cx);
+                            this.state.visit_post_mut(&jump_pid, |p| {
+                                p.comments_count = p.comments_count.saturating_add(1);
+                            });
+                            if this.state.route == CommunityRoute::PostDetail(jump_pid.clone()) {
+                                if this.state.feed_loading || this.state.feed_loading_more {
+                                    this.load_feed(cx);
+                                }
+                                this.load_post_detail(jump_pid.clone(), cx);
+                            } else {
+                                this.reload_detail_if_loading_post(&jump_pid, true, cx);
+                            }
                         }
                         this.state.bot_studio_test_last_post_id = Some(jump_pid);
                         let is_err = !resp.triggered;

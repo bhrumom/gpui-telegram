@@ -185,6 +185,7 @@ impl CommunityWorkspace {
         let target_kind_cb = target_kind.clone();
         let target_id_cb = target_id.clone();
         let flair_cb = flair.clone();
+        let queue_item_id_cb = queue_item_id.clone();
         let req = ModActionRequest {
             action,
             target_kind,
@@ -208,13 +209,15 @@ impl CommunityWorkspace {
                     || this.state.active_actor_id != submitter_actor_id
                 {
                     if res.as_ref().is_ok_and(Result::is_ok) {
+                        let on_mod_queue = matches!(this.state.route, CommunityRoute::ModQueue(_));
                         this.reconcile_mod_action_caches_and_routes(
                             &reload_slug,
                             action,
                             &target_kind_cb,
                             &target_id_cb,
                             flair_cb.as_deref(),
-                            false,
+                            queue_item_id_cb.as_deref(),
+                            on_mod_queue,
                             cx,
                         );
                     }
@@ -231,6 +234,7 @@ impl CommunityWorkspace {
                             &target_kind_cb,
                             &target_id_cb,
                             flair_cb.as_deref(),
+                            queue_item_id_cb.as_deref(),
                             true,
                             cx,
                         );
@@ -511,6 +515,13 @@ impl CommunityWorkspace {
         self.state.automod_dirty.remove(&slug_key);
         self.state.automod_flight_seq = self.state.automod_flight_seq.wrapping_add(1);
         let my_flight_seq = self.state.automod_flight_seq;
+        let entity_entry = self
+            .state
+            .automod_entity_save_seq
+            .entry(slug_key.clone())
+            .or_insert(0);
+        *entity_entry = entity_entry.wrapping_add(1);
+        let my_entity_seq = *entity_entry;
         let my_actor_gen = self.state.actor_switch_gen;
         let submitter_actor_id = self.state.active_actor_id.clone();
         self.state
@@ -542,16 +553,35 @@ impl CommunityWorkspace {
             let _ = weak.update(app, |this, cx| {
                 // Fence 1: Actor switch occurred (ABA-proof via actor_switch_gen + actor_id).
                 // Never clear another actor's saving state or write submitter's `viewer_role`
-                // into `mod_community`, `communities`, or `community_detail`; still apply
-                // public field-scoped `automod_rules` patch + Case B reloads on commit.
+                // into `mod_community`, `communities`, or `community_detail`. Gate public
+                // `automod_rules` patching on `is_latest_entity_save` + no active in-flight/dirty
+                // save for this slug (preventing cross-actor AutoMod ABA & server data loss), while
+                // still running Case B reloads whenever loading flags are active.
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != submitter_actor_id
                 {
                     if let Ok(Ok(updated)) = res {
-                        this.state.automod_rules_gen =
-                            this.state.automod_rules_gen.wrapping_add(1);
-                        this.state
-                            .patch_community_automod_rules(&updated.slug, &updated.automod_rules);
+                        let is_latest_entity_save = this
+                            .state
+                            .automod_entity_save_seq
+                            .get(&slug_key)
+                            .copied()
+                            == Some(my_entity_seq);
+                        if is_latest_entity_save
+                            && !this.state.automod_in_flight.contains_key(&slug_key)
+                            && !this.state.automod_dirty.contains(&slug_key)
+                        {
+                            this.state.automod_rules_gen =
+                                this.state.automod_rules_gen.wrapping_add(1);
+                            let slug_gen = this
+                                .state
+                                .automod_rules_gen_by_slug
+                                .entry(slug_key.clone())
+                                .or_insert(0);
+                            *slug_gen = slug_gen.wrapping_add(1);
+                            this.state
+                                .patch_community_automod_rules(&updated.slug, &updated.automod_rules);
+                        }
                         if this.state.communities_loading {
                             this.reload_communities_list(cx);
                         }
@@ -600,6 +630,12 @@ impl CommunityWorkspace {
                     Ok(Ok(updated)) => {
                         this.state.automod_rules_gen =
                             this.state.automod_rules_gen.wrapping_add(1);
+                        let slug_gen = this
+                            .state
+                            .automod_rules_gen_by_slug
+                            .entry(slug_key.clone())
+                            .or_insert(0);
+                        *slug_gen = slug_gen.wrapping_add(1);
                         this.state
                             .automod_last_synced
                             .insert(slug_key.clone(), updated.automod_rules.clone());

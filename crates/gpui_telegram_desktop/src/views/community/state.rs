@@ -1000,6 +1000,12 @@ pub struct CommunityWorkspaceState {
     pub automod_dry_run_is_bot: bool,
     pub automod_dry_run_result: Option<gpui_telegram_community::AutoModDecision>,
     pub automod_rules_gen: u64,
+    /// Monotonic per-slug AutoMod rules generation counter (isolates `load_mod_queue(slugB)` from
+    /// commits on `slugA` — `R11-R2-OBS-1`).
+    pub automod_rules_gen_by_slug: HashMap<String, u64>,
+    /// Monotonic per-slug AutoMod entity save sequence (bumped ONLY on `flush_automod_rules_sync`
+    /// start; NEVER cleared on `switch_active_actor` or `load_mod_queue` — `R11-R1-1`/`R11-HUNT-1a/1b`).
+    pub automod_entity_save_seq: HashMap<String, u64>,
     pub automod_flight_seq: u64,
     pub automod_in_flight: HashMap<String, u64>,
     pub automod_dirty: HashSet<String>,
@@ -1266,6 +1272,8 @@ impl Default for CommunityWorkspaceState {
             automod_dry_run_is_bot: false,
             automod_dry_run_result: None,
             automod_rules_gen: 0,
+            automod_rules_gen_by_slug: HashMap::new(),
+            automod_entity_save_seq: HashMap::new(),
             automod_flight_seq: 0,
             automod_in_flight: HashMap::new(),
             automod_dirty: HashSet::new(),
@@ -2043,6 +2051,11 @@ impl CommunityWorkspaceState {
     /// while unconditionally pruning `actor_profile.recent_comments`), clearing per-comment
     /// flight/UI state and decrementing post comment counts once.
     pub fn remove_comment_from_caches(&mut self, comment_id: &str) {
+        let edit_seq = self
+            .comment_edit_entity_save_seq
+            .entry(comment_id.to_string())
+            .or_insert(0);
+        *edit_seq = edit_seq.wrapping_add(1);
         let found_meta = self
             .find_comment(comment_id)
             .map(|c| (c.post_id.clone(), !c.is_deleted && !c.is_removed));
@@ -2114,13 +2127,16 @@ impl CommunityWorkspaceState {
         }
     }
 
-    /// Applies public moderation action state changes across all cached posts/comments.
+    /// Applies public moderation action state changes across all cached posts/comments and
+    /// immediately reconciles matching pending `mod_queue` entries for the target community.
     pub fn apply_mod_action_to_caches(
         &mut self,
+        slug: &str,
         action: ModActionKind,
         target_kind: &str,
         target_id: &str,
         flair: Option<&str>,
+        queue_item_id: Option<&str>,
     ) {
         if target_kind.eq_ignore_ascii_case("post") {
             match action {
@@ -2164,6 +2180,11 @@ impl CommunityWorkspaceState {
         } else if target_kind.eq_ignore_ascii_case("comment") {
             match action {
                 ModActionKind::Remove => {
+                    let edit_seq = self
+                        .comment_edit_entity_save_seq
+                        .entry(target_id.to_string())
+                        .or_insert(0);
+                    *edit_seq = edit_seq.wrapping_add(1);
                     self.visit_comment_mut(target_id, |c| c.is_removed = true);
                     if let Some(ref mut prof) = self.actor_profile {
                         prof.recent_comments.retain(|c| c.comment_id != target_id);
@@ -2181,6 +2202,35 @@ impl CommunityWorkspaceState {
                     self.visit_comment_mut(target_id, |c| c.is_mod_distinguished = dist);
                 }
                 _ => {}
+            }
+        }
+        let matching_mod_slug = self
+            .mod_slug
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(slug));
+        if matching_mod_slug {
+            let next_queue_status = match action {
+                ModActionKind::Approve => Some(ModQueueStatus::Approved),
+                ModActionKind::Remove => Some(ModQueueStatus::Removed),
+                ModActionKind::ResolveReport => Some(ModQueueStatus::Dismissed),
+                _ => None,
+            };
+            if let Some(next_status) = next_queue_status {
+                for q in &mut self.mod_queue {
+                    let matches_item = if let Some(qid) = queue_item_id {
+                        q.item_id == qid
+                    } else {
+                        q.target_id == target_id
+                            && q.target_kind.eq_ignore_ascii_case(target_kind)
+                            && q.status == ModQueueStatus::Pending
+                    };
+                    if matches_item {
+                        q.status = next_status;
+                    }
+                }
+                if let Some(filter) = self.mod_status_filter {
+                    self.mod_queue.retain(|q| q.status == filter);
+                }
             }
         }
     }

@@ -300,6 +300,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.bookmark_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .bookmark_in_flight
             .insert(post_id.clone(), my_flight_seq);
@@ -320,10 +321,27 @@ impl CommunityWorkspace {
         let handle = facade.runtime_handle().clone();
         let req_post_id = post_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade.bookmark_post(&req_post_id, &req).await
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(facade.bookmark_post(&req_post_id, &req).await)
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 // Guard 1: ABA-proof actor switch fence.
                 if this.state.actor_switch_gen != my_actor_gen

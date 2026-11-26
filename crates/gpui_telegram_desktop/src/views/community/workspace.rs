@@ -12,7 +12,8 @@ use gpui_telegram_client::{
 };
 use gpui_telegram_community::validate_create_comment_request;
 use gpui_telegram_proto::community_contracts::{
-    ActorFilter, CommentSort, CommunityIdentitiesResponse, CommunityPollVoteRequest, CommunitySearchRequestDto, CommunitySearchTab, CreateCommentRequest,
+    ActorFilter, CommentSort, CommunityIdentitiesResponse, CommunityPollVoteRequest,
+    CommunityPostDto, CommunitySearchRequestDto, CommunitySearchTab, CreateCommentRequest,
     CreatePostRequest, EngagementSignalKind, FeedItemDto, FeedRequestDto, FeedSort, FeedTab,
     GiveAwardRequest, MarkNotificationsReadRequest, ModActionKind, ModActionRequest, PostFormat,
     PostStatus, RecordSignalRequest, RepostRequest, TimeWindow, VoteRequest,
@@ -1320,7 +1321,7 @@ impl CommunityWorkspace {
                     || this.state.active_actor_id != expected_actor_id
                 {
                     if let Ok(Ok(created)) = res {
-                        this.reload_detail_if_loading_post(&created.post.post_id, true, cx);
+                        this.reload_routes_after_cross_actor_published_post(&created.post, cx);
                     }
                     return;
                 }
@@ -1420,15 +1421,65 @@ impl CommunityWorkspace {
         }
     }
 
+    pub(super) fn reload_routes_after_cross_actor_published_post(
+        &mut self,
+        post: &CommunityPostDto,
+        cx: &mut Context<Self>,
+    ) {
+        if post.status != PostStatus::Published || post.is_removed {
+            self.reload_detail_if_loading_post(&post.post_id, true, cx);
+            cx.notify();
+            return;
+        }
+        // Always refresh active actor's Feed (and matching CommunityPage / ActorProfile) cleanly
+        // via GET instead of injecting the submitter's DTO with submitter's viewer_vote/liked flags.
+        let was_feed_loading = self.state.feed_loading || self.state.feed_loading_more;
+        let was_comm_loading = self.state.community_loading || self.state.community_loading_more;
+        let was_profile_loading = self.state.profile_loading;
+        let on_matching_comm = post.community_slug.as_deref().is_some_and(|slug| {
+            matches!(
+                &self.state.route,
+                CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(slug)
+            )
+        });
+        let on_matching_author = matches!(
+            &self.state.route,
+            CommunityRoute::ActorProfile(h) if h.eq_ignore_ascii_case(&post.author_handle)
+        );
+        self.reload_detail_if_loading_post(&post.post_id, true, cx);
+        if !was_feed_loading {
+            self.load_feed(cx);
+        }
+        if on_matching_comm && !was_comm_loading {
+            if let CommunityRoute::CommunityPage(slug) = self.state.route.clone() {
+                self.load_community_page(slug, cx);
+            }
+        }
+        if on_matching_author && !was_profile_loading {
+            if let CommunityRoute::ActorProfile(h) = self.state.route.clone() {
+                self.load_actor_profile(h, cx);
+            }
+        }
+        cx.notify();
+    }
+
     pub(super) fn reload_comment_route_if_loading(
         &mut self,
         _detail_pid: Option<&str>,
         cx: &mut Context<Self>,
     ) {
+        if self.state.feed_loading || self.state.feed_loading_more {
+            self.load_feed(cx);
+        }
         match self.state.route.clone() {
             CommunityRoute::PostDetail(id) => {
                 if self.state.detail_loading {
                     self.load_post_detail(id, cx);
+                }
+            }
+            CommunityRoute::CommunityPage(slug) => {
+                if self.state.community_loading || self.state.community_loading_more {
+                    self.load_community_page(slug, cx);
                 }
             }
             CommunityRoute::ActorProfile(handle) => {
@@ -1611,11 +1662,18 @@ impl CommunityWorkspace {
         target_kind: &str,
         target_id: &str,
         flair: Option<&str>,
+        queue_item_id: Option<&str>,
         force_reload_matching_mod_queue: bool,
         cx: &mut Context<Self>,
     ) {
-        self.state
-            .apply_mod_action_to_caches(action, target_kind, target_id, flair);
+        self.state.apply_mod_action_to_caches(
+            slug,
+            action,
+            target_kind,
+            target_id,
+            flair,
+            queue_item_id,
+        );
         if target_kind.eq_ignore_ascii_case("post") {
             let on_target_detail = matches!(
                 &self.state.route,
@@ -1641,6 +1699,9 @@ impl CommunityWorkspace {
             }
         } else if target_kind.eq_ignore_ascii_case("comment") {
             if let CommunityRoute::PostDetail(id) = self.state.route.clone() {
+                if self.state.feed_loading || self.state.feed_loading_more {
+                    self.load_feed(cx);
+                }
                 self.load_post_detail(id, cx);
             } else {
                 self.reload_comment_route_if_loading(None, cx);
@@ -1651,7 +1712,10 @@ impl CommunityWorkspace {
             .mod_slug
             .as_deref()
             .is_some_and(|s| s.eq_ignore_ascii_case(slug));
-        if matching_mod_slug && (force_reload_matching_mod_queue || self.state.mod_loading) {
+        let on_mod_queue = matches!(self.state.route, CommunityRoute::ModQueue(_));
+        if matching_mod_slug
+            && (force_reload_matching_mod_queue || self.state.mod_loading || on_mod_queue)
+        {
             self.load_mod_queue(slug.to_string(), cx);
         }
         cx.notify();
@@ -1688,6 +1752,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.post_vote_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .post_vote_in_flight
             .insert(post_id.clone(), my_flight_seq);
@@ -1695,12 +1760,31 @@ impl CommunityWorkspace {
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade
-                    .vote_post(&pid, &VoteRequest { direction: target_dir })
-                    .await
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(
+                    facade
+                        .vote_post(&pid, &VoteRequest { direction: target_dir })
+                        .await,
+                )
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
@@ -1802,6 +1886,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.post_like_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .post_like_in_flight
             .insert(post_id.clone(), my_flight_seq);
@@ -1809,10 +1894,27 @@ impl CommunityWorkspace {
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade.toggle_post_like(&pid).await
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(facade.toggle_post_like(&pid).await)
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
@@ -1907,6 +2009,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.post_repost_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .post_repost_in_flight
             .insert(post_id.clone(), my_flight_seq);
@@ -1914,10 +2017,27 @@ impl CommunityWorkspace {
         let handle = facade.runtime_handle().clone();
         let pid = post_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade.repost(&pid, &RepostRequest::default()).await
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(facade.repost(&pid, &RepostRequest::default()).await)
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
@@ -2004,7 +2124,13 @@ impl CommunityWorkspace {
                     || this.state.active_actor_id != expected_actor_id
                 {
                     if let Ok(Ok(created)) = res {
-                        this.reload_detail_if_loading_post(&created.post.post_id, true, cx);
+                        let was_detail_loading = this.state.detail_loading;
+                        this.reload_routes_after_cross_actor_published_post(&created.post, cx);
+                        if !was_detail_loading
+                            && this.state.route == CommunityRoute::PostDetail(quoted_pid.clone())
+                        {
+                            this.load_post_detail(quoted_pid, cx);
+                        }
                     }
                     return;
                 }
@@ -2120,6 +2246,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.poll_vote_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .poll_vote_in_flight
             .insert(post_id.clone(), my_flight_seq);
@@ -2128,12 +2255,31 @@ impl CommunityWorkspace {
         let pid = post_id.clone();
         let req_options = target_option_ids.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade
-                    .vote_poll(&pid, &CommunityPollVoteRequest { option_ids: req_options })
-                    .await
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(
+                    facade
+                        .vote_poll(&pid, &CommunityPollVoteRequest { option_ids: req_options })
+                        .await,
+                )
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
@@ -2202,23 +2348,43 @@ impl CommunityWorkspace {
         self.state.active_popover = None;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         let pid_cb = post_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade
-                    .give_post_award(
-                        &post_id,
-                        &GiveAwardRequest {
-                            award_kind,
-                            message: None,
-                        },
-                    )
-                    .await
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(
+                    facade
+                        .give_post_award(
+                            &post_id,
+                            &GiveAwardRequest {
+                                award_kind,
+                                message: None,
+                            },
+                        )
+                        .await,
+                )
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
@@ -2567,6 +2733,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.community_join_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let submitter_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .community_join_in_flight
             .insert(slug_key.clone(), my_flight_seq);
@@ -2574,14 +2741,31 @@ impl CommunityWorkspace {
         let handle = facade.runtime_handle().clone();
         let req_slug = slug.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                if target_join {
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == submitter_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(if target_join {
                     facade.join_community(&req_slug).await
                 } else {
                     facade.leave_community(&req_slug).await
-                }
+                })
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != submitter_actor_id
@@ -2711,6 +2895,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.actor_follow_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .actor_follow_in_flight
             .insert(actor_id.clone(), my_flight_seq);
@@ -2718,14 +2903,31 @@ impl CommunityWorkspace {
         let handle = facade.runtime_handle().clone();
         let aid = actor_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                if target_follow {
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(if target_follow {
                     facade.follow_actor(&aid).await
                 } else {
                     facade.unfollow_actor(&aid).await
-                }
+                })
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
@@ -3033,8 +3235,21 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
-                    if res.as_ref().is_ok_and(Result::is_ok) {
-                        this.reload_detail_if_loading_post(&reload_pid, true, cx);
+                    if let Ok(Ok(ref resp)) = res {
+                        if !resp.comment.is_removed && !resp.comment.is_deleted {
+                            this.state.visit_post_mut(&reload_pid, |p| {
+                                p.comments_count = p.comments_count.saturating_add(1);
+                            });
+                        }
+                        if this.state.route == CommunityRoute::PostDetail(reload_pid.clone()) {
+                            if this.state.feed_loading || this.state.feed_loading_more {
+                                this.load_feed(cx);
+                            }
+                            this.load_post_detail(reload_pid, cx);
+                        } else {
+                            this.reload_detail_if_loading_post(&reload_pid, true, cx);
+                        }
+                        cx.notify();
                     }
                     return;
                 }
@@ -3465,7 +3680,13 @@ impl CommunityWorkspace {
             .is_some_and(|s| s.eq_ignore_ascii_case(&slug));
         self.state.mod_gen = self.state.mod_gen.wrapping_add(1);
         let my_gen = self.state.mod_gen;
-        let my_automod_rules_gen = self.state.automod_rules_gen;
+        let slug_key_init = slug.to_ascii_lowercase();
+        let my_automod_rules_gen = self
+            .state
+            .automod_rules_gen_by_slug
+            .get(&slug_key_init)
+            .copied()
+            .unwrap_or(0);
         self.state.mod_slug = Some(slug.clone());
         self.state.mod_loading = true;
         self.state.mod_error = None;
@@ -3497,9 +3718,15 @@ impl CommunityWorkspace {
                         let mut comm = d.community;
                         this.state.overlay_in_flight_community_mutations(&mut comm);
                         let slug_key = comm.slug.to_ascii_lowercase();
+                        let cur_automod_rules_gen = this
+                            .state
+                            .automod_rules_gen_by_slug
+                            .get(&slug_key)
+                            .copied()
+                            .unwrap_or(0);
                         let preserve_rules = this.state.automod_in_flight.contains_key(&slug_key)
                             || this.state.automod_dirty.contains(&slug_key)
-                            || this.state.automod_rules_gen != my_automod_rules_gen;
+                            || cur_automod_rules_gen != my_automod_rules_gen;
                         if preserve_rules {
                             if let Some(prev_rules) = this
                                 .state
@@ -3573,6 +3800,7 @@ impl CommunityWorkspace {
         }
         let target_kind_cb = target_kind.clone();
         let target_id_cb = target_id.clone();
+        let item_id_cb = item_id.clone();
         let req = ModActionRequest {
             action,
             target_kind,
@@ -3596,13 +3824,15 @@ impl CommunityWorkspace {
                     || this.state.active_actor_id != submitter_actor_id
                 {
                     if res.as_ref().is_ok_and(Result::is_ok) {
+                        let on_mod_queue = matches!(this.state.route, CommunityRoute::ModQueue(_));
                         this.reconcile_mod_action_caches_and_routes(
                             &reload_slug,
                             action,
                             &target_kind_cb,
                             &target_id_cb,
                             None,
-                            false,
+                            Some(item_id_cb.as_str()),
+                            on_mod_queue,
                             cx,
                         );
                     }
@@ -3616,6 +3846,7 @@ impl CommunityWorkspace {
                             &target_kind_cb,
                             &target_id_cb,
                             None,
+                            Some(item_id_cb.as_str()),
                             true,
                             cx,
                         );

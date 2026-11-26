@@ -133,6 +133,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.actor_mute_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .actor_mute_in_flight
             .insert(actor_id.clone(), my_flight_seq);
@@ -145,14 +146,31 @@ impl CommunityWorkspace {
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                if target_muted {
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(if target_muted {
                     facade.set_mute_block(&req).await.map(|_| ())
                 } else {
                     facade.remove_mute_block(&req).await.map(|_| ())
-                }
+                })
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
@@ -322,6 +340,7 @@ impl CommunityWorkspace {
         let my_flight_seq = self.state.actor_block_flight_seq;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
+        let expected_facade_actor = self.facade.active_actor_id();
         self.state
             .actor_block_in_flight
             .insert(actor_id.clone(), my_flight_seq);
@@ -334,14 +353,31 @@ impl CommunityWorkspace {
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                if target_blocked {
+            let still_same_actor = weak
+                .read_with(app, |this, _| {
+                    this.state.actor_switch_gen == my_actor_gen
+                        && this.state.active_actor_id == expected_actor_id
+                })
+                .unwrap_or(false);
+            if !still_same_actor {
+                return;
+            }
+            let raw_res = run_on_community_tokio(&handle, async move {
+                if facade.active_actor_id() != expected_facade_actor {
+                    return None;
+                }
+                Some(if target_blocked {
                     facade.set_mute_block(&req).await.map(|_| ())
                 } else {
                     facade.remove_mute_block(&req).await.map(|_| ())
-                }
+                })
             })
             .await;
+            let res = match raw_res {
+                Ok(Some(inner)) => Ok(inner),
+                Ok(None) => return,
+                Err(e) => Err(e),
+            };
             let _ = weak.update(app, |this, cx| {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id

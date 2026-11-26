@@ -687,8 +687,7 @@ impl CommunityWorkspace {
                         if is_latest_post_edit {
                             this.state.patch_edited_post_metadata(&updated);
                         }
-                        this.reload_detail_if_loading_post(&updated.post_id, true, cx);
-                        cx.notify();
+                        this.reload_routes_after_cross_actor_published_post(&updated, cx);
                     }
                     return;
                 }
@@ -1213,7 +1212,7 @@ impl CommunityWorkspace {
                 {
                     if let Ok(Ok(resp)) = res {
                         if requested_status == PostStatus::Published {
-                            this.reload_detail_if_loading_post(&resp.post.post_id, true, cx);
+                            this.reload_routes_after_cross_actor_published_post(&resp.post, cx);
                         }
                     }
                     return;
