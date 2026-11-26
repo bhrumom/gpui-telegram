@@ -25,6 +25,9 @@ bot-browser = { workspace = true }
 zeroize = { workspace = true }
 magpie_gateway = { workspace = true }
 gpui_telegram_webrtc = { workspace = true }
+orca_core = { workspace = true }
+orca_bots = { workspace = true }
+orca_ide = { workspace = true }
 gpui = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }

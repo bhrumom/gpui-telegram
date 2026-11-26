@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod cdp;
+pub mod design_mode;
 pub mod e2ee_sync;
 pub mod orchestrator;
 pub mod script_app;
@@ -13,6 +14,13 @@ pub use backend::{
     ActionOutcome, BrowserPerformanceMetrics, BrowserSessionBackend, CdpBrowserBackend,
     ChromeLaunchConfig, KeyEventKind, KeyInputEvent, NavigationResult, OffscreenFrameBuffer,
     PointerButton, PointerEventKind, PointerInputEvent,
+};
+pub use design_mode::{
+    DesignBoxEdges, DesignBoxModel, DesignCaptureContract, DesignDiffMode, DesignDomPayload,
+    DesignHoverTarget, DesignModeCapture, DesignModeCaptureOptions, DesignModeChatHandoff,
+    DesignModeError, DesignModeSpec, DesignOverlaySpec, DesignPin, DesignSourceMapRef,
+    DesignViewport, DomAncestorNode, RawSourceMapProbe, SourceMapFramework, SourceMapResolution,
+    SourceMapV3,
 };
 pub use e2ee_sync::*;
 pub use script_app::{
