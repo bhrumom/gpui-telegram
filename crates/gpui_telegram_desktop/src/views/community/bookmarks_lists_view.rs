@@ -549,16 +549,26 @@ impl CommunityWorkspace {
         actor_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(existing) = self.state.lists.iter().find(|l| l.list_id == list_id) else {
-            return;
+        let (members, slugs) = {
+            let Some(existing) = self.state.lists.iter_mut().find(|l| l.list_id == list_id) else {
+                return;
+            };
+            if let Some(pos) = existing
+                .member_actor_ids
+                .iter()
+                .position(|id| id == &actor_id)
+            {
+                existing.member_actor_ids.remove(pos);
+            } else {
+                existing.member_actor_ids.push(actor_id);
+            }
+            (
+                existing.member_actor_ids.clone(),
+                existing.community_slugs.clone(),
+            )
         };
-        let mut members = existing.member_actor_ids.clone();
-        if let Some(pos) = members.iter().position(|id| id == &actor_id) {
-            members.remove(pos);
-        } else {
-            members.push(actor_id);
-        }
-        self.persist_list_membership(list_id, Some(members), None, cx);
+        cx.notify();
+        self.persist_list_membership(list_id, Some(members), Some(slugs), cx);
     }
 
     pub fn toggle_selected_list_community(
@@ -567,16 +577,26 @@ impl CommunityWorkspace {
         slug: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(existing) = self.state.lists.iter().find(|l| l.list_id == list_id) else {
-            return;
+        let (members, slugs) = {
+            let Some(existing) = self.state.lists.iter_mut().find(|l| l.list_id == list_id) else {
+                return;
+            };
+            if let Some(pos) = existing
+                .community_slugs
+                .iter()
+                .position(|s| s.eq_ignore_ascii_case(&slug))
+            {
+                existing.community_slugs.remove(pos);
+            } else {
+                existing.community_slugs.push(slug);
+            }
+            (
+                existing.member_actor_ids.clone(),
+                existing.community_slugs.clone(),
+            )
         };
-        let mut slugs = existing.community_slugs.clone();
-        if let Some(pos) = slugs.iter().position(|s| s.eq_ignore_ascii_case(&slug)) {
-            slugs.remove(pos);
-        } else {
-            slugs.push(slug);
-        }
-        self.persist_list_membership(list_id, None, Some(slugs), cx);
+        cx.notify();
+        self.persist_list_membership(list_id, Some(members), Some(slugs), cx);
     }
 
     fn persist_list_membership(
@@ -586,6 +606,8 @@ impl CommunityWorkspace {
         community_slugs: Option<Vec<String>>,
         cx: &mut Context<Self>,
     ) {
+        self.state.list_membership_gen = self.state.list_membership_gen.wrapping_add(1);
+        let my_gen = self.state.list_membership_gen;
         let req = UpdateCommunityListRequest {
             member_actor_ids,
             community_slugs,
@@ -600,6 +622,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.list_membership_gen != my_gen {
+                    return;
+                }
                 match res {
                     Ok(Ok(updated)) => {
                         if let Some(pos) = this

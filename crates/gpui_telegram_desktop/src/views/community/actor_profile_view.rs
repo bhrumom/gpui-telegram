@@ -813,7 +813,11 @@ fn render_bot_citizenship_card(
     let pal = ws.palette;
     let lang = ws.language_id.as_str();
     let (_, bot_bg, bot_fg) = TdesktopThemePalette::bot_hue_colors("violet", pal.mode.is_dark());
-    let trust = actor.trust_score.clamp(0.0, 1.0);
+    let trust = if actor.trust_score.is_finite() {
+        actor.trust_score.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
     let trust_pct = (trust * 100.0).round() as u32;
     let is_owned = ws.is_viewer_owned_actor(&actor.actor_id);
 
@@ -1014,19 +1018,29 @@ fn render_profile_tabs_bar(
 
 fn collect_viewer_posts_matching(
     ws: &CommunityWorkspace,
+    is_viewer_self: bool,
     prof_posts: &[CommunityPostDto],
     pred: impl Fn(&CommunityPostDto) -> bool,
 ) -> Vec<CommunityPostDto> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    let iter = prof_posts
-        .iter()
-        .chain(ws.state.feed_items.iter().map(|i| &i.post))
-        .chain(ws.state.saved_items.iter().map(|i| &i.post))
-        .chain(ws.state.community_posts.iter().map(|i| &i.post));
-    for p in iter {
+    for p in prof_posts {
         if p.status == PostStatus::Published && pred(p) && seen.insert(p.post_id.clone()) {
             out.push(p.clone());
+        }
+    }
+    if is_viewer_self {
+        let iter = ws
+            .state
+            .feed_items
+            .iter()
+            .map(|i| &i.post)
+            .chain(ws.state.saved_items.iter().map(|i| &i.post))
+            .chain(ws.state.community_posts.iter().map(|i| &i.post));
+        for p in iter {
+            if p.status == PostStatus::Published && pred(p) && seen.insert(p.post_id.clone()) {
+                out.push(p.clone());
+            }
         }
     }
     out
@@ -1104,8 +1118,9 @@ fn render_profile_tab_body(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.state.detail_focused_comment_id = Some(nav_cid.clone());
                                 this.open_post_detail(nav_pid.clone(), cx);
+                                this.state.detail_focused_comment_id = Some(nav_cid.clone());
+                                cx.notify();
                             }),
                         )
                         .child(
@@ -1187,7 +1202,8 @@ fn render_profile_tab_body(
                 }))
         }
         ActorProfileTab::Likes => {
-            let liked = collect_viewer_posts_matching(ws, &published_posts, |p| p.viewer_liked);
+            let is_self = prof.actor.actor_id == ws.state.active_actor_id;
+            let liked = collect_viewer_posts_matching(ws, is_self, &published_posts, |p| p.viewer_liked);
             if liked.is_empty() {
                 return div().child(render_empty_state(
                     IconName::HeartReaction,
@@ -1206,7 +1222,8 @@ fn render_profile_tab_body(
                 }))
         }
         ActorProfileTab::Upvoted => {
-            let upvoted = collect_viewer_posts_matching(ws, &published_posts, |p| p.viewer_vote == 1);
+            let is_self = prof.actor.actor_id == ws.state.active_actor_id;
+            let upvoted = collect_viewer_posts_matching(ws, is_self, &published_posts, |p| p.viewer_vote == 1);
             if upvoted.is_empty() {
                 return div().child(render_empty_state(
                     IconName::UpvoteArrow,

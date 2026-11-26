@@ -25,7 +25,8 @@ use super::shared_widgets::{
     render_loading_skeleton, render_vote_stepper_pill,
 };
 use super::state::{
-    ActiveCommunityInput, CommunityPopover, CommunityWorkspaceAction, PostDetailMode,
+    ActiveCommunityInput, CommunityPopover, CommunityRoute, CommunityWorkspaceAction,
+    PostDetailMode,
 };
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
@@ -302,7 +303,9 @@ impl CommunityWorkspace {
             let _ = weak.update(app, |this, cx| match res {
                 Ok(Ok(_)) => {
                     if let Some(pid) = reload_pid {
-                        this.load_post_detail(pid, cx);
+                        if this.state.route == CommunityRoute::PostDetail(pid.clone()) {
+                            this.load_post_detail(pid, cx);
+                        }
                     }
                     let lang = this.language_id.clone();
                     this.emit_action(
@@ -329,13 +332,19 @@ impl CommunityWorkspace {
         if !self.state.detail_loading_more_comment_ids.insert(parent_comment_id.clone()) {
             return;
         }
+        let my_gen = self.state.detail_gen;
         let sort = self.state.detail_comment_sort;
+        let cursor = self
+            .state
+            .detail_comment_more_cursors
+            .get(&parent_comment_id)
+            .cloned();
         let params = CommentsQueryParams {
             sort: Some(sort),
             parent_id: Some(parent_comment_id.clone()),
             max_depth: None,
             limit: Some(50),
-            cursor: None,
+            cursor,
         };
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -347,10 +356,25 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.detail_gen != my_gen {
+                    return;
+                }
                 this.state.detail_loading_more_comment_ids.remove(&pcid);
                 match res {
                     Ok(Ok(resp)) => {
-                        this.state.merge_loaded_comment_children(&pcid, resp.comments, resp.has_more);
+                        if resp.has_more {
+                            if let Some(next) = resp.next_cursor.filter(|s| !s.trim().is_empty()) {
+                                this.state
+                                    .detail_comment_more_cursors
+                                    .insert(pcid.clone(), next);
+                            } else {
+                                this.state.detail_comment_more_cursors.remove(&pcid);
+                            }
+                        } else {
+                            this.state.detail_comment_more_cursors.remove(&pcid);
+                        }
+                        this.state
+                            .merge_loaded_comment_children(&pcid, resp.comments, resp.has_more);
                         cx.notify();
                     }
                     Ok(Err(e)) => {
@@ -394,7 +418,9 @@ impl CommunityWorkspace {
             let _ = weak.update(app, |this, cx| match res {
                 Ok(Ok(_)) => {
                     if let Some(pid) = reload_pid {
-                        this.load_post_detail(pid, cx);
+                        if this.state.route == CommunityRoute::PostDetail(pid.clone()) {
+                            this.load_post_detail(pid, cx);
+                        }
                     }
                     let lang = this.language_id.clone();
                     this.emit_action(
@@ -441,7 +467,9 @@ impl CommunityWorkspace {
             .await;
             let _ = weak.update(app, |this, cx| match res {
                 Ok(Ok(_)) => {
-                    this.load_post_detail(post_id, cx);
+                    if this.state.route == CommunityRoute::PostDetail(post_id.clone()) {
+                        this.load_post_detail(post_id, cx);
+                    }
                     let lang = this.language_id.clone();
                     this.emit_action(
                         CommunityWorkspaceAction::ShowToast {
@@ -559,6 +587,20 @@ impl CommunityWorkspace {
     ) {
         let lang = self.language_id.clone();
         if self.state.detail_summon_pending {
+            let msg = tr_str(
+                &lang,
+                "Bot 召唤请求正在进行中，请稍候…",
+                "Bot summon already in progress…",
+            )
+            .to_string();
+            self.state.detail_summon_feedback = Some((msg.clone(), false));
+            self.emit_action(
+                CommunityWorkspaceAction::ShowToast {
+                    text: msg,
+                    is_error: false,
+                },
+                cx,
+            );
             return;
         }
         if let Some(det) = self.state.detail_post.as_ref() {
@@ -622,7 +664,9 @@ impl CommunityWorkspace {
                                 CommunityWorkspaceAction::ShowToast { text: ok_msg, is_error: false },
                                 cx,
                             );
-                            this.load_post_detail(reload_pid, cx);
+                            if this.state.route == CommunityRoute::PostDetail(reload_pid.clone()) {
+                                this.load_post_detail(reload_pid, cx);
+                            }
                         } else {
                             let reason = if r.reason.trim().is_empty() {
                                 tr_str(&lang, "Bot 当前处于冷却期或防循环保护中", "Bot declined due to cooldown or anti-loop guard").to_string()
@@ -1349,6 +1393,21 @@ fn render_inline_reply_box(
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 if this.state.detail_summon_pending {
+                                    let lang = this.language_id.clone();
+                                    let msg = tr_str(
+                                        &lang,
+                                        "Bot 召唤请求正在进行中，请稍候…",
+                                        "Bot summon already in progress…",
+                                    )
+                                    .to_string();
+                                    this.state.detail_summon_feedback = Some((msg.clone(), false));
+                                    this.emit_action(
+                                        CommunityWorkspaceAction::ShowToast {
+                                            text: msg,
+                                            is_error: false,
+                                        },
+                                        cx,
+                                    );
                                     return;
                                 }
                                 if !bots_allowed {

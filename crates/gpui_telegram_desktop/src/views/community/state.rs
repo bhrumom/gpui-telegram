@@ -760,6 +760,7 @@ pub struct CommunityWorkspaceState {
 
     // Left Nav & Right Rail caches
     pub communities: Vec<SubCommunityDto>,
+    pub communities_gen: u64,
     pub lists: Vec<CommunityListDto>,
     pub trending: Vec<TrendingTopicDto>,
     pub recommended_actors: Vec<CommunityActorDto>,
@@ -773,11 +774,13 @@ pub struct CommunityWorkspaceState {
     pub detail_editing_comment_id: Option<String>,
     pub detail_edit_comment_draft: String,
     pub detail_loading_more_comment_ids: HashSet<String>,
+    pub detail_comment_more_cursors: HashMap<String, String>,
     pub detail_summon_bot_id: Option<String>,
     pub detail_summon_prompt: String,
     pub detail_summon_pending: bool,
     pub detail_summon_feedback: Option<(String, bool)>,
     pub detail_focused_comment_id: Option<String>,
+    pub detail_opened_from_notification: bool,
     pub detail_loading: bool,
     pub detail_error: Option<String>,
     pub detail_gen: u64,
@@ -847,6 +850,7 @@ pub struct CommunityWorkspaceState {
     pub list_feed_actor_filter: ActorFilter,
     pub list_feed_loading: bool,
     pub list_feed_gen: u64,
+    pub list_membership_gen: u64,
     pub list_editor_open: bool,
     pub list_editor: ListEditorDraft,
     pub saved_loading: bool,
@@ -949,6 +953,7 @@ impl Default for CommunityWorkspaceState {
             poll_breakdown_by_post: HashMap::new(),
             hidden_post_ids: HashSet::new(),
             communities: Vec::new(),
+            communities_gen: 0,
             lists: Vec::new(),
             trending: Vec::new(),
             recommended_actors: Vec::new(),
@@ -960,11 +965,13 @@ impl Default for CommunityWorkspaceState {
             detail_editing_comment_id: None,
             detail_edit_comment_draft: String::new(),
             detail_loading_more_comment_ids: HashSet::new(),
+            detail_comment_more_cursors: HashMap::new(),
             detail_summon_bot_id: None,
             detail_summon_prompt: String::new(),
             detail_summon_pending: false,
             detail_summon_feedback: None,
             detail_focused_comment_id: None,
+            detail_opened_from_notification: false,
             detail_loading: false,
             detail_error: None,
             detail_gen: 0,
@@ -1022,6 +1029,7 @@ impl Default for CommunityWorkspaceState {
             list_feed_actor_filter: ActorFilter::AllCitizens,
             list_feed_loading: false,
             list_feed_gen: 0,
+            list_membership_gen: 0,
             list_editor_open: false,
             list_editor: ListEditorDraft::default(),
             saved_loading: false,
@@ -1080,22 +1088,36 @@ impl CommunityWorkspaceState {
                 self.route_stack.remove(0);
             }
         }
+        if !matches!(self.route, CommunityRoute::PostDetail(_)) {
+            self.detail_opened_from_notification = false;
+            self.detail_focused_comment_id = None;
+        }
         self.active_popover = None;
     }
 
     pub fn replace_route(&mut self, next: CommunityRoute) {
         self.route_stack.clear();
         self.route = next;
+        if !matches!(self.route, CommunityRoute::PostDetail(_)) {
+            self.detail_opened_from_notification = false;
+            self.detail_focused_comment_id = None;
+        }
         self.active_popover = None;
     }
 
     pub fn go_back(&mut self) -> bool {
         if let Some(prev) = self.route_stack.pop() {
             self.route = prev;
+            if !matches!(self.route, CommunityRoute::PostDetail(_)) {
+                self.detail_opened_from_notification = false;
+                self.detail_focused_comment_id = None;
+            }
             self.active_popover = None;
             true
         } else if self.route != CommunityRoute::Feed {
             self.route = CommunityRoute::Feed;
+            self.detail_opened_from_notification = false;
+            self.detail_focused_comment_id = None;
             self.active_popover = None;
             true
         } else {
@@ -1682,6 +1704,10 @@ impl CommunityWorkspaceState {
             };
             post.bookmarks_count = resp.bookmarks_count;
         });
+        if !resp.bookmarked {
+            self.saved_items
+                .retain(|it| it.post.post_id != resp.post_id);
+        }
     }
 
     pub fn reconcile_poll(&mut self, post_id: &str, poll: PollDto) {

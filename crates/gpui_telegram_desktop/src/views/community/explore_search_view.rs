@@ -6,8 +6,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_community::parse_search_operators;
 use gpui_telegram_proto::community_contracts::{
-    ActorKind, CommunityActorDto, CommunitySearchRequestDto, CommunitySearchSort,
-    CommunitySearchTab, FeedItemDto, SubCommunityDto, TrendingItemKind, TrendingTopicDto,
+    ActorKind, CommunityActorDto, CommunitySearchRequestDto, CommunitySearchResultDto,
+    CommunitySearchSort, CommunitySearchTab, FeedItemDto, SubCommunityDto, TrendingItemKind,
+    TrendingTopicDto,
 };
 
 use crate::i18n::tr_str;
@@ -155,6 +156,37 @@ pub fn build_search_request(
         limit: 25,
         offset: 0,
     }
+}
+
+/// Applies structured operator filters (`c:<slug>`, `author:<handle>`, `kind:...`) to a
+/// [`CommunitySearchResultDto`] so `Communities`, `People`, and `Bots` tabs match strictly
+/// across both Online Tantivy and Local SQLite fallback.
+pub fn filter_search_result_by_operators(
+    req: &CommunitySearchRequestDto,
+    mut res: CommunitySearchResultDto,
+) -> CommunitySearchResultDto {
+    if let Some(ref slug) = req.community_slug {
+        let target = slug.trim().trim_start_matches("c/").trim_start_matches("C/");
+        if !target.is_empty() {
+            res.communities
+                .retain(|c| c.slug.eq_ignore_ascii_case(target));
+        }
+    }
+    if let Some(ref author) = req.author_handle {
+        let target = author.trim().trim_start_matches('@');
+        if !target.is_empty() {
+            res.actors
+                .retain(|a| a.handle.eq_ignore_ascii_case(target));
+        }
+    }
+    if let Some(kind) = req.actor_kind {
+        res.actors.retain(|a| match kind {
+            ActorKind::Human => a.actor_kind == ActorKind::Human,
+            ActorKind::Bot => a.actor_kind.is_bot_like(),
+            ActorKind::HybridAgent => a.actor_kind == ActorKind::HybridAgent,
+        });
+    }
+    res
 }
 
 impl CommunityWorkspace {
@@ -642,18 +674,37 @@ fn render_search_results_section(
     let Some(res) = ws.state.search_result.clone() else {
         return div();
     };
+    let parsed_query = parse_search_operators(&normalize_search_query(&res.query));
     let cat_filter = ws.state.search_category_filter.as_deref();
+    let comm_op_filter = parsed_query.community.as_deref();
+    let author_op_filter = parsed_query.author.as_deref();
+    let filtered_actors: Vec<CommunityActorDto> = res
+        .actors
+        .into_iter()
+        .filter(|a| {
+            author_op_filter
+                .map(|target| a.handle.eq_ignore_ascii_case(target.trim_start_matches('@')))
+                .unwrap_or(true)
+        })
+        .collect();
     let filtered_comms: Vec<SubCommunityDto> = res
         .communities
         .into_iter()
         .filter(|c| {
-            cat_filter
+            let cat_ok = cat_filter
                 .map(|cat| c.category.eq_ignore_ascii_case(cat))
-                .unwrap_or(true)
+                .unwrap_or(true);
+            let comm_ok = comm_op_filter
+                .map(|target| {
+                    let clean = target.trim().trim_start_matches("c/").trim_start_matches("C/");
+                    clean.is_empty() || c.slug.eq_ignore_ascii_case(clean)
+                })
+                .unwrap_or(true);
+            cat_ok && comm_ok
         })
         .collect();
 
-    let total_visible = res.posts.len() + res.actors.len() + filtered_comms.len();
+    let total_visible = res.posts.len() + filtered_actors.len() + filtered_comms.len();
     if total_visible == 0 {
         return div().child(render_empty_state(
             IconName::Search,
@@ -698,7 +749,7 @@ fn render_search_results_section(
             };
             render_post_card(ws, &it, i, cx)
         }))
-        .children(res.actors.into_iter().map(|a| {
+        .children(filtered_actors.into_iter().map(|a| {
             render_explore_actor_card(a, "search", &active_actor_id, &base_url, &pal, lang, cx)
         }))
         .children(

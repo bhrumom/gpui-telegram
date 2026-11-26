@@ -26,21 +26,22 @@ use gpui::{
 use gpui_telegram_client::{AuthResponse, ClientConfig, TelegramClient};
 use gpui_telegram_desktop::theme::{IconName, TelegramAssetSource};
 use gpui_telegram_desktop::views::community::bot_studio_view::{
-    clamp_grok_avatar_indices, format_bot_api_snippet, resolve_grok_avatar_pair,
-    validate_bot_studio_registration,
+    clamp_grok_avatar_indices, format_bot_api_snippet, format_bot_api_snippet_for_display,
+    resolve_bot_studio_token_for_actor, resolve_grok_avatar_pair, validate_bot_studio_registration,
 };
 use gpui_telegram_desktop::views::community::composer_modal::{
-    compute_composer_autocomplete, detect_autocomplete_trigger, AutocompleteKind,
+    compute_composer_autocomplete, detect_autocomplete_trigger, validate_composer_link_url,
+    AutocompleteKind,
 };
 use gpui_telegram_desktop::views::community::explore_search_view::{
-    build_search_request, normalize_search_query,
+    build_search_request, filter_search_result_by_operators, normalize_search_query,
 };
 use gpui_telegram_desktop::views::community::mod_queue_view::validate_automod_regex_syntax;
 use gpui_telegram_desktop::views::community::{
-    ActiveCommunityInput, ActorProfileTab, BookmarksListsSection, CommunityLayoutMode,
-    CommunityModal, CommunityPageTab, CommunityRoute, CommunityWorkspace,
-    CommunityWorkspaceAction, ComposerFormatTab, ComposerMediaDraft, ModConsoleTab,
-    NotificationCategoryTab, PostDetailMode,
+    ActiveCommunityInput, ActorProfileTab, BookmarksListsSection, BotStudioEditDraft,
+    CommunityLayoutMode, CommunityModal, CommunityPageTab, CommunityPopover, CommunityRoute,
+    CommunityWorkspace, CommunityWorkspaceAction, ComposerFormatTab, ComposerMediaDraft,
+    ModConsoleTab, NotificationCategoryTab, PostDetailMode,
 };
 use gpui_telegram_desktop::views::composer::formatting_bar::TextStyleKind;
 use gpui_telegram_desktop::views::shell::{ActiveWorkspacePanel, AppShell};
@@ -463,17 +464,69 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
 
     assert!(validate_automod_regex_syntax("(spam|airdrop)\\s+free").is_ok());
     assert!(validate_automod_regex_syntax("(?i)(?:scam|phish){1,3}?").is_ok());
+    assert!(validate_automod_regex_syntax("(?P<word>foo)").is_ok());
+    assert!(validate_automod_regex_syntax("[]a]").is_ok());
+    assert!(validate_automod_regex_syntax("[^]a]").is_ok());
+    assert!(validate_automod_regex_syntax("\\(?").is_ok());
     assert!(validate_automod_regex_syntax("").is_ok());
-    assert!(validate_automod_regex_syntax("(unclosed").is_err());
-    assert!(validate_automod_regex_syntax("[unclosed").is_err());
-    assert!(validate_automod_regex_syntax("trailing\\").is_err());
-    assert!(validate_automod_regex_syntax("*leading").is_err());
-    assert!(validate_automod_regex_syntax("?leading").is_err());
-    assert!(validate_automod_regex_syntax("a{5,2}").is_err());
-    assert!(validate_automod_regex_syntax("a{abc}").is_err());
-    assert!(validate_automod_regex_syntax("a{}").is_err());
-    assert!(validate_automod_regex_syntax("(?)").is_err());
-    assert!(validate_automod_regex_syntax("foo|?bar").is_err());
+    for bad in [
+        "(unclosed",
+        "[unclosed",
+        "trailing\\",
+        "*leading",
+        "?leading",
+        "a{5,2}",
+        "a{abc}",
+        "a{}",
+        "a{,3}",
+        "(?)",
+        "(?z)",
+        "foo|?bar",
+        "(?P<bad)",
+        "(?P<>foo)",
+        "(?P<1bad>foo)",
+        "(?iz)foo",
+        "(?i-z)foo",
+        "(?-)foo",
+        "(?i)*",
+        "[]",
+        "[^]",
+        "[z-a]",
+        "a{99999999}",
+        "(?P=foo)",
+        "(a{50}){50}",
+    ] {
+        assert!(
+            validate_automod_regex_syntax(bad).is_err(),
+            "invalid regex `{bad}` must be rejected"
+        );
+    }
+
+    // Strict Link URL validation
+    for bad_url in [
+        "",
+        "not-a-url",
+        "https://",
+        "http://   ",
+        "https:///no-host",
+        "https://bad host.com/x",
+        "https://example.com/a b",
+        "ftp://example.com",
+        "https://example.com/\x00",
+    ] {
+        assert!(
+            validate_composer_link_url(bad_url).is_err(),
+            "invalid Link URL `{bad_url:?}` must be rejected"
+        );
+    }
+    assert_eq!(
+        validate_composer_link_url("https://rust-lang.org/learn").unwrap(),
+        "rust-lang.org"
+    );
+    assert_eq!(
+        validate_composer_link_url("http://localhost:8080/api").unwrap(),
+        "localhost"
+    );
 }
 
 #[test]
@@ -498,6 +551,112 @@ fn test_m5_bot_studio_validation_grok_clamp_and_snippet() {
     assert!(local_snip.contains("/bot/<LOCAL_BOT_TOKEN>/community.createPost"));
     let live_snip = format_bot_api_snippet("https://api.example.com", Some("tok_123"), Some("ai"));
     assert!(live_snip.contains("https://api.example.com/bot/tok_123/community.createPost"));
+
+    // Token isolation + masked snippet when revealed == false
+    let mut tok_map = std::collections::HashMap::new();
+    tok_map.insert("b:101".to_string(), "123456:SUPER_SECRET_TOKEN_9876".to_string());
+    assert_eq!(
+        resolve_bot_studio_token_for_actor(&tok_map, "b:101").as_deref(),
+        Some("123456:SUPER_SECRET_TOKEN_9876")
+    );
+    assert!(
+        resolve_bot_studio_token_for_actor(&tok_map, "b:102").is_none(),
+        "Bot B must never inherit Bot A's token"
+    );
+    let masked_snip = format_bot_api_snippet_for_display(
+        "https://api.example.com",
+        Some("123456:SUPER_SECRET_TOKEN_9876"),
+        false,
+        Some("rust"),
+    );
+    assert!(
+        !masked_snip.contains("SUPER_SECRET"),
+        "Unrevealed Bot Studio snippet must not expose plaintext token"
+    );
+    assert!(masked_snip.contains("123456••••••••9876"));
+    let revealed_snip = format_bot_api_snippet_for_display(
+        "https://api.example.com",
+        Some("123456:SUPER_SECRET_TOKEN_9876"),
+        true,
+        Some("rust"),
+    );
+    assert!(revealed_snip.contains("123456:SUPER_SECRET_TOKEN_9876"));
+
+    // Search operator filtering on Communities & People/Bots
+    let req_comm = build_search_request("c/rust", CommunitySearchTab::Communities, CommunitySearchSort::Relevance);
+    let sample_res = gpui_telegram_proto::community_contracts::CommunitySearchResultDto {
+        query: req_comm.query.clone(),
+        tab: CommunitySearchTab::Communities,
+        posts: Vec::new(),
+        actors: Vec::new(),
+        communities: vec![
+            gpui_telegram_proto::community_contracts::SubCommunityDto {
+                community_id: "c1".into(),
+                slug: "rust".into(),
+                name: "Rust".into(),
+                description: String::new(),
+                category: "tech".into(),
+                banner_media_id: None,
+                icon_media_id: None,
+                icon_emoji: String::new(),
+                accent_color: "#000000".into(),
+                member_count: 1,
+                human_member_count: 1,
+                bot_member_count: 0,
+                posts_count: 0,
+                allow_bots: true,
+                require_bot_disclosure: true,
+                is_nsfw: false,
+                rules: Vec::new(),
+                post_flairs: Vec::new(),
+                user_flairs: Vec::new(),
+                wiki_markdown: String::new(),
+                wiki_revision: 1,
+                pinned_post_ids: Vec::new(),
+                automod_rules: Vec::new(),
+                viewer_role: None,
+                is_joined: false,
+                notifications_enabled: false,
+                created_by_actor_id: "u:1".into(),
+                created_at_ms: 0,
+            },
+            gpui_telegram_proto::community_contracts::SubCommunityDto {
+                community_id: "c2".into(),
+                slug: "ai_agents".into(),
+                name: "AI Agents".into(),
+                description: String::new(),
+                category: "ai".into(),
+                banner_media_id: None,
+                icon_media_id: None,
+                icon_emoji: String::new(),
+                accent_color: "#000000".into(),
+                member_count: 1,
+                human_member_count: 1,
+                bot_member_count: 0,
+                posts_count: 0,
+                allow_bots: true,
+                require_bot_disclosure: true,
+                is_nsfw: false,
+                rules: Vec::new(),
+                post_flairs: Vec::new(),
+                user_flairs: Vec::new(),
+                wiki_markdown: String::new(),
+                wiki_revision: 1,
+                pinned_post_ids: Vec::new(),
+                automod_rules: Vec::new(),
+                viewer_role: None,
+                is_joined: false,
+                notifications_enabled: false,
+                created_by_actor_id: "u:1".into(),
+                created_at_ms: 0,
+            },
+        ],
+        total_hits: 2,
+        next_offset: None,
+    };
+    let filtered = filter_search_result_by_operators(&req_comm, sample_res);
+    assert_eq!(filtered.communities.len(), 1);
+    assert_eq!(filtered.communities[0].slug, "rust");
 }
 
 #[test]
@@ -764,6 +923,149 @@ async fn body_f17_post_detail(mut app: AsyncApp) {
             "Locked post must reject inline reply with error toast"
         );
     });
+
+    // 6. Pending Summon Bot re-trigger emits informative non-error feedback + toast
+    let _ = cw.update(&mut app, |w, cx| {
+        let _ = w.take_pending_actions();
+        w.state.detail_summon_pending = true;
+        w.state.detail_summon_feedback = None;
+        w.summon_bot_with_options(pid.clone(), Some(bot_id.clone()), None, None, cx);
+        assert!(
+            w.state
+                .detail_summon_feedback
+                .as_ref()
+                .is_some_and(|(msg, is_err)| !msg.is_empty() && !is_err),
+            "Re-triggering Summon Bot while pending must set informative feedback"
+        );
+        let acts = w.take_pending_actions();
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, CommunityWorkspaceAction::ShowToast { is_error: false, .. })),
+            "Re-triggering Summon Bot while pending must emit non-error toast"
+        );
+        w.state.detail_summon_pending = false;
+    });
+
+    // 7. Multi-page Comment Load-More Pagination (> 50 direct children) + Cross-Post Async Reload Race
+    let post_b = host
+        .client
+        .community()
+        .block_on(host.client.community().create_post(&CreatePostRequest {
+            community_slug: Some("f17_lab".to_string()),
+            format: PostFormat::Micro,
+            body: "F17 Post B for 55-child pagination & cross-post race".to_string(),
+            status: PostStatus::Published,
+            ..Default::default()
+        }))
+        .expect("create F17 post_b")
+        .post;
+    let pid_b = post_b.post_id.clone();
+    let p55 = host
+        .client
+        .community()
+        .block_on(host.client.community().create_comment(
+            &pid_b,
+            &gpui_telegram_proto::community_contracts::CreateCommentRequest {
+                parent_comment_id: None,
+                body: "Parent with 55 replies".to_string(),
+                media: Vec::new(),
+                is_mod_distinguished: false,
+            },
+        ))
+        .expect("create parent_55")
+        .comment
+        .comment_id;
+    for idx in 0..55 {
+        let _ = host
+            .client
+            .community()
+            .block_on(host.client.community().create_comment(
+                &pid_b,
+                &gpui_telegram_proto::community_contracts::CreateCommentRequest {
+                    parent_comment_id: Some(p55.clone()),
+                    body: format!("Child reply #{idx}"),
+                    media: Vec::new(),
+                    is_mod_distinguished: false,
+                },
+            ))
+            .expect("create child reply");
+    }
+    let _ = cw.update(&mut app, |w, cx| w.open_post_detail(pid_b.clone(), cx));
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            cw.read(cx)
+                .state
+                .detail_post
+                .as_ref()
+                .is_some_and(|d| d.post.post_id == pid_b)
+        })
+        .await
+    );
+    // Simulate trimmed parent (0 loaded, 55 hidden) -> page 1 fetches 50 + stores cursor -> page 2 fetches remaining 5
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.visit_comment_mut(&p55, |c| {
+            c.children.clear();
+            c.more_children_count = 55;
+        });
+        w.load_more_comment_children(pid_b.clone(), p55.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading_more_comment_ids.contains(&p55)
+                && st
+                    .find_comment(&p55)
+                    .is_some_and(|c| c.children.len() == 50 && c.more_children_count == 5)
+        })
+        .await,
+        "First load-more page must load 50 children and retain 5 remaining"
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        assert!(
+            w.state.detail_comment_more_cursors.contains_key(&p55),
+            "First load-more page must record next_cursor for parent"
+        );
+        w.load_more_comment_children(pid_b.clone(), p55.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading_more_comment_ids.contains(&p55)
+                && st
+                    .find_comment(&p55)
+                    .is_some_and(|c| c.children.len() == 55 && c.more_children_count == 0)
+        })
+        .await,
+        "Second load-more page must paginate via cursor to reach all 55 children"
+    );
+    let _ = cw.update(&mut app, |w, _| {
+        assert!(!w.state.detail_comment_more_cursors.contains_key(&p55));
+    });
+
+    // Cross-post async reload race: reply on pid_b then immediately navigate to pid -> pid MUST win!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.detail_reply_draft = "Cross-post race reply on B".to_string();
+        w.submit_detail_reply(cx);
+        w.open_post_detail(pid.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st.route == CommunityRoute::PostDetail(pid.clone())
+                && st.detail_post.as_ref().is_some_and(|d| d.post.post_id == pid)
+        })
+        .await
+    );
+    app.background_executor().timer(Duration::from_millis(120)).await;
+    let _ = cw.read_with(&app, |w, _| {
+        assert_eq!(w.state.route, CommunityRoute::PostDetail(pid.clone()));
+        assert_eq!(
+            w.state.detail_post.as_ref().unwrap().post.post_id,
+            pid,
+            "Stale Post B async reply reload must NEVER overwrite active Post A detail_post"
+        );
+    });
 }
 
 // ============================================================================
@@ -816,24 +1118,44 @@ async fn body_f18_composer_modal(mut app: AsyncApp) {
             .build_composer_create_request(PostStatus::Published, now_ms)
             .is_ok());
 
-        // Link validation
+        // Link validation (reject hostless & whitespace URLs)
         w.set_composer_tab(ComposerFormatTab::Link, cx);
-        w.state.composer.link_url = "not-a-url".to_string();
-        assert!(w
-            .build_composer_create_request(PostStatus::Published, now_ms)
-            .is_err());
+        for bad_link in [
+            "not-a-url",
+            "https://",
+            "http://   ",
+            "https:///no-host",
+            "https://bad host.com/x",
+        ] {
+            w.state.composer.link_url = bad_link.to_string();
+            assert!(
+                w.build_composer_create_request(PostStatus::Published, now_ms)
+                    .is_err(),
+                "Composer Link tab must reject `{bad_link}`"
+            );
+        }
         w.state.composer.link_url = "https://rust-lang.org".to_string();
         assert!(w
             .build_composer_create_request(PostStatus::Published, now_ms)
             .is_ok());
 
-        // Poll validation (2..=6 options)
+        // Poll validation (2..=6 options, NO silent dropping of blank option slots)
         w.set_composer_tab(ComposerFormatTab::Poll, cx);
         w.state.composer.poll_question = "Best desktop UI stack?".to_string();
         w.state.composer.poll_options = vec!["GPUI".to_string()];
         assert!(w
             .build_composer_create_request(PostStatus::Published, now_ms)
             .is_err());
+        w.state.composer.poll_options = vec![
+            "GPUI".to_string(),
+            "   ".to_string(),
+            "Qt".to_string(),
+        ];
+        assert!(
+            w.build_composer_create_request(PostStatus::Published, now_ms)
+                .is_err(),
+            "Blank poll option slot must be rejected instead of silently dropped"
+        );
         w.state.composer.poll_options =
             vec!["GPUI".to_string(), "SwiftUI".to_string(), "Qt".to_string()];
         assert!(w
@@ -875,15 +1197,33 @@ async fn body_f18_composer_modal(mut app: AsyncApp) {
     });
     host.draw(&mut app);
 
-    // 2. Live `@/#`/`c/` autocomplete (English + CJK) + Progressive Escape cascade
+    // 2. Live `@/#`/`c/` autocomplete (English + CJK + localized hashtag subtitle) + Visual Z-Order Escape cascade
     let _ = cw.update(&mut app, |w, cx| {
+        w.set_language("zh-CN");
         w.open_composer_modal(Some("rust".to_string()), cx);
         w.state.focus_input(ActiveCommunityInput::ComposerBody);
+        w.insert_text_to_active_input("你好 #brandnewtag_zh", cx);
+        let ac_tag = compute_composer_autocomplete(w).expect("hashtag autocomplete");
+        assert_eq!(ac_tag.1[0].subtitle, "新建话题标签");
+
+        w.state.composer.body.clear();
         w.insert_text_to_active_input("你好 c/r", cx);
         let ac = compute_composer_autocomplete(w).expect("c/ autocomplete must trigger");
         assert!(!ac.1.is_empty());
         let (start, token) = (ac.0, ac.1[0].insert_token.clone());
-        // Escape #1 dismisses autocomplete while keeping modal open
+        // Popover rendered on top of Composer modal MUST be dismissed by Escape BEFORE occluded autocomplete!
+        w.toggle_popover(CommunityPopover::IdentitySwitcher, cx);
+        assert_eq!(w.state.active_popover, Some(CommunityPopover::IdentitySwitcher));
+        assert!(w.handle_escape_key(cx));
+        assert_eq!(
+            w.state.active_popover, None,
+            "Escape #1 must close topmost popover above Composer"
+        );
+        assert!(
+            !w.state.composer.autocomplete_dismissed,
+            "Occluded autocomplete must remain untouched until topmost popover is closed"
+        );
+        // Escape #2 now dismisses autocomplete while keeping modal open
         assert!(w.handle_escape_key(cx));
         assert_eq!(w.state.active_modal, Some(CommunityModal::Composer));
         assert!(w.state.composer.autocomplete_dismissed);
@@ -891,7 +1231,7 @@ async fn body_f18_composer_modal(mut app: AsyncApp) {
         w.state.composer.autocomplete_dismissed = false;
         w.apply_composer_autocomplete(start, token, cx);
         assert!(w.state.composer.body.contains("c/"));
-        // Escape #2 closes Composer modal while staying inside Community
+        // Escape #3 closes Composer modal while staying inside Community
         assert!(w.handle_escape_key(cx));
         assert_eq!(w.state.active_modal, None);
     });
@@ -960,6 +1300,111 @@ async fn body_f18_composer_modal(mut app: AsyncApp) {
         })
         .await
     );
+
+    // 5. Draft Resume Hydration (Poll fields preserved) & Edit Validation (Article empty body rejected)
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_composer_modal(Some("rust".to_string()), cx);
+        w.set_composer_tab(ComposerFormatTab::Poll, cx);
+        w.state.composer.poll_question = "Draft poll question?".to_string();
+        w.state.composer.poll_options = vec!["Alpha".to_string(), "Beta".to_string()];
+        w.state.composer.poll_multi_select = true;
+        w.submit_composer(PostStatus::Draft, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.composer.submitting && cw.read(cx).state.active_modal.is_none()
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_composer_modal(None, cx);
+        w.load_composer_drafts(cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.composer.drafts_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .composer
+                    .drafts
+                    .iter()
+                    .any(|d| d.format == PostFormat::Poll)
+        })
+        .await
+    );
+    let poll_draft = cw
+        .read_with(&app, |w, _| {
+            w.state
+                .composer
+                .drafts
+                .iter()
+                .find(|d| d.format == PostFormat::Poll)
+                .cloned()
+                .unwrap()
+        })
+        .unwrap();
+    let _ = cw.update(&mut app, |w, cx| {
+        w.resume_draft_into_composer(poll_draft, cx);
+        assert_eq!(w.state.composer.tab, ComposerFormatTab::Poll);
+        assert_eq!(w.state.composer.poll_question, "Draft poll question?");
+        assert_eq!(
+            w.state.composer.poll_options,
+            vec!["Alpha".to_string(), "Beta".to_string()]
+        );
+        assert!(w.state.composer.poll_multi_select);
+
+        // Save Article draft -> resume -> clear body -> Publish MUST be rejected!
+        w.open_composer_modal(Some("rust".to_string()), cx);
+        w.set_composer_tab(ComposerFormatTab::Article, cx);
+        w.state.composer.title = "Article Draft Title".to_string();
+        w.state.composer.body = "Original article draft body".to_string();
+        w.submit_composer(PostStatus::Draft, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.composer.submitting && cw.read(cx).state.active_modal.is_none()
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_composer_modal(None, cx);
+        w.load_composer_drafts(cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.composer.drafts_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .composer
+                    .drafts
+                    .iter()
+                    .any(|d| d.format == PostFormat::Article)
+        })
+        .await
+    );
+    let art_draft = cw
+        .read_with(&app, |w, _| {
+            w.state
+                .composer
+                .drafts
+                .iter()
+                .find(|d| d.format == PostFormat::Article)
+                .cloned()
+                .unwrap()
+        })
+        .unwrap();
+    let _ = cw.update(&mut app, |w, cx| {
+        w.resume_draft_into_composer(art_draft, cx);
+        w.state.composer.body = "   ".to_string();
+        w.submit_composer(PostStatus::Published, cx);
+        assert!(
+            w.state.composer.validation_error.is_some() && !w.state.composer.submitting,
+            "Editing/publishing an Article draft with empty body must be rejected"
+        );
+        assert_eq!(w.state.active_modal, Some(CommunityModal::Composer));
+    });
     host.draw(&mut app);
 }
 
@@ -979,7 +1424,7 @@ async fn body_f19_community_page(mut app: AsyncApp) {
     let host = open_community_host(&mut app, 1440.0, 900.0, 7103, "m5_f19_human").await;
     let cw = host.cw.clone();
 
-    // 1. Create Community Modal validation (reject invalid slug) -> then create c/m5_arena
+    // 1. Create Community Modal validation (reject invalid & uppercase slugs preserving entered fields) -> then create c/m5_arena
     let _ = cw.update(&mut app, |w, cx| {
         w.open_create_community_modal(cx);
         assert_eq!(w.state.active_modal, Some(CommunityModal::CreateCommunity));
@@ -991,6 +1436,28 @@ async fn body_f19_community_page(mut app: AsyncApp) {
             "Invalid slug must produce inline validation error"
         );
         assert_eq!(w.state.active_modal, Some(CommunityModal::CreateCommunity));
+
+        w.state.create_community.slug = "UPPER_SLUG".to_string();
+        w.state.create_community.name = "Preserved Name".to_string();
+        w.state.create_community.description = "Preserved Description".to_string();
+        w.state.create_community.error = None;
+        w.submit_create_community(cx);
+        assert!(
+            w.state.create_community.error.is_some(),
+            "Uppercase slug must be rejected inline"
+        );
+        assert_eq!(w.state.active_modal, Some(CommunityModal::CreateCommunity));
+        assert_eq!(w.state.create_community.slug, "UPPER_SLUG");
+        assert_eq!(w.state.create_community.name, "Preserved Name");
+        assert_eq!(w.state.create_community.description, "Preserved Description");
+
+        w.state.create_community.slug = "C/mixed_prefix".to_string();
+        w.state.create_community.error = None;
+        w.submit_create_community(cx);
+        assert!(
+            w.state.create_community.error.is_some(),
+            "Uppercase C/ prefix must be rejected inline"
+        );
 
         w.state.create_community.slug = "m5_arena".to_string();
         w.state.create_community.name = "M5 Community Arena".to_string();
@@ -1218,6 +1685,14 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
     );
     let _ = cw.update(&mut app, |w, cx| {
         w.toggle_block_actor(target_bot.actor_id.clone(), true, cx);
+        if let Some(ref mut prof) = w.state.actor_profile {
+            prof.actor.trust_score = f64::NAN;
+        }
+        w.set_profile_tab(ActorProfileTab::Likes, cx);
+    });
+    host.draw(&mut app);
+    let _ = cw.update(&mut app, |w, cx| {
+        w.set_profile_tab(ActorProfileTab::Upvoted, cx);
     });
     host.draw(&mut app);
 
@@ -1368,6 +1843,65 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
         .await,
         "Deleted notification target must route graceful error toast into AppShell"
     );
+    // Jumping from a post-level notification (target_comment_id == None) targeting a deleted post ALSO emits error toast!
+    let _ = host.shell.update(&mut app, |s, _| {
+        s.window_runtime.controller.current_toast = None;
+        s.window_runtime.controller.toast_queue.clear();
+    });
+    let _ = cw.update(&mut app, |w, cx| {
+        let _ = w.take_pending_actions();
+        w.open_notification_target(
+            CommunityNotificationDto {
+                notif_id: "n_deleted_post_level".to_string(),
+                recipient_actor_id: own_human.actor_id.clone(),
+                actor_id: target_bot.actor_id.clone(),
+                actor_handle: target_bot.handle.clone(),
+                actor_display_name: target_bot.display_name.clone(),
+                actor_kind: ActorKind::Bot,
+                kind: CommunityNotificationKind::Like,
+                target_post_id: Some("deleted_post_level_only_xyz".to_string()),
+                target_comment_id: None,
+                preview_text: "liked your deleted post".to_string(),
+                is_read: true,
+                created_at_ms: 1_700_000_003_000,
+            },
+            cx,
+        );
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading && st.detail_post.is_none() && st.detail_error.is_some()
+        })
+        .await,
+        "Deleted post-level notification must resolve to not-found fallback"
+    );
+    assert!(
+        pump_until(&mut app, Duration::from_secs(2), |cx| {
+            let ctrl = &host.shell.read(cx).window_runtime.controller;
+            ctrl.current_toast.is_some() || !ctrl.toast_queue.is_empty()
+        })
+        .await,
+        "Deleted post-level notification (target_comment_id = None) MUST emit error toast"
+    );
+    // Direct navigation to another post clears any stale detail_focused_comment_id
+    let other_pid = cw
+        .read_with(&app, |w, _| {
+            w.state
+                .feed_items
+                .get(1)
+                .map(|i| i.post.post_id.clone())
+                .unwrap_or_else(|| sample_pid.clone())
+        })
+        .unwrap();
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.detail_focused_comment_id = Some("c_stale_leak".to_string());
+        w.open_post_detail(other_pid.clone(), cx);
+        assert!(
+            w.state.detail_focused_comment_id.is_none(),
+            "Direct navigation to another post must clear stale detail_focused_comment_id"
+        );
+    });
     host.draw(&mut app);
 
     // Nonexistent @missing_handle profile renders clean not-found fallback
@@ -1384,7 +1918,7 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
     );
     host.draw(&mut app);
 
-    // 3. BookmarksListsView: Custom Folders (Create/Move/Remove) + Lists CRUD + Membership + Timeline
+    // 3. BookmarksListsView: Custom Folders (Create/Move/Remove) + PostCard toggle_bookmark removal + Lists CRUD + Optimistic Membership + Timeline
     let _ = cw.update(&mut app, |w, cx| {
         w.move_bookmark_to_folder(sample_pid.clone(), "RustDeep".to_string(), cx);
     });
@@ -1408,17 +1942,37 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
             .any(|f| f == "Systems"));
         w.select_bookmark_folder("RustDeep".to_string(), cx);
     });
-    assert!(pump_until(&mut app, Duration::from_secs(4), |cx| !cw.read(cx).state.saved_loading).await);
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.saved_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .saved_items
+                    .iter()
+                    .any(|it| it.post.post_id == sample_pid)
+        })
+        .await
+    );
     host.draw(&mut app);
 
+    // Unbookmarking via PostCard's toggle_bookmark MUST remove post from saved_items!
     let _ = cw.update(&mut app, |w, cx| {
-        w.remove_bookmark_from_saved(sample_pid.clone(), cx);
-        assert!(!w
-            .state
-            .saved_items
-            .iter()
-            .any(|it| it.post.post_id == sample_pid));
+        w.toggle_bookmark(sample_pid.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx)
+                .state
+                .saved_items
+                .iter()
+                .any(|it| it.post.post_id == sample_pid)
+        })
+        .await,
+        "Unbookmarking via PostCard toggle_bookmark must remove post from saved_items"
+    );
 
+    let _ = cw.update(&mut app, |w, cx| {
         // Switch to Lists & Custom Feeds: reject empty name, then create list with community + actor
         w.set_bookmarks_section(BookmarksListsSection::Lists, cx);
         w.open_create_list_form(cx);
@@ -1454,8 +2008,18 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
                 .clone()
         })
         .unwrap();
+    // Rapid consecutive chip toggles must optimistically update state.lists without clobbering each other
     let _ = cw.update(&mut app, |w, cx| {
         w.toggle_selected_list_actor(list_id.clone(), target_bot.actor_id.clone(), cx);
+        w.toggle_selected_list_community(list_id.clone(), "systems".to_string(), cx);
+        let l = w
+            .state
+            .lists
+            .iter()
+            .find(|x| x.list_id == list_id)
+            .unwrap();
+        assert!(l.member_actor_ids.contains(&target_bot.actor_id));
+        assert!(l.community_slugs.iter().any(|s| s == "systems"));
         w.toggle_list_pinned(list_id.clone(), false, cx);
     });
     assert!(
@@ -1518,6 +2082,29 @@ async fn body_f21_explore_mod_bot_studio(mut app: AsyncApp) {
         );
         host.draw(&mut app);
     }
+
+    // Searching `c/rust` on Communities tab must filter strictly to c/rust!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.explore_search_draft = "c/rust".to_string();
+        w.execute_search("c/rust".to_string(), CommunitySearchTab::Communities, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.search_loading
+        })
+        .await
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        let comms = &w.state.search_result.as_ref().expect("search result").communities;
+        assert_eq!(
+            comms.len(),
+            1,
+            "c/rust on Communities tab must return only c/rust, got: {:?}",
+            comms.iter().map(|c| &c.slug).collect::<Vec<_>>()
+        );
+        assert_eq!(comms[0].slug, "rust");
+    });
+    host.draw(&mut app);
 
     // 2. ModQueueView: Unauthorized guard on 0-moderated fresh user -> create owned c/mod_lab
     let _ = cw.update(&mut app, |w, cx| {
@@ -1592,6 +2179,40 @@ async fn body_f21_explore_mod_bot_studio(mut app: AsyncApp) {
         })
         .await
     );
+    // Cross-slug moderation guard: moderating mod_lab MUST NOT authorize actions against c/rust!
+    let _ = cw.update(&mut app, |w, cx| {
+        assert!(!w.can_moderate_community_slug("rust"));
+        let _ = w.take_pending_actions();
+        w.execute_mod_console_action(
+            "rust".to_string(),
+            ModActionKind::Remove,
+            "post".to_string(),
+            "p_cross_slug".to_string(),
+            None,
+            cx,
+        );
+        let acts = w.take_pending_actions();
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, CommunityWorkspaceAction::ShowToast { is_error: true, .. })),
+            "Cross-slug execute_mod_console_action must be rejected synchronously"
+        );
+        w.execute_mod_decision(
+            "rust".to_string(),
+            "q_cross_slug".to_string(),
+            "post".to_string(),
+            "p_cross_slug".to_string(),
+            ModActionKind::Remove,
+            cx,
+        );
+        let acts2 = w.take_pending_actions();
+        assert!(
+            acts2
+                .iter()
+                .any(|a| matches!(a, CommunityWorkspaceAction::ShowToast { is_error: true, .. })),
+            "Cross-slug execute_mod_decision must be rejected synchronously"
+        );
+    });
     host.draw(&mut app);
 
     // AutoMod Rules: reject invalid regex -> add valid rule -> run pure-Rust Dry-Run!
@@ -1759,6 +2380,87 @@ async fn body_f21_explore_mod_bot_studio(mut app: AsyncApp) {
             !cw.read(cx).state.bot_studio_test_submitting
         })
         .await
+    );
+
+    // 4. Bot Studio unhydrated edit preservation + auto-hydration on identities arrival
+    let owned_bot_dto = cw
+        .read_with(&app, |w, _| {
+            w.state
+                .identities
+                .as_ref()
+                .unwrap()
+                .bot_actors
+                .iter()
+                .find(|b| b.actor_id == bot_id)
+                .cloned()
+                .unwrap()
+        })
+        .unwrap();
+    let ids_snap = cw
+        .read_with(&app, |w, _| w.state.identities.clone().unwrap())
+        .unwrap();
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.bot_studio_selected_bot_id = None;
+        w.state.bot_studio_edit = BotStudioEditDraft::default();
+        w.state.bot_studio_edit.display_name = "Preserved Unhydrated Draft".to_string();
+        w.ensure_bot_studio_edit_hydrated(&owned_bot_dto);
+        assert_eq!(w.state.bot_studio_edit.actor_id, bot_id);
+        assert_eq!(
+            w.state.bot_studio_edit.display_name,
+            "Preserved Unhydrated Draft",
+            "Hydrating an unhydrated edit draft must preserve user edits"
+        );
+
+        w.state.bot_studio_selected_bot_id = None;
+        w.state.bot_studio_edit = BotStudioEditDraft::default();
+        w.apply_identities_response(ids_snap, cx);
+        assert_eq!(
+            w.state.bot_studio_selected_bot_id.as_deref(),
+            Some(bot_id.as_str()),
+            "apply_identities_response on BotStudio must auto-hydrate selected bot"
+        );
+        assert_eq!(w.state.bot_studio_edit.actor_id, bot_id);
+    });
+
+    // 5. Mod Console actor-switch role revocation: Owner -> non-mod Bot immediately revokes ModQueue access!
+    let owner_id = cw
+        .read_with(&app, |w, _| w.state.active_actor_id.clone())
+        .unwrap();
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::ModQueue(Some("mod_lab".to_string())), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.mod_loading && cw.read(cx).can_moderate_active_mod_community()
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.switch_active_actor(bot_id.clone(), cx);
+        assert!(
+            !w.can_moderate_active_mod_community(),
+            "Switching from Owner to non-mod Bot on ModQueue must IMMEDIATELY revoke UI mod access"
+        );
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.mod_loading && !cw.read(cx).can_moderate_active_mod_community()
+        })
+        .await,
+        "Non-mod Bot must remain unauthorized after ModQueue refresh completes"
+    );
+    host.draw(&mut app);
+
+    // Switching back to Owner must refresh communities & ModQueue cleanly!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.switch_active_actor(owner_id.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.mod_loading && cw.read(cx).can_moderate_active_mod_community()
+        })
+        .await,
+        "Switching back to Owner on ModQueue must restore moderator access cleanly"
     );
     host.draw(&mut app);
 }

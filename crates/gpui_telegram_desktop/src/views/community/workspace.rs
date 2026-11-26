@@ -31,7 +31,9 @@ use super::bookmarks_lists_view::render_bookmarks_lists_view;
 use super::bot_studio_view::render_bot_studio_view;
 use super::community_page_view::{render_community_page_view, render_create_community_modal};
 use super::composer_modal::{compute_composer_autocomplete, render_composer_modal};
-use super::explore_search_view::{build_search_request, render_explore_search_view};
+use super::explore_search_view::{
+    build_search_request, filter_search_result_by_operators, render_explore_search_view,
+};
 use super::feed_view::{
     render_algo_tuner_popover, render_feed_view, render_quick_post_community_picker_popover,
 };
@@ -166,10 +168,24 @@ impl CommunityWorkspace {
         }
         self.state.identities = Some(resp);
         self.state.runtime_mode = self.facade.runtime_mode();
+        self.ensure_bot_studio_selected_hydrated(cx);
         if prev_active != self.state.active_actor_id && !self.state.active_actor_id.is_empty() {
             self.load_feed(cx);
         }
         cx.notify();
+    }
+
+    pub(super) fn ensure_bot_studio_selected_hydrated(&mut self, cx: &mut Context<Self>) {
+        if self.state.route != CommunityRoute::BotStudio {
+            return;
+        }
+        if let Some(bot) = self.resolve_selected_owned_bot() {
+            if self.state.bot_studio_selected_bot_id.as_deref() != Some(bot.actor_id.as_str())
+                || self.state.bot_studio_edit.actor_id != bot.actor_id
+            {
+                self.select_bot_for_studio(bot, cx);
+            }
+        }
     }
 
     /// Synchronously seeds known owned Human/Bot actor IDs (e.g. from `AppShell`) so
@@ -232,6 +248,8 @@ impl CommunityWorkspace {
         self.load_feed(cx);
         self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
         let my_id_gen = self.state.identities_gen;
+        self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        let my_comm_gen = self.state.communities_gen;
         self.state.algo_prefs_gen = self.state.algo_prefs_gen.wrapping_add(1);
         let my_algo_gen = self.state.algo_prefs_gen;
         self.state.notifications_gen = self.state.notifications_gen.wrapping_add(1);
@@ -283,6 +301,7 @@ impl CommunityWorkspace {
                                     .set_active_actor_id(Some(id_resp.active_actor_id.clone()));
                             }
                             this.state.identities = Some(id_resp);
+                            this.ensure_bot_studio_selected_hydrated(cx);
                         }
                     }
                     if this.state.algo_prefs_gen == my_algo_gen {
@@ -292,8 +311,10 @@ impl CommunityWorkspace {
                             this.state.algo_draft = clean;
                         }
                     }
-                    if let Some(c) = comms {
-                        this.state.communities = c.communities;
+                    if this.state.communities_gen == my_comm_gen {
+                        if let Some(c) = comms {
+                            this.state.communities = c.communities;
+                        }
                     }
                     if let Some(l) = lists {
                         this.state.lists = l.lists;
@@ -761,21 +782,14 @@ impl CommunityWorkspace {
         }
     }
 
-    /// Progressive Escape cascade inside Community:
-    /// 1) Dismiss open Composer `@/#`/`c/` autocomplete popup
-    /// 2) Close open Community popover (Identity Switcher / Algo Tuner / Explain / Award / Quote / Summon Bot)
+    /// Progressive Escape cascade inside Community (strictly matching visual Z-order):
+    /// 1) Close topmost open Community popover (Identity Switcher / Algo Tuner / Explain / Award / Quote / Summon Bot)
+    /// 2) Dismiss open Composer `@/#`/`c/` autocomplete popup
     /// 3) Close open Community modal sheet (Composer / Create Community / Edit Profile)
     /// 4) Close open inline List Editor / Bookmark Folder Move picker
     /// 5) Blur focused Community text input
     /// 6) Return `false` so `AppShell::dismiss_post_auth_escape` exits Community back to `Chats`.
     pub fn handle_escape_key(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.state.active_modal == Some(CommunityModal::Composer)
-            && compute_composer_autocomplete(self).is_some()
-        {
-            self.state.composer.autocomplete_dismissed = true;
-            cx.notify();
-            return true;
-        }
         if self.state.active_popover.is_some() {
             self.state.active_popover = None;
             if matches!(
@@ -784,6 +798,13 @@ impl CommunityWorkspace {
             ) {
                 self.state.blur_input();
             }
+            cx.notify();
+            return true;
+        }
+        if self.state.active_modal == Some(CommunityModal::Composer)
+            && compute_composer_autocomplete(self).is_some()
+        {
+            self.state.composer.autocomplete_dismissed = true;
             cx.notify();
             return true;
         }
@@ -886,16 +907,7 @@ impl CommunityWorkspace {
                 }
             }
             CommunityRoute::BotStudio => {
-                if self.state.bot_studio_selected_bot_id.is_none() {
-                    if let Some(first_bot) = self
-                        .state
-                        .identities
-                        .as_ref()
-                        .and_then(|i| i.bot_actors.first().cloned())
-                    {
-                        self.select_bot_for_studio(first_bot, cx);
-                    }
-                }
+                self.ensure_bot_studio_selected_hydrated(cx);
             }
         }
     }
@@ -1554,6 +1566,20 @@ impl CommunityWorkspace {
         self.state.active_actor_id = actor_id.clone();
         self.state.active_popover = None;
         self.facade.set_active_actor_id(Some(actor_id));
+        // Immediately revoke stale role caches before async refresh so unauthorized actors
+        // never retain the previous actor's moderator permissions on ModQueue / CommunityPage.
+        for c in &mut self.state.communities {
+            c.viewer_role = None;
+        }
+        if let Some(ref mut det) = self.state.community_detail {
+            det.community.viewer_role = None;
+        }
+        if matches!(self.state.route, CommunityRoute::ModQueue(_)) {
+            self.state.mod_community = None;
+            self.state.mod_queue.clear();
+            self.state.mod_logs.clear();
+            self.state.mod_error = None;
+        }
         let lang = self.language_id.clone();
         let handle = self
             .state
@@ -1573,6 +1599,56 @@ impl CommunityWorkspace {
         );
         self.load_feed(cx);
         self.load_notifications(cx);
+
+        // Generation-guarded communities refresh for the new actor's viewer_role memberships,
+        // and automatic ModQueue re-evaluation when switching identities on ModQueue.
+        self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        let my_comm_gen = self.state.communities_gen;
+        let facade = self.facade.clone();
+        let rt_handle = facade.runtime_handle().clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = run_on_community_tokio(&rt_handle, async move {
+                facade.list_communities(None, Some(40)).await
+            })
+            .await;
+            let _ = weak.update(app, |this, cx| {
+                if this.state.communities_gen != my_comm_gen {
+                    return;
+                }
+                if let Ok(Ok(c)) = res {
+                    this.state.communities = c.communities;
+                    if matches!(this.state.route, CommunityRoute::ModQueue(None)) {
+                        if let Some(s) = this
+                            .moderated_communities()
+                            .first()
+                            .map(|cm| cm.slug.clone())
+                        {
+                            this.load_mod_queue(s, cx);
+                        } else {
+                            this.state.mod_slug = None;
+                            this.state.mod_community = None;
+                            this.state.mod_queue.clear();
+                            this.state.mod_logs.clear();
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+
+        // Reload active non-feed route for the newly selected actor.
+        let active_route = self.state.route.clone();
+        match active_route {
+            CommunityRoute::Feed | CommunityRoute::Notifications => {}
+            CommunityRoute::ModQueue(Some(slug)) => self.load_mod_queue(slug, cx),
+            CommunityRoute::ModQueue(None) => {
+                // Will auto-select & load once refreshed `communities` arrives above.
+                self.state.mod_slug = None;
+                cx.notify();
+            }
+            other => self.load_data_for_route(&other, cx),
+        }
     }
 
     pub fn toggle_join_community(&mut self, slug: String, join: bool, cx: &mut Context<Self>) {
@@ -1699,18 +1775,23 @@ impl CommunityWorkspace {
     pub fn load_post_detail(&mut self, post_id: String, cx: &mut Context<Self>) {
         self.state.detail_gen = self.state.detail_gen.wrapping_add(1);
         let my_gen = self.state.detail_gen;
-        if self
+        let is_same_post = self
             .state
             .detail_post
             .as_ref()
-            .is_some_and(|d| d.post.post_id != post_id)
-        {
+            .is_some_and(|d| d.post.post_id == post_id);
+        if !is_same_post {
             self.state.detail_post = None;
             self.state.detail_editing_comment_id = None;
             self.state.detail_edit_comment_draft.clear();
             self.state.detail_summon_feedback = None;
             self.state.detail_reply_parent_id = None;
+            if !self.state.detail_opened_from_notification {
+                self.state.detail_focused_comment_id = None;
+            }
         }
+        self.state.detail_comment_more_cursors.clear();
+        self.state.detail_loading_more_comment_ids.clear();
         self.state.detail_error = None;
         self.state.detail_loading = true;
         let sort = self.state.detail_comment_sort;
@@ -1727,6 +1808,7 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.detail_loading = false;
+                let from_notif = std::mem::take(&mut this.state.detail_opened_from_notification);
                 match res {
                     Ok(Ok(det)) => {
                         this.state.detail_post = Some(det);
@@ -1736,7 +1818,8 @@ impl CommunityWorkspace {
                         let msg = e.to_string();
                         this.state.detail_post = None;
                         this.state.detail_error = Some(msg.clone());
-                        if this.state.detail_focused_comment_id.take().is_some() {
+                        this.state.detail_focused_comment_id = None;
+                        if from_notif {
                             let lang = this.language_id.clone();
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast {
@@ -1757,7 +1840,8 @@ impl CommunityWorkspace {
                     Err(e) => {
                         this.state.detail_post = None;
                         this.state.detail_error = Some(e.clone());
-                        if this.state.detail_focused_comment_id.take().is_some() {
+                        this.state.detail_focused_comment_id = None;
+                        if from_notif {
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast {
                                     text: e,
@@ -1833,7 +1917,9 @@ impl CommunityWorkspace {
             .await;
             let _ = weak.update(app, |this, cx| match res {
                 Ok(Ok(_)) => {
-                    this.load_post_detail(reload_pid, cx);
+                    if this.state.route == CommunityRoute::PostDetail(reload_pid.clone()) {
+                        this.load_post_detail(reload_pid, cx);
+                    }
                 }
                 Ok(Err(e)) => {
                     this.emit_action(
@@ -2007,6 +2093,7 @@ impl CommunityWorkspace {
         self.state.search_loading = true;
         self.state.search_error = None;
         let req = build_search_request(&query, tab, self.state.search_sort);
+        let req_for_filter = req.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -2020,7 +2107,8 @@ impl CommunityWorkspace {
                 this.state.search_loading = false;
                 match res {
                     Ok(Ok(sr)) => {
-                        this.state.search_result = Some(sr);
+                        let filtered = filter_search_result_by_operators(&req_for_filter, sr);
+                        this.state.search_result = Some(filtered);
                         this.state.search_error = None;
                     }
                     Ok(Err(e)) => {
@@ -2209,6 +2297,22 @@ impl CommunityWorkspace {
         action: ModActionKind,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_moderate_community_slug(&slug) {
+            let lang = self.language_id.clone();
+            self.emit_action(
+                CommunityWorkspaceAction::ShowToast {
+                    text: tr_str(
+                        &lang,
+                        "你当前身份没有该社区的版主权限",
+                        "Active identity does not have moderator permissions for this community",
+                    )
+                    .to_string(),
+                    is_error: true,
+                },
+                cx,
+            );
+            return;
+        }
         let req = ModActionRequest {
             action,
             target_kind,
@@ -2392,6 +2496,7 @@ impl CommunityWorkspace {
     pub fn set_detail_comment_sort(&mut self, sort: CommentSort, cx: &mut Context<Self>) {
         if self.state.detail_comment_sort != sort {
             self.state.detail_comment_sort = sort;
+            self.state.detail_comment_more_cursors.clear();
             if let CommunityRoute::PostDetail(pid) = self.state.route.clone() {
                 self.load_post_detail(pid, cx);
             }

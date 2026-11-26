@@ -128,6 +128,7 @@ pub fn compute_composer_autocomplete(ws: &CommunityWorkspace) -> Option<(usize, 
             }
         }
         AutocompleteKind::Hashtag => {
+            let lang = ws.language_id.as_str();
             let mut seen = HashSet::new();
             for t in &ws.state.trending {
                 let raw = t.slug_or_tag.trim_start_matches('#');
@@ -139,7 +140,11 @@ pub fn compute_composer_autocomplete(ws: &CommunityWorkspace) -> Option<(usize, 
                         kind: AutocompleteKind::Hashtag,
                         insert_token: format!("#{raw} "),
                         display_label: format!("#{raw}"),
-                        subtitle: format!("{} posts", t.posts_count_24h),
+                        subtitle: if lang.starts_with("zh") {
+                            format!("{} 篇帖子", t.posts_count_24h)
+                        } else {
+                            format!("{} posts", t.posts_count_24h)
+                        },
                     });
                     if items.len() >= 6 {
                         break;
@@ -151,7 +156,7 @@ pub fn compute_composer_autocomplete(ws: &CommunityWorkspace) -> Option<(usize, 
                     kind: AutocompleteKind::Hashtag,
                     insert_token: format!("#{query} "),
                     display_label: format!("#{query}"),
-                    subtitle: "New hashtag".to_string(),
+                    subtitle: tr_str(lang, "新建话题标签", "New hashtag").to_string(),
                 });
             }
         }
@@ -197,17 +202,36 @@ fn apply_markdown_format_snippet(body: &mut String, kind: TextStyleKind) {
     body.push_str(snippet);
 }
 
-fn extract_domain(url: &str) -> String {
-    let trimmed = url
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    trimmed
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("link")
-        .to_string()
+/// Strictly validates an HTTP(S) Link URL (rejects hostless, empty-authority like `https:///no-host`,
+/// whitespace, or control chars) and returns its parsed host domain on success.
+pub fn validate_composer_link_url(raw: &str) -> Result<String, &'static str> {
+    let url = raw.trim();
+    if url.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("invalid_chars");
+    }
+    let after_scheme = if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
+        &url[8..]
+    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
+        &url[7..]
+    } else {
+        return Err("invalid_scheme");
+    };
+    if after_scheme.is_empty() || after_scheme.starts_with(['/', '?', '#', '\\']) {
+        return Err("missing_host");
+    }
+    let authority = after_scheme.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("missing_host");
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| "parse_error")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("invalid_scheme");
+    }
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or("missing_host")?;
+    Ok(host.to_string())
 }
 
 impl CommunityWorkspace {
@@ -286,6 +310,47 @@ impl CommunityWorkspace {
         st.body = post.body.clone();
         st.is_nsfw = post.is_nsfw;
         st.is_spoiler = post.is_spoiler;
+        st.co_author_bot_id = post.co_author_actor_id.clone();
+        if !post.media.is_empty() {
+            st.media_items = post
+                .media
+                .iter()
+                .map(|m| ComposerMediaDraft {
+                    url_or_id: m.url.clone().unwrap_or_else(|| m.media_id.clone()),
+                    kind: if m.kind.trim().is_empty() {
+                        "image".to_string()
+                    } else {
+                        m.kind.clone()
+                    },
+                    alt_text: m.alt_text.clone().unwrap_or_default(),
+                })
+                .collect();
+        }
+        if let Some(ref lp) = post.link_preview {
+            st.link_url = lp.url.clone();
+            st.link_title = lp.title.clone();
+            st.link_description = lp.description.clone().unwrap_or_default();
+        }
+        if let Some(ref poll) = post.poll {
+            st.poll_question = poll.question.clone();
+            let mut opts: Vec<String> = poll.options.iter().map(|o| o.text.clone()).collect();
+            while opts.len() < 2 {
+                opts.push(String::new());
+            }
+            st.poll_options = opts;
+            st.poll_multi_select = poll.multi_select;
+            if poll.expires_at_ms > post.created_at_ms {
+                st.poll_duration_secs =
+                    ((poll.expires_at_ms - post.created_at_ms) / 1000).clamp(300, 2_592_000);
+            }
+        }
+        st.quoted_post_id = post.quoted_post_id.clone();
+        st.crosspost_of_id = post.crosspost_of_id.clone();
+        let origin_id = post
+            .quoted_post_id
+            .as_deref()
+            .or(post.crosspost_of_id.as_deref());
+        st.origin_preview = origin_id.and_then(|oid| self.state.find_post(oid).cloned());
         if let Some(ts) = post.scheduled_at_ms {
             let mins = ((ts - now_unix_ms()) / 60_000).max(5);
             st.schedule_enabled = post.status == PostStatus::Scheduled;
@@ -704,15 +769,14 @@ impl CommunityWorkspace {
 
         let link_preview = if c.tab == ComposerFormatTab::Link {
             let url = c.link_url.trim();
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err(tr_str(
+            let domain = validate_composer_link_url(url).map_err(|_| {
+                tr_str(
                     lang,
-                    "请输入以 http:// 或 https:// 开头的有效链接地址。",
-                    "Please enter a valid Link URL starting with http:// or https://.",
+                    "请输入有效的 http:// 或 https:// 链接地址（需包含有效主机名且不能含空白字符）。",
+                    "Please enter a valid http:// or https:// URL with a non-empty host and no whitespace.",
                 )
-                .to_string());
-            }
-            let domain = extract_domain(url);
+                .to_string()
+            })?;
             let title = if c.link_title.trim().is_empty() {
                 domain.clone()
             } else {
@@ -730,12 +794,26 @@ impl CommunityWorkspace {
         };
 
         let poll = if c.tab == ComposerFormatTab::Poll {
-            let opts: Vec<String> = c
-                .poll_options
-                .iter()
-                .map(|o| o.trim().to_string())
-                .filter(|o| !o.is_empty())
-                .collect();
+            if !(2..=6).contains(&c.poll_options.len()) {
+                return Err(tr_str(
+                    lang,
+                    "投票需包含 2 至 6 个选项。",
+                    "Polls must have between 2 and 6 options.",
+                )
+                .to_string());
+            }
+            let mut opts = Vec::with_capacity(c.poll_options.len());
+            for (idx, raw_opt) in c.poll_options.iter().enumerate() {
+                let trimmed = raw_opt.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "{} #{}",
+                        tr_str(lang, "投票选项不能为空：选项", "Poll option cannot be empty: option"),
+                        idx + 1
+                    ));
+                }
+                opts.push(trimmed.to_string());
+            }
             Some(CreatePollInputDto {
                 question: c.poll_question.trim().to_string(),
                 options: opts,
@@ -815,16 +893,103 @@ impl CommunityWorkspace {
         }
         let now_ms = now_unix_ms();
         if let Some(edit_id) = self.state.composer.editing_post_id.clone() {
+            let lang = self.language_id.clone();
             let body = self.state.composer.body.trim().to_string();
+            let body_chars = body.chars().count();
             let title = Some(self.state.composer.title.trim().to_string()).filter(|s| !s.is_empty());
-            if body.is_empty() && title.is_none() {
-                let lang = self.language_id.clone();
+            if title.as_ref().is_some_and(|t| t.chars().count() > 300) {
                 self.state.composer.validation_error = Some(
-                    tr_str(&lang, "标题和正文不能同时为空", "Title and body cannot both be empty")
-                        .to_string(),
+                    tr_str(
+                        &lang,
+                        "帖子标题不能超过 300 个字符",
+                        "Post title must be <= 300 characters",
+                    )
+                    .to_string(),
                 );
                 cx.notify();
                 return;
+            }
+            if body_chars > 40_000 {
+                self.state.composer.validation_error = Some(
+                    tr_str(
+                        &lang,
+                        "帖子正文超过最大长度限制 (40000 字符)",
+                        "Post body exceeds maximum length (40000 characters)",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            match self.state.composer.tab {
+                ComposerFormatTab::Article => {
+                    if title.is_none() || body.is_empty() {
+                        self.state.composer.validation_error = Some(
+                            tr_str(
+                                &lang,
+                                "长文必须包含非空标题和正文",
+                                "Article posts require both a non-empty title and body",
+                            )
+                            .to_string(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+                ComposerFormatTab::Micro | ComposerFormatTab::Thread => {
+                    if body.is_empty() || body_chars > 2000 {
+                        self.state.composer.validation_error = Some(
+                            tr_str(
+                                &lang,
+                                "短帖正文需为 1–2000 个字符",
+                                "Micro post body must be 1–2000 characters",
+                            )
+                            .to_string(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+                ComposerFormatTab::Quote => {
+                    if body.is_empty() {
+                        self.state.composer.validation_error = Some(
+                            tr_str(
+                                &lang,
+                                "引用帖正文不能为空",
+                                "Quote post commentary cannot be empty",
+                            )
+                            .to_string(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+                ComposerFormatTab::Media
+                | ComposerFormatTab::Link
+                | ComposerFormatTab::Poll
+                | ComposerFormatTab::Crosspost => {
+                    let has_payload = self
+                        .state
+                        .composer
+                        .media_items
+                        .iter()
+                        .any(|m| !m.url_or_id.trim().is_empty())
+                        || !self.state.composer.link_url.trim().is_empty()
+                        || !self.state.composer.poll_question.trim().is_empty()
+                        || self.state.composer.crosspost_of_id.is_some();
+                    if body.is_empty() && title.is_none() && !has_payload {
+                        self.state.composer.validation_error = Some(
+                            tr_str(
+                                &lang,
+                                "标题和正文不能同时为空",
+                                "Title and body cannot both be empty",
+                            )
+                            .to_string(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
             }
             let scheduled_at_ms = if requested_status == PostStatus::Scheduled {
                 let mins = self
@@ -835,7 +1000,6 @@ impl CommunityWorkspace {
                     .parse::<i64>()
                     .unwrap_or(0);
                 if mins <= 0 {
-                    let lang = self.language_id.clone();
                     self.state.composer.validation_error = Some(
                         tr_str(&lang, "定时时间必须大于 0 分钟", "Schedule minutes must be > 0")
                             .to_string(),
@@ -843,7 +1007,16 @@ impl CommunityWorkspace {
                     cx.notify();
                     return;
                 }
-                Some(now_ms.saturating_add(mins.saturating_mul(60_000)))
+                let ts = now_ms.saturating_add(mins.saturating_mul(60_000));
+                if ts <= now_ms {
+                    self.state.composer.validation_error = Some(
+                        tr_str(&lang, "定时发布时间必须在未来", "Scheduled timestamp must be in the future")
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                Some(ts)
             } else {
                 None
             };

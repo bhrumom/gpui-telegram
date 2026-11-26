@@ -169,6 +169,7 @@ impl CommunityWorkspace {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            self.state.detail_opened_from_notification = true;
             self.state.detail_focused_comment_id = notif
                 .target_comment_id
                 .as_deref()

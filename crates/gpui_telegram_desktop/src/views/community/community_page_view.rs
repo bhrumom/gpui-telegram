@@ -476,7 +476,25 @@ impl CommunityWorkspace {
             return;
         }
         let lang = self.language_id.clone();
-        let slug = match normalize_community_slug(&self.state.create_community.slug) {
+        let raw_slug_trimmed = self.state.create_community.slug.trim();
+        let raw_slug_body = raw_slug_trimmed
+            .strip_prefix("c/")
+            .unwrap_or(raw_slug_trimmed);
+        if raw_slug_trimmed.starts_with("C/")
+            || raw_slug_body.bytes().any(|b| b.is_ascii_uppercase())
+        {
+            self.state.create_community.error = Some(
+                tr_str(
+                    &lang,
+                    "社区标识不能包含大写字母（仅限 2–32 位小写字母、数字或下划线 [a-z0-9_]）",
+                    "Invalid slug: uppercase letters are not allowed (2–32 lowercase ASCII [a-z0-9_])",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let slug = match normalize_community_slug(raw_slug_trimmed) {
             Ok(s) => s,
             Err(e) => {
                 self.state.create_community.error = Some(format!(

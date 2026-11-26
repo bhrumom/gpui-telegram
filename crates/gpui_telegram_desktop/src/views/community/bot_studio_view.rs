@@ -95,6 +95,14 @@ pub fn validate_bot_studio_registration(
     Ok((clean_handle, cooldown, max_posts))
 }
 
+/// Resolves a bot's API token strictly from the per-actor token map (never leaking another bot's token).
+pub fn resolve_bot_studio_token_for_actor(
+    tokens_by_actor: &std::collections::HashMap<String, String>,
+    actor_id: &str,
+) -> Option<String> {
+    tokens_by_actor.get(actor_id).cloned()
+}
+
 /// Formats a ready-to-run `curl` snippet targeting `/bot/{token}/community.createPost`.
 pub fn format_bot_api_snippet(base_url: &str, token: Option<&str>, community_slug: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
@@ -103,6 +111,23 @@ pub fn format_bot_api_snippet(base_url: &str, token: Option<&str>, community_slu
     format!(
         "curl -X POST \"{base}/bot/{tok}/community.createPost\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{{\"community_slug\":\"{comm}\",\"format\":\"micro\",\"body\":\"Hello from my first-class Bot citizen!\"}}'"
     )
+}
+
+/// Formats a visible `curl` snippet for UI rendering, masking the secret token unless `revealed == true`.
+pub fn format_bot_api_snippet_for_display(
+    base_url: &str,
+    token: Option<&str>,
+    revealed: bool,
+    community_slug: Option<&str>,
+) -> String {
+    let display_tok = token.map(|tok| {
+        if revealed {
+            tok.to_string()
+        } else {
+            mask_bot_token(tok)
+        }
+    });
+    format_bot_api_snippet(base_url, display_tok.as_deref(), community_slug)
 }
 
 fn mask_bot_token(token: &str) -> String {
@@ -125,6 +150,73 @@ fn autonomy_choice_label(mode: BotAutonomyMode, lang: &str) -> &'static str {
 }
 
 impl CommunityWorkspace {
+    /// Resolves the currently selected owned bot (or first owned bot fallback).
+    pub fn resolve_selected_owned_bot(&self) -> Option<CommunityActorDto> {
+        let bots = &self.state.identities.as_ref()?.bot_actors;
+        self.state
+            .bot_studio_selected_bot_id
+            .as_deref()
+            .and_then(|id| bots.iter().find(|b| b.actor_id == id).cloned())
+            .or_else(|| bots.first().cloned())
+    }
+
+    /// Hydrates `bot_studio_edit` from `bot` only when `bot_studio_edit.actor_id != bot.actor_id`,
+    /// preserving any in-progress unhydrated user edits if `actor_id` was previously empty.
+    pub fn ensure_bot_studio_edit_hydrated(&mut self, bot: &CommunityActorDto) {
+        if self.state.bot_studio_edit.actor_id == bot.actor_id {
+            return;
+        }
+        let prev = self.state.bot_studio_edit.clone();
+        let shape_idx = GROK_AVATAR_SHAPES
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(&bot.avatar_shape))
+            .unwrap_or(0);
+        let color_idx = GROK_AVATAR_COLOR_IDS
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(&bot.avatar_color))
+            .unwrap_or(0);
+        self.state.bot_studio_selected_bot_id = Some(bot.actor_id.clone());
+        let mut draft = BotStudioEditDraft {
+            actor_id: bot.actor_id.clone(),
+            display_name: bot.display_name.clone(),
+            bio: bot.bio.clone(),
+            bot_badge: bot.bot_badge.clone().unwrap_or_default(),
+            bot_model: bot.bot_model.clone().unwrap_or_default(),
+            bot_capabilities: bot.bot_capabilities.clone(),
+            custom_cap_draft: String::new(),
+            bot_persona: bot.bot_persona.clone().unwrap_or_default(),
+            bot_autonomy_mode: bot.bot_autonomy_mode,
+            shape_idx,
+            color_idx,
+            saving: false,
+            error: None,
+        };
+        if prev.actor_id.is_empty() {
+            if !prev.display_name.is_empty() {
+                draft.display_name = prev.display_name;
+            }
+            if !prev.bio.is_empty() {
+                draft.bio = prev.bio;
+            }
+            if !prev.bot_badge.is_empty() {
+                draft.bot_badge = prev.bot_badge;
+            }
+            if !prev.bot_model.is_empty() {
+                draft.bot_model = prev.bot_model;
+            }
+            if !prev.bot_persona.is_empty() {
+                draft.bot_persona = prev.bot_persona;
+            }
+            if !prev.bot_capabilities.is_empty() {
+                draft.bot_capabilities = prev.bot_capabilities;
+            }
+            if !prev.custom_cap_draft.is_empty() {
+                draft.custom_cap_draft = prev.custom_cap_draft;
+            }
+        }
+        self.state.bot_studio_edit = draft;
+    }
+
     /// Selects an owned bot in Bot Studio and hydrates its edit draft cleanly.
     pub fn select_bot_for_studio(&mut self, actor: CommunityActorDto, cx: &mut Context<Self>) {
         let shape_idx = GROK_AVATAR_SHAPES
@@ -174,6 +266,11 @@ impl CommunityWorkspace {
         color_idx: usize,
         cx: &mut Context<Self>,
     ) {
+        if self.state.bot_studio_edit.actor_id.is_empty() {
+            if let Some(bot) = self.resolve_selected_owned_bot() {
+                self.ensure_bot_studio_edit_hydrated(&bot);
+            }
+        }
         let (s, c) = clamp_grok_avatar_indices(shape_idx, color_idx);
         self.state.bot_studio_edit.shape_idx = s;
         self.state.bot_studio_edit.color_idx = c;
@@ -216,6 +313,11 @@ impl CommunityWorkspace {
     }
 
     pub fn toggle_bot_studio_edit_capability(&mut self, cap: String, cx: &mut Context<Self>) {
+        if self.state.bot_studio_edit.actor_id.is_empty() {
+            if let Some(bot) = self.resolve_selected_owned_bot() {
+                self.ensure_bot_studio_edit_hydrated(&bot);
+            }
+        }
         let norm = cap.trim().to_ascii_lowercase();
         if norm.is_empty() {
             return;
@@ -235,6 +337,11 @@ impl CommunityWorkspace {
     }
 
     pub fn add_bot_studio_edit_custom_capability(&mut self, cx: &mut Context<Self>) {
+        if self.state.bot_studio_edit.actor_id.is_empty() {
+            if let Some(bot) = self.resolve_selected_owned_bot() {
+                self.ensure_bot_studio_edit_hydrated(&bot);
+            }
+        }
         let raw = self
             .state
             .bot_studio_edit
@@ -391,6 +498,11 @@ impl CommunityWorkspace {
     pub fn save_selected_bot_edits(&mut self, cx: &mut Context<Self>) {
         if self.state.bot_studio_edit.saving {
             return;
+        }
+        if self.state.bot_studio_edit.actor_id.trim().is_empty() {
+            if let Some(bot) = self.resolve_selected_owned_bot() {
+                self.ensure_bot_studio_edit_hydrated(&bot);
+            }
         }
         let actor_id = self.state.bot_studio_edit.actor_id.trim().to_string();
         let display_name = self.state.bot_studio_edit.display_name.trim().to_string();
@@ -700,6 +812,20 @@ fn render_studio_input_box(
     ws: &CommunityWorkspace,
     cx: &mut Context<CommunityWorkspace>,
 ) -> Stateful<Div> {
+    render_studio_input_box_with_hydrate(id, target, value, placeholder, multiline, None, ws, cx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_studio_input_box_with_hydrate(
+    id: &'static str,
+    target: ActiveCommunityInput,
+    value: &str,
+    placeholder: &str,
+    multiline: bool,
+    hydrate_bot: Option<CommunityActorDto>,
+    ws: &CommunityWorkspace,
+    cx: &mut Context<CommunityWorkspace>,
+) -> Stateful<Div> {
     let pal = ws.palette;
     let foc = ws.state.active_input == target;
     let preedit = if foc {
@@ -726,6 +852,9 @@ fn render_studio_input_box(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
+                if let Some(ref bot) = hydrate_bot {
+                    this.ensure_bot_studio_edit_hydrated(bot);
+                }
                 this.state.focus_input(target);
                 cx.notify();
             }),
@@ -734,12 +863,14 @@ fn render_studio_input_box(
 }
 
 /// Interactive 8-Shape × 11-Hue `GrokBotAvatar` live customizer widget.
+#[allow(clippy::too_many_arguments)]
 fn render_grok_avatar_customizer(
     id_prefix: &'static str,
     preview_source_id: &str,
     shape_idx: usize,
     color_idx: usize,
     is_edit: bool,
+    hydrate_bot: Option<CommunityActorDto>,
     pal: &TdesktopThemePalette,
     lang: &str,
     cx: &mut Context<CommunityWorkspace>,
@@ -797,6 +928,7 @@ fn render_grok_avatar_customizer(
                 .gap(px(5.0))
                 .children(GROK_AVATAR_SHAPES.iter().enumerate().map(|(idx, sh)| {
                     let selected = idx == s_idx;
+                    let hb = hydrate_bot.clone();
                     div()
                         .id(SharedString::from(format!("{id_prefix}-shape-{idx}")))
                         .cursor_pointer()
@@ -822,6 +954,9 @@ fn render_grok_avatar_customizer(
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 if is_edit {
+                                    if let Some(ref b) = hb {
+                                        this.ensure_bot_studio_edit_hydrated(b);
+                                    }
                                     this.set_bot_studio_edit_avatar_indices(
                                         idx,
                                         this.state.bot_studio_edit.color_idx,
@@ -857,6 +992,7 @@ fn render_grok_avatar_customizer(
                 .gap(px(5.0))
                 .children(GROK_COLOR_PALETTE.iter().enumerate().map(|(idx, spec)| {
                     let selected = idx == c_idx;
+                    let hb = hydrate_bot.clone();
                     div()
                         .id(SharedString::from(format!("{id_prefix}-color-{idx}")))
                         .cursor_pointer()
@@ -882,6 +1018,9 @@ fn render_grok_avatar_customizer(
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 if is_edit {
+                                    if let Some(ref b) = hb {
+                                        this.ensure_bot_studio_edit_hydrated(b);
+                                    }
                                     this.set_bot_studio_edit_avatar_indices(
                                         this.state.bot_studio_edit.shape_idx,
                                         idx,
@@ -1378,20 +1517,21 @@ fn render_bot_api_token_card(
 ) -> Div {
     let pal = ws.palette;
     let lang = ws.language_id.as_str();
-    let token_opt = ws
-        .state
-        .bot_studio_tokens_by_actor
-        .get(&bot.actor_id)
-        .cloned()
-        .or_else(|| ws.state.bot_studio_last_token.clone());
+    let token_opt =
+        resolve_bot_studio_token_for_actor(&ws.state.bot_studio_tokens_by_actor, &bot.actor_id);
     let revealed = ws.state.bot_studio_token_revealed;
     let comm_slug = ws
         .state
         .bot_studio_test_community
         .as_deref()
         .or_else(|| ws.state.communities.first().map(|c| c.slug.as_str()));
-    let snippet = format_bot_api_snippet(&ws.media_base_url, token_opt.as_deref(), comm_slug);
-    let snippet_copy = snippet.clone();
+    let visible_snippet = format_bot_api_snippet_for_display(
+        &ws.media_base_url,
+        token_opt.as_deref(),
+        revealed,
+        comm_slug,
+    );
+    let snippet_copy = format_bot_api_snippet(&ws.media_base_url, token_opt.as_deref(), comm_slug);
 
     div()
         .p(px(13.0))
@@ -1532,7 +1672,7 @@ fn render_bot_api_token_card(
                 .bg(rgb(pal.code_bg))
                 .text_size(px(11.0))
                 .text_color(rgb(pal.code_fg))
-                .child(snippet),
+                .child(visible_snippet),
         )
 }
 
@@ -1630,16 +1770,18 @@ fn render_selected_bot_editor_card(
             ed_shape,
             ed_color,
             true,
+            Some(bot_for_hydrate.clone()),
             &pal,
             lang,
             cx,
         ))
-        .child(render_studio_input_box(
+        .child(render_studio_input_box_with_hydrate(
             "studio-edit-name-input",
             ActiveCommunityInput::BotStudioEditName,
             &ed_name,
             tr_str(lang, "显示名称", "Display name"),
             false,
+            Some(bot_for_hydrate.clone()),
             ws,
             cx,
         ))
@@ -1647,40 +1789,44 @@ fn render_selected_bot_editor_card(
             div()
                 .flex()
                 .gap(px(8.0))
-                .child(div().flex_1().child(render_studio_input_box(
+                .child(div().flex_1().child(render_studio_input_box_with_hydrate(
                     "studio-edit-badge-input",
                     ActiveCommunityInput::BotStudioEditBadge,
                     &ed_badge,
                     tr_str(lang, "Bot 徽章 (如 AI Agent)", "Bot badge"),
                     false,
+                    Some(bot_for_hydrate.clone()),
                     ws,
                     cx,
                 )))
-                .child(div().flex_1().child(render_studio_input_box(
+                .child(div().flex_1().child(render_studio_input_box_with_hydrate(
                     "studio-edit-model-input",
                     ActiveCommunityInput::BotStudioEditModel,
                     &ed_model,
                     tr_str(lang, "模型名称 (如 Hermes-4)", "Model (e.g. Hermes-4)"),
                     false,
+                    Some(bot_for_hydrate.clone()),
                     ws,
                     cx,
                 ))),
         )
-        .child(render_studio_input_box(
+        .child(render_studio_input_box_with_hydrate(
             "studio-edit-bio-input",
             ActiveCommunityInput::BotStudioEditBio,
             &ed_bio,
             tr_str(lang, "Bot 简介", "Bot bio"),
             true,
+            Some(bot_for_hydrate.clone()),
             ws,
             cx,
         ))
-        .child(render_studio_input_box(
+        .child(render_studio_input_box_with_hydrate(
             "studio-edit-persona-input",
             ActiveCommunityInput::BotStudioEditPersona,
             &ed_persona,
             tr_str(lang, "Bot 人设提示词与辩论风格", "Bot persona & debate instructions"),
             true,
+            Some(bot_for_hydrate.clone()),
             ws,
             cx,
         ))
@@ -1693,6 +1839,7 @@ fn render_selected_bot_editor_card(
                 .children(PRESET_CAPABILITIES.into_iter().map(|cap| {
                     let active = ed_caps.iter().any(|c| c.eq_ignore_ascii_case(cap));
                     let cap_s = cap.to_string();
+                    let hb = bot_for_hydrate.clone();
                     div()
                         .id(SharedString::from(format!("studio-edit-cap-{cap}")))
                         .cursor_pointer()
@@ -1710,6 +1857,7 @@ fn render_selected_bot_editor_card(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
+                                this.ensure_bot_studio_edit_hydrated(&hb);
                                 this.toggle_bot_studio_edit_capability(cap_s.clone(), cx);
                             }),
                         )
@@ -1723,6 +1871,7 @@ fn render_selected_bot_editor_card(
                 .gap(px(5.0))
                 .children(autonomies.into_iter().map(|mode| {
                     let active = ed_mode == mode;
+                    let hb = bot_for_hydrate.clone();
                     div()
                         .id(SharedString::from(format!("studio-edit-mode-{mode:?}")))
                         .cursor_pointer()
@@ -1745,6 +1894,7 @@ fn render_selected_bot_editor_card(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
+                                this.ensure_bot_studio_edit_hydrated(&hb);
                                 this.state.bot_studio_edit.bot_autonomy_mode = mode;
                                 cx.notify();
                             }),
@@ -1779,7 +1929,7 @@ fn render_selected_bot_editor_card(
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         if this.state.bot_studio_edit.actor_id != bot_for_hydrate.actor_id {
-                            this.select_bot_for_studio(bot_for_hydrate.clone(), cx);
+                            this.ensure_bot_studio_edit_hydrated(&bot_for_hydrate);
                         }
                         this.save_selected_bot_edits(cx);
                     }),
@@ -2031,6 +2181,7 @@ fn render_register_new_bot_card(
             ws.state.bot_studio_shape_idx,
             ws.state.bot_studio_color_idx,
             false,
+            None,
             &pal,
             lang,
             cx,
