@@ -2652,4 +2652,87 @@ async fn test_r2_mid_session_server_stop_acting_as_online_registered_bot() {
     }
 }
 
+#[tokio::test]
+async fn test_r9_create_post_as_actor_header_isolation_and_validation() {
+    // 1. Online mode: create_post_as sends X-Community-Actor-Id for the bot WITHOUT mutating
+    //    shared active_actor_id, while concurrent/subsequent calls continue using Human u:1001.
+    let state = MockState::default();
+    let server = spawn_router(build_full_mock_router(state.clone())).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = open_client(&server.base_url, dir.path());
+    client.set_auth_session(make_auth_session(1001, "alice_iso", "tok_alice"));
+    let c = client.community();
+    c.set_active_actor_id(Some("u:1001".to_string()));
+
+    let req = CreatePostRequest {
+        community_slug: Some("rust".into()),
+        body: "Bot-authored test post via create_post_as".into(),
+        ..Default::default()
+    };
+    let created = c
+        .create_post_as("  b:42  ", &req)
+        .await
+        .expect("create_post_as succeeds");
+    assert!(!created.post.post_id.is_empty());
+    assert_eq!(
+        c.active_actor_id().as_deref(),
+        Some("u:1001"),
+        "create_post_as must NEVER mutate facade.active_actor_id"
+    );
+
+    let _ = c
+        .vote_post("p_1", &VoteRequest { direction: 1 })
+        .await
+        .expect("vote_post succeeds");
+
+    {
+        let captured = state.captured.lock();
+        let create_req = captured
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v1/community/posts")
+            .expect("captured POST /posts");
+        assert_eq!(create_req.actor_id.as_deref(), Some("b:42"));
+
+        let vote_req = captured
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v1/community/posts/p_1/vote")
+            .expect("captured POST /vote");
+        assert_eq!(vote_req.actor_id.as_deref(), Some("u:1001"));
+    }
+
+    // 2. Empty, space-only, and CRLF/control-character actor_ids must all be rejected cleanly
+    //    (never silently falling back to Human active_actor_id).
+    for bad in ["", "   ", "\r\n", "b:42\r\nX-Injected: 1", "b:42\x00"] {
+        let err = c
+            .create_post_as(bad, &req)
+            .await
+            .expect_err(&format!("bad actor_id {bad:?} must fail validation"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "expected Validation for {bad:?}, got {err:?}"
+        );
+    }
+    assert_eq!(c.active_actor_id().as_deref(), Some("u:1001"));
+
+    // 3. Offline/local fallback mode: create_post_as authors under b:42 while active_actor_id stays u:1001.
+    let _ = c.get_identities().await.expect("mirror b:42 locally");
+    server.stop().await;
+
+    let local_post = c
+        .create_post_as("b:42", &req)
+        .await
+        .expect("local create_post_as b:42 succeeds");
+    assert_eq!(local_post.post.author_actor_id, "b:42");
+    assert_eq!(c.active_actor_id().as_deref(), Some("u:1001"));
+
+    let crlf_local = c
+        .create_post_as("b:42\r\n", &req)
+        .await
+        .expect_err("local CRLF actor_id must fail");
+    assert!(matches!(crlf_local, TelegramError::Validation(_)));
+
+    drop_client(client).await;
+}
+
+
 

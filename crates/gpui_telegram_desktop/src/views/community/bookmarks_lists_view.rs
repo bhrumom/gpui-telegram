@@ -396,7 +396,7 @@ impl CommunityWorkspace {
                         this.state.bookmark_pending_target.remove(&post_id);
                         this.state.bookmark_last_synced.remove(&post_id);
                         this.state.bookmark_cached_items.remove(&post_id);
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, false, cx);
                         if resp.bookmarked
                             && !this.state.saved_loading
                             && this.state.route == CommunityRoute::BookmarksLists
@@ -412,7 +412,7 @@ impl CommunityWorkspace {
                     }
                     Ok(Err(e)) => {
                         this.rollback_bookmark_flight(&post_id);
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, false, cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -423,7 +423,7 @@ impl CommunityWorkspace {
                     }
                     Err(_) => {
                         this.rollback_bookmark_flight(&post_id);
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, false, cx);
                     }
                 }
                 cx.notify();
@@ -741,6 +741,11 @@ impl CommunityWorkspace {
                                             saved.community_slugs.clone(),
                                         )
                                     });
+                                let server_confirmed_updated_at_ms = lists
+                                    .as_ref()
+                                    .and_then(|l| l.lists.iter().find(|x| &x.list_id == lid))
+                                    .map(|x| x.updated_at_ms)
+                                    .unwrap_or(saved.updated_at_ms);
                                 if this.state.lists_gen == my_lists_gen {
                                     if let Some(l) = lists {
                                         this.state.merge_refreshed_lists(l.lists);
@@ -779,6 +784,19 @@ impl CommunityWorkspace {
                                                 lid.clone(),
                                                 server_confirmed_toggle,
                                             );
+                                            if let Some(&active_flight_seq) =
+                                                this.state.list_membership_in_flight.get(lid)
+                                            {
+                                                this.state
+                                                    .list_membership_last_synced_editor_pinned_flight
+                                                    .insert(
+                                                        lid.clone(),
+                                                        (
+                                                            active_flight_seq,
+                                                            server_confirmed_updated_at_ms,
+                                                        ),
+                                                    );
+                                            }
                                             this.state.list_membership_dirty.insert(lid.clone());
                                             if members_or_slugs_differ {
                                                 this.state
@@ -787,6 +805,9 @@ impl CommunityWorkspace {
                                             }
                                         } else if preserved_differs_from_server || edited_was_dirty
                                         {
+                                            this.state
+                                                .list_membership_last_synced_editor_pinned_flight
+                                                .remove(lid);
                                             this.state.list_membership_last_synced.insert(
                                                 lid.clone(),
                                                 server_confirmed_toggle,
@@ -806,6 +827,9 @@ impl CommunityWorkspace {
                                         } else {
                                             this.state.list_membership_dirty.remove(lid);
                                             this.state.list_membership_last_synced.remove(lid);
+                                            this.state
+                                                .list_membership_last_synced_editor_pinned_flight
+                                                .remove(lid);
                                             if !is_deleting {
                                                 this.state
                                                     .list_membership_needs_feed_reload
@@ -815,6 +839,9 @@ impl CommunityWorkspace {
                                     } else {
                                         this.state.list_membership_dirty.remove(lid);
                                         this.state.list_membership_last_synced.remove(lid);
+                                        this.state
+                                            .list_membership_last_synced_editor_pinned_flight
+                                            .remove(lid);
                                         if is_deleting {
                                             if prev_toggle_fields.as_ref().is_some_and(
                                                 |(_, p_mem, p_slug)| {
@@ -948,6 +975,9 @@ impl CommunityWorkspace {
                         this.state.list_membership_dirty.remove(&list_id);
                         this.state.list_membership_needs_feed_reload.remove(&list_id);
                         this.state.list_membership_last_synced.remove(&list_id);
+                        this.state
+                            .list_membership_last_synced_editor_pinned_flight
+                            .remove(&list_id);
                         this.state.list_membership_toggle_seq.remove(&list_id);
                         this.state.lists.retain(|l| l.list_id != list_id);
                         if this.state.selected_list_id.as_deref() == Some(list_id.as_str()) {
@@ -1118,6 +1148,9 @@ impl CommunityWorkspace {
             self.state.list_membership_dirty.remove(&list_id);
             self.state.list_membership_needs_feed_reload.remove(&list_id);
             self.state.list_membership_last_synced.remove(&list_id);
+            self.state
+                .list_membership_last_synced_editor_pinned_flight
+                .remove(&list_id);
             return;
         };
 
@@ -1165,6 +1198,9 @@ impl CommunityWorkspace {
                     this.state.list_membership_dirty.remove(&list_id);
                     this.state.list_membership_needs_feed_reload.remove(&list_id);
                     this.state.list_membership_last_synced.remove(&list_id);
+                    this.state
+                        .list_membership_last_synced_editor_pinned_flight
+                        .remove(&list_id);
                     cx.notify();
                     return;
                 };
@@ -1179,14 +1215,24 @@ impl CommunityWorkspace {
                             .entry(list_id.clone())
                             .or_insert(0);
                         *toggle_seq = toggle_seq.wrapping_add(1);
-                        this.state.list_membership_last_synced.insert(
-                            list_id.clone(),
-                            (
-                                updated.is_pinned,
-                                updated.member_actor_ids.clone(),
-                                updated.community_slugs.clone(),
-                            ),
-                        );
+                        let editor_pinned_this_flight = this
+                            .state
+                            .list_membership_last_synced_editor_pinned_flight
+                            .remove(&list_id)
+                            .is_some_and(|(pinned_seq, editor_ts)| {
+                                pinned_seq == my_flight_seq
+                                    && updated.updated_at_ms <= editor_ts
+                            });
+                        if !editor_pinned_this_flight {
+                            this.state.list_membership_last_synced.insert(
+                                list_id.clone(),
+                                (
+                                    updated.is_pinned,
+                                    updated.member_actor_ids.clone(),
+                                    updated.community_slugs.clone(),
+                                ),
+                            );
+                        }
                         if is_deleting {
                             let ui_differs = {
                                 let cur = &this.state.lists[pos];
@@ -1219,6 +1265,9 @@ impl CommunityWorkspace {
                     }
                     Ok(Err(e)) => {
                         this.state.list_membership_dirty.remove(&list_id);
+                        this.state
+                            .list_membership_last_synced_editor_pinned_flight
+                            .remove(&list_id);
                         let had_feed_reload =
                             this.state.list_membership_needs_feed_reload.remove(&list_id);
                         if let Some((prev_pinned, prev_members, prev_slugs)) =
@@ -1247,6 +1296,9 @@ impl CommunityWorkspace {
                     }
                     Err(_) => {
                         this.state.list_membership_dirty.remove(&list_id);
+                        this.state
+                            .list_membership_last_synced_editor_pinned_flight
+                            .remove(&list_id);
                         let had_feed_reload =
                             this.state.list_membership_needs_feed_reload.remove(&list_id);
                         if let Some((prev_pinned, prev_members, prev_slugs)) =

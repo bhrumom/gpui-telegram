@@ -248,6 +248,9 @@ impl CommunityWorkspace {
         initial_community: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.community_slug = initial_community;
         self.state.composer = st;
@@ -259,6 +262,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_from_quick_post(&mut self, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.title = self.state.quick_post_title.clone();
         st.body = self.state.quick_post_body.clone();
@@ -275,6 +281,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_quote(&mut self, origin: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.tab = ComposerFormatTab::Quote;
         st.quoted_post_id = Some(origin.post_id.clone());
@@ -288,6 +297,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_crosspost(&mut self, origin: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.tab = ComposerFormatTab::Crosspost;
         st.crosspost_of_id = Some(origin.post_id.clone());
@@ -301,6 +313,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_composer_edit(&mut self, post: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let mut st = ComposerModalState::default();
         st.editing_post_id = Some(post.post_id.clone());
         st.tab = match post.format {
@@ -626,6 +641,9 @@ impl CommunityWorkspace {
     }
 
     pub fn resume_draft_into_composer(&mut self, draft: CommunityPostDto, cx: &mut Context<Self>) {
+        if self.state.composer.submitting {
+            return;
+        }
         let prev_drafts = self.state.composer.drafts.clone();
         self.open_composer_edit(draft, cx);
         self.state.composer.drafts = prev_drafts;
@@ -1085,9 +1103,9 @@ impl CommunityWorkspace {
                             let updated_pid = updated.post_id.clone();
                             this.state
                                 .visit_post_mut(&updated_pid, |p| *p = updated.clone());
-                            if !matches!(this.state.route, CommunityRoute::Feed) {
-                                this.reload_detail_if_loading_post(&updated_pid, cx);
-                            }
+                            let was_feed_loading =
+                                this.state.feed_loading || this.state.feed_loading_more;
+                            this.reload_detail_if_loading_post(&updated_pid, true, cx);
                             if this.state.composer.drafts_loading
                                 || this.state.composer.show_drafts_drawer
                             {
@@ -1101,7 +1119,9 @@ impl CommunityWorkspace {
                                 },
                                 cx,
                             );
-                            this.load_feed(cx);
+                            if !was_feed_loading {
+                                this.load_feed(cx);
+                            }
                         }
                         Ok(Err(e)) => {
                             this.state.composer.validation_error = Some(e.to_string());

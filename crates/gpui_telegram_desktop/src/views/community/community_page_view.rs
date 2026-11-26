@@ -100,7 +100,7 @@ impl CommunityWorkspace {
     }
 
     pub fn load_more_community_posts(&mut self, slug: String, cx: &mut Context<Self>) {
-        if self.state.community_loading_more {
+        if self.state.community_loading || self.state.community_loading_more {
             return;
         }
         let Some(cursor) = self.state.community_next_cursor.clone() else {
@@ -308,12 +308,26 @@ impl CommunityWorkspace {
                 {
                     return;
                 }
-                this.state.community_wiki_saving = false;
+                let on_different_comm = matches!(
+                    &this.state.route,
+                    CommunityRoute::CommunityPage(s) if !s.eq_ignore_ascii_case(&reload_slug)
+                ) || this
+                    .state
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| !d.community.slug.eq_ignore_ascii_case(&reload_slug));
+                if !on_different_comm {
+                    this.state.community_wiki_saving = false;
+                }
                 let still_same_comm_gen = this.state.community_gen == my_comm_gen;
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(rev)) => {
-                        if still_same_comm_gen {
+                        let on_same_comm_route = matches!(
+                            &this.state.route,
+                            CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&reload_slug)
+                        );
+                        if still_same_comm_gen || on_same_comm_route {
                             this.state.community_wiki_editing = false;
                             this.state.community_wiki_preview_rev = None;
                             if matches!(
@@ -323,6 +337,8 @@ impl CommunityWorkspace {
                             ) {
                                 this.state.blur_input();
                             }
+                        }
+                        if still_same_comm_gen {
                             if let Some(ref mut det) = this.state.community_detail {
                                 if det.community.slug.eq_ignore_ascii_case(&reload_slug) {
                                     det.community.wiki_markdown = rev.markdown.clone();
@@ -331,10 +347,6 @@ impl CommunityWorkspace {
                                 }
                             }
                         }
-                        let on_same_comm_route = matches!(
-                            &this.state.route,
-                            CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&reload_slug)
-                        );
                         if on_same_comm_route
                             && (this.state.community_loading || !still_same_comm_gen)
                         {
@@ -452,13 +464,51 @@ impl CommunityWorkspace {
                 {
                     return;
                 }
-                this.state.community_rules_saving = false;
+                let on_different_comm = matches!(
+                    &this.state.route,
+                    CommunityRoute::CommunityPage(s) if !s.eq_ignore_ascii_case(&reload_slug)
+                ) || this
+                    .state
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| !d.community.slug.eq_ignore_ascii_case(&reload_slug));
+                if !on_different_comm {
+                    this.state.community_rules_saving = false;
+                }
                 let still_same_comm_gen = this.state.community_gen == my_comm_gen;
                 let lang = this.language_id.clone();
                 match res {
-                    Ok(Ok(updated)) => {
+                    Ok(Ok(mut updated)) => {
                         this.state.community_new_rule_title.clear();
                         this.state.community_new_rule_desc.clear();
+                        this.state.overlay_in_flight_community_mutations(&mut updated);
+                        let slug_key = updated.slug.to_ascii_lowercase();
+                        if this.state.automod_in_flight.contains_key(&slug_key)
+                            || this.state.automod_dirty.contains(&slug_key)
+                        {
+                            let existing_automod = this
+                                .state
+                                .mod_community
+                                .as_ref()
+                                .filter(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
+                                .or_else(|| {
+                                    this.state
+                                        .communities
+                                        .iter()
+                                        .find(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
+                                })
+                                .or_else(|| {
+                                    this.state
+                                        .community_detail
+                                        .as_ref()
+                                        .map(|d| &d.community)
+                                        .filter(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
+                                })
+                                .map(|c| c.automod_rules.clone());
+                            if let Some(rules) = existing_automod {
+                                updated.automod_rules = rules;
+                            }
+                        }
                         if let Some(pos) = this
                             .state
                             .communities
@@ -478,6 +528,9 @@ impl CommunityWorkspace {
                                     det.community = updated;
                                 }
                             }
+                        }
+                        if this.state.communities_loading {
+                            this.reload_communities_list(cx);
                         }
                         let on_same_comm_route = matches!(
                             &this.state.route,
@@ -523,6 +576,9 @@ impl CommunityWorkspace {
     }
 
     pub fn open_create_community_modal(&mut self, cx: &mut Context<Self>) {
+        if self.state.create_community.submitting {
+            return;
+        }
         self.state.create_community = CreateCommunityDraft::default();
         self.state.active_popover = None;
         self.state.active_modal = Some(CommunityModal::CreateCommunity);
@@ -604,6 +660,7 @@ impl CommunityWorkspace {
         self.state.create_community.submitting = true;
         self.state.create_community.error = None;
         self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        self.state.communities_loading = true;
         let my_comm_gen = self.state.communities_gen;
         let my_actor_gen = self.state.actor_switch_gen;
         let submitter_actor_id = self.state.active_actor_id.clone();
@@ -624,10 +681,14 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.create_community.submitting = false;
+                let same_comm_gen = this.state.communities_gen == my_comm_gen;
+                if same_comm_gen {
+                    this.state.communities_loading = false;
+                }
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok((created, list))) => {
-                        if this.state.communities_gen == my_comm_gen {
+                        if same_comm_gen {
                             if let Some(mut l) = list {
                                 for comm in &mut l.communities {
                                     this.state.overlay_in_flight_community_mutations(comm);
@@ -642,6 +703,9 @@ impl CommunityWorkspace {
                             .any(|c| c.slug.eq_ignore_ascii_case(&created.slug))
                         {
                             this.state.communities.insert(0, created.clone());
+                        }
+                        if this.state.communities_loading {
+                            this.reload_communities_list(cx);
                         }
                         this.close_create_community_modal(cx);
                         this.emit_action(

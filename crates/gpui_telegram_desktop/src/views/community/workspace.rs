@@ -264,6 +264,7 @@ impl CommunityWorkspace {
         let my_id_gen = self.state.identities_gen;
         let my_actor_gen = self.state.actor_switch_gen;
         self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        self.state.communities_loading = true;
         let my_comm_gen = self.state.communities_gen;
         self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
         let my_lists_gen = self.state.lists_gen;
@@ -305,78 +306,93 @@ impl CommunityWorkspace {
             })
             .await;
 
-            if let Ok((ids, prefs, comms, lists, trending, notifs, bots, people, mode)) = res {
-                let _ = weak.update(app, |this, cx| {
-                    this.state.runtime_mode = mode;
-                    if this.state.identities_gen == my_id_gen {
-                        if let Some(id_resp) = ids {
-                            if this.state.active_actor_id.is_empty()
-                                && !id_resp.active_actor_id.is_empty()
-                            {
-                                this.state.active_actor_id = id_resp.active_actor_id.clone();
-                                this.facade
-                                    .set_active_actor_id(Some(id_resp.active_actor_id.clone()));
-                            }
-                            this.state.identities = Some(id_resp);
-                            this.ensure_bot_studio_selected_hydrated(cx);
-                        }
-                    }
-                    if this.state.algo_prefs_gen == my_algo_gen {
-                        if let Some(p) = prefs {
-                            let clean = sanitize_algo_prefs(&p);
-                            this.state.algo_prefs = clean.clone();
-                            this.state.algo_draft = clean;
-                        }
-                    }
-                    if this.state.communities_gen == my_comm_gen {
-                        if let Some(mut c) = comms {
-                            for comm in &mut c.communities {
-                                this.state.overlay_in_flight_community_mutations(comm);
-                            }
-                            this.state.communities = c.communities;
-                        }
-                    }
-                    if this.state.lists_gen == my_lists_gen
-                        && this.state.actor_switch_gen == my_actor_gen
-                    {
-                        if let Some(l) = lists {
-                            this.state.merge_refreshed_lists(l.lists);
-                        }
-                    }
-                    if let Some(t) = trending {
-                        this.state.trending = t.topics;
-                    }
-                    if this.state.notifications_gen == my_notif_gen {
-                        this.state.notifications_loading = false;
-                        if let Some(n) = notifs {
-                            let unread = n.unread_count.min(u32::MAX as u64) as u32;
-                            this.state.notifications = n.notifications;
-                            this.state.unread_notifications = unread;
-                            this.emit_action(
-                                CommunityWorkspaceAction::UnreadCountChanged(unread),
-                                cx,
-                            );
-                        }
-                    }
-                    let mut rec = Vec::new();
-                    if let Some(b) = bots {
-                        rec.extend(b.actors);
-                    }
-                    if let Some(p) = people {
-                        for a in p.actors {
-                            if !rec.iter().any(|x| x.actor_id == a.actor_id) {
-                                rec.push(a);
+            match res {
+                Ok((ids, prefs, comms, lists, trending, notifs, bots, people, mode)) => {
+                    let _ = weak.update(app, |this, cx| {
+                        this.state.runtime_mode = mode;
+                        if this.state.identities_gen == my_id_gen {
+                            if let Some(id_resp) = ids {
+                                if this.state.active_actor_id.is_empty()
+                                    && !id_resp.active_actor_id.is_empty()
+                                {
+                                    this.state.active_actor_id = id_resp.active_actor_id.clone();
+                                    this.facade
+                                        .set_active_actor_id(Some(id_resp.active_actor_id.clone()));
+                                }
+                                this.state.identities = Some(id_resp);
+                                this.ensure_bot_studio_selected_hydrated(cx);
                             }
                         }
-                    }
-                    if this.state.actor_switch_gen == my_actor_gen && !rec.is_empty() {
-                        for a in &mut rec {
-                            this.state.overlay_in_flight_actor_mutations(a);
+                        if this.state.algo_prefs_gen == my_algo_gen {
+                            if let Some(p) = prefs {
+                                let clean = sanitize_algo_prefs(&p);
+                                this.state.algo_prefs = clean.clone();
+                                this.state.algo_draft = clean;
+                            }
                         }
-                        this.state.recommended_actors = rec;
-                    }
-                    cx.notify();
-                });
+                        if this.state.communities_gen == my_comm_gen
+                            && this.state.actor_switch_gen == my_actor_gen
+                        {
+                            this.state.communities_loading = false;
+                            if let Some(mut c) = comms {
+                                for comm in &mut c.communities {
+                                    this.state.overlay_in_flight_community_mutations(comm);
+                                }
+                                this.state.communities = c.communities;
+                            }
+                        }
+                        if this.state.lists_gen == my_lists_gen
+                            && this.state.actor_switch_gen == my_actor_gen
+                        {
+                            if let Some(l) = lists {
+                                this.state.merge_refreshed_lists(l.lists);
+                            }
+                        }
+                        if let Some(t) = trending {
+                            this.state.trending = t.topics;
+                        }
+                        if this.state.notifications_gen == my_notif_gen {
+                            this.state.notifications_loading = false;
+                            if let Some(n) = notifs {
+                                let unread = n.unread_count.min(u32::MAX as u64) as u32;
+                                this.state.notifications = n.notifications;
+                                this.state.unread_notifications = unread;
+                                this.emit_action(
+                                    CommunityWorkspaceAction::UnreadCountChanged(unread),
+                                    cx,
+                                );
+                            }
+                        }
+                        let mut rec = Vec::new();
+                        if let Some(b) = bots {
+                            rec.extend(b.actors);
+                        }
+                        if let Some(p) = people {
+                            for a in p.actors {
+                                if !rec.iter().any(|x| x.actor_id == a.actor_id) {
+                                    rec.push(a);
+                                }
+                            }
+                        }
+                        if this.state.actor_switch_gen == my_actor_gen && !rec.is_empty() {
+                            for a in &mut rec {
+                                this.state.overlay_in_flight_actor_mutations(a);
+                            }
+                            this.state.recommended_actors = rec;
+                        }
+                        cx.notify();
+                    });
+                }
+                Err(_) => {
+                    let _ = weak.update(app, |this, cx| {
+                        if this.state.communities_gen == my_comm_gen
+                            && this.state.actor_switch_gen == my_actor_gen
+                        {
+                            this.state.communities_loading = false;
+                        }
+                        cx.notify();
+                    });
+                }
             }
         })
         .detach();
@@ -1256,7 +1272,7 @@ impl CommunityWorkspace {
                                 is_exploration_slot: false,
                             },
                         );
-                        if this.state.feed_loading {
+                        if this.state.feed_loading || this.state.feed_loading_more {
                             this.load_feed(cx);
                         }
                         this.emit_action(
@@ -1287,20 +1303,23 @@ impl CommunityWorkspace {
         .detach();
     }
 
-    pub(super) fn reload_detail_if_loading_post(&mut self, post_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn reload_detail_if_loading_post(
+        &mut self,
+        post_id: &str,
+        allow_saved_reload: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.feed_loading || self.state.feed_loading_more {
+            self.load_feed(cx);
+        }
         match self.state.route.clone() {
             CommunityRoute::PostDetail(id) if id == post_id => {
                 if self.state.detail_loading {
                     self.load_post_detail(id, cx);
                 }
             }
-            CommunityRoute::Feed => {
-                if self.state.feed_loading {
-                    self.load_feed(cx);
-                }
-            }
             CommunityRoute::CommunityPage(slug) => {
-                if self.state.community_loading {
+                if self.state.community_loading || self.state.community_loading_more {
                     self.load_community_page(slug, cx);
                 }
             }
@@ -1316,9 +1335,12 @@ impl CommunityWorkspace {
                 }
             }
             CommunityRoute::BookmarksLists => {
-                // CRITICAL: NEVER call `load_saved_posts` here when `saved_loading == true`!
-                // `bookmark_recent_overrides` is the designed Order 2 mechanism (F2/F3).
-                // Only reload `list_feed_loading` when a list feed fetch is in flight.
+                // CRITICAL: Pass `allow_saved_reload = false` ONLY from `flush_bookmark_sync` so
+                // F2/F3 Order 2 `bookmark_recent_overrides` and `R8-7B` stay untouched; non-bookmark
+                // post mutations pass `true` to prevent Case B wipes on the Saved tab.
+                if allow_saved_reload && self.state.saved_loading {
+                    self.load_saved_posts(cx);
+                }
                 if self.state.list_feed_loading {
                     if let Some(lid) = self.state.selected_list_id.clone() {
                         self.load_selected_list_feed(lid, cx);
@@ -1356,6 +1378,11 @@ impl CommunityWorkspace {
                     self.load_actor_profile(handle, cx);
                 }
             }
+            CommunityRoute::CommunityPage(slug) => {
+                if self.state.community_loading {
+                    self.load_community_page(slug, cx);
+                }
+            }
             CommunityRoute::Explore { .. } => {
                 if self.state.search_loading {
                     let q = self.state.explore_search_draft.trim().to_string();
@@ -1366,11 +1393,59 @@ impl CommunityWorkspace {
         }
     }
 
+    pub(super) fn reload_communities_list(&mut self, cx: &mut Context<Self>) {
+        self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        self.state.communities_loading = true;
+        let my_comm_gen = self.state.communities_gen;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let facade = self.facade.clone();
+        let rt_handle = facade.runtime_handle().clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = run_on_community_tokio(&rt_handle, async move {
+                facade.list_communities(None, Some(50)).await
+            })
+            .await;
+            let _ = weak.update(app, |this, cx| {
+                if this.state.communities_gen != my_comm_gen
+                    || this.state.actor_switch_gen != my_actor_gen
+                {
+                    return;
+                }
+                this.state.communities_loading = false;
+                if let Ok(Ok(mut c)) = res {
+                    for comm in &mut c.communities {
+                        this.state.overlay_in_flight_community_mutations(comm);
+                    }
+                    this.state.communities = c.communities;
+                    if matches!(this.state.route, CommunityRoute::ModQueue(None)) {
+                        if let Some(s) = this
+                            .moderated_communities()
+                            .first()
+                            .map(|cm| cm.slug.clone())
+                        {
+                            this.load_mod_queue(s, cx);
+                        } else {
+                            this.state.mod_slug = None;
+                            this.state.mod_community = None;
+                            this.state.mod_queue.clear();
+                            this.state.mod_logs.clear();
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn reload_community_join_route_if_loading(
         &mut self,
         slug: &str,
         cx: &mut Context<Self>,
     ) {
+        if self.state.communities_loading {
+            self.reload_communities_list(cx);
+        }
         if self.state.community_loading
             && matches!(
                 &self.state.route,
@@ -1469,7 +1544,7 @@ impl CommunityWorkspace {
                         this.state.post_vote_pending_dir.remove(&post_id);
                         this.state.post_vote_last_synced.remove(&post_id);
                         this.state.reconcile_vote(&resp);
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                     Ok(Err(e)) => {
                         this.state.post_vote_dirty.remove(&post_id);
@@ -1477,7 +1552,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.post_vote_last_synced.remove(&post_id) {
                             this.state.rollback_vote(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -1492,7 +1567,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.post_vote_last_synced.remove(&post_id) {
                             this.state.rollback_vote(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                 }
                 cx.notify();
@@ -1569,7 +1644,7 @@ impl CommunityWorkspace {
                         this.state.post_like_pending_liked.remove(&post_id);
                         this.state.post_like_last_synced.remove(&post_id);
                         this.state.reconcile_like(&resp);
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                     Ok(Err(e)) => {
                         this.state.post_like_pending_toggle.remove(&post_id);
@@ -1577,7 +1652,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.post_like_last_synced.remove(&post_id) {
                             this.state.rollback_like(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -1592,7 +1667,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.post_like_last_synced.remove(&post_id) {
                             this.state.rollback_like(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                 }
                 cx.notify();
@@ -1671,7 +1746,7 @@ impl CommunityWorkspace {
                         this.state.post_repost_pending_target.remove(&post_id);
                         this.state.post_repost_last_synced.remove(&post_id);
                         this.state.reconcile_repost(&resp);
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                     Ok(Err(e)) => {
                         this.state.post_repost_pending_toggle.remove(&post_id);
@@ -1679,7 +1754,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.post_repost_last_synced.remove(&post_id) {
                             this.state.rollback_repost(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -1694,7 +1769,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.post_repost_last_synced.remove(&post_id) {
                             this.state.rollback_repost(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                 }
                 cx.notify();
@@ -1744,12 +1819,7 @@ impl CommunityWorkspace {
                                 is_exploration_slot: false,
                             },
                         );
-                        if this.state.feed_loading {
-                            this.load_feed(cx);
-                        }
-                        if !matches!(this.state.route, CommunityRoute::Feed) {
-                            this.reload_detail_if_loading_post(&quoted_pid, cx);
-                        }
+                        this.reload_detail_if_loading_post(&quoted_pid, true, cx);
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -1893,7 +1963,7 @@ impl CommunityWorkspace {
                         this.state.poll_vote_pending_options.remove(&post_id);
                         this.state.poll_vote_last_synced.remove(&post_id);
                         this.state.reconcile_poll(&post_id, poll);
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                     Ok(Err(e)) => {
                         this.state.poll_vote_dirty.remove(&post_id);
@@ -1901,7 +1971,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.poll_vote_last_synced.remove(&post_id) {
                             this.state.reconcile_poll(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -1916,7 +1986,7 @@ impl CommunityWorkspace {
                         if let Some(snap) = this.state.poll_vote_last_synced.remove(&post_id) {
                             this.state.reconcile_poll(&post_id, snap);
                         }
-                        this.reload_detail_if_loading_post(&post_id, cx);
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
                     }
                 }
                 cx.notify();
@@ -1955,7 +2025,7 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok(resp)) => {
                         this.state.reconcile_awards(&resp);
-                        this.reload_detail_if_loading_post(&pid_cb, cx);
+                        this.reload_detail_if_loading_post(&pid_cb, true, cx);
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -2094,6 +2164,7 @@ impl CommunityWorkspace {
         self.state.comment_like_last_synced.clear();
 
         self.state.community_gen = self.state.community_gen.wrapping_add(1);
+        self.state.communities_loading = false;
         self.state.community_loading = false;
         self.state.community_loading_more = false;
         self.state.community_wiki_editing = false;
@@ -2158,6 +2229,9 @@ impl CommunityWorkspace {
         self.state.list_membership_dirty.clear();
         self.state.list_membership_needs_feed_reload.clear();
         self.state.list_membership_last_synced.clear();
+        self.state
+            .list_membership_last_synced_editor_pinned_flight
+            .clear();
         self.state.list_membership_toggle_seq.clear();
         self.state.list_deleting.clear();
         self.state.list_editor.submitting = false;
@@ -2199,45 +2273,7 @@ impl CommunityWorkspace {
 
         // Generation-guarded communities refresh for the new actor's viewer_role memberships,
         // and automatic ModQueue re-evaluation when switching identities on ModQueue.
-        self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
-        let my_comm_gen = self.state.communities_gen;
-        let facade = self.facade.clone();
-        let rt_handle = facade.runtime_handle().clone();
-        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&rt_handle, async move {
-                facade.list_communities(None, Some(40)).await
-            })
-            .await;
-            let _ = weak.update(app, |this, cx| {
-                if this.state.communities_gen != my_comm_gen
-                    || this.state.actor_switch_gen != my_actor_gen
-                {
-                    return;
-                }
-                if let Ok(Ok(mut c)) = res {
-                    for comm in &mut c.communities {
-                        this.state.overlay_in_flight_community_mutations(comm);
-                    }
-                    this.state.communities = c.communities;
-                    if matches!(this.state.route, CommunityRoute::ModQueue(None)) {
-                        if let Some(s) = this
-                            .moderated_communities()
-                            .first()
-                            .map(|cm| cm.slug.clone())
-                        {
-                            this.load_mod_queue(s, cx);
-                        } else {
-                            this.state.mod_slug = None;
-                            this.state.mod_community = None;
-                            this.state.mod_queue.clear();
-                            this.state.mod_logs.clear();
-                        }
-                    }
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.reload_communities_list(cx);
 
         // Off-route concurrent refresh of lists for the new actor (e.g. LeftNav pinned lists).
         if !matches!(self.state.route, CommunityRoute::BookmarksLists) {
@@ -2485,22 +2521,31 @@ impl CommunityWorkspace {
                     return;
                 }
                 this.state.actor_follow_in_flight.remove(&actor_id);
-                // Cross-lane Follow -> Block safety belt: never set `is_following = true` onto a blocked actor.
-                if this
-                    .state
-                    .actor_block_pending_target
-                    .get(&actor_id)
-                    .copied()
-                    == Some(true)
+                // Cross-lane Follow -> Block serialization: update block rollback baseline from
+                // settled Follow, never set `is_following = true` onto a blocked actor, and launch
+                // any deferred Block flight strictly after Follow settles.
+                let block_superseding = this.state.actor_block_dirty.contains(&actor_id)
+                    || this.state.actor_block_pending_target.contains_key(&actor_id)
                     || this.state.actor_block_chain_had_block.contains(&actor_id)
                     || this
                         .state
                         .find_actor(&actor_id)
-                        .is_some_and(|a| a.is_blocked)
-                {
+                        .is_some_and(|a| a.is_blocked);
+                if block_superseding {
+                    if let Ok(Ok(ref resp)) = res {
+                        if let Some(entry) = this.state.actor_block_last_synced.get_mut(&actor_id) {
+                            entry.1 = resp.is_following;
+                            entry.2 = resp.followers_count;
+                        }
+                    }
                     this.state.actor_follow_dirty.remove(&actor_id);
                     this.state.actor_follow_pending_target.remove(&actor_id);
                     this.state.actor_follow_last_synced.remove(&actor_id);
+                    if !this.state.actor_block_in_flight.contains_key(&actor_id)
+                        && this.state.actor_block_dirty.contains(&actor_id)
+                    {
+                        this.flush_actor_block_sync(actor_id, cx);
+                    }
                     cx.notify();
                     return;
                 }
@@ -2814,12 +2859,13 @@ impl CommunityWorkspace {
             self.state.community_selected_flair = None;
             self.state.community_wiki_editing = false;
             self.state.community_wiki_preview_rev = None;
+            self.state.community_wiki_saving = false;
+            self.state.community_rules_saving = false;
             self.state.community_next_cursor = None;
         }
-        self.state.community_wiki_saving = false;
-        self.state.community_rules_saving = false;
         self.state.community_error = None;
         self.state.community_loading = true;
+        self.state.community_loading_more = false;
         let sort = self.state.community_sort;
         let time_window = self.state.community_time_window;
         let actor_filter = self.state.community_actor_filter;

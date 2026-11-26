@@ -19,8 +19,8 @@ use super::shared_widgets::{
     render_input_display, render_loading_skeleton,
 };
 use super::state::{
-    ActiveCommunityInput, AutoModRuleDraft, CommunityPopover, CommunityWorkspaceAction,
-    ModConsoleTab,
+    ActiveCommunityInput, AutoModRuleDraft, CommunityPopover, CommunityRoute,
+    CommunityWorkspaceAction, ModConsoleTab,
 };
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
@@ -527,23 +527,32 @@ impl CommunityWorkspace {
                 let lang = this.language_id.clone();
 
                 match res {
-                    Ok(Ok(updated)) => {
+                    Ok(Ok(mut updated)) => {
                         this.state.automod_rules_gen =
                             this.state.automod_rules_gen.wrapping_add(1);
+                        this.state.overlay_in_flight_community_mutations(&mut updated);
                         this.state
                             .automod_last_synced
                             .insert(slug_key.clone(), updated.automod_rules.clone());
+                        let mut cache_dto = updated.clone();
+                        if is_dirty && still_same_slug {
+                            if let Some(ref mc) = this.state.mod_community {
+                                if mc.slug.eq_ignore_ascii_case(&updated.slug) {
+                                    cache_dto.automod_rules = mc.automod_rules.clone();
+                                }
+                            }
+                        }
                         if let Some(pos) = this
                             .state
                             .communities
                             .iter()
-                            .position(|c| c.slug.eq_ignore_ascii_case(&updated.slug))
+                            .position(|c| c.slug.eq_ignore_ascii_case(&cache_dto.slug))
                         {
-                            this.state.communities[pos] = updated.clone();
+                            this.state.communities[pos] = cache_dto.clone();
                         }
                         if let Some(ref mut cdet) = this.state.community_detail {
-                            if cdet.community.slug.eq_ignore_ascii_case(&updated.slug) {
-                                cdet.community = updated.clone();
+                            if cdet.community.slug.eq_ignore_ascii_case(&cache_dto.slug) {
+                                cdet.community = cache_dto;
                             }
                         }
                         if this.state.automod_reset_draft_pending.remove(&slug_key) {
@@ -563,8 +572,19 @@ impl CommunityWorkspace {
                         if still_same_slug {
                             this.state.mod_community = Some(updated);
                             if this.state.mod_loading {
-                                this.load_mod_queue(slug, cx);
+                                this.load_mod_queue(slug.clone(), cx);
                             }
+                        }
+                        if this.state.communities_loading {
+                            this.reload_communities_list(cx);
+                        }
+                        if this.state.community_loading
+                            && matches!(
+                                &this.state.route,
+                                CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&slug)
+                            )
+                        {
+                            this.load_community_page(slug, cx);
                         }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
@@ -602,7 +622,18 @@ impl CommunityWorkspace {
                             }
                         }
                         if this.state.mod_loading && still_same_slug {
-                            this.load_mod_queue(slug, cx);
+                            this.load_mod_queue(slug.clone(), cx);
+                        }
+                        if this.state.communities_loading {
+                            this.reload_communities_list(cx);
+                        }
+                        if this.state.community_loading
+                            && matches!(
+                                &this.state.route,
+                                CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&slug)
+                            )
+                        {
+                            this.load_community_page(slug, cx);
                         }
                         this.state.automod_draft.error = Some(e.to_string());
                     }
@@ -633,7 +664,18 @@ impl CommunityWorkspace {
                             }
                         }
                         if this.state.mod_loading && still_same_slug {
-                            this.load_mod_queue(slug, cx);
+                            this.load_mod_queue(slug.clone(), cx);
+                        }
+                        if this.state.communities_loading {
+                            this.reload_communities_list(cx);
+                        }
+                        if this.state.community_loading
+                            && matches!(
+                                &this.state.route,
+                                CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&slug)
+                            )
+                        {
+                            this.load_community_page(slug, cx);
                         }
                         this.state.automod_draft.error = Some(e);
                     }

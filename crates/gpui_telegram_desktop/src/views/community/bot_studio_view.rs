@@ -175,6 +175,8 @@ impl CommunityWorkspace {
             .iter()
             .position(|c| c.eq_ignore_ascii_case(&bot.avatar_color))
             .unwrap_or(0);
+        self.state.bot_studio_edit_save_seq =
+            self.state.bot_studio_edit_save_seq.wrapping_add(1);
         self.state.bot_studio_selected_bot_id = Some(bot.actor_id.clone());
         let mut draft = BotStudioEditDraft {
             actor_id: bot.actor_id.clone(),
@@ -234,6 +236,8 @@ impl CommunityWorkspace {
 
     /// Selects an owned bot in Bot Studio and hydrates its edit draft cleanly.
     pub fn select_bot_for_studio(&mut self, actor: CommunityActorDto, cx: &mut Context<Self>) {
+        self.state.bot_studio_edit_save_seq =
+            self.state.bot_studio_edit_save_seq.wrapping_add(1);
         let shape_idx = GROK_AVATAR_SHAPES
             .iter()
             .position(|s| s.eq_ignore_ascii_case(&actor.avatar_shape))
@@ -566,6 +570,9 @@ impl CommunityWorkspace {
             bot_persona: Some(self.state.bot_studio_edit.bot_persona.trim().to_string()),
             ..Default::default()
         };
+        self.state.bot_studio_edit_save_seq =
+            self.state.bot_studio_edit_save_seq.wrapping_add(1);
+        let my_save_seq = self.state.bot_studio_edit_save_seq;
         self.state.bot_studio_edit.saving = true;
         self.state.bot_studio_edit.error = None;
         self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
@@ -584,24 +591,24 @@ impl CommunityWorkspace {
             .await;
             let _ = weak.update(app, |this, cx| {
                 let lang = this.language_id.clone();
-                let still_selected = this
-                    .state
-                    .bot_studio_selected_bot_id
-                    .as_deref()
-                    == Some(actor_id_cb.as_str());
-                if still_selected {
+                let still_current_save = this.state.bot_studio_edit_save_seq == my_save_seq
+                    && this.state.bot_studio_selected_bot_id.as_deref()
+                        == Some(actor_id_cb.as_str());
+                let latest_identities = this.state.identities_gen == my_id_gen;
+                if still_current_save {
                     this.state.bot_studio_edit.saving = false;
                 }
                 match res {
-                    Ok((Ok(updated), ids)) => {
-                        if this.state.identities_gen == my_id_gen {
+                    Ok((Ok(mut updated), ids)) => {
+                        this.state.overlay_in_flight_actor_mutations(&mut updated);
+                        if latest_identities {
                             if let Some(i) = ids {
                                 this.state.identities = Some(i);
                             }
-                        }
-                        if let Some(ref mut prof) = this.state.actor_profile {
-                            if prof.actor.actor_id == updated.actor_id {
-                                prof.actor = updated.clone();
+                            if let Some(ref mut prof) = this.state.actor_profile {
+                                if prof.actor.actor_id == updated.actor_id {
+                                    prof.actor = updated.clone();
+                                }
                             }
                         }
                         if this.state.profile_loading {
@@ -609,25 +616,31 @@ impl CommunityWorkspace {
                                 this.load_actor_profile(h, cx);
                             }
                         }
-                        if still_selected {
+                        if still_current_save {
                             this.select_bot_for_studio(updated, cx);
                         }
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "Bot 资料与外观已更新", "Bot profile & avatar updated")
+                        if still_current_save || latest_identities {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(
+                                        &lang,
+                                        "Bot 资料与外观已更新",
+                                        "Bot profile & avatar updated",
+                                    )
                                     .to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Ok((Err(e), _)) => {
-                        if still_selected {
+                        if still_current_save {
                             this.state.bot_studio_edit.error = Some(e.to_string());
                         }
                     }
                     Err(e) => {
-                        if still_selected {
+                        if still_current_save {
                             this.state.bot_studio_edit.error = Some(e);
                         }
                     }
@@ -694,26 +707,16 @@ impl CommunityWorkspace {
         self.state.bot_studio_test_feedback = None;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
-        let prev_actor = self.facade.active_actor_id();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                facade.set_active_actor_id(Some(bot_actor_id));
-                let out = facade.create_post(&req).await;
-                facade.set_active_actor_id(prev_actor);
-                out
+                facade.create_post_as(&bot_actor_id, &req).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                // CRITICAL: Always restore facade's active_actor_id to the CURRENT workspace
-                // actor BEFORE early-returning on an actor_switch_gen mismatch!
-                if !this.state.active_actor_id.is_empty() {
-                    this.facade
-                        .set_active_actor_id(Some(this.state.active_actor_id.clone()));
-                }
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
@@ -735,7 +738,7 @@ impl CommunityWorkspace {
                                 is_exploration_slot: false,
                             },
                         );
-                        if this.state.feed_loading {
+                        if this.state.feed_loading || this.state.feed_loading_more {
                             this.load_feed(cx);
                         }
                         let msg = if lang.starts_with("zh") {
@@ -844,7 +847,7 @@ impl CommunityWorkspace {
                 match res {
                     Ok(Ok(resp)) => {
                         if resp.triggered {
-                            this.reload_detail_if_loading_post(&jump_pid, cx);
+                            this.reload_detail_if_loading_post(&jump_pid, true, cx);
                         }
                         this.state.bot_studio_test_last_post_id = Some(jump_pid);
                         let is_err = !resp.triggered;

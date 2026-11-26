@@ -540,8 +540,27 @@ pub fn follow_actor_tx(
     }
     let follower = get_actor_conn(tx, follower_id, None)?
         .ok_or_else(|| TelegramError::NotFound(format!("follower '{follower_id}' not found")))?;
-    if get_actor_conn(tx, target_id, None)?.is_none() {
-        return Err(TelegramError::NotFound(format!("target actor '{target_id}' not found")));
+    let target = get_actor_conn(tx, target_id, None)?
+        .ok_or_else(|| TelegramError::NotFound(format!("target actor '{target_id}' not found")))?;
+    if follower.actor_id == target.actor_id {
+        return Err(TelegramError::Validation("cannot follow yourself".to_string()));
+    }
+    let blocked: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM community_mutes_blocks
+                WHERE target_kind = 'actor' AND action = 'block'
+                  AND ((owner_actor_id = ?1 AND target_value = ?2)
+                    OR (owner_actor_id = ?2 AND target_value = ?1))
+            )",
+            params![follower.actor_id, target.actor_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| db_err("check block before follow", e))?;
+    if blocked != 0 {
+        return Err(TelegramError::PermissionDenied(
+            "cannot follow an actor while a block exists between you".to_string(),
+        ));
     }
     let changed = tx
         .execute(
@@ -815,5 +834,106 @@ impl CommunityStore {
 
     pub fn list_mutes_blocks(&self, owner_actor_id: &str) -> Result<Vec<CommunityMuteBlockDto>> {
         self.with_conn(|conn| list_mutes_blocks_conn(conn, owner_actor_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn follow_actor_rejected_when_bidirectional_block_exists() {
+        let store = CommunityStore::open_in_memory().expect("in-memory store");
+        let now = 1_700_000_000_000i64;
+        let alice = store
+            .create_human_actor(
+                101,
+                &RegisterHumanActorRequest {
+                    handle: "alice_blk".into(),
+                    display_name: "Alice".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("alice");
+        let bob = store
+            .create_human_actor(
+                102,
+                &RegisterHumanActorRequest {
+                    handle: "bob_blk".into(),
+                    display_name: "Bob".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("bob");
+
+        // Alice blocks Bob -> neither Alice->Bob nor Bob->Alice follow may succeed.
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: bob.actor_id.clone(),
+                    action: MuteBlockActionKind::Block,
+                    reason: None,
+                },
+                now + 10,
+            )
+            .expect("block bob");
+
+        let err_ab = store
+            .follow_actor(&alice.actor_id, &bob.actor_id, now + 20)
+            .expect_err("blocker following blocked target must fail");
+        assert!(matches!(err_ab, TelegramError::PermissionDenied(_)), "got {err_ab:?}");
+
+        let err_ba = store
+            .follow_actor(&bob.actor_id, &alice.actor_id, now + 30)
+            .expect_err("blocked actor following blocker must fail");
+        assert!(matches!(err_ba, TelegramError::PermissionDenied(_)), "got {err_ba:?}");
+
+        // Mute (not block) must NOT reject follow, and after removing block follow succeeds.
+        store
+            .remove_mute_block(
+                &alice.actor_id,
+                MuteBlockTargetKind::Actor,
+                &bob.actor_id,
+                MuteBlockActionKind::Block,
+            )
+            .expect("unblock bob");
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: bob.actor_id.clone(),
+                    action: MuteBlockActionKind::Mute,
+                    reason: None,
+                },
+                now + 40,
+            )
+            .expect("mute bob");
+        let followed = store
+            .follow_actor(&alice.actor_id, &bob.actor_id, now + 50)
+            .expect("follow after unblock must succeed");
+        assert!(followed);
+        let bob_view = store
+            .get_actor(&bob.actor_id, Some(&alice.actor_id))
+            .expect("get bob")
+            .expect("bob exists");
+        assert!(bob_view.is_following);
+        assert_eq!(bob_view.followers_count, 1);
     }
 }

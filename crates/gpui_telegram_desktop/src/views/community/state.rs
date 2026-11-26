@@ -830,6 +830,7 @@ pub struct CommunityWorkspaceState {
 
     // Left Nav & Right Rail caches
     pub communities: Vec<SubCommunityDto>,
+    pub communities_loading: bool,
     pub communities_gen: u64,
     pub lists: Vec<CommunityListDto>,
     pub lists_gen: u64,
@@ -905,7 +906,7 @@ pub struct CommunityWorkspaceState {
     pub actor_block_dirty: HashSet<String>,
     pub actor_block_pending_target: HashMap<String, bool>,
     pub actor_block_chain_had_block: HashSet<String>,
-    pub actor_block_last_synced: HashMap<String, (bool, bool)>,
+    pub actor_block_last_synced: HashMap<String, (bool, bool, u64)>,
     pub actor_follow_flight_seq: u64,
     pub actor_follow_in_flight: HashMap<String, u64>,
     pub actor_follow_dirty: HashSet<String>,
@@ -956,6 +957,7 @@ pub struct CommunityWorkspaceState {
     pub list_membership_dirty: HashSet<String>,
     pub list_membership_needs_feed_reload: HashSet<String>,
     pub list_membership_last_synced: HashMap<String, (bool, Vec<String>, Vec<String>)>,
+    pub list_membership_last_synced_editor_pinned_flight: HashMap<String, (u64, i64)>,
     pub list_membership_toggle_seq: HashMap<String, u64>,
     pub list_deleting: HashSet<String>,
     pub list_editor_open: bool,
@@ -1006,6 +1008,7 @@ pub struct CommunityWorkspaceState {
     pub bot_studio_tokens_by_actor: HashMap<String, String>,
     pub bot_studio_token_revealed: bool,
     pub bot_studio_selected_bot_id: Option<String>,
+    pub bot_studio_edit_save_seq: u64,
     pub bot_studio_edit: BotStudioEditDraft,
     pub bot_studio_test_community: Option<String>,
     pub bot_studio_test_content: String,
@@ -1097,6 +1100,7 @@ impl Default for CommunityWorkspaceState {
             comment_like_pending_liked: HashMap::new(),
             comment_like_last_synced: HashMap::new(),
             communities: Vec::new(),
+            communities_loading: false,
             communities_gen: 0,
             lists: Vec::new(),
             lists_gen: 0,
@@ -1209,6 +1213,7 @@ impl Default for CommunityWorkspaceState {
             list_membership_dirty: HashSet::new(),
             list_membership_needs_feed_reload: HashSet::new(),
             list_membership_last_synced: HashMap::new(),
+            list_membership_last_synced_editor_pinned_flight: HashMap::new(),
             list_membership_toggle_seq: HashMap::new(),
             list_deleting: HashSet::new(),
             list_editor_open: false,
@@ -1255,6 +1260,7 @@ impl Default for CommunityWorkspaceState {
             bot_studio_tokens_by_actor: HashMap::new(),
             bot_studio_token_revealed: false,
             bot_studio_selected_bot_id: None,
+            bot_studio_edit_save_seq: 0,
             bot_studio_edit: BotStudioEditDraft::default(),
             bot_studio_test_community: None,
             bot_studio_test_content: String::new(),
@@ -1586,32 +1592,99 @@ impl CommunityWorkspaceState {
     }
 
     pub fn find_post(&self, post_id: &str) -> Option<&CommunityPostDto> {
-        self.feed_items
-            .iter()
-            .map(|i| &i.post)
-            .chain(self.community_posts.iter().map(|i| &i.post))
-            .chain(
-                self.community_detail
+        let primary = match self.route {
+            CommunityRoute::PostDetail(_) => self
+                .detail_post
+                .iter()
+                .map(|d| &d.post)
+                .chain(self.detail_post.iter().flat_map(|d| d.thread_chain.iter()))
+                .chain(self.detail_post.iter().flat_map(|d| d.quote_chain.iter()))
+                .find(|p| p.post_id == post_id),
+            CommunityRoute::CommunityPage(_) => self
+                .community_posts
+                .iter()
+                .map(|i| &i.post)
+                .chain(
+                    self.community_detail
+                        .iter()
+                        .flat_map(|d| d.pinned_posts.iter()),
+                )
+                .find(|p| p.post_id == post_id),
+            CommunityRoute::BookmarksLists => match self.bookmarks_section {
+                BookmarksListsSection::Bookmarks => self
+                    .saved_items
                     .iter()
-                    .flat_map(|d| d.pinned_posts.iter()),
-            )
-            .chain(self.saved_items.iter().map(|i| &i.post))
-            .chain(self.list_feed_items.iter().map(|i| &i.post))
-            .chain(self.detail_post.iter().map(|d| &d.post))
-            .chain(self.detail_post.iter().flat_map(|d| d.thread_chain.iter()))
-            .chain(self.detail_post.iter().flat_map(|d| d.quote_chain.iter()))
-            .chain(self.actor_profile.iter().flat_map(|p| p.recent_posts.iter()))
-            .chain(self.search_result.iter().flat_map(|s| s.posts.iter()))
-            .find(|p| p.post_id == post_id)
+                    .map(|i| &i.post)
+                    .chain(self.list_feed_items.iter().map(|i| &i.post))
+                    .find(|p| p.post_id == post_id),
+                BookmarksListsSection::Lists => self
+                    .list_feed_items
+                    .iter()
+                    .map(|i| &i.post)
+                    .chain(self.saved_items.iter().map(|i| &i.post))
+                    .find(|p| p.post_id == post_id),
+            },
+            CommunityRoute::ActorProfile(_) => self
+                .actor_profile
+                .iter()
+                .flat_map(|p| p.recent_posts.iter())
+                .find(|p| p.post_id == post_id),
+            CommunityRoute::Explore { .. } => self
+                .search_result
+                .iter()
+                .flat_map(|s| s.posts.iter())
+                .find(|p| p.post_id == post_id),
+            _ => None,
+        };
+        primary.or_else(|| {
+            self.feed_items
+                .iter()
+                .map(|i| &i.post)
+                .chain(self.community_posts.iter().map(|i| &i.post))
+                .chain(
+                    self.community_detail
+                        .iter()
+                        .flat_map(|d| d.pinned_posts.iter()),
+                )
+                .chain(self.saved_items.iter().map(|i| &i.post))
+                .chain(self.list_feed_items.iter().map(|i| &i.post))
+                .chain(self.detail_post.iter().map(|d| &d.post))
+                .chain(self.detail_post.iter().flat_map(|d| d.thread_chain.iter()))
+                .chain(self.detail_post.iter().flat_map(|d| d.quote_chain.iter()))
+                .chain(self.actor_profile.iter().flat_map(|p| p.recent_posts.iter()))
+                .chain(self.search_result.iter().flat_map(|s| s.posts.iter()))
+                .find(|p| p.post_id == post_id)
+        })
     }
 
     pub fn find_feed_item(&self, post_id: &str) -> Option<&FeedItemDto> {
-        self.feed_items
-            .iter()
-            .chain(self.community_posts.iter())
-            .chain(self.saved_items.iter())
-            .chain(self.list_feed_items.iter())
-            .find(|i| i.post.post_id == post_id)
+        let primary = match self.route {
+            CommunityRoute::CommunityPage(_) => self
+                .community_posts
+                .iter()
+                .find(|i| i.post.post_id == post_id),
+            CommunityRoute::BookmarksLists => match self.bookmarks_section {
+                BookmarksListsSection::Bookmarks => self
+                    .saved_items
+                    .iter()
+                    .chain(self.list_feed_items.iter())
+                    .find(|i| i.post.post_id == post_id),
+                BookmarksListsSection::Lists => self
+                    .list_feed_items
+                    .iter()
+                    .chain(self.saved_items.iter())
+                    .find(|i| i.post.post_id == post_id),
+            },
+            _ => None,
+        };
+        primary.or_else(|| {
+            self.feed_items
+                .iter()
+                .chain(self.community_posts.iter())
+                .chain(self.saved_items.iter())
+                .chain(self.list_feed_items.iter())
+                .find(|i| i.post.post_id == post_id)
+        })
     }
 
     pub fn snapshot_feed_item_for_post(&self, post_id: &str) -> Option<FeedItemDto> {
@@ -1644,9 +1717,19 @@ impl CommunityWorkspaceState {
             }
             None
         }
-        self.detail_post
-            .as_ref()
-            .and_then(|d| find_in_slice(&d.comments, comment_id))
+        let primary = if matches!(self.route, CommunityRoute::ActorProfile(_)) {
+            self.actor_profile
+                .as_ref()
+                .and_then(|p| p.recent_comments.iter().find(|c| c.comment_id == comment_id))
+        } else {
+            None
+        };
+        primary
+            .or_else(|| {
+                self.detail_post
+                    .as_ref()
+                    .and_then(|d| find_in_slice(&d.comments, comment_id))
+            })
             .or_else(|| {
                 self.actor_profile
                     .as_ref()
@@ -2020,27 +2103,46 @@ impl CommunityWorkspaceState {
     }
 
     pub fn find_community(&self, slug: &str) -> Option<&SubCommunityDto> {
-        self.community_detail
-            .as_ref()
-            .map(|d| &d.community)
-            .filter(|c| c.slug.eq_ignore_ascii_case(slug))
-            .or_else(|| {
-                self.communities
+        let primary = match self.route {
+            CommunityRoute::CommunityPage(_) => self
+                .community_detail
+                .as_ref()
+                .map(|d| &d.community)
+                .filter(|c| c.slug.eq_ignore_ascii_case(slug)),
+            CommunityRoute::ModQueue(_) => self
+                .mod_community
+                .as_ref()
+                .filter(|c| c.slug.eq_ignore_ascii_case(slug)),
+            CommunityRoute::Explore { .. } => self.search_result.as_ref().and_then(|sr| {
+                sr.communities
                     .iter()
                     .find(|c| c.slug.eq_ignore_ascii_case(slug))
-            })
-            .or_else(|| {
-                self.mod_community
-                    .as_ref()
-                    .filter(|c| c.slug.eq_ignore_ascii_case(slug))
-            })
-            .or_else(|| {
-                self.search_result.as_ref().and_then(|sr| {
-                    sr.communities
+            }),
+            _ => None,
+        };
+        primary.or_else(|| {
+            self.community_detail
+                .as_ref()
+                .map(|d| &d.community)
+                .filter(|c| c.slug.eq_ignore_ascii_case(slug))
+                .or_else(|| {
+                    self.communities
                         .iter()
                         .find(|c| c.slug.eq_ignore_ascii_case(slug))
                 })
-            })
+                .or_else(|| {
+                    self.mod_community
+                        .as_ref()
+                        .filter(|c| c.slug.eq_ignore_ascii_case(slug))
+                })
+                .or_else(|| {
+                    self.search_result.as_ref().and_then(|sr| {
+                        sr.communities
+                            .iter()
+                            .find(|c| c.slug.eq_ignore_ascii_case(slug))
+                    })
+                })
+        })
     }
 
     /// Optimistically updates ONLY `is_joined` and `member_count` across caches.
@@ -2219,25 +2321,43 @@ impl CommunityWorkspaceState {
     }
 
     pub fn find_actor(&self, actor_id: &str) -> Option<&CommunityActorDto> {
-        self.actor_profile
-            .as_ref()
-            .map(|p| &p.actor)
-            .filter(|a| a.actor_id == actor_id)
-            .or_else(|| {
-                self.recommended_actors
-                    .iter()
-                    .find(|a| a.actor_id == actor_id)
-            })
-            .or_else(|| {
-                self.search_result
-                    .as_ref()
-                    .and_then(|sr| sr.actors.iter().find(|a| a.actor_id == actor_id))
-            })
-            .or_else(|| {
-                self.community_detail
-                    .as_ref()
-                    .and_then(|det| det.moderators.iter().find(|a| a.actor_id == actor_id))
-            })
+        let primary = match self.route {
+            CommunityRoute::ActorProfile(_) => self
+                .actor_profile
+                .as_ref()
+                .map(|p| &p.actor)
+                .filter(|a| a.actor_id == actor_id),
+            CommunityRoute::CommunityPage(_) => self
+                .community_detail
+                .as_ref()
+                .and_then(|det| det.moderators.iter().find(|a| a.actor_id == actor_id)),
+            CommunityRoute::Explore { .. } => self
+                .search_result
+                .as_ref()
+                .and_then(|sr| sr.actors.iter().find(|a| a.actor_id == actor_id)),
+            _ => None,
+        };
+        primary.or_else(|| {
+            self.actor_profile
+                .as_ref()
+                .map(|p| &p.actor)
+                .filter(|a| a.actor_id == actor_id)
+                .or_else(|| {
+                    self.recommended_actors
+                        .iter()
+                        .find(|a| a.actor_id == actor_id)
+                })
+                .or_else(|| {
+                    self.search_result
+                        .as_ref()
+                        .and_then(|sr| sr.actors.iter().find(|a| a.actor_id == actor_id))
+                })
+                .or_else(|| {
+                    self.community_detail
+                        .as_ref()
+                        .and_then(|det| det.moderators.iter().find(|a| a.actor_id == actor_id))
+                })
+        })
     }
 
     pub fn reconcile_mute_block(
@@ -2253,8 +2373,9 @@ impl CommunityWorkspaceState {
                 }
                 if let Some(b) = is_blocked {
                     a.is_blocked = b;
-                    if b {
+                    if b && a.is_following {
                         a.is_following = false;
+                        a.followers_count = a.followers_count.saturating_sub(1);
                     }
                 }
             }
@@ -2282,11 +2403,13 @@ impl CommunityWorkspaceState {
         actor_id: &str,
         is_blocked: bool,
         is_following: bool,
+        followers_count: u64,
     ) {
         let apply = |a: &mut CommunityActorDto| {
             if a.actor_id == actor_id {
                 a.is_blocked = is_blocked;
                 a.is_following = is_following;
+                a.followers_count = followers_count;
             }
         };
         for a in &mut self.recommended_actors {
@@ -2466,9 +2589,12 @@ impl CommunityWorkspaceState {
                     || self
                         .actor_block_last_synced
                         .get(aid)
-                        .is_some_and(|&(_, f)| !f)
+                        .is_some_and(|&(_, f, _)| !f)
                 {
-                    actor.is_following = false;
+                    if actor.is_following {
+                        actor.is_following = false;
+                        actor.followers_count = actor.followers_count.saturating_sub(1);
+                    }
                 }
             }
         }

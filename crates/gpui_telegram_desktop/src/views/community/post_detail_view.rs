@@ -804,16 +804,21 @@ impl CommunityWorkspace {
                             this.state.detail_gen = this.state.detail_gen.wrapping_add(1);
                             this.state.detail_loading = false;
                         }
-                        // Case B reloads: prevent any in-flight loader from resurrecting the deleted post.
-                        if this.state.feed_loading {
+                        // Case B reloads: prevent any in-flight loader or pagination from resurrecting the deleted post.
+                        if this.state.feed_loading || this.state.feed_loading_more {
                             this.load_feed(cx);
                         }
                         if this.state.saved_loading {
                             this.load_saved_posts(cx);
                         }
-                        if this.state.community_loading {
+                        if this.state.community_loading || this.state.community_loading_more {
                             if let CommunityRoute::CommunityPage(slug) = this.state.route.clone() {
                                 this.load_community_page(slug, cx);
+                            } else {
+                                this.state.community_gen =
+                                    this.state.community_gen.wrapping_add(1);
+                                this.state.community_loading = false;
+                                this.state.community_loading_more = false;
                             }
                         }
                         if this.state.profile_loading {

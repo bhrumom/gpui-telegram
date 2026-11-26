@@ -239,6 +239,7 @@ impl CommunityWorkspace {
 
     pub fn refresh_trending_discovery(&mut self, cx: &mut Context<Self>) {
         self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        self.state.communities_loading = true;
         let my_comm_gen = self.state.communities_gen;
         let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
@@ -250,23 +251,36 @@ impl CommunityWorkspace {
                 (trending, comms)
             })
             .await;
-            if let Ok((t, c)) = res {
-                let _ = weak.update(app, |this, cx| {
-                    if let Some(tr) = t {
-                        this.state.trending = tr.topics;
-                    }
-                    if this.state.communities_gen == my_comm_gen
-                        && this.state.actor_switch_gen == my_actor_gen
-                    {
-                        if let Some(mut cm) = c {
-                            for comm in &mut cm.communities {
-                                this.state.overlay_in_flight_community_mutations(comm);
-                            }
-                            this.state.communities = cm.communities;
+            match res {
+                Ok((t, c)) => {
+                    let _ = weak.update(app, |this, cx| {
+                        if let Some(tr) = t {
+                            this.state.trending = tr.topics;
                         }
-                    }
-                    cx.notify();
-                });
+                        if this.state.communities_gen == my_comm_gen
+                            && this.state.actor_switch_gen == my_actor_gen
+                        {
+                            this.state.communities_loading = false;
+                            if let Some(mut cm) = c {
+                                for comm in &mut cm.communities {
+                                    this.state.overlay_in_flight_community_mutations(comm);
+                                }
+                                this.state.communities = cm.communities;
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                Err(_) => {
+                    let _ = weak.update(app, |this, cx| {
+                        if this.state.communities_gen == my_comm_gen
+                            && this.state.actor_switch_gen == my_actor_gen
+                        {
+                            this.state.communities_loading = false;
+                        }
+                        cx.notify();
+                    });
+                }
             }
         })
         .detach();

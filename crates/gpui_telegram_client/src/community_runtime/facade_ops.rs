@@ -277,12 +277,16 @@ impl CommunityClientFacade {
     // C. Posts & Post Interactions (15–25)
     // -------------------------------------------------------------------------
 
-    pub async fn create_post(&self, req: &CreatePostRequest) -> Result<CreatePostResponse> {
+    async fn create_post_inner(
+        &self,
+        explicit_act_as: Option<&str>,
+        req: &CreatePostRequest,
+    ) -> Result<CreatePostResponse> {
         let req_remote = req.clone();
         let req_local = req.clone();
         self.execute_with_fallback(
             false,
-            None,
+            explicit_act_as,
             move |http, tok, act| async move {
                 http.community_create_post(tok.as_deref(), act.as_deref(), &req_remote)
                     .await
@@ -290,6 +294,24 @@ impl CommunityClientFacade {
             move |local, act| local.create_post(act.as_deref(), &req_local),
         )
         .await
+    }
+
+    pub async fn create_post(&self, req: &CreatePostRequest) -> Result<CreatePostResponse> {
+        self.create_post_inner(None, req).await
+    }
+
+    pub async fn create_post_as(
+        &self,
+        actor_id: &str,
+        req: &CreatePostRequest,
+    ) -> Result<CreatePostResponse> {
+        let normalized = actor_id.trim_matches(' ');
+        if normalized.is_empty() {
+            return Err(gpui_telegram_core::error::TelegramError::Validation(
+                "actor_id must not be empty".to_string(),
+            ));
+        }
+        self.create_post_inner(Some(normalized), req).await
     }
 
     pub async fn get_post(
