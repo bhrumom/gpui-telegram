@@ -19,6 +19,7 @@ members = [
     "crates/fabushi_miniapp",
     "crates/magpie_gateway",
     "crates/bot-browser",
+    "crates/openbot_contracts",
     "tests/e2e_magpie_gateway",
     "tests/e2e_suite",
 
@@ -67,6 +68,7 @@ fabushi_remote_daemon = { path = "crates/fabushi_remote_daemon" }
 fabushi_miniapp = { path = "crates/fabushi_miniapp" }
 magpie_gateway = { path = "crates/magpie_gateway" }
 bot-browser = { path = "crates/bot-browser" }
+openbot_contracts = { path = "crates/openbot_contracts" }
 
 # --- Inherited Domain Crates ---
 fabushi-messaging-core = { path = "inherited/mahayana-messaging" }
