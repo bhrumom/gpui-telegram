@@ -1140,9 +1140,11 @@ fn test_cm_t2_f06_02_extreme_and_non_finite_recommender_weights_clamped_safely()
         assert!(!resp.items.is_empty());
         for item in &resp.items {
             assert!(item.rank_score.is_finite(), "rank_score must be finite: {}", item.rank_score);
-            if let Some(ref exp) = item.explanation {
-                assert!(exp.signal_breakdown.iter().all(|s| s.contribution_pct.is_finite() && s.contribution_pct >= 0.0));
-            }
+            let exp = item
+                .explanation
+                .as_ref()
+                .expect("explanation must be populated when show_explanations=true");
+            assert!(exp.signal_breakdown.iter().all(|s| s.contribution_pct.is_finite() && s.contribution_pct >= 0.0));
         }
         let ui_san = sanitize_algo_prefs(prefs);
         assert!((0.0..=1.0).contains(&ui_san.recency_weight) && (0.0..=1.0).contains(&ui_san.affinity_weight) && (0.0..=1.0).contains(&ui_san.bot_content_ratio));

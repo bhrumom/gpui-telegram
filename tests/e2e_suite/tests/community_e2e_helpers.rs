@@ -729,12 +729,12 @@ pub async fn execute_human_hermes_tool(
 /// Headless GPUI shell host supporting both macOS real offscreen windows and Linux
 /// `HeadlessClient` fallback while executing real `AppShell` + `CommunityWorkspace` layout/render.
 pub struct HeadlessCommunityHost {
-    pub _dir: Option<TempDir>,
-    pub client: Arc<TelegramClient>,
     pub win: Option<WindowHandle<AppShell>>,
     pub shell: Entity<AppShell>,
+    pub client: Arc<TelegramClient>,
     pub width: f32,
     pub height: f32,
+    pub _dir: Option<TempDir>,
 }
 
 impl HeadlessCommunityHost {
@@ -900,12 +900,12 @@ pub fn open_shell_for_community(
         .expect("app.update open_shell_for_community");
 
     HeadlessCommunityHost {
-        _dir: None,
-        client,
         win,
         shell,
+        client,
         width,
         height,
+        _dir: None,
     }
 }
 
@@ -920,7 +920,7 @@ pub async fn open_offline_community_host(
 ) -> (HeadlessCommunityHost, Option<Entity<CommunityWorkspace>>) {
     let dir = TempDir::new().expect("create TempDir for headless GPUI client");
     let cfg = ClientConfig {
-        server_url: "http://127.0.0.1:9".to_string(),
+        server_url: closed_local_url(),
         max_reconnect_attempts: 0,
         ..Default::default()
     };

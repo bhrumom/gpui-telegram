@@ -3105,10 +3105,40 @@ async fn body_f15_02(mut app: AsyncApp) {
     let (host, _) = open_offline_community_host(&mut app, 1440.0, 900.0, 8152, "f15_02", false).await;
     let shell = host.shell.clone();
 
-    let _ = shell.update(&mut app, |s, cx| s.handle_main_menu_command(MainMenuCommand::Community, cx));
+    // 1. AccountPopover open -> Community command activates Community & closes popover
+    let _ = shell.update(&mut app, |s, cx| {
+        s.toggle_account_popover(cx);
+        assert!(
+            s.sidebar.read(cx).is_account_popover_open,
+            "toggle_account_popover must open AccountPopover before switching to Community"
+        );
+        s.handle_main_menu_command(MainMenuCommand::Community, cx);
+        assert!(
+            !s.sidebar.read(cx).is_account_popover_open,
+            "switching to Community must close AccountPopover"
+        );
+    });
     assert_eq!(shell.read_with(&app, |s, _| s.active_panel).unwrap(), ActiveWorkspacePanel::Community);
     host.draw(&mut app);
 
+    // 2. MainMenuDrawer open -> Community command activates Community & closes drawer
+    let _ = shell.update(&mut app, |s, cx| {
+        s.activate_nav_destination(NavDestination::Chats, cx);
+        s.main_menu_drawer.update(cx, |d, _| d.open());
+        assert!(
+            s.main_menu_drawer.read(cx).is_open,
+            "MainMenuDrawer must be open before triggering MainMenuCommand::Community"
+        );
+        s.handle_main_menu_command(MainMenuCommand::Community, cx);
+        assert!(
+            !s.main_menu_drawer.read(cx).is_open,
+            "switching to Community must close MainMenuDrawer"
+        );
+    });
+    assert_eq!(shell.read_with(&app, |s, _| s.active_panel).unwrap(), ActiveWorkspacePanel::Community);
+    host.draw(&mut app);
+
+    // 3. Cmd+Shift+C toggles Community <-> Chats while plain Cmd+C stays on Chats
     host.key(&mut app, "cmd-shift-c");
     assert_eq!(shell.read_with(&app, |s, _| s.active_panel).unwrap(), ActiveWorkspacePanel::Chats);
 

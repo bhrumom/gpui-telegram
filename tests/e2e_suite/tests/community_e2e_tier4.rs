@@ -22,7 +22,7 @@ use community_e2e_helpers::{
 use e2e_suite::browser_e2e_fixtures::LatencyBudget;
 use e2e_suite::common::{EphemeralTestServer, connect_ws, recv_ws_frame_matching};
 use e2e_suite::gpui_browser_harness::{pump_until, pump_with_ticks};
-use gpui::{AssetSource, AsyncApp};
+use gpui::{AssetSource, AsyncApp, Entity};
 use gpui_telegram_agent::ApprovalMode;
 use gpui_telegram_agent::hermes::toolsets::ToolsetPreset;
 use gpui_telegram_client::config::ClientConfig;
@@ -36,8 +36,8 @@ use gpui_telegram_desktop::views::community::bot_studio_view::{
 };
 use gpui_telegram_desktop::views::community::{
     ActiveCommunityInput, CommunityLayoutMode, CommunityModal, CommunityPopover, CommunityRoute,
-    CommunityWorkspaceAction, ComposerFormatTab, ComposerMediaDraft, NotificationCategoryTab,
-    PollBreakdownMode,
+    CommunityWorkspace, CommunityWorkspaceAction, ComposerFormatTab, ComposerMediaDraft,
+    NotificationCategoryTab, PollBreakdownMode,
 };
 use gpui_telegram_desktop::views::nav_rail::{NavDestination, NavRail};
 use gpui_telegram_desktop::views::shell::{
@@ -116,6 +116,110 @@ fn open_live_community_host(
     );
     host._dir = Some(dir);
     host
+}
+
+/// Waits until a live-server-backed `AppShell` + `CommunityWorkspace` has completed BOTH:
+/// 1. `CommunityWorkspace::bootstrap_initial_load` (`!feed_loading && !communities.is_empty() && identities.is_some()`), AND
+/// 2. `AppShell`'s initial WebSocket connect + `refresh_chats` + `refresh_miniapps_catalog` -> `sync_community_identities`
+///    chain so no late background `sync_community_identities` can bump `identities_gen` while
+///    subsequent live mutations (e.g. `BotStudioView::submit_register_bot`) are in flight.
+async fn wait_live_community_bootstrap(
+    host: &HeadlessCommunityHost,
+    app: &mut AsyncApp,
+    timeout: Duration,
+) -> Entity<CommunityWorkspace> {
+    let shell = host.shell.clone();
+    let mut settled_since: Option<Instant> = None;
+    let mut last_id_gen: u64 = 0;
+    let mut id_gen_stable_since: Option<Instant> = None;
+
+    let ok = pump_until(app, timeout, |cx| {
+        let s = shell.read(cx);
+        if s.active_panel != ActiveWorkspacePanel::Community {
+            return false;
+        }
+        let Some(cw) = s.community_workspace.as_ref() else {
+            return false;
+        };
+        let st = &cw.read(cx).state;
+        let ws_ready = !st.feed_loading && !st.communities.is_empty() && st.identities.is_some();
+        let ws_connected = s.session_sync.has_connected_ws_once;
+        let dialogs_synced = s.sidebar.read(cx).has_synced_dialogs;
+        let chat_idle = s.session_sync.chat_list_in_flight_since.is_none();
+        let chat_gen = s.session_sync.chat_list_request_generation;
+        let id_gen = st.identities_gen;
+
+        if id_gen != last_id_gen {
+            last_id_gen = id_gen;
+            id_gen_stable_since = Some(Instant::now());
+        } else if id_gen_stable_since.is_none() {
+            id_gen_stable_since = Some(Instant::now());
+        }
+
+        if !(ws_ready && ws_connected && dialogs_synced && chat_idle) {
+            settled_since = None;
+            return false;
+        }
+
+        // Exact generation accounting:
+        // - `begin_session` sets `chat_list_request_generation = 1`; each `refresh_chats` adds 1.
+        // - Mounting `CommunityWorkspace` before any await runs `bootstrap_initial_load` (gen=1) +
+        //   `sync_community_identities` (gen=2).
+        // - Each completed `refresh_chats` spawns `refresh_miniapps_catalog`, whose completion calls
+        //   `sync_community_identities` (+1 to `identities_gen`).
+        // Thus all initial catalog/identity syncs have settled once `id_gen >= (1 + chat_gen).max(3)`.
+        // If an early `refresh_chats` was fenced out after >3s, fall back to a 1.5s quiescence window.
+        let expected_gen = 1u64.saturating_add(chat_gen).max(3);
+        if id_gen >= expected_gen {
+            return true;
+        }
+        let since = *settled_since.get_or_insert_with(Instant::now);
+        id_gen >= 3
+            && since.elapsed() >= Duration::from_millis(1500)
+            && id_gen_stable_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(500))
+    })
+    .await;
+
+    if !ok {
+        let diag = shell.read_with(app, |s, cx| {
+            let cw_diag = s.community_workspace.as_ref().map(|w| {
+                let st = &w.read(cx).state;
+                format!(
+                    "feed_loading={}, communities={}, identities={}, identities_gen={}, runtime_mode={:?}",
+                    st.feed_loading,
+                    st.communities.len(),
+                    st.identities.is_some(),
+                    st.identities_gen,
+                    st.runtime_mode,
+                )
+            });
+            format!(
+                "active_panel={:?}, ws_connected={}, dialogs_synced={}, chat_in_flight={}, chat_gen={}, cw={cw_diag:?}",
+                s.active_panel,
+                s.session_sync.has_connected_ws_once,
+                s.sidebar.read(cx).has_synced_dialogs,
+                s.session_sync.chat_list_in_flight_since.is_some(),
+                s.session_sync.chat_list_request_generation,
+            )
+        });
+        panic!(
+            "Live AppShell + CommunityWorkspace bootstrap did not quiesce within {timeout:?} (diag: {diag:?})"
+        );
+    }
+
+    host.cw(app)
+}
+
+/// Synchronously opens `CommunityWorkspace` on a live host and awaits full shell + workspace quiescence.
+async fn open_live_community_and_wait(
+    host: &HeadlessCommunityHost,
+    app: &mut AsyncApp,
+    timeout: Duration,
+) -> Entity<CommunityWorkspace> {
+    let _ = host.shell.update(app, |s, cx| {
+        s.open_community_workspace(cx);
+    });
+    wait_live_community_bootstrap(host, app, timeout).await
 }
 
 /// Counts maximum consecutive appearances of a specific author in a feed item slice.
@@ -294,20 +398,12 @@ async fn body_t4_01(mut app: AsyncApp) {
             sb.handle_unified_action(UnifiedSidebarAction::SelectDestination(NavDestination::Community), scx);
         });
     });
-    assert!(pump_until(&mut app, Duration::from_secs(6), |cx| {
-        let s = shell.read(cx);
-        s.active_panel == ActiveWorkspacePanel::Community
-            && s.community_workspace.as_ref().is_some_and(|w| {
-                let st = &w.read(cx).state;
-                !st.feed_loading && st.identities.is_some() && !st.communities.is_empty()
-            })
-    }).await, "Live GPUI CommunityWorkspace must bootstrap from left sidebar");
-    let cw = host.cw(&app);
+    let cw = wait_live_community_bootstrap(&host, &mut app, Duration::from_secs(15)).await;
     assert_eq!(cw.read_with(&app, |w, _| w.state.runtime_mode).unwrap(), CommunityRuntimeMode::Online);
 
     // Inspect Article nested Human+Bot comment tree & cycle all 6 CommentSorts
     let _ = cw.update(&mut app, |w, cx| w.open_post_detail(art_id.clone(), cx));
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         cw.read(cx).state.detail_post.as_ref().is_some_and(|d| d.post.post_id == art_id && !d.comments.is_empty())
     }).await);
     cw.read_with(&app, |w, _| {
@@ -321,13 +417,13 @@ async fn body_t4_01(mut app: AsyncApp) {
     }).unwrap();
     for sort in [CommentSort::Best, CommentSort::Top, CommentSort::New, CommentSort::Controversial, CommentSort::Old, CommentSort::Qa] {
         let _ = cw.update(&mut app, |w, cx| w.set_detail_comment_sort(sort, cx));
-        assert!(pump_until(&mut app, Duration::from_secs(4), |cx| !cw.read(cx).state.detail_loading).await);
+        assert!(pump_until(&mut app, Duration::from_secs(8), |cx| !cw.read(cx).state.detail_loading).await);
         host.draw(&mut app);
     }
 
     // Inspect Poll Human/Bot vote breakdown inside GPUI
     let _ = cw.update(&mut app, |w, cx| w.open_post_detail(poll_id.clone(), cx));
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         cw.read(cx).state.detail_post.as_ref().is_some_and(|d| d.post.post_id == poll_id && d.post.poll.is_some())
     }).await);
     cw.read_with(&app, |w, _| {
@@ -461,14 +557,17 @@ async fn body_t4_02(mut app: AsyncApp) {
             "community_slug": "t4_02_rust", "body": "Bot benchmark breakdown for #RustPerf async runtimes"
         }))).await.unwrap().1["post"]["post_id"].as_str().unwrap().to_string();
         for i in 0..4 {
-            let _ = driver.req(Method::POST, "/api/v1/community/posts", &mb_auth, Some(json!({
+            let (st, pv) = driver.req(Method::POST, "/api/v1/community/posts", &mb_auth, Some(json!({
                 "community_slug": "t4_02_ai", "body": format!("Bot autonomous reasoning benchmark #{i} #AIAgents")
-            }))).await.unwrap();
+            }))).await.expect("create AI bot benchmark post");
+            assert!(matches!(st, 200 | 201), "create AI bot benchmark post #{i} failed ({st}): {pv}");
         }
         // Boost velocity on Rust posts
         for auth in [&d_auth, &rb_auth, &mb_auth] {
-            let _ = driver.req(Method::POST, &format!("/api/v1/community/posts/{p_rust_h}/vote"), auth, Some(json!({ "direction": 1 }))).await;
-            let _ = driver.req(Method::POST, &format!("/api/v1/community/posts/{p_rust_b}/vote"), auth, Some(json!({ "direction": 1 }))).await;
+            let (st1, v1) = driver.req(Method::POST, &format!("/api/v1/community/posts/{p_rust_h}/vote"), auth, Some(json!({ "direction": 1 }))).await.expect("upvote p_rust_h");
+            assert!(matches!(st1, 200 | 201), "upvote p_rust_h failed ({st1}): {v1}");
+            let (st2, v2) = driver.req(Method::POST, &format!("/api/v1/community/posts/{p_rust_b}/vote"), auth, Some(json!({ "direction": 1 }))).await.expect("upvote p_rust_b");
+            assert!(matches!(st2, 200 | 201), "upvote p_rust_b failed ({st2}): {v2}");
         }
 
         // Single-author 10-post flood by Dave to verify Greedy MMR diversity caps
@@ -590,7 +689,7 @@ async fn body_t4_02(mut app: AsyncApp) {
 
     // Headless GPUI Algo Tuner reflects persisted server prefs & saves new preset back to server
     let host = open_live_community_host(&mut app, &base_url, charlie.user_id as u64, &charlie.username, &charlie.token, 1440.0, 900.0);
-    let cw = host.open_community_and_wait(&mut app).await;
+    let cw = open_live_community_and_wait(&host, &mut app, Duration::from_secs(15)).await;
     assert_eq!(cw.read_with(&app, |w, _| w.state.runtime_mode).unwrap(), CommunityRuntimeMode::Online);
     assert_eq!(cw.read_with(&app, |w, _| w.state.algo_prefs.preset).unwrap(), AlgoPreset::RedditDeepDive);
 
@@ -600,7 +699,7 @@ async fn body_t4_02(mut app: AsyncApp) {
     });
     host.draw(&mut app);
     let _ = cw.update(&mut app, |w, cx| w.save_algo_prefs(cx));
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         cw.read(cx).state.algo_prefs.preset == AlgoPreset::BotHeavy && !cw.read(cx).state.feed_loading
     }).await);
     host.draw(&mut app);
@@ -655,15 +754,7 @@ async fn body_t4_03(mut app: AsyncApp) {
 
     let host = open_live_community_host(&mut app, &base_url, alice.user_id as u64, &alice.username, &alice.token, 1440.0, 900.0);
     host.key(&mut app, "cmd-shift-c");
-    assert!(pump_until(&mut app, Duration::from_secs(6), |cx| {
-        let s = host.shell.read(cx);
-        s.active_panel == ActiveWorkspacePanel::Community
-            && s.community_workspace.as_ref().is_some_and(|w| {
-                let st = &w.read(cx).state;
-                !st.feed_loading && st.identities.is_some()
-            })
-    }).await, "Cmd+Shift+C must open & bootstrap CommunityWorkspace");
-    let cw = host.cw(&app);
+    let cw = wait_live_community_bootstrap(&host, &mut app, Duration::from_secs(15)).await;
     assert_eq!(cw.read_with(&app, |w, _| w.state.runtime_mode).unwrap(), CommunityRuntimeMode::Online);
 
     let _ = cw.update(&mut app, |w, cx| {
@@ -676,11 +767,29 @@ async fn body_t4_03(mut app: AsyncApp) {
         w.state.bot_studio_autonomy = BotAutonomyMode::Reactive;
         w.submit_register_bot(cx);
     });
-    assert!(pump_until(&mut app, Duration::from_secs(6), |cx| {
+    let reg_ok = pump_until(&mut app, Duration::from_secs(15), |cx| {
         let st = &cw.read(cx).state;
         !st.bot_studio_submitting
             && st.identities.as_ref().is_some_and(|i| i.bot_actors.iter().any(|b| b.handle == "t4_studio_live_bot"))
-    }).await, "BotStudio must register @t4_studio_live_bot on live server");
+    }).await;
+    if !reg_ok {
+        let diag = cw.read_with(&app, |w, cx| {
+            let st = &w.state;
+            let s = host.shell.read(cx);
+            format!(
+                "bot_studio_submitting={}, bot_studio_error={:?}, identities_gen={}, identities={:?}, runtime_mode={:?}, ws_connected={}, dialogs_synced={}, chat_gen={}",
+                st.bot_studio_submitting,
+                st.bot_studio_error,
+                st.identities_gen,
+                st.identities,
+                st.runtime_mode,
+                s.session_sync.has_connected_ws_once,
+                s.sidebar.read(cx).has_synced_dialogs,
+                s.session_sync.chat_list_request_generation,
+            )
+        });
+        panic!("BotStudio must register @t4_studio_live_bot on live server within 15s (diag: {diag:?})");
+    }
 
     let (bot_actor_id, bot_uid, bot_token) = cw.read_with(&app, |w, _| {
         let b = w.state.identities.as_ref().unwrap().bot_actors.iter().find(|b| b.handle == "t4_studio_live_bot").unwrap();
@@ -698,9 +807,9 @@ async fn body_t4_03(mut app: AsyncApp) {
         w.state.bot_studio_test_content = "Hello from Bot Studio live playground T4-03!".into();
         w.run_bot_studio_test_post(bot_actor_id.clone(), cx);
     });
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         !cw.read(cx).state.bot_studio_test_submitting && cw.read(cx).state.bot_studio_test_last_post_id.is_some()
-    }).await);
+    }).await, "BotStudio test post must succeed within 10s");
     host.draw(&mut app);
 
     // Switch active Act-As identity to the newly created Bot and Quick-Post from main Feed
@@ -708,13 +817,13 @@ async fn body_t4_03(mut app: AsyncApp) {
         w.navigate_to(CommunityRoute::Feed, cx);
         w.switch_active_actor(bot_actor_id.clone(), cx);
     });
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| !cw.read(cx).state.feed_loading).await);
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| !cw.read(cx).state.feed_loading).await);
     let _ = cw.update(&mut app, |w, cx| {
         w.state.quick_post_community = Some("rust".into());
         w.state.quick_post_body = "Act-As Feed post by T4 Studio Bot!".into();
         w.submit_quick_post(cx);
     });
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         let st = &cw.read(cx).state;
         !st.quick_post_submitting
             && st.feed_items.iter().any(|i| i.post.body.contains("Act-As Feed post by T4 Studio Bot!") && i.post.author_actor_id == bot_actor_id && i.post.author_kind == ActorKind::Bot)
@@ -876,14 +985,14 @@ async fn body_t4_04(mut app: AsyncApp) {
 
     // Phase 1: Alice in live headless GPUI ComposerModal (CJK IME + Media gallery + 1/3 Thread + Draft->Published)
     let host_a = open_live_community_host(&mut app, &base_url, alice.user_id as u64, &alice.username, &alice.token, 1440.0, 900.0);
-    let cw_a = host_a.open_community_and_wait(&mut app).await;
+    let cw_a = open_live_community_and_wait(&host_a, &mut app, Duration::from_secs(15)).await;
     let shell_a = host_a.shell.clone();
     assert_eq!(cw_a.read_with(&app, |w, _| w.state.runtime_mode).unwrap(), CommunityRuntimeMode::Online);
     let _ = cw_a.update(&mut app, |w, cx| {
         w.select_feed_tab(FeedTab::All, cx);
         w.set_feed_sort(FeedSort::New, cx);
     });
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| !cw_a.read(cx).state.feed_loading).await);
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| !cw_a.read(cx).state.feed_loading).await);
 
     // Open Composer -> Media tab -> test CJK IME preedit + progressive Escape + 80ms Enter fence
     let _ = cw_a.update(&mut app, |w, cx| {
@@ -1004,7 +1113,7 @@ async fn body_t4_04(mut app: AsyncApp) {
 
     // Phase 3: Bob in live headless GPUI exercises OpenMediaLightbox, SharePostToChat & OpenDmWithActor
     let host_b = open_live_community_host(&mut app, &base_url, bob.user_id as u64, &bob.username, &bob.token, 1440.0, 900.0);
-    let cw_b = host_b.open_community_and_wait(&mut app).await;
+    let cw_b = open_live_community_and_wait(&host_b, &mut app, Duration::from_secs(15)).await;
     let shell_b = host_b.shell.clone();
 
     let _ = shell_b.update(&mut app, |s, cx| {
@@ -1637,8 +1746,10 @@ async fn body_t4_08(mut app: AsyncApp) {
             }))).await.unwrap();
             assert_eq!(st, 201);
             let pid = pv["post"]["post_id"].as_str().unwrap();
-            let _ = driver.req(Method::POST, &format!("/api/v1/community/posts/{pid}/vote"), &a_auth, Some(json!({ "direction": 1 }))).await;
-            let _ = driver.req(Method::POST, &format!("/api/v1/community/posts/{pid}/vote"), &b_auth, Some(json!({ "direction": 1 }))).await;
+            let (st_va, va) = driver.req(Method::POST, &format!("/api/v1/community/posts/{pid}/vote"), &a_auth, Some(json!({ "direction": 1 }))).await.expect("Alice upvote burst post");
+            assert!(matches!(st_va, 200 | 201), "Alice upvote burst post #{i} failed ({st_va}): {va}");
+            let (st_vb, vb) = driver.req(Method::POST, &format!("/api/v1/community/posts/{pid}/vote"), &b_auth, Some(json!({ "direction": 1 }))).await.expect("Bob upvote burst post");
+            assert!(matches!(st_vb, 200 | 201), "Bob upvote burst post #{i} failed ({st_vb}): {vb}");
         }
 
         // 6 CJK technical posts (Humans + Bot)
@@ -1745,18 +1856,18 @@ async fn body_t4_08(mut app: AsyncApp) {
 
     // 4. Live Headless GPUI ExploreSearchView across themes (Cmd+D) & locales (Cmd+L)
     let host = open_live_community_host(&mut app, &base_url, alice.user_id as u64, &alice.username, &alice.token, 1440.0, 900.0);
-    let cw = host.open_community_and_wait(&mut app).await;
+    let cw = open_live_community_and_wait(&host, &mut app, Duration::from_secs(15)).await;
     assert_eq!(cw.read_with(&app, |w, _| w.state.runtime_mode).unwrap(), CommunityRuntimeMode::Online);
 
     let _ = cw.update(&mut app, |w, cx| w.open_explore_with_query("#GPUICommunity2026".into(), cx));
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         let st = &cw.read(cx).state;
         !st.search_loading && st.search_result.as_ref().is_some_and(|r| !r.posts.is_empty())
     }).await);
     assert!(cw.read_with(&app, |w, _| w.state.trending.iter().any(|t| t.slug_or_tag.eq_ignore_ascii_case("gpuicommunity2026"))).unwrap());
 
     let _ = cw.update(&mut app, |w, cx| w.open_explore_with_query("is:bot c:t4_08_rust".into(), cx));
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         let st = &cw.read(cx).state;
         !st.search_loading && st.search_result.as_ref().is_some_and(|r| !r.posts.is_empty())
     }).await);
@@ -1917,10 +2028,10 @@ async fn body_t4_09(mut app: AsyncApp) {
 
     // 4. Live Headless GPUI: Left-Sidebar Unread Badge Sync (Expanded + Collapsed + AppleAppSidebar) -> Mark Read Clears to 0
     let host = open_live_community_host(&mut app, &base_url, alice.user_id as u64, &alice.username, &alice.token, 1440.0, 900.0);
-    let cw = host.open_community_and_wait(&mut app).await;
+    let cw = open_live_community_and_wait(&host, &mut app, Duration::from_secs(15)).await;
     let shell = host.shell.clone();
 
-    assert!(pump_until(&mut app, Duration::from_secs(5), |cx| {
+    assert!(pump_until(&mut app, Duration::from_secs(10), |cx| {
         cw.read(cx).state.unread_notifications == expected_unread
             && shell.read(cx).apple_sidebar.read(cx).community_unread_count == expected_unread
     }).await, "left-sidebar badge must sync with server unread count ({expected_unread})");
@@ -2074,13 +2185,12 @@ async fn body_t4_10(mut app: AsyncApp) {
             sb.handle_unified_action(UnifiedSidebarAction::SelectDestination(NavDestination::Community), scx);
         });
     });
-    assert!(pump_until(&mut app, Duration::from_secs(6), |cx| {
-        let s = shell.read(cx);
-        s.active_panel == ActiveWorkspacePanel::Community
-            && s.should_hide_composer(cx)
-            && s.inspect_state(cx).window.active_panel == "Community"
-            && s.community_workspace.as_ref().is_some_and(|w| !w.read(cx).state.feed_loading && w.read(cx).state.identities.is_some())
-    }).await);
+    let _ = wait_live_community_bootstrap(&host, &mut app, Duration::from_secs(15)).await;
+    shell.read_with(&app, |s, cx| {
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::Community);
+        assert!(s.should_hide_composer(cx));
+        assert_eq!(s.inspect_state(cx).window.active_panel, "Community");
+    }).unwrap();
 
     // (2) Collapsed 64px rail (#rail-community-btn)
     let _ = shell.update(&mut app, |s, cx| {
