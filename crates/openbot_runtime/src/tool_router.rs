@@ -1414,25 +1414,31 @@ impl OpenBotToolRouter {
                     .unwrap_or_else(|| note.clone());
                 let request_message_id = json_opt_str(args, &["requestMessageId", "deliveryId"])
                     .unwrap_or_else(|| format!("wait-req:{}", Uuid::new_v4()));
+                let routine_id = json_opt_str(args, &["routineId", "routine_id"])
+                    .or_else(|| ctx.origin_routine_id.clone());
                 let wait = self.database.agent_wait_store().open(OpenAgentWaitInput {
                     agent_id: ctx.agent_id.clone(),
                     request_message_id,
                     request_text,
                     note,
-                    routine_id: ctx.origin_routine_id.clone(),
+                    routine_id,
                 })?;
                 Ok(serde_json::to_value(wait)?)
             }
             "close_wait" => {
                 let wait_id = json_req_str(args, &["waitId", "wait_id", "id"], "waitId")?;
+                let owner_id = json_opt_str(args, &["agentId", "agent_id"])
+                    .unwrap_or_else(|| ctx.agent_id.clone());
                 let closed = self
                     .database
                     .agent_wait_store()
-                    .delete(&ctx.agent_id, &wait_id)?;
+                    .delete(&owner_id, &wait_id)?;
                 Ok(json!({ "closed": closed, "waitId": wait_id }))
             }
             "list_waits" => {
-                let waits = self.database.agent_wait_store().list(&ctx.agent_id)?;
+                let owner_id = json_opt_str(args, &["agentId", "agent_id"])
+                    .unwrap_or_else(|| ctx.agent_id.clone());
+                let waits = self.database.agent_wait_store().list(&owner_id)?;
                 Ok(json!({ "waits": waits, "count": waits.len() }))
             }
             _ => Err(OpenBotRuntimeError::Validation(format!(
@@ -1667,7 +1673,9 @@ fn canonicalize_router_tool_name(raw: &str) -> String {
         "memory_save" | "memory_put" | "essential_memory" | "memory_search" | "memory_delete"
         | "agent_data_exec" | "sql_exec" | "sql_query" | "sql_list_tables" | "channel_forget"
         | "channel_continue" | "channel_reassign" | "channel_status" | "channel_list_members"
-        | "channel_send" | "channel_await" | "channel_set_topic" => format!("openbot.{trimmed}"),
+        | "channel_send" | "channel_await" | "channel_set_topic" | "workflow_list"
+        | "workflow_get" | "workflow_save" | "workflow_delete" | "workflow_run"
+        | "marketplace_search" | "marketplace_install" => format!("openbot.{trimmed}"),
         _ => qualified_tool_name(trimmed),
     }
 }
@@ -1684,6 +1692,12 @@ fn router_alias_catalog_target(qualified: &str) -> Option<&'static str> {
         "openbot.sql_list_tables" => Some("openbot.list_tables"),
         "openbot.channel_forget" => Some("openbot.channel_forget_memory"),
         "openbot.channel_send" => Some("openbot.send_to_channel"),
+        "openbot.workflow_list" => Some("openbot.list_workflows"),
+        "openbot.workflow_get" => Some("openbot.read_workflow"),
+        "openbot.workflow_save" => Some("openbot.edit_workflow"),
+        "openbot.workflow_delete" => Some("openbot.delete_workflow"),
+        "openbot.workflow_run" => Some("openbot.run_workflow"),
+        "openbot.marketplace_search" => Some("openbot.suggest_marketplace_app"),
         "openbot_browser.back" | "openbot_browser.forward" | "openbot_browser.reload" => {
             Some("openbot_browser.navigate")
         }
@@ -1724,6 +1738,14 @@ fn router_extension_schema(qualified: &str) -> Option<JsonValue> {
                 "channelId": { "type": "string" },
                 "title": { "type": "string" },
                 "topic": { "type": "string" }
+            }
+        })),
+        "openbot.marketplace_install" => Some(json!({
+            "type": "object",
+            "properties": {
+                "tab": { "type": "string" },
+                "id": { "type": "string" },
+                "slug": { "type": "string" }
             }
         })),
         "openbot_browser.console_logs" => Some(json!({

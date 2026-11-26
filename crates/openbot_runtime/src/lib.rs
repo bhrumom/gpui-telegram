@@ -25,6 +25,7 @@ pub mod context_compactor;
 pub mod drain_scheduler;
 pub mod error;
 pub mod host_runtime;
+pub mod platform;
 pub mod providers;
 pub mod skill_mcp_service;
 pub mod tool_catalog;
@@ -76,6 +77,22 @@ pub use drain_scheduler::{
 };
 pub use error::{FailoverCause, OpenBotRuntimeError, RuntimeResult, SoftRefusal};
 pub use host_runtime::OpenBotHostRuntime;
+pub use platform::{
+    AutomationHttpServer, AutomationServerConfig, AutomationServerHandle, BridgeEvalOutcome,
+    BridgeEvalRequest, CreditMediaOutcome, CrmProposeOutcome, CrmProposeRequest, CrmService,
+    CrmSyncOutcome, CrmSyncRequest, ExternalBridgeOrchestrator, HtmlAndCreditMediaService,
+    HtmlRenderMode, HtmlRenderOutcome, HtmlRenderRequest, JoinedServerClient, MarketplaceItem,
+    MarketplaceSearchOutcome, MarketplaceSearchRequest, MarketplaceService, MarketplaceTab,
+    OpenBotPageRpcOutcome, OpenBotServeConfig, OpenBotServeHandle, PlatformServices,
+    PlatformToolDelegate, RoutineEngine, RoutineRunOutcome, RoutineRunRequest, RoutineSaveOutcome,
+    RoutineSaveRequest, RoutineTimer, StaticSiteDeleteOutcome, StaticSiteDeleteRequest,
+    StaticSitePublishRequest, StaticSiteRecord, StaticSiteService, TeamApiConfig, TeamApiHandle,
+    TeamApiServer, TeamProtocolEvalOutcome, TeamProtocolEvalRequest, VoiceEvalMode,
+    VoiceEvalOutcome, VoiceEvalRequest, VoiceService, WebhookPostOutcome, WebhookPostRequest,
+    WhatsAppDecision, WhatsAppSenderFacts, WhatsAppSenderRules, WorkflowEngine, WorkflowRunOutcome,
+    WorkflowRunRequest, WorkflowSaveOutcome, WorkflowSaveRequest, WorkflowStepReport, ct_eq,
+    generate_base64url_token_32,
+};
 pub use providers::{
     HANDOFF_MAX_CHARS, HANDOFF_START, ProviderCliProbe, ProviderHarnessInfo,
     ProviderProtocolKind, ProviderRuntimeManager, StartTurnRequest, TurnExecutionOutcome,

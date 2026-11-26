@@ -21,13 +21,19 @@ use crate::channel_service::ChannelService;
 use crate::context_compactor::ContextCompactor;
 use crate::drain_scheduler::{BootRecoveryReport, DrainScheduler};
 use crate::error::RuntimeResult;
+use crate::platform::{
+    AutomationHttpServer, AutomationServerConfig, AutomationServerHandle, CrmService,
+    ExternalBridgeOrchestrator, HtmlAndCreditMediaService, MarketplaceService, OpenBotServeConfig,
+    OpenBotServeHandle, PlatformServices, PlatformToolDelegate, RoutineEngine, StaticSiteService,
+    TeamApiConfig, TeamApiHandle, TeamApiServer, VoiceService, WorkflowEngine,
+};
 use crate::providers::ProviderRuntimeManager;
 use crate::skill_mcp_service::{McpGateway, SkillService};
 use crate::tool_catalog::ToolCatalog;
 use crate::tool_router::{ExternalToolDelegate, OpenBotToolRouter};
 use crate::vault_service::VaultService;
 
-/// Top-level facade owning the complete OpenBot core runtime for a single `<data_dir>`.
+/// Top-level facade owning the complete OpenBot core & platform runtime for a single `<data_dir>`.
 pub struct OpenBotHostRuntime {
     data_dir: PathBuf,
     database: OpenBotDatabase,
@@ -44,6 +50,7 @@ pub struct OpenBotHostRuntime {
     vault: Arc<VaultService>,
     browser: Arc<BrowserService>,
     tool_router: Arc<OpenBotToolRouter>,
+    platform: Arc<PlatformServices>,
     boot_recovery: BootRecoveryReport,
     expired_attention_on_boot: usize,
     extensions: RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
@@ -51,7 +58,8 @@ pub struct OpenBotHostRuntime {
 
 impl OpenBotHostRuntime {
     /// Opens or creates `<data_dir>/openbot.db` and `<data_dir>/Shared/Data/agent-data.db`,
-    /// wires every M3 core runtime service, and executes boot crash recovery.
+    /// wires every M3 core runtime service and M4 platform subsystem, registers
+    /// [`PlatformToolDelegate`] on [`OpenBotToolRouter`], and executes boot crash recovery.
     pub fn open(data_dir: impl AsRef<Path>) -> RuntimeResult<Arc<Self>> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
@@ -95,10 +103,14 @@ impl OpenBotHostRuntime {
             Arc::clone(&browser),
         );
 
+        let platform = PlatformServices::open(database.clone(), &data_dir)?;
+        let platform_delegate = PlatformToolDelegate::new(database.clone(), Arc::clone(&platform));
+        tool_router.set_external_delegate(Some(platform_delegate));
+
         let boot_recovery = scheduler.recover_boot_state()?;
         let expired_attention_on_boot = attention.expire_stale();
 
-        Ok(Arc::new(Self {
+        let runtime = Arc::new(Self {
             data_dir,
             database,
             shared_agent_data,
@@ -114,10 +126,13 @@ impl OpenBotHostRuntime {
             vault,
             browser,
             tool_router,
+            platform: Arc::clone(&platform),
             boot_recovery,
             expired_attention_on_boot,
             extensions: RwLock::new(HashMap::new()),
-        }))
+        });
+        runtime.attach_extension(platform);
+        Ok(runtime)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -180,12 +195,100 @@ impl OpenBotHostRuntime {
         &self.tool_router
     }
 
+    pub fn platform(&self) -> &Arc<PlatformServices> {
+        &self.platform
+    }
+
+    pub fn routines(&self) -> &Arc<RoutineEngine> {
+        &self.platform.routines
+    }
+
+    pub fn workflows(&self) -> &Arc<WorkflowEngine> {
+        &self.platform.workflows
+    }
+
+    pub fn crm(&self) -> &Arc<CrmService> {
+        &self.platform.crm
+    }
+
+    pub fn static_sites(&self) -> &Arc<StaticSiteService> {
+        &self.platform.static_sites
+    }
+
+    pub fn marketplace(&self) -> &Arc<MarketplaceService> {
+        &self.platform.marketplace
+    }
+
+    pub fn html_media(&self) -> &Arc<HtmlAndCreditMediaService> {
+        &self.platform.html_media
+    }
+
+    pub fn voice(&self) -> &Arc<VoiceService> {
+        &self.platform.voice
+    }
+
+    pub fn bridges(&self) -> &Arc<ExternalBridgeOrchestrator> {
+        &self.platform.bridges
+    }
+
     pub fn boot_recovery(&self) -> &BootRecoveryReport {
         &self.boot_recovery
     }
 
     pub fn expired_attention_on_boot(&self) -> usize {
         self.expired_attention_on_boot
+    }
+
+    /// Starts the loopback automation HTTP server (`127.0.0.1:<bind_port>`).
+    pub async fn start_automation_server(
+        &self,
+        bind_port: u16,
+    ) -> RuntimeResult<AutomationServerHandle> {
+        AutomationHttpServer::start(
+            self.database.clone(),
+            Arc::clone(&self.platform.routines),
+            AutomationServerConfig {
+                bind_port,
+                data_dir: self.data_dir.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Starts the `/v1/*` Team API HTTP/SSE server (`127.0.0.1:<bind_port>`).
+    pub async fn start_team_api_server(
+        &self,
+        bind_port: u16,
+        require_auth_token: Option<String>,
+    ) -> RuntimeResult<TeamApiHandle> {
+        TeamApiServer::start(
+            self.database.clone(),
+            Arc::clone(&self.platform.voice),
+            TeamApiConfig {
+                bind_port,
+                data_dir: self.data_dir.clone(),
+                require_auth_token,
+            },
+        )
+        .await
+    }
+
+    /// Starts both the `/v1/*` Team API server and loopback automation server together.
+    pub async fn serve(
+        &self,
+        team_port: u16,
+        automation_port: u16,
+    ) -> RuntimeResult<OpenBotServeHandle> {
+        OpenBotServeHandle::start(
+            self.database.clone(),
+            Arc::clone(&self.platform),
+            OpenBotServeConfig {
+                data_dir: self.data_dir.clone(),
+                team_port,
+                automation_port,
+            },
+        )
+        .await
     }
 
     /// Registers an optional external tool delegate on the runtime's [`OpenBotToolRouter`].
