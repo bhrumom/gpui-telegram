@@ -5810,6 +5810,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "orca_ide"
+version = "1.6.15"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "getrandom 0.2.17",
+ "hex",
+ "http",
+ "orca_bots",
+ "orca_core",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "walkdir",
+ "zeroize",
+]
+
+[[package]]
 name = "ordered-stream"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
