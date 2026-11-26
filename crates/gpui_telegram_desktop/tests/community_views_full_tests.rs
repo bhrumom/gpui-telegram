@@ -47,9 +47,13 @@ use gpui_telegram_desktop::views::composer::formatting_bar::TextStyleKind;
 use gpui_telegram_desktop::views::shell::{ActiveWorkspacePanel, AppShell};
 use gpui_telegram_desktop::views::TdesktopThemeMode;
 use gpui_telegram_proto::community_contracts::{
-    ActorKind, AutoModActionKind, BotAutonomyMode, CommentSort, CommunityNotificationDto,
-    CommunityNotificationKind, CommunitySearchSort, CommunitySearchTab, CreatePostRequest,
-    EngagementSignalKind, ModActionKind, PostFormat, PostStatus,
+    ActorKind, AlgoPreferencesDto, AutoModActionKind, BotAutonomyMode, CommentSort,
+    CommunityActorDto, CommunityDetailResponse, CommunityIdentitiesResponse, CommunityListDto,
+    CommunityListKind, CommunityListsResponse, CommunityMemberRole, CommunityNotificationDto,
+    CommunityNotificationKind, CommunitySearchResultDto, CommunitySearchSort, CommunitySearchTab,
+    CreatePostRequest, EngagementSignalKind, FeedResponseDto, ListCommunitiesResponse,
+    ModActionKind, ModLogsResponse, ModQueueResponse, NotificationsListResponse, PostFormat,
+    PostStatus, SubCommunityDto, TrendingResponse, VerifiedTier,
 };
 use tempfile::TempDir;
 
@@ -104,6 +108,12 @@ fn dispatch_headless_target(target: &str, use_underscore_exit: bool) -> ! {
         }
         "test_m5_multi_theme_bilingual_and_responsive_layout_smoke_all_routes" => {
             |app| Box::pin(body_multi_theme_bilingual_responsive_smoke(app))
+        }
+        "test_m5_f21_mod_race_actor_switch_fences_online_delayed_rtt" => {
+            |app| Box::pin(body_f21_mod_race_actor_switch_fences_online_delayed_rtt(app))
+        }
+        "test_m5_f20_lists_rapid_toggle_single_flight_sqlite_stress" => {
+            |app| Box::pin(body_f20_lists_rapid_toggle_single_flight_sqlite_stress(app))
         }
         other => {
             eprintln!("unknown community M5 headless gpui test target: {other}");
@@ -500,6 +510,20 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
         "\\s{80}",
         ".{60}",
         "(?-u:\\w{500})",
+        // Wave r3 Challenger differential parity patterns (Unicode/dot/bracket capture names & within-64-KiB)
+        "(?<标签>测试)",
+        "(?<α>x)",
+        "(?P<α>x)",
+        "(?<a.b>x)",
+        "(?P<a.b>x)",
+        "(?<a[0]>x)",
+        "(?P<a[0]>x)",
+        "(?:a|b){400}",
+        "(?:a|b){600}",
+        "(?:a|b){800}",
+        "\\p{Latin}{20}",
+        "(a{10000}){0}",
+        "(\\d{100}){0}",
     ] {
         assert!(
             validate_automod_regex_syntax(ok_pat).is_ok(),
@@ -561,6 +585,16 @@ fn test_m5_notification_category_exhaustive_mapping_and_automod_regex_validation
         ".{100}",
         "\\p{L}{2}",
         "(?-u:\\w{700})",
+        // Wave r3 Challenger Unicode case-folded char-class 64 KiB overflows
+        "[a-z]{250}",
+        "[a-z]{300}",
+        "[a-z]{350}",
+        "[a-z]{400}",
+        "[a-z]{600}",
+        "[a-z]{800}",
+        "[a-z]{1000}",
+        "[a-z0-9_-]{350}",
+        "[a-z0-9._%+-]{350}",
     ] {
         assert!(
             validate_automod_regex_syntax(bad).is_err(),
@@ -2212,10 +2246,22 @@ async fn body_f20_profile_notifs_bookmarks_lists(mut app: AsyncApp) {
     });
     assert!(
         pump_until(&mut app, Duration::from_secs(4), |cx| {
-            !cw.read(cx).state.list_feed_loading
+            let st = &cw.read(cx).state;
+            !st.list_membership_in_flight.contains_key(&list_id)
+                && !st.list_membership_dirty.contains(&list_id)
+                && !st.list_feed_loading
         })
         .await
     );
+    let facade_for_f20 = cw.read_with(&app, |w, _| w.facade.clone()).unwrap();
+    let db_lists_f20 = fetch_db_lists(&facade_for_f20).await;
+    let db_list_f20 = db_lists_f20
+        .iter()
+        .find(|x| x.list_id == list_id)
+        .expect("list must persist in SQLite");
+    assert!(db_list_f20.member_actor_ids.contains(&target_bot.actor_id));
+    assert!(db_list_f20.community_slugs.iter().any(|s| s == "systems"));
+    assert!(!db_list_f20.is_pinned);
     host.draw(&mut app);
     let _ = cw.update(&mut app, |w, cx| w.delete_list_action(list_id.clone(), cx));
     assert!(
@@ -2814,4 +2860,893 @@ async fn body_multi_theme_bilingual_responsive_smoke(mut app: AsyncApp) {
         });
         host.draw_at(&mut app, 1440.0, 900.0);
     }
+}
+
+// ============================================================================
+// Wave r4 Regression 1: Online Delayed-RTT Actor-Switch Fences
+// (`F21-MOD-4` load_community_page + `persist_automod_rules` + `save_community_rules`)
+// ============================================================================
+
+async fn fetch_db_lists(
+    facade: &gpui_telegram_client::CommunityClientFacade,
+) -> Vec<CommunityListDto> {
+    let f = facade.clone();
+    let handle = f.runtime_handle().clone();
+    let (tx, rx) = futures::channel::oneshot::channel();
+    handle.spawn(async move {
+        let _ = tx.send(f.list_lists().await);
+    });
+    rx.await
+        .expect("tokio oneshot")
+        .expect("facade.list_lists()")
+        .lists
+}
+
+fn mock_actor_dto(actor_id: &str, kind: ActorKind, handle: &str, name: &str) -> CommunityActorDto {
+    CommunityActorDto {
+        actor_id: actor_id.to_string(),
+        linked_user_id: if kind == ActorKind::Human { Some(902301) } else { Some(950000) },
+        owner_user_id: Some(902301),
+        actor_kind: kind,
+        handle: handle.to_string(),
+        display_name: name.to_string(),
+        bio: String::new(),
+        location: None,
+        website: None,
+        avatar_media_id: None,
+        banner_media_id: None,
+        avatar_shape: "classic".to_string(),
+        avatar_color: "blue".to_string(),
+        verified_tier: VerifiedTier::None,
+        bot_badge: if kind.is_bot_like() { Some("AI Agent".to_string()) } else { None },
+        bot_model: None,
+        bot_capabilities: Vec::new(),
+        bot_autonomy_mode: BotAutonomyMode::Manual,
+        bot_persona: None,
+        post_karma: 100,
+        comment_karma: 50,
+        awardee_karma: 0,
+        followers_count: 1,
+        following_count: 1,
+        posts_count: 0,
+        trust_score: 0.9,
+        is_following: false,
+        is_muted: false,
+        is_blocked: false,
+        created_at_ms: 1_750_000_000_000,
+    }
+}
+
+fn mock_community_dto(
+    slug: &str,
+    owner_id: &str,
+    viewer_role: Option<CommunityMemberRole>,
+) -> SubCommunityDto {
+    SubCommunityDto {
+        community_id: format!("comm_{slug}"),
+        slug: slug.to_string(),
+        name: "Probe Mod Lab".to_string(),
+        description: "Delayed-RTT moderation fence test community".to_string(),
+        category: "technology".to_string(),
+        banner_media_id: None,
+        icon_media_id: None,
+        icon_emoji: "🛡️".to_string(),
+        accent_color: "#3B82F6".to_string(),
+        rules: Vec::new(),
+        post_flairs: Vec::new(),
+        user_flairs: Vec::new(),
+        wiki_markdown: String::new(),
+        wiki_revision: 1,
+        pinned_post_ids: Vec::new(),
+        automod_rules: Vec::new(),
+        allow_bots: true,
+        require_bot_disclosure: false,
+        is_nsfw: false,
+        member_count: 2,
+        human_member_count: 1,
+        bot_member_count: 1,
+        posts_count: 0,
+        viewer_role,
+        is_joined: viewer_role.is_some(),
+        notifications_enabled: false,
+        created_by_actor_id: owner_id.to_string(),
+        created_at_ms: 1_750_000_000_000,
+    }
+}
+
+struct DelayedModRaceServerCounters {
+    get_detail_completed: Arc<std::sync::atomic::AtomicUsize>,
+    patch_completed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn spawn_delayed_mod_race_server(
+    rt_handle: &tokio::runtime::Handle,
+    owner_id: String,
+    non_mod_bot_id: String,
+    slug: String,
+) -> (std::net::SocketAddr, DelayedModRaceServerCounters) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let get_detail_completed = Arc::new(AtomicUsize::new(0));
+    let patch_completed = Arc::new(AtomicUsize::new(0));
+    let get_cnt = Arc::clone(&get_detail_completed);
+    let patch_cnt = Arc::clone(&patch_completed);
+
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback mock");
+    std_listener
+        .set_nonblocking(true)
+        .expect("nonblocking loopback mock");
+    let addr = std_listener.local_addr().expect("mock local_addr");
+
+    rt_handle.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .expect("tokio TcpListener from_std");
+        let owner_actor = mock_actor_dto(&owner_id, ActorKind::Human, "race_owner", "Race Owner");
+        let bot_actor = mock_actor_dto(&non_mod_bot_id, ActorKind::Bot, "race_bot", "Race Bot");
+
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let owner_id = owner_id.clone();
+            let slug = slug.clone();
+            let owner_actor = owner_actor.clone();
+            let bot_actor = bot_actor.clone();
+            let get_cnt = Arc::clone(&get_cnt);
+            let patch_cnt = Arc::clone(&patch_cnt);
+
+            tokio::spawn(async move {
+                let mut buf = Vec::with_capacity(4096);
+                let mut tmp = [0u8; 2048];
+                let header_end = loop {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                            if buf.len() > 65536 {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let head_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let mut lines = head_str.lines();
+                let req_line = lines.next().unwrap_or("");
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET").to_string();
+                let full_target = parts.next().unwrap_or("/");
+                let path = full_target.split('?').next().unwrap_or("/").to_string();
+
+                let mut actor_header = String::new();
+                let mut content_len: usize = 0;
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("x-community-actor-id") {
+                            actor_header = v.trim().to_string();
+                        } else if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                while buf.len() < header_end + content_len {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+
+                let is_owner = actor_header.is_empty() || actor_header == owner_id;
+                let viewer_role = if is_owner {
+                    Some(CommunityMemberRole::Owner)
+                } else {
+                    None
+                };
+                let detail_path = format!("/api/v1/community/communities/{slug}");
+                let queue_path = format!("/api/v1/community/communities/{slug}/mod-queue");
+                let logs_path = format!("/api/v1/community/communities/{slug}/mod-logs");
+
+                let (status, body) = if method == "GET" && path == "/api/v1/community/identities" {
+                    let resp = CommunityIdentitiesResponse {
+                        active_actor_id: owner_id.clone(),
+                        human_actor: Some(owner_actor.clone()),
+                        bot_actors: vec![bot_actor.clone()],
+                        all_actors: vec![owner_actor.clone(), bot_actor.clone()],
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST" && path == "/api/v1/community/identities/human" {
+                    ("200 OK", serde_json::to_string(&owner_actor).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/communities" {
+                    let resp = ListCommunitiesResponse {
+                        communities: vec![mock_community_dto(&slug, &owner_id, viewer_role)],
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path == detail_path {
+                    if is_owner {
+                        tokio::time::sleep(Duration::from_millis(220)).await;
+                        get_cnt.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let resp = CommunityDetailResponse {
+                        community: mock_community_dto(&slug, &owner_id, viewer_role),
+                        pinned_posts: Vec::new(),
+                        moderators: vec![owner_actor.clone()],
+                        wiki_revisions: Vec::new(),
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "PATCH" && path == detail_path {
+                    if is_owner {
+                        tokio::time::sleep(Duration::from_millis(220)).await;
+                        patch_cnt.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let resp = mock_community_dto(&slug, &owner_id, viewer_role);
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path == queue_path {
+                    if is_owner {
+                        ("200 OK", serde_json::to_string(&ModQueueResponse::default()).unwrap())
+                    } else {
+                        (
+                            "403 Forbidden",
+                            r#"{"error":"permission_denied","message":"actor is not a community moderator"}"#
+                                .to_string(),
+                        )
+                    }
+                } else if method == "GET" && path == logs_path {
+                    if is_owner {
+                        ("200 OK", serde_json::to_string(&ModLogsResponse::default()).unwrap())
+                    } else {
+                        (
+                            "403 Forbidden",
+                            r#"{"error":"permission_denied","message":"actor is not a community moderator"}"#
+                                .to_string(),
+                        )
+                    }
+                } else if path == "/api/v1/community/feed" {
+                    ("200 OK", serde_json::to_string(&FeedResponseDto::default()).unwrap())
+                } else if path == "/api/v1/community/notifications" {
+                    (
+                        "200 OK",
+                        serde_json::to_string(&NotificationsListResponse::default()).unwrap(),
+                    )
+                } else if path == "/api/v1/community/lists" {
+                    (
+                        "200 OK",
+                        serde_json::to_string(&CommunityListsResponse::default()).unwrap(),
+                    )
+                } else if path == "/api/v1/community/trending" {
+                    ("200 OK", serde_json::to_string(&TrendingResponse::default()).unwrap())
+                } else if path == "/api/v1/community/algo-prefs" {
+                    ("200 OK", serde_json::to_string(&AlgoPreferencesDto::default()).unwrap())
+                } else if path == "/api/v1/community/search" {
+                    let sr = CommunitySearchResultDto {
+                        query: String::new(),
+                        tab: CommunitySearchTab::Top,
+                        posts: Vec::new(),
+                        actors: Vec::new(),
+                        communities: Vec::new(),
+                        total_hits: 0,
+                        next_offset: None,
+                    };
+                    ("200 OK", serde_json::to_string(&sr).unwrap())
+                } else {
+                    ("200 OK", "{}".to_string())
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    (
+        addr,
+        DelayedModRaceServerCounters {
+            get_detail_completed,
+            patch_completed,
+        },
+    )
+}
+
+#[test]
+fn test_m5_f21_mod_race_actor_switch_fences_online_delayed_rtt() {
+    run_in_headless_subprocess("test_m5_f21_mod_race_actor_switch_fences_online_delayed_rtt");
+}
+
+async fn body_f21_mod_race_actor_switch_fences_online_delayed_rtt(mut app: AsyncApp) {
+    use std::sync::atomic::Ordering;
+
+    let dir = TempDir::new().expect("create delayed mod race tempdir");
+    let owner_id = "u:902301".to_string();
+    let bot_id = "b:950000".to_string();
+    let slug = "probe_mod_lab".to_string();
+
+    // Open client on a throwaway runtime first? No — open with placeholder, then bind?
+    // Even cleaner: spawn a small temp tokio runtime OR open TelegramClient after binding using
+    // a dedicated TcpListener bound synchronously and attached onto client.runtime()!
+    let dummy_cfg = ClientConfig {
+        server_url: "http://127.0.0.1:9".to_string(),
+        max_reconnect_attempts: 0,
+        ..Default::default()
+    };
+    let bootstrap_dir = TempDir::new().expect("bootstrap tempdir");
+    let rt_holder =
+        TelegramClient::open_with_dir(dummy_cfg, bootstrap_dir.path()).expect("open rt holder");
+    let (addr, counters) = spawn_delayed_mod_race_server(
+        rt_holder.runtime().handle(),
+        owner_id.clone(),
+        bot_id.clone(),
+        slug.clone(),
+    );
+
+    let cfg = ClientConfig {
+        server_url: format!("http://{addr}"),
+        max_reconnect_attempts: 0,
+        ..Default::default()
+    };
+    let client = Arc::new(
+        TelegramClient::open_with_dir(cfg, dir.path()).expect("open online race TelegramClient"),
+    );
+    // Keep force_local = false so CommunityClientFacade uses our delayed-RTT loopback server!
+    let auth = test_auth(902301, "race_owner");
+    client.set_auth_session(auth.clone());
+
+    let client_for_win = Arc::clone(&client);
+    let auth_for_win = auth.clone();
+    let shell = app
+        .update(|cx| {
+            let _rt_guard = client_for_win.runtime().enter();
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client_for_win.clone(), cx);
+                s.apply_authenticated_session(auth_for_win.clone(), cx);
+                s
+            })
+        })
+        .expect("mount online race AppShell");
+    let _ = shell.update(&mut app, |s, cx| {
+        s.open_community_workspace(cx);
+    });
+    let cw = shell
+        .read_with(&app, |s, _| {
+            s.community_workspace
+                .clone()
+                .expect("community workspace mounted")
+        })
+        .unwrap();
+
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let w = cw.read(cx);
+            w.state.communities.len() == 1 && w.can_moderate_community_slug(&slug)
+        })
+        .await,
+        "Online bootstrap must hydrate probe_mod_lab with Owner role"
+    );
+
+    // Sub-test A (F21-MOD-4): Off-route load_community_page delayed Owner GET must NEVER leak Owner role!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(slug.clone()), cx);
+    });
+    app.background_executor().timer(Duration::from_millis(40)).await;
+    let _ = cw.update(&mut app, |w, cx| {
+        let prev_comm_gen = w.state.community_gen;
+        w.navigate_to(CommunityRoute::Feed, cx);
+        w.switch_active_actor(bot_id.clone(), cx);
+        assert_ne!(
+            w.state.community_gen, prev_comm_gen,
+            "switch_active_actor must unconditionally bump community_gen"
+        );
+        assert!(!w.state.community_loading);
+        assert!(!w.can_moderate_community_slug(&slug));
+    });
+    app.background_executor().timer(Duration::from_millis(340)).await;
+    assert!(
+        counters.get_detail_completed.load(Ordering::SeqCst) >= 1,
+        "delayed Owner GET /communities/probe_mod_lab must have completed on mock server"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        assert!(!w.can_moderate_community_slug(&slug));
+        assert!(w.moderated_communities().is_empty());
+        assert!(w
+            .state
+            .community_detail
+            .as_ref()
+            .and_then(|d| d.community.viewer_role)
+            .is_none());
+        assert!(w
+            .state
+            .communities
+            .iter()
+            .find(|c| c.slug == slug)
+            .and_then(|c| c.viewer_role)
+            .is_none());
+    });
+
+    // Sub-test B: In-flight persist_automod_rules delayed Owner PATCH must NEVER leak Owner role or mod_community!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.switch_active_actor(owner_id.clone(), cx);
+        w.navigate_to(CommunityRoute::ModQueue(Some(slug.clone())), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let w = cw.read(cx);
+            !w.state.mod_loading && w.can_moderate_active_mod_community()
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.automod_draft.name = "Delayed Race Rule".to_string();
+        w.state.automod_draft.keywords = "spam".to_string();
+        w.submit_add_automod_rule(cx);
+        assert!(w.state.automod_draft.saving);
+    });
+    app.background_executor().timer(Duration::from_millis(40)).await;
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::Feed, cx);
+        w.switch_active_actor(bot_id.clone(), cx);
+        assert!(!w.state.automod_draft.saving);
+        assert!(w.state.mod_community.is_none());
+        assert!(!w.can_moderate_community_slug(&slug));
+    });
+    app.background_executor().timer(Duration::from_millis(340)).await;
+    assert!(
+        counters.patch_completed.load(Ordering::SeqCst) >= 1,
+        "delayed Owner PATCH (persist_automod_rules) must have completed on mock server"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        assert!(w.state.mod_community.is_none());
+        assert!(!w.can_moderate_community_slug(&slug));
+        assert!(w.moderated_communities().is_empty());
+        assert!(w
+            .state
+            .communities
+            .iter()
+            .find(|c| c.slug == slug)
+            .and_then(|c| c.viewer_role)
+            .is_none());
+        assert!(w
+            .state
+            .community_detail
+            .as_ref()
+            .and_then(|d| d.community.viewer_role)
+            .is_none());
+    });
+
+    // Sub-test C: In-flight save_community_rules delayed Owner PATCH must NEVER leak Owner role!
+    let _ = cw.update(&mut app, |w, cx| {
+        w.switch_active_actor(owner_id.clone(), cx);
+        w.navigate_to(CommunityRoute::CommunityPage(slug.clone()), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let w = cw.read(cx);
+            !w.state.community_loading
+                && w.state
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.viewer_role == Some(CommunityMemberRole::Owner))
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.state.community_new_rule_title = "Delayed Rule Race".to_string();
+        w.state.community_new_rule_desc = "Must not leak role on switch".to_string();
+        w.add_community_rule(slug.clone(), cx);
+        assert!(w.state.community_rules_saving);
+    });
+    app.background_executor().timer(Duration::from_millis(40)).await;
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::Feed, cx);
+        w.switch_active_actor(bot_id.clone(), cx);
+        assert!(!w.state.community_rules_saving);
+        assert!(!w.can_moderate_community_slug(&slug));
+    });
+    app.background_executor().timer(Duration::from_millis(340)).await;
+    assert!(
+        counters.patch_completed.load(Ordering::SeqCst) >= 2,
+        "delayed Owner PATCH (save_community_rules) must have completed on mock server"
+    );
+    let _ = cw.read_with(&app, |w, _| {
+        assert!(!w.can_moderate_community_slug(&slug));
+        assert!(w.moderated_communities().is_empty());
+        assert!(w
+            .state
+            .community_detail
+            .as_ref()
+            .and_then(|d| d.community.viewer_role)
+            .is_none());
+        assert!(w
+            .state
+            .communities
+            .iter()
+            .find(|c| c.slug == slug)
+            .and_then(|c| c.viewer_role)
+            .is_none());
+    });
+    drop(rt_holder);
+}
+
+// ============================================================================
+// Wave r4 Regression 2: F20-LISTS Single-Flight Coalescing SQLite Stress Suite
+// ============================================================================
+
+#[test]
+fn test_m5_f20_lists_rapid_toggle_single_flight_sqlite_stress() {
+    run_in_headless_subprocess("test_m5_f20_lists_rapid_toggle_single_flight_sqlite_stress");
+}
+
+async fn body_f20_lists_rapid_toggle_single_flight_sqlite_stress(mut app: AsyncApp) {
+    let host = open_community_host(&mut app, 1440.0, 900.0, 7120, "m5_lists_stress").await;
+    let cw = host.cw.clone();
+    let facade = cw.read_with(&app, |w, _| w.facade.clone()).unwrap();
+
+    // Navigate to BookmarksLists -> Lists and create two real lists L1 and L2
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::BookmarksLists, cx);
+        w.set_bookmarks_section(BookmarksListsSection::Lists, cx);
+        w.open_create_list_form(cx);
+        w.state.list_editor.name = "Stress List L1".to_string();
+        w.state.list_editor.is_pinned = false;
+        w.submit_list_editor(cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.list_editor.submitting
+                && cw.read(cx).state.lists.iter().any(|l| l.name == "Stress List L1")
+        })
+        .await
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        w.open_create_list_form(cx);
+        w.state.list_editor.name = "Stress List L2".to_string();
+        w.state.list_editor.is_pinned = false;
+        w.submit_list_editor(cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.list_editor.submitting
+                && cw.read(cx).state.lists.iter().any(|l| l.name == "Stress List L2")
+        })
+        .await
+    );
+    let (l1_id, l2_id) = cw
+        .read_with(&app, |w, _| {
+            let l1 = w
+                .state
+                .lists
+                .iter()
+                .find(|l| l.name == "Stress List L1")
+                .unwrap()
+                .list_id
+                .clone();
+            let l2 = w
+                .state
+                .lists
+                .iter()
+                .find(|l| l.name == "Stress List L2")
+                .unwrap()
+                .list_id
+                .clone();
+            (l1, l2)
+        })
+        .unwrap();
+
+    let a1 = "u:100".to_string();
+    let a2 = "b:200".to_string();
+
+    // Phase A: 10 rounds x 5 rapid synchronous toggles on L1 (4 membership + pin) — UI == SQLite every round!
+    for round in 0..10usize {
+        let want_pinned = round % 2 == 0;
+        let expect_present = round % 2 == 0;
+        let _ = cw.update(&mut app, |w, cx| {
+            w.toggle_selected_list_actor(l1_id.clone(), a1.clone(), cx);
+            w.toggle_selected_list_actor(l1_id.clone(), a2.clone(), cx);
+            w.toggle_selected_list_community(l1_id.clone(), "rust".to_string(), cx);
+            w.toggle_selected_list_community(l1_id.clone(), "ai_agents".to_string(), cx);
+            w.toggle_list_pinned(l1_id.clone(), want_pinned, cx);
+            assert!(
+                w.state.list_membership_in_flight.contains_key(&l1_id),
+                "round {round}: L1 must be in_flight immediately"
+            );
+            assert!(
+                w.state.list_membership_dirty.contains(&l1_id),
+                "round {round}: L1 must be marked dirty by coalesced burst"
+            );
+        });
+        assert!(
+            pump_until(&mut app, Duration::from_secs(4), |cx| {
+                let st = &cw.read(cx).state;
+                !st.list_membership_in_flight.contains_key(&l1_id)
+                    && !st.list_membership_dirty.contains(&l1_id)
+            })
+            .await,
+            "round {round}: single-flight flush must settle"
+        );
+        let ui_list = cw
+            .read_with(&app, |w, _| {
+                w.state
+                    .lists
+                    .iter()
+                    .find(|x| x.list_id == l1_id)
+                    .cloned()
+                    .expect("L1 in UI")
+            })
+            .unwrap();
+        let db_lists = fetch_db_lists(&facade).await;
+        let db_list = db_lists
+            .iter()
+            .find(|x| x.list_id == l1_id)
+            .expect("L1 in SQLite");
+        let expected_actors = if expect_present {
+            vec![a1.clone(), a2.clone()]
+        } else {
+            Vec::new()
+        };
+        let expected_comms = if expect_present {
+            vec!["rust".to_string(), "ai_agents".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(ui_list.member_actor_ids, expected_actors, "round {round} UI actors");
+        assert_eq!(db_list.member_actor_ids, expected_actors, "round {round} DB actors");
+        assert_eq!(ui_list.community_slugs, expected_comms, "round {round} UI comms");
+        assert_eq!(db_list.community_slugs, expected_comms, "round {round} DB comms");
+        assert_eq!(ui_list.is_pinned, want_pinned, "round {round} UI pinned");
+        assert_eq!(db_list.is_pinned, want_pinned, "round {round} DB pinned");
+    }
+
+    // Phase B: Interleaved L1 + L2 + mid-flight toggle on L1
+    let _ = cw.update(&mut app, |w, cx| {
+        w.toggle_selected_list_actor(l1_id.clone(), a1.clone(), cx);
+        w.toggle_selected_list_actor(l2_id.clone(), a2.clone(), cx);
+        w.toggle_selected_list_community(l1_id.clone(), "rust".to_string(), cx);
+        w.toggle_selected_list_community(l2_id.clone(), "systems".to_string(), cx);
+    });
+    app.background_executor().timer(Duration::from_millis(2)).await;
+    let _ = cw.update(&mut app, |w, cx| {
+        w.toggle_selected_list_community(l1_id.clone(), "ai_agents".to_string(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            st.list_membership_in_flight.is_empty() && st.list_membership_dirty.is_empty()
+        })
+        .await
+    );
+    let db_lists_b = fetch_db_lists(&facade).await;
+    let db_l1_b = db_lists_b.iter().find(|x| x.list_id == l1_id).unwrap();
+    let db_l2_b = db_lists_b.iter().find(|x| x.list_id == l2_id).unwrap();
+    assert_eq!(db_l1_b.member_actor_ids, vec![a1.clone()]);
+    assert_eq!(db_l1_b.community_slugs, vec!["rust".to_string(), "ai_agents".to_string()]);
+    assert_eq!(db_l2_b.member_actor_ids, vec![a2.clone()]);
+    assert_eq!(db_l2_b.community_slugs, vec!["systems".to_string()]);
+
+    // Phase C: load_saved_posts racing 4 rapid toggles on L1 (merge_refreshed_lists must preserve optimistic edits)
+    let _ = cw.update(&mut app, |w, cx| {
+        w.load_saved_posts(cx);
+        w.toggle_selected_list_actor(l1_id.clone(), a2.clone(), cx);
+        w.toggle_selected_list_community(l1_id.clone(), "systems".to_string(), cx);
+        w.toggle_list_pinned(l1_id.clone(), true, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.saved_loading
+                && st.list_membership_in_flight.is_empty()
+                && st.list_membership_dirty.is_empty()
+        })
+        .await
+    );
+    let db_lists_c = fetch_db_lists(&facade).await;
+    let db_l1_c = db_lists_c.iter().find(|x| x.list_id == l1_id).unwrap();
+    let ui_l1_c = cw
+        .read_with(&app, |w, _| {
+            w.state.lists.iter().find(|x| x.list_id == l1_id).cloned().unwrap()
+        })
+        .unwrap();
+    assert_eq!(ui_l1_c.member_actor_ids, vec![a1.clone(), a2.clone()]);
+    assert_eq!(db_l1_c.member_actor_ids, vec![a1.clone(), a2.clone()]);
+    assert_eq!(
+        ui_l1_c.community_slugs,
+        vec!["rust".to_string(), "ai_agents".to_string(), "systems".to_string()]
+    );
+    assert_eq!(db_l1_c.community_slugs, ui_l1_c.community_slugs);
+    assert!(ui_l1_c.is_pinned && db_l1_c.is_pinned);
+
+    // Phase D: delete_list_action while L2 flush is in_flight & dirty -> zero error toasts, deleted cleanly
+    let _ = host.shell.update(&mut app, |s, _| {
+        s.window_runtime.controller.current_toast = None;
+        s.window_runtime.controller.toast_queue.clear();
+    });
+    let _ = cw.update(&mut app, |w, cx| {
+        let _ = w.take_pending_actions();
+        w.toggle_selected_list_actor(l2_id.clone(), a1.clone(), cx);
+        w.toggle_selected_list_community(l2_id.clone(), "rust".to_string(), cx);
+        w.toggle_list_pinned(l2_id.clone(), true, cx);
+        w.delete_list_action(l2_id.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.lists.iter().any(|l| l.list_id == l2_id)
+                && !st.list_deleting.contains(&l2_id)
+                && !st.list_membership_in_flight.contains_key(&l2_id)
+                && !st.list_membership_dirty.contains(&l2_id)
+        })
+        .await
+    );
+    app.background_executor().timer(Duration::from_millis(80)).await;
+    let db_lists_d = fetch_db_lists(&facade).await;
+    assert!(!db_lists_d.iter().any(|x| x.list_id == l2_id));
+    let shell_err_toasts_d: Vec<String> = host
+        .shell
+        .read_with(&app, |s, _| {
+            let ctrl = &s.window_runtime.controller;
+            ctrl.current_toast
+                .iter()
+                .chain(ctrl.toast_queue.iter())
+                .filter(|t| t.duration_ms == 3500)
+                .map(|t| t.text.clone())
+                .collect()
+        })
+        .unwrap();
+    assert!(
+        shell_err_toasts_d.is_empty(),
+        "delete_list_action racing in-flight toggles must emit zero AppShell error toasts, got: {shell_err_toasts_d:?}"
+    );
+    let _ = cw.update(&mut app, |w, _| {
+        let errs: Vec<_> = w
+            .take_pending_actions()
+            .into_iter()
+            .filter(|a| matches!(a, CommunityWorkspaceAction::ShowToast { is_error: true, .. }))
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "delete_list_action racing in-flight toggles must emit zero error toasts, got: {errs:?}"
+        );
+    });
+
+    // Phase E: Error recovery (zero deadlock + rollback on nonexistent synthetic list)
+    let fake_id = "list_missing_err_probe".to_string();
+    let _ = host.shell.update(&mut app, |s, _| {
+        s.window_runtime.controller.current_toast = None;
+        s.window_runtime.controller.toast_queue.clear();
+    });
+    let _ = cw.update(&mut app, |w, cx| {
+        let _ = w.take_pending_actions();
+        w.state.lists.push(CommunityListDto {
+            list_id: fake_id.clone(),
+            owner_actor_id: w.state.active_actor_id.clone(),
+            name: "Missing Probe".to_string(),
+            description: String::new(),
+            kind: CommunityListKind::Mixed,
+            is_private: false,
+            is_pinned: false,
+            member_actor_ids: Vec::new(),
+            community_slugs: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        });
+        w.toggle_selected_list_actor(fake_id.clone(), a1.clone(), cx);
+        w.toggle_selected_list_actor(fake_id.clone(), a2.clone(), cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.list_membership_in_flight.contains_key(&fake_id)
+        })
+        .await
+    );
+    assert!(
+        pump_until(&mut app, Duration::from_secs(2), |cx| {
+            let ctrl = &host.shell.read(cx).window_runtime.controller;
+            ctrl.current_toast
+                .iter()
+                .chain(ctrl.toast_queue.iter())
+                .any(|t| t.duration_ms == 3500)
+        })
+        .await,
+        "terminal update_list error must surface an error toast into AppShell"
+    );
+    let _ = cw.update(&mut app, |w, cx| {
+        assert!(!w.state.list_membership_dirty.contains(&fake_id));
+        let fake_ui = w.state.lists.iter().find(|l| l.list_id == fake_id).unwrap();
+        assert!(
+            fake_ui.member_actor_ids.is_empty(),
+            "terminal error must roll back synthetic list from list_membership_last_synced"
+        );
+        w.state.lists.retain(|l| l.list_id != fake_id);
+        // Verify real L1 still persists cleanly with zero deadlock
+        w.toggle_list_pinned(l1_id.clone(), false, cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.list_membership_in_flight.contains_key(&l1_id)
+                && !st.list_membership_dirty.contains(&l1_id)
+        })
+        .await
+    );
+    let db_lists_e = fetch_db_lists(&facade).await;
+    assert!(!db_lists_e.iter().find(|x| x.list_id == l1_id).unwrap().is_pinned);
+
+    // Phase F: switch_active_actor while L1 flush is in_flight & dirty -> zero cross-actor errors or stuck slots
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::BotStudio, cx);
+        w.state.bot_studio_name = "Lists Race Bot".to_string();
+        w.state.bot_studio_handle = "lists_race_bot".to_string();
+        w.state.bot_studio_persona = "Verifies list actor-switch fencing.".to_string();
+        w.submit_register_bot(cx);
+    });
+    assert!(
+        pump_until(&mut app, Duration::from_secs(4), |cx| {
+            cw.read(cx)
+                .state
+                .identities
+                .as_ref()
+                .is_some_and(|i| i.bot_actors.iter().any(|b| b.handle == "lists_race_bot"))
+        })
+        .await
+    );
+    let bot_id = cw
+        .read_with(&app, |w, _| {
+            w.state
+                .identities
+                .as_ref()
+                .unwrap()
+                .bot_actors
+                .iter()
+                .find(|b| b.handle == "lists_race_bot")
+                .unwrap()
+                .actor_id
+                .clone()
+        })
+        .unwrap();
+    let _ = host.shell.update(&mut app, |s, _| {
+        s.window_runtime.controller.current_toast = None;
+        s.window_runtime.controller.toast_queue.clear();
+    });
+    let _ = cw.update(&mut app, |w, cx| {
+        w.navigate_to(CommunityRoute::BookmarksLists, cx);
+        w.set_bookmarks_section(BookmarksListsSection::Lists, cx);
+        let _ = w.take_pending_actions();
+        w.toggle_selected_list_actor(l1_id.clone(), a1.clone(), cx);
+        w.toggle_selected_list_community(l1_id.clone(), "rust".to_string(), cx);
+        w.toggle_list_pinned(l1_id.clone(), true, cx);
+        w.switch_active_actor(bot_id.clone(), cx);
+    });
+    app.background_executor().timer(Duration::from_millis(250)).await;
+    let shell_err_toasts_f: Vec<String> = host
+        .shell
+        .read_with(&app, |s, _| {
+            let ctrl = &s.window_runtime.controller;
+            ctrl.current_toast
+                .iter()
+                .chain(ctrl.toast_queue.iter())
+                .filter(|t| t.duration_ms == 3500)
+                .map(|t| t.text.clone())
+                .collect()
+        })
+        .unwrap();
+    assert!(
+        shell_err_toasts_f.is_empty(),
+        "switch_active_actor racing in-flight list toggles must emit zero AppShell error toasts, got: {shell_err_toasts_f:?}"
+    );
+    let _ = cw.update(&mut app, |w, _| {
+        assert_eq!(w.state.active_actor_id, bot_id);
+        assert!(w.state.list_membership_in_flight.is_empty());
+        assert!(w.state.list_membership_dirty.is_empty());
+        let errs: Vec<_> = w
+            .take_pending_actions()
+            .into_iter()
+            .filter(|a| matches!(a, CommunityWorkspaceAction::ShowToast { is_error: true, .. }))
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "switch_active_actor racing in-flight list toggles must emit zero error toasts, got: {errs:?}"
+        );
+    });
 }

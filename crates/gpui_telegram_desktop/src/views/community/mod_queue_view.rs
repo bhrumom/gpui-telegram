@@ -24,7 +24,11 @@ use super::state::{
 };
 use super::workspace::{run_on_community_tokio, CommunityWorkspace};
 
-pub use super::automod_regex::validate_automod_regex_syntax;
+/// Validates an AutoMod regex pattern directly via [`AutoModEngine::validate_regex`],
+/// sharing the exact `regex::RegexBuilder` 64 KiB NFA/DFA limits used during evaluation.
+pub fn validate_automod_regex_syntax(pattern: &str) -> Result<(), String> {
+    AutoModEngine::validate_regex(pattern)
+}
 
 fn automod_action_label(action: AutoModActionKind, lang: &str) -> &'static str {
     match action {
@@ -186,6 +190,9 @@ impl CommunityWorkspace {
             flair,
             queue_item_id,
         };
+        let my_actor_gen = self.state.actor_switch_gen;
+        let my_mod_gen = self.state.mod_gen;
+        let submitter_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let reload_slug = slug.clone();
@@ -195,6 +202,12 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != submitter_actor_id
+                    || this.state.mod_gen != my_mod_gen
+                {
+                    return;
+                }
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(_)) => {
@@ -366,50 +379,116 @@ impl CommunityWorkspace {
             auto_reply_template,
             created_at_ms: now_ms,
         };
-        let mut updated_rules = comm.automod_rules.clone();
-        updated_rules.push(new_rule);
-        self.persist_automod_rules(comm.slug, updated_rules, true, cx);
+        let slug = comm.slug.clone();
+        let slug_key = slug.to_ascii_lowercase();
+        self.state
+            .automod_last_synced
+            .entry(slug_key)
+            .or_insert_with(|| comm.automod_rules.clone());
+        if let Some(ref mut mc) = self.state.mod_community {
+            if mc.slug.eq_ignore_ascii_case(&slug) {
+                mc.automod_rules.push(new_rule);
+            }
+        }
+        self.persist_automod_rules(slug, true, cx);
     }
 
     pub fn toggle_automod_rule_enabled(&mut self, rule_id: String, cx: &mut Context<Self>) {
         if !self.can_moderate_active_mod_community() {
             return;
         }
-        let Some(comm) = self.state.mod_community.clone() else {
+        let Some((slug, prev_rules)) = self
+            .state
+            .mod_community
+            .as_ref()
+            .map(|c| (c.slug.clone(), c.automod_rules.clone()))
+        else {
             return;
         };
-        let mut rules = comm.automod_rules.clone();
-        for r in &mut rules {
-            if r.rule_id == rule_id {
-                r.enabled = !r.enabled;
+        let slug_key = slug.to_ascii_lowercase();
+        self.state
+            .automod_last_synced
+            .entry(slug_key)
+            .or_insert(prev_rules);
+        if let Some(ref mut mc) = self.state.mod_community {
+            for r in &mut mc.automod_rules {
+                if r.rule_id == rule_id {
+                    r.enabled = !r.enabled;
+                }
             }
         }
-        self.persist_automod_rules(comm.slug, rules, false, cx);
+        self.persist_automod_rules(slug, false, cx);
     }
 
     pub fn delete_automod_rule(&mut self, rule_id: String, cx: &mut Context<Self>) {
         if !self.can_moderate_active_mod_community() {
             return;
         }
-        let Some(comm) = self.state.mod_community.clone() else {
+        let Some((slug, prev_rules)) = self
+            .state
+            .mod_community
+            .as_ref()
+            .map(|c| (c.slug.clone(), c.automod_rules.clone()))
+        else {
             return;
         };
-        let mut rules = comm.automod_rules.clone();
-        rules.retain(|r| r.rule_id != rule_id);
-        self.persist_automod_rules(comm.slug, rules, false, cx);
+        let slug_key = slug.to_ascii_lowercase();
+        self.state
+            .automod_last_synced
+            .entry(slug_key)
+            .or_insert(prev_rules);
+        if let Some(ref mut mc) = self.state.mod_community {
+            mc.automod_rules.retain(|r| r.rule_id != rule_id);
+        }
+        self.persist_automod_rules(slug, false, cx);
     }
 
-    fn persist_automod_rules(
-        &mut self,
-        slug: String,
-        rules: Vec<AutoModRuleDto>,
-        reset_draft: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn persist_automod_rules(&mut self, slug: String, reset_draft: bool, cx: &mut Context<Self>) {
+        let slug_key = slug.to_ascii_lowercase();
+        if reset_draft {
+            self.state.automod_reset_draft_pending.insert(slug_key.clone());
+        }
+        if self.state.automod_in_flight.contains_key(&slug_key) {
+            self.state.automod_dirty.insert(slug_key);
+            self.state.automod_draft.saving = true;
+            cx.notify();
+            return;
+        }
+        self.flush_automod_rules_sync(slug, cx);
+    }
+
+    fn flush_automod_rules_sync(&mut self, slug: String, cx: &mut Context<Self>) {
+        let slug_key = slug.to_ascii_lowercase();
+        let Some(rules) = self
+            .state
+            .mod_community
+            .as_ref()
+            .filter(|c| c.slug.eq_ignore_ascii_case(&slug))
+            .map(|c| c.automod_rules.clone())
+        else {
+            self.state.automod_dirty.remove(&slug_key);
+            self.state.automod_reset_draft_pending.remove(&slug_key);
+            self.state.automod_last_synced.remove(&slug_key);
+            self.state.automod_draft.saving = !self.state.automod_in_flight.is_empty();
+            cx.notify();
+            return;
+        };
+
+        self.state.automod_dirty.remove(&slug_key);
+        self.state.automod_flight_seq = self.state.automod_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.automod_flight_seq;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let my_mod_gen = self.state.mod_gen;
+        let submitter_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .automod_in_flight
+            .insert(slug_key.clone(), my_flight_seq);
         self.state.automod_draft.saving = true;
         self.state.automod_draft.error = None;
+
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
+        let req_slug = slug.clone();
         let req = UpdateCommunityRequest {
             automod_rules: Some(rules),
             ..Default::default()
@@ -417,15 +496,44 @@ impl CommunityWorkspace {
         cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                facade.update_community(&slug, &req).await
+                facade.update_community(&req_slug, &req).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                this.state.automod_draft.saving = false;
+                // Fence 1: Actor switch occurred (ABA-proof via actor_switch_gen + actor_id).
+                // Never clear another actor's saving state or write submitter's `viewer_role`
+                // into `mod_community`, `communities`, or `community_detail`.
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != submitter_actor_id
+                {
+                    return;
+                }
+                // Fence 2: Flight token ownership.
+                if this.state.automod_in_flight.get(&slug_key).copied() != Some(my_flight_seq) {
+                    return;
+                }
+                this.state.automod_in_flight.remove(&slug_key);
+
+                let still_same_mod_gen = this.state.mod_gen == my_mod_gen;
+                let is_dirty = this.state.automod_dirty.remove(&slug_key);
                 let lang = this.language_id.clone();
+
                 match res {
                     Ok(Ok(updated)) => {
-                        this.state.mod_community = Some(updated.clone());
+                        this.state
+                            .automod_last_synced
+                            .insert(slug_key.clone(), updated.automod_rules.clone());
+                        if is_dirty && still_same_mod_gen {
+                            // Newer optimistic rule toggles arrived mid-flight: preserve optimistic
+                            // `mod_community.automod_rules` and flush latest snapshot strictly next.
+                            this.flush_automod_rules_sync(slug, cx);
+                            return;
+                        }
+                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
+                        this.state.automod_last_synced.remove(&slug_key);
+                        if still_same_mod_gen {
+                            this.state.mod_community = Some(updated.clone());
+                        }
                         if let Some(pos) = this
                             .state
                             .communities
@@ -439,7 +547,7 @@ impl CommunityWorkspace {
                                 cdet.community = updated;
                             }
                         }
-                        if reset_draft {
+                        if this.state.automod_reset_draft_pending.remove(&slug_key) {
                             this.state.automod_draft = AutoModRuleDraft::default();
                             if this.state.active_input.is_automod_input() {
                                 this.state.blur_input();
@@ -455,9 +563,33 @@ impl CommunityWorkspace {
                         );
                     }
                     Ok(Err(e)) => {
+                        this.state.automod_dirty.remove(&slug_key);
+                        this.state.automod_reset_draft_pending.remove(&slug_key);
+                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
+                        if let Some(prev_rules) = this.state.automod_last_synced.remove(&slug_key) {
+                            if still_same_mod_gen {
+                                if let Some(ref mut mc) = this.state.mod_community {
+                                    if mc.slug.eq_ignore_ascii_case(&slug) {
+                                        mc.automod_rules = prev_rules;
+                                    }
+                                }
+                            }
+                        }
                         this.state.automod_draft.error = Some(e.to_string());
                     }
                     Err(e) => {
+                        this.state.automod_dirty.remove(&slug_key);
+                        this.state.automod_reset_draft_pending.remove(&slug_key);
+                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
+                        if let Some(prev_rules) = this.state.automod_last_synced.remove(&slug_key) {
+                            if still_same_mod_gen {
+                                if let Some(ref mut mc) = this.state.mod_community {
+                                    if mc.slug.eq_ignore_ascii_case(&slug) {
+                                        mc.automod_rules = prev_rules;
+                                    }
+                                }
+                            }
+                        }
                         this.state.automod_draft.error = Some(e);
                     }
                 }

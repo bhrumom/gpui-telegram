@@ -99,6 +99,7 @@ impl CommunityWorkspace {
             action: MuteBlockActionKind::Mute,
             reason: None,
         };
+        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -112,6 +113,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen {
+                    return;
+                }
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(())) => this.emit_action(
@@ -159,6 +163,7 @@ impl CommunityWorkspace {
             action: MuteBlockActionKind::Block,
             reason: None,
         };
+        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -172,6 +177,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen {
+                    return;
+                }
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(())) => this.emit_action(
@@ -269,6 +277,7 @@ impl CommunityWorkspace {
         let aid = d.actor_id.clone();
         self.state.edit_profile.submitting = true;
         self.state.edit_profile.error = None;
+        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -280,6 +289,14 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen {
+                    if let Ok(Ok((_, Some(id_resp)))) = res {
+                        this.state.identities = Some(id_resp);
+                        this.ensure_bot_studio_selected_hydrated(cx);
+                        cx.notify();
+                    }
+                    return;
+                }
                 this.state.edit_profile.submitting = false;
                 let lang = this.language_id.clone();
                 match res {

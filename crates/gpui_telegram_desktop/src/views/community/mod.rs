@@ -16,7 +16,6 @@
 //!   hooks, progressive Escape cascade, popover overlay layer, and live-data secondary routes.
 
 pub mod actor_profile_view;
-mod automod_regex;
 pub mod bookmarks_lists_view;
 pub mod bot_studio_view;
 pub mod community_page_view;

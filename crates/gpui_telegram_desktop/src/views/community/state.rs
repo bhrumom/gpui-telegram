@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use gpui_telegram_client::CommunityRuntimeMode;
 use gpui_telegram_proto::community_contracts::{
-    ActorFilter, ActorProfileResponse, AlgoPreferencesDto, AutoModActionKind, AwardResponse,
+    ActorFilter, ActorProfileResponse, AlgoPreferencesDto, AutoModActionKind, AutoModRuleDto,
+    AwardResponse,
     BookmarkResponse, BotAutonomyMode, CommentSort, CommunityActorDto, CommunityCommentDto,
     CommunityDetailResponse, CommunityListDto, CommunityListKind, CommunityNotificationDto,
     CommunityNotificationKind, CommunityPostDto, CommunitySearchResultDto, CommunitySearchSort,
@@ -715,6 +716,7 @@ pub struct CommunityWorkspaceState {
     pub known_owned_actor_ids: HashSet<String>,
     pub runtime_mode: CommunityRuntimeMode,
     pub identities_gen: u64,
+    pub actor_switch_gen: u64,
 
     // Feed query & stream
     pub active_tab: FeedTab,
@@ -765,6 +767,7 @@ pub struct CommunityWorkspaceState {
     pub communities: Vec<SubCommunityDto>,
     pub communities_gen: u64,
     pub lists: Vec<CommunityListDto>,
+    pub lists_gen: u64,
     pub trending: Vec<TrendingTopicDto>,
     pub recommended_actors: Vec<CommunityActorDto>,
     pub unread_notifications: u32,
@@ -854,6 +857,12 @@ pub struct CommunityWorkspaceState {
     pub list_feed_loading: bool,
     pub list_feed_gen: u64,
     pub list_membership_gen: u64,
+    pub list_membership_flight_seq: u64,
+    pub list_membership_in_flight: HashMap<String, u64>,
+    pub list_membership_dirty: HashSet<String>,
+    pub list_membership_needs_feed_reload: HashSet<String>,
+    pub list_membership_last_synced: HashMap<String, (bool, Vec<String>, Vec<String>)>,
+    pub list_deleting: HashSet<String>,
     pub list_editor_open: bool,
     pub list_editor: ListEditorDraft,
     pub saved_loading: bool,
@@ -874,6 +883,11 @@ pub struct CommunityWorkspaceState {
     pub automod_dry_run_body: String,
     pub automod_dry_run_is_bot: bool,
     pub automod_dry_run_result: Option<gpui_telegram_community::AutoModDecision>,
+    pub automod_flight_seq: u64,
+    pub automod_in_flight: HashMap<String, u64>,
+    pub automod_dirty: HashSet<String>,
+    pub automod_reset_draft_pending: HashSet<String>,
+    pub automod_last_synced: HashMap<String, Vec<AutoModRuleDto>>,
     pub mod_loading: bool,
     pub mod_gen: u64,
 
@@ -916,6 +930,7 @@ impl Default for CommunityWorkspaceState {
             known_owned_actor_ids: HashSet::new(),
             runtime_mode: CommunityRuntimeMode::LocalFallback,
             identities_gen: 0,
+            actor_switch_gen: 0,
             active_tab: FeedTab::ForYou,
             sort: FeedSort::Algo,
             time_window: TimeWindow::All,
@@ -958,6 +973,7 @@ impl Default for CommunityWorkspaceState {
             communities: Vec::new(),
             communities_gen: 0,
             lists: Vec::new(),
+            lists_gen: 0,
             trending: Vec::new(),
             recommended_actors: Vec::new(),
             unread_notifications: 0,
@@ -1033,6 +1049,12 @@ impl Default for CommunityWorkspaceState {
             list_feed_loading: false,
             list_feed_gen: 0,
             list_membership_gen: 0,
+            list_membership_flight_seq: 0,
+            list_membership_in_flight: HashMap::new(),
+            list_membership_dirty: HashSet::new(),
+            list_membership_needs_feed_reload: HashSet::new(),
+            list_membership_last_synced: HashMap::new(),
+            list_deleting: HashSet::new(),
             list_editor_open: false,
             list_editor: ListEditorDraft::default(),
             saved_loading: false,
@@ -1051,6 +1073,11 @@ impl Default for CommunityWorkspaceState {
             automod_dry_run_body: String::new(),
             automod_dry_run_is_bot: false,
             automod_dry_run_result: None,
+            automod_flight_seq: 0,
+            automod_in_flight: HashMap::new(),
+            automod_dirty: HashSet::new(),
+            automod_reset_draft_pending: HashSet::new(),
+            automod_last_synced: HashMap::new(),
             mod_loading: false,
             mod_gen: 0,
             bot_studio_name: String::new(),
@@ -1804,5 +1831,28 @@ impl CommunityWorkspaceState {
                 apply(a);
             }
         }
+    }
+
+    /// Replaces `self.lists` with a freshly fetched snapshot while excluding lists currently
+    /// being deleted and preserving optimistic `(is_pinned, member_actor_ids, community_slugs)`
+    /// for any list with an active or pending single-flight sync.
+    pub fn merge_refreshed_lists(&mut self, mut fresh: Vec<CommunityListDto>) {
+        if !self.list_deleting.is_empty() {
+            fresh.retain(|item| !self.list_deleting.contains(&item.list_id));
+        }
+        if !self.list_membership_in_flight.is_empty() || !self.list_membership_dirty.is_empty() {
+            for item in &mut fresh {
+                if self.list_membership_in_flight.contains_key(&item.list_id)
+                    || self.list_membership_dirty.contains(&item.list_id)
+                {
+                    if let Some(prev) = self.lists.iter().find(|x| x.list_id == item.list_id) {
+                        item.is_pinned = prev.is_pinned;
+                        item.member_actor_ids = prev.member_actor_ids.clone();
+                        item.community_slugs = prev.community_slugs.clone();
+                    }
+                }
+            }
+        }
+        self.lists = fresh;
     }
 }

@@ -238,6 +238,9 @@ impl CommunityWorkspace {
     }
 
     pub fn refresh_trending_discovery(&mut self, cx: &mut Context<Self>) {
+        self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        let my_comm_gen = self.state.communities_gen;
+        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -252,8 +255,12 @@ impl CommunityWorkspace {
                     if let Some(tr) = t {
                         this.state.trending = tr.topics;
                     }
-                    if let Some(cm) = c {
-                        this.state.communities = cm.communities;
+                    if this.state.communities_gen == my_comm_gen
+                        && this.state.actor_switch_gen == my_actor_gen
+                    {
+                        if let Some(cm) = c {
+                            this.state.communities = cm.communities;
+                        }
                     }
                     cx.notify();
                 });
