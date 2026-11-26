@@ -5746,6 +5746,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "openbot_contracts"
+version = "1.6.15"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
+ "hex",
+ "hmac",
+ "percent-encoding",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "unicode-normalization",
+ "url",
+ "uuid",
+]
+
+
+[[package]]
+name = "openbot_storage"
+version = "1.6.15"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "openbot_contracts",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
