@@ -58,12 +58,17 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/orca/rpc", post(handle_orca_rpc))
 }
 
-/// Aggregated Orca router merging all M4.1 Orca route modules (extensible by M4.2).
+/// Aggregated Orca router merging all Orca REST, WebSocket, Webhook, Orchestration, IDE,
+/// Telegram IM Fusion, and Unified RPC v3 route modules.
 pub fn orca_router() -> Router<Arc<AppState>> {
     Router::new()
         .merge(crate::routes::orca_bots::router())
         .merge(crate::routes::orca_bots_items::router())
         .merge(crate::routes::orca_bots_groups::router())
         .merge(crate::routes::orca_share_wake::router())
+        .merge(crate::routes::orca_webhooks::router())
+        .merge(crate::routes::orca_orchestration::router())
+        .merge(crate::routes::orca_ide::router())
+        .merge(crate::routes::orca_telegram_bridge::router())
         .merge(router())
 }
