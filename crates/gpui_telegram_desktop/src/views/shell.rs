@@ -43,9 +43,9 @@ use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
 };
 use crate::views::{
-    BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, ComputerWorkbench,
-    ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer,
-    NavRail,
+    BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, CodeSceneWorkspace,
+    ComputerWorkbench, ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer,
+    MediaViewer, NavRail,
 };
 use crate::window::WindowSubsystemRuntime;
 
@@ -57,6 +57,7 @@ pub enum ActiveWorkspacePanel {
     TaskCenter,
     McpTools,
     Browser,
+    CodeScene,
     Settings,
 }
 
@@ -114,6 +115,7 @@ pub struct AppShell {
     pub main_menu_drawer: Entity<MainMenuDrawer>,
     pub tasks_workspace: Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<Entity<BrowserWorkspace>>,
+    pub code_scene_workspace: Option<Entity<CodeSceneWorkspace>>,
     pub auth_wizard: Entity<AuthWizardView>,
     pub settings_router: Entity<SettingsRouter>,
     pub client: Arc<TelegramClient>,
@@ -229,6 +231,7 @@ impl AppShell {
             main_menu_drawer,
             tasks_workspace,
             browser_workspace: None,
+            code_scene_workspace: None,
             auth_wizard,
             settings_router,
             client: client.clone(),
@@ -429,7 +432,15 @@ impl AppShell {
                     w.set_occluded(true, wcx);
                 });
             }
-            if self.active_panel == ActiveWorkspacePanel::Browser {
+            if let Some(cs) = self.code_scene_workspace.take() {
+                cs.update(cx, |w, wcx| {
+                    w.teardown(wcx);
+                });
+            }
+            if matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::CodeScene
+            ) {
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
             }
@@ -531,6 +542,11 @@ impl AppShell {
             bw.update(cx, |w, wcx| {
                 w.set_workspace_visible(false, wcx);
                 w.set_occluded(true, wcx);
+            });
+        }
+        if let Some(cs) = self.code_scene_workspace.take() {
+            cs.update(cx, |w, wcx| {
+                w.teardown(wcx);
             });
         }
         self.bot_browser.reset_on_logout();
@@ -928,6 +944,7 @@ impl AppShell {
             || creation_dialog_open
             || show_bot_start_bar
             || self.active_panel == ActiveWorkspacePanel::Browser
+            || self.active_panel == ActiveWorkspacePanel::CodeScene
     }
 
     /// Flushes the active chat's unsent draft and isolates `CanonicalComposer` for `+` / creation.
@@ -1654,6 +1671,16 @@ impl Render for AppShell {
         let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
         let hide_composer = self.should_hide_composer(cx);
         let has_blocking_overlay = self.has_blocking_overlay(cx);
+        if let Some(ref cs) = self.code_scene_workspace {
+            let cs_occluded = self.has_code_scene_shell_blocker(cx);
+            let want_vis = self.is_authenticated && self.active_panel == ActiveWorkspacePanel::CodeScene;
+            cs.update(cx, |w, wcx| {
+                w.set_occluded(cs_occluded, wcx);
+                if !want_vis && w.is_visible {
+                    w.set_visible(false, wcx);
+                }
+            });
+        }
         self.sync_compose_state_to_composer(false, cx);
 
         div()
@@ -1661,6 +1688,9 @@ impl Render for AppShell {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_window_key_down(event, window, cx);
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
+                this.handle_window_key_up(event, cx);
             }))
             .relative().size_full().flex().flex_col()
             .bg(rgb(pal.window_bg))
@@ -1683,7 +1713,19 @@ impl Render for AppShell {
                             row
                         }
                     })
-                    .when(self.active_panel != ActiveWorkspacePanel::Browser, |row| {
+                    .when(self.active_panel == ActiveWorkspacePanel::CodeScene, |row| {
+                        if let Some(ref cs) = self.code_scene_workspace {
+                            row.child(cs.clone())
+                        } else {
+                            row
+                        }
+                    })
+                    .when(
+                        !matches!(
+                            self.active_panel,
+                            ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::CodeScene
+                        ),
+                        |row| {
                         row.child(
                             div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
                                 .bg(rgb(pal.stage_bg))

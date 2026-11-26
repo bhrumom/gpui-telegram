@@ -7554,6 +7554,214 @@ fn detect_computer_tool_call(
     None
 }
 
+fn detect_code_scene_tool_call(
+    prompt: &str,
+    available_tools: &[ProviderToolSpec],
+) -> Option<ProviderToolCall> {
+    let has_tool = |name: &str| available_tools.iter().any(|t| t.name == name);
+    let intent = crate::code_scene_bot::detect_code_scene_chat_intent(prompt)?;
+    match intent {
+        crate::code_scene_bot::CodeSceneChatIntent::CreateAndPublish { prompt, kind } => {
+            if !has_tool("code_scene_publish") {
+                return None;
+            }
+            let payload = json!({
+                "prompt": prompt,
+                "kind": kind.map(|k| k.as_str()),
+                "post_card_to_chat": true
+            });
+            Some(ProviderToolCall {
+                id: format!("local_call_{}", Uuid_short()),
+                name: "code_scene_publish".to_string(),
+                arguments: payload.to_string(),
+                thought_signature: None,
+            })
+        }
+        crate::code_scene_bot::CodeSceneChatIntent::CreateDraft { prompt, kind } => {
+            if !has_tool("code_scene_create_draft") {
+                return None;
+            }
+            let payload = json!({
+                "prompt": prompt,
+                "kind": kind.map(|k| k.as_str()),
+            });
+            Some(ProviderToolCall {
+                id: format!("local_call_{}", Uuid_short()),
+                name: "code_scene_create_draft".to_string(),
+                arguments: payload.to_string(),
+                thought_signature: None,
+            })
+        }
+        crate::code_scene_bot::CodeSceneChatIntent::Remix {
+            scene_id,
+            prompt,
+            auto_publish,
+        } => {
+            if !has_tool("code_scene_remix") {
+                return None;
+            }
+            let payload = json!({
+                "scene_id": scene_id,
+                "prompt": prompt,
+                "auto_publish": auto_publish
+            });
+            Some(ProviderToolCall {
+                id: format!("local_call_{}", Uuid_short()),
+                name: "code_scene_remix".to_string(),
+                arguments: payload.to_string(),
+                thought_signature: None,
+            })
+        }
+        crate::code_scene_bot::CodeSceneChatIntent::ListMine => {
+            if !has_tool("code_scene_list_mine") {
+                return None;
+            }
+            Some(ProviderToolCall {
+                id: format!("local_call_{}", Uuid_short()),
+                name: "code_scene_list_mine".to_string(),
+                arguments: "{}".to_string(),
+                thought_signature: None,
+            })
+        }
+    }
+}
+
+fn synthesize_code_scene_tool_reply(
+    user_prompt: &str,
+    tool_msgs: &[&ProviderChatMessage],
+) -> Option<String> {
+    let is_cjk = contains_cjk(user_prompt);
+    for msg in tool_msgs.iter().rev() {
+        let tool_name = msg.name.as_deref().unwrap_or("");
+        if !tool_name.starts_with("code_scene_") {
+            continue;
+        }
+        let parsed = serde_json::from_str::<Value>(msg.content.trim()).ok();
+        match tool_name {
+            "code_scene_publish" | "code_scene_remix" => {
+                if let Some(val) = parsed {
+                    let asset = val
+                        .get("asset")
+                        .or_else(|| val.pointer("/published/asset"))
+                        .unwrap_or(&val);
+                    let title = asset
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Code Scene");
+                    let scene_id = asset
+                        .get("scene_id")
+                        .or_else(|| val.get("scene_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let kind = asset
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("animation");
+                    let engine = val
+                        .get("engine_used")
+                        .or_else(|| val.pointer("/draft/engine_used"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("cs1");
+                    let tags: Vec<&str> = asset
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(Value::as_str).take(5).collect())
+                        .unwrap_or_default();
+                    let tags_str = if tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {}",
+                            tags.iter()
+                                .map(|t| format!("#{t}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    };
+                    if !scene_id.is_empty() {
+                        return Some(if is_cjk {
+                            format!(
+                                "已为你创作并发布到代码场景：**{title}** (`{kind}`)\n\
+                                 - 场景 ID: `{scene_id}`{tags_str}\n\
+                                 - 引擎: `{engine}` · 已通过沙盒编译与 5 帧干跑验证\n\
+                                 - 已同步发送互动卡片到聊天，点击下方按钮即可打开体验或继续 Remix 改编。"
+                            )
+                        } else {
+                            format!(
+                                "Published to Code Scene: **{title}** (`{kind}`)\n\
+                                 - Scene ID: `{scene_id}`{tags_str}\n\
+                                 - Engine: `{engine}` · compiled & 5-frame verified\n\
+                                 - Posted an interactive Code Scene card to chat with Open / Remix / Share actions."
+                            )
+                        });
+                    }
+                    if let Some(draft_id) = val
+                        .pointer("/draft/draft_id")
+                        .and_then(Value::as_str)
+                    {
+                        return Some(if is_cjk {
+                            format!("已生成代码场景二创草稿 `{draft_id}`（**{title}**），随时可调用发布。")
+                        } else {
+                            format!("Created Code Scene remix draft `{draft_id}` (**{title}**).")
+                        });
+                    }
+                }
+            }
+            "code_scene_create_draft" | "code_scene_iterate_draft" => {
+                if let Some(val) = parsed {
+                    let draft_id = val.get("draft_id").and_then(Value::as_str).unwrap_or("");
+                    let title = val.get("title").and_then(Value::as_str).unwrap_or("Code Scene");
+                    let kind = val.get("kind").and_then(Value::as_str).unwrap_or("animation");
+                    return Some(if is_cjk {
+                        format!(
+                            "已生成代码场景草稿：**{title}** (`{kind}`)\n\
+                             - 草稿 ID: `{draft_id}` · 校验通过\n\
+                             - 回复“发布到代码场景”或提供修改意见即可继续迭代。"
+                        )
+                    } else {
+                        format!(
+                            "Generated validated Code Scene draft **{title}** (`{kind}`, draft_id: `{draft_id}`)."
+                        )
+                    });
+                }
+            }
+            "code_scene_list_mine" => {
+                if let Some(val) = parsed {
+                    let scenes = val
+                        .get("scenes")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if scenes.is_empty() {
+                        return Some(if is_cjk {
+                            "你还没有发布过代码场景作品，发送 `/scene create game 霓虹弹球` 立即创作一个吧！".to_string()
+                        } else {
+                            "You have not published any Code Scenes yet. Try `/scene create game neon pinball`!".to_string()
+                        });
+                    }
+                    let lines: Vec<String> = scenes
+                        .iter()
+                        .take(10)
+                        .map(|s| {
+                            let t = s.get("title").and_then(Value::as_str).unwrap_or("Untitled");
+                            let id = s.get("scene_id").and_then(Value::as_str).unwrap_or("");
+                            let k = s.get("kind").and_then(Value::as_str).unwrap_or("animation");
+                            format!("- **{t}** (`{k}`, `{id}`)")
+                        })
+                        .collect();
+                    return Some(if is_cjk {
+                        format!("你已发布的代码场景作品（共 {} 个）：\n{}", scenes.len(), lines.join("\n"))
+                    } else {
+                        format!("Your published Code Scenes ({} total):\n{}", scenes.len(), lines.join("\n"))
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn has_computer_list_intent(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
     [
@@ -8051,6 +8259,10 @@ async fn execute_local_hermes_with_policy(
             synthesize_computer_tool_reply(last_user_msg, &recent_tool_msgs)
         {
             redact_cloud_secrets(&computer_reply)
+        } else if let Some(cs_reply) =
+            synthesize_code_scene_tool_reply(last_user_msg, &recent_tool_msgs)
+        {
+            cs_reply
         } else {
             let recent_tool_outputs: Vec<String> = recent_tool_msgs
                 .iter()
@@ -8080,6 +8292,7 @@ async fn execute_local_hermes_with_policy(
     // Check if the user's message directly invokes an available Hermes tool
     if let Some(tc) = parse_explicit_tool_directive(last_user_msg, &request.tools)
         .or_else(|| detect_computer_tool_call(last_user_msg, &request.tools))
+        .or_else(|| detect_code_scene_tool_call(last_user_msg, &request.tools))
     {
         if let Some(tx) = stream_tx {
             let _ = tx.send(ProviderStreamEvent::ToolCallReady(tc.clone())).await;

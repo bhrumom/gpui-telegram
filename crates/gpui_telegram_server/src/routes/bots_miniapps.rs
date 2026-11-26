@@ -2828,6 +2828,453 @@ pub(crate) async fn handle_ai_bot_reply_with_floor_fence(
         }
     }
 
+    // Direct Code Scene fallback when user has no remote provider AND local_fallback is disabled
+    // (e.g. production server binary without API keys configured), so `/scene ...` and natural
+    // language Code Scene creation requests always generate, dry-run validate, publish, and post
+    // an interactive `GenerativeCard` cleanly.
+    let user_router = state
+        .fabushi_core()
+        .providers_for_user(&sender_id.0.to_string());
+    let router_snap = user_router.snapshot();
+    if user_router.needs_provider_selection() && !router_snap.allow_local_fallback {
+        if let Some(intent) = gpui_telegram_agent::detect_code_scene_chat_intent(text.trim()) {
+            let typing_guard = crate::routes::hermes::BotTypingGuard::start(
+                Arc::clone(state),
+                chat_id,
+                bot_user_id,
+            );
+            let author_uid = sender_id.0 as i64;
+            let (bot_id, bot_username) = crate::routes::code_scene::resolve_creator_bot(
+                &state.db,
+                Some(bot_user_id.0 as i64),
+                reg_bot.as_ref().map(|b| b.username.as_str()),
+                true,
+            );
+            match intent {
+                gpui_telegram_agent::CodeSceneChatIntent::CreateAndPublish { prompt, kind } => {
+                    let gen_req = gpui_telegram_proto::code_scene_contracts::AiGenerateSceneRequest {
+                        prompt: prompt.clone(),
+                        kind,
+                        bot_id,
+                        bot_username: bot_username.clone(),
+                        style_tags: None,
+                        seed: None,
+                    };
+                    let outcome = gpui_telegram_agent::CodeSceneBotGenerator::offline()
+                        .generate(None, &gen_req)
+                        .await;
+                    let pub_req = gpui_telegram_proto::code_scene_contracts::PublishCodeSceneRequest {
+                        scene_id: None,
+                        title: outcome.draft.title,
+                        description: outcome.draft.description,
+                        kind: outcome.draft.kind,
+                        tags: outcome.draft.tags,
+                        source_code: outcome.draft.source_code,
+                        code_format: outcome.draft.code_format,
+                        manifest: outcome.draft.manifest,
+                        controls_hint: outcome.draft.controls_hint,
+                        creator_bot_id: bot_id,
+                        creator_bot_username: bot_username,
+                        remix_parent_id: None,
+                        share_to_chat_id: Some(chat_id.0),
+                    };
+                    match crate::routes::code_scene::publish_validated_scene_atomic(
+                        &state.db,
+                        &state.code_scene,
+                        author_uid,
+                        &pub_req,
+                        None,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok((asset, _rep, _)) => {
+                            if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                                let _ = crate::routes::code_scene::post_code_scene_card_to_chat_raw(
+                                    &state.message_pipeline,
+                                    Some(&state.gateway_hub),
+                                    Some(&state.search_indexer),
+                                    Some(&state.hybrid_memory),
+                                    chat_id,
+                                    bot_user_id,
+                                    true,
+                                    &asset,
+                                );
+                                let summary = format!(
+                                    "已为你创作并发布代码场景：**{}** (`{}`)\n场景 ID: `{}`",
+                                    asset.title,
+                                    asset.kind.as_str(),
+                                    asset.scene_id
+                                );
+                                let kb = vec![vec![
+                                    InlineKeyboardButton {
+                                        text: "▶ 打开代码场景".into(),
+                                        callback_data: Some(
+                                            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Open(
+                                                asset.scene_id.clone(),
+                                            )
+                                            .to_payload(),
+                                        ),
+                                        url: None,
+                                        web_app_url: None,
+                                    },
+                                    InlineKeyboardButton {
+                                        text: "✨ Remix 改编".into(),
+                                        callback_data: Some(
+                                            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Remix(
+                                                asset.scene_id.clone(),
+                                            )
+                                            .to_payload(),
+                                        ),
+                                        url: None,
+                                        web_app_url: None,
+                                    },
+                                    InlineKeyboardButton {
+                                        text: "↗ 分享".into(),
+                                        callback_data: Some(
+                                            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Share(
+                                                asset.scene_id,
+                                            )
+                                            .to_payload(),
+                                        ),
+                                        url: None,
+                                        web_app_url: None,
+                                    },
+                                ]];
+                                let _ = send_bot_chat_reply_in_topic(
+                                    state,
+                                    chat_id,
+                                    bot_user_id,
+                                    &summary,
+                                    kb,
+                                    topic_id,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            let msg = err.into_message();
+                            tracing::warn!(
+                                chat_id = chat_id.0,
+                                author_uid,
+                                error = %msg,
+                                "Direct Code Scene bot CreateAndPublish failed"
+                            );
+                            if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                                let reply = format!("创作发布代码场景失败：{msg}");
+                                let _ = send_bot_chat_reply_in_topic(
+                                    state,
+                                    chat_id,
+                                    bot_user_id,
+                                    &reply,
+                                    Vec::new(),
+                                    topic_id,
+                                );
+                            }
+                        }
+                    }
+                }
+                gpui_telegram_agent::CodeSceneChatIntent::CreateDraft { prompt, kind } => {
+                    let gen_req = gpui_telegram_proto::code_scene_contracts::AiGenerateSceneRequest {
+                        prompt: prompt.clone(),
+                        kind,
+                        bot_id,
+                        bot_username: bot_username.clone(),
+                        style_tags: None,
+                        seed: None,
+                    };
+                    let mut outcome = gpui_telegram_agent::CodeSceneBotGenerator::offline()
+                        .generate(None, &gen_req)
+                        .await;
+                    if !outcome.draft.validation.ok {
+                        let (rechecked, _) = state
+                            .code_scene
+                            .run_validation_offloaded(
+                                outcome.draft.source_code.clone(),
+                                outcome.draft.manifest.clone(),
+                            )
+                            .await;
+                        outcome.draft.validation = rechecked;
+                    }
+                    let draft_id = format!("draft_{}", uuid::Uuid::new_v4().simple());
+                    let resp = outcome.draft.into_ai_generate_response(
+                        draft_id.clone(),
+                        bot_id,
+                        bot_username,
+                        outcome.repair_attempts,
+                    );
+                    let rec = crate::routes::code_scene::draft_record_from_ai_response(
+                        &resp,
+                        author_uid,
+                        None,
+                        vec![prompt],
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    let _ = state.db.upsert_code_scene_bot_draft(&rec);
+                    if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                        let summary = format!(
+                            "已生成代码场景草稿：**{}** (`{}`, draft_id: `{}`)",
+                            resp.title,
+                            resp.kind.as_str(),
+                            draft_id
+                        );
+                        let _ = send_bot_chat_reply_in_topic(
+                            state,
+                            chat_id,
+                            bot_user_id,
+                            &summary,
+                            Vec::new(),
+                            topic_id,
+                        );
+                    }
+                }
+                gpui_telegram_agent::CodeSceneChatIntent::Remix {
+                    scene_id,
+                    prompt,
+                    auto_publish,
+                } => match state.db.get_code_scene(&scene_id) {
+                    Ok(Some(parent)) => {
+                        let mut outcome = gpui_telegram_agent::CodeSceneBotGenerator::offline()
+                            .iterate_or_remix(
+                                None,
+                                &parent.source_code,
+                                &parent.manifest,
+                                Some(&parent.title),
+                                &parent.tags,
+                                &prompt,
+                            )
+                            .await;
+                        if !outcome.draft.validation.ok {
+                            let (rechecked, _) = state
+                                .code_scene
+                                .run_validation_offloaded(
+                                    outcome.draft.source_code.clone(),
+                                    outcome.draft.manifest.clone(),
+                                )
+                                .await;
+                            outcome.draft.validation = rechecked;
+                        }
+                        let draft_id = format!("draft_{}", uuid::Uuid::new_v4().simple());
+                        let draft_resp = outcome.draft.into_ai_generate_response(
+                            draft_id.clone(),
+                            bot_id,
+                            bot_username.clone(),
+                            outcome.repair_attempts,
+                        );
+                        let rec = crate::routes::code_scene::draft_record_from_ai_response(
+                            &draft_resp,
+                            author_uid,
+                            Some(parent.scene_id.clone()),
+                            vec![prompt],
+                            chrono::Utc::now().timestamp_millis(),
+                        );
+                        let _ = state.db.upsert_code_scene_bot_draft(&rec);
+                        if auto_publish {
+                            let pub_req =
+                                gpui_telegram_proto::code_scene_contracts::PublishCodeSceneRequest {
+                                    scene_id: None,
+                                    title: draft_resp.title,
+                                    description: draft_resp.description,
+                                    kind: draft_resp.kind,
+                                    tags: draft_resp.tags,
+                                    source_code: draft_resp.source_code,
+                                    code_format: draft_resp.code_format,
+                                    manifest: draft_resp.manifest,
+                                    controls_hint: draft_resp.controls_hint,
+                                    creator_bot_id: bot_id,
+                                    creator_bot_username: bot_username,
+                                    remix_parent_id: Some(parent.scene_id.clone()),
+                                    share_to_chat_id: Some(chat_id.0),
+                                };
+                            match crate::routes::code_scene::publish_validated_scene_atomic(
+                                &state.db,
+                                &state.code_scene,
+                                author_uid,
+                                &pub_req,
+                                Some(&draft_id),
+                                true,
+                            )
+                            .await
+                            {
+                                Ok((asset, _rep, _)) => {
+                                    crate::routes::code_scene::record_remix_parent_telemetry(
+                                        &state.db,
+                                        &state.code_scene,
+                                        author_uid,
+                                        &parent.scene_id,
+                                        parent.author_user_id,
+                                    );
+                                    if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                                        let _ = crate::routes::code_scene::post_code_scene_card_to_chat_raw(
+                                            &state.message_pipeline,
+                                            Some(&state.gateway_hub),
+                                            Some(&state.search_indexer),
+                                            Some(&state.hybrid_memory),
+                                            chat_id,
+                                            bot_user_id,
+                                            true,
+                                            &asset,
+                                        );
+                                        let summary = format!(
+                                            "已完成二创改编并发布：**{}** (`{}`)\n场景 ID: `{}`",
+                                            asset.title,
+                                            asset.kind.as_str(),
+                                            asset.scene_id
+                                        );
+                                        let kb = vec![vec![
+                                            InlineKeyboardButton {
+                                                text: "▶ 打开代码场景".into(),
+                                                callback_data: Some(
+                                                    gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Open(
+                                                        asset.scene_id.clone(),
+                                                    )
+                                                    .to_payload(),
+                                                ),
+                                                url: None,
+                                                web_app_url: None,
+                                            },
+                                            InlineKeyboardButton {
+                                                text: "✨ Remix 改编".into(),
+                                                callback_data: Some(
+                                                    gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Remix(
+                                                        asset.scene_id.clone(),
+                                                    )
+                                                    .to_payload(),
+                                                ),
+                                                url: None,
+                                                web_app_url: None,
+                                            },
+                                            InlineKeyboardButton {
+                                                text: "↗ 分享".into(),
+                                                callback_data: Some(
+                                                    gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Share(
+                                                        asset.scene_id,
+                                                    )
+                                                    .to_payload(),
+                                                ),
+                                                url: None,
+                                                web_app_url: None,
+                                            },
+                                        ]];
+                                        let _ = send_bot_chat_reply_in_topic(
+                                            state,
+                                            chat_id,
+                                            bot_user_id,
+                                            &summary,
+                                            kb,
+                                            topic_id,
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    let msg = err.into_message();
+                                    tracing::warn!(
+                                        chat_id = chat_id.0,
+                                        author_uid,
+                                        parent_scene_id = %parent.scene_id,
+                                        error = %msg,
+                                        "Direct Code Scene bot Remix publish failed"
+                                    );
+                                    if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                                        let reply = format!("二创发布代码场景失败：{msg}");
+                                        let _ = send_bot_chat_reply_in_topic(
+                                            state,
+                                            chat_id,
+                                            bot_user_id,
+                                            &reply,
+                                            Vec::new(),
+                                            topic_id,
+                                        );
+                                    }
+                                }
+                            }
+                        } else if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                            let summary = format!(
+                                "已生成二创草稿：**{}** (`{}`, draft_id: `{}`, 原作品: `{}`)",
+                                draft_resp.title,
+                                draft_resp.kind.as_str(),
+                                draft_id,
+                                parent.scene_id
+                            );
+                            let _ = send_bot_chat_reply_in_topic(
+                                state,
+                                chat_id,
+                                bot_user_id,
+                                &summary,
+                                Vec::new(),
+                                topic_id,
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                            let reply = format!(
+                                "未找到要二创的代码场景 `{scene_id}`，请检查场景 ID 是否存在。"
+                            );
+                            let _ = send_bot_chat_reply_in_topic(
+                                state,
+                                chat_id,
+                                bot_user_id,
+                                &reply,
+                                Vec::new(),
+                                topic_id,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            chat_id = chat_id.0,
+                            scene_id = %scene_id,
+                            error = %err,
+                            "Failed to load parent scene for direct bot Remix"
+                        );
+                        if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                            let reply = format!("加载原代码场景 `{scene_id}` 失败，请稍后重试。");
+                            let _ = send_bot_chat_reply_in_topic(
+                                state,
+                                chat_id,
+                                bot_user_id,
+                                &reply,
+                                Vec::new(),
+                                topic_id,
+                            );
+                        }
+                    }
+                },
+                gpui_telegram_agent::CodeSceneChatIntent::ListMine => {
+                    let q = gpui_telegram_proto::code_scene_contracts::ListCodeSceneAssetsQuery {
+                        author_user_id: Some(author_uid),
+                        limit: Some(20),
+                        ..Default::default()
+                    };
+                    let list = state.code_scene.recommender().read().list_assets(&q);
+                    if floor_fence.as_ref().is_none_or(|f| f.is_active()) {
+                        let summary = if list.assets.is_empty() {
+                            "你还没有发布过代码场景作品，发送 `/scene create game 霓虹弹球` 立即创作吧！".to_string()
+                        } else {
+                            let lines: Vec<String> = list
+                                .assets
+                                .iter()
+                                .take(10)
+                                .map(|a| format!("- **{}** (`{}`, `{}`)", a.title, a.kind.as_str(), a.scene_id))
+                                .collect();
+                            format!("你已发布的代码场景作品（共 {} 个）：\n{}", list.total, lines.join("\n"))
+                        };
+                        let _ = send_bot_chat_reply_in_topic(
+                            state,
+                            chat_id,
+                            bot_user_id,
+                            &summary,
+                            Vec::new(),
+                            topic_id,
+                        );
+                    }
+                }
+            }
+            typing_guard.finish();
+            return;
+        }
+    }
+
     let (bot_sp, bot_model, _) = crate::routes::hermes::load_bot_persona_config(state, bot_user_id);
     let mut extra_context_sections = Vec::new();
     if !apps.is_empty() {
@@ -7386,6 +7833,53 @@ pub async fn chat_callback(
                 Err(resp) => return resp,
             }
         }
+    }
+
+    if data.starts_with("code_scene:") {
+        let Some(action) =
+            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::parse_payload(data)
+        else {
+            return err_resp(
+                StatusCode::BAD_REQUEST,
+                "invalid_code_scene_callback",
+                "Malformed code_scene callback payload",
+            );
+        };
+        let sid = match &action {
+            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Open(id)
+            | gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Remix(id)
+            | gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Share(id) => {
+                id.as_str()
+            }
+        };
+        let Some(asset) = state.db.get_code_scene(sid).ok().flatten() else {
+            return err_resp(
+                StatusCode::NOT_FOUND,
+                "scene_not_found",
+                &format!("Code Scene '{sid}' not found"),
+            );
+        };
+        let toast = match &action {
+            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Open(_) => {
+                format!("打开代码场景: {}", asset.title)
+            }
+            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Remix(_) => {
+                format!("准备二创改编: {}", asset.title)
+            }
+            gpui_telegram_proto::code_scene_contracts::CodeSceneCardAction::Share(_) => {
+                format!("准备分享代码场景: {}", asset.title)
+            }
+        };
+        return (
+            StatusCode::OK,
+            Json(PeerBotActionResult {
+                ok: true,
+                companion_chat_id: Some(chat_id),
+                toast: Some(toast),
+                ..Default::default()
+            }),
+        )
+            .into_response();
     }
 
     let bot_member = members

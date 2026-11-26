@@ -80,6 +80,7 @@ impl TelegramAssetSource {
     fn collect_embedded_entries(prefix: &str, out: &mut BTreeSet<String>) {
         let embedded = IconName::ALL
             .iter()
+            .chain(IconName::EXTRA.iter())
             .map(|icon| icon.path())
             .chain(["langs/en.strings", "langs/zh-CN.strings"]);
         for rel in embedded {

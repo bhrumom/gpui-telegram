@@ -966,6 +966,14 @@ impl SlashCommandRegistry {
         self.add("reasoning", &["think"], "/reasoning [on|off|budget <tokens>]", ModesAndUi, "Toggle or adjust model thinking/reasoning visibility", true);
         self.add("debug", &[], "/debug [on|off]", ModesAndUi, "Toggle runtime debug trace output", true);
         self.add("config", &[], "/config [show|set <key> <val>]", ModesAndUi, "View or update Fabushi runtime configuration", true);
+        self.add(
+            "scene",
+            &["codescene", "create-scene"],
+            "/scene [create [video|animation|game] <prompt>|remix <scene_id> <prompt>|mine|help]",
+            ModesAndUi,
+            "Create, remix, or list interactive Code Scene videos, animations, and playable games",
+            true,
+        );
     }
 
     pub fn list_descriptors(&self) -> &[CommandDescriptor] {
@@ -1681,6 +1689,53 @@ impl SlashCommandRegistry {
                 match host.config_action(action, key, val) {
                     Ok(msg) => CommandExecutionOutcome::ok("config", msg),
                     Err(e) => CommandExecutionOutcome::err("config", e),
+                }
+            }
+
+            "scene" => {
+                match crate::code_scene_bot::parse_scene_slash_args(args_str) {
+                    crate::code_scene_bot::SceneSlashAction::Help => CommandExecutionOutcome::ok(
+                        "scene",
+                        "**Code Scene (代码场景)**\n\
+                         - `/scene create [video|animation|game] <prompt>` — 用 AI 创作并发布代码视频/动画/游戏\n\
+                         - `/scene remix <scene_id> <prompt>` — 对现有代码场景进行二创改编并发布\n\
+                         - `/scene mine` — 查看你已发布的代码场景作品\n\
+                         Aliases: `/codescene`, `/create-scene`",
+                    ),
+                    crate::code_scene_bot::SceneSlashAction::ListMine => {
+                        let mut out = CommandExecutionOutcome::ok("scene", "");
+                        out.should_continue_to_llm = true;
+                        out.rewritten_prompt = Some(
+                            "Call the `code_scene_list_mine` tool with {} and list the user's published Code Scene works.".to_string(),
+                        );
+                        out
+                    }
+                    crate::code_scene_bot::SceneSlashAction::Create { kind, prompt } => {
+                        let payload = serde_json::json!({
+                            "prompt": prompt,
+                            "kind": kind.map(|k| k.as_str()),
+                            "post_card_to_chat": true
+                        });
+                        let mut out = CommandExecutionOutcome::ok("scene", "");
+                        out.should_continue_to_llm = true;
+                        out.rewritten_prompt = Some(format!(
+                            "Call the `code_scene_publish` tool with {payload} to generate, validate, publish to Code Scene, and post the interactive card to chat, then summarize the published creation."
+                        ));
+                        out
+                    }
+                    crate::code_scene_bot::SceneSlashAction::Remix { scene_id, prompt } => {
+                        let payload = serde_json::json!({
+                            "scene_id": scene_id,
+                            "prompt": prompt,
+                            "auto_publish": true
+                        });
+                        let mut out = CommandExecutionOutcome::ok("scene", "");
+                        out.should_continue_to_llm = true;
+                        out.rewritten_prompt = Some(format!(
+                            "Call the `code_scene_remix` tool with {payload} to remix and publish this Code Scene and post the interactive card to chat, then summarize the result."
+                        ));
+                        out
+                    }
                 }
             }
 

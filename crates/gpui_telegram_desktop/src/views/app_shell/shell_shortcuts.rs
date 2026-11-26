@@ -1,6 +1,6 @@
 //! Keyboard shortcuts, window key dispatch, inspector toggle, language toggle, and nav switching.
 
-use gpui::{Context, KeyDownEvent, Window};
+use gpui::{Context, KeyDownEvent, KeyUpEvent, Window};
 
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::global_tasks_workspace::TasksWorkspaceTab;
@@ -47,6 +47,9 @@ impl AppShell {
         });
         if dest != NavDestination::Browser {
             self.hide_browser_native_webview(cx);
+        }
+        if dest != NavDestination::CodeScene {
+            self.leave_code_scene_panel_if_active(cx);
         }
         match dest {
             NavDestination::Chats | NavDestination::Folders => {
@@ -153,6 +156,9 @@ impl AppShell {
             NavDestination::Browser => {
                 self.open_browser_workspace(cx);
             }
+            NavDestination::CodeScene => {
+                self.open_code_scene_workspace(cx);
+            }
             NavDestination::TaskCenter => {
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.tasks_workspace
@@ -182,6 +188,7 @@ impl AppShell {
                 | NavDestination::TalkMode
                 | NavDestination::RemoteComputer
                 | NavDestination::Browser
+                | NavDestination::CodeScene
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
@@ -328,6 +335,14 @@ impl AppShell {
                 self.toggle_account_popover(cx);
                 true
             }
+            "s" if is_shift => {
+                if self.active_panel == ActiveWorkspacePanel::CodeScene {
+                    self.activate_nav_destination(NavDestination::Chats, cx);
+                } else {
+                    self.activate_nav_destination(NavDestination::CodeScene, cx);
+                }
+                true
+            }
             "j" => {
                 self.refresh_contacts(cx);
                 self.open_modal_dialog(
@@ -341,6 +356,7 @@ impl AppShell {
             }
             "n" => {
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
                 self.nav_rail.update(cx, |r, r_cx| {
@@ -457,7 +473,29 @@ impl AppShell {
             return;
         }
 
-        // 2. Handle non-character control keys (Enter, Backspace/Alt+Backspace, Tab, Escape)
+        // 2. Route direct Code Scene browsing/game keys when Code Scene is active without text input
+        if self.is_authenticated
+            && self.active_panel == ActiveWorkspacePanel::CodeScene
+            && !self.is_code_scene_input_active(cx)
+            && !self.has_code_scene_shell_blocker(cx)
+        {
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                if cs.update(cx, |w, wcx| {
+                    w.handle_non_char_key_input(
+                        key,
+                        event.keystroke.modifiers.shift,
+                        event.keystroke.modifiers.alt,
+                        wcx,
+                    )
+                }) {
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        // 3. Handle non-character control keys (Enter, Backspace/Alt+Backspace, Tab, Escape)
         if self.handle_non_char_key_with_alt(
             key,
             event.keystroke.modifiers.shift,
@@ -466,9 +504,19 @@ impl AppShell {
         ) {
             cx.stop_propagation();
         }
-        // 3. Printable characters are NOT stopped here so GPUI's macOS NSTextInputClient
+        // 4. Printable characters are NOT stopped here so GPUI's macOS NSTextInputClient
         //    routes both English keys (`insertText:`) and Chinese Pinyin (`setMarkedText:`)
         //    through `EntityInputHandler` without duplication.
+    }
+
+    /// Handles window-level key up events (releases held keys in interactive Code Scene games).
+    pub fn handle_window_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::CodeScene {
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                let key = event.keystroke.key.as_str();
+                cs.update(cx, |w, wcx| w.handle_key_up(key, wcx));
+            }
+        }
     }
 
     /// Dispatches a synthetic or view-local `KeyDownEvent` (used by tests and fallback key handlers).
@@ -481,6 +529,26 @@ impl AppShell {
         if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
             self.handle_shortcut_key(key, event.keystroke.modifiers.shift, cx);
             return;
+        }
+
+        if self.is_authenticated
+            && self.active_panel == ActiveWorkspacePanel::CodeScene
+            && !self.is_code_scene_input_active(cx)
+            && !self.has_code_scene_shell_blocker(cx)
+        {
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                if cs.update(cx, |w, wcx| {
+                    w.handle_non_char_key_input(
+                        key,
+                        event.keystroke.modifiers.shift,
+                        event.keystroke.modifiers.alt,
+                        wcx,
+                    )
+                }) {
+                    cx.notify();
+                    return;
+                }
+            }
         }
 
         if self.handle_non_char_key_with_alt(

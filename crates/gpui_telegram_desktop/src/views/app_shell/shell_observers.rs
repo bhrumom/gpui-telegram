@@ -529,6 +529,7 @@ impl AppShell {
                 selection_changed = true;
                 if let Some(d) = selected_dialog {
                     shell.leave_browser_panel_if_active(cx);
+                    shell.leave_code_scene_panel_if_active(cx);
                     shell.active_panel = ActiveWorkspacePanel::Chats;
                     shell.last_handled_nav_dest = Some(NavDestination::Chats);
                     shell.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Chats));

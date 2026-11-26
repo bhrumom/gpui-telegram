@@ -101,6 +101,29 @@ impl AppShell {
             })
     }
 
+    /// Returns `true` when a shell modal, lockscreen, popover, or sidebar search blocks Code Scene keys.
+    pub fn has_code_scene_shell_blocker(&self, cx: &App) -> bool {
+        let sb = self.sidebar.read(cx);
+        self.overlays.is_passcode_locked
+            || self.has_browser_visual_occlusion_overlay(cx)
+            || sb.search_focused
+            || sb.is_contacts_modal_open
+            || sb.active_creation_modal.is_some()
+            || sb.is_account_popover_open
+            || sb.is_plus_menu_open
+    }
+
+    /// Returns `true` when `CodeSceneWorkspace` is active and has a focused text input field
+    /// (Search, Comment, Code Editor, or AI Bot Studio).
+    pub fn is_code_scene_input_active(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::CodeScene
+            && !self.has_code_scene_shell_blocker(cx)
+            && self
+                .code_scene_workspace
+                .as_ref()
+                .is_some_and(|cs| cs.read(cx).has_focused_text_input())
+    }
+
     /// Returns `true` when the `ComputerWorkbench` overlay's Remote Terminal or interactive PTY is focused.
     pub fn is_computer_workbench_input_active(&self, cx: &App) -> bool {
         self.active_computer_terminal_overlay(cx).is_some()
@@ -165,6 +188,7 @@ impl AppShell {
             || self.miniapps.miniapp_overlay.as_ref().is_some_and(|w| w.read(cx).has_focused_text_input())
             || self.is_studio_input_active(cx)
             || self.is_browser_workspace_input_active(cx)
+            || self.is_code_scene_input_active(cx)
             || self.is_settings_input_active(cx)
             || self.is_inspector_bot_input_active(cx)
             || self.is_bot_card_input_active(cx)
@@ -251,6 +275,17 @@ impl AppShell {
                 .unwrap_or_default();
             return (txt, pre());
         }
+        if self.is_code_scene_input_active(cx) {
+            let (txt, cs_pre) = self
+                .code_scene_workspace
+                .as_ref()
+                .map(|cs| {
+                    let r = cs.read(cx);
+                    (r.active_input_text(), r.ime_preedit.clone())
+                })
+                .unwrap_or_default();
+            return (txt, cs_pre.or_else(pre));
+        }
         if self.is_apple_compose_input_active(cx) {
             if sb.compose_title_focused {
                 return (sb.compose_draft.custom_group_title.clone(), pre());
@@ -315,6 +350,12 @@ impl AppShell {
             if let Some(bw) = self.browser_workspace.clone() {
                 bw.update(cx, |w, wcx| w.clear_active_input(wcx));
             }
+        } else if self.is_code_scene_input_active(cx) {
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                cs.update(cx, |w, wcx| {
+                    let _ = w.clear_active_input(wcx);
+                });
+            }
         } else if self.is_inspector_bot_input_active(cx) {
             self.inspector.update(cx, |ins, icx| { let _ = ins.clear_active_bot_input(icx); });
         } else if self.is_bot_card_input_active(cx) {
@@ -349,6 +390,7 @@ impl AppShell {
         if clean.is_empty()
             && !self.is_inspector_bot_input_active(cx)
             && !self.is_browser_workspace_input_active(cx)
+            && !self.is_code_scene_input_active(cx)
         {
             cx.notify();
             return;
@@ -433,6 +475,21 @@ impl AppShell {
             if let Some(bw) = self.browser_workspace.clone() {
                 bw.update(cx, |w, wcx| {
                     w.insert_text_to_active_input(raw_text, wcx);
+                });
+            }
+        } else if self.is_code_scene_input_active(cx) {
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                let allow_nl = matches!(
+                    cs.read(cx).active_input,
+                    crate::views::code_scene::ActiveCodeSceneInput::CodeEditor
+                        | crate::views::code_scene::ActiveCodeSceneInput::StudioPrompt
+                );
+                let txt = sanitize_paste_text(raw_text, allow_nl);
+                cs.update(cx, |w, wcx| {
+                    w.set_ime_preedit(None, wcx);
+                    if !txt.is_empty() {
+                        let _ = w.insert_text_input(&txt, wcx);
+                    }
                 });
             }
         } else if self.sidebar.read(cx).search_focused {
@@ -649,6 +706,18 @@ impl AppShell {
                 }
             }
             self.hide_browser_native_webview(cx);
+            self.active_panel = ActiveWorkspacePanel::Chats;
+            self.last_handled_nav_dest = Some(NavDestination::Chats);
+            self.nav_rail.update(cx, |r, _| { r.set_active_destination(NavDestination::Chats); });
+            return true;
+        }
+        if self.active_panel == ActiveWorkspacePanel::CodeScene {
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                if cs.update(cx, |w, wcx| w.handle_non_char_key_input("escape", false, false, wcx)) {
+                    return true;
+                }
+            }
+            self.leave_code_scene_panel_if_active(cx);
             self.active_panel = ActiveWorkspacePanel::Chats;
             self.last_handled_nav_dest = Some(NavDestination::Chats);
             self.nav_rail.update(cx, |r, _| { r.set_active_destination(NavDestination::Chats); });
@@ -1165,6 +1234,28 @@ impl AppShell {
                 }
             }
         }
+        if self.is_code_scene_input_active(cx) {
+            if key == "backspace" && self.ime.ime_preedit.take().is_some() {
+                if let Some(cs) = self.code_scene_workspace.clone() {
+                    cs.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+                }
+                cx.notify();
+                return true;
+            }
+            if key == "enter" && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed()) {
+                cx.notify();
+                return true;
+            }
+            if key == "tab" {
+                self.ime.clear_preedit();
+            }
+            if let Some(cs) = self.code_scene_workspace.clone() {
+                if cs.update(cx, |w, wcx| w.handle_non_char_key_input(key, is_shift, is_alt, wcx)) {
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
         if self.active_panel == ActiveWorkspacePanel::Chats
             && !self.sidebar.read(cx).search_focused
             && self.sidebar.read(cx).active_creation_modal.is_none()
@@ -1176,8 +1267,10 @@ impl AppShell {
             return true;
         }
         if key == "tab" {
-            if self.active_panel == ActiveWorkspacePanel::Browser
-                && !self.sidebar.read(cx).search_focused
+            if matches!(
+                self.active_panel,
+                ActiveWorkspacePanel::Browser | ActiveWorkspacePanel::CodeScene
+            ) && !self.sidebar.read(cx).search_focused
             {
                 return true;
             }
@@ -1307,6 +1400,10 @@ impl AppShell {
                     st.bot_assist_ime_preedit = None;
                     stcx.notify();
                 });
+            } else if self.is_code_scene_input_active(cx) {
+                if let Some(cs) = self.code_scene_workspace.clone() {
+                    cs.update(cx, |w, wcx| w.set_ime_preedit(None, wcx));
+                }
             }
             if !non_composer {
                 self.composer.update(cx, |c, ccx| { c.ime_machine.on_ime_cancel(); c.sync_autocomplete(); ccx.notify(); });
@@ -1347,6 +1444,12 @@ impl AppShell {
                     st.bot_assist_ime_preedit = Some(new_text.to_string());
                     stcx.notify();
                 });
+            } else if self.is_code_scene_input_active(cx) {
+                if let Some(cs) = self.code_scene_workspace.clone() {
+                    cs.update(cx, |w, wcx| {
+                        w.set_ime_preedit(Some(new_text.to_string()), wcx);
+                    });
+                }
             }
         } else {
             self.composer.update(cx, |c, ccx| {
@@ -1465,6 +1568,13 @@ impl EntityInputHandler for AppShell {
                 + px(360.0)
                 + px((char_count as f32 * 7.5).min(360.0));
             return Some(Bounds::new(point(caret_x, element_bounds.origin.y + px(28.0)), size(px(2.0), px(18.0))));
+        }
+        if self.is_code_scene_input_active(cx) {
+            let caret_x = (element_bounds.origin.x + element_bounds.size.width - px(360.0)
+                + px((char_count as f32 * 7.5).min(280.0)))
+                .max(element_bounds.origin.x + px(320.0));
+            let caret_y = element_bounds.origin.y + px(180.0);
+            return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))));
         }
         if self.stage.read(cx).search_open {
             let caret_x = element_bounds.origin.x + px(360.0) + px((char_count as f32 * 8.0).min(280.0));

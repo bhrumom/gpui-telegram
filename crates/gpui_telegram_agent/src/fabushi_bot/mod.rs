@@ -983,6 +983,14 @@ impl FabushiBotHost {
             "x.com",
             "发布",
             "登录",
+            "代码场景",
+            "code scene",
+            "codescene",
+            "/scene",
+            "弹球",
+            "小游戏",
+            "remix",
+            "创作",
         ]
         .iter()
         .any(|kw| lower.contains(kw) || trimmed.contains(kw));

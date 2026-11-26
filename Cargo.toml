@@ -4,6 +4,7 @@ members = [
     # Core Presentation & Server Crates (9 Crates)
     "crates/gpui_telegram_core",
     "crates/gpui_telegram_proto",
+    "crates/gpui_telegram_code_scene",
     "crates/gpui_telegram_media",
     "crates/gpui_telegram_webrtc",
     "crates/gpui_telegram_agent",
@@ -51,6 +52,7 @@ rust-version = "1.85"
 # --- Internal Crates ---
 gpui_telegram_core = { path = "crates/gpui_telegram_core" }
 gpui_telegram_proto = { path = "crates/gpui_telegram_proto" }
+gpui_telegram_code_scene = { path = "crates/gpui_telegram_code_scene" }
 gpui_telegram_media = { path = "crates/gpui_telegram_media" }
 gpui_telegram_webrtc = { path = "crates/gpui_telegram_webrtc" }
 gpui_telegram_agent = { path = "crates/gpui_telegram_agent" }

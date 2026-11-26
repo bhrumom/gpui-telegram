@@ -7,6 +7,7 @@ pub mod automation_apps;
 pub mod bots_miniapps;
 pub mod chat_extras;
 pub mod chat_lifecycle;
+pub mod code_scene;
 pub mod computers;
 pub mod devices;
 pub mod e2ee;

@@ -1794,6 +1794,7 @@ impl AppShell {
                     .child(menu_row("account-popover-profile", IconName::ContactsUsers, tr_str(lang, "个人资料", "Profile"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::MyProfile, cx)))
                     .child(menu_row("account-popover-saved", IconName::SavedMessages, tr_str(lang, "收藏夹", "Saved"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::SavedMessages, cx)))
                     .child(menu_row("account-popover-connectors", IconName::TerminalMcp, tr_str(lang, "连接器", "Connectors"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::McpTools, cx)))
+                    .child(menu_row("account-popover-code-scene", IconName::CodeScene, tr_str(lang, "代码场景", "Code Scene"), 0xFE2C55, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::CodeScene, cx)))
                     .child(menu_row("account-popover-fabushi", IconName::BotRobot, tr_str(lang, "新建智能体 · Fabushi Bot", "New Fabushi Bot"), pal.accent, false, |this, cx| this.open_fabushi_creator_modal(cx)))
                     .child(menu_row("account-popover-botfather", IconName::BotRobot, tr_str(lang, "BotFather · 创建机器人/小程序", "BotFather · Create Bot/App"), pal.accent, false, |this, cx| this.open_botfather_chat(cx)))
                     .child(menu_row("account-popover-miniapps", IconName::FolderBots, tr_str(lang, "小程序中心", "Mini Apps Center"), pal.text_primary, false, |this, cx| this.open_miniapps_center(cx)))

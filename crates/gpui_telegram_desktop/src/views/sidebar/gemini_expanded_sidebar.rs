@@ -320,6 +320,142 @@ pub fn render_expanded_gemini_search_bar<V: 'static>(
         .into_any_element()
 }
 
+/// Renders the prominent first-class left-sidebar entry pill for Code Scene ("代码场景")
+/// directly below the search bar without polluting `ChatSidebar::dialogs`.
+pub fn render_expanded_code_scene_entry<V: 'static>(
+    nav: &UnifiedNavSnapshot,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + 'static,
+) -> AnyElement {
+    let is_active = nav.active_destination == NavDestination::CodeScene;
+    let is_apple = palette.is_apple_style();
+    let is_dark = palette.mode.is_dark();
+    let bg = if is_active {
+        TdesktopThemePalette::rgba_with_alpha(0xFE2C55, if is_dark { 0.24 } else { 0.14 })
+    } else if is_apple {
+        if is_dark {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
+        }
+    } else {
+        rgb(palette.input_bg).into()
+    };
+    let hover_bg = if is_active {
+        TdesktopThemePalette::rgba_with_alpha(0xFE2C55, if is_dark { 0.30 } else { 0.20 })
+    } else if is_apple {
+        if is_dark {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.11)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.08)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg).into()
+    };
+    let border_col = if is_active {
+        TdesktopThemePalette::rgba_with_alpha(0xFE2C55, 0.65)
+    } else if is_apple {
+        palette.separator_rgba()
+    } else {
+        rgb(palette.border_fg).into()
+    };
+    let icon_fg = if is_active { 0xFE2C55 } else { palette.accent };
+
+    div()
+        .w_full()
+        .px(px(12.0))
+        .pb(px(8.0))
+        .flex_shrink_0()
+        .child(
+            div()
+                .id("sidebar-code-scene-entry")
+                .w_full()
+                .h(px(38.0))
+                .px(px(11.0))
+                .rounded(px(10.0))
+                .bg(bg)
+                .border_1()
+                .border_color(border_col)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _w, cx| {
+                        cx.stop_propagation();
+                        on_action(
+                            this,
+                            UnifiedSidebarAction::SelectDestination(NavDestination::CodeScene),
+                            cx,
+                        );
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .rounded(px(7.0))
+                                .bg(if is_active {
+                                    TdesktopThemePalette::rgba_with_alpha(0xFE2C55, 0.22)
+                                } else {
+                                    TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16)
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .flex_shrink_0()
+                                .child(tg_icon(IconName::CodeScene, 15.0, icon_fg)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.5))
+                                .font_weight(if is_active {
+                                    FontWeight::BOLD
+                                } else {
+                                    FontWeight::SEMIBOLD
+                                })
+                                .text_color(if is_active {
+                                    rgb(0xFE2C55)
+                                } else {
+                                    rgb(palette.text_primary)
+                                })
+                                .child(tr_str(lang_id, "代码场景", "Code Scene")),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(7.0))
+                        .py(px(2.0))
+                        .rounded(px(999.0))
+                        .bg(if is_active {
+                            rgba(0xFE2C55DD)
+                        } else {
+                            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14)
+                        })
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if is_active {
+                            rgba(0xFFFFFFFF)
+                        } else {
+                            rgb(palette.text_secondary)
+                        })
+                        .child(tr_str(lang_id, "视频·动画·游戏", "AI Feed")),
+                ),
+        )
+        .into_any_element()
+}
+
 fn render_expanded_nav_row<V: 'static>(
     id: &'static str,
     icon: IconName,

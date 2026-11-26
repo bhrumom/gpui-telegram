@@ -398,6 +398,19 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                     on_action.clone(),
                     UnifiedSidebarAction::OpenContacts,
                 ))
+                .child(render_collapsed_icon_btn(
+                    "rail-code-scene-btn",
+                    "code_scene",
+                    IconName::CodeScene,
+                    tr_str(lang_id, "代码场景", "Code Scene"),
+                    nav.active_destination == NavDestination::CodeScene,
+                    0,
+                    hovered_item,
+                    palette,
+                    cx,
+                    on_action.clone(),
+                    UnifiedSidebarAction::SelectDestination(NavDestination::CodeScene),
+                ))
                 .child(
                     div()
                         .w(px(24.0))

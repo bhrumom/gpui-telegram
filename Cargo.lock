@@ -3361,6 +3361,7 @@ dependencies = [
  "ed25519-dalek",
  "fabushi-messaging-core",
  "getrandom 0.2.17",
+ "gpui_telegram_code_scene",
  "gpui_telegram_core",
  "gpui_telegram_media",
  "gpui_telegram_proto",
@@ -3423,6 +3424,7 @@ dependencies = [
  "fabushi_remote_engine",
  "futures",
  "getrandom 0.2.17",
+ "gpui_telegram_code_scene",
  "gpui_telegram_core",
  "gpui_telegram_media",
  "gpui_telegram_proto",
@@ -3449,6 +3451,19 @@ dependencies = [
  "x25519-dalek",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "gpui_telegram_code_scene"
+version = "1.6.11"
+dependencies = [
+ "chrono",
+ "gpui_telegram_proto",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]
@@ -3506,6 +3521,7 @@ dependencies = [
  "gpui",
  "gpui_telegram_agent",
  "gpui_telegram_client",
+ "gpui_telegram_code_scene",
  "gpui_telegram_coding",
  "gpui_telegram_core",
  "gpui_telegram_media",
@@ -3580,6 +3596,7 @@ dependencies = [
  "getrandom 0.2.17",
  "gpui_telegram_agent",
  "gpui_telegram_client",
+ "gpui_telegram_code_scene",
  "gpui_telegram_core",
  "gpui_telegram_media",
  "gpui_telegram_proto",

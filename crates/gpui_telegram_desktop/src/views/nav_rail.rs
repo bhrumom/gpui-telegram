@@ -27,6 +27,7 @@ pub enum NavDestination {
     TalkMode,
     RemoteComputer,
     Browser,
+    CodeScene,
     SavedMessages,
     Settings,
 }
@@ -42,6 +43,7 @@ impl NavDestination {
             Self::TalkMode => IconName::Mic,
             Self::RemoteComputer => IconName::ComputerDesktop,
             Self::Browser => IconName::ScreenShare,
+            Self::CodeScene => IconName::CodeScene,
             Self::SavedMessages => IconName::SavedMessages,
             Self::Settings => IconName::SettingsGear,
         }
@@ -57,6 +59,7 @@ impl NavDestination {
             Self::TalkMode => tr_str(lang_id, "语音对话", "Talk Mode"),
             Self::RemoteComputer => tr_str(lang_id, "远程电脑", "Remote Computer"),
             Self::Browser => tr_str(lang_id, "浏览器", "Browser"),
+            Self::CodeScene => tr_str(lang_id, "代码场景", "Code Scene"),
             Self::SavedMessages => tr_str(lang_id, "收藏夹", "Saved Messages"),
             Self::Settings => tr_str(lang_id, "设置", "Settings"),
         }
@@ -164,6 +167,12 @@ impl NavRail {
                 destination: NavDestination::Browser,
                 icon_label: "browser".to_string(),
                 tooltip: "Browser".to_string(),
+                unread_badge: 0,
+            },
+            NavItem {
+                destination: NavDestination::CodeScene,
+                icon_label: "code_scene".to_string(),
+                tooltip: "Code Scene".to_string(),
                 unread_badge: 0,
             },
             NavItem {

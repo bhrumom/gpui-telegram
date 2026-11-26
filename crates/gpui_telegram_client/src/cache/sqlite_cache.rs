@@ -206,6 +206,86 @@ const CLIENT_SCHEMA_SQL: &str = "
         payload_json TEXT NOT NULL,
         cached_at_ms INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS code_scenes_cache (
+        scene_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        author_user_id INTEGER NOT NULL,
+        creator_bot_id INTEGER,
+        title TEXT NOT NULL,
+        source_sha256 TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        is_local_only INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms INTEGER NOT NULL,
+        cached_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_code_scenes_cache_kind_updated
+        ON code_scenes_cache(kind, updated_at_ms DESC, scene_id);
+    CREATE INDEX IF NOT EXISTS idx_code_scenes_cache_author
+        ON code_scenes_cache(author_user_id, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS code_scene_local_profile (
+        user_id INTEGER PRIMARY KEY,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        revision INTEGER NOT NULL DEFAULT 0,
+        profile_json TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS code_scene_telemetry_outbox (
+        outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        user_id INTEGER NOT NULL,
+        scene_id TEXT NOT NULL,
+        event_kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_code_scene_telemetry_outbox_user
+        ON code_scene_telemetry_outbox(user_id, outbox_id ASC);
+
+    CREATE TABLE IF NOT EXISTS code_scene_local_drafts (
+        draft_id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        remix_parent_id TEXT,
+        prompt TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_code_scene_local_drafts_user
+        ON code_scene_local_drafts(user_id, updated_at_ms DESC, draft_id);
+
+    CREATE TABLE IF NOT EXISTS code_scene_local_social (
+        user_id INTEGER NOT NULL,
+        relation_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        active INTEGER NOT NULL,
+        pending_sync INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (user_id, relation_kind, target_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_code_scene_local_social_pending
+        ON code_scene_local_social(user_id, pending_sync, updated_at_ms ASC);
+
+    CREATE TABLE IF NOT EXISTS code_scene_local_comments (
+        comment_id TEXT PRIMARY KEY,
+        scene_id TEXT NOT NULL,
+        author_user_id INTEGER NOT NULL,
+        parent_comment_id TEXT,
+        likes_count INTEGER NOT NULL DEFAULT 0,
+        created_at_ms INTEGER NOT NULL,
+        pending_sync INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_code_scene_local_comments_scene_created
+        ON code_scene_local_comments(scene_id, created_at_ms DESC, comment_id);
+    CREATE INDEX IF NOT EXISTS idx_code_scene_local_comments_scene_hot
+        ON code_scene_local_comments(scene_id, likes_count DESC, created_at_ms DESC);
 ";
 
 impl SqliteClientCache {
@@ -337,7 +417,13 @@ impl SqliteClientCache {
              DELETE FROM e2ee_sender_key_history;
              DELETE FROM e2ee_distributed_keys;
              DELETE FROM installed_automation_apps;
-             DELETE FROM automation_app_cache;",
+             DELETE FROM automation_app_cache;
+             DELETE FROM code_scenes_cache;
+             DELETE FROM code_scene_local_profile;
+             DELETE FROM code_scene_telemetry_outbox;
+             DELETE FROM code_scene_local_drafts;
+             DELETE FROM code_scene_local_social;
+             DELETE FROM code_scene_local_comments;",
         );
     }
 

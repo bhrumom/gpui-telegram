@@ -355,12 +355,14 @@ impl AppShell {
             }
             MainMenuCommand::Calls => {
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Calls;
                 self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::Calls));
                 self.sync_calls_history(cx);
             }
             MainMenuCommand::SavedMessages => {
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.nav_rail.update(cx, |r, _| r.set_active_destination(NavDestination::SavedMessages));
                 let target_id = self.sidebar.read(cx).saved_messages_id.or_else(|| {
@@ -374,18 +376,27 @@ impl AppShell {
             }
             MainMenuCommand::TaskCenter => {
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::TaskCenter;
                 self.tasks_workspace.update(cx, |w, _| w.set_tab(TasksWorkspaceTab::Tasks));
                 self.refresh_tasks_and_mcp(cx);
             }
             MainMenuCommand::McpTools => {
                 self.leave_browser_panel_if_active(cx);
+                self.leave_code_scene_panel_if_active(cx);
                 self.active_panel = ActiveWorkspacePanel::McpTools;
                 self.tasks_workspace.update(cx, |w, _| w.set_tab(TasksWorkspaceTab::McpTools));
                 self.refresh_tasks_and_mcp(cx);
             }
-            MainMenuCommand::RemoteComputer => self.open_remote_computers_hub(cx),
+            MainMenuCommand::RemoteComputer => {
+                self.leave_code_scene_panel_if_active(cx);
+                self.open_remote_computers_hub(cx);
+            }
+            MainMenuCommand::CodeScene => {
+                self.open_code_scene_workspace(cx);
+            }
             MainMenuCommand::Settings => {
+                self.leave_code_scene_panel_if_active(cx);
                 self.navigate_settings_to(SettingsSectionType::Main, cx);
             }
             MainMenuCommand::ToggleNightMode => {

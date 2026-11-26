@@ -4,8 +4,8 @@ use crate::config::ClientConfig;
 use crate::e2ee::{E2eeManager, E2eeStore};
 use crate::media_transfer::{ChunkedTransferManager, FileTransferStore};
 use crate::net::{
-    AuthResponse, BotComputerProfileDto, ClientProxyConfig, ComputerListResponse, ComputerNodeDto,
-    ConnectionStatus,
+    AuthResponse, BotComputerProfileDto, ClientProxyConfig, CodeSceneHttpClient,
+    ComputerListResponse, ComputerNodeDto, ConnectionStatus,
     HermesApprovalDecisionRequest, HermesApprovalDto, HermesCallInviteRequest,
     HermesCallInviteResponse, HermesClient, HermesCommandDescriptor, HermesCommandRequest,
     HermesCommandResponse, HermesCreateKanbanBoardRequest, HermesCreateKanbanCardRequest,
@@ -55,6 +55,7 @@ pub struct TelegramClient {
     pub sync_coordinator: ClientSyncCoordinator,
     pub http_client: HttpClient,
     pub hermes: HermesClient,
+    pub code_scene: CodeSceneHttpClient,
     pub ws_channel: WsChannel,
     pub ws_transport: WsTransport,
     pub tailnet: Arc<TailnetEngine>,
@@ -114,6 +115,7 @@ impl TelegramClient {
         http_client.set_device_id(tailnet_identity.device_id.clone());
         let tailnet = TailnetEngine::new(tailnet_identity);
         let hermes = HermesClient::new(http_client.clone());
+        let code_scene = CodeSceneHttpClient::new(http_client.clone());
         let ws_channel = WsChannel::new();
         let ws_transport = WsTransport::new_with_runtime(
             config.server_url.clone(),
@@ -212,6 +214,7 @@ impl TelegramClient {
             sync_coordinator,
             http_client,
             hermes,
+            code_scene,
             ws_channel,
             ws_transport,
             tailnet,
@@ -2848,5 +2851,253 @@ impl TelegramClient {
     ) -> std::result::Result<DeviceSyncStatusResponse, HttpClientError> {
         self.ensure_pinned_session(expected_epoch, token)?;
         self.http_client.device_sync_status(token, request_id).await
+    }
+
+    // ========================================================================
+    // Code Scene ("代码场景") Client Accessors & Session-Pinned Wrappers
+    // ========================================================================
+
+    pub fn code_scene(&self) -> &CodeSceneHttpClient {
+        &self.code_scene
+    }
+
+    pub fn build_code_scene_service(&self) -> crate::code_scene_service::LocalCodeSceneService {
+        let sess = self.current_auth_session();
+        let uid = sess.as_ref().map(|s| s.user_id).unwrap_or(0);
+        let uname = sess.as_ref().map(|s| s.username.clone());
+        crate::code_scene_service::LocalCodeSceneService::new_with_remote(
+            self.local_store.clone(),
+            self.config.server_url.clone(),
+            uid,
+            uname,
+            Some(self.code_scene.clone()),
+        )
+    }
+
+    pub fn code_scene_fetch_feed<'a>(
+        &'a self,
+        req: &'a crate::net::CodeSceneFeedRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::CodeSceneFeedResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.fetch_feed(&token, req).await
+        }
+    }
+
+    pub fn code_scene_list_assets<'a>(
+        &'a self,
+        query: &'a crate::net::ListCodeSceneAssetsQuery,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::ListCodeSceneAssetsResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.list_assets(&token, query).await
+        }
+    }
+
+    pub fn code_scene_get_asset<'a>(
+        &'a self,
+        scene_id: &'a str,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::CodeSceneAssetDto, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.get_asset(&token, scene_id).await
+        }
+    }
+
+    pub fn code_scene_publish_asset<'a>(
+        &'a self,
+        req: &'a crate::net::PublishCodeSceneRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::PublishCodeSceneResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.publish_asset(&token, req).await
+        }
+    }
+
+    pub fn code_scene_validate_asset<'a>(
+        &'a self,
+        req: &'a crate::net::ValidateCodeSceneRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::ValidationReportDto, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.validate_asset(&token, req).await
+        }
+    }
+
+    pub fn code_scene_toggle_like<'a>(
+        &'a self,
+        scene_id: &'a str,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::ToggleLikeResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.toggle_like(&token, scene_id).await
+        }
+    }
+
+    pub fn code_scene_toggle_bookmark<'a>(
+        &'a self,
+        scene_id: &'a str,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::ToggleBookmarkResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.toggle_bookmark(&token, scene_id).await
+        }
+    }
+
+    pub fn code_scene_list_comments<'a>(
+        &'a self,
+        scene_id: &'a str,
+        query: &'a crate::net::ListCodeSceneCommentsQuery,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::ListCodeSceneCommentsResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.list_comments(&token, scene_id, query).await
+        }
+    }
+
+    pub fn code_scene_add_comment<'a>(
+        &'a self,
+        scene_id: &'a str,
+        req: &'a crate::net::CreateCodeSceneCommentRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::CreateCodeSceneCommentResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.add_comment(&token, scene_id, req).await
+        }
+    }
+
+    pub fn code_scene_toggle_follow(
+        &self,
+        creator_user_id: i64,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::ToggleFollowResponse, HttpClientError>,
+    > + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.toggle_follow(&token, creator_user_id).await
+        }
+    }
+
+    pub fn code_scene_submit_telemetry<'a>(
+        &'a self,
+        payload: &'a crate::net::TelemetrySubmitPayload,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::TelemetryIngestResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.submit_telemetry(&token, payload).await
+        }
+    }
+
+    pub fn code_scene_ai_generate<'a>(
+        &'a self,
+        req: &'a crate::net::AiGenerateSceneRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::AiGenerateSceneResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.ai_generate(&token, req).await
+        }
+    }
+
+    pub fn code_scene_ai_iterate<'a>(
+        &'a self,
+        req: &'a crate::net::AiIterateSceneRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::AiGenerateSceneResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.ai_iterate(&token, req).await
+        }
+    }
+
+    pub fn code_scene_ai_publish<'a>(
+        &'a self,
+        req: &'a crate::net::AiPublishSceneRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::PublishCodeSceneResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.ai_publish(&token, req).await
+        }
+    }
+
+    pub fn code_scene_ai_remix<'a>(
+        &'a self,
+        req: &'a crate::net::RemixSceneRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<crate::net::RemixSceneResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.code_scene.ai_remix(&token, req).await
+        }
     }
 }
