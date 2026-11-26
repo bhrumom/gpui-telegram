@@ -1,7 +1,7 @@
 use gpui::{Context, Entity, WindowAppearance};
 
 use crate::app::preferences::{AppPreferences, ThemeMode};
-use crate::theme::{TdesktopThemeMode, TdesktopThemePalette};
+use crate::theme::{OpenBotColorScheme, TdesktopThemeMode, TdesktopThemePalette};
 use crate::components::bots::bot_attach_web_view::BotAttachWebView;
 use crate::views::app_shell::ModalContainer;
 use crate::views::auth::AuthWizardView;
@@ -11,7 +11,7 @@ use crate::views::tdesktop_theme::resolve_desktop_palette;
 use crate::views::{
     BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar, ComputerWorkbench,
     ContextInspector, ConversationStage, GlobalTasksWorkspace, IvViewer, MainMenuDrawer,
-    MediaViewer, NavRail,
+    MediaViewer, NavRail, OpenBotWorkspaceShell,
 };
 
 /// Maps persisted app preferences and optional desktop mode override into a full theme palette.
@@ -115,6 +115,7 @@ pub struct ShellThemeTargets<'a> {
     pub modal_container: &'a Entity<ModalContainer>,
     pub tasks_workspace: &'a Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<&'a Entity<BrowserWorkspace>>,
+    pub openbot_workspace: Option<&'a Entity<OpenBotWorkspaceShell>>,
     pub talk_mode_overlay: Option<&'a Entity<CallOverlay>>,
     pub computer_overlay: Option<&'a Entity<ComputerWorkbench>>,
     pub media_viewer_overlay: Option<&'a Entity<MediaViewer>>,
@@ -180,6 +181,18 @@ pub fn propagate_theme_and_locale<V: 'static>(
     if let Some(browser) = targets.browser_workspace {
         browser.update(cx, |w, wcx| {
             w.sync_theme_and_locale(palette.clone(), lang_id, wcx);
+        });
+    }
+    if let Some(openbot) = targets.openbot_workspace {
+        let scheme = if palette.mode.is_dark() {
+            OpenBotColorScheme::Dark
+        } else {
+            OpenBotColorScheme::Light
+        };
+        openbot.update(cx, |ws, wcx| {
+            ws.sync_color_scheme(scheme);
+            ws.sync_locale(lang_id);
+            wcx.notify();
         });
     }
     if let Some(overlay) = targets.computer_overlay {

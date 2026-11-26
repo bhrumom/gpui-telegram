@@ -5,12 +5,30 @@ use gpui::{Context, KeyDownEvent, Window};
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::global_tasks_workspace::TasksWorkspaceTab;
 use crate::views::nav_rail::NavDestination;
+use crate::views::openbot::{ServerPlatform, ShortcutChord};
 use crate::views::settings::settings_type::SettingsSectionType;
 use crate::views::shell::{
     nav_destination_for_shortcut_digit, next_tdesktop_theme_cycle, toggled_language_code,
     ActiveWorkspacePanel, AppShell,
 };
 use crate::views::tdesktop_theme::tr_str;
+
+fn map_shell_key_to_openbot_code(key_lower: &str) -> Option<&'static str> {
+    match key_lower {
+        "k" => Some("KeyK"),
+        "b" => Some("KeyB"),
+        "f" => Some("KeyF"),
+        "," => Some("Comma"),
+        "." => Some("Period"),
+        "e" => Some("KeyE"),
+        "/" | "?" => Some("Slash"),
+        "[" => Some("BracketLeft"),
+        "]" => Some("BracketRight"),
+        "n" => Some("KeyN"),
+        "t" => Some("KeyT"),
+        _ => None,
+    }
+}
 
 impl AppShell {
     /// Synchronizes `ContextInspector` open state with `ConversationStage::is_inspector_open`.
@@ -175,6 +193,9 @@ impl AppShell {
                     self.navigate_settings_to(SettingsSectionType::Main, cx);
                 }
             }
+            NavDestination::OpenBot => {
+                self.open_openbot_workspace(cx);
+            }
         }
         if matches!(
             dest,
@@ -185,6 +206,7 @@ impl AppShell {
                 | NavDestination::TaskCenter
                 | NavDestination::McpTools
                 | NavDestination::Settings
+                | NavDestination::OpenBot
         ) {
             self.sidebar.update(cx, |sb, sb_cx| {
                 sb.cancel_compose_mode();
@@ -258,6 +280,50 @@ impl AppShell {
 
         if !self.is_authenticated || !self.preferences.shortcuts_enabled {
             return false;
+        }
+
+        // Dual-surface toggle: Cmd+0 / Ctrl+0 and Cmd+Shift+O / Ctrl+Shift+O toggle
+        // ActiveWorkspacePanel::OpenBot <-> ActiveWorkspacePanel::Chats while leaving
+        // `nav_destination_for_shortcut_digit("0") == None` (TRAP #2) untouched.
+        if key_lower == "0" || (key_lower == "o" && is_shift) {
+            if self.active_panel == ActiveWorkspacePanel::OpenBot {
+                self.activate_nav_destination(NavDestination::Chats, cx);
+            } else {
+                self.activate_nav_destination(NavDestination::OpenBot, cx);
+            }
+            return true;
+        }
+
+        // When inside the OpenBot workspace, forward OpenBot-native shortcuts into
+        // `OpenBotWorkspaceShell` while keeping Telegram `Cmd+1..9` direct jumps available.
+        if self.active_panel == ActiveWorkspacePanel::OpenBot {
+            if key_lower == "enter" {
+                if let Some(ws) = self.openbot_workspace.clone() {
+                    ws.update(cx, |shell, wcx| {
+                        shell.handle_enter(true);
+                        wcx.notify();
+                    });
+                    cx.notify();
+                    return true;
+                }
+            }
+            if let Some(code) = map_shell_key_to_openbot_code(&key_lower) {
+                if let Some(ws) = self.openbot_workspace.clone() {
+                    let handled = ws.update(cx, |shell, wcx| {
+                        let is_mac = shell.platform == ServerPlatform::MacOs;
+                        let chord = ShortcutChord::new(!is_mac, false, is_shift, is_mac, code);
+                        let ok = shell.handle_shortcut(&chord);
+                        if ok {
+                            wcx.notify();
+                        }
+                        ok
+                    });
+                    if handled {
+                        cx.notify();
+                        return true;
+                    }
+                }
+            }
         }
 
         let lang = self.active_lang_id();

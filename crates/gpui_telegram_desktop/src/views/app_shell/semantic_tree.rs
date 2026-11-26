@@ -36,6 +36,7 @@ fn active_panel_label(panel: ActiveWorkspacePanel) -> String {
         ActiveWorkspacePanel::McpTools => "McpTools".to_string(),
         ActiveWorkspacePanel::Browser => "Browser".to_string(),
         ActiveWorkspacePanel::Settings => "Settings".to_string(),
+        ActiveWorkspacePanel::OpenBot => "OpenBot".to_string(),
     }
 }
 
@@ -51,6 +52,7 @@ fn nav_dest_label(dest: NavDestination) -> String {
         NavDestination::Browser => "Browser".to_string(),
         NavDestination::SavedMessages => "SavedMessages".to_string(),
         NavDestination::Settings => "Settings".to_string(),
+        NavDestination::OpenBot => "OpenBot".to_string(),
     }
 }
 

@@ -6,6 +6,7 @@ pub mod help;
 pub mod http_client;
 pub mod ipc_client;
 pub mod mcp_config;
+pub mod openbot;
 pub mod registry;
 pub mod session_store;
 pub mod unified_commands;
@@ -17,6 +18,7 @@ use crate::envelope::{format_json, ok_envelope, CliOutcome};
 use crate::error::CliError;
 use crate::help::{format_actions_table, format_topic_help};
 use crate::http_client::{ActionHttpClient, ActionHttpOutcome};
+use crate::openbot::execute_openbot;
 use crate::registry::{build_default_registry, default_cli_schema, resolve_action, PROGRAM_NAME};
 use crate::unified_commands::execute_unified;
 use gpui_telegram_core::action_bus::{
@@ -95,6 +97,7 @@ pub async fn execute_command_outcome(
             }
         }
         CliCommand::Unified(unified) => execute_unified(&opts, unified).await,
+        CliCommand::OpenBot(openbot_cmd) => execute_openbot(&opts, openbot_cmd).await,
         CliCommand::ExportSchema { format } => {
             let val = match format {
                 ExportFormat::Cli => {

@@ -101,6 +101,13 @@ impl AppShell {
             })
     }
 
+    /// Returns `true` when `ActiveWorkspacePanel::OpenBot` is active without an occluding shell modal.
+    pub fn is_openbot_workspace_input_active(&self, cx: &App) -> bool {
+        self.active_panel == ActiveWorkspacePanel::OpenBot
+            && !self.has_browser_visual_occlusion_overlay(cx)
+            && self.openbot_workspace.is_some()
+    }
+
     /// Returns `true` when the `ComputerWorkbench` overlay's Remote Terminal or interactive PTY is focused.
     pub fn is_computer_workbench_input_active(&self, cx: &App) -> bool {
         self.active_computer_terminal_overlay(cx).is_some()
@@ -165,6 +172,7 @@ impl AppShell {
             || self.miniapps.miniapp_overlay.as_ref().is_some_and(|w| w.read(cx).has_focused_text_input())
             || self.is_studio_input_active(cx)
             || self.is_browser_workspace_input_active(cx)
+            || self.is_openbot_workspace_input_active(cx)
             || self.is_settings_input_active(cx)
             || self.is_inspector_bot_input_active(cx)
             || self.is_bot_card_input_active(cx)
@@ -251,6 +259,30 @@ impl AppShell {
                 .unwrap_or_default();
             return (txt, pre());
         }
+        if self.is_openbot_workspace_input_active(cx) {
+            let txt = self
+                .openbot_workspace
+                .as_ref()
+                .map(|ws| {
+                    let w = ws.read(cx);
+                    if w.global_search.open {
+                        w.global_search.query.clone()
+                    } else if w.show_channel_create_dialog {
+                        w.channel_editor.name.clone()
+                    } else if w.conversation.search.open {
+                        w.conversation.search.query.clone()
+                    } else if w.active_page == crate::views::openbot::OpenBotPage::Agents
+                        && w.agents.is_empty()
+                        && w.active_target == crate::views::openbot::ActiveOpenBotTarget::None
+                    {
+                        w.first_agent_setup.purpose.clone()
+                    } else {
+                        w.composer.text.clone()
+                    }
+                })
+                .unwrap_or_default();
+            return (txt, pre());
+        }
         if self.is_apple_compose_input_active(cx) {
             if sb.compose_title_focused {
                 return (sb.compose_draft.custom_group_title.clone(), pre());
@@ -315,6 +347,27 @@ impl AppShell {
             if let Some(bw) = self.browser_workspace.clone() {
                 bw.update(cx, |w, wcx| w.clear_active_input(wcx));
             }
+        } else if self.is_openbot_workspace_input_active(cx) {
+            if let Some(ws) = self.openbot_workspace.clone() {
+                ws.update(cx, |w, wcx| {
+                    if w.global_search.open {
+                        w.global_search.set_query(String::new(), 0.0, w.now_ms);
+                    } else if w.show_channel_create_dialog {
+                        w.channel_editor.set_name(String::new());
+                    } else if w.conversation.search.open {
+                        w.conversation.run_search("");
+                    } else if w.active_page == crate::views::openbot::OpenBotPage::Agents
+                        && w.agents.is_empty()
+                        && w.active_target == crate::views::openbot::ActiveOpenBotTarget::None
+                    {
+                        let _ = w.first_agent_setup.set_purpose(String::new());
+                    } else {
+                        w.composer.text.clear();
+                        w.composer.close_picker();
+                    }
+                    wcx.notify();
+                });
+            }
         } else if self.is_inspector_bot_input_active(cx) {
             self.inspector.update(cx, |ins, icx| { let _ = ins.clear_active_bot_input(icx); });
         } else if self.is_bot_card_input_active(cx) {
@@ -349,6 +402,7 @@ impl AppShell {
         if clean.is_empty()
             && !self.is_inspector_bot_input_active(cx)
             && !self.is_browser_workspace_input_active(cx)
+            && !self.is_openbot_workspace_input_active(cx)
         {
             cx.notify();
             return;
@@ -433,6 +487,13 @@ impl AppShell {
             if let Some(bw) = self.browser_workspace.clone() {
                 bw.update(cx, |w, wcx| {
                     w.insert_text_to_active_input(raw_text, wcx);
+                });
+            }
+        } else if self.is_openbot_workspace_input_active(cx) {
+            if let Some(ws) = self.openbot_workspace.clone() {
+                ws.update(cx, |w, wcx| {
+                    w.handle_text_input(raw_text);
+                    wcx.notify();
                 });
             }
         } else if self.sidebar.read(cx).search_focused {
@@ -653,6 +714,15 @@ impl AppShell {
             self.last_handled_nav_dest = Some(NavDestination::Chats);
             self.nav_rail.update(cx, |r, _| { r.set_active_destination(NavDestination::Chats); });
             return true;
+        }
+        if self.active_panel == ActiveWorkspacePanel::OpenBot {
+            if let Some(ws) = self.openbot_workspace.clone() {
+                ws.update(cx, |w, wcx| {
+                    w.handle_escape();
+                    wcx.notify();
+                });
+                return true;
+            }
         }
         if matches!(self.active_panel, ActiveWorkspacePanel::Calls | ActiveWorkspacePanel::TaskCenter | ActiveWorkspacePanel::McpTools) {
             self.active_panel = ActiveWorkspacePanel::Chats;
@@ -1165,6 +1235,51 @@ impl AppShell {
                 }
             }
         }
+        if self.is_openbot_workspace_input_active(cx) {
+            if key == "backspace" && self.ime.ime_preedit.take().is_some() {
+                cx.notify();
+                return true;
+            }
+            if key == "enter" && (self.take_ime_preedit_commit(cx) || self.ime.take_just_committed()) {
+                cx.notify();
+                return true;
+            }
+            if let Some(ws) = self.openbot_workspace.clone() {
+                let handled = match key {
+                    "backspace" => {
+                        ws.update(cx, |w, wcx| {
+                            w.handle_backspace();
+                            wcx.notify();
+                        });
+                        true
+                    }
+                    "enter" => {
+                        ws.update(cx, |w, wcx| {
+                            if is_shift {
+                                w.handle_text_input("\n");
+                            } else {
+                                w.handle_enter(false);
+                            }
+                            wcx.notify();
+                        });
+                        true
+                    }
+                    "tab" => {
+                        self.ime.clear_preedit();
+                        ws.update(cx, |w, wcx| {
+                            w.handle_tab();
+                            wcx.notify();
+                        });
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
         if self.active_panel == ActiveWorkspacePanel::Chats
             && !self.sidebar.read(cx).search_focused
             && self.sidebar.read(cx).active_creation_modal.is_none()
@@ -1465,6 +1580,13 @@ impl EntityInputHandler for AppShell {
                 + px(360.0)
                 + px((char_count as f32 * 7.5).min(360.0));
             return Some(Bounds::new(point(caret_x, element_bounds.origin.y + px(28.0)), size(px(2.0), px(18.0))));
+        }
+        if self.is_openbot_workspace_input_active(cx) {
+            let caret_x = element_bounds.origin.x
+                + px(416.0)
+                + px((char_count as f32 * 7.5).min(360.0));
+            let caret_y = element_bounds.origin.y + element_bounds.size.height - px(52.0);
+            return Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))));
         }
         if self.stage.read(cx).search_open {
             let caret_x = element_bounds.origin.x + px(360.0) + px((char_count as f32 * 8.0).min(280.0));

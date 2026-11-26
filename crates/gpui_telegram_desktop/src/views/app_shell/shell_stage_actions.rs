@@ -331,6 +331,7 @@ impl AppShell {
             modal_container: &self.modal_container,
             tasks_workspace: &self.tasks_workspace,
             browser_workspace: self.browser_workspace.as_ref(),
+            openbot_workspace: self.openbot_workspace.as_ref(),
             talk_mode_overlay: self.rtc_talk.talk_mode_overlay.as_ref(),
             computer_overlay: self.overlays.computer_overlay.as_ref(),
             media_viewer_overlay: self.overlays.media_viewer_overlay.as_ref(),

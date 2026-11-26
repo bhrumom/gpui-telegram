@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 openbot_contracts = { workspace = true }
+openbot_storage = { workspace = true }
+openbot_runtime = { workspace = true }
 gpui_telegram_core = { workspace = true }
 gpui_telegram_proto = { workspace = true }
 gpui_telegram_media = { workspace = true }

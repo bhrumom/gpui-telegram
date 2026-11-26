@@ -14,7 +14,7 @@ pub use crate::views::auth::{
     PendingAuthVaultBootstrap,
 };
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
@@ -27,7 +27,9 @@ use crate::app::session::send_as_peers::SendAsKey;
 use crate::app::{preferences::{AppPreferences, ThemeMode}, TelegramApp};
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemeMode, TdesktopThemePalette};
+use crate::theme::{
+    tg_icon, IconName, OpenBotColorScheme, TdesktopThemeMode, TdesktopThemePalette,
+};
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::app_shell::{
     build_account_record, compute_shell_palette,
@@ -37,8 +39,14 @@ use crate::views::app_shell::{
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
     ShellBotBrowserState, ShellPanelState,
 };
+use crate::views::chat_sidebar::{BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel};
+use crate::views::composer::field_autocomplete::MentionRow;
 use crate::views::composer::BotKeyboard;
 use crate::views::nav_rail::NavDestination;
+use crate::views::openbot::{
+    OPENBOT_SYNTHETIC_DIALOG_PREFIX, OpenBotRuntimeBridge, OpenBotWorkspaceShell,
+    TelegramBidirectionalProjection, load_telegram_bidirectional_projection,
+};
 use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
 };
@@ -58,6 +66,7 @@ pub enum ActiveWorkspacePanel {
     McpTools,
     Browser,
     Settings,
+    OpenBot,
 }
 
 /// Cycles the 4 built-in Telegram Desktop theme palettes (`Night -> Tinted -> Day -> Classic`).
@@ -114,6 +123,7 @@ pub struct AppShell {
     pub main_menu_drawer: Entity<MainMenuDrawer>,
     pub tasks_workspace: Entity<GlobalTasksWorkspace>,
     pub browser_workspace: Option<Entity<BrowserWorkspace>>,
+    pub openbot_workspace: Option<Entity<OpenBotWorkspaceShell>>,
     pub auth_wizard: Entity<AuthWizardView>,
     pub settings_router: Entity<SettingsRouter>,
     pub client: Arc<TelegramClient>,
@@ -229,6 +239,7 @@ impl AppShell {
             main_menu_drawer,
             tasks_workspace,
             browser_workspace: None,
+            openbot_workspace: None,
             auth_wizard,
             settings_router,
             client: client.clone(),
@@ -875,6 +886,7 @@ impl AppShell {
                 w.set_occluded(true, wcx);
             });
         }
+        self.openbot_workspace = None;
         self.bot_browser.reset_on_logout();
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
@@ -1082,6 +1094,193 @@ impl AppShell {
         }
     }
 
+    /// Returns the OpenBot workspace data directory scoped under the desktop preferences directory.
+    pub fn openbot_data_dir(&self) -> PathBuf {
+        self.preferences_dir.join("openbot")
+    }
+
+    /// Lazily constructs and hydrates the mounted [`OpenBotWorkspaceShell`] GPUI entity,
+    /// synchronizing dark/light `OpenBotColorScheme`, locale, and any live `openbot.db` data.
+    pub fn ensure_openbot_workspace(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<OpenBotWorkspaceShell> {
+        if let Some(existing) = self.openbot_workspace.clone() {
+            return existing;
+        }
+        let data_dir = self.openbot_data_dir();
+        let scheme = if self.theme_state.palette.mode.is_dark() {
+            OpenBotColorScheme::Dark
+        } else {
+            OpenBotColorScheme::Light
+        };
+        let lang = self.active_lang_id().to_string();
+        let width_px = self.overlays.last_viewport_width.round().max(960.0) as u32;
+        let created = cx.new(|_| {
+            let mut ws = OpenBotWorkspaceShell::with_data_dir(&data_dir);
+            ws.sync_color_scheme(scheme);
+            ws.sync_locale(&lang);
+            ws.set_window_width(width_px);
+            if data_dir.join("openbot.db").is_file() {
+                if let Ok(bridge) = OpenBotRuntimeBridge::open(&data_dir) {
+                    let _ = bridge.hydrate_workspace_shell(&mut ws);
+                }
+            }
+            ws
+        });
+        self.openbot_workspace = Some(created.clone());
+        created
+    }
+
+    /// Switches `AppShell` into the 1:1 OpenBot Workspace surface (`ActiveWorkspacePanel::OpenBot`),
+    /// occluding any native browser webview and synchronizing `NavRail` without mutating Telegram state.
+    pub fn open_openbot_workspace(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<OpenBotWorkspaceShell> {
+        self.hide_browser_native_webview(cx);
+        self.ime.clear_preedit();
+        self.bot_browser.ime_preedit_input_gen = None;
+        let ws = self.ensure_openbot_workspace(cx);
+        self.active_panel = ActiveWorkspacePanel::OpenBot;
+        self.last_handled_nav_dest = Some(NavDestination::OpenBot);
+        self.nav_rail.update(cx, |r, r_cx| {
+            r.set_active_destination(NavDestination::OpenBot);
+            r_cx.notify();
+        });
+        cx.notify();
+        ws
+    }
+
+    /// Bidirectionally projects live OpenBot Agents (`plush:<seed>`) and Multi-Bot Shared Channels
+    /// (`bloub:<id>`) from `data_dir/openbot.db` into `gpui-telegram`'s native `ChatSidebar` and
+    /// `CanonicalComposer` `@mention` candidates without disturbing baseline Telegram dialogs.
+    pub fn sync_openbot_peers_into_telegram_sidebar(
+        &mut self,
+        data_dir: &Path,
+        cx: &mut Context<Self>,
+    ) -> Result<TelegramBidirectionalProjection, String> {
+        let projection = if data_dir.join("openbot.db").is_file() {
+            let bridge = OpenBotRuntimeBridge::open(data_dir)?;
+            if let Some(ws) = self.openbot_workspace.clone() {
+                ws.update(cx, |shell, wcx| {
+                    let _ = bridge.hydrate_workspace_shell(shell);
+                    wcx.notify();
+                });
+            }
+            bridge.build_telegram_projection()?
+        } else {
+            load_telegram_bidirectional_projection(data_dir)?
+        };
+
+        let proj_clone = projection.clone();
+        self.sidebar.update(cx, |sb, sb_cx| {
+            let stale_ids: Vec<u64> = sb
+                .dialogs
+                .iter()
+                .filter(|d| (d.id & 0xFFFF_0000_0000_0000) == OPENBOT_SYNTHETIC_DIALOG_PREFIX)
+                .map(|d| d.id)
+                .collect();
+            for stale_id in stale_ids {
+                sb.bot_ids.remove(&stale_id);
+                sb.group_chat_ids.remove(&stale_id);
+                sb.bot_fabushi_visuals.remove(&stale_id);
+                sb.bot_grok_avatars.remove(&stale_id);
+            }
+            sb.dialogs.retain(|d| {
+                (d.id & 0xFFFF_0000_0000_0000) != OPENBOT_SYNTHETIC_DIALOG_PREFIX
+            });
+
+            for peer in &proj_clone.projected_agent_peers {
+                sb.dialogs.push(DialogItemModel {
+                    id: peer.synthetic_dialog_id,
+                    peer_name: peer.display_name.clone(),
+                    avatar_initials: peer.avatar_initials.clone(),
+                    avatar_color: peer.avatar_color_rgb,
+                    last_message: peer.subtitle.clone(),
+                    timestamp: "OpenBot".to_string(),
+                    unread_count: peer.unread_count,
+                    is_muted: false,
+                    is_pinned: false,
+                    is_online: true,
+                    typing_indicator: None,
+                    delivery_status: DialogDeliveryStatus::Read,
+                    folder: "Bots".to_string(),
+                });
+                sb.bot_ids.insert(peer.synthetic_dialog_id);
+                sb.bot_fabushi_visuals.insert(
+                    peer.synthetic_dialog_id,
+                    (peer.avatar_initials.clone(), peer.avatar_color_rgb),
+                );
+                sb.bot_grok_avatars.insert(
+                    peer.synthetic_dialog_id,
+                    BotGrokAvatarVisual {
+                        agent_id: peer.openbot_id.clone(),
+                        shape: peer.avatar_spec.clone(),
+                        color: peer.avatar_color_hex.clone(),
+                        execution_state: "idle".to_string(),
+                    },
+                );
+            }
+
+            for peer in &proj_clone.projected_channel_peers {
+                sb.dialogs.push(DialogItemModel {
+                    id: peer.synthetic_dialog_id,
+                    peer_name: peer.display_name.clone(),
+                    avatar_initials: peer.avatar_initials.clone(),
+                    avatar_color: peer.avatar_color_rgb,
+                    last_message: peer.subtitle.clone(),
+                    timestamp: "OpenBot".to_string(),
+                    unread_count: peer.unread_count,
+                    is_muted: false,
+                    is_pinned: false,
+                    is_online: true,
+                    typing_indicator: None,
+                    delivery_status: DialogDeliveryStatus::Read,
+                    folder: "Bots".to_string(),
+                });
+                sb.group_chat_ids.insert(peer.synthetic_dialog_id);
+                sb.bot_grok_avatars.insert(
+                    peer.synthetic_dialog_id,
+                    BotGrokAvatarVisual {
+                        agent_id: peer.openbot_id.clone(),
+                        shape: peer.avatar_spec.clone(),
+                        color: peer.avatar_color_hex.clone(),
+                        execution_state: "idle".to_string(),
+                    },
+                );
+            }
+            sb_cx.notify();
+        });
+
+        self.composer.update(cx, |comp, c_cx| {
+            let mut merged: Vec<(MentionRow, Option<String>)> = comp
+                .autocomplete
+                .all_mention_candidates
+                .iter()
+                .filter(|r| (r.user_id & 0xFFFF_0000_0000_0000) != OPENBOT_SYNTHETIC_DIALOG_PREFIX)
+                .cloned()
+                .map(|r| (r, None))
+                .collect();
+            for peer in &proj_clone.projected_agent_peers {
+                merged.push((
+                    MentionRow::new(
+                        peer.synthetic_dialog_id,
+                        peer.mention_handle.clone(),
+                        peer.display_name.clone(),
+                        true,
+                    ),
+                    Some("OpenBot".to_string()),
+                ));
+            }
+            comp.set_mention_candidates_with_roles(merged);
+            c_cx.notify();
+        });
+
+        cx.notify();
+        Ok(projection)
+    }
+
     /// Mutates `AppPreferences`, persists to disk + `Localstorage`, syncs `SettingsRouter`,
     /// updates locale flag, and propagates active theme/locale across child views.
     pub fn update_preferences<F>(&mut self, cx: &mut Context<Self>, f: F)
@@ -1270,6 +1469,7 @@ impl AppShell {
             || creation_dialog_open
             || show_bot_start_bar
             || self.active_panel == ActiveWorkspacePanel::Browser
+            || self.active_panel == ActiveWorkspacePanel::OpenBot
     }
 
     /// Flushes the active chat's unsent draft and isolates `CanonicalComposer` for `+` / creation.
@@ -1972,6 +2172,9 @@ impl Render for AppShell {
         if (vp_w - self.overlays.last_viewport_width).abs() >= 1.0 && vp_w > 0.0 {
             self.overlays.last_viewport_width = vp_w;
             self.app.sync_viewport_size(vp_w, vp_h);
+            if let Some(ref ws) = self.openbot_workspace {
+                ws.update(cx, |shell, _| shell.set_window_width(vp_w.round() as u32));
+            }
         }
 
         self.reconcile_chat_scoped_toasts(cx);
@@ -2066,7 +2269,19 @@ impl Render for AppShell {
             .bg(rgb(pal.window_bg))
             .child(ime_canvas)
             .when_some(update_banner, |el, banner| el.child(banner))
-            .child(
+            .child(if self.active_panel == ActiveWorkspacePanel::OpenBot {
+                div()
+                    .id("app-shell-openbot-slot")
+                    .flex_1()
+                    .size_full()
+                    .min_h(px(0.0))
+                    .min_w(px(0.0))
+                    .flex()
+                    .when_some(self.openbot_workspace.clone(), |slot, ws| {
+                        slot.child(div().flex_1().size_full().child(ws))
+                    })
+                    .into_any_element()
+            } else {
                 div().flex_1().w_full().min_h(px(0.0)).flex()
                     .child(self.sidebar.clone())
                     .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
@@ -2115,8 +2330,9 @@ impl Render for AppShell {
                                 .into_any_element(),
                         )
                         .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
-                    }),
-            )
+                    })
+                    .into_any_element()
+            })
             .when(show_conn_banner && !has_blocking_overlay, |el| {
                 let pill_bg = if pal.mode.is_dark() {
                     hsla(0.0, 0.0, 0.14, 0.92)

@@ -1,4 +1,5 @@
 use crate::error::CliError;
+use crate::openbot::{OpenBotCommand, parse_openbot_args};
 use crate::registry::{
     infer_array_item_type, resolve_action, resolve_category, resolve_category_action,
     DEFAULT_SERVER_URL,
@@ -107,6 +108,7 @@ pub enum CliCommand {
         input: Value,
     },
     Unified(UnifiedCommand),
+    OpenBot(OpenBotCommand),
 }
 
 #[derive(Debug, Clone)]
@@ -390,6 +392,7 @@ pub fn parse_args(
         "export-schema" => parse_export_schema_args(args, idx, opts, help_requested),
         "schema" => parse_schema_args(args, idx, opts, help_requested),
         "approve" => parse_approve_args(args, idx, opts, help_requested),
+        "openbot" => parse_openbot_args(args, idx, opts, help_requested),
         other => {
             if let Some(outcome) =
                 parse_unified_command(other, args, idx, &mut opts, help_requested)?

@@ -12,10 +12,18 @@ path = "src/lib.rs"
 name = "fabushi"
 path = "src/main.rs"
 
+[[bin]]
+name = "gpui-telegram-cli"
+path = "src/bin/gpui-telegram-cli.rs"
+
 [dependencies]
 gpui_telegram_core = { workspace = true }
 gpui_telegram_proto = { workspace = true }
 fabushi_remote_engine = { workspace = true }
+openbot_contracts = { workspace = true }
+openbot_storage = { workspace = true }
+openbot_runtime = { workspace = true }
+gpui_telegram_desktop = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

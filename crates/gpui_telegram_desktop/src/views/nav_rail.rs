@@ -29,6 +29,7 @@ pub enum NavDestination {
     Browser,
     SavedMessages,
     Settings,
+    OpenBot,
 }
 
 impl NavDestination {
@@ -44,6 +45,7 @@ impl NavDestination {
             Self::Browser => IconName::ScreenShare,
             Self::SavedMessages => IconName::SavedMessages,
             Self::Settings => IconName::SettingsGear,
+            Self::OpenBot => IconName::BotRobot,
         }
     }
 
@@ -59,6 +61,7 @@ impl NavDestination {
             Self::Browser => tr_str(lang_id, "浏览器", "Browser"),
             Self::SavedMessages => tr_str(lang_id, "收藏夹", "Saved Messages"),
             Self::Settings => tr_str(lang_id, "设置", "Settings"),
+            Self::OpenBot => tr_str(lang_id, "OpenBot", "OpenBot"),
         }
     }
 }
@@ -605,7 +608,34 @@ impl Render for NavRail {
                                 cx.notify();
                             }),
                         )
-                    })),
+                    }))
+                    .child(
+                        div()
+                            .w(px(NAV_DIVIDER_WIDTH))
+                            .h(px(NAV_DIVIDER_HEIGHT))
+                            .my(px(2.0))
+                            .bg(divider_bg),
+                    )
+                    // Dedicated OpenBot Dual-Surface Workspace launcher (preserves 10-item baseline `self.items`)
+                    .child(
+                        render_rail_tile(
+                            NavDestination::OpenBot.icon_name(),
+                            19.0,
+                            active_dest == NavDestination::OpenBot,
+                            0,
+                            false,
+                            dark_rail,
+                            &palette,
+                        )
+                        .id("nav-rail-openbot-workspace")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _window, cx| {
+                                this.select(NavDestination::OpenBot);
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
             // Bottom Section: Theme Toggle + Logout + Connection Dot
             .child(
