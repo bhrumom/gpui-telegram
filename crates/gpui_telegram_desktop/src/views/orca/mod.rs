@@ -31,3 +31,31 @@ pub use security_surface::{
     SecurityModalKind, SecuritySurfaceDecision, SecuritySurfaceModal, SecuritySurfaceModalState,
     SecuritySurfacePalette,
 };
+
+// M5.2 Agent IDE Surfaces (strictly additive)
+pub mod diff_tasks_panel;
+pub mod ide_state;
+pub mod ide_workspace;
+pub mod jump_palette;
+pub mod orchestration_board;
+pub mod split_layout;
+pub mod usage_vault_plugins;
+
+pub use diff_tasks_panel::{attribution_gutter_meta, render_diff_tasks_drawer};
+pub use ide_state::{
+    DiffDisplayMode, DiffTasksSubTab, IdeInputTarget, OrcaIdeAction, OrcaIdeDrawer,
+    OrcaIdeSurfaceState, OrchestrationBoardTab, PopoutKanbanWindowState,
+};
+pub use ide_workspace::OrcaIdeWorkspace;
+pub use jump_palette::{
+    JUMP_PALETTE_PAGE_SIZE, JUMP_PALETTE_RECENT_SHORTCUT_COUNT, JumpPaletteFilterChip,
+    JumpPaletteSelection, OrcaJumpPaletteState, ScopedJumpPalette,
+};
+pub use orchestration_board::{
+    AgentPopoutKanban, agent_run_state_meta, open_popout_kanban_window,
+    render_orchestration_board_drawer,
+};
+pub use split_layout::{render_split_layout, tab_content_badge_color, tab_content_icon};
+pub use usage_vault_plugins::{
+    format_countdown_ms, render_ai_vault_drawer, render_plugins_drawer, render_usage_popover_drawer,
+};
