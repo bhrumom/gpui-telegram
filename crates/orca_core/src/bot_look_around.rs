@@ -65,7 +65,9 @@ pub fn ensure_look_around_agent(agent: BotAgentId) -> Result<(), BotError> {
 #[serde(rename_all = "kebab-case")]
 pub enum LookAroundEvery {
     #[default]
+    #[serde(rename = "every-4h", alias = "every4h")]
     Every4h,
+    #[serde(rename = "every-2h", alias = "every2h")]
     Every2h,
     TwiceDaily,
     Mornings,
@@ -207,6 +209,7 @@ pub struct LookAroundPatch {
     pub every: Option<LookAroundEvery>,
     pub weekdays_only: Option<bool>,
     pub focus: Option<Option<String>>,
+    pub since_ms: Option<i64>,
 }
 
 impl LookAroundState {
@@ -251,7 +254,9 @@ pub fn patch_look_around(
     next.schedule.validate()?;
 
     let next_on = patch.on.unwrap_or(current.on);
-    if !current.on && next_on {
+    if let Some(explicit_since) = patch.since_ms {
+        next.schedule.since_ms = Some(explicit_since);
+    } else if !current.on && next_on {
         next.schedule.since_ms = Some(now_ms);
     }
     next.on = next_on;
@@ -501,7 +506,7 @@ pub enum UpNextState {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotUpNext {
     pub state: UpNextState,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub suggestions: Vec<Suggestion>,
     pub shown: usize,
     pub overflow: usize,
@@ -4929,6 +4934,7 @@ mod tests {
                 every: None,
                 weekdays_only: None,
                 focus: Some(Some(ok_focus)),
+                since_ms: None,
             },
             1_000_000,
         )

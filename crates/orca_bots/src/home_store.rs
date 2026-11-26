@@ -1,6 +1,7 @@
 //! Bot home directory store: slug validation, `bot.json` ownership guard,
 //! atomic CAS filesystem primitives, generated/seeded files, and skill symlinks.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -39,7 +40,10 @@ pub struct WorktreeReleaseBotHome {
 pub struct BotHomeStore {
     root: PathBuf,
     cas_lock: Arc<Mutex<()>>,
+    folder_overrides: Arc<Mutex<BTreeMap<String, PathBuf>>>,
 }
+
+const FOLDER_OVERRIDES_FILE: &str = ".folder_overrides.json";
 
 impl BotHomeStore {
     /// Resolves the default bots root directory (`~/.fabushi/bots`).
@@ -59,9 +63,12 @@ impl BotHomeStore {
 
     /// Creates a store rooted at an explicit directory (for tests or isolated profiles).
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let loaded = load_folder_overrides(&root);
         Self {
-            root: root.into(),
+            root,
             cas_lock: Arc::new(Mutex::new(())),
+            folder_overrides: Arc::new(Mutex::new(loaded)),
         }
     }
 
@@ -70,9 +77,61 @@ impl BotHomeStore {
         &self.root
     }
 
+    /// Registers an explicit absolute `home_path` override for `folder` so all provisioning,
+    /// memory writes, skill symlinks, and `.mcp.json` scrubbing target that exact directory.
+    pub fn register_folder_override(
+        &self,
+        folder: &BotFolderSlug,
+        home_path: PathBuf,
+    ) -> Result<PathBuf> {
+        if !home_path.is_absolute() {
+            return Err(OrcaBotsError::bot(
+                BotErrorCode::InvalidArgument,
+                "Explicit bot homePath must be an absolute path.",
+            ));
+        }
+        fs::create_dir_all(&home_path)?;
+        let mut map = self.folder_overrides.lock().map_err(|_| {
+            OrcaBotsError::bot(
+                BotErrorCode::InvalidArgument,
+                "BotHomeStore folder_overrides lock poisoned.",
+            )
+        })?;
+        map.insert(folder.as_str().to_string(), home_path.clone());
+        let _ = save_folder_overrides(&self.root, &map);
+        Ok(home_path)
+    }
+
+    /// Returns `true` if `folder` is mapped to an explicit `home_path` override.
+    pub fn has_folder_override(&self, folder: &BotFolderSlug) -> bool {
+        self.folder_overrides
+            .lock()
+            .ok()
+            .is_some_and(|m| m.contains_key(folder.as_str()))
+    }
+
+    /// Removes any registered explicit `home_path` override for `folder`.
+    pub fn unregister_folder_override(&self, folder: &BotFolderSlug) {
+        if let Ok(mut map) = self.folder_overrides.lock()
+            && map.remove(folder.as_str()).is_some()
+        {
+            let _ = save_folder_overrides(&self.root, &map);
+        }
+    }
+
     /// Resolves the absolute directory path for a validated `BotFolderSlug`.
     pub fn bot_dir(&self, folder: &BotFolderSlug) -> PathBuf {
+        if let Ok(map) = self.folder_overrides.lock()
+            && let Some(override_dir) = map.get(folder.as_str())
+        {
+            return override_dir.clone();
+        }
         self.root.join(folder.as_str())
+    }
+
+    /// Convenience helper resolving the absolute home directory for `bot`.
+    pub fn bot_dir_for(&self, bot: &OrcaBotRecord) -> PathBuf {
+        self.bot_dir(&bot.folder)
     }
 
     /// Validates a raw slug string via `BotFolderSlug::new` and returns its bot directory path.
@@ -295,9 +354,16 @@ impl BotHomeStore {
     ) -> Result<PathBuf> {
         let dir = self.bot_dir(&bot.folder);
         if !dir.exists() {
-            self.reserve_directory(&bot.folder)?;
+            if self.has_folder_override(&bot.folder) {
+                fs::create_dir_all(&dir)?;
+            } else {
+                self.reserve_directory(&bot.folder)?;
+            }
         } else if !is_dir_empty(&dir)? {
-            self.assert_bot_owns_home(&bot.folder, &bot.id)?;
+            let manifest_exists = dir.join("bot.json").exists();
+            if manifest_exists || !self.has_folder_override(&bot.folder) {
+                self.assert_bot_owns_home(&bot.folder, &bot.id)?;
+            }
         }
 
         fs::create_dir_all(dir.join("memory"))?;
@@ -388,6 +454,7 @@ impl BotHomeStore {
         self.assert_bot_owns_home(folder, bot_id)?;
         let home_path = self.bot_dir(folder);
         fs::remove_dir_all(&home_path)?;
+        self.unregister_folder_override(folder);
         Ok(WorktreeReleaseBotHome {
             bot_id: bot_id.to_string(),
             folder: folder.clone(),
@@ -396,6 +463,20 @@ impl BotHomeStore {
             released_at_ms: now_epoch_ms(),
         })
     }
+}
+
+fn load_folder_overrides(root: &Path) -> BTreeMap<String, PathBuf> {
+    let path = root.join(FOLDER_OVERRIDES_FILE);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_str::<BTreeMap<String, PathBuf>>(&raw).unwrap_or_default()
+}
+
+fn save_folder_overrides(root: &Path, map: &BTreeMap<String, PathBuf>) -> Result<()> {
+    fs::create_dir_all(root)?;
+    let bytes = serde_json::to_vec_pretty(map)?;
+    atomic_write_bytes(&root.join(FOLDER_OVERRIDES_FILE), &bytes)
 }
 
 fn is_dir_empty(dir: &Path) -> Result<bool> {

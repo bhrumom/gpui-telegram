@@ -77,30 +77,39 @@ pub struct ObservationFact {
 /// Request to start a worker dispatch on a ready task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartWorkerRequest {
+    #[serde(alias = "runId")]
     pub run_id: String,
+    #[serde(alias = "taskId")]
     pub task_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "dispatchId", skip_serializing_if = "Option::is_none")]
     pub dispatch_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "hostId",
+        alias = "on",
+        alias = "targetServer",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_id: Option<String>,
+    #[serde(alias = "agent", alias = "agentId")]
     pub agent_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "worktree", alias = "worktreeId", skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "capabilityManifest", skip_serializing_if = "Option::is_none")]
     pub capability_manifest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "launchToken", skip_serializing_if = "Option::is_none")]
     pub launch_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "followUpOfDispatchId", skip_serializing_if = "Option::is_none")]
     pub follow_up_of_dispatch_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "keepOpen")]
     pub keep_open: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "tabId", skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "ptyIncarnationId", skip_serializing_if = "Option::is_none")]
     pub pty_incarnation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "nowMs", skip_serializing_if = "Option::is_none")]
     pub now_ms: Option<i64>,
 }
 
@@ -125,21 +134,37 @@ pub struct LivenessReportOutcome {
     pub coordinator_woken: bool,
 }
 
+const fn default_expected_gen_1() -> u64 {
+    1
+}
+
+const fn default_succeeded_true() -> bool {
+    true
+}
+
 /// Request to settle a worker dispatch and handle terminal archiving/auto-teardown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteWorkerRequest {
+    #[serde(alias = "dispatchId", alias = "dispatch")]
     pub dispatch_id: String,
+    #[serde(default = "default_expected_gen_1", alias = "expectedGeneration")]
     pub expected_generation: u64,
+    #[serde(default = "default_succeeded_true")]
     pub succeeded: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "exitCode", skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "transcriptText",
+        alias = "summary",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub transcript_text: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "keepOpen")]
     pub keep_open: bool,
-    #[serde(default)]
+    #[serde(default, alias = "setupFailed")]
     pub setup_failed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "nowMs", skip_serializing_if = "Option::is_none")]
     pub now_ms: Option<i64>,
 }
 
@@ -239,7 +264,7 @@ pub struct OrchestrationQuestion {
     pub answered_at_ms: Option<i64>,
 }
 
-/// Parses shorthand target strings (`@all`, `@idle`, `@worktree:<id>`, `@<agent>`, `dispatch:<id>`).
+/// Parses shorthand target strings (`@all`, `@idle`, `@worktree:<id>`, `@agent:<name>`, `@<agent>`, `dispatch:<id>`).
 pub fn parse_mailbox_target(raw: &str) -> MailboxTarget {
     let trimmed = raw.trim();
     if trimmed == "@all" {
@@ -249,6 +274,10 @@ pub fn parse_mailbox_target(raw: &str) -> MailboxTarget {
     } else if let Some(wt) = trimmed.strip_prefix("@worktree:") {
         MailboxTarget::GroupWorktree {
             worktree_id: wt.trim().to_string(),
+        }
+    } else if let Some(agent) = trimmed.strip_prefix("@agent:") {
+        MailboxTarget::GroupAgent {
+            agent: agent.trim().to_string(),
         }
     } else if let Some(agent) = trimmed.strip_prefix('@') {
         MailboxTarget::GroupAgent {
@@ -611,16 +640,18 @@ impl OrchestrationEngine {
         let effective_keep_open = req.keep_open || ctx_keep_open != 0 || effective_setup_failed;
 
         let (liveness_str, liveness_exit) = liveness_to_cols(liveness);
+        let kept_open_idle = i32::from(effective_keep_open && next_dispatch_status == DispatchStatus::Completed);
         conn.execute(
             "UPDATE worker_dispatches
              SET generation = ?1, status = ?2, liveness = ?3, exit_code = ?4,
-                 is_idle = 0, updated_at_ms = ?5
-             WHERE dispatch_id = ?6",
+                 is_idle = ?5, updated_at_ms = ?6
+             WHERE dispatch_id = ?7",
             params![
                 i64::try_from(new_generation).unwrap_or(i64::MAX),
                 dispatch_status_to_str(next_dispatch_status),
                 liveness_str,
                 liveness_exit,
+                kept_open_idle,
                 now_ms,
                 &req.dispatch_id
             ],
@@ -773,7 +804,226 @@ impl OrchestrationEngine {
              WHERE dispatch_id = ?2 AND released_at_ms IS NULL",
             params![now_ms, dispatch_id],
         )?;
+        conn.execute(
+            "UPDATE dispatch_contexts SET keep_open = 0 WHERE dispatch_id = ?1",
+            params![dispatch_id],
+        )?;
+        conn.execute(
+            "UPDATE worker_dispatches SET is_idle = 0, updated_at_ms = ?1 WHERE dispatch_id = ?2",
+            params![now_ms, dispatch_id],
+        )?;
         Ok(released)
+    }
+
+    /// Appends a note/transcript line into `worker_terminal_archives` for `dispatch_id`.
+    pub fn record_worker_archive(
+        &self,
+        dispatch_id: &str,
+        transcript_text: &str,
+        now_ms: Option<i64>,
+    ) -> Result<WorkerTerminalArchive> {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let archive_id = format!("arch-{}", Uuid::new_v4());
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO worker_terminal_archives
+             (archive_id, dispatch_id, transcript_text, archived_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&archive_id, dispatch_id, transcript_text, now_ms],
+        )?;
+        Ok(WorkerTerminalArchive {
+            archive_id,
+            dispatch_id: dispatch_id.to_string(),
+            transcript_text: transcript_text.to_string(),
+            archived_at_ms: now_ms,
+        })
+    }
+
+    /// Looks up `(run_id, task_id)` for a persisted dispatch context.
+    pub fn lookup_dispatch_run_task(&self, dispatch_id: &str) -> Result<(String, String)> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT run_id, task_id FROM dispatch_contexts WHERE dispatch_id = ?1",
+            params![dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            OrcaIdeRuntimeError::ide(
+                OrcaIdeErrorCode::UnknownDispatch,
+                format!("unknown dispatch '{dispatch_id}'"),
+            )
+        })
+    }
+
+    /// Finds the most recent dispatch_id associated with `task_id`.
+    pub fn lookup_dispatch_for_task(&self, task_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let found = conn
+            .query_row(
+                "SELECT dispatch_id FROM dispatch_contexts
+                 WHERE task_id = ?1
+                 ORDER BY created_at_ms DESC LIMIT 1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// Returns `true` when `dispatch_id` exists in `worker_dispatches` or `federated_dispatches`
+    /// and has not yet reached a terminal settled state (`completed`, `failed`, `canceled`, `circuit_broken`).
+    pub fn is_dispatch_unsettled(&self, dispatch_id: &str) -> Result<bool> {
+        let trimmed = dispatch_id.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        let local_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM worker_dispatches WHERE dispatch_id = ?1",
+                params![trimmed],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(status) = local_status {
+            return Ok(!matches!(
+                status.as_str(),
+                "completed" | "failed" | "canceled" | "circuit_broken"
+            ));
+        }
+        let federated_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM federated_dispatches WHERE dispatch_id = ?1",
+                params![trimmed],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(status) = federated_status {
+            return Ok(!matches!(
+                status.as_str(),
+                "completed" | "failed" | "canceled" | "circuit_broken"
+            ));
+        }
+        Ok(false)
+    }
+
+    /// Inspects live/settled worker state including `terminalClosed` for `orchestration.worker.show`.
+    pub fn get_worker_show(&self, dispatch_id: &str) -> Result<serde_json::Value> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT c.dispatch_id, c.run_id, c.task_id, c.agent_id, c.worktree_id,
+                        c.keep_open, c.setup_failed, w.host_id, w.generation, w.status, w.is_idle
+                 FROM dispatch_contexts c
+                 JOIN worker_dispatches w ON w.dispatch_id = c.dispatch_id
+                 WHERE c.dispatch_id = ?1",
+                params![dispatch_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, i64>(5)? != 0,
+                        r.get::<_, i64>(6)? != 0,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, String>(9)?,
+                        r.get::<_, i64>(10)? != 0,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                OrcaIdeRuntimeError::ide(
+                    OrcaIdeErrorCode::UnknownDispatch,
+                    format!("unknown dispatch '{dispatch_id}'"),
+                )
+            })?;
+        let mut stmt = conn.prepare(
+            "SELECT resource_id, released_at_ms FROM worker_terminal_resources WHERE dispatch_id = ?1",
+        )?;
+        let res_rows = stmt
+            .query_map(params![dispatch_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let settled = matches!(row.9.as_str(), "completed" | "failed" | "canceled");
+        let terminal_closed = if !res_rows.is_empty() {
+            res_rows.iter().all(|(_, rel)| rel.is_some())
+        } else {
+            settled && !row.5
+        };
+        Ok(serde_json::json!({
+            "id": row.0,
+            "dispatchId": row.0,
+            "runId": row.1,
+            "taskId": row.2,
+            "agentId": row.3,
+            "agent": row.3,
+            "worktreeId": row.4,
+            "keepOpen": row.5,
+            "setupFailed": row.6,
+            "hostId": row.7,
+            "generation": row.8,
+            "status": row.9,
+            "isIdle": row.10,
+            "terminalClosed": terminal_closed,
+        }))
+    }
+
+    /// Lists all mailbox messages persisted in `run_id` ordered by monotonic SQLite `rowid` (`seq`).
+    pub fn list_run_mailbox(&self, run_id: &str) -> Result<Vec<(i64, MailboxMessage)>> {
+        let conn = self.conn.lock();
+        let _run = Self::get_run_inner(&conn, run_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT rowid, message_id, run_id, from_id, target_kind, target_value,
+                    message_type, priority, route_kind, server_host_id,
+                    body, dispatch_generation, delivery_state, created_at_ms
+             FROM messages
+             WHERE run_id = ?1
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, i64>(13)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let msg = MailboxMessage {
+                message_id: r.1,
+                run_id: r.2,
+                from_id: r.3,
+                target: cols_to_target(&r.4, r.5)?,
+                message_type: str_to_message_type(&r.6)?,
+                priority: str_to_priority(&r.7)?,
+                route: cols_to_route(&r.8, r.9)?,
+                body: r.10,
+                dispatch_generation: r.11.map(|g| u64::try_from(g.max(0)).unwrap_or(0)),
+                delivery_state: str_to_delivery_state(&r.12)?,
+                created_at_ms: r.13,
+            };
+            out.push((r.0, msg));
+        }
+        Ok(out)
     }
 
     /// Lists all tracked terminal resources (released and unreleased) for `dispatch_id`.
@@ -1074,7 +1324,9 @@ impl OrchestrationEngine {
             "SELECT w.dispatch_id, w.generation, c.agent_id, c.worktree_id, w.is_idle, w.status
              FROM worker_dispatches w
              JOIN dispatch_contexts c ON c.dispatch_id = w.dispatch_id
-             WHERE c.run_id = ?1 AND w.status IN ('pending', 'dispatched')
+             WHERE c.run_id = ?1
+               AND (w.status IN ('pending', 'dispatched')
+                    OR (w.status = 'completed' AND c.keep_open = 1 AND w.is_idle = 1))
              ORDER BY w.dispatch_id ASC",
         )?;
         let rows = stmt

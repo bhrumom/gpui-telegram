@@ -523,21 +523,7 @@ impl AppShell {
                 true
             }
             "j" => {
-                if matches!(
-                    self.active_panel,
-                    ActiveWorkspacePanel::Community | ActiveWorkspacePanel::ContentHub(_)
-                ) {
-                    self.refresh_contacts(cx);
-                    self.open_modal_dialog(
-                        tr_str(lang, "联系人", "Contacts"),
-                        ModalDialogKind::Contacts,
-                        420.0,
-                        500.0,
-                        cx,
-                    );
-                } else {
-                    self.toggle_scoped_jump_palette(cx);
-                }
+                self.toggle_scoped_jump_palette(cx);
                 true
             }
             "n" => {

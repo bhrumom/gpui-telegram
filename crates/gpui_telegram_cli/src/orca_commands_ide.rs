@@ -43,7 +43,7 @@ pub(crate) async fn execute_worktree(
         "parse-yaml" => {
             let yaml_text = if let Some(raw_yaml) = args.first(&["--yaml", "--content"]) {
                 raw_yaml.to_string()
-            } else if let Some(file_path) = args.first(&["--file"]) {
+            } else if let Some(file_path) = args.first(&["--file", "--path"]) {
                 std::fs::read_to_string(file_path).map_err(|e| {
                     orca_usage(format!("Failed reading orca.yaml file '{file_path}': {e}"))
                 })?
@@ -57,7 +57,7 @@ pub(crate) async fn execute_worktree(
                 }
             } else {
                 return Err(orca_usage(
-                    "Missing required <file> or --yaml argument for 'worktree parse-yaml'",
+                    "Missing required <file>, --path, or --yaml argument for 'worktree parse-yaml'",
                 ));
             };
             http.post("/api/v1/orca/ide/orca-yaml/parse", &json!({ "yaml": yaml_text }))
@@ -68,7 +68,7 @@ pub(crate) async fn execute_worktree(
             let target = req_str(
                 args,
                 Some(1),
-                &["--target", "--target-worktree-root"],
+                &["--target", "--dest", "--target-worktree-root"],
                 "--target",
             )?;
             let rules = if let Some(raw_rules) = args.first(&["--rules"]) {
@@ -117,7 +117,7 @@ pub(crate) async fn execute_worktree(
                 "repo_root": repo_root,
                 "worktree_path": wt_path,
             });
-            if let Some(branch) = args.first(&["--branch", "--branch-name"]) {
+            if let Some(branch) = args.first(&["--branch", "--branch-name", "--name"]) {
                 body["branch_name"] = json!(branch);
             }
             if let Some(title) = args.first(&["--title"]) {
@@ -129,7 +129,12 @@ pub(crate) async fn execute_worktree(
             http.post("/api/v1/orca/ide/worktrees", &body).await
         }
         "set" => {
-            let id = req_str(args, Some(0), &["--id", "--worktree-id"], "<worktree_id>")?;
+            let id = req_str(
+                args,
+                Some(0),
+                &["--id", "--worktree-id", "--worktree"],
+                "<worktree_id>",
+            )?;
             let mut body = Map::new();
             if let Some(comment) = args.first(&["--comment", "--checkpoint-comment"]) {
                 body.insert("checkpoint_comment".into(), json!(comment));
@@ -147,7 +152,22 @@ pub(crate) async fn execute_worktree(
             .await
         }
         "cleanup" | "remove" => {
-            let id = req_str(args, Some(0), &["--id", "--worktree-id"], "<worktree_id>")?;
+            if args.has_bool(&["--preview"]) {
+                let mut body = json!({ "preview": true });
+                if let Some(repo) = args.first(&["--repo", "--repo-path", "--repo-root"]) {
+                    body["repoPath"] = json!(repo);
+                }
+                if let Some(id) = args.first(&["--id", "--worktree-id", "--worktree"]).or_else(|| args.pos(0)) {
+                    body["worktree_id"] = json!(id);
+                }
+                return http.post("/api/v1/orca/ide/worktrees/cleanup", &body).await;
+            }
+            let id = req_str(
+                args,
+                Some(0),
+                &["--id", "--worktree-id", "--worktree"],
+                "<worktree_id>",
+            )?;
             let body = json!({
                 "worktree_id": id,
                 "unsaved_editor_tabs": args.all(&["--unsaved-tab"]),
@@ -156,7 +176,17 @@ pub(crate) async fn execute_worktree(
             });
             http.post("/api/v1/orca/ide/worktrees/cleanup", &body).await
         }
-        "ports" => http.get("/api/v1/orca/ide/worktrees/ports").await,
+        "ports" => {
+            let mut q = Vec::new();
+            if let Some(wid) = args
+                .first(&["--worktree", "--worktree-id", "--id"])
+                .or_else(|| args.pos(0))
+            {
+                q.push(("worktree_id", wid.to_string()));
+            }
+            http.get(&build_query_url("/api/v1/orca/ide/worktrees/ports", &q))
+                .await
+        }
         other => Err(CliError::UnknownCommand(format!(
             "Unknown 'worktree' subcommand '{other}'"
         ))),
@@ -165,16 +195,23 @@ pub(crate) async fn execute_worktree(
 
 fn load_plugin_manifest_body(args: &OrcaArgBag) -> Result<Map<String, Value>, CliError> {
     let mut body = Map::new();
-    if let Some(raw) = args.first(&["--manifest", "--file"]).or_else(|| args.pos(0)) {
-        let parsed = load_json_file_or_inline(raw, "plugin manifest")?;
-        if parsed.get("manifest").is_some() {
-            if let Some(obj) = parsed.as_object() {
-                for (k, v) in obj {
-                    body.insert(k.clone(), v.clone());
-                }
-            }
+    if let Some(path_raw) = args.first(&["--path"]) {
+        body.insert("path".into(), json!(path_raw));
+    } else if let Some(raw) = args.first(&["--manifest", "--file"]).or_else(|| args.pos(0)) {
+        let p = std::path::Path::new(raw);
+        if p.is_dir() {
+            body.insert("path".into(), json!(raw));
         } else {
-            body.insert("manifest".into(), parsed);
+            let parsed = load_json_file_or_inline(raw, "plugin manifest")?;
+            if parsed.get("manifest").is_some() {
+                if let Some(obj) = parsed.as_object() {
+                    for (k, v) in obj {
+                        body.insert(k.clone(), v.clone());
+                    }
+                }
+            } else {
+                body.insert("manifest".into(), parsed);
+            }
         }
     } else if let Some(id) = args.first(&["--id", "--plugin-id"]) {
         let manifest = json!({
@@ -191,7 +228,7 @@ fn load_plugin_manifest_body(args: &OrcaArgBag) -> Result<Map<String, Value>, Cl
         body.insert("manifest".into(), manifest);
     } else {
         return Err(orca_usage(
-            "Missing required <manifest.json> or --manifest argument",
+            "Missing required --path <dir> or <manifest.json> or --manifest argument",
         ));
     }
     if let Some(pkg) = args.first(&["--package-dir"]) {
@@ -224,6 +261,9 @@ pub(crate) async fn execute_ide(
                 "line_start": line_start,
                 "body": body_text,
             });
+            if let Some(repo) = args.first(&["--repo", "--repo-path"]) {
+                payload["repo_path"] = json!(repo);
+            }
             if let Some(le) = args.opt_u32(&["--line-end"])? {
                 payload["line_end"] = json!(le);
             }
@@ -238,6 +278,9 @@ pub(crate) async fn execute_ide(
         }
         "diff-list" => {
             let mut q = Vec::new();
+            if let Some(repo) = args.first(&["--repo", "--repo-path"]) {
+                q.push(("repo_path", repo.to_string()));
+            }
             if let Some(fp) = args.first(&["--file", "--file-path"]).or_else(|| args.pos(0)) {
                 q.push(("file_path", fp.to_string()));
             }
@@ -252,6 +295,9 @@ pub(crate) async fn execute_ide(
         }
         "diff-batch" => {
             let mut q = Vec::new();
+            if let Some(repo) = args.first(&["--repo", "--repo-path"]) {
+                q.push(("repo_path", repo.to_string()));
+            }
             if let Some(fp) = args.first(&["--file", "--file-path"]).or_else(|| args.pos(0)) {
                 q.push(("file_path", fp.to_string()));
             }
@@ -309,31 +355,12 @@ pub(crate) async fn execute_ide(
                     "true" | "false" | "1" | "0"
                 )
             {
-                // Explicit capability fingerprint passed: install first, then approve with exact fingerprint.
-                body.insert("approve".into(), json!(false));
-                body.insert("enforce_approval".into(), json!(false));
-                let installed = http
+                // Atomic single-call checked install + fingerprint approval (never persists on mismatch).
+                body.insert("approve_fingerprint".into(), json!(fp_raw.trim()));
+                body.insert("enforce_approval".into(), json!(true));
+                return http
                     .post("/api/v1/orca/ide/plugins", &Value::Object(body))
-                    .await?;
-                let plugin_id = installed
-                    .get("manifest")
-                    .and_then(|m| m.get("id"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| orca_usage("Installed plugin response missing manifest.id"))?;
-                let decision = http
-                    .post(
-                        "/api/v1/orca/ide/plugins",
-                        &json!({
-                            "action": "approve",
-                            "plugin_id": plugin_id,
-                            "fingerprint": fp_raw.trim(),
-                        }),
-                    )
-                    .await?;
-                return Ok(json!({
-                    "installed": installed,
-                    "approval": decision,
-                }));
+                    .await;
             }
             let approve_bool = opts.approve
                 || args.opt_bool(&["--approve"])?.unwrap_or(false)
@@ -424,11 +451,58 @@ async fn execute_ide_runtime(
 ) -> Result<Value, CliError> {
     match sub {
         "computer-hotkey" => {
-            let target_id = args
-                .first(&["--target-id", "--target"])
-                .unwrap_or("window-1")
-                .to_string();
-            let target_kind = match args.first(&["--target-kind"]) {
+            if args.has_bool(&["--text-stdin", "--value-stdin"]) {
+                let mut stdin_secret = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_secret)
+                    .map_err(|e| orca_usage(format!("Failed reading --text-stdin: {e}")))?;
+                let trimmed = stdin_secret.trim_end_matches(['\r', '\n']);
+                let app = args.first(&["--app"]).unwrap_or("Fabushi");
+                let target = args.first(&["--target-id", "--target"]).unwrap_or("@e2");
+                let rpc = http
+                    .post(
+                        "/api/v1/orca/rpc",
+                        &json!({
+                            "method": "computer.setValue",
+                            "params": {
+                                "app": app,
+                                "target": target,
+                                "value": trimmed,
+                                "secret": true,
+                                "background_delivery": true,
+                            },
+                            "protocol_version": 3,
+                            "caller_scope": "cli",
+                        }),
+                    )
+                    .await?;
+                let mut out = rpc.get("result").cloned().unwrap_or(rpc);
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("allowed".into(), json!(true));
+                    obj.insert("via_stdin".into(), json!(true));
+                    obj.insert("redacted".into(), json!(true));
+                }
+                return Ok(out);
+            }
+
+            let target_id_opt = args.first(&["--target-id", "--target"]);
+            let target_kind_opt = args.first(&["--target-kind"]);
+            if target_id_opt.is_none()
+                && target_kind_opt.is_none()
+                && !args.has_bool(&["--approve-target", "--allow-foreground-restore"])
+            {
+                let key_str = args
+                    .first(&["--key", "--chord"])
+                    .or_else(|| args.pos(0))
+                    .ok_or_else(|| orca_usage("Missing required --key <chord> or --text-stdin"))?;
+                let body = json!({
+                    "key": key_str,
+                    "allow_system_shortcut": args.has_bool(&["--allow-system-shortcut"]),
+                });
+                return http.post("/api/v1/orca/ide/computer/guard", &body).await;
+            }
+
+            let target_id = target_id_opt.unwrap_or("window-1").to_string();
+            let target_kind = match target_kind_opt {
                 Some(raw) => parse_target_kind(raw)?,
                 None => ComputerUseTargetKind::NormalWindow,
             };
@@ -519,8 +593,14 @@ async fn execute_ide_runtime(
                 load_json_file_or_inline(raw, "hibernation candidate")?
             } else {
                 let mut m = Map::new();
-                if let Some(tid) = args.first(&["--tab-id"]) {
+                if let Some(tid) = args.first(&["--tab-id", "--session-id"]) {
                     m.insert("tab_id".into(), json!(tid));
+                }
+                if let Some(did) = args.first(&["--dispatch-id", "--dispatch"]) {
+                    m.insert("dispatch_id".into(), json!(did));
+                }
+                if let Some(st) = args.first(&["--state"]) {
+                    m.insert("state".into(), json!(st));
                 }
                 if let Some(ag) = args.first(&["--agent", "--agent-id"]) {
                     m.insert("agent_id".into(), json!(ag));
@@ -528,15 +608,22 @@ async fn execute_ide_runtime(
                 if let Some(idle) = args.opt_u64(&["--idle-duration-ms", "--idle-ms"])? {
                     m.insert("idle_duration_ms".into(), json!(idle));
                 }
+                if let Some(win) = args.opt_u64(&["--window-ms"])? {
+                    m.insert("window_ms".into(), json!(win));
+                }
                 if let Some(ks) = args.opt_u64(&["--keystrokes-since-done"])? {
                     m.insert("keystrokes_since_done".into(), json!(ks));
                 }
-                if let Some(sub_n) = args.opt_usize(&["--live-subagent-count"])? {
+                if let Some(unsettled_n) = args.opt_u64(&["--unsettled-dispatches"])? {
+                    m.insert("unsettled_dispatch_count".into(), json!(unsettled_n));
+                }
+                if let Some(sub_n) = args.opt_usize(&["--live-subagent-count", "--live-subagents"])? {
                     m.insert("live_subagent_count".into(), json!(sub_n));
                 }
                 for (flag, key) in [
                     ("--agent-state-is-done", "agent_state_is_done"),
                     ("--tab-visible", "tab_visible"),
+                    ("--mobile-driver", "mobile_driver_attached"),
                     ("--mobile-driver-attached", "mobile_driver_attached"),
                     ("--unsettled-orchestration-dispatch", "unsettled_orchestration_dispatch"),
                     ("--git-operation-in-progress", "git_operation_in_progress"),
@@ -599,6 +686,16 @@ async fn execute_ide_runtime(
             }))
         }
         "profile-state" | "profile-get" | "profile-put" => {
+            if args.has_bool(&["--recover-status"]) {
+                return http
+                    .get("/api/v1/orca/ide/profile-state?recover_status=true")
+                    .await;
+            }
+            if args.pos(0) == Some("export") || args.has_bool(&["--export"]) {
+                return http
+                    .get("/api/v1/orca/ide/profile-state?export=true")
+                    .await;
+            }
             if sub == "profile-put" || args.first(&["--put"]).is_some() || args.first(&["--payload"]).is_some() {
                 let domain = req_str(args, Some(0), &["--put", "--domain"], "--put <domain>")?;
                 let raw_payload = req_str(

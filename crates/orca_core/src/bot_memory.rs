@@ -586,7 +586,16 @@ fn insert_line_at_anchor(lines: &mut Vec<String>, entry: &BotMemoryLine) {
                         .find(|&i| !in_fence_after[i] && !lines[i].trim().is_empty())
                 });
             match pos {
-                Some(idx) => lines.insert(idx + 1, entry.line.clone()),
+                Some(idx) => {
+                    let mut insert_at = idx + 1;
+                    if lines[idx].trim_start().starts_with('#')
+                        && insert_at < lines.len()
+                        && lines[insert_at].trim().is_empty()
+                    {
+                        insert_at += 1;
+                    }
+                    lines.insert(insert_at, entry.line.clone());
+                }
                 None => lines.insert(0, entry.line.clone()),
             }
         }
@@ -767,8 +776,9 @@ pub fn tag_memory_changes(
     allow_deletions: bool,
 ) -> TagMemoryChangesResult {
     let clean_turn_source = sanitize_turn_source(turn_source);
+    let effective_allow_deletions = allow_deletions && clean_turn_source.is_none();
 
-    let (working, mut restored) = if !allow_deletions {
+    let (working, mut restored) = if !effective_allow_deletions {
         let lost = bot_memory_change(before_md, after_md).removed;
         if lost.is_empty() {
             (after_md.to_string(), Vec::new())
@@ -868,7 +878,7 @@ pub fn tag_memory_changes(
         }
     }
 
-    if !allow_deletions && !owner_order.is_empty() {
+    if !effective_allow_deletions && !owner_order.is_empty() {
         let out_owner_keys: HashSet<String> = {
             let refs: Vec<&str> = out_lines.iter().map(String::as_str).collect();
             let (out_facts, _) = line_facts(&refs);
@@ -2127,6 +2137,7 @@ type ValidatedTidyTopics = (BTreeMap<String, Vec<String>>, BTreeSet<String>);
 fn validate_tidy_topics(
     before_md: &str,
     topics: &BTreeMap<String, Vec<String>>,
+    allow_new_topic_lines: bool,
 ) -> Result<ValidatedTidyTopics, TidyUpError> {
     let (before_lines, _) = split_lines(before_md);
     let (before_facts, _) = line_facts(&before_lines);
@@ -2200,15 +2211,32 @@ fn validate_tidy_topics(
                     format!("topic '{topic}' line is not a valid fact: {trimmed}"),
                 ));
             };
-            let Some(verbatim) = before_line_by_key.get(&fact.key) else {
+            if let Some(verbatim) = before_line_by_key.get(&fact.key) {
+                validated.push(verbatim.clone());
+                filed_keys.insert(fact.key);
+                fact_count += 1;
+            } else if allow_new_topic_lines {
+                if looks_secret_line(raw) {
+                    continue;
+                }
+                let clean_text = one_line(&defuse_source_separators(&fact.text));
+                if clean_text.is_empty() {
+                    continue;
+                }
+                let sanitized =
+                    format_fact_line(&fact.prefix, fact.date.as_deref(), &clean_text, None);
+                if looks_secret_line(&sanitized) {
+                    continue;
+                }
+                validated.push(sanitized);
+                filed_keys.insert(fact.key);
+                fact_count += 1;
+            } else {
                 return Err(TidyUpError::new(
                     TidyUpErrorCode::NotCopied,
                     format!("topic '{topic}' line was not copied verbatim from MEMORY.md"),
                 ));
-            };
-            validated.push(verbatim.clone());
-            filed_keys.insert(fact.key);
-            fact_count += 1;
+            }
         }
         if fact_count == 0 {
             return Err(TidyUpError::new(
@@ -2377,6 +2405,17 @@ pub fn validate_tidy_up_draft(
     ctx: &TidyUpValidationContext<'_>,
     draft: &TidyUpDraft,
 ) -> Result<TidyUpPlan, TidyUpError> {
+    validate_tidy_up_draft_with_options(ctx, draft, false)
+}
+
+/// Validates a `TidyUpDraft` with explicit control over whether structured topic filings may
+/// introduce newly learned topic lines (`allow_new_topic_lines = true`) or must strictly copy
+/// lines verbatim from `MEMORY.md` (`allow_new_topic_lines = false`).
+pub fn validate_tidy_up_draft_with_options(
+    ctx: &TidyUpValidationContext<'_>,
+    draft: &TidyUpDraft,
+    allow_new_topic_lines: bool,
+) -> Result<TidyUpPlan, TidyUpError> {
     if !TIDY_UP_SUPPORTED_AGENTS.contains(&ctx.agent) {
         return Err(TidyUpError::new(
             TidyUpErrorCode::UnsupportedAgent,
@@ -2404,7 +2443,8 @@ pub fn validate_tidy_up_draft(
 
     validate_tidy_index_syntax(&draft.index)?;
     let (deduped_before, dup_merged_count) = dedup_before_memory(ctx.before_md);
-    let (topic_writes, filed_keys) = validate_tidy_topics(&deduped_before, &draft.topics)?;
+    let (topic_writes, filed_keys) =
+        validate_tidy_topics(&deduped_before, &draft.topics, allow_new_topic_lines)?;
 
     let cleaned_index = sanitize_tidy_up_index(ctx.before_md, &draft.index);
     let replaced_keys: BTreeSet<String> = draft
@@ -2431,10 +2471,23 @@ pub fn validate_tidy_up_draft(
         raw_fact_key(&l.line).is_none_or(|k| !before_undated_keys.contains(&k))
     });
 
+    let has_added_replacements = !change.added.is_empty();
     let archived_count = change
         .removed
         .iter()
-        .filter(|l| raw_fact_key(&l.line).is_none_or(|k| !filed_keys.contains(&k)))
+        .filter(|l| {
+            raw_fact_key(&l.line).is_none_or(|k| {
+                if filed_keys.contains(&k) {
+                    return false;
+                }
+                if has_added_replacements
+                    && (replaced_keys.contains(&k) || merged_keys.contains(&k))
+                {
+                    return false;
+                }
+                true
+            })
+        })
         .count();
     let before_fact_count = parse_memory_facts(&deduped_before).len();
     let max_archived = before_fact_count
@@ -5222,4 +5275,23 @@ END MERGED";
             );
         }
     }
+
+    #[test]
+    fn mem01_external_turn_with_allow_deletions_true_cannot_delete_owner_rules() {
+        let rule = "- 2026-11-25 Rule: Never merge red CI.";
+        let before = format!("# Memory\n\n{rule}\n");
+        let after = "# Memory\n\n- 2026-11-25 Fact: External note.\n";
+        let res = tag_memory_changes(&before, after, Some("slack:mallory"), true);
+        assert!(
+            res.markdown.contains(rule),
+            "protected owner rule MUST survive external turn even with allow_deletions=true: {}",
+            res.markdown
+        );
+        assert!(
+            res.markdown.contains(" · from: slack:mallory"),
+            "external addition must still carry provenance: {}",
+            res.markdown
+        );
+    }
 }
+

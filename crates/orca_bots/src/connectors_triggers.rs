@@ -592,6 +592,15 @@ impl BotAccessHost {
                 format!("Access request '{request_id}' was already granted."),
             ));
         }
+        if snapshot.status == ConnectorAccessRequestStatus::Granted
+            && approve
+            && !snapshot.granted_not_added
+        {
+            return Ok(AccessDecisionOutcome {
+                request: snapshot,
+                added_locally: false,
+            });
+        }
 
         if !approve {
             let mut guard = self.lock_state()?;
@@ -1195,6 +1204,8 @@ impl SlackMirror {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebhookCliView {
     pub hook_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub bot_id: String,
     pub automation_id: String,
     pub adapter: WebhookAdapterId,
@@ -1265,6 +1276,8 @@ pub struct WebhookCallRecord {
     pub adapter: WebhookAdapterId,
     pub epoch: u64,
     pub state: WebhookCallState,
+    #[serde(default)]
+    pub filter_rejected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spool_path: Option<PathBuf>,
     pub received_at_ms: u64,
@@ -1298,6 +1311,7 @@ pub struct WebhookIngestOutcome {
 #[derive(Debug, Clone)]
 struct StoredWebhook {
     hook_id: String,
+    name: Option<String>,
     bot_id: String,
     automation_id: String,
     adapter: WebhookAdapterId,
@@ -1316,6 +1330,7 @@ impl StoredWebhook {
     fn to_cli_view(&self, hourly_cap: u32) -> WebhookCliView {
         WebhookCliView {
             hook_id: self.hook_id.clone(),
+            name: self.name.clone(),
             bot_id: self.bot_id.clone(),
             automation_id: self.automation_id.clone(),
             adapter: self.adapter,
@@ -1391,6 +1406,15 @@ impl WebhookEngine {
         &self,
         req: CreateWebhookRequest,
     ) -> Result<(WebhookCliView, WebhookCopyUrlCard)> {
+        self.create_hook_named(req, None)
+    }
+
+    /// Creates a new webhook with an optional human-readable display `name`.
+    pub fn create_hook_named(
+        &self,
+        req: CreateWebhookRequest,
+        name: Option<String>,
+    ) -> Result<(WebhookCliView, WebhookCopyUrlCard)> {
         if req.bot_id.trim().is_empty() || req.automation_id.trim().is_empty() {
             return Err(OrcaBotsError::bot(
                 BotErrorCode::InvalidArgument,
@@ -1421,8 +1445,12 @@ impl WebhookEngine {
             guard.cap_tracker.set_hook_cap(&hook_id, cap)?;
         }
         let effective_cap = guard.cap_tracker.effective_hook_cap(&hook_id);
+        let clean_name = name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let stored = StoredWebhook {
             hook_id: hook_id.clone(),
+            name: clean_name,
             bot_id: req.bot_id,
             automation_id: req.automation_id,
             adapter: req.adapter,
@@ -1581,6 +1609,7 @@ impl WebhookEngine {
                 adapter: hook.adapter,
                 epoch: hook.epoch,
                 state: WebhookCallState::Refused,
+                filter_rejected: false,
                 spool_path: None,
                 received_at_ms: req.now_ms,
                 updated_at_ms: req.now_ms,
@@ -1605,6 +1634,7 @@ impl WebhookEngine {
                 adapter: hook.adapter,
                 epoch: hook.epoch,
                 state: WebhookCallState::Paused,
+                filter_rejected: false,
                 spool_path: None,
                 received_at_ms: req.now_ms,
                 updated_at_ms: req.now_ms,
@@ -1662,6 +1692,7 @@ impl WebhookEngine {
                 adapter: hook.adapter,
                 epoch: hook.epoch,
                 state: WebhookCallState::Ignored,
+                filter_rejected: true,
                 spool_path: None,
                 received_at_ms: req.now_ms,
                 updated_at_ms: req.now_ms,
@@ -1694,6 +1725,7 @@ impl WebhookEngine {
                     adapter: hook.adapter,
                     epoch: hook.epoch,
                     state: WebhookCallState::WaitingCapacity,
+                    filter_rejected: false,
                     spool_path: None,
                     received_at_ms: req.now_ms,
                     updated_at_ms: req.now_ms,
@@ -1765,6 +1797,7 @@ impl WebhookEngine {
             adapter: hook.adapter,
             epoch: hook.epoch,
             state: WebhookCallState::Delivered,
+            filter_rejected: false,
             spool_path: Some(spool_path.clone()),
             received_at_ms: req.now_ms,
             updated_at_ms: req.now_ms,

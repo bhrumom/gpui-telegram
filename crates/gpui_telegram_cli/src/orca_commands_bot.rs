@@ -137,7 +137,7 @@ pub(crate) async fn execute_bot(
     match sub {
         "list" => http.get("/api/v1/orca/bots").await,
         "get" | "show" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id", "--id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id", "--id"], "<bot_id>")?;
             http.get(&format!("/api/v1/orca/bots/{}", pct_encode(bot_id)))
                 .await
         }
@@ -148,6 +148,12 @@ pub(crate) async fn execute_bot(
             }
             if let Some(agent) = args.first(&["--agent"]) {
                 body.insert("agent".into(), json!(agent));
+            }
+            if let Some(folder) = args.first(&["--folder"]) {
+                body.insert("folder".into(), json!(folder));
+            }
+            if let Some(hp) = args.first(&["--home-path"]) {
+                body.insert("home_path".into(), json!(hp));
             }
             if let Some(soul) = args.first(&["--soul", "--custom-soul"]) {
                 body.insert("custom_soul".into(), json!(soul));
@@ -167,7 +173,7 @@ pub(crate) async fn execute_bot(
             if let Some(ws) = args.first(&["--folder-workspace-id", "--workspace-id"]) {
                 body.insert("folder_workspace_id".into(), json!(ws));
             }
-            if let Some(tpl) = args.first(&["--template-id"]) {
+            if let Some(tpl) = args.first(&["--template-id", "--template"]) {
                 body.insert("template_id".into(), json!(tpl));
             }
             if let Some(fr) = args.opt_bool(&["--first-run"])? {
@@ -176,7 +182,7 @@ pub(crate) async fn execute_bot(
             http.post("/api/v1/orca/bots", &Value::Object(body)).await
         }
         "update" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id", "--id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id", "--id"], "<bot_id>")?;
             let mut body = Map::new();
             if let Some(name) = args.first(&["--name"]) {
                 body.insert("name".into(), json!(name));
@@ -212,13 +218,22 @@ pub(crate) async fn execute_bot(
                 body.insert("expected_avatar_revision_epoch".into(), json!(epoch));
             }
             if let Some(hmcp) = args.opt_bool(&["--host-mcp-servers"])? {
-                body.insert("host_mcp_servers".into(), json!(hmcp));
+                let rpc = json!({
+                    "method": "bots.tools.setHostMcpServers",
+                    "params": { "botId": bot_id, "enabled": hmcp },
+                    "protocol_version": 3,
+                    "caller_scope": "cli",
+                });
+                let resp = http.post("/api/v1/orca/rpc", &rpc).await?;
+                if body.is_empty() {
+                    return Ok(resp.get("result").cloned().unwrap_or(resp));
+                }
             }
             let path = format!("/api/v1/orca/bots/{}", pct_encode(bot_id));
             http.patch(&path, &Value::Object(body)).await
         }
         "delete" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id", "--id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id", "--id"], "<bot_id>")?;
             http.delete(&format!("/api/v1/orca/bots/{}", pct_encode(bot_id)))
                 .await
         }
@@ -231,7 +246,8 @@ pub(crate) async fn execute_bot(
             http.get(&path).await
         }
         "from-template" => {
-            let template_id = req_str(args, Some(0), &["--template-id", "--id"], "<template_id>")?;
+            let template_id =
+                req_str(args, Some(0), &["--template", "--template-id", "--id"], "<template_id>")?;
             let mut body = json!({ "template_id": template_id });
             if let Some(name) = args.first(&["--name", "--custom-name"]) {
                 body["custom_name"] = json!(name);
@@ -249,12 +265,12 @@ async fn execute_bot_extended(
 ) -> Result<Value, CliError> {
     match sub {
         "chats" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             http.get(&format!("/api/v1/orca/bots/{}/chats", pct_encode(bot_id)))
                 .await
         }
         "new-chat" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let mut body = Map::new();
             if let Some(title) = args.first(&["--title"]).or_else(|| args.pos(1)) {
                 body.insert("title".into(), json!(title));
@@ -269,11 +285,13 @@ async fn execute_bot_extended(
             .await
         }
         "reply" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
-            let (chat_id, text) = if args.first(&["--chat-id"]).is_some()
-                || args.first(&["--text"]).is_some()
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
+            let (chat_id, text) = if args.first(&["--chat-id", "--chat"]).is_some()
+                || args.first(&["--text", "--message"]).is_some()
             {
-                let cid = args.first(&["--chat-id", "--session-id"]).map(ToOwned::to_owned);
+                let cid = args
+                    .first(&["--chat-id", "--chat", "--session-id"])
+                    .map(ToOwned::to_owned);
                 let txt = req_str(args, Some(1), &["--text", "--message"], "<text>")?.to_string();
                 (cid, txt)
             } else if args.positionals.len() >= 3 {
@@ -300,14 +318,14 @@ async fn execute_bot_extended(
             .await
         }
         "memory-get" | "memory" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             http.get(&format!("/api/v1/orca/bots/{}/memory", pct_encode(bot_id)))
                 .await
         }
         "memory-set" | "memory-add" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let mut body = Map::new();
-            if let Some(md) = args.first(&["--markdown"]) {
+            if let Some(md) = args.first(&["--markdown", "--content"]) {
                 body.insert("markdown".into(), json!(md));
             } else if let Some(line) = args
                 .first(&["--fact", "--append-line", "--line"])
@@ -315,7 +333,7 @@ async fn execute_bot_extended(
             {
                 body.insert("append_line".into(), json!(line));
             }
-            if let Some(src) = args.first(&["--turn-source"]) {
+            if let Some(src) = args.first(&["--turn-source", "--source"]) {
                 body.insert("turn_source".into(), json!(src));
             }
             if let Some(txt) = args.first(&["--owner-turn-text"]) {
@@ -331,7 +349,7 @@ async fn execute_bot_extended(
             .await
         }
         "memory-forget" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let query = req_str(args, Some(1), &["--query", "--fact"], "<query>")?;
             let mut body = json!({ "query": query });
             if let Some(by) = args.first(&["--by"]) {
@@ -344,17 +362,22 @@ async fn execute_bot_extended(
             .await
         }
         "memory-undo" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
-            let row_id = req_str(args, Some(1), &["--row-id", "--history-id"], "<row_id>")?;
-            let body = json!({ "row_id": row_id });
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
+            let mut body = Map::new();
+            if let Some(row_id) = args
+                .first(&["--row-id", "--history-id"])
+                .or_else(|| args.pos(1))
+            {
+                body.insert("row_id".into(), json!(row_id));
+            }
             http.post(
                 &format!("/api/v1/orca/bots/{}/memory/undo", pct_encode(bot_id)),
-                &body,
+                &Value::Object(body),
             )
             .await
         }
         "tidy-up" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             if args.has_bool(&["--undo"]) {
                 let mut body = Map::new();
                 if let Some(rid) = args.first(&["--row-id", "--history-id"]) {
@@ -369,11 +392,7 @@ async fn execute_bot_extended(
             }
             let mut body = Map::new();
             if args.has_bool(&["--enable", "--disable"]) || args.first(&["--schedule"]).is_some() {
-                let enabled = if args.has_bool(&["--disable"]) {
-                    false
-                } else {
-                    true
-                };
+                let enabled = !args.has_bool(&["--disable"]);
                 let schedule = args.first(&["--schedule"]).unwrap_or("night");
                 body.insert(
                     "configure".into(),
@@ -399,7 +418,7 @@ async fn execute_bot_extended(
             .await
         }
         "item-add" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let title = req_str(args, Some(1), &["--title"], "<title>")?;
             let mut body = Map::new();
             body.insert("title".into(), json!(title));
@@ -412,7 +431,7 @@ async fn execute_bot_extended(
             if let Some(st) = args.first(&["--status"]) {
                 body.insert("status".into(), json!(st));
             }
-            if let Some(wn) = args.first(&["--wait-note"]) {
+            if let Some(wn) = args.first(&["--wait-note", "--wait"]) {
                 body.insert("wait_note".into(), json!(wn));
             }
             if let Some(actor_raw) = args.first(&["--actor"]) {
@@ -456,10 +475,10 @@ async fn execute_bot_items_and_groups(
             if let Some(st) = args.first(&["--status"]) {
                 body.insert("status".into(), json!(st));
             }
-            if let Some(wn) = args.first(&["--wait-note"]) {
+            if let Some(wn) = args.first(&["--wait-note", "--wait"]) {
                 body.insert("wait_note".into(), json!(wn));
             }
-            if let Some(note) = args.first(&["--note", "--close-note"]) {
+            if let Some(note) = args.first(&["--note", "--close-note", "--comment"]) {
                 body.insert("note".into(), json!(note));
             }
             if let Some(ev) = args.opt_u64(&["--expected-version"])? {
@@ -614,7 +633,7 @@ async fn execute_bot_items_and_groups(
             .await
         }
         "item-list" => {
-            let bot_id = args.first(&["--bot-id"]).or_else(|| args.pos(0));
+            let bot_id = args.first(&["--bot", "--bot-id"]).or_else(|| args.pos(0));
             if let Some(bid) = bot_id {
                 let mut q = Vec::new();
                 if args.has_bool(&["--include-closed"]) {
@@ -656,7 +675,7 @@ async fn execute_bot_items_and_groups(
         }
         "needs-you" => {
             let mut q = Vec::new();
-            if let Some(bid) = args.first(&["--bot-id"]).or_else(|| args.pos(0)) {
+            if let Some(bid) = args.first(&["--bot", "--bot-id"]).or_else(|| args.pos(0)) {
                 q.push(("bot_id", bid.to_string()));
             }
             if let Some(foc) = args.first(&["--focused", "--focused-uid"]) {
@@ -679,10 +698,12 @@ async fn execute_bot_ecosystem(
 ) -> Result<Value, CliError> {
     match sub {
         "look-around" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let path = format!("/api/v1/orca/bots/{}/look-around", pct_encode(bot_id));
             let has_write = args.has_bool(&["--enable", "--disable", "--weekdays-only", "--run", "--force"])
-                || args.first(&["--schedule", "--every", "--focus", "--suggestions-json"]).is_some();
+                || args
+                    .first(&["--schedule", "--every", "--focus", "--since", "--suggestions-json"])
+                    .is_some();
             if !has_write {
                 return http.get(&path).await;
             }
@@ -692,6 +713,8 @@ async fn execute_bot_ecosystem(
                 patch.insert("on".into(), json!(true));
             } else if args.has_bool(&["--disable"]) {
                 patch.insert("on".into(), json!(false));
+            } else if args.first(&["--schedule", "--every", "--focus", "--since"]).is_some() {
+                patch.insert("on".into(), json!(true));
             }
             if let Some(sched) = args.first(&["--schedule", "--every"]) {
                 patch.insert("every".into(), json!(sched));
@@ -701,6 +724,9 @@ async fn execute_bot_ecosystem(
             }
             if let Some(focus) = args.first(&["--focus"]) {
                 patch.insert("focus".into(), json!(focus));
+            }
+            if let Some(since) = args.first(&["--since"]) {
+                patch.insert("since".into(), json!(since));
             }
             if !patch.is_empty() {
                 body.insert("patch".into(), Value::Object(patch));
@@ -721,7 +747,7 @@ async fn execute_bot_ecosystem(
             http.post(&path, &Value::Object(body)).await
         }
         "suggest" | "up-next" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let path = format!("/api/v1/orca/bots/{}/up-next", pct_encode(bot_id));
             if let Some(sid) = args.first(&["--start"]) {
                 http.post(&path, &json!({ "action": "start", "suggestion_id": sid }))
@@ -729,6 +755,16 @@ async fn execute_bot_ecosystem(
             } else if let Some(sid) = args.first(&["--dismiss"]) {
                 http.post(&path, &json!({ "action": "dismiss", "suggestion_id": sid }))
                     .await
+            } else if let Some(title) = args.first(&["--title"]) {
+                let mut body = json!({
+                    "title": title,
+                    "why": args.first(&["--why"]).unwrap_or(""),
+                    "ask": args.first(&["--ask"]).unwrap_or(""),
+                });
+                if let Some(link) = args.first(&["--link"]) {
+                    body["link"] = json!(link);
+                }
+                http.post(&path, &body).await
             } else {
                 http.get(&path).await
             }
@@ -736,9 +772,18 @@ async fn execute_bot_ecosystem(
         "group-list" => http.get("/api/v1/orca/groups").await,
         "group-create" => {
             let name = req_str(args, Some(0), &["--name"], "<name>")?;
+            let mut members: Vec<String> = args.all(&["--member", "--member-bot-id"]);
+            for csv in args.all(&["--members"]) {
+                for part in csv.split(',') {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        members.push(trimmed.to_string());
+                    }
+                }
+            }
             let mut body = json!({
                 "name": name,
-                "member_bot_ids": args.all(&["--member", "--member-bot-id"]),
+                "member_bot_ids": members,
             });
             if let Some(rm) = args.first(&["--reply-mode"]) {
                 body["reply_mode"] = json!(rm);
@@ -755,7 +800,7 @@ async fn execute_bot_ecosystem(
             if let Some(tid) = args.first(&["--thread-id", "--thread"]) {
                 body["thread_id"] = json!(tid);
             }
-            if let Some(sb) = args.first(&["--sender-bot"]) {
+            if let Some(sb) = args.first(&["--sender-bot", "--from-bot"]) {
                 body["sender"] = json!(format!("bot:{sb}"));
             } else if let Some(s) = args.first(&["--sender"]) {
                 body["sender"] = json!(s);
@@ -771,7 +816,8 @@ async fn execute_bot_ecosystem(
         }
         "group-thread" => {
             let gid = req_str(args, Some(0), &["--group-id", "--group"], "<group_id>")?;
-            let first_post = req_str(args, Some(1), &["--title", "--first-post"], "<title>")?;
+            let first_post =
+                req_str(args, Some(1), &["--title", "--first-post", "--text"], "<title>")?;
             http.post(
                 &format!("/api/v1/orca/groups/{}/threads", pct_encode(gid)),
                 &json!({ "first_post": first_post }),
@@ -791,7 +837,7 @@ async fn execute_bot_ecosystem(
             http.get(&path).await
         }
         "access-list" => {
-            let bot_id = args.first(&["--bot-id"]).or_else(|| args.pos(0));
+            let bot_id = args.first(&["--bot", "--bot-id"]).or_else(|| args.pos(0));
             let mut q = Vec::new();
             if let Some(st) = args.first(&["--status"]) {
                 q.push(("status", st.to_string()));
@@ -803,7 +849,7 @@ async fn execute_bot_ecosystem(
             http.get(&build_query_url(&base, &q)).await
         }
         "access-request" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let member = if let Some(raw_m) = args.first(&["--member-json"]) {
                 load_json_file_or_inline(raw_m, "member")?
             } else {
@@ -829,19 +875,23 @@ async fn execute_bot_ecosystem(
             .await
         }
         "access-decide" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let mut body = Map::new();
             if let Some(tok) = args.first(&["--redeem-token"]) {
                 body.insert("redeem_token".into(), json!(tok));
             } else {
                 let req_id = req_str(args, Some(1), &["--request-id"], "--request-id")?;
-                let approve = if args.has_bool(&["--decline", "--reject", "--deny"]) {
-                    false
-                } else {
-                    args.opt_bool(&["--approve"])?.unwrap_or(true)
-                };
                 body.insert("request_id".into(), json!(req_id));
-                body.insert("approve".into(), json!(approve));
+                if let Some(dec) = args.first(&["--decision"]) {
+                    body.insert("decision".into(), json!(dec));
+                } else {
+                    let approve = if args.has_bool(&["--decline", "--reject", "--deny"]) {
+                        false
+                    } else {
+                        args.opt_bool(&["--approve"])?.unwrap_or(true)
+                    };
+                    body.insert("approve".into(), json!(approve));
+                }
             }
             http.post(
                 &format!("/api/v1/orca/bots/{}/access/decide", pct_encode(bot_id)),
@@ -860,8 +910,13 @@ async fn execute_bot_sharing(
 ) -> Result<Value, CliError> {
     match sub {
         "hand-over" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
-            let ws_id = req_str(args, Some(1), &["--workspace-id", "--workspace"], "--workspace-id")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
+            let ws_id = req_str(
+                args,
+                Some(1),
+                &["--workspace-id", "--workspace", "--workspace-path"],
+                "--workspace-id",
+            )?;
             let mut body = json!({ "workspace_id": ws_id });
             if args.has_bool(&["--create-new"]) {
                 body["mode"] = json!("create_new");
@@ -874,10 +929,13 @@ async fn execute_bot_sharing(
             if let Some(wn) = args.first(&["--workspace-name"]) {
                 body["workspace_name"] = json!(wn);
             }
+            if let Some(br) = args.first(&["--branch"]) {
+                body["branch"] = json!(br);
+            }
             if let Some(rs) = args.first(&["--repo-slug"]) {
                 body["repo_slug"] = json!(rs);
             }
-            if let Some(rp) = args.first(&["--recent-prompt"]) {
+            if let Some(rp) = args.first(&["--recent-prompt", "--prompt"]) {
                 body["recent_prompt"] = json!(rp);
             }
             if let Some(ag) = args.first(&["--agent"]) {
@@ -893,7 +951,7 @@ async fn execute_bot_sharing(
             .await
         }
         "package-export" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let mut body = Map::new();
             if args.has_bool(&["--include-memory"]) {
                 body.insert("include_memory".into(), json!(true));
@@ -952,7 +1010,7 @@ async fn execute_bot_sharing(
         }
         "share-identity" => http.get("/api/v1/orca/bots/share/identity").await,
         "share-seal" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             let mut body = Map::new();
             if let Some(mode) = args.first(&["--mode"]) {
                 body.insert("mode".into(), json!(mode));
@@ -975,10 +1033,16 @@ async fn execute_bot_sharing(
             if let Some(sid) = args.first(&["--share-id"]) {
                 body.insert("share_id".into(), json!(sid));
             }
+            if let Some(hk) = args.first(&["--host-key"]) {
+                body.insert("host_key".into(), json!(hk));
+            }
+            if let Some(mid) = args.first(&["--message-id", "--client-message-id"]) {
+                body.insert("client_message_id".into(), json!(mid));
+            }
             if let Some(exp) = args.opt_i64(&["--expires-at-ms"])? {
                 body.insert("expires_at_ms".into(), json!(exp));
             }
-            if let Some(text) = args.first(&["--text"]) {
+            if let Some(text) = args.first(&["--text", "--plaintext"]) {
                 body.insert("text".into(), json!(text));
             }
             http.post(
@@ -989,7 +1053,9 @@ async fn execute_bot_sharing(
         }
         "share-open" => {
             let mut body = Map::new();
-            if let Some(env_raw) = args.first(&["--envelope-json", "--envelope"]).or_else(|| args.pos(0)) {
+            if let Some(env_raw) =
+                args.first(&["--envelope-json", "--envelope"]).or_else(|| args.pos(0))
+            {
                 let parsed = load_json_file_or_inline(env_raw, "envelope")?;
                 if parsed.get("offer").is_some() || parsed.get("held_message").is_some() {
                     if let Some(obj) = parsed.as_object() {
@@ -1001,7 +1067,7 @@ async fn execute_bot_sharing(
                     body.insert("mode".into(), json!("held_message"));
                     body.insert("held_message".into(), parsed);
                 } else {
-                    body.insert("offer".into(), parsed);
+                    body.insert("envelope".into(), parsed);
                 }
             }
             if let Some(mode) = args.first(&["--mode"]) {
@@ -1019,21 +1085,26 @@ async fn execute_bot_sharing(
             if let Some(ed) = args.first(&["--sender-ed25519", "--expected-sender-ed25519"]) {
                 body.insert("expected_sender_ed25519_b64".into(), json!(ed));
             }
-            if let Some(sid) = args.first(&["--expected-share-id"]) {
+            if let Some(sid) = args.first(&["--expected-share-id", "--share-id"]) {
                 body.insert("expected_share_id".into(), json!(sid));
             }
-            if let Some(bid) = args.first(&["--expected-bot-id"]) {
+            if let Some(bid) = args.first(&["--expected-bot-id", "--bot-id", "--bot"]) {
                 body.insert("expected_bot_id".into(), json!(bid));
+            }
+            if let Some(hk) = args.first(&["--host-key"]) {
+                body.insert("host_key".into(), json!(hk));
             }
             http.post("/api/v1/orca/bots/share/open", &Value::Object(body))
                 .await
         }
         "import-discover" => {
+            let root = args.first(&["--root"]);
             let openclaw_dirs = args.all(&["--openclaw-dir"]);
             let hermes_dirs = args.all(&["--hermes-dir"]);
             let openbot_dirs = args.all(&["--openbot-dir"]);
             let export_text = args.first(&["--export-text"]);
-            if openclaw_dirs.is_empty()
+            if root.is_none()
+                && openclaw_dirs.is_empty()
                 && hermes_dirs.is_empty()
                 && openbot_dirs.is_empty()
                 && export_text.is_none()
@@ -1041,6 +1112,9 @@ async fn execute_bot_sharing(
                 return http.get("/api/v1/orca/bots/import/discover").await;
             }
             let mut body = Map::new();
+            if let Some(r) = root {
+                body.insert("root".into(), json!(r));
+            }
             if !openclaw_dirs.is_empty() || !hermes_dirs.is_empty() || !openbot_dirs.is_empty() {
                 body.insert(
                     "roots".into(),
@@ -1061,7 +1135,7 @@ async fn execute_bot_sharing(
                 .await
         }
         "chat-tree" => {
-            let bot_id = req_str(args, Some(0), &["--bot-id"], "<bot_id>")?;
+            let bot_id = req_str(args, Some(0), &["--bot", "--bot-id"], "<bot_id>")?;
             http.get(&format!(
                 "/api/v1/orca/bots/{}/chat-tree",
                 pct_encode(bot_id)

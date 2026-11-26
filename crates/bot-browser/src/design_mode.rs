@@ -2064,3 +2064,195 @@ pub async fn capture_element_by_selector(
     let target_expr = format!("document.querySelector({sel_json})");
     capture_via_backend_eval(backend, &target_expr, options).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_solid_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([0x20, 0x40, 0x80, 0xFF]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("encode png");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn design_mode_vlq_decode_and_source_map_v3_resolution() {
+        assert_eq!(decode_vlq_segment("AAAA").unwrap(), vec![0, 0, 0, 0]);
+        assert_eq!(decode_vlq_segment("EACK").unwrap(), vec![2, 0, 1, 5]);
+        let raw = r#"{
+            "version": 3,
+            "sources": ["src/Button.tsx"],
+            "names": ["PrimaryButton"],
+            "mappings": "AAAA,IAAI"
+        }"#;
+        let sm = parse_source_map_v3(raw).expect("parse v3 map");
+        let resolved = resolve_generated_position(&sm, 1, 0).expect("resolve gen pos");
+        assert_eq!(resolved.file_path, "src/Button.tsx");
+        assert_eq!(resolved.line, 1);
+
+        let attr_ref = parse_framework_source_attr("src/Card.tsx:42:8").expect("parse attr");
+        assert_eq!(attr_ref.file_path, "src/Card.tsx");
+        assert_eq!(attr_ref.line, 42);
+        assert_eq!(attr_ref.column, Some(8));
+    }
+
+    #[test]
+    fn design_mode_sanitize_outer_html_and_curated_css_filtering() {
+        let (clean, redacted) = sanitize_outer_html(
+            "<form><input type=\"password\" value=\"super-secret-42\" /><button>Deploy</button></form>",
+            DEFAULT_MAX_OUTER_HTML_BYTES,
+        );
+        assert!(redacted);
+        assert!(clean.contains("Deploy"));
+        assert!(clean.contains("value=\"[REDACTED]\""));
+        assert!(!clean.contains("super-secret-42"));
+
+        let huge = format!("<div>{}</div>", "x".repeat(400));
+        let (clipped, was_redacted) = sanitize_outer_html(&huge, 64);
+        assert!(!was_redacted);
+        assert!(clipped.contains("truncated"));
+        assert!(clipped.len() <= 64);
+
+        let mut styles = BTreeMap::new();
+        styles.insert("color".to_string(), "rgb(255, 255, 255)".to_string());
+        styles.insert("font-family".to_string(), "Inter".to_string());
+        styles.insert("non-curated-prop".to_string(), "ignored".to_string());
+        let filtered = filter_computed_styles_map(&styles, false);
+        assert_eq!(filtered.get("font-family").map(String::as_str), Some("Inter"));
+        assert!(!filtered.contains_key("non-curated-prop"));
+    }
+
+    #[test]
+    fn design_mode_png_crop_padding_and_sha256_integrity() {
+        let png = make_solid_png(100, 80);
+        let rect = ElementRect {
+            x: 20.0,
+            y: 15.0,
+            width: 30.0,
+            height: 20.0,
+            device_pixel_ratio: 1.0,
+        };
+        let cropped = crop_png_with_padding(png, &rect, 100.0, 80.0, 4).expect("crop png");
+        assert!(cropped.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let (sha, (w, h)) = compute_png_sha256_and_dims(&cropped).expect("sha and dims");
+        assert_eq!(sha.len(), 64);
+        assert_eq!((w, h), (38, 28));
+    }
+
+    #[test]
+    fn design_mode_capture_from_dom_payload_and_contract_handoff() {
+        let png = make_solid_png(64, 32);
+        let payload = DesignDomPayload {
+            url: "http://feat.orca.localhost:3000/dashboard".to_string(),
+            viewport: DesignViewport {
+                width_px: 1280,
+                height_px: 800,
+                device_scale_factor_x100: 200,
+                is_mobile: false,
+            },
+            selector: "button.primary-cta".to_string(),
+            tag_name: "button".to_string(),
+            id_attr: Some("deploy-btn".to_string()),
+            classes: vec!["primary-cta".to_string()],
+            text_preview: "Deploy".to_string(),
+            outer_html: "<button id=\"deploy-btn\" class=\"primary-cta\">Deploy</button>".to_string(),
+            computed_styles: BTreeMap::from([
+                ("color".to_string(), "rgb(255, 255, 255)".to_string()),
+                ("font-family".to_string(), "Inter".to_string()),
+            ]),
+            dom_hierarchy: vec![DomAncestorNode {
+                tag: "main".to_string(),
+                id: None,
+                classes: vec!["shell".to_string()],
+                role: Some("main".to_string()),
+                nth_of_type: 1,
+                selector_segment: "main.shell".to_string(),
+            }],
+            bounding_box: ElementRect {
+                x: 100.0,
+                y: 200.0,
+                width: 120.0,
+                height: 40.0,
+                device_pixel_ratio: 2.0,
+            },
+            box_model: None,
+            semantic_locator: None,
+            source_map_probe: Some(RawSourceMapProbe {
+                data_source: Some("src/Button.tsx:42:8".to_string()),
+                ..Default::default()
+            }),
+            cropped_png_bytes: Some(png),
+            captured_at_ms: Some(1_700_000_000_000),
+        };
+        let capture = DesignModeCapture::from_dom_payload(payload, &DesignModeCaptureOptions::default())
+            .expect("build capture");
+        let contract = capture.to_orca_capture_contract();
+        assert_eq!(contract.source_map.as_ref().map(|s| s.file_path.as_str()), Some("src/Button.tsx"));
+        assert_eq!(contract.source_map.as_ref().map(|s| s.line), Some(42));
+        assert!(contract.screenshot_sha256.as_ref().is_some_and(|h| h.len() == 64));
+        assert!(capture.cropped_png_base64().is_some());
+        let (cx_bp, cy_bp) = capture.normalized_center_bp();
+        assert!(cx_bp > 0 && cx_bp < 10_000 && cy_bp > 0 && cy_bp < 10_000);
+
+        let handoff = capture.to_chat_handoff(Some("Increase button contrast"), &[]);
+        let md = capture.format_chat_attachment_markdown();
+        assert!(md.contains("button.primary-cta"));
+        assert!(handoff.prompt_markdown.contains("Increase button contrast"));
+    }
+
+    #[test]
+    fn design_mode_spec_validation_and_breadcrumb_formatting() {
+        let payload = DesignDomPayload {
+            url: "http://127.0.0.1:4173".to_string(),
+            viewport: DesignViewport {
+                width_px: 390,
+                height_px: 844,
+                device_scale_factor_x100: 300,
+                is_mobile: true,
+            },
+            selector: "nav > a.active".to_string(),
+            tag_name: "a".to_string(),
+            id_attr: None,
+            classes: vec!["active".to_string()],
+            text_preview: "Home".to_string(),
+            outer_html: "<a class=\"active\">Home</a>".to_string(),
+            computed_styles: BTreeMap::new(),
+            dom_hierarchy: vec![DomAncestorNode {
+                tag: "nav".to_string(),
+                id: Some("top".to_string()),
+                classes: vec![],
+                role: Some("navigation".to_string()),
+                nth_of_type: 1,
+                selector_segment: "nav#top".to_string(),
+            }],
+            bounding_box: ElementRect {
+                x: 10.0,
+                y: 12.0,
+                width: 80.0,
+                height: 32.0,
+                device_pixel_ratio: 3.0,
+            },
+            box_model: None,
+            semantic_locator: None,
+            source_map_probe: None,
+            cropped_png_bytes: None,
+            captured_at_ms: Some(1_700_000_000_001),
+        };
+        let capture = DesignModeCapture::from_dom_payload(payload, &DesignModeCaptureOptions::default())
+            .expect("mobile capture");
+        assert!(capture.dom_breadcrumb().contains("nav#top"));
+        let overlay = DesignOverlaySpec {
+            enabled: true,
+            diff_mode: DesignDiffMode::Overlay,
+            opacity_percent: 85,
+            show_spacing_guides: true,
+            pins: Vec::new(),
+        };
+        let spec = capture.into_mode_spec("ws-mobile", overlay);
+        assert!(spec.validate().is_ok());
+        assert!(spec.viewport.is_mobile);
+    }
+}

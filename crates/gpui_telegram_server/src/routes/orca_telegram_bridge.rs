@@ -219,6 +219,114 @@ pub async fn link_telegram_chat(
     .into_response()
 }
 
+/// Reusable server helper invoked by RPC `bots.telegram.bindChat` to bind an `OrcaBotRecord`
+/// to an existing Telegram chat (or provision a companion DM if `explicit_chat_id` is `None`).
+pub async fn bind_bot_to_telegram_chat(
+    state: &Arc<AppState>,
+    owner_user_id: UserId,
+    bot_id: &str,
+    explicit_chat_id: Option<i64>,
+) -> Result<(i64, u64, String), (String, String)> {
+    let bot = state
+        .orca_bots
+        .controller()
+        .get_bot(bot_id)
+        .await
+        .map_err(|e| (e.code().as_str().to_string(), e.to_string()))?;
+
+    let (bot_user_id, bot_username) =
+        ensure_mirrored_telegram_bot(state, owner_user_id, &bot, None)
+            .map_err(|_| ("internal".to_string(), "Failed to ensure mirrored Telegram bot".to_string()))?;
+
+    let chat_id = match explicit_chat_id {
+        Some(cid_raw) => {
+            let cid = ChatId(cid_raw);
+            if check_active_membership(state, cid, owner_user_id).is_err() {
+                return Err((
+                    "permission_denied".to_string(),
+                    format!("Caller is not an active member of Telegram chat {cid_raw}"),
+                ));
+            }
+            cid
+        }
+        None => state
+            .db
+            .ensure_companion_bot_chat_record(owner_user_id, bot_user_id)
+            .map(|(cid, _)| cid)
+            .map_err(|e| ("internal".to_string(), e.to_string()))?,
+    };
+
+    state
+        .orca_telegram_links
+        .write()
+        .insert(bot_id.to_string(), chat_id.0);
+    Ok((chat_id.0, bot_user_id.0, bot_username))
+}
+
+/// Builds inline keyboard button rows for an interactive Orca Ask Decision Card.
+pub fn build_ask_card_keyboard(
+    item_number: u64,
+    ask: &orca_core::bot_items::BotItemAsk,
+) -> Vec<Vec<InlineKeyboardButton>> {
+    let mut rows = Vec::new();
+    for (q_idx, q) in ask.questions.iter().enumerate() {
+        let mut row = Vec::new();
+        for (opt_idx, opt) in q.options.iter().enumerate() {
+            let option_id = if q_idx == 0 {
+                opt_idx.to_string()
+            } else {
+                format!("q{q_idx}_{opt_idx}")
+            };
+            let label = if q.recommended == Some(opt_idx) {
+                format!("★ {}", opt.label.trim())
+            } else {
+                opt.label.trim().to_string()
+            };
+            row.push(cb_button(
+                label,
+                format!("orca:ask:{item_number}:{option_id}"),
+            ));
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// Automatically posts an interactive Ask Decision Card message with `InlineKeyboardButton` rows
+/// into a linked Telegram chat when an item transitions to `needs_you` with a structured `ask`.
+pub async fn post_ask_decision_card_to_chat(
+    state: &Arc<AppState>,
+    caller_user_id: UserId,
+    item: &orca_core::bot_items::BotItem,
+    chat_id_raw: i64,
+) -> Option<i64> {
+    let ask = item.ask.as_ref()?;
+    let bot = state.orca_bots.controller().get_bot(&item.owner_bot_id).await.ok()?;
+    let chat_id = ChatId(chat_id_raw);
+    if check_active_membership(state, chat_id, caller_user_id).is_err() {
+        return None;
+    }
+    let sender_bot_uid = ensure_mirrored_telegram_bot(state, caller_user_id, &bot, None)
+        .map(|(uid, _)| uid)
+        .unwrap_or(caller_user_id);
+    let kb_rows = build_ask_card_keyboard(item.number, ask);
+    if kb_rows.is_empty() {
+        return None;
+    }
+    let card_text = format!(
+        "🤖 {} — Item #{}: {}\n\n{}",
+        bot.name.as_str(),
+        item.number,
+        item.title,
+        bot_item_ask_text(ask)
+    );
+    send_bot_chat_reply(state, chat_id, sender_bot_uid, &card_text, kb_rows)
+        .ok()
+        .map(|mid| mid.0)
+}
+
 // ---------------------------------------------------------------------------
 // 2. Interactive Telegram Decision Card Poster (`POST .../telegram/card`)
 // ---------------------------------------------------------------------------

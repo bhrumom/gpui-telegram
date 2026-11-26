@@ -3686,9 +3686,23 @@ fn is_running_in_rust_test_harness() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
-            let parent = exe.parent()?.file_name()?.to_str()?;
+            let parent_dir = exe.parent()?;
+            let parent = parent_dir.file_name()?.to_str()?;
             let stem = exe.file_stem()?.to_str()?;
-            Some(parent == "deps" && stem.contains('-'))
+            let in_deps = parent == "deps" && stem.contains('-');
+            let has_hash_suffix = stem.rsplit_once('-').is_some_and(|(_, suffix)| {
+                suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+            let in_cargo_build_out = parent == "out"
+                && has_hash_suffix
+                && parent_dir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    == Some("build");
+            Some(in_deps || in_cargo_build_out)
         })
         .unwrap_or(false)
 }

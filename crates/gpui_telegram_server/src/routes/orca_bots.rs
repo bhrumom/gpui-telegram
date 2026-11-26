@@ -2,6 +2,7 @@
 //! and Overnight Tool-Less Tidy-Up REST routes (`/api/v1/orca/bots*`).
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -20,6 +21,9 @@ use gpui_telegram_proto::orca_contracts::{
     OrcaMemoryUndoRequest, OrcaMemoryWriteRequest, OrcaTidyUpRequest, OrcaTidyUpUndoRequest,
     OrcaUpdateBotRequest,
 };
+use orca_bots::wire_json::{
+    bot_record_to_wire_json, parse_tidy_up_draft_value, parse_usage_limit_continue,
+};
 use orca_bots::{
     BotConnectorPatch, BotMemberRemoval, BotPatch, BotTemplateInstaller, CreateBotRequest,
     TidyUpChatTranscript, TidyUpDraftProvider, TidyUpDraftResponse, TidyUpPromptInput,
@@ -30,9 +34,9 @@ use orca_core::bot_ecosystem::BotTemplateCategory;
 use orca_core::bot_memory::{
     utc_today_iso_date, BotMemoryAuthor, TidyUpDraft, TidyUpError, TidyUpErrorCode,
 };
-use orca_core::bot_types::BotAgentId;
+use orca_core::bot_types::{BotAgentId, BotTidyUpConfig};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::routes::orca_error::{map_bots_err, orca_err, parse_json_body, parse_optional_json_body};
 use crate::server::{AppState, AuthBearer};
@@ -47,7 +51,12 @@ fn now_epoch_ms() -> i64 {
 
 pub async fn list_bots(_auth: AuthBearer, State(state): State<Arc<AppState>>) -> Response {
     let bots = state.orca_bots.controller().list_bots().await;
-    Json(bots).into_response()
+    let home = state.orca_bots.home_store();
+    let out: Vec<Value> = bots
+        .iter()
+        .map(|b| bot_record_to_wire_json(b, home))
+        .collect();
+    Json(out).into_response()
 }
 
 pub async fn create_bot(
@@ -72,9 +81,40 @@ pub async fn create_bot(
         },
         None => BotAgentId::Claude,
     };
+    let tidy_up_cfg_sched: Option<(bool, TidyUpSchedule)> = if let Some(ref val) = req.tidy_up {
+        if let Some(obj) = val.as_object() {
+            let sched_raw = obj
+                .get("schedule")
+                .and_then(Value::as_str)
+                .unwrap_or("night");
+            let sched = match sched_raw.trim().to_ascii_lowercase().as_str() {
+                "night" | "nightly" => TidyUpSchedule::Night,
+                "week" | "weekly" => TidyUpSchedule::Week,
+                other => {
+                    return orca_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        format!("Unknown tidy_up schedule '{other}'"),
+                    );
+                }
+            };
+            let enabled = obj
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            Some((enabled, sched))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let create_req = CreateBotRequest {
         name: req.name,
         agent,
+        folder: req.folder,
+        home_path: req.home_path.map(PathBuf::from),
         mascot: req.mascot,
         avatar_color: req.avatar_color,
         avatar_outfit: req.avatar_outfit,
@@ -84,10 +124,27 @@ pub async fn create_bot(
         folder_workspace_id: req.folder_workspace_id,
         template_id: req.template_id,
         first_run: req.first_run,
+        items_stale: req.items_stale,
+        tidy_up: tidy_up_cfg_sched.map(|(enabled, _)| BotTidyUpConfig {
+            enabled,
+            last_run_at: None,
+        }),
+        look_around: req.look_around,
         ..CreateBotRequest::default()
     };
     match state.orca_bots.create_bot(create_req).await {
-        Ok(bot) => (StatusCode::CREATED, Json(bot)).into_response(),
+        Ok(bot) => {
+            if let Some((enabled, sched)) = tidy_up_cfg_sched {
+                let _ = state.orca_bots.memory_service().configure_tidy_up(
+                    &bot.id,
+                    enabled,
+                    sched,
+                    now_epoch_ms(),
+                );
+            }
+            let wire = bot_record_to_wire_json(&bot, state.orca_bots.home_store());
+            (StatusCode::CREATED, Json(wire)).into_response()
+        }
         Err(err) => map_bots_err(err),
     }
 }
@@ -98,7 +155,7 @@ pub async fn get_bot(
     Path(bot_id): Path<String>,
 ) -> Response {
     match state.orca_bots.controller().get_bot(&bot_id).await {
-        Ok(bot) => Json(bot).into_response(),
+        Ok(bot) => Json(bot_record_to_wire_json(&bot, state.orca_bots.home_store())).into_response(),
         Err(err) => map_bots_err(err),
     }
 }
@@ -240,27 +297,43 @@ pub async fn update_bot(
             offer_answer: req.offer_answer.map(Into::into),
             accept_offer: req.accept_offer,
             folder_workspace_id: req.folder_workspace_id,
+            add_handed_paired_workspace: None,
         };
         match ctrl.update_bot(&bot_id, patch).await {
-            Ok(bot) => latest = Some(bot),
+            Ok(bot) => {
+                if req.paused == Some(false) {
+                    let _ = state.orca_bots.group_runtime().flush_pending_for_bot(&bot.id);
+                }
+                latest = Some(bot);
+            }
             Err(err) => return map_bots_err(err),
         }
     }
 
-    if let Some(host_mcp) = req.host_mcp_servers {
-        match ctrl.set_host_mcp_servers(&bot_id, host_mcp).await {
-            Ok(bot) => latest = Some(bot),
-            Err(err) => return map_bots_err(err),
-        }
-    }
+    // SECURITY INVARIANT: Generic PATCH MUST NEVER modify `connectors.host_mcp_servers`.
+    // Only the dedicated host-only RPC `bots.tools.setHostMcpServers` may toggle it.
+    let _ignored_host_mcp = req.host_mcp_servers;
 
-    match latest {
-        Some(bot) => Json(bot).into_response(),
+    let final_bot = match latest {
+        Some(bot) => bot,
         None => match ctrl.get_bot(&bot_id).await {
-            Ok(bot) => Json(bot).into_response(),
-            Err(err) => map_bots_err(err),
+            Ok(bot) => bot,
+            Err(err) => return map_bots_err(err),
         },
+    };
+
+    if let Some(ul_val) = req.usage_limit_continue {
+        match parse_usage_limit_continue(&ul_val, final_bot.agent.as_str(), now_epoch_ms()) {
+            Ok(ul) => {
+                if let Err(err) = state.orca_bots.set_usage_limit_continue(&final_bot.id, ul) {
+                    return map_bots_err(err);
+                }
+            }
+            Err(err) => return map_bots_err(err),
+        }
     }
+
+    Json(bot_record_to_wire_json(&final_bot, state.orca_bots.home_store())).into_response()
 }
 
 pub async fn delete_bot(
@@ -328,17 +401,29 @@ pub async fn from_template(
         .install_from_template(&req.template_id, req.custom_name.as_deref())
         .await
     {
-        Ok(installed) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "bot": installed.bot,
-                "template_id": installed.template_id,
-                "installed_skills": installed.installed_skills,
-                "suggested_schedules": installed.suggested_schedules,
-                "look_around_enabled": installed.look_around_enabled,
-            })),
-        )
-            .into_response(),
+        Ok(installed) => {
+            let mut bot_wire =
+                bot_record_to_wire_json(&installed.bot, state.orca_bots.home_store());
+            if let Some(obj) = bot_wire.as_object_mut() {
+                obj.insert("skills".into(), json!(installed.installed_skills));
+                obj.insert("schedules".into(), json!(installed.suggested_schedules));
+                obj.insert("lookAroundEnabled".into(), json!(installed.look_around_enabled));
+            }
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "bot": bot_wire,
+                    "template_id": installed.template_id,
+                    "templateId": installed.template_id,
+                    "installed_skills": installed.installed_skills,
+                    "skills": installed.installed_skills,
+                    "suggested_schedules": installed.suggested_schedules,
+                    "schedules": installed.suggested_schedules,
+                    "look_around_enabled": installed.look_around_enabled,
+                })),
+            )
+                .into_response()
+        }
         Err(err) => map_bots_err(err),
     }
 }
@@ -375,6 +460,7 @@ pub async fn memory_get(
     Json(json!({
         "bot_id": bot.id,
         "markdown": markdown,
+        "content": markdown,
         "history": history,
         "tidy_up": tidy_up,
         "preamble": preamble,
@@ -405,6 +491,7 @@ pub async fn memory_write(
         Ok(opt) => opt.unwrap_or_default(),
         Err(err) => return map_bots_err(err),
     };
+    let had_before_md = req.before_memory_md.is_some();
     let before_md = req
         .before_memory_md
         .unwrap_or_else(|| current_disk.clone());
@@ -441,6 +528,9 @@ pub async fn memory_write(
     let today = req.today.unwrap_or_else(utc_today_iso_date);
     let owner_turn_text = req.owner_turn_text.as_deref().unwrap_or("");
     let session_id = req.session_id.as_deref().unwrap_or("");
+    let allow_deletions = req.allow_deletions.unwrap_or(
+        req.turn_source.is_none() && req.session_id.is_none() && !had_before_md,
+    );
 
     match state.orca_bots.memory_service().apply_turn_end_memory_governance(
         &bot,
@@ -448,12 +538,13 @@ pub async fn memory_write(
         req.turn_source.as_deref(),
         owner_turn_text,
         session_id,
-        req.allow_deletions,
+        allow_deletions,
         now_ms,
         &today,
     ) {
         Ok(res) => Json(json!({
             "final_markdown": res.final_markdown,
+            "content": res.final_markdown,
             "tagged_lines": res.tagged_lines,
             "restored_lines": res.restored_lines,
             "intercepted_for_archive": res.intercepted_for_archive,
@@ -489,6 +580,7 @@ pub async fn memory_forget(
         Ok(res) => Json(json!({
             "removed_count": res.dropped,
             "markdown": res.markdown,
+            "content": res.markdown,
             "history_entry": res.history_entry,
         }))
         .into_response(),
@@ -502,7 +594,7 @@ pub async fn memory_undo(
     Path(bot_id): Path<String>,
     body: Bytes,
 ) -> Response {
-    let req: OrcaMemoryUndoRequest = match parse_json_body(&body) {
+    let req: OrcaMemoryUndoRequest = match parse_optional_json_body(&body) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -511,14 +603,31 @@ pub async fn memory_undo(
         Err(err) => return map_bots_err(err),
     };
     let now_ms = req.now_ms.unwrap_or_else(now_epoch_ms);
-    match state
-        .orca_bots
-        .memory_service()
-        .undo_memory_change(&bot, &req.row_id, now_ms)
-    {
+    let svc = state.orca_bots.memory_service();
+    let row_id = match req.row_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => id,
+        None => {
+            let history = match svc.list_history(&bot.id) {
+                Ok(h) => h,
+                Err(err) => return map_bots_err(err),
+            };
+            match history.iter().find(|h| h.undoable) {
+                Some(row) => row.id.clone(),
+                None => {
+                    return orca_err(
+                        StatusCode::NOT_FOUND,
+                        "not_found",
+                        "No undoable memory history entry found",
+                    );
+                }
+            }
+        }
+    };
+    match svc.undo_memory_change(&bot, &row_id, now_ms) {
         Ok(res) => Json(json!({
-            "undone_row_id": req.row_id,
+            "undone_row_id": row_id,
             "markdown": res.markdown,
+            "content": res.markdown,
             "history_entry": res.history_entry,
         }))
         .into_response(),
@@ -531,7 +640,7 @@ pub async fn memory_undo(
 // ---------------------------------------------------------------------------
 
 struct ServerTidyUpDraftProvider {
-    draft: Option<TidyUpDraft>,
+    draft: Option<(TidyUpDraft, bool)>,
     raw_reply: Option<String>,
     simulate_error: Option<TidyUpErrorCode>,
 }
@@ -560,9 +669,13 @@ impl TidyUpDraftProvider for ServerTidyUpDraftProvider {
                     elapsed_ms: 1,
                 });
             }
-            if let Some(ref draft) = self.draft {
+            if let Some((ref draft, is_structured)) = self.draft {
                 return Ok(TidyUpProviderOutput {
-                    response: TidyUpDraftResponse::Draft(draft.clone()),
+                    response: if is_structured {
+                        TidyUpDraftResponse::StructuredDraft(draft.clone())
+                    } else {
+                        TidyUpDraftResponse::Draft(draft.clone())
+                    },
                     elapsed_ms: 1,
                 });
             }
@@ -658,19 +771,42 @@ pub async fn tidy_up_run(
         }
     }
 
+    let parsed_draft = if let Some(ref draft_val) = req.draft {
+        let mem_path = state
+            .orca_bots
+            .home_store()
+            .bot_dir(&bot.folder)
+            .join("MEMORY.md");
+        let before_md = state
+            .orca_bots
+            .home_store()
+            .read_text_optional(&mem_path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        match parse_tidy_up_draft_value(draft_val, &before_md) {
+            Ok(d) => Some(d),
+            Err(err) => return map_bots_err(err),
+        }
+    } else {
+        None
+    };
+
+    let has_explicit_draft = parsed_draft.is_some() || req.raw_reply.is_some() || req.simulate_error.is_some();
     let provider = ServerTidyUpDraftProvider {
-        draft: req.draft,
+        draft: parsed_draft,
         raw_reply: req.raw_reply,
         simulate_error: req.simulate_error.as_deref().map(parse_tidy_up_error_code),
     };
     let today = req.today.unwrap_or_else(utc_today_iso_date);
+    let effective_force = req.force || has_explicit_draft;
     let run_req = TidyUpRunRequest {
         chats,
         now_ms,
         today,
         utc_offset_seconds: req.utc_offset_seconds.unwrap_or(0),
         allow_sleep_catchup: req.allow_sleep_catchup,
-        force: req.force,
+        force: effective_force,
     };
 
     match svc.run_tidy_up(&bot, &provider, run_req).await {
@@ -682,6 +818,9 @@ pub async fn tidy_up_run(
             Json(json!({
                 "outcome": "skipped_not_due",
                 "state": st,
+                "changesCount": 0,
+                "summary": st.last_summary,
+                "statusNote": "Skipped (not due)",
             }))
             .into_response()
         }
@@ -693,10 +832,16 @@ pub async fn tidy_up_run(
                 Ok(s) => s,
                 Err(err) => return map_bots_err(err),
             };
+            let changes_count = plan.summary.change_count();
             Json(json!({
                 "outcome": "applied",
                 "state": st,
                 "home_chat_note": home_chat_note,
+                "statusNote": home_chat_note,
+                "changesCount": changes_count,
+                "summary": plan.summary,
+                "historyId": plan.undo_snapshot.history_row.id,
+                "undoable": plan.undo_snapshot.history_row.undoable,
                 "plan": plan,
             }))
             .into_response()
@@ -726,6 +871,7 @@ pub async fn tidy_up_undo(
             let st = svc.get_tidy_up_state(&bot.id).ok();
             Json(json!({
                 "markdown": res.markdown,
+                "content": res.markdown,
                 "history_entry": res.history_entry,
                 "state": st,
             }))

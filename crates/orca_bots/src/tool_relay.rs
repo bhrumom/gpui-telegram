@@ -38,6 +38,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::shared_mcp::{SharedMcpPool, SharedMcpServerConfig};
 use crate::tool_oauth::BotToolOAuth;
 use crate::{OrcaBotsError, Result, now_epoch_ms};
 
@@ -86,7 +87,7 @@ pub struct RelayToolRegistration {
 }
 
 /// Registration payload for a per-bot loopback relay grant.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BotRelayGrant {
     pub bot_id: String,
     pub owner_id: String,
@@ -96,6 +97,10 @@ pub struct BotRelayGrant {
     /// Empty set allows all tools whose `allowed_folders` include the bot's folder;
     /// non-empty set restricts this bot to the listed `tool_handle`s.
     pub allowed_tools: HashSet<String>,
+    /// Host-only gate mirroring `bot.connectors.uses_host_mcp_servers()`.
+    /// MUST default to `false` so bots cannot invoke host shared stdio MCP servers unless
+    /// explicitly toggled via `bots.tools.setHostMcpServers`.
+    pub allow_host_mcp_servers: bool,
 }
 
 /// Configuration for `BotToolRelay`.
@@ -106,6 +111,7 @@ pub struct BotToolRelayConfig {
     pub owner_rate_limit: usize,
     pub owner_rate_window: Duration,
     pub oauth: BotToolOAuth,
+    pub shared_mcp: Option<SharedMcpPool>,
 }
 
 impl Default for BotToolRelayConfig {
@@ -116,6 +122,7 @@ impl Default for BotToolRelayConfig {
             owner_rate_limit: DEFAULT_OWNER_RATE_LIMIT,
             owner_rate_window: DEFAULT_OWNER_RATE_WINDOW,
             oauth: BotToolOAuth::new(),
+            shared_mcp: None,
         }
     }
 }
@@ -254,6 +261,7 @@ struct StoredBotGrant {
     folder: String,
     allowed_folders: HashSet<String>,
     allowed_tools: HashSet<String>,
+    allow_host_mcp_servers: bool,
     revoked: bool,
     cancel_token: CancellationToken,
 }
@@ -272,6 +280,8 @@ struct StoredToolEntry {
 struct RelayState {
     header_read_timeout: Duration,
     oauth: BotToolOAuth,
+    shared_mcp: Option<SharedMcpPool>,
+    host_mcp_servers: Mutex<HashMap<String, SharedMcpServerConfig>>,
     admission: RelayAdmission,
     http_client: reqwest::Client,
     grants: Mutex<HashMap<String, StoredBotGrant>>,
@@ -426,6 +436,8 @@ impl BotToolRelay {
         let state = Arc::new(RelayState {
             header_read_timeout: config.header_read_timeout,
             oauth: config.oauth,
+            shared_mcp: config.shared_mcp,
+            host_mcp_servers: Mutex::new(HashMap::new()),
             admission: RelayAdmission::new(
                 config.owner_max_concurrent,
                 config.owner_rate_limit,
@@ -583,6 +595,7 @@ impl BotToolRelay {
             folder: grant.folder,
             allowed_folders,
             allowed_tools: grant.allowed_tools,
+            allow_host_mcp_servers: grant.allow_host_mcp_servers,
             revoked: false,
             cancel_token: CancellationToken::new(),
         };
@@ -594,6 +607,42 @@ impl BotToolRelay {
             prev.cancel_token.cancel();
         }
         Ok(())
+    }
+
+    /// Updates a live bot grant's `allow_host_mcp_servers` permission without reissuing its token.
+    pub fn set_bot_host_mcp_access(&self, bot_id: &str, enabled: bool) -> Result<()> {
+        let mut grants = self.state.grants.lock().map_err(|_| {
+            OrcaBotsError::relay(500, "lock_poisoned", "Grant registry mutex poisoned.")
+        })?;
+        if let Some(grant) = grants.get_mut(bot_id) {
+            grant.allow_host_mcp_servers = enabled;
+        }
+        Ok(())
+    }
+
+    /// Registers or updates a host-level shared stdio MCP server routed at `/tools/<name>`
+    /// exclusively for bots whose grant has `allow_host_mcp_servers == true`.
+    pub fn set_host_mcp_server(
+        &self,
+        name: impl Into<String>,
+        config: SharedMcpServerConfig,
+    ) -> Result<()> {
+        let name = name.into();
+        BotToolName::new(&name)?;
+        config.validate()?;
+        let mut map = self.state.host_mcp_servers.lock().map_err(|_| {
+            OrcaBotsError::relay(500, "lock_poisoned", "Host MCP registry mutex poisoned.")
+        })?;
+        map.insert(name, config);
+        Ok(())
+    }
+
+    /// Removes a host-level shared stdio MCP server from the relay routing table.
+    pub fn remove_host_mcp_server(&self, name: &str) -> Result<bool> {
+        let mut map = self.state.host_mcp_servers.lock().map_err(|_| {
+            OrcaBotsError::relay(500, "lock_poisoned", "Host MCP registry mutex poisoned.")
+        })?;
+        Ok(map.remove(name).is_some())
     }
 
     /// Immediately cancels all in-flight streams for `bot_id` and marks its grant revoked
@@ -1127,6 +1176,118 @@ async fn handle_connection(stream: TcpStream, state: Arc<RelayState>) {
         .ok()
         .and_then(|map| map.get(&tool_handle).cloned());
     let Some(tool) = tool_opt else {
+        // Fallback: check host-managed shared stdio MCP server registry (strictly gated on
+        // `grant.allow_host_mcp_servers`!).
+        let host_mcp_cfg = state
+            .host_mcp_servers
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&tool_handle).cloned());
+        if let (Some(cfg), Some(pool)) = (host_mcp_cfg, state.shared_mcp.as_ref()) {
+            if grant.revoked
+                || grant.cancel_token.is_cancelled()
+                || !grant.allow_host_mcp_servers
+            {
+                write_simple_response(
+                    &mut writer,
+                    StatusCode::NOT_FOUND,
+                    "application/json",
+                    &[],
+                    br#"{"error":"CREDENTIAL_ENDED"}"#,
+                )
+                .await;
+                return;
+            }
+            let Some(_permit) = state.admission.try_admit(&grant.owner_id) else {
+                write_simple_response(
+                    &mut writer,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "application/json",
+                    &[],
+                    br#"{"error":"rate_limited"}"#,
+                )
+                .await;
+                return;
+            };
+            let req_body = match read_http1_body(&mut reader, &head.headers).await {
+                Ok(b) => b,
+                Err(msg) => {
+                    write_simple_response(
+                        &mut writer,
+                        StatusCode::BAD_REQUEST,
+                        "text/plain; charset=utf-8",
+                        &[],
+                        msg.as_bytes(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let rpc_val: JsonValue = match serde_json::from_slice(&req_body) {
+                Ok(v) => v,
+                Err(_) => {
+                    write_simple_response(
+                        &mut writer,
+                        StatusCode::BAD_REQUEST,
+                        "application/json",
+                        &[],
+                        br#"{"error":"invalid_jsonrpc"}"#,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let req_id = rpc_val.get("id").cloned().unwrap_or(JsonValue::from(1));
+            let rpc_method = rpc_val
+                .get("method")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("tools/list");
+            let rpc_params = rpc_val
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let mcp_call = tokio::select! {
+                biased;
+                _ = state.shutdown_token.cancelled() => return,
+                _ = grant.cancel_token.cancelled() => return,
+                res = pool.call(&tool_handle, &cfg, rpc_method, rpc_params) => res,
+            };
+            match mcp_call {
+                Ok(result) => {
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result,
+                    })
+                    .to_string();
+                    write_simple_response(
+                        &mut writer,
+                        StatusCode::OK,
+                        "application/json",
+                        &[],
+                        body.as_bytes(),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": { "code": -32000, "message": err.to_string() },
+                    })
+                    .to_string();
+                    write_simple_response(
+                        &mut writer,
+                        StatusCode::BAD_GATEWAY,
+                        "application/json",
+                        &[],
+                        body.as_bytes(),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
         write_simple_response(
             &mut writer,
             StatusCode::NOT_FOUND,
@@ -1663,6 +1824,7 @@ mod tests {
                 folder: "alpha-bot".into(),
                 allowed_folders,
                 allowed_tools: HashSet::new(),
+                allow_host_mcp_servers: false,
             })
             .unwrap();
 
@@ -1889,6 +2051,7 @@ mod tests {
                 folder: "bot-a".into(),
                 allowed_folders: folders,
                 allowed_tools: HashSet::new(),
+                allow_host_mcp_servers: false,
             })
             .unwrap();
 
@@ -1966,6 +2129,7 @@ mod tests {
                 folder: "sse-bot".into(),
                 allowed_folders: folders,
                 allowed_tools: HashSet::new(),
+                allow_host_mcp_servers: false,
             })
             .unwrap();
 
@@ -2126,6 +2290,7 @@ mod tests {
                 folder: "bot-cred".into(),
                 allowed_folders: folders,
                 allowed_tools: HashSet::new(),
+                allow_host_mcp_servers: false,
             })
             .unwrap();
 

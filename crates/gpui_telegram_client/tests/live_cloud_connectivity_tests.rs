@@ -8,6 +8,7 @@ use gpui_telegram_core::types::{ChatId, UserId};
 use gpui_telegram_proto::sync::{PtsUpdate, TypingAction, TypingEvent, UpdateEvent};
 
 #[tokio::test]
+#[ignore = "requires live cloud server"]
 async fn test_live_cloud_backend_connectivity_and_flow() {
     let base_url = std::env::var("GPUI_TELEGRAM_SERVER_URL")
         .unwrap_or_else(|_| "http://34.46.77.133:8080".to_string());
@@ -84,6 +85,7 @@ async fn test_live_cloud_backend_connectivity_and_flow() {
 }
 
 #[test]
+#[ignore = "requires live cloud server"]
 fn test_non_tokio_executor_login_and_ws_start_no_panic() {
     // Regression test for GPUI ForegroundExecutor (non-Tokio main thread):
     // Ensures HttpClient async methods and WsTransport::start() never panic with
@@ -116,6 +118,7 @@ fn test_non_tokio_executor_login_and_ws_start_no_panic() {
 }
 
 #[tokio::test]
+#[ignore = "requires live cloud server"]
 async fn test_live_cloud_http_send_message_and_chats_and_history() {
     let base_url = std::env::var("GPUI_TELEGRAM_SERVER_URL")
         .unwrap_or_else(|_| "http://34.46.77.133:8080".to_string());
@@ -312,6 +315,7 @@ fn test_cascading_four_tier_configuration_resolution() {
 }
 
 #[tokio::test]
+#[ignore = "requires live cloud server"]
 async fn test_live_cloud_reaction_roundtrip_and_durable_sqlite_persistence() {
     let base_url = std::env::var("GPUI_TELEGRAM_SERVER_URL")
         .unwrap_or_else(|_| "http://34.46.77.133:8080".to_string());

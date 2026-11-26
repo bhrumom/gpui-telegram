@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use orca_core::bot_types::{
-    AcceptedBotOffer, BotAgentId, BotAvatarSpec, BotConnectorLinks, BotGitHubLink,
+    AcceptedBotOffer, BotAgentId, BotAvatarSpec, BotConnectorLinks, BotFolderSlug, BotGitHubLink,
     BotImportedFrom, BotItemsStale, BotLaunchConfig, BotLinearLink, BotLookAroundConfig,
     BotMascotId, BotMember, BotName, BotNotifications, BotOfferAnswerUpdate, BotPermissionMode,
-    BotSharedFrom, BotSlackLink, BotTidyUpConfig, OrcaBotRecord, apply_bot_offer_answer,
-    bot_member_source, new_bot_name, normalize_persisted_bots, split_bots_by_older_build_support,
-    without_bot_member,
+    BotSharedFrom, BotSlackLink, BotTidyUpConfig, HandedPairedWorkspace, OrcaBotRecord,
+    apply_bot_offer_answer, bot_folder_name, bot_member_source, new_bot_name,
+    normalize_persisted_bots, split_bots_by_older_build_support, without_bot_member,
 };
 use orca_core::{BotErrorCode, LOCAL_EXECUTION_HOST_ID};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,8 @@ const BOTS_NEWER_FILE: &str = "bots_newer.json";
 pub struct CreateBotRequest {
     pub name: Option<String>,
     pub agent: BotAgentId,
+    pub folder: Option<String>,
+    pub home_path: Option<PathBuf>,
     pub mascot: Option<BotMascotId>,
     pub avatar_color: Option<String>,
     pub avatar_outfit: Option<String>,
@@ -41,6 +43,9 @@ pub struct CreateBotRequest {
     pub folder_workspace_id: Option<String>,
     pub template_id: Option<String>,
     pub first_run: bool,
+    pub items_stale: Option<BotItemsStale>,
+    pub tidy_up: Option<BotTidyUpConfig>,
+    pub look_around: Option<BotLookAroundConfig>,
     pub imported_from: Option<BotImportedFrom>,
     pub shared_from: Option<BotSharedFrom>,
 }
@@ -48,9 +53,10 @@ pub struct CreateBotRequest {
 /// Identifies a single member entry to remove from a bot's member list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotMemberRemoval {
-    pub source: String,
-    pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub id: String,
+    #[serde(default, alias = "workspaceId", skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
 }
 
@@ -92,6 +98,7 @@ pub struct BotPatch {
     pub offer_answer: Option<BotOfferAnswerUpdate>,
     pub accept_offer: Option<AcceptedBotOffer>,
     pub folder_workspace_id: Option<Option<String>>,
+    pub add_handed_paired_workspace: Option<HandedPairedWorkspace>,
 }
 
 /// Request to update a bot's mascot/emoji, color, and/or outfit with optional CAS guard.
@@ -217,13 +224,51 @@ impl BotController {
             avatar_spec.avatar_revision = 0;
         }
 
-        let (folder, reserved_dir) = self.home_store.reserve_unique_folder(name.as_str())?;
+        let (folder, reserved_dir, cleanup_dir_on_err) = match (req.folder, req.home_path) {
+            (Some(raw_folder), Some(home_path)) => {
+                let slug = BotFolderSlug::new(&raw_folder)?;
+                if guard.bots.iter().any(|b| b.folder == slug) {
+                    return Err(OrcaBotsError::bot(
+                        BotErrorCode::BotFolderNotOwned,
+                        format!("Bot folder '{}' is already owned by another bot.", slug.as_str()),
+                    ));
+                }
+                let existed = home_path.exists();
+                let dir = self.home_store.register_folder_override(&slug, home_path)?;
+                (slug, dir, !existed)
+            }
+            (None, Some(home_path)) => {
+                let base_slug = bot_folder_name(name.as_str());
+                let mut slug = base_slug.clone();
+                if guard.bots.iter().any(|b| b.folder == slug) {
+                    for n in 2..=10_000usize {
+                        let cand = BotFolderSlug::new(&format!("{}-{n}", base_slug.as_str()))?;
+                        if !guard.bots.iter().any(|b| b.folder == cand) {
+                            slug = cand;
+                            break;
+                        }
+                    }
+                }
+                let existed = home_path.exists();
+                let dir = self.home_store.register_folder_override(&slug, home_path)?;
+                (slug, dir, !existed)
+            }
+            (Some(raw_folder), None) => {
+                let slug = BotFolderSlug::new(&raw_folder)?;
+                let dir = self.home_store.reserve_directory(&slug)?;
+                (slug, dir, true)
+            }
+            (None, None) => {
+                let (slug, dir) = self.home_store.reserve_unique_folder(name.as_str())?;
+                (slug, dir, true)
+            }
+        };
         let now = now_epoch_ms();
         let record = OrcaBotRecord {
             id: Uuid::new_v4().to_string(),
             name,
             host_id: LOCAL_EXECUTION_HOST_ID.to_string(),
-            folder,
+            folder: folder.clone(),
             folder_workspace_id: req.folder_workspace_id,
             agent: req.agent,
             avatar_spec,
@@ -236,9 +281,9 @@ impl BotController {
             skill_projects: None,
             sidebar_order: None,
             chat_session_id: None,
-            look_around: None,
-            tidy_up: None,
-            items_stale: None,
+            look_around: req.look_around,
+            tidy_up: req.tidy_up,
+            items_stale: req.items_stale,
             items_seen: None,
             first_run: req.first_run,
             accepted_offers: None,
@@ -253,7 +298,10 @@ impl BotController {
         };
 
         if let Err(err) = record.validate() {
-            let _ = fs::remove_dir_all(&reserved_dir);
+            if cleanup_dir_on_err {
+                let _ = fs::remove_dir_all(&reserved_dir);
+            }
+            self.home_store.unregister_folder_override(&folder);
             return Err(OrcaBotsError::from(err));
         }
 
@@ -261,14 +309,20 @@ impl BotController {
             .home_store
             .provision_bot_home(&record, req.custom_soul.as_deref())
         {
-            let _ = fs::remove_dir_all(&reserved_dir);
+            if cleanup_dir_on_err {
+                let _ = fs::remove_dir_all(&reserved_dir);
+            }
+            self.home_store.unregister_folder_override(&folder);
             return Err(err);
         }
 
         guard.bots.push(record.clone());
         if let Err(err) = save_split_bots(&self.state_dir, &guard.bots) {
             guard.bots.pop();
-            let _ = fs::remove_dir_all(&reserved_dir);
+            if cleanup_dir_on_err {
+                let _ = fs::remove_dir_all(&reserved_dir);
+            }
+            self.home_store.unregister_folder_override(&folder);
             return Err(err);
         }
         Ok(record)
@@ -356,6 +410,14 @@ impl BotController {
         }
         if let Some(ws_id) = patch.folder_workspace_id {
             candidate.folder_workspace_id = ws_id;
+        }
+        if let Some(handed) = patch.add_handed_paired_workspace {
+            let list = candidate
+                .handed_paired_workspaces
+                .get_or_insert_with(Vec::new);
+            if !list.iter().any(|h| h.workspace_id == handed.workspace_id) {
+                list.push(handed);
+            }
         }
 
         // Enforce host-only invariant: general patches can never mutate `host_mcp_servers`.
@@ -499,12 +561,24 @@ fn apply_member_mutations(
     }
 
     for removal in remove_member.into_iter().chain(remove_members) {
-        *members = without_bot_member(
-            members,
-            &removal.source,
-            &removal.id,
-            removal.workspace_id.as_deref(),
-        );
+        if let Some(src) = removal.source.as_deref().filter(|s| !s.trim().is_empty()) {
+            *members = without_bot_member(
+                members,
+                src,
+                &removal.id,
+                removal.workspace_id.as_deref(),
+            );
+        } else {
+            members.retain(|m| {
+                if m.id != removal.id {
+                    return true;
+                }
+                match removal.workspace_id.as_deref() {
+                    Some(ws) => m.workspace_id.as_deref() != Some(ws),
+                    None => false,
+                }
+            });
+        }
     }
 }
 

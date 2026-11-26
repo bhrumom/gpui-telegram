@@ -110,9 +110,34 @@ struct InFlightRestart {
     target_account_id: String,
 }
 
+/// Metadata for an isolated registered provider account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredAccountMeta {
+    pub provider: String,
+    pub account_id: String,
+    pub label: Option<String>,
+    pub home_dir: PathBuf,
+    pub reset_credits: u32,
+    pub rate_limited: bool,
+    pub last_credit_status: Option<String>,
+}
+
+/// Persisted auto-continue limit stop notice per provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderLimitStopStatus {
+    pub provider: String,
+    pub auto_continue: bool,
+    pub grace_minutes: u32,
+    pub resumes_at: String,
+    pub status_text: String,
+}
+
 #[derive(Debug, Default)]
 struct AccountCoordinatorState {
     active_account_by_provider: BTreeMap<String, String>,
+    registered_accounts: BTreeMap<(String, String), RegisteredAccountMeta>,
+    surface_bindings: BTreeMap<(String, String, String), String>,
+    spent_attempts: BTreeMap<(String, String), bool>,
     in_flight_restarts: BTreeMap<String, InFlightRestart>,
     last_reask_at_ms: BTreeMap<String, i64>,
     codex_reset_credits: BTreeMap<(String, String), CodexResetCreditEntry>,
@@ -431,6 +456,223 @@ impl AccountHomeManager {
             .cloned()
             .collect()
     }
+
+    /// Registers an isolated provider account with optional custom `home_dir`, `label`,
+    /// `reset_credits`, and `rate_limited` state.
+    pub fn add_account(
+        &self,
+        provider: &str,
+        account_id: &str,
+        label: Option<String>,
+        custom_home_dir: Option<PathBuf>,
+        reset_credits: Option<u32>,
+        rate_limited: Option<bool>,
+    ) -> Result<RegisteredAccountMeta> {
+        let paths = self.ensure_account_home(provider, account_id)?;
+        let home_dir = match custom_home_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir)?;
+                dir
+            }
+            None => paths.home_dir,
+        };
+        let meta = RegisteredAccountMeta {
+            provider: paths.provider.clone(),
+            account_id: paths.account_id.clone(),
+            label,
+            home_dir,
+            reset_credits: reset_credits.unwrap_or(0),
+            rate_limited: rate_limited.unwrap_or(false),
+            last_credit_status: None,
+        };
+        let mut st = self.state.lock();
+        st.registered_accounts
+            .insert((paths.provider.clone(), paths.account_id.clone()), meta.clone());
+        st.active_account_by_provider
+            .entry(paths.provider)
+            .or_insert(paths.account_id);
+        Ok(meta)
+    }
+
+    /// Lists registered accounts (optionally filtered by `provider`).
+    pub fn list_accounts(&self, provider: Option<&str>) -> Vec<RegisteredAccountMeta> {
+        let norm = provider.map(|p| p.trim().to_ascii_lowercase());
+        let st = self.state.lock();
+        st.registered_accounts
+            .values()
+            .filter(|a| norm.as_deref().is_none_or(|p| a.provider == p))
+            .cloned()
+            .collect()
+    }
+
+    /// Switches the active account for `provider` without removing other accounts.
+    pub fn set_active_account(&self, provider: &str, account_id: &str) -> Result<String> {
+        let prov = validate_home_provider(provider)?;
+        let acct = validate_account_slug(account_id)?;
+        let mut st = self.state.lock();
+        st.active_account_by_provider.insert(prov, acct.clone());
+        Ok(acct)
+    }
+
+    /// Builds isolated runtime environment variables pointing exclusively at `(provider, account_id)`'s home dir.
+    pub fn get_runtime_env(
+        &self,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        let prov = validate_home_provider(provider)?;
+        let acct = validate_account_slug(account_id)?;
+        let home_dir = {
+            let st = self.state.lock();
+            st.registered_accounts
+                .get(&(prov.clone(), acct.clone()))
+                .map(|m| m.home_dir.clone())
+        };
+        let resolved_home = match home_dir {
+            Some(h) => h,
+            None => self.ensure_account_home(&prov, &acct)?.home_dir,
+        };
+        let home_str = resolved_home.to_string_lossy().to_string();
+        let mut env = BTreeMap::new();
+        env.insert("ORCA_ACCOUNT_ID".to_string(), acct);
+        env.insert("ORCA_ACCOUNT_HOME".to_string(), home_str.clone());
+        match prov.as_str() {
+            "codex" => {
+                env.insert("CODEX_HOME".to_string(), home_str);
+            }
+            "claude" => {
+                env.insert("CLAUDE_CONFIG_DIR".to_string(), home_str);
+            }
+            other => {
+                env.insert(
+                    format!("{}_HOME", other.to_ascii_uppercase().replace('-', "_")),
+                    home_str,
+                );
+            }
+        }
+        Ok(env)
+    }
+
+    /// Binds a running surface (`terminal` or `chat`) to the provider's current active account at launch.
+    pub fn bind_surface_launch(
+        &self,
+        provider: &str,
+        surface: &str,
+        surface_id: &str,
+    ) -> Result<String> {
+        let prov = validate_home_provider(provider)?;
+        let surf = surface.trim().to_ascii_lowercase();
+        let sid = surface_id.trim().to_string();
+        let mut st = self.state.lock();
+        let active = st
+            .active_account_by_provider
+            .get(&prov)
+            .cloned()
+            .ok_or_else(|| {
+                OrcaIdeRuntimeError::not_found(format!("no active account for provider '{prov}'"))
+            })?;
+        st.surface_bindings.insert((prov, surf, sid), active.clone());
+        Ok(active)
+    }
+
+    /// Resolves `(launch_account_id, next_turn_account_id)`:
+    /// - `terminal` surfaces stay pinned to their launch account
+    /// - `chat` surfaces adopt the new active account on the next turn.
+    pub fn resolve_turn_account(
+        &self,
+        provider: &str,
+        surface: &str,
+        surface_id: &str,
+    ) -> Result<(String, String)> {
+        let prov = validate_home_provider(provider)?;
+        let surf = surface.trim().to_ascii_lowercase();
+        let sid = surface_id.trim().to_string();
+        let st = self.state.lock();
+        let current_active = st
+            .active_account_by_provider
+            .get(&prov)
+            .cloned()
+            .ok_or_else(|| {
+                OrcaIdeRuntimeError::not_found(format!("no active account for provider '{prov}'"))
+            })?;
+        let launch_acct = st
+            .surface_bindings
+            .get(&(prov, surf.clone(), sid))
+            .cloned()
+            .unwrap_or_else(|| current_active.clone());
+        let next_turn = if surf == "terminal" {
+            launch_acct.clone()
+        } else {
+            current_active
+        };
+        Ok((launch_acct, next_turn))
+    }
+
+    /// Idempotently spends one rate-limit reset credit for `account_id` keyed by `attempt_id`,
+    /// clearing `rate_limited` and recording a durable Codex reset credit entry.
+    pub fn spend_reset_credit(
+        &self,
+        account_id: &str,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<(u32, bool, &'static str)> {
+        let acct = validate_account_slug(account_id)?;
+        let att = attempt_id.trim().to_string();
+        let mut st = self.state.lock();
+        let already = !att.is_empty() && st.spent_attempts.contains_key(&(acct.clone(), att.clone()));
+        let key = st
+            .registered_accounts
+            .keys()
+            .find(|(_, a)| a == &acct)
+            .cloned()
+            .ok_or_else(|| {
+                OrcaIdeRuntimeError::not_found(format!("account '{acct}' not found"))
+            })?;
+        let (rem, rl) = {
+            let entry = st.registered_accounts.get_mut(&key).unwrap();
+            if !already {
+                if entry.reset_credits == 0 {
+                    return Err(OrcaIdeRuntimeError::conflict(format!(
+                        "account '{acct}' has no remaining reset credits"
+                    )));
+                }
+                entry.reset_credits -= 1;
+                entry.rate_limited = false;
+                entry.last_credit_status = Some("applied".to_string());
+            }
+            (entry.reset_credits, entry.rate_limited)
+        };
+        if !already && !att.is_empty() {
+            st.spent_attempts.insert((acct.clone(), att.clone()), true);
+        }
+        drop(st);
+        let window_key = if att.is_empty() {
+            format!("spend-{now_ms}")
+        } else {
+            att
+        };
+        let _ = self.record_codex_reset_credit(&acct, &window_key, 0, now_ms);
+        Ok((rem, rl, "applied"))
+    }
+
+    pub fn get_reset_credit_status(&self, account_id: &str) -> Result<(u32, bool, String)> {
+        let acct = validate_account_slug(account_id)?;
+        let st = self.state.lock();
+        let meta = st
+            .registered_accounts
+            .values()
+            .find(|m| m.account_id == acct)
+            .ok_or_else(|| {
+                OrcaIdeRuntimeError::not_found(format!("account '{acct}' not found"))
+            })?;
+        Ok((
+            meta.reset_credits,
+            meta.rate_limited,
+            meta.last_credit_status
+                .clone()
+                .unwrap_or_else(|| "idle".to_string()),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +812,7 @@ pub fn infer_provider_cost_usd(
 pub struct UsageRosterManager {
     snapshots: RwLock<BTreeMap<(String, String), ProviderQuotaSnapshot>>,
     pauses: RwLock<BTreeMap<String, UsageLimitContinue>>,
+    limit_stops: RwLock<BTreeMap<String, ProviderLimitStopStatus>>,
 }
 
 impl UsageRosterManager {
@@ -622,12 +865,34 @@ impl UsageRosterManager {
     /// highest `percent_used` first, tie-broken by earliest `tightest_reset_at_ms`,
     /// then lexicographically by `(provider, account_id)`.
     pub fn sorted_roster(&self, now_ms: i64) -> Vec<UsageRosterEntry> {
-        let mut entries: Vec<UsageRosterEntry> = self
-            .snapshots
-            .read()
+        let snaps = self.snapshots.read();
+        let mut present_providers = std::collections::BTreeSet::new();
+        let mut entries: Vec<UsageRosterEntry> = snaps
             .values()
-            .map(|snap| build_roster_entry(snap, now_ms))
+            .map(|snap| {
+                present_providers.insert(snap.provider.as_str());
+                build_roster_entry(snap, now_ms)
+            })
             .collect();
+
+        for &prov in &USAGE_PROVIDERS_9 {
+            if !present_providers.contains(prov) {
+                entries.push(UsageRosterEntry {
+                    provider: prov.to_string(),
+                    account_id: "default".to_string(),
+                    percent_used: 0.0,
+                    percent_remaining: 100.0,
+                    warning_chip: false,
+                    tightest_reset_at_ms: None,
+                    five_hour_reset_in_ms: None,
+                    daily_reset_in_ms: None,
+                    weekly_reset_in_ms: None,
+                    inferred_cost_usd: 0.0,
+                    source: QuotaSource::LocalEstimate,
+                    updated_at_ms: now_ms,
+                });
+            }
+        }
 
         entries.sort_by(|a, b| {
             b.percent_used
@@ -707,6 +972,117 @@ impl UsageRosterManager {
 
     pub fn clear_usage_limit_pause(&self, session_key: &str) -> Option<UsageLimitContinue> {
         self.pauses.write().remove(session_key)
+    }
+
+    /// Records a usage-limit stop with auto-continue status (e.g., `"Continues at 14:30"`).
+    pub fn report_limit_stop(
+        &self,
+        provider: &str,
+        auto_continue: bool,
+        grace_minutes: u32,
+        resumes_at: &str,
+        now_ms: i64,
+    ) -> Result<ProviderLimitStopStatus> {
+        let canonical = canonicalize_usage_provider(provider)?;
+        let resumes = resumes_at.trim().to_string();
+        let status_text = if auto_continue {
+            format!("Continues at {resumes}")
+        } else {
+            format!("Paused until {resumes}")
+        };
+        let st = ProviderLimitStopStatus {
+            provider: canonical.to_string(),
+            auto_continue,
+            grace_minutes,
+            resumes_at: resumes,
+            status_text,
+        };
+        self.limit_stops
+            .write()
+            .insert(canonical.to_string(), st.clone());
+        let has_row = self
+            .snapshots
+            .read()
+            .keys()
+            .any(|(p, _)| p == canonical);
+        if !has_row {
+            let _ = self.ingest_snapshot(ProviderQuotaSnapshot {
+                provider: canonical.to_string(),
+                account_id: "default".to_string(),
+                source: QuotaSource::LocalEstimate,
+                windows: vec![QuotaWindowUsage {
+                    window_kind: QuotaWindowKind::FiveHour,
+                    percent_used: 100.0,
+                    reset_at_ms: Some(now_ms.saturating_add(i64::from(grace_minutes) * 60_000)),
+                }],
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                explicit_cost_usd: Some(0.0),
+                captured_at_ms: now_ms,
+            });
+        }
+        Ok(st)
+    }
+
+    pub fn get_limit_status(&self, provider: &str) -> Result<ProviderLimitStopStatus> {
+        let canonical = canonicalize_usage_provider(provider)?;
+        self.limit_stops
+            .read()
+            .get(canonical)
+            .cloned()
+            .ok_or_else(|| {
+                OrcaIdeRuntimeError::not_found(format!(
+                    "no limit stop recorded for provider '{canonical}'"
+                ))
+            })
+    }
+
+    /// Returns the tightest-limit-first roster enriched with camelCase wire fields and
+    /// active `limitStatusText` / `statusText`.
+    pub fn sorted_roster_wire_json(&self, now_ms: i64) -> Vec<serde_json::Value> {
+        let entries = self.sorted_roster(now_ms);
+        let stops = self.limit_stops.read();
+        entries
+            .into_iter()
+            .map(|e| {
+                let source_str = match e.source {
+                    QuotaSource::ClaudeStatusLine => "status_line",
+                    QuotaSource::StructuredApi => "api",
+                    QuotaSource::LocalEstimate => "local",
+                };
+                let resets_in_sec = e
+                    .tightest_reset_at_ms
+                    .map(|ts| ts.saturating_sub(now_ms).max(0) / 1_000);
+                let limit_stop = stops.get(&e.provider);
+                let mut val = serde_json::json!({
+                    "provider": e.provider,
+                    "accountId": e.account_id,
+                    "account_id": e.account_id,
+                    "percentUsed": e.percent_used,
+                    "percent_used": e.percent_used,
+                    "percentRemaining": e.percent_remaining,
+                    "percent_remaining": e.percent_remaining,
+                    "warningChip": e.warning_chip,
+                    "warning_chip": e.warning_chip,
+                    "resetsInSec": resets_in_sec,
+                    "tightestResetAtMs": e.tightest_reset_at_ms,
+                    "inferredCostUsd": e.inferred_cost_usd,
+                    "inferred_cost_usd": e.inferred_cost_usd,
+                    "source": source_str,
+                    "updatedAtMs": e.updated_at_ms,
+                });
+                if let Some(st) = limit_stop
+                    && let Some(obj) = val.as_object_mut()
+                {
+                    obj.insert("limitStatusText".into(), serde_json::json!(st.status_text));
+                    obj.insert("statusText".into(), serde_json::json!(st.status_text));
+                    obj.insert("autoContinue".into(), serde_json::json!(st.auto_continue));
+                    obj.insert("graceMinutes".into(), serde_json::json!(st.grace_minutes));
+                }
+                val
+            })
+            .collect()
     }
 }
 

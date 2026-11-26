@@ -42,7 +42,11 @@ pub(crate) async fn execute_orchestration(
             if let Some(rid) = args.first(&["--run-id", "--id"]) {
                 body["run_id"] = json!(rid);
             }
-            if let Some(csid) = args.first(&["--coordinator-session-id", "--session-id"]) {
+            if let Some(csid) = args.first(&[
+                "--coordinator-session-id",
+                "--coordinator-session",
+                "--session-id",
+            ]) {
                 body["coordinator_orca_session_id"] = json!(csid);
             }
             if let Some(local) = args.opt_bool(&["--mailbox-local-only"])? {
@@ -62,7 +66,7 @@ pub(crate) async fn execute_orchestration(
                 .await
         }
         "run-get" => {
-            let run_id = req_str(args, Some(0), &["--run-id", "--id"], "<run_id>")?;
+            let run_id = req_str(args, Some(0), &["--run-id", "--run", "--id"], "<run_id>")?;
             http.get(&format!(
                 "/api/v1/orca/orchestration/runs/{}",
                 pct_encode(run_id)
@@ -70,10 +74,10 @@ pub(crate) async fn execute_orchestration(
             .await
         }
         "task-create" => {
-            let run_id = req_str(args, Some(0), &["--run-id"], "--run-id")?;
+            let run_id = req_str(args, Some(0), &["--run-id", "--run"], "--run-id")?;
             let title = req_str(
                 args,
-                if args.first(&["--run-id"]).is_some() {
+                if args.first(&["--run-id", "--run"]).is_some() {
                     Some(0)
                 } else {
                     Some(1)
@@ -98,8 +102,8 @@ pub(crate) async fn execute_orchestration(
             http.post("/api/v1/orca/orchestration/tasks", &body).await
         }
         "task-set" | "task-transition" => {
-            let task_id = req_str(args, Some(0), &["--task-id", "--id"], "<task_id>")?;
-            let run_id = req_str(args, None, &["--run-id"], "--run-id")?;
+            let task_id = req_str(args, Some(0), &["--task-id", "--task", "--id"], "<task_id>")?;
+            let run_id = req_str(args, None, &["--run-id", "--run"], "--run-id")?;
             let status = req_str(args, Some(1), &["--status", "--next"], "--status")?;
             let mut body = json!({ "run_id": run_id, "status": status });
             if let Some(ms) = args.opt_i64(&["--now-ms"])? {
@@ -112,8 +116,8 @@ pub(crate) async fn execute_orchestration(
             .await
         }
         "worker-start" => {
-            let run_id = req_str(args, None, &["--run-id"], "--run-id")?;
-            let task_id = req_str(args, None, &["--task-id"], "--task-id")?;
+            let run_id = req_str(args, None, &["--run-id", "--run"], "--run-id")?;
+            let task_id = req_str(args, None, &["--task-id", "--task"], "--task-id")?;
             let agent_id = args.first(&["--agent", "--agent-id"]).unwrap_or("claude");
             let mut body = json!({
                 "run_id": run_id,
@@ -121,7 +125,7 @@ pub(crate) async fn execute_orchestration(
                 "agent_id": agent_id,
                 "keep_open": args.has_bool(&["--keep-open"]),
             });
-            if let Some(did) = args.first(&["--dispatch-id"]) {
+            if let Some(did) = args.first(&["--dispatch-id", "--dispatch"]) {
                 body["dispatch_id"] = json!(did);
             }
             if let Some(host) = args.first(&["--host-id", "--on", "--host"]) {
@@ -143,7 +147,12 @@ pub(crate) async fn execute_orchestration(
                 .await
         }
         "worker-done" => {
-            let dispatch_id = req_str(args, Some(0), &["--dispatch-id", "--id"], "<dispatch_id>")?;
+            let dispatch_id = req_str(
+                args,
+                Some(0),
+                &["--dispatch-id", "--dispatch", "--id"],
+                "<dispatch_id>",
+            )?;
             let expected_gen = args
                 .opt_u64(&["--expected-generation", "--generation", "--gen"])?
                 .unwrap_or(1);
@@ -162,14 +171,19 @@ pub(crate) async fn execute_orchestration(
             if let Some(ec) = args.opt_i64(&["--exit-code"])? {
                 body["exit_code"] = json!(ec);
             }
-            if let Some(tx) = args.first(&["--transcript", "--transcript-text"]) {
+            if let Some(tx) = args.first(&["--transcript", "--transcript-text", "--summary"]) {
                 body["transcript_text"] = json!(tx);
             }
             http.post("/api/v1/orca/orchestration/workers/done", &body)
                 .await
         }
         "worker-read" => {
-            let dispatch_id = req_str(args, Some(0), &["--dispatch-id", "--id"], "<dispatch_id>")?;
+            let dispatch_id = req_str(
+                args,
+                Some(0),
+                &["--dispatch-id", "--dispatch", "--id"],
+                "<dispatch_id>",
+            )?;
             http.get(&format!(
                 "/api/v1/orca/orchestration/workers/{}/archive",
                 pct_encode(dispatch_id)
@@ -177,7 +191,12 @@ pub(crate) async fn execute_orchestration(
             .await
         }
         "worker-release" => {
-            let dispatch_id = req_str(args, Some(0), &["--dispatch-id", "--id"], "<dispatch_id>")?;
+            let dispatch_id = req_str(
+                args,
+                Some(0),
+                &["--dispatch-id", "--dispatch", "--id"],
+                "<dispatch_id>",
+            )?;
             let mut body = Map::new();
             if let Some(ms) = args.opt_i64(&["--now-ms"])? {
                 body.insert("now_ms".into(), json!(ms));
@@ -202,7 +221,7 @@ async fn execute_orchestration_mail_and_gates(
 ) -> Result<Value, CliError> {
     match sub {
         "send" => {
-            let run_id = req_str(args, None, &["--run-id"], "--run-id")?;
+            let run_id = req_str(args, None, &["--run-id", "--run"], "--run-id")?;
             let from_id = args.first(&["--from", "--from-id"]).unwrap_or("coordinator");
             let to_raw = req_str(args, Some(0), &["--to", "--target"], "--to")?;
             let target_val = if to_raw.trim().starts_with('{') {
@@ -246,10 +265,23 @@ async fn execute_orchestration_mail_and_gates(
                 .await
         }
         "check" => {
-            let recipient = req_str(args, Some(0), &["--recipient-id", "--recipient", "--id"], "<recipient_id>")?;
-            let mut q = vec![("recipient_id", recipient.to_string())];
-            if let Some(did) = args.first(&["--dispatch-id"]) {
+            let mut q = Vec::new();
+            if let Some(rid) = args.first(&["--run", "--run-id"]) {
+                q.push(("run_id", rid.to_string()));
+            }
+            if let Some(did) = args.first(&["--dispatch-id", "--dispatch"]) {
                 q.push(("dispatch_id", did.to_string()));
+            }
+            if let Some(recipient) = args
+                .first(&["--recipient-id", "--recipient", "--id"])
+                .or_else(|| args.pos(0))
+            {
+                q.push(("recipient_id", recipient.to_string()));
+            }
+            if q.is_empty() {
+                return Err(orca_usage(
+                    "Missing required --recipient-id, --dispatch, or --run for 'orchestration check'",
+                ));
             }
             if let Some(g) = args.opt_u64(&["--expected-generation", "--generation", "--gen"])? {
                 q.push(("expected_generation", g.to_string()));
@@ -261,14 +293,15 @@ async fn execute_orchestration_mail_and_gates(
                 .await
         }
         "ask" => {
-            let run_id = req_str(args, None, &["--run-id"], "--run-id")?;
-            let dispatch_id = req_str(args, None, &["--dispatch-id"], "--dispatch-id")?;
+            let dispatch_id = req_str(args, None, &["--dispatch-id", "--dispatch"], "--dispatch")?;
             let prompt = req_str(args, Some(0), &["--prompt", "--question", "--text"], "<prompt>")?;
             let mut body = json!({
-                "run_id": run_id,
                 "dispatch_id": dispatch_id,
                 "prompt": prompt,
             });
+            if let Some(run_id) = args.first(&["--run-id", "--run"]) {
+                body["run_id"] = json!(run_id);
+            }
             if let Some(ms) = args.opt_i64(&["--now-ms"])? {
                 body["now_ms"] = json!(ms);
             }
@@ -276,10 +309,16 @@ async fn execute_orchestration_mail_and_gates(
                 .await
         }
         "gate-create" => {
-            let run_id = req_str(args, None, &["--run-id"], "--run-id")?;
-            let task_id = req_str(args, None, &["--task-id"], "--task-id")?;
+            let run_id = req_str(args, None, &["--run-id", "--run"], "--run-id")?;
+            let task_id = args.first(&["--task-id", "--task"]);
+            let dispatch_id = args.first(&["--dispatch-id", "--dispatch"]);
+            if task_id.is_none() && dispatch_id.is_none() {
+                return Err(orca_usage(
+                    "Missing required --task-id or --dispatch for 'orchestration gate-create'",
+                ));
+            }
             let gate_id = args
-                .first(&["--gate-id", "--id"])
+                .first(&["--gate-id", "--gate", "--id"])
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("gate-{}", uuid::Uuid::new_v4()));
             let payload = if let Some(raw_p) = args.first(&["--payload-json"]) {
@@ -290,7 +329,7 @@ async fn execute_orchestration_mail_and_gates(
                     "review" => json!({
                         "kind": "review",
                         "gate_id": gate_id,
-                        "task_id": task_id,
+                        "task_id": task_id.unwrap_or_default(),
                         "required_approvals": args.opt_u32(&["--required-approvals"])?.unwrap_or(1),
                         "approvals": [],
                         "rejections": [],
@@ -300,7 +339,7 @@ async fn execute_orchestration_mail_and_gates(
                     "merge" => json!({
                         "kind": "merge",
                         "gate_id": gate_id,
-                        "task_id": task_id,
+                        "task_id": task_id.unwrap_or_default(),
                         "ci_passed": args.has_bool(&["--ci-passed"]),
                         "conflicts_resolved": args.has_bool(&["--conflicts-resolved"]),
                         "review_gates": [],
@@ -317,10 +356,23 @@ async fn execute_orchestration_mail_and_gates(
             };
             let mut body = json!({
                 "run_id": run_id,
-                "task_id": task_id,
                 "gate_id": gate_id,
                 "payload": payload,
             });
+            if let Some(tid) = task_id {
+                body["task_id"] = json!(tid);
+            }
+            if let Some(did) = dispatch_id {
+                body["dispatchId"] = json!(did);
+            }
+            if let Some(opts) = args.first(&["--options"]) {
+                let list: Vec<String> = opts
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                body["options"] = json!(list);
+            }
             if let Some(dl) = args.opt_i64(&["--deadline-ms"])? {
                 body["deadline_ms"] = json!(dl);
             }
@@ -330,9 +382,15 @@ async fn execute_orchestration_mail_and_gates(
             http.post("/api/v1/orca/orchestration/gates", &body).await
         }
         "gate-resolve" => {
-            let gate_id = req_str(args, Some(0), &["--gate-id", "--id"], "<gate_id>")?;
+            let gate_id = req_str(args, Some(0), &["--gate-id", "--gate", "--id"], "<gate_id>")?;
             let actor = args.first(&["--actor"]).unwrap_or("owner");
-            let mut body = if args.has_bool(&["--reject", "--decline", "--deny"]) {
+            let mut body = if let Some(dec) = args.first(&["--decision"]) {
+                json!({
+                    "decision": dec,
+                    "actor": actor,
+                    "note": args.first(&["--note", "--rationale", "--reason"]),
+                })
+            } else if args.has_bool(&["--reject", "--decline", "--deny"]) {
                 json!({
                     "action": "reject",
                     "actor": actor,
@@ -466,20 +524,24 @@ pub(crate) async fn execute_webhooks(
     let mut val = match sub {
         "list" => {
             let mut q = Vec::new();
-            if let Some(bid) = args.first(&["--bot-id"]).or_else(|| args.pos(0)) {
+            if let Some(bid) = args.first(&["--bot", "--bot-id"]).or_else(|| args.pos(0)) {
                 q.push(("bot_id", bid.to_string()));
             }
             http.get(&build_query_url("/api/v1/orca/webhooks", &q))
                 .await?
         }
         "create" => {
-            let bot_id = req_str(args, None, &["--bot-id"], "--bot-id")?;
-            let automation_id = req_str(args, None, &["--automation-id"], "--automation-id")?;
+            let bot_id = req_str(args, None, &["--bot", "--bot-id"], "--bot")?;
             let mut body = json!({
                 "bot_id": bot_id,
-                "automation_id": automation_id,
                 "include_copy_card": false,
             });
+            if let Some(automation_id) = args.first(&["--automation-id"]) {
+                body["automation_id"] = json!(automation_id);
+            }
+            if let Some(name) = args.first(&["--name"]) {
+                body["name"] = json!(name);
+            }
             if let Some(adapter) = args.first(&["--adapter"]) {
                 body["adapter"] = json!(adapter);
             }
@@ -662,7 +724,7 @@ pub(crate) async fn execute_automations(
     match sub {
         "list" => {
             let mut q = Vec::new();
-            if let Some(bid) = args.first(&["--bot-id"]).or_else(|| args.pos(0)) {
+            if let Some(bid) = args.first(&["--bot", "--bot-id"]).or_else(|| args.pos(0)) {
                 q.push(("bot_id", bid.to_string()));
             }
             if args.has_bool(&["--local-only"]) {
@@ -673,9 +735,15 @@ pub(crate) async fn execute_automations(
         }
         "create" => {
             let name = req_str(args, None, &["--name"], "--name")?;
-            let prompt = req_str(args, None, &["--prompt"], "--prompt")?;
-            let bot_id = req_str(args, None, &["--bot-id"], "--bot-id")?;
-            let raw_triggers = args.all(&["--trigger"]);
+            let bot_id = req_str(args, None, &["--bot", "--bot-id"], "--bot")?;
+            let prompt = args
+                .first(&["--prompt"])
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Handle automation {name}"));
+            let mut raw_triggers = args.all(&["--trigger"]);
+            if let (Some(src), Some(kind)) = (args.first(&["--source"]), args.first(&["--kind"])) {
+                raw_triggers.push(format!("{src}:{kind}"));
+            }
             let mut triggers = Vec::with_capacity(raw_triggers.len());
             for (i, raw_t) in raw_triggers.iter().enumerate() {
                 triggers.push(parse_trigger_arg(raw_t, i, args)?);
@@ -740,8 +808,15 @@ pub(crate) async fn execute_automations(
                 .await
         }
         "watch-pr" => {
-            let bot_id = req_str(args, None, &["--bot-id"], "--bot-id")?;
-            let pr = req_str(args, Some(0), &["--pr"], "<owner/repo#n>")?;
+            let bot_id = req_str(args, None, &["--bot", "--bot-id"], "--bot")?;
+            let pr_raw = req_str(args, Some(0), &["--pr"], "<owner/repo#n>")?;
+            let pr = if let Some(repo) = args.first(&["--repo"])
+                && !pr_raw.contains('#')
+            {
+                format!("{repo}#{pr_raw}")
+            } else {
+                pr_raw.to_string()
+            };
             let mut body = json!({
                 "bot_id": bot_id,
                 "pr": pr,

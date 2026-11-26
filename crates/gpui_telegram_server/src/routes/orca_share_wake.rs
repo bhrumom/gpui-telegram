@@ -35,6 +35,7 @@ use orca_bots::{
 };
 use orca_core::bot_ecosystem::{
     TeamShareHeldMessagePayload, TeamShareOfferPayload, TeamSharePublicIdentity,
+    compute_team_share_host_key_commitment,
 };
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -301,14 +302,19 @@ pub async fn package_export(
         connectors_hint: req.connectors_hint,
     };
     match state.orca_bots.export_package(&bot_id, &opts).await {
-        Ok(exported) => Json(json!({
-            "manifest": exported.validated.manifest,
-            "zip_size_bytes": exported.zip_bytes.len(),
-            "zip_b64": BASE64_STD.encode(&exported.zip_bytes),
-            "warnings": exported.warnings,
-            "runnable_warnings": exported.runnable_warnings,
-        }))
-        .into_response(),
+        Ok(exported) => {
+            let zip_b64 = BASE64_STD.encode(&exported.zip_bytes);
+            Json(json!({
+                "schemaVersion": exported.validated.manifest.schema_version,
+                "manifest": exported.validated.manifest,
+                "zip_size_bytes": exported.zip_bytes.len(),
+                "zip_b64": zip_b64,
+                "package": zip_b64,
+                "warnings": exported.warnings,
+                "runnable_warnings": exported.runnable_warnings,
+            }))
+            .into_response()
+        }
         Err(err) => map_bots_err(err),
     }
 }
@@ -371,7 +377,10 @@ pub async fn package_import(
         Ok(imported) => (
             StatusCode::CREATED,
             Json(json!({
-                "bot": imported.bot,
+                "bot": orca_bots::wire_json::bot_record_to_wire_json(
+                    &imported.bot,
+                    state.orca_bots.home_store()
+                ),
                 "manifest": imported.validated.manifest,
                 "warnings": imported.warnings,
                 "restored_files": imported.restored_files,
@@ -413,7 +422,13 @@ pub async fn share_seal(
         .recipient_identity
         .unwrap_or_else(|| sender_identity.clone());
     let now_ms = req.now_ms.unwrap_or_else(now_epoch_ms);
-    let mode = req.mode.as_deref().unwrap_or("offer");
+    let mode = req.mode.as_deref().unwrap_or_else(|| {
+        if req.text.is_some() || req.client_message_id.is_some() || req.host_key.is_some() {
+            "held_message"
+        } else {
+            "offer"
+        }
+    });
 
     match mode {
         "offer" => {
@@ -454,6 +469,8 @@ pub async fn share_seal(
                     Json(json!({
                         "mode": "offer",
                         "offer": sealed,
+                        "envelope": sealed,
+                        "receiverKey": recipient.x25519_public_b64,
                         "sender_identity": sender_identity,
                     }))
                     .into_response()
@@ -462,7 +479,20 @@ pub async fn share_seal(
             }
         }
         "held_message" => {
-            let payload: TeamShareHeldMessagePayload = match req.payload {
+            if let Some(ref hk) = req.host_key
+                && hk.trim().is_empty()
+            {
+                return orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "hostKey must be non-empty when provided",
+                );
+            }
+            let sender_name = req
+                .sender_name
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Owner".to_string());
+            let mut payload: TeamShareHeldMessagePayload = match req.payload {
                 Some(val) => match serde_json::from_value(val) {
                     Ok(p) => p,
                     Err(e) => {
@@ -477,15 +507,24 @@ pub async fn share_seal(
                     share_id: req
                         .share_id
                         .unwrap_or_else(|| format!("sh_{}", Uuid::new_v4().simple())),
-                    bot_id: bot.id.clone(),
+                    bot_id: req.bot_id.unwrap_or_else(|| bot.id.clone()),
                     client_message_id: req
                         .client_message_id
                         .unwrap_or_else(|| format!("cmsg_{}", Uuid::new_v4().simple())),
-                    sender_name: req.sender_name.unwrap_or_else(|| "Owner".to_string()),
+                    sender_name,
                     text: req.text.unwrap_or_default(),
                     sent_at_ms: now_ms,
+                    host_key_commitment: None,
                 },
             };
+            if let Some(ref hk) = req.host_key {
+                payload.host_key_commitment = Some(compute_team_share_host_key_commitment(
+                    hk,
+                    &payload.share_id,
+                    &payload.bot_id,
+                    &payload.client_message_id,
+                ));
+            }
             match team_share.seal_held_message(&recipient, &payload) {
                 Ok(sealed) => {
                     state
@@ -494,6 +533,8 @@ pub async fn share_seal(
                     Json(json!({
                         "mode": "held_message",
                         "held_message": sealed,
+                        "envelope": sealed,
+                        "receiverKey": recipient.x25519_public_b64,
                         "sender_identity": sender_identity,
                     }))
                     .into_response()
@@ -519,9 +560,51 @@ pub async fn share_open(
         Err(resp) => return resp,
     };
     let team_share = state.orca_bots.team_share();
+    let local_id = team_share.public_identity();
+    if let Some(ref recv_key) = req.receiver_key
+        && recv_key.trim() != local_id.x25519_public_b64.trim()
+    {
+        return orca_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Team share receiverKey does not match local host X25519 key",
+        );
+    }
+
     let now_ms = req.now_ms.unwrap_or_else(now_epoch_ms);
+    let mut offer_opt = req.offer;
+    let mut held_opt = req.held_message;
+    if offer_opt.is_none()
+        && held_opt.is_none()
+        && let Some(env_val) = req.envelope
+    {
+        if env_val.get("share_send_proof_b64").is_some() {
+            match serde_json::from_value(env_val) {
+                Ok(h) => held_opt = Some(h),
+                Err(e) => {
+                    return orca_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        format!("Malformed held_message envelope: {e}"),
+                    );
+                }
+            }
+        } else {
+            match serde_json::from_value(env_val) {
+                Ok(o) => offer_opt = Some(o),
+                Err(e) => {
+                    return orca_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        format!("Malformed offer envelope: {e}"),
+                    );
+                }
+            }
+        }
+    }
+
     let mode = req.mode.as_deref().unwrap_or_else(|| {
-        if req.held_message.is_some() {
+        if held_opt.is_some() {
             "held_message"
         } else {
             "offer"
@@ -530,7 +613,7 @@ pub async fn share_open(
 
     match mode {
         "offer" => {
-            let Some(offer) = req.offer else {
+            let Some(offer) = offer_opt else {
                 return orca_err(
                     StatusCode::BAD_REQUEST,
                     "invalid_argument",
@@ -553,7 +636,7 @@ pub async fn share_open(
             }
         }
         "held_message" => {
-            let Some(held) = req.held_message else {
+            let Some(held) = held_opt else {
                 return orca_err(
                     StatusCode::BAD_REQUEST,
                     "invalid_argument",
@@ -569,14 +652,31 @@ pub async fn share_open(
                 .as_deref()
                 .unwrap_or(&held.share_id);
             let expected_bot_id = req.expected_bot_id.as_deref().unwrap_or(&held.bot_id);
-            match team_share.open_held_message_strict(
+            if let Some(ref expected_cmsg) = req.client_message_id
+                && held.client_message_id != *expected_cmsg
+            {
+                return orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "Held message clientMessageId mismatch",
+                );
+            }
+            match team_share.open_held_message_strict_with_host_key(
                 expected_sender,
                 expected_share_id,
                 expected_bot_id,
+                req.host_key.as_deref(),
                 &held,
             ) {
-                Ok(payload) => {
-                    Json(json!({ "mode": "held_message", "payload": payload })).into_response()
+                Ok(mut payload) => {
+                    payload.host_key_commitment = None;
+                    let plaintext = payload.text.clone();
+                    Json(json!({
+                        "mode": "held_message",
+                        "payload": payload,
+                        "plaintext": plaintext,
+                    }))
+                    .into_response()
                 }
                 Err(err) => map_bots_err(err),
             }
@@ -599,6 +699,22 @@ pub struct ImportDiscoverQuery {
     pub now_ms: Option<i64>,
 }
 
+fn candidates_to_wire_json(
+    candidates: Vec<orca_core::bot_ecosystem::BotImportCandidate>,
+) -> Vec<serde_json::Value> {
+    candidates
+        .into_iter()
+        .map(|c| {
+            let display_name = c.suggested_name.as_str().to_string();
+            let mut val = serde_json::to_value(c).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("name".into(), json!(display_name));
+            }
+            val
+        })
+        .collect()
+}
+
 pub async fn import_discover_get(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
@@ -607,7 +723,7 @@ pub async fn import_discover_get(
     let now_ms = query.now_ms.unwrap_or_else(now_epoch_ms);
     match state.orca_bots.discover_imports(now_ms) {
         Ok(candidates) => Json(json!({
-            "candidates": candidates,
+            "candidates": candidates_to_wire_json(candidates),
             "export_prompt": BotImportEngine::export_prompt(),
         }))
         .into_response(),
@@ -636,7 +752,16 @@ pub async fn import_discover_post(
             )
             .await
         {
-            Ok(bot) => (StatusCode::CREATED, Json(json!({ "bot": bot, "imported": true })))
+            Ok(bot) => (
+                StatusCode::CREATED,
+                Json(json!({
+                    "bot": orca_bots::wire_json::bot_record_to_wire_json(
+                        &bot,
+                        state.orca_bots.home_store()
+                    ),
+                    "imported": true,
+                })),
+            )
                 .into_response(),
             Err(err) => map_bots_err(err),
         };
@@ -645,7 +770,29 @@ pub async fn import_discover_post(
     if let Some(export_text) = req.export_text {
         return match BotImportEngine::parse_generic_export(&export_text, now_ms) {
             Ok(candidates) => Json(json!({
-                "candidates": candidates,
+                "candidates": candidates_to_wire_json(candidates),
+                "export_prompt": BotImportEngine::export_prompt(),
+            }))
+            .into_response(),
+            Err(err) => map_bots_err(err),
+        };
+    }
+
+    if let Some(root_str) = req.root.filter(|s| !s.trim().is_empty()) {
+        let root_path = PathBuf::from(root_str);
+        let roots = BotImportDiscoveryRoots {
+            openclaw_dirs: vec![
+                root_path.join(".openclaw"),
+                root_path.join(".clawdbot"),
+                root_path.join(".moltbot"),
+            ],
+            hermes_dirs: vec![root_path.clone(), root_path.join(".hermes")],
+            openbot_dirs: vec![root_path.join("OpenBot").join("Agents")],
+        };
+        let engine = BotImportEngine::new(roots);
+        return match engine.discover_all(now_ms) {
+            Ok(candidates) => Json(json!({
+                "candidates": candidates_to_wire_json(candidates),
                 "export_prompt": BotImportEngine::export_prompt(),
             }))
             .into_response(),
@@ -662,7 +809,7 @@ pub async fn import_discover_post(
         let engine = BotImportEngine::new(roots);
         return match engine.discover_all(now_ms) {
             Ok(candidates) => Json(json!({
-                "candidates": candidates,
+                "candidates": candidates_to_wire_json(candidates),
                 "export_prompt": BotImportEngine::export_prompt(),
             }))
             .into_response(),
@@ -672,7 +819,7 @@ pub async fn import_discover_post(
 
     match state.orca_bots.discover_imports(now_ms) {
         Ok(candidates) => Json(json!({
-            "candidates": candidates,
+            "candidates": candidates_to_wire_json(candidates),
             "export_prompt": BotImportEngine::export_prompt(),
         }))
         .into_response(),
@@ -832,6 +979,13 @@ pub async fn relay_register_grant(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("user_{}", auth.user_id.0));
     let bot_id = req.bot_id.clone();
+    let allow_host_mcp = state
+        .orca_bots
+        .controller()
+        .get_bot(&req.bot_id)
+        .await
+        .ok()
+        .is_some_and(|b| b.connectors.uses_host_mcp_servers());
     if let Err(err) = relay.register_bot_grant(BotRelayGrant {
         bot_id: req.bot_id,
         owner_id,
@@ -839,6 +993,7 @@ pub async fn relay_register_grant(
         folder,
         allowed_folders: req.allowed_folders,
         allowed_tools: req.allowed_tools,
+        allow_host_mcp_servers: allow_host_mcp,
     }) {
         return map_bots_err(err);
     }

@@ -60,25 +60,28 @@ pub const BOT_AGENTS_OLDER_BUILDS_READ: [BotAgentId; 7] = [
 ];
 
 /// Retired agent wire identifiers kept for automatic migration.
-pub const BOT_RETIRED_AGENTS: [&str; 1] = ["gemini"];
+pub const BOT_RETIRED_AGENTS: [&str; 2] = ["gemini", "claude-code"];
 
 /// Retired agent enum for explicit migration mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BotRetiredAgent {
     Gemini,
+    ClaudeCode,
 }
 
 impl BotRetiredAgent {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Gemini => "gemini",
+            Self::ClaudeCode => "claude-code",
         }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "gemini" => Some(Self::Gemini),
+            "claude-code" => Some(Self::ClaudeCode),
             _ => None,
         }
     }
@@ -86,6 +89,7 @@ impl BotRetiredAgent {
     pub const fn successor(self) -> BotAgentId {
         match self {
             Self::Gemini => BotAgentId::Antigravity,
+            Self::ClaudeCode => BotAgentId::Claude,
         }
     }
 }
@@ -1291,6 +1295,7 @@ impl BotConnectorLinks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BotPermissionMode {
+    #[serde(alias = "default")]
     Ask,
     AcceptEdits,
     Auto,
@@ -1308,22 +1313,23 @@ pub struct BotLaunchConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BotNotifications {
     #[serde(
         default = "default_true",
-        alias = "needsPermission",
+        alias = "needs_permission",
         deserialize_with = "deserialize_salvage_bool_true"
     )]
     pub needs_permission: bool,
     #[serde(
         default = "default_true",
-        alias = "taskComplete",
+        alias = "task_complete",
         deserialize_with = "deserialize_salvage_bool_true"
     )]
     pub task_complete: bool,
     #[serde(
         default = "default_true",
-        alias = "couldNotFinish",
+        alias = "could_not_finish",
         deserialize_with = "deserialize_salvage_bool_true"
     )]
     pub could_not_finish: bool,
@@ -2084,13 +2090,51 @@ fn extract_url_host(detail: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
+fn extract_url_path_segments(detail: &str) -> Vec<&str> {
+    let Some(rest) = strip_http_scheme(detail) else {
+        return Vec::new();
+    };
+    let Some(slash_idx) = rest.find('/') else {
+        return Vec::new();
+    };
+    let after_host = &rest[slash_idx + 1..];
+    let path_only = after_host
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_host);
+    path_only
+        .split(['/', '.', '_', '-'])
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn is_loopback_or_ip_host(host: &str) -> bool {
+    let lower = host.trim().to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    lower.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Derives a concise, valid `BotToolName` from an HTTP(S) URL or stdio CLI command.
 pub fn bot_tool_name_from(detail: &str) -> BotToolName {
     let trimmed = detail.trim();
     if let Some(host) = extract_url_host(trimmed) {
+        if is_loopback_or_ip_host(host) {
+            let path_parts = extract_url_path_segments(trimmed);
+            let path_slug = meaningful_tool_slug(&path_parts);
+            if let Ok(name) = BotToolName::new(&path_slug) {
+                return name;
+            }
+        }
         let host_parts: Vec<&str> = host.split('.').collect();
         let slug = meaningful_tool_slug(&host_parts);
         if let Ok(name) = BotToolName::new(&slug) {
+            return name;
+        }
+        let path_parts = extract_url_path_segments(trimmed);
+        let path_slug = meaningful_tool_slug(&path_parts);
+        if let Ok(name) = BotToolName::new(&path_slug) {
             return name;
         }
         return BotToolName("tool".to_string());

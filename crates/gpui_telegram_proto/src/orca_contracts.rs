@@ -13,9 +13,9 @@ use orca_core::bot_ecosystem::{
 use orca_core::bot_groups::{
     BotGroupImage, BotGroupPeerScope, BotGroupReplyMode, BotGroupSyntheticRoot, RemoteBotMember,
 };
-use orca_core::bot_items::{AskSelection, BotItemActor, BotItemAsk, BotItemLink, BotItemStatus};
-use orca_core::bot_look_around::{LookAroundEvery, Suggestion};
-use orca_core::bot_memory::{BotMemoryAuthor, TidyUpDraft};
+use orca_core::bot_items::{AskSelection, BotItemActor, BotItemAsk, BotItemStatus};
+use orca_core::bot_look_around::Suggestion;
+use orca_core::bot_memory::BotMemoryAuthor;
 use orca_core::bot_types::{
     AcceptedBotOffer, BotAgentId, BotGitHubLink, BotItemsStale, BotLaunchConfig, BotLinearLink,
     BotLookAroundConfig, BotMascotId, BotMember, BotNotifications, BotOfferAnswerState,
@@ -25,7 +25,7 @@ use orca_core::orchestration_protocol::{
     CallerScope, RpcErrorPayload, RpcRequestEnvelope, RpcResponseEnvelope,
 };
 use orca_core::triggers_webhooks::{
-    AutomationBotTarget, AutomationEventTrigger, OneShotWait, WebhookAdapterId, WebhookFilters,
+    AutomationBotTarget, AutomationEventTrigger, OneShotWait, WebhookAdapterId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -82,6 +82,10 @@ pub struct OrcaCreateBotRequest {
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default, alias = "homePath")]
+    pub home_path: Option<String>,
+    #[serde(default)]
     pub mascot: Option<BotMascotId>,
     #[serde(default, alias = "avatarColor")]
     pub avatar_color: Option<String>,
@@ -99,12 +103,19 @@ pub struct OrcaCreateBotRequest {
     pub template_id: Option<String>,
     #[serde(default, alias = "firstRun")]
     pub first_run: bool,
+    #[serde(default, alias = "itemsStale")]
+    pub items_stale: Option<BotItemsStale>,
+    #[serde(default, alias = "tidyUp")]
+    pub tidy_up: Option<Value>,
+    #[serde(default, alias = "lookAround")]
+    pub look_around: Option<BotLookAroundConfig>,
 }
 
 /// Member removal descriptor inside [`OrcaUpdateBotRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrcaBotMemberRemovalDto {
-    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub id: String,
     #[serde(default, alias = "workspaceId", skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -190,6 +201,8 @@ pub struct OrcaUpdateBotRequest {
     pub expected_avatar_revision_epoch: Option<String>,
     #[serde(default, alias = "hostMcpServers")]
     pub host_mcp_servers: Option<bool>,
+    #[serde(default, alias = "usageLimitContinue")]
+    pub usage_limit_continue: Option<Value>,
 }
 
 /// Wire DTO mirroring `orca_core::bot_types::BotOfferAnswerUpdate`.
@@ -250,20 +263,20 @@ pub struct OrcaFromTemplateRequest {
 /// Request body for `POST /api/v1/orca/bots/{bot_id}/memory`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrcaMemoryWriteRequest {
-    #[serde(default)]
+    #[serde(default, alias = "content")]
     pub markdown: Option<String>,
     #[serde(default, alias = "appendLine", alias = "fact")]
     pub append_line: Option<String>,
     #[serde(default, alias = "beforeMemoryMd")]
     pub before_memory_md: Option<String>,
-    #[serde(default, alias = "turnSource")]
+    #[serde(default, alias = "turnSource", alias = "source")]
     pub turn_source: Option<String>,
     #[serde(default, alias = "ownerTurnText")]
     pub owner_turn_text: Option<String>,
     #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
     #[serde(default, alias = "allowDeletions")]
-    pub allow_deletions: bool,
+    pub allow_deletions: Option<bool>,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
     #[serde(default)]
@@ -282,10 +295,10 @@ pub struct OrcaMemoryForgetRequest {
 }
 
 /// Request body for `POST /api/v1/orca/bots/{bot_id}/memory/undo`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrcaMemoryUndoRequest {
-    #[serde(alias = "history_id", alias = "rowId", alias = "historyId")]
-    pub row_id: String,
+    #[serde(default, alias = "history_id", alias = "rowId", alias = "historyId")]
+    pub row_id: Option<String>,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
 }
@@ -322,7 +335,7 @@ pub struct OrcaTidyUpRequest {
     #[serde(default)]
     pub chats: Vec<Value>,
     #[serde(default)]
-    pub draft: Option<TidyUpDraft>,
+    pub draft: Option<Value>,
     #[serde(default, alias = "rawReply")]
     pub raw_reply: Option<String>,
     #[serde(default, alias = "simulateError")]
@@ -356,18 +369,24 @@ pub struct OrcaCreateItemRequest {
     pub status: Option<BotItemStatus>,
     #[serde(default)]
     pub ask: Option<BotItemAsk>,
-    #[serde(default, alias = "waitNote")]
+    #[serde(default, alias = "waitNote", alias = "wait")]
     pub wait_note: Option<String>,
     #[serde(default, alias = "chatId")]
     pub chat_id: Option<String>,
+    #[serde(default, alias = "telegramChatId")]
+    pub telegram_chat_id: Option<Value>,
     #[serde(default, alias = "groupId")]
     pub group_id: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
     #[serde(default, alias = "madeBy")]
     pub made_by: Option<BotItemActor>,
     #[serde(default)]
-    pub links: Vec<BotItemLink>,
+    pub links: Vec<Value>,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
 }
@@ -387,16 +406,18 @@ pub struct OrcaUpdateItemRequest {
     pub done_means: Option<Option<String>>,
     #[serde(default)]
     pub status: Option<BotItemStatus>,
-    #[serde(default, alias = "waitNote")]
+    #[serde(default, alias = "waitNote", alias = "wait")]
     pub wait_note: Option<String>,
     #[serde(default, alias = "closeNote")]
     pub close_note: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "comment")]
     pub note: Option<String>,
     #[serde(default)]
     pub ask: Option<BotItemAsk>,
     #[serde(default)]
-    pub link: Option<BotItemLink>,
+    pub link: Option<Value>,
+    #[serde(default, alias = "telegramChatId")]
+    pub telegram_chat_id: Option<Value>,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
 }
@@ -414,8 +435,12 @@ pub struct OrcaItemCommentRequest {
     pub question_event: Option<u64>,
     #[serde(default)]
     pub selections: Option<Vec<AskSelection>>,
+    #[serde(default)]
+    pub answers: Option<Value>,
     #[serde(default, alias = "replyText")]
     pub reply_text: Option<String>,
+    #[serde(default, alias = "chatId")]
+    pub chat_id: Option<Value>,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
 }
@@ -427,6 +452,8 @@ pub struct OrcaItemSnoozeRequest {
     pub actor: Option<BotItemActor>,
     #[serde(default, alias = "untilMs")]
     pub until_ms: Option<i64>,
+    #[serde(default, alias = "snoozedUntil", alias = "until")]
+    pub snoozed_until: Option<Value>,
     #[serde(default)]
     pub unsnooze: bool,
     #[serde(default, alias = "nowMs")]
@@ -439,11 +466,13 @@ pub struct OrcaLookAroundPatchDto {
     #[serde(default, alias = "enabled")]
     pub on: Option<bool>,
     #[serde(default, alias = "schedule")]
-    pub every: Option<LookAroundEvery>,
+    pub every: Option<String>,
     #[serde(default, alias = "weekdaysOnly")]
     pub weekdays_only: Option<bool>,
     #[serde(default)]
     pub focus: Option<Option<String>>,
+    #[serde(default, alias = "sinceMs", alias = "since_ms")]
+    pub since: Option<Value>,
 }
 
 /// Request body for `POST /api/v1/orca/bots/{bot_id}/look-around`.
@@ -451,6 +480,16 @@ pub struct OrcaLookAroundPatchDto {
 pub struct OrcaLookAroundRequest {
     #[serde(default)]
     pub patch: Option<OrcaLookAroundPatchDto>,
+    #[serde(default, alias = "enabled")]
+    pub on: Option<bool>,
+    #[serde(default, alias = "schedule")]
+    pub every: Option<String>,
+    #[serde(default, alias = "weekdaysOnly")]
+    pub weekdays_only: Option<bool>,
+    #[serde(default)]
+    pub focus: Option<Option<String>>,
+    #[serde(default, alias = "sinceMs", alias = "since_ms")]
+    pub since: Option<Value>,
     #[serde(default)]
     pub run: Option<bool>,
     #[serde(default)]
@@ -464,11 +503,22 @@ pub struct OrcaLookAroundRequest {
 }
 
 /// Request body for `POST /api/v1/orca/bots/{bot_id}/up-next`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Supports both action dispatch (`action: "start"|"dismiss"`) and direct suggestion submission
+/// (`title`, `why`, `ask`, optional `link`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrcaUpNextActionRequest {
-    pub action: String,
-    #[serde(alias = "suggestionId")]
-    pub suggestion_id: String,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default, alias = "suggestionId")]
+    pub suggestion_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub why: Option<String>,
+    #[serde(default)]
+    pub ask: Option<String>,
+    #[serde(default)]
+    pub link: Option<String>,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
 }
@@ -525,7 +575,7 @@ pub struct OrcaCreateGroupRequest {
 /// Request body for `POST /api/v1/orca/groups/{group_id}/threads`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaCreateGroupThreadRequest {
-    #[serde(alias = "title", alias = "firstPost")]
+    #[serde(alias = "title", alias = "firstPost", alias = "text")]
     pub first_post: String,
 }
 
@@ -537,6 +587,10 @@ pub struct OrcaSendGroupMessageRequest {
     pub thread_id: Option<String>,
     #[serde(default)]
     pub sender: Option<Value>,
+    #[serde(default, alias = "fromBotId")]
+    pub from_bot_id: Option<String>,
+    #[serde(default)]
+    pub handoff: bool,
     #[serde(default)]
     pub images: Vec<BotGroupImage>,
     #[serde(default)]
@@ -548,9 +602,16 @@ pub struct OrcaSendGroupMessageRequest {
 }
 
 /// Request body for `POST /api/v1/orca/bots/{bot_id}/access`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrcaCreateAccessRequest {
-    pub member: BotMember,
+    #[serde(default)]
+    pub member: Option<BotMember>,
+    #[serde(default, alias = "connector")]
+    pub source: Option<String>,
+    #[serde(default, alias = "externalUserId", alias = "external_user_id", alias = "userId")]
+    pub user_id: Option<String>,
+    #[serde(default, alias = "displayName", alias = "display_name")]
+    pub name: Option<String>,
     #[serde(default, alias = "connectorWorkspaceId")]
     pub connector_workspace_id: Option<String>,
     #[serde(default, alias = "ttlMs")]
@@ -568,6 +629,8 @@ pub struct OrcaDecideAccessRequest {
     pub request_id: Option<String>,
     #[serde(default)]
     pub approve: Option<bool>,
+    #[serde(default)]
+    pub decision: Option<String>,
     #[serde(default, alias = "redeemToken")]
     pub redeem_token: Option<String>,
     #[serde(default, alias = "nowMs")]
@@ -577,7 +640,7 @@ pub struct OrcaDecideAccessRequest {
 /// Request body for `POST /api/v1/orca/bots/{bot_id}/hand-over`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaHandOverRequest {
-    #[serde(alias = "workspaceId")]
+    #[serde(alias = "workspaceId", alias = "workspacePath", alias = "workspace_path")]
     pub workspace_id: String,
     #[serde(default)]
     pub mode: Option<String>,
@@ -585,19 +648,21 @@ pub struct OrcaHandOverRequest {
     pub purpose: Option<String>,
     #[serde(default, alias = "workspaceName")]
     pub workspace_name: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
     #[serde(default, alias = "repoSlug")]
     pub repo_slug: Option<String>,
-    #[serde(default, alias = "recentPrompt")]
+    #[serde(default, alias = "recentPrompt", alias = "prompt")]
     pub recent_prompt: Option<String>,
     #[serde(default)]
     pub agent: Option<BotAgentId>,
     #[serde(default, alias = "customName")]
     pub custom_name: Option<String>,
-    #[serde(default, alias = "expectedInitialParent")]
+    #[serde(default, alias = "expectedInitialParent", alias = "originalParent", alias = "original_parent")]
     pub expected_initial_parent: Option<String>,
     #[serde(default, alias = "simulateNotifyFailure")]
-    pub simulate_notify_failure: Option<String>,
-    #[serde(default, alias = "simulateConcurrentReparent")]
+    pub simulate_notify_failure: Option<Value>,
+    #[serde(default, alias = "simulateConcurrentReparent", alias = "concurrentParent", alias = "concurrent_parent")]
     pub simulate_concurrent_reparent: Option<String>,
     #[serde(default, alias = "simulateRestoreFailure")]
     pub simulate_restore_failure: Option<String>,
@@ -640,7 +705,7 @@ pub struct OrcaPackageExportRequest {
 /// Request body for `POST /api/v1/orca/bots/package/import`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaPackageImportRequest {
-    #[serde(alias = "zipB64")]
+    #[serde(alias = "zipB64", alias = "package")]
     pub zip_b64: String,
     #[serde(default, alias = "customName", alias = "name")]
     pub custom_name: Option<String>,
@@ -657,6 +722,10 @@ pub struct OrcaShareSealRequest {
     pub offer_id: Option<String>,
     #[serde(default, alias = "shareId")]
     pub share_id: Option<String>,
+    #[serde(default, alias = "hostKey")]
+    pub host_key: Option<String>,
+    #[serde(default, alias = "botId")]
+    pub bot_id: Option<String>,
     #[serde(default, alias = "expiresAtMs")]
     pub expires_at_ms: Option<i64>,
     #[serde(default, alias = "relayUrl")]
@@ -665,7 +734,7 @@ pub struct OrcaShareSealRequest {
     pub sender_name: Option<String>,
     #[serde(default, alias = "clientMessageId")]
     pub client_message_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "plaintext")]
     pub text: Option<String>,
     #[serde(default)]
     pub payload: Option<Value>,
@@ -682,14 +751,22 @@ pub struct OrcaShareOpenRequest {
     pub offer: Option<SealedTeamShareOffer>,
     #[serde(default, alias = "heldMessage")]
     pub held_message: Option<SealedTeamShareHeldMessage>,
+    #[serde(default)]
+    pub envelope: Option<Value>,
+    #[serde(default, alias = "hostKey")]
+    pub host_key: Option<String>,
+    #[serde(default, alias = "receiverKey")]
+    pub receiver_key: Option<String>,
     #[serde(default, alias = "expectedSenderEd25519B64")]
     pub expected_sender_ed25519_b64: Option<String>,
     #[serde(default, alias = "senderIdentity")]
     pub sender_identity: Option<TeamSharePublicIdentity>,
-    #[serde(default, alias = "expectedShareId")]
+    #[serde(default, alias = "expectedShareId", alias = "shareId")]
     pub expected_share_id: Option<String>,
-    #[serde(default, alias = "expectedBotId")]
+    #[serde(default, alias = "expectedBotId", alias = "botId")]
     pub expected_bot_id: Option<String>,
+    #[serde(default, alias = "clientMessageId")]
+    pub client_message_id: Option<String>,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
 }
@@ -708,6 +785,8 @@ pub struct OrcaImportRootsDto {
 /// Request body for `POST /api/v1/orca/bots/import/discover`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrcaImportDiscoverRequest {
+    #[serde(default)]
+    pub root: Option<String>,
     #[serde(default)]
     pub roots: Option<OrcaImportRootsDto>,
     #[serde(default, alias = "exportText")]
@@ -835,12 +914,14 @@ pub struct OrcaRelayRevokeRequest {
 pub struct OrcaWebhookCreateRequest {
     #[serde(alias = "botId")]
     pub bot_id: String,
-    #[serde(alias = "automationId")]
-    pub automation_id: String,
+    #[serde(default, alias = "automationId")]
+    pub automation_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub adapter: Option<WebhookAdapterId>,
-    #[serde(default)]
-    pub filters: Option<WebhookFilters>,
+    #[serde(default, alias = "rules")]
+    pub filters: Option<Value>,
     #[serde(default, alias = "hourlyCap")]
     pub hourly_cap: Option<u32>,
     #[serde(default, alias = "graceMinutes")]
@@ -856,8 +937,8 @@ pub struct OrcaWebhookCreateRequest {
 /// Request body for `PATCH /api/v1/orca/webhooks/{hook_id}`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrcaWebhookPatchRequest {
-    #[serde(default)]
-    pub filters: Option<WebhookFilters>,
+    #[serde(default, alias = "rules")]
+    pub filters: Option<Value>,
     #[serde(default)]
     pub paused: Option<bool>,
 }
@@ -866,7 +947,8 @@ pub struct OrcaWebhookPatchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaAutomationCreateRequest {
     pub name: String,
-    pub prompt: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(alias = "botId")]
     pub bot_id: String,
     #[serde(default)]
@@ -876,9 +958,17 @@ pub struct OrcaAutomationCreateRequest {
     #[serde(default, alias = "dtstartMs")]
     pub dtstart_ms: Option<i64>,
     #[serde(default)]
+    pub schedule: Option<Value>,
+    #[serde(default)]
     pub rrule: Option<String>,
     #[serde(default)]
-    pub triggers: Vec<AutomationEventTrigger>,
+    pub trigger: Option<Value>,
+    #[serde(default)]
+    pub triggers: Vec<Value>,
+    #[serde(default, alias = "runsIn")]
+    pub runs_in: Option<Value>,
+    #[serde(default, alias = "resultsTo")]
+    pub results_to: Option<Value>,
     #[serde(default)]
     pub once: Option<OneShotWait>,
     #[serde(default, alias = "chatSessionId")]
@@ -909,7 +999,12 @@ pub struct OrcaAutomationPatchRequest {
 pub struct OrcaWatchPrRequest {
     #[serde(alias = "botId")]
     pub bot_id: String,
-    pub pr: String,
+    #[serde(default)]
+    pub pr: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default, alias = "prNumber")]
+    pub pr_number: Option<u64>,
     #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
     #[serde(default)]

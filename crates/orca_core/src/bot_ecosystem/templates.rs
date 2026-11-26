@@ -90,7 +90,7 @@ pub struct BotTemplateScheduleSuggestion {
 }
 
 /// Complete built-in Bot Template specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BotTemplate {
     pub id: &'static str,
     pub name: &'static str,
@@ -107,6 +107,31 @@ pub struct BotTemplate {
     pub suggested_schedules: &'static [BotTemplateScheduleSuggestion],
     pub look_around_preset: Option<LookAroundPreset>,
     pub look_around_enabled: bool,
+}
+
+impl Serialize for BotTemplate {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("BotTemplate", 17)?;
+        st.serialize_field("id", self.id)?;
+        st.serialize_field("name", self.name)?;
+        st.serialize_field("category", &self.category)?;
+        st.serialize_field("tagline", self.tagline)?;
+        st.serialize_field("mascot", &self.mascot)?;
+        st.serialize_field("outfit", &self.outfit)?;
+        st.serialize_field("avatar_color", self.avatar_color)?;
+        st.serialize_field("default_agent", &self.default_agent)?;
+        st.serialize_field("soul_md", self.soul_md)?;
+        st.serialize_field("bundled_skills", self.bundled_skills)?;
+        st.serialize_field("skills", self.bundled_skills)?;
+        st.serialize_field("recommended_connectors", self.recommended_connectors)?;
+        st.serialize_field("suggested_triggers", self.suggested_triggers)?;
+        st.serialize_field("suggested_schedules", self.suggested_schedules)?;
+        st.serialize_field("schedules", self.suggested_schedules)?;
+        st.serialize_field("look_around_preset", &self.look_around_preset)?;
+        st.serialize_field("look_around_enabled", &self.look_around_enabled)?;
+        st.end()
+    }
 }
 
 /// All 24 built-in Orca Bot Templates in canonical `TEMPLATE_IDS_24` order.
@@ -399,7 +424,12 @@ I watch failing workflows, extract the exact root error, and distinguish code re
         bundled_skills: &["ci-failure-triage", "bug-reproduction"],
         recommended_connectors: &["github", "slack"],
         suggested_triggers: &["github:ci_failed", "github:workflow_finished"],
-        suggested_schedules: &[],
+        suggested_schedules: &[BotTemplateScheduleSuggestion {
+            name: "Weekday CI flake digest",
+            cron: "0 9 * * 1-5",
+            prompt: "Summarize recurring CI failures and flakes across active branches.",
+            enabled: false,
+        }],
         look_around_preset: Some(LookAroundPreset::Every2h),
         look_around_enabled: false,
     },

@@ -3,28 +3,39 @@
 //! to `Option<Arc<orca_bots::OrcaBotsFacade>>`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use orca_bots::wire_json::{
+    bot_record_to_wire_json, chat_tree_to_wire_json, parse_usage_limit_continue,
+};
 use orca_bots::{
-    BotPatch, BotTemplateInstaller, CreateAutomationRequest, CreateBotGroupRequest,
-    CreateBotItemRequest, CreateBotRequest, CreateWebhookRequest, ExportPackageOptions,
-    GroupMessageSender, IngestWebhookCallRequest, ListBotItemsFilter, OrcaBotsFacade,
-    PostGroupMessageRequest,
+    BotMemberRemoval, BotPatch, BotTemplateInstaller, CreateAutomationRequest,
+    CreateBotGroupRequest, CreateBotItemRequest, CreateBotRequest, CreateWebhookRequest,
+    ExportPackageOptions, GroupMessageSender, IngestWebhookCallRequest, ListBotItemsFilter,
+    OrcaBotsFacade, PostGroupMessageRequest, UpdateAvatarStyleRequest, UploadAvatarPngRequest,
+    decorate_external_action_body, require_owner_asker,
 };
 use orca_core::BotErrorCode;
-use orca_core::bot_ecosystem::{BotChatNode, NativeChatBotCard, UsageLimitContinue};
+use orca_core::bot_ecosystem::{
+    BotChatLiveState, BotChatNode, BotChatNodeKind, NativeChatBotCard, UsageLimitContinue,
+};
 use orca_core::bot_groups::{BotGroupReplyMode, BotGroupSend, MentionCandidate};
 use orca_core::bot_items::{BotItemActor, BotItemStatus};
 use orca_core::bot_memory::BotMemoryAuthor;
-use orca_core::bot_types::{BotAgentId, BotPermissionMode};
+use orca_core::bot_types::{
+    ActsForAsker, BotAgentId, BotItemsStale, BotLaunchConfig, BotMember, BotNotifications,
+    BotPermissionMode, ConnectorAskerRole, ConnectorSource, normalize_persisted_bots,
+};
 use orca_core::triggers_webhooks::{
     AutomationBotResultsTo, AutomationBotRunsIn, AutomationBotTarget, AutomationEventTrigger,
-    OneShotWait, WebhookAdapterId, WebhookFilters,
+    OneShotWait, WatchPrStepAction, WatchPrWakeOutcome, WebhookAdapterId, WebhookFilters,
 };
 use serde_json::{Value, json};
 
+use crate::rpc_dispatcher::{RpcSubsystemHandles, bots_routes_ext, bots_routes_tools};
 use crate::{OrcaIdeRuntimeError, Result, now_epoch_ms};
 
 fn require_bots(bots: Option<&Arc<OrcaBotsFacade>>) -> Result<&Arc<OrcaBotsFacade>> {
@@ -48,23 +59,93 @@ fn opt_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
     params.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty())
 }
 
+fn opt_str_any<'a>(params: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    for k in keys {
+        if let Some(v) = opt_str(params, k) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn req_str_any<'a>(params: &'a Value, keys: &[&str]) -> Result<&'a str> {
+    opt_str_any(params, keys).ok_or_else(|| {
+        OrcaIdeRuntimeError::invalid_argument(format!(
+            "missing required string '{}'",
+            keys.first().copied().unwrap_or("param")
+        ))
+    })
+}
+
 pub(super) async fn dispatch_bots_namespace(
-    bots_opt: Option<&Arc<OrcaBotsFacade>>,
+    handles: &Arc<RpcSubsystemHandles>,
     op: &str,
     params: &Value,
 ) -> Result<Value> {
-    let bots = require_bots(bots_opt)?;
-    let now_ms = params.get("now_ms").and_then(Value::as_i64).unwrap_or_else(now_epoch_ms);
+    let bots = require_bots(handles.bots.as_ref())?;
+    let now_ms = params
+        .get("now_ms")
+        .or_else(|| params.get("nowMs"))
+        .and_then(Value::as_i64)
+        .unwrap_or_else(now_epoch_ms);
+
+    if let Some((prefix, sub)) = op.split_once('.') {
+        return match prefix {
+            "home" => bots_routes_ext::dispatch_bots_home(bots, sub, params).await,
+            "chat" => bots_routes_ext::dispatch_bots_chat(bots, sub, params).await,
+            "memory" => bots_routes_ext::dispatch_bots_memory(bots, sub, params, now_ms).await,
+            "tidyUp" | "tidy_up" => bots_routes_ext::dispatch_bots_tidy_up(bots, sub, params).await,
+            "items" => bots_routes_ext::dispatch_bots_items(bots, sub, params, now_ms).await,
+            "lookAround" | "look_around" => {
+                bots_routes_ext::dispatch_bots_look_around(bots, sub, params, now_ms).await
+            }
+            "upNext" | "up_next" => {
+                bots_routes_ext::dispatch_bots_up_next(bots, sub, params, now_ms).await
+            }
+            "groups" => bots_routes_ext::dispatch_bots_groups(bots, sub, params).await,
+            "tools" => bots_routes_tools::dispatch_bots_tools(bots, sub, params).await,
+            "storage" if sub == "loadRecords" || sub == "load_records" => {
+                let raw = params
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let normalized = normalize_persisted_bots(&raw);
+                let out: Vec<Value> = normalized
+                    .iter()
+                    .map(|b| bot_record_to_wire_json(b, bots.home_store()))
+                    .collect();
+                Ok(json!({ "bots": out }))
+            }
+            "avatar" if sub == "set" => handle_avatar_set(bots, params).await,
+            "connectors" => handle_bots_connectors(bots, sub, params).await,
+            other => Err(OrcaIdeRuntimeError::not_found(format!(
+                "unknown bots RPC sub-namespace 'bots.{other}.{sub}'"
+            ))),
+        };
+    }
 
     match op {
         "list" => {
             let list = bots.controller().list_bots().await;
-            Ok(serde_json::to_value(list)?)
+            let out: Vec<Value> = list
+                .iter()
+                .map(|b| bot_record_to_wire_json(b, bots.home_store()))
+                .collect();
+            Ok(Value::Array(out))
+        }
+        "roster" => {
+            let list = bots.controller().list_bots().await;
+            let out: Vec<Value> = list
+                .iter()
+                .map(|b| bot_record_to_wire_json(b, bots.home_store()))
+                .collect();
+            Ok(json!({ "bots": out }))
         }
         "get" => {
-            let id = req_str(params, "bot_id").or_else(|_| req_str(params, "id"))?;
+            let id = req_str_any(params, &["bot_id", "botId", "id"])?;
             let bot = bots.controller().get_bot(id).await?;
-            Ok(serde_json::to_value(bot)?)
+            Ok(bot_record_to_wire_json(&bot, bots.home_store()))
         }
         "create" => {
             let agent = match opt_str(params, "agent") {
@@ -75,41 +156,143 @@ pub(super) async fn dispatch_bots_namespace(
             };
             let permission_mode = params
                 .get("permission_mode")
+                .or_else(|| params.get("permissionMode"))
                 .cloned()
                 .map(serde_json::from_value::<BotPermissionMode>)
+                .transpose()?;
+            let launch = params
+                .get("launch")
+                .cloned()
+                .map(serde_json::from_value::<BotLaunchConfig>)
+                .transpose()?;
+            let items_stale = params
+                .get("items_stale")
+                .or_else(|| params.get("itemsStale"))
+                .cloned()
+                .map(serde_json::from_value::<BotItemsStale>)
                 .transpose()?;
             let req = CreateBotRequest {
                 name: opt_str(params, "name").map(ToOwned::to_owned),
                 agent,
-                custom_soul: opt_str(params, "custom_soul").map(ToOwned::to_owned),
+                folder: opt_str(params, "folder").map(ToOwned::to_owned),
+                home_path: opt_str_any(params, &["homePath", "home_path"]).map(PathBuf::from),
+                custom_soul: opt_str_any(params, &["custom_soul", "customSoul", "soul"])
+                    .map(ToOwned::to_owned),
                 permission_mode,
-                folder_workspace_id: opt_str(params, "folder_workspace_id").map(ToOwned::to_owned),
-                first_run: params.get("first_run").and_then(Value::as_bool).unwrap_or(false),
+                launch,
+                folder_workspace_id: opt_str_any(
+                    params,
+                    &["folder_workspace_id", "folderWorkspaceId"],
+                )
+                .map(ToOwned::to_owned),
+                first_run: params
+                    .get("first_run")
+                    .or_else(|| params.get("firstRun"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                items_stale,
                 ..CreateBotRequest::default()
             };
             let bot = bots.create_bot(req).await?;
-            Ok(serde_json::to_value(bot)?)
+            Ok(bot_record_to_wire_json(&bot, bots.home_store()))
         }
         "update" => {
-            let id = req_str(params, "bot_id").or_else(|_| req_str(params, "id"))?;
+            let id = req_str_any(params, &["bot_id", "botId", "id"])?;
             let agent = match opt_str(params, "agent") {
                 Some(raw) => Some(BotAgentId::parse_strict(raw).ok_or_else(|| {
                     OrcaIdeRuntimeError::invalid_argument(format!("unknown bot agent '{raw}'"))
                 })?),
                 None => None,
             };
+            let add_members: Vec<BotMember> = params
+                .get("addMembers")
+                .or_else(|| params.get("add_members"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let remove_member: Option<BotMemberRemoval> = params
+                .get("removeMember")
+                .or_else(|| params.get("remove_member"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?;
+            let remove_members: Vec<BotMemberRemoval> = params
+                .get("removeMembers")
+                .or_else(|| params.get("remove_members"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let permission_mode = params
+                .get("permissionMode")
+                .or_else(|| params.get("permission_mode"))
+                .cloned()
+                .map(serde_json::from_value::<Option<BotPermissionMode>>)
+                .transpose()?;
+            let launch = params
+                .get("launch")
+                .cloned()
+                .map(serde_json::from_value::<Option<BotLaunchConfig>>)
+                .transpose()?;
+            let notifications = params
+                .get("notifications")
+                .cloned()
+                .map(serde_json::from_value::<BotNotifications>)
+                .transpose()?;
+            let skill_projects = params
+                .get("skillProjects")
+                .or_else(|| params.get("skill_projects"))
+                .cloned()
+                .map(serde_json::from_value::<Option<Vec<String>>>)
+                .transpose()?;
+            let sidebar_order = params
+                .get("sidebarOrder")
+                .or_else(|| params.get("sidebar_order"))
+                .cloned()
+                .map(serde_json::from_value::<Option<u32>>)
+                .transpose()?;
+            let items_stale = params
+                .get("itemsStale")
+                .or_else(|| params.get("items_stale"))
+                .cloned()
+                .map(serde_json::from_value::<Option<BotItemsStale>>)
+                .transpose()?;
+            let paused = params.get("paused").and_then(Value::as_bool);
             let patch = BotPatch {
                 name: opt_str(params, "name").map(ToOwned::to_owned),
                 agent,
-                paused: params.get("paused").and_then(Value::as_bool),
-                first_run: params.get("first_run").and_then(Value::as_bool),
+                paused,
+                permission_mode,
+                launch,
+                notifications,
+                add_members,
+                remove_member,
+                remove_members,
+                skill_projects,
+                sidebar_order,
+                items_stale,
+                first_run: params
+                    .get("first_run")
+                    .or_else(|| params.get("firstRun"))
+                    .and_then(Value::as_bool),
                 ..BotPatch::default()
             };
             let updated = bots.controller().update_bot(id, patch).await?;
-            Ok(serde_json::to_value(updated)?)
+            if paused == Some(false) {
+                let _ = bots.group_runtime().flush_pending_for_bot(&updated.id);
+            }
+            if let Some(ul_val) = params
+                .get("usageLimitContinue")
+                .or_else(|| params.get("usage_limit_continue"))
+            {
+                let ul = parse_usage_limit_continue(ul_val, updated.agent.as_str(), now_ms)?;
+                bots.set_usage_limit_continue(&updated.id, ul)?;
+            }
+            Ok(bot_record_to_wire_json(&updated, bots.home_store()))
         }
         "delete" => {
-            let id = req_str(params, "bot_id").or_else(|_| req_str(params, "id"))?;
+            let id = req_str_any(params, &["bot_id", "botId", "id"])?;
             let release = bots.delete_bot(id).await?;
             Ok(json!({
                 "deleted": true,
@@ -118,17 +301,7 @@ pub(super) async fn dispatch_bots_namespace(
             }))
         }
         "templates" => {
-            let templates: Vec<Value> = BotTemplateInstaller::list_templates()
-                .iter()
-                .map(|t| {
-                    json!({
-                        "id": t.id,
-                        "name": t.name,
-                        "category": t.category,
-                        "default_agent": t.default_agent,
-                    })
-                })
-                .collect();
+            let templates = BotTemplateInstaller::list_templates();
             Ok(json!({ "templates": templates }))
         }
         "from_template" => {
@@ -201,11 +374,71 @@ pub(super) async fn dispatch_bots_namespace(
                 "unsnoozed_early": outcome.unsnoozed_early,
             }))
         }
-        _ => dispatch_bots_namespace_part2(bots, op, params, now_ms).await,
+        _ => dispatch_bots_namespace_part2(handles, bots, op, params, now_ms).await,
     }
 }
 
+async fn handle_avatar_set(bots: &Arc<OrcaBotsFacade>, params: &Value) -> Result<Value> {
+    let bot_id = req_str_any(params, &["botId", "bot_id", "id"])?;
+    let expected_rev = params
+        .get("expectedAvatarRevision")
+        .or_else(|| params.get("expected_avatar_revision"))
+        .and_then(Value::as_u64);
+    let expected_epoch = opt_str_any(
+        params,
+        &["expectedAvatarRevisionEpoch", "expected_avatar_revision_epoch"],
+    )
+    .map(ToOwned::to_owned);
+
+    let updated = if let Some(png_b64) =
+        opt_str_any(params, &["pngBase64", "png_base64", "pngB64", "avatarPngB64"])
+    {
+        let png_bytes = BASE64_STD.decode(png_b64.trim()).map_err(|e| {
+            OrcaIdeRuntimeError::bot(
+                BotErrorCode::BotAvatarInvalid,
+                format!("invalid base64 in pngBase64: {e}"),
+            )
+        })?;
+        bots.controller()
+            .upload_avatar_png(
+                bot_id,
+                UploadAvatarPngRequest {
+                    png_bytes,
+                    expected_avatar_revision: expected_rev,
+                    expected_avatar_revision_epoch: expected_epoch,
+                },
+            )
+            .await?
+    } else {
+        let avatar = opt_str(params, "mascot")
+            .map(|m| {
+                if m.starts_with("mascot:") {
+                    m.to_string()
+                } else {
+                    format!("mascot:{m}")
+                }
+            })
+            .or_else(|| opt_str(params, "avatar").map(ToOwned::to_owned));
+        let color = opt_str_any(params, &["color", "avatarColor"]).map(ToOwned::to_owned);
+        let outfit = opt_str_any(params, &["outfit", "avatarOutfit"]).map(ToOwned::to_owned);
+        bots.controller()
+            .update_avatar_style(
+                bot_id,
+                UpdateAvatarStyleRequest {
+                    avatar,
+                    color,
+                    outfit,
+                    expected_avatar_revision: expected_rev,
+                    expected_avatar_revision_epoch: expected_epoch,
+                },
+            )
+            .await?
+    };
+    Ok(bot_record_to_wire_json(&updated, bots.home_store()))
+}
+
 async fn dispatch_bots_namespace_part2(
+    handles: &Arc<RpcSubsystemHandles>,
     bots: &Arc<OrcaBotsFacade>,
     op: &str,
     params: &Value,
@@ -304,27 +537,84 @@ async fn dispatch_bots_namespace_part2(
             let found = bots.discover_imports(now_ms)?;
             Ok(serde_json::to_value(found)?)
         }
-        "chat_tree" => {
-            let bot_id = req_str(params, "bot_id")?;
-            let nodes: Vec<BotChatNode> = params
+        "chat_tree" | "chatTree" => {
+            let bot_id = req_str_any(params, &["bot_id", "botId", "id"])?;
+            let bot = bots.controller().get_bot(bot_id).await?;
+            let mut nodes: Vec<BotChatNode> = params
                 .get("nodes")
                 .cloned()
                 .map(serde_json::from_value)
                 .transpose()?
                 .unwrap_or_default();
+            if nodes.is_empty() {
+                let ws_key = format!("bot:{}", bot.id);
+                let mut seen = HashSet::new();
+                if let Some(ref hid) = bot.chat_session_id {
+                    seen.insert(hid.clone());
+                    nodes.push(BotChatNode {
+                        session_id: hid.clone(),
+                        parent_session_id: None,
+                        title: format!("{} (Home)", bot.name.as_str()),
+                        kind: BotChatNodeKind::Home,
+                        live_state: BotChatLiveState::Idle,
+                        note: None,
+                        unread: false,
+                        needs_you: false,
+                        updated_at_ms: bot.updated_at,
+                    });
+                }
+                if let Ok(sessions) = handles.chat_journal.list_sessions(Some(&ws_key)) {
+                    for sess in sessions {
+                        if !seen.insert(sess.session_id.clone()) {
+                            continue;
+                        }
+                        let kind = if nodes.is_empty() {
+                            BotChatNodeKind::Home
+                        } else {
+                            BotChatNodeKind::Side
+                        };
+                        nodes.push(BotChatNode {
+                            session_id: sess.session_id,
+                            parent_session_id: sess.parent_session_id,
+                            title: format!("Chat {}", sess.agent_id),
+                            kind,
+                            live_state: BotChatLiveState::Idle,
+                            note: None,
+                            unread: false,
+                            needs_you: false,
+                            updated_at_ms: sess.updated_at_ms,
+                        });
+                    }
+                }
+                if nodes.is_empty() {
+                    nodes.push(BotChatNode {
+                        session_id: format!("home-{}", bot.id),
+                        parent_session_id: None,
+                        title: format!("{} (Home)", bot.name.as_str()),
+                        kind: BotChatNodeKind::Home,
+                        live_state: BotChatLiveState::Idle,
+                        note: None,
+                        unread: false,
+                        needs_you: false,
+                        updated_at_ms: bot.updated_at,
+                    });
+                }
+            }
             let usage_limit: Option<UsageLimitContinue> = params
                 .get("usage_limit")
+                .or_else(|| params.get("usageLimit"))
                 .cloned()
                 .map(serde_json::from_value)
-                .transpose()?;
+                .transpose()?
+                .or_else(|| bots.get_usage_limit_continue(&bot.id).ok().flatten());
             let cards: Vec<NativeChatBotCard> = params
                 .get("cards")
                 .cloned()
                 .map(serde_json::from_value)
                 .transpose()?
                 .unwrap_or_default();
-            let view = bots.build_chat_tree(bot_id, &nodes, usage_limit, cards, now_ms)?;
-            Ok(serde_json::to_value(view)?)
+            let view = bots.build_chat_tree(&bot.id, &nodes, usage_limit.clone(), cards, now_ms)?;
+            Ok(chat_tree_to_wire_json(&bot, &view, usage_limit.as_ref()))
         }
         other => Err(OrcaIdeRuntimeError::not_found(format!(
             "unknown bots RPC method 'bots.{other}'"
@@ -533,9 +823,26 @@ pub(super) async fn dispatch_webhooks_namespace(
             }))
         }
         "calls" => {
-            let call_id = req_str(params, "call_id")?;
+            let call_id = req_str(params, "call_id").or_else(|_| req_str(params, "callId"))?;
             let call = bots.webhook_engine().get_call(call_id)?;
-            Ok(serde_json::to_value(call)?)
+            let state_str = if call.filter_rejected {
+                "filtered"
+            } else {
+                call.state.as_str()
+            };
+            // SECURITY INVARIANT (SEC-03): NEVER expose spoolPath, ingest URL, secret, raw body, or raw headers.
+            Ok(json!({
+                "id": call.call_id,
+                "callId": call.call_id,
+                "hookId": call.hook_id,
+                "botId": call.bot_id,
+                "adapter": call.adapter,
+                "epoch": call.epoch,
+                "state": state_str,
+                "filterRejected": call.filter_rejected,
+                "receivedAtMs": call.received_at_ms,
+                "updatedAtMs": call.updated_at_ms,
+            }))
         }
         other => Err(OrcaIdeRuntimeError::not_found(format!(
             "unknown webhooks RPC method 'webhooks.{other}'"
@@ -618,27 +925,194 @@ pub(super) async fn dispatch_automations_namespace(
             let removed = bots.automation_engine().remove_automation(id)?;
             Ok(json!({ "removed": removed, "automation_id": id }))
         }
-        "watch_pr" => {
-            let bot_id = req_str(params, "bot_id")?;
-            let session_id = opt_str(params, "session_id").unwrap_or("home");
-            let pr = req_str(params, "pr")?;
+        "watch_pr" | "watchPr" => {
+            let bot_id = req_str_any(params, &["bot_id", "botId"])?;
+            let session_id = opt_str_any(params, &["session_id", "sessionId"]).unwrap_or("home");
+            let pr_owned = if let Some(pr) = opt_str(params, "pr") {
+                pr.to_string()
+            } else if let (Some(repo), Some(num)) = (
+                opt_str(params, "repo"),
+                params
+                    .get("prNumber")
+                    .or_else(|| params.get("pr_number"))
+                    .and_then(Value::as_u64),
+            ) {
+                format!("{repo}#{num}")
+            } else {
+                return Err(OrcaIdeRuntimeError::invalid_argument(
+                    "missing 'pr' or 'repo'+'prNumber'",
+                ));
+            };
             let duration = opt_str(params, "duration");
             let ci_supported = params
                 .get("ci_finished_supported")
+                .or_else(|| params.get("ciFinishedSupported"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             let watch = bots.automation_engine().watch_pr().start_watch(
                 bot_id,
                 session_id,
-                pr,
+                &pr_owned,
                 now_ms.max(0) as u64,
                 duration,
                 ci_supported,
             )?;
-            Ok(serde_json::to_value(watch)?)
+            let mut val = serde_json::to_value(&watch)?;
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("id".into(), json!(watch.watch_id));
+            }
+            Ok(val)
+        }
+        "triggerEvent" | "trigger_event" => {
+            let aid = req_str_any(params, &["automationId", "automation_id", "watchId", "watch_id", "id"])?;
+            let kind = opt_str_any(params, &["kind", "event", "outcome"])
+                .unwrap_or("ci_failed")
+                .trim()
+                .to_ascii_lowercase();
+            let coord = bots.automation_engine().watch_pr();
+            if coord.get_watch(aid).is_ok() {
+                let outcome = match kind.as_str() {
+                    "ci_failed" | "merge_conflict" | "changes_requested" | "needs_change" | "needs_fix" => {
+                        let authorized = params
+                            .get("authorized")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true);
+                        WatchPrWakeOutcome::NeedsChange { authorized }
+                    }
+                    "pr_merged" | "pr_closed" | "merged" | "closed" | "merged_or_closed" => {
+                        WatchPrWakeOutcome::MergedOrClosed
+                    }
+                    "ready_to_merge" | "ready" | "ci_passed" => WatchPrWakeOutcome::ReadyToMerge,
+                    _ => WatchPrWakeOutcome::StillRunningOrQuestion,
+                };
+                let step = coord.handle_wake(aid, outcome, now_ms.max(0) as u64)?;
+                let watch = coord.get_watch(aid)?;
+                let dispatched = matches!(step, WatchPrStepAction::DispatchWorkerFix { .. });
+                let escalated = matches!(step, WatchPrStepAction::EscalateToOwnerAndStop { .. });
+                let action_name = match step {
+                    WatchPrStepAction::DispatchWorkerFix { .. } => "dispatch_worker_fix",
+                    WatchPrStepAction::EscalateToOwnerAndStop { .. } => "escalate_to_owner_and_stop",
+                    WatchPrStepAction::AnnounceAndStop { .. } => "announce_and_stop",
+                    WatchPrStepAction::NotifyOwnerAndRearmSameAttempt { .. } => {
+                        "notify_owner_and_rearm_same_attempt"
+                    }
+                    WatchPrStepAction::ForwardQuestionAndRearmSameAttempt { .. } => {
+                        "forward_question_and_rearm_same_attempt"
+                    }
+                };
+                return Ok(json!({
+                    "automationId": aid,
+                    "watchId": aid,
+                    "attempts": watch.fix_dispatches_used,
+                    "dispatched": dispatched,
+                    "escalated": escalated,
+                    "stopped": !watch.active,
+                    "action": action_name,
+                    "watch": watch,
+                }));
+            }
+            // Non-watch-pr general automation event evaluation.
+            let autos = bots.automation_engine().list_automations(None)?;
+            let auto = autos
+                .into_iter()
+                .find(|a| a.id == aid)
+                .ok_or_else(|| OrcaIdeRuntimeError::not_found(format!("automation '{aid}'")))?;
+            if !auto.enabled {
+                return Ok(json!({
+                    "automationId": aid,
+                    "dispatched": false,
+                    "skipped": true,
+                    "reason": "disabled",
+                }));
+            }
+            Ok(json!({
+                "automationId": aid,
+                "dispatched": true,
+                "kind": kind,
+                "localOnly": auto.has_local_only_triggers(),
+            }))
         }
         other => Err(OrcaIdeRuntimeError::not_found(format!(
             "unknown automations RPC method 'automations.{other}'"
+        ))),
+    }
+}
+
+async fn handle_bots_connectors(
+    bots: &Arc<OrcaBotsFacade>,
+    sub: &str,
+    params: &Value,
+) -> Result<Value> {
+    match sub {
+        "externalAction" | "external_action" => {
+            let bot_id = req_str_any(params, &["botId", "bot_id", "id"])?;
+            let action = req_str_any(params, &["action", "kind"])?;
+            let text = opt_str_any(params, &["text", "body"]).unwrap_or("");
+            let bot = bots.controller().get_bot(bot_id).await?;
+
+            let acts_for = params.get("actsFor").or_else(|| params.get("acts_for"));
+            let is_owner = acts_for
+                .and_then(|v| v.get("isOwner").or_else(|| v.get("is_owner")))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let askers: Vec<ActsForAsker> = if is_owner {
+                vec![ActsForAsker::Owner]
+            } else if let Some(af) = acts_for {
+                let source = af
+                    .get("source")
+                    .or_else(|| af.get("connector"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                        "github" => Some(ConnectorSource::Github),
+                        "linear" => Some(ConnectorSource::Linear),
+                        "slack" => Some(ConnectorSource::Slack),
+                        _ => None,
+                    })
+                    .unwrap_or(ConnectorSource::Slack);
+                let user_id = af
+                    .get("id")
+                    .or_else(|| af.get("userId"))
+                    .or_else(|| af.get("user_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("external")
+                    .to_string();
+                let name = af
+                    .get("name")
+                    .or_else(|| af.get("displayName"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                vec![ActsForAsker::Person {
+                    source,
+                    user_id,
+                    name,
+                    workspace_id: None,
+                    role: Some(ConnectorAskerRole::Member),
+                    place_kind: None,
+                }]
+            } else {
+                vec![ActsForAsker::Unknown]
+            };
+
+            let action_norm = action.trim().to_ascii_lowercase();
+            let owner_only = matches!(
+                action_norm.as_str(),
+                "merge_pr" | "approve_pr" | "merge" | "approve" | "deploy" | "delete"
+            );
+            if owner_only {
+                require_owner_asker(&askers, action)?;
+            }
+
+            let decorated = decorate_external_action_body(text, &askers, bot.name.as_str(), is_owner);
+            Ok(json!({
+                "botId": bot.id,
+                "action": action,
+                "text": decorated,
+                "attribution": decorated,
+                "isOwner": is_owner,
+            }))
+        }
+        other => Err(OrcaIdeRuntimeError::not_found(format!(
+            "unknown bots.connectors RPC method 'bots.connectors.{other}'"
         ))),
     }
 }

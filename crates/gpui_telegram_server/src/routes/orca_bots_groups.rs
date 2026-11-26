@@ -18,18 +18,21 @@ use gpui_telegram_proto::orca_contracts::{
     OrcaCreateBotChatRequest, OrcaCreateGroupRequest, OrcaCreateGroupThreadRequest,
     OrcaDecideAccessRequest, OrcaHandOverRequest, OrcaSendGroupMessageRequest,
 };
+use orca_bots::wire_json::chat_tree_to_wire_json;
 use orca_bots::{
-    ConnectorAccessRequestStatus, CreateAccessRequestInput, CreateBotGroupRequest,
+    BotPatch, ConnectorAccessRequestStatus, CreateAccessRequestInput, CreateBotGroupRequest,
     GroupMessageRequester, GroupMessageSender, HandOverTarget, LeaveThreadContext,
     LeaveThreadDecision, OrcaBotsError, PostGroupMessageRequest, WakeFrameKind,
-    evaluate_leave_thread_request,
+    evaluate_leave_thread_request, suggested_bot_name,
 };
-use orca_core::bot_ecosystem::{BotChatLiveState, BotChatNode, BotChatNodeKind};
+use orca_core::bot_ecosystem::{
+    BotChatLiveState, BotChatNode, BotChatNodeKind, BotChatNodeNote, HandOverOutcome,
+};
 use orca_core::bot_groups::{
     BotGroupFolderSlug, BotGroupReplyMode, BotGroupSend, MentionCandidate,
 };
 use orca_core::bot_preamble::{addressed_bot_words, is_quiet_reply, quiet_bot_result_text};
-use orca_core::bot_types::BotAgentId;
+use orca_core::bot_types::{BotAgentId, BotMember, HandedPairedWorkspace};
 use orca_core::workspace_layout::TabViewMode;
 use orca_core::BotErrorCode;
 use orca_ide::{AppendJournalItemRequest, CreateAgentSessionRequest};
@@ -192,9 +195,18 @@ pub async fn send_group_message(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let sender = match parse_group_sender(req.sender) {
-        Ok(s) => s,
-        Err(resp) => return resp,
+    let sender = if req.sender.is_none()
+        && let Some(ref bid) = req.from_bot_id
+        && !bid.trim().is_empty()
+    {
+        GroupMessageSender::Bot {
+            bot_id: bid.trim().to_string(),
+        }
+    } else {
+        match parse_group_sender(req.sender) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        }
     };
     let requester = match parse_group_requester(req.requester) {
         Ok(r) => r,
@@ -236,9 +248,15 @@ pub async fn send_group_message(
         Ok(posted) => Json(json!({
             "message": posted.message,
             "targets": posted.targets,
+            "targetBotIds": posted.targets.dispatched_bot_ids,
+            "dispatchedBotIds": posted.targets.dispatched_bot_ids,
+            "heldBotIds": posted.targets.held_bot_ids,
+            "pendingBotIds": posted.targets.held_bot_ids,
+            "handedOff": posted.targets.handed_off || req.handoff,
             "operation_ids": posted.operation_ids,
             "pending_ids": posted.pending_ids,
             "remote_asks": posted.remote_asks,
+            "remoteAsks": posted.remote_asks,
         }))
         .into_response(),
         Err(err) => map_bots_err(err),
@@ -257,14 +275,36 @@ pub async fn list_group_messages(
     Path(group_id): Path<String>,
     Query(query): Query<GroupMessagesQuery>,
 ) -> Response {
-    match state
+    let msgs = match state
         .orca_bots
         .group_runtime()
         .list_messages(&group_id, query.thread_id.as_deref())
     {
-        Ok(msgs) => Json(msgs).into_response(),
-        Err(err) => map_bots_err(err),
-    }
+        Ok(m) => m,
+        Err(err) => return map_bots_err(err),
+    };
+    let ops = state
+        .orca_bots
+        .group_runtime()
+        .list_operations(&group_id)
+        .unwrap_or_default();
+    let enriched: Vec<Value> = msgs
+        .into_iter()
+        .map(|m| {
+            let mailed = m.mailed.clone();
+            let mut v = serde_json::to_value(m).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("deliveredBotIds".into(), json!(mailed));
+            }
+            v
+        })
+        .collect();
+    Json(json!({
+        "messages": enriched,
+        "turns": ops,
+        "deliveries": ops,
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +354,14 @@ pub async fn access_list_all(
     }
 }
 
+fn access_req_to_wire_json(req: &orca_bots::ConnectorAccessRequest) -> Value {
+    let mut val = serde_json::to_value(req).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".into(), json!(req.request_id));
+    }
+    val
+}
+
 pub async fn access_list(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
@@ -334,7 +382,10 @@ pub async fn access_list(
         .access_host()
         .list_requests(filter_bot, status)
     {
-        Ok(list) => Json(list).into_response(),
+        Ok(list) => {
+            let wire: Vec<Value> = list.iter().map(access_req_to_wire_json).collect();
+            Json(wire).into_response()
+        }
         Err(err) => map_bots_err(err),
     }
 }
@@ -349,9 +400,42 @@ pub async fn access_create(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let member = match req.member {
+        Some(m) => m,
+        None => {
+            let Some(uid) = req
+                .user_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                return orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "Provide 'member' or flat 'externalUserId'/'user_id' for access request",
+                );
+            };
+            let name = req
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| uid.clone());
+            BotMember {
+                id: uid,
+                name,
+                source: req.source.or_else(|| Some("slack".to_string())),
+                workspace_id: req.connector_workspace_id.clone(),
+                avatar_url: None,
+                kind: None,
+            }
+        }
+    };
     let input = CreateAccessRequestInput {
         bot_id,
-        member: req.member,
+        member,
         connector_workspace_id: req.connector_workspace_id,
         ttl_ms: req.ttl_ms,
         now_ms: req.now_ms.unwrap_or_else(now_epoch_ms),
@@ -371,7 +455,7 @@ pub async fn access_create(
             state
                 .orca_wake_hub
                 .notify_host(&created.host_id, WakeFrameKind::AccessRequest);
-            (StatusCode::CREATED, Json(created)).into_response()
+            (StatusCode::CREATED, Json(access_req_to_wire_json(&created))).into_response()
         }
         Err(err) => map_bots_err(err),
     }
@@ -391,6 +475,22 @@ pub async fn access_decide(
     let host = state.orca_bots.access_host();
     let ctrl = state.orca_bots.controller();
 
+    let resolved_approve = if let Some(ref dec) = req.decision {
+        match dec.trim().to_ascii_lowercase().as_str() {
+            "granted" | "grant" | "approve" | "approved" | "allow" | "yes" => true,
+            "declined" | "decline" | "denied" | "deny" | "reject" | "rejected" | "no" => false,
+            other => {
+                return orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    format!("Unsupported access decision '{other}' (expected granted|declined)"),
+                );
+            }
+        }
+    } else {
+        req.approve.unwrap_or(true)
+    };
+
     let res = if let Some(token) = req
         .redeem_token
         .as_deref()
@@ -404,7 +504,7 @@ pub async fn access_decide(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        host.decide_request(request_id, req.approve.unwrap_or(true), now_ms, ctrl)
+        host.decide_request(request_id, resolved_approve, now_ms, ctrl)
             .await
     } else {
         return orca_err(
@@ -416,7 +516,8 @@ pub async fn access_decide(
 
     match res {
         Ok(outcome) => Json(json!({
-            "request": outcome.request,
+            "id": outcome.request.request_id,
+            "request": access_req_to_wire_json(&outcome.request),
             "added_locally": outcome.added_locally,
         }))
         .into_response(),
@@ -450,7 +551,12 @@ pub async fn hand_over(
             return map_bots_err(err);
         }
     }
-    if let Some(ref fail_reason) = req.simulate_notify_failure {
+    let notify_fail_reason: Option<String> = match req.simulate_notify_failure.as_ref() {
+        Some(Value::Bool(true)) => Some("simulated notify failure".to_string()),
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    };
+    if let Some(ref fail_reason) = notify_fail_reason {
         let reparent = req.simulate_concurrent_reparent.as_ref().map(|p| {
             let trimmed = p.trim();
             (
@@ -472,6 +578,19 @@ pub async fn hand_over(
         return map_bots_err(err);
     }
 
+    let name_seed = req
+        .branch
+        .as_deref()
+        .or(req.workspace_name.as_deref())
+        .unwrap_or(&req.workspace_id);
+    let suggested = suggested_bot_name(
+        name_seed,
+        req.repo_slug.as_deref(),
+        req.recent_prompt.as_deref(),
+    )
+    .ok()
+    .map(|n| n.into_inner());
+
     let mode = req
         .mode
         .as_deref()
@@ -481,7 +600,9 @@ pub async fn hand_over(
     let target = match mode.as_str() {
         "create_new" | "new" => HandOverTarget::CreateNewBot {
             workspace_name: req
-                .workspace_name
+                .branch
+                .clone()
+                .or(req.workspace_name)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| req.workspace_id.clone()),
             repo_slug: req.repo_slug,
@@ -490,9 +611,10 @@ pub async fn hand_over(
             custom_name: req.custom_name,
         },
         "existing" => HandOverTarget::ExistingBot {
-            bot_id,
+            bot_id: bot_id.clone(),
             purpose: req
                 .purpose
+                .or(req.recent_prompt)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "Supervise workspace".to_string()),
         },
@@ -510,7 +632,56 @@ pub async fn hand_over(
         .hand_over_workspace(lineage, &req.workspace_id, target)
         .await
     {
-        Ok(outcome) => Json(outcome).into_response(),
+        Ok(outcome) => {
+            let moved_and_notified = matches!(
+                outcome,
+                HandOverOutcome::Attached { .. } | HandOverOutcome::Created { .. }
+            );
+            if let HandOverOutcome::Attached { bot_id: ref bid }
+            | HandOverOutcome::Created { bot_id: ref bid, .. } = outcome
+            {
+                let _ = state
+                    .orca_bots
+                    .controller()
+                    .update_bot(
+                        bid,
+                        BotPatch {
+                            add_handed_paired_workspace: Some(HandedPairedWorkspace {
+                                workspace_id: req.workspace_id.clone(),
+                                handed_at: now_epoch_ms(),
+                            }),
+                            ..BotPatch::default()
+                        },
+                    )
+                    .await;
+            }
+            let mut val = serde_json::to_value(&outcome).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = val.as_object_mut() {
+                if let Some(ref sname) = suggested {
+                    obj.insert("suggestedBotName".into(), json!(sname));
+                }
+                obj.insert("moved".into(), json!(moved_and_notified));
+                obj.insert("notified".into(), json!(moved_and_notified));
+                obj.insert("workspaceId".into(), json!(req.workspace_id));
+                if let HandOverOutcome::RolledBack {
+                    placement: orca_core::bot_ecosystem::HandOverRollbackPlacement::MovedSince,
+                    ..
+                } = &outcome
+                {
+                    use orca_bots::WorkspaceLineageAdapter as _;
+                    let cur_parent = lineage
+                        .get_parent(&req.workspace_id)
+                        .ok()
+                        .flatten()
+                        .or_else(|| req.simulate_concurrent_reparent.clone());
+                    obj.insert("placement".into(), json!("moved-since"));
+                    obj.insert("currentParent".into(), json!(cur_parent));
+                    obj.insert("current_parent".into(), json!(cur_parent));
+                    obj.insert("reason".into(), json!("lineage_parent_changed"));
+                }
+            }
+            Json(val).into_response()
+        }
         Err(err) => map_bots_err(err),
     }
 }
@@ -525,7 +696,10 @@ pub struct ChatTreeQuery {
     pub now_ms: Option<i64>,
 }
 
-fn default_chat_tree_nodes(state: &AppState, bot: &orca_core::bot_types::OrcaBotRecord) -> Vec<BotChatNode> {
+fn default_chat_tree_nodes(
+    state: &AppState,
+    bot: &orca_core::bot_types::OrcaBotRecord,
+) -> Vec<BotChatNode> {
     let ws_key = bot_workspace_key(&bot.id);
     let mut nodes = Vec::new();
     let mut seen = HashSet::new();
@@ -550,7 +724,7 @@ fn default_chat_tree_nodes(state: &AppState, bot: &orca_core::bot_types::OrcaBot
             if !seen.insert(sess.session_id.clone()) {
                 continue;
             }
-            let kind = if bot.chat_session_id.as_deref() == Some(sess.session_id.as_str()) {
+            let kind = if nodes.is_empty() {
                 BotChatNodeKind::Home
             } else {
                 BotChatNodeKind::Side
@@ -569,6 +743,40 @@ fn default_chat_tree_nodes(state: &AppState, bot: &orca_core::bot_types::OrcaBot
         }
     }
 
+    if nodes.is_empty() {
+        nodes.push(BotChatNode {
+            session_id: format!("home-{}", bot.id),
+            parent_session_id: None,
+            title: format!("{} (Home)", bot.name.as_str()),
+            kind: BotChatNodeKind::Home,
+            live_state: BotChatLiveState::Idle,
+            note: None,
+            unread: false,
+            needs_you: false,
+            updated_at_ms: bot.updated_at,
+        });
+    }
+
+    if let Some(ref handed) = bot.handed_paired_workspaces {
+        let home_sid = nodes.first().map(|n| n.session_id.clone());
+        for hw in handed {
+            let sid = format!("handed:{}", hw.workspace_id);
+            if seen.insert(sid.clone()) {
+                nodes.push(BotChatNode {
+                    session_id: sid,
+                    parent_session_id: home_sid.clone(),
+                    title: hw.workspace_id.clone(),
+                    kind: BotChatNodeKind::Side,
+                    live_state: BotChatLiveState::Idle,
+                    note: Some(BotChatNodeNote::HandedOver),
+                    unread: false,
+                    needs_you: false,
+                    updated_at_ms: hw.handed_at,
+                });
+            }
+        }
+    }
+
     nodes
 }
 
@@ -584,11 +792,16 @@ pub async fn chat_tree_get(
     };
     let nodes = default_chat_tree_nodes(&state, &bot);
     let now_ms = query.now_ms.unwrap_or_else(now_epoch_ms);
+    let usage_limit = state
+        .orca_bots
+        .get_usage_limit_continue(&bot.id)
+        .ok()
+        .flatten();
     match state
         .orca_bots
-        .build_chat_tree(&bot.id, &nodes, None, Vec::new(), now_ms)
+        .build_chat_tree(&bot.id, &nodes, usage_limit.clone(), Vec::new(), now_ms)
     {
-        Ok(view) => Json(view).into_response(),
+        Ok(view) => Json(chat_tree_to_wire_json(&bot, &view, usage_limit.as_ref())).into_response(),
         Err(err) => map_bots_err(err),
     }
 }
@@ -613,11 +826,18 @@ pub async fn chat_tree_post(
         req.nodes
     };
     let now_ms = req.now_ms.unwrap_or_else(now_epoch_ms);
+    let usage_limit = req.usage_limit.or_else(|| {
+        state
+            .orca_bots
+            .get_usage_limit_continue(&bot.id)
+            .ok()
+            .flatten()
+    });
     match state
         .orca_bots
-        .build_chat_tree(&bot.id, &nodes, req.usage_limit, req.cards, now_ms)
+        .build_chat_tree(&bot.id, &nodes, usage_limit.clone(), req.cards, now_ms)
     {
-        Ok(view) => Json(view).into_response(),
+        Ok(view) => Json(chat_tree_to_wire_json(&bot, &view, usage_limit.as_ref())).into_response(),
         Err(err) => map_bots_err(err),
     }
 }
@@ -695,11 +915,28 @@ pub async fn bot_chats_create(
                 now_ms: Some(now_ms),
             });
     }
+    if bot.chat_session_id.is_none() {
+        let _ = state
+            .orca_bots
+            .controller()
+            .update_bot(
+                &bot.id,
+                BotPatch {
+                    chat_session_id: Some(Some(snap.session.session_id.clone())),
+                    ..BotPatch::default()
+                },
+            )
+            .await;
+    } else {
+        let _ = state.orca_bots.home_store().sync_generated_home_files(&bot);
+    }
     (
         StatusCode::CREATED,
         Json(json!({
+            "id": snap.session.session_id,
             "bot_id": bot.id,
             "chat_id": snap.session.session_id,
+            "chatId": snap.session.session_id,
             "title": req.title,
             "session": snap.session,
             "chat_state": snap.chat_state,

@@ -309,7 +309,7 @@ pub fn compile_rule_pack_json(json: &str) -> Result<CompiledScreenAnchorPack> {
 /// All 13 built-in JSON screen-anchor rule packs (`claude`, `codex`, `grok`, `opencode`,
 /// `cursor`, `copilot`, `hermes`, `kimi`, `kiro`, `goose`, `cline`, `aider`, `pi`).
 pub const BUILTIN_SCREEN_ANCHOR_PACKS_JSON: [&str; BUILTIN_SCREEN_ANCHOR_PACK_COUNT] = [
-    r#"{"agent_id":"claude","title_working":["[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏].*Claude","Claude.*Working"],"title_waiting":["Claude.*Waiting"],"working_anchors":["[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+(Thinking|Working|Running|Reading|Editing)","esc to interrupt"],"blocked_anchors":["Do you want to (proceed|allow|run)","Allow once.*Allow always","Permission required"],"waiting_anchors":["(?m)^❯\\s*$","(?m)^>\\s*Try "],"done_anchors":["Total cost:|Cost: \\$[0-9]+\\.[0-9]+","Turn complete"]}"#,
+    r#"{"agent_id":"claude","title_working":["[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏].*Claude","Claude.*Working"],"title_waiting":["Claude.*Waiting"],"working_anchors":["[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+(Thinking|Working|Running|Reading|Editing)","esc to interrupt"],"blocked_anchors":["Do you want to (proceed|allow|run)","Allow once.*Allow always","Permission required","Allow .*\\? \\[y/[nN]\\]"],"waiting_anchors":["(?m)^❯\\s*$","(?m)^>\\s*Try ","AskUserQuestion:"],"done_anchors":["Total cost:|Cost: \\$[0-9]+\\.[0-9]+","Turn complete","Task complete"]}"#,
     r#"{"agent_id":"codex","title_working":["Codex.*(Working|Running)"],"title_waiting":["Codex.*Idle"],"working_anchors":["[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s*(Working|Thinking|Executing)","Esc to interrupt"],"blocked_anchors":["Approve command\\?","Run command\\?.*\\[y/n\\]","Would you like to run"],"waiting_anchors":["(?m)^›\\s*$","Ask Codex anything"],"done_anchors":["Token usage:","codex finished"]}"#,
     r#"{"agent_id":"grok","title_working":["Grok.*Thinking"],"title_waiting":["Grok.*Ready"],"working_anchors":["Grok is thinking","[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+Grok"],"blocked_anchors":["Approve tool call\\?","Confirm execution \\[y/N\\]"],"waiting_anchors":["(?m)^grok>\\s*$","Ask Grok"],"done_anchors":["Completed in [0-9]+\\.?[0-9]*s"]}"#,
     r#"{"agent_id":"opencode","title_working":["OpenCode.*Working"],"title_waiting":["OpenCode.*Ready"],"working_anchors":["Generating\\.\\.\\.","Running tool:"],"blocked_anchors":["Allow tool execution\\?","Permission: .*\\[a\\]llow"],"waiting_anchors":["(?m)^opencode>\\s*$","Type a message"],"done_anchors":["Session idle","Done \\([0-9]+ tokens\\)"]}"#,
@@ -482,6 +482,9 @@ fn parse_osc7501_body(body: &str) -> Osc7501ProgramStatus {
 struct SessionTracker {
     status: AgentSessionStatus,
     layer_timestamps: [Option<i64>; 4],
+    raw_interactive_prompt: Option<serde_json::Value>,
+    prompt_cache_ttl_ms: Option<u64>,
+    turn_completed_at_ms: Option<i64>,
 }
 
 /// Thread-safe (`Send + Sync`) 4-state agent status engine enforcing strict 3-layer precedence:
@@ -571,6 +574,9 @@ impl AgentStatusEngine {
             SessionTracker {
                 status: status.clone(),
                 layer_timestamps: [None; 4],
+                raw_interactive_prompt: None,
+                prompt_cache_ttl_ms: None,
+                turn_completed_at_ms: None,
             },
         );
         status
@@ -579,6 +585,111 @@ impl AgentStatusEngine {
     /// Fetches the current status snapshot for `session_id`.
     pub fn get_status(&self, session_id: &str) -> Option<AgentSessionStatus> {
         self.sessions.read().get(session_id).map(|t| t.status.clone())
+    }
+
+    /// Fetches the rich camelCase + snake_case wire JSON snapshot for `session_id`.
+    pub fn get_status_wire_json(&self, session_id: &str) -> Option<serde_json::Value> {
+        let guard = self.sessions.read();
+        let tracker = guard.get(session_id)?;
+        let st = &tracker.status;
+        let source = match st.authoritative_layer {
+            Some(StatusSignalLayer::Hook) => "hook",
+            Some(StatusSignalLayer::ScreenAnchor) => "screen",
+            Some(StatusSignalLayer::Osc7501) => "osc7501",
+            None => "none",
+        };
+        let subagents: Vec<serde_json::Value> = st
+            .subagents
+            .values()
+            .map(|s| {
+                let status_str = match s.state {
+                    AgentRunState::Working => "running",
+                    other => other.as_str(),
+                };
+                serde_json::json!({
+                    "id": s.subagent_id,
+                    "subagentId": s.subagent_id,
+                    "state": s.state.as_str(),
+                    "status": status_str,
+                    "updatedAtMs": s.updated_at_ms,
+                })
+            })
+            .collect();
+        let interactive_prompt = tracker.raw_interactive_prompt.clone().or_else(|| {
+            st.interactive_prompt
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok())
+        });
+        Some(serde_json::json!({
+            "sessionId": st.session_id,
+            "session_id": st.session_id,
+            "agentId": st.agent_id,
+            "agent_id": st.agent_id,
+            "state": st.state.as_str(),
+            "source": source,
+            "authoritativeLayer": st.authoritative_layer,
+            "workingMode": if st.monitoring_mode { "monitoring" } else { "normal" },
+            "monitoringMode": st.monitoring_mode,
+            "sessionBoundary": st.session_boundary,
+            "completionAlertsSuppressed": st.completion_alerts_suppressed,
+            "interactivePrompt": interactive_prompt,
+            "turnCompletedAt": tracker.turn_completed_at_ms,
+            "lastTurnActivityAt": st.updated_at_ms,
+            "promptCacheTtlMs": tracker.prompt_cache_ttl_ms,
+            "promptCacheExpiresAt": st.prompt_cache_expires_at_ms,
+            "subagents": subagents,
+            "lastMatchedRule": st.last_matched_rule,
+            "updatedAtMs": st.updated_at_ms,
+        }))
+    }
+
+    /// Clears the Layer 1 Hook precedence lock for `session_id` so lower layers (screen/OSC)
+    /// may evaluate and update state again.
+    pub fn clear_hook_override(&self, session_id: &str) {
+        let mut guard = self.sessions.write();
+        if let Some(tracker) = guard.get_mut(session_id) {
+            tracker.layer_timestamps[usize::from(StatusSignalLayer::Hook.rank())] = None;
+        }
+    }
+
+    /// Records a raw JSON `interactivePrompt` payload for `session_id`.
+    pub fn set_raw_interactive_prompt(&self, session_id: &str, prompt: serde_json::Value) {
+        let mut guard = self.sessions.write();
+        if let Some(tracker) = guard.get_mut(session_id) {
+            tracker.raw_interactive_prompt = Some(prompt);
+        }
+    }
+
+    /// Updates subagent states for `session_id`.
+    pub fn update_subagents(
+        &self,
+        session_id: &str,
+        subs: Vec<(String, AgentRunState)>,
+        now_ms: Option<i64>,
+    ) {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let mut guard = self.sessions.write();
+        let tracker = guard
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionTracker {
+                status: empty_status(session_id, "unknown", now_ms),
+                layer_timestamps: [None; 4],
+                raw_interactive_prompt: None,
+                prompt_cache_ttl_ms: None,
+                turn_completed_at_ms: None,
+            });
+        for (sub_id, sub_state) in subs {
+            tracker.status.subagents.insert(
+                sub_id.clone(),
+                SubagentStatus {
+                    subagent_id: sub_id,
+                    state: sub_state,
+                    label: None,
+                    updated_at_ms: now_ms,
+                },
+            );
+        }
+        tracker.status.updated_at_ms = now_ms;
     }
 
     /// Lists all tracked agent session statuses.
@@ -633,6 +744,9 @@ impl AgentStatusEngine {
             .or_insert_with(|| SessionTracker {
                 status: empty_status(&payload.session_id, &payload.agent_id, now_ms),
                 layer_timestamps: [None; 4],
+                raw_interactive_prompt: None,
+                prompt_cache_ttl_ms: None,
+                turn_completed_at_ms: None,
             });
         let prev_state = tracker.status.state;
         tracker.status.agent_id = payload.agent_id;
@@ -660,6 +774,7 @@ impl AgentStatusEngine {
         }
         if let Some(ttl) = payload.prompt_cache_ttl_ms {
             let ttl_i64 = i64::try_from(ttl).unwrap_or(i64::MAX);
+            tracker.prompt_cache_ttl_ms = Some(ttl);
             tracker.status.prompt_cache_expires_at_ms = Some(now_ms.saturating_add(ttl_i64));
         }
         if let Some(prompt) = payload.interactive_prompt {
@@ -672,6 +787,10 @@ impl AgentStatusEngine {
             tracker.status.authoritative_layer = Some(StatusSignalLayer::Hook);
             if next_state == AgentRunState::Working {
                 tracker.status.interactive_prompt = None;
+                tracker.raw_interactive_prompt = None;
+            }
+            if next_state == AgentRunState::Done {
+                tracker.turn_completed_at_ms = Some(now_ms);
             }
             state_applied = true;
         }
@@ -721,6 +840,9 @@ impl AgentStatusEngine {
             .or_insert_with(|| SessionTracker {
                 status: empty_status(session_id, agent_id, now_ms),
                 layer_timestamps: [None; 4],
+                raw_interactive_prompt: None,
+                prompt_cache_ttl_ms: None,
+                turn_completed_at_ms: None,
             });
         let prev_state = tracker.status.state;
         tracker.status.restored_unconfirmed = false;
@@ -731,6 +853,9 @@ impl AgentStatusEngine {
         let state_applied = if self.can_layer_update_state(tracker, StatusSignalLayer::ScreenAnchor, now_ms) {
             tracker.status.state = matched_state;
             tracker.status.authoritative_layer = Some(StatusSignalLayer::ScreenAnchor);
+            if matched_state == AgentRunState::Done {
+                tracker.turn_completed_at_ms = Some(now_ms);
+            }
             true
         } else {
             false
@@ -776,6 +901,9 @@ impl AgentStatusEngine {
                 .or_insert_with(|| SessionTracker {
                     status: empty_status(session_id, agent_id, now_ms),
                     layer_timestamps: [None; 4],
+                    raw_interactive_prompt: None,
+                    prompt_cache_ttl_ms: None,
+                    turn_completed_at_ms: None,
                 });
             let prev_state = tracker.status.state;
             tracker.status.restored_unconfirmed = false;
@@ -801,6 +929,7 @@ impl AgentStatusEngine {
             }
             if let Some(ttl) = facet.prompt_cache_ttl_ms {
                 let ttl_i64 = i64::try_from(ttl).unwrap_or(i64::MAX);
+                tracker.prompt_cache_ttl_ms = Some(ttl);
                 tracker.status.prompt_cache_expires_at_ms = Some(now_ms.saturating_add(ttl_i64));
             }
             if let Some(prompt) = facet.interactive_prompt {
@@ -1371,8 +1500,8 @@ async fn handle_hook_connection(
         return;
     }
 
-    let payload: HookEventPayload = match serde_json::from_slice(&body_bytes) {
-        Ok(p) => p,
+    let raw_val: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
         Err(err) => {
             write_json_response(
                 &mut s,
@@ -1384,7 +1513,90 @@ async fn handle_hook_connection(
         }
     };
 
+    let raw_prompt = raw_val
+        .get("interactivePrompt")
+        .or_else(|| raw_val.get("interactive_prompt"))
+        .cloned();
+
+    let payload: HookEventPayload = match serde_json::from_value(raw_val.clone()) {
+        Ok(p) => p,
+        Err(_) => {
+            let Some(session_id) = raw_val
+                .get("sessionId")
+                .or_else(|| raw_val.get("session_id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                write_json_response(
+                    &mut s,
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({"error":{"code":"invalid_argument","message": "missing session_id / sessionId"}}),
+                )
+                .await;
+                return;
+            };
+            let agent_id = raw_val
+                .get("agentId")
+                .or_else(|| raw_val.get("agent_id"))
+                .or_else(|| raw_val.get("agent"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("claude")
+                .to_string();
+            let state = raw_val
+                .get("state")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "idle" => Some(AgentRunState::Idle),
+                    "working" | "running" => Some(AgentRunState::Working),
+                    "blocked" => Some(AgentRunState::Blocked),
+                    "waiting" => Some(AgentRunState::Waiting),
+                    "done" | "completed" => Some(AgentRunState::Done),
+                    _ => None,
+                });
+            let event = raw_val
+                .get("event")
+                .or_else(|| raw_val.get("reason"))
+                .or_else(|| raw_val.get("state"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("hook")
+                .to_string();
+            let interactive_prompt = raw_prompt
+                .as_ref()
+                .and_then(|p| serde_json::from_value::<AskUserQuestionPrompt>(p.clone()).ok());
+            HookEventPayload {
+                session_id,
+                agent_id,
+                event,
+                state,
+                session_boundary: raw_val
+                    .get("sessionBoundary")
+                    .or_else(|| raw_val.get("session_boundary"))
+                    .and_then(|v| v.as_bool()),
+                monitoring_mode: raw_val
+                    .get("monitoringMode")
+                    .or_else(|| raw_val.get("monitoring_mode"))
+                    .and_then(|v| v.as_bool()),
+                subagent_id: raw_val
+                    .get("subagentId")
+                    .or_else(|| raw_val.get("subagent_id"))
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                subagent_state: None,
+                prompt_cache_ttl_ms: raw_val
+                    .get("promptCacheTtlMs")
+                    .or_else(|| raw_val.get("prompt_cache_ttl_ms"))
+                    .and_then(|v| v.as_u64()),
+                interactive_prompt,
+            }
+        }
+    };
+
+    let sid_copy = payload.session_id.clone();
     let transition = engine.apply_hook_event(payload, None);
+    if let Some(rp) = raw_prompt {
+        engine.set_raw_interactive_prompt(&sid_copy, rp);
+    }
     write_json_response(
         &mut s,
         StatusCode::OK,

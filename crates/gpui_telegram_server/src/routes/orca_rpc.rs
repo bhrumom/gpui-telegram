@@ -11,9 +11,20 @@ use axum::{
     routing::post,
     Router,
 };
-use orca_core::orchestration_protocol::{RpcRequestEnvelope, RpcResponseEnvelope};
+use orca_core::RUNTIME_PROTOCOL_VERSION;
+use orca_core::orchestration_protocol::{
+    RpcRequestEnvelope, RpcResponseEnvelope, negotiate_runtime_protocol,
+};
+use serde_json::{Value, json};
 
 use crate::server::{AppState, AuthBearer};
+
+fn parse_optional_i64(val: Option<&Value>) -> Option<i64> {
+    let v = val?;
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
 
 /// Dispatches a Unified Runtime RPC v3 request (`POST /api/v1/orca/rpc`).
 ///
@@ -22,7 +33,7 @@ use crate::server::{AppState, AuthBearer};
 /// - All dispatched RPC calls (both `ok: true` and `ok: false`) -> HTTP `200 OK` with `Json(RpcResponseEnvelope)`.
 /// - NEVER returns HTTP `501 Not Implemented`.
 pub async fn handle_orca_rpc(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Response {
@@ -49,7 +60,65 @@ pub async fn handle_orca_rpc(
                 .into_response();
         }
     };
-    let resp = state.orca_ide.dispatch_rpc(req).await;
+
+    if matches!(
+        req.method.trim(),
+        "bots.telegram.bindChat" | "bot.telegram.bindChat" | "bots.telegram.bind_chat"
+    ) {
+        if let Err(err) = negotiate_runtime_protocol(req.protocol_version, RUNTIME_PROTOCOL_VERSION)
+        {
+            return (
+                StatusCode::OK,
+                Json(RpcResponseEnvelope::err("protocol_version", err.to_string())),
+            )
+                .into_response();
+        }
+        let Some(bot_id) = req
+            .params
+            .get("botId")
+            .or_else(|| req.params.get("bot_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return (
+                StatusCode::OK,
+                Json(RpcResponseEnvelope::err(
+                    "invalid_argument",
+                    "Missing required 'botId' for bots.telegram.bindChat",
+                )),
+            )
+                .into_response();
+        };
+        let explicit_chat_id =
+            parse_optional_i64(req.params.get("chatId").or_else(|| req.params.get("chat_id")));
+        let resp = match crate::routes::orca_telegram_bridge::bind_bot_to_telegram_chat(
+            &state,
+            auth.user_id,
+            bot_id,
+            explicit_chat_id,
+        )
+        .await
+        {
+            Ok((chat_id, bot_user_id, bot_username)) => RpcResponseEnvelope::ok(json!({
+                "botId": bot_id,
+                "bot_id": bot_id,
+                "chatId": chat_id,
+                "chat_id": chat_id,
+                "botUserId": bot_user_id,
+                "botUsername": bot_username,
+                "linked": true,
+            })),
+            Err((code, msg)) => RpcResponseEnvelope::err(code, msg),
+        };
+        return (StatusCode::OK, Json(resp)).into_response();
+    }
+
+    let caller_profile = format!("user:{}", auth.user_id.0);
+    let resp = state
+        .orca_ide
+        .dispatch_rpc_for_profile(req, &caller_profile)
+        .await;
     (StatusCode::OK, Json(resp)).into_response()
 }
 

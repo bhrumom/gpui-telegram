@@ -211,6 +211,8 @@ pub(crate) fn redact_webhook_secret_text(input: &str) -> String {
 }
 
 const WEBHOOK_FORBIDDEN_KEYS: &[&str] = &[
+    "url",
+    "secret",
     "ingest_url",
     "ingestUrl",
     "secret_key",
@@ -451,6 +453,7 @@ fn is_pure_bool_flag(flag: &str) -> bool {
             | "--approve-target"
             | "--allow-foreground-restore"
             | "--remove-dir"
+            | "--recover-status"
             | "--remove-directory"
             | "--keep-open"
             | "--setup-failed"
@@ -480,6 +483,10 @@ fn is_pure_bool_flag(flag: &str) -> bool {
             | "--human-approved"
             | "--require-human-approval"
             | "--auto-approve"
+            | "--preview"
+            | "--text-stdin"
+            | "--value-stdin"
+            | "--export"
     )
 }
 
@@ -495,6 +502,7 @@ fn is_dual_bool_flag(flag: &str) -> bool {
             | "--enforce-approval"
             | "--tab-visible"
             | "--agent-state-is-done"
+            | "--mobile-driver"
             | "--mobile-driver-attached"
             | "--unsettled-orchestration-dispatch"
             | "--git-operation-in-progress"
@@ -667,7 +675,12 @@ pub fn parse_orca_command(
             } else if idx + 1 < args.len()
                 && !args[idx + 1].starts_with('-')
                 && (looks_like_hex_fingerprint(&args[idx + 1])
-                    || looks_like_bool_literal(&args[idx + 1]))
+                    || looks_like_bool_literal(&args[idx + 1])
+                    || (flag == "--approve"
+                        && matches!(
+                            sub_token.as_deref(),
+                            Some("plugin-install") | Some("plugin-approve") | Some("install")
+                        )))
             {
                 idx += 1;
                 let v = args[idx].clone();
@@ -709,7 +722,9 @@ pub fn parse_orca_command(
                 }
                 break;
             }
-            if is_pure_bool_flag(flag) {
+            if is_pure_bool_flag(flag)
+                && !(flag == "--run" && matches!(head, "orchestration" | "orch"))
+            {
                 if let Some(v) = eq_val {
                     bag.values
                         .entry(flag.to_string())

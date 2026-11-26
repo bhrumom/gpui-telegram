@@ -405,6 +405,18 @@ pub struct DynamicClientRegistrationResponse {
     pub client_secret_expires_at: Option<i64>,
 }
 
+/// RFC 8414 OAuth 2.0 Authorization Server Metadata document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthServerMetadata {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+}
+
 /// OAuth 2.1 provider endpoints and client binding for a single MCP tool credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthProviderConfig {
@@ -550,6 +562,64 @@ impl BotToolOAuth {
             .entry(credential_id.to_string())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone())
+    }
+
+    /// Discovers RFC 8414 metadata at `<issuer>/.well-known/oauth-authorization-server`
+    /// under this manager's configured SSRF policy.
+    pub async fn discover_metadata(&self, issuer: &str) -> Result<OAuthServerMetadata> {
+        self.discover_metadata_with_policy(issuer, self.policy).await
+    }
+
+    /// Discovers RFC 8414 metadata at `<issuer>/.well-known/oauth-authorization-server`
+    /// under an explicit SSRF policy (never looser than `self.policy`).
+    pub async fn discover_metadata_with_policy(
+        &self,
+        issuer: &str,
+        requested_policy: OAuthSecurityPolicy,
+    ) -> Result<OAuthServerMetadata> {
+        let effective = if requested_policy.allows_loopback() && self.policy.allows_loopback() {
+            OAuthSecurityPolicy::allow_loopback_for_tests()
+        } else {
+            OAuthSecurityPolicy::strict()
+        };
+        let trimmed = issuer.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(OrcaBotsError::oauth(
+                "invalid_issuer",
+                "OAuth issuer URL must be non-empty.",
+            ));
+        }
+        let well_known = format!("{trimmed}/.well-known/oauth-authorization-server");
+        let (url, addrs) = resolve_and_validate_oauth_url(&well_known, effective).await?;
+        let client = build_pinned_oauth_client(
+            &url,
+            &addrs,
+            Duration::from_secs(self.token_deadline_secs),
+        )?;
+        let resp = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(OrcaBotsError::oauth(
+                "discovery_failed",
+                format!(
+                    "RFC 8414 metadata discovery failed with HTTP {}.",
+                    resp.status().as_u16()
+                ),
+            ));
+        }
+        let meta: OAuthServerMetadata = resp.json().await?;
+        validate_oauth_endpoint_url(&meta.authorization_endpoint, effective)?;
+        validate_oauth_endpoint_url(&meta.token_endpoint, effective)?;
+        if let Some(ref reg) = meta.registration_endpoint {
+            validate_oauth_endpoint_url(reg, effective)?;
+        }
+        if let Some(ref rev) = meta.revocation_endpoint {
+            validate_oauth_endpoint_url(rev, effective)?;
+        }
+        Ok(meta)
     }
 
     /// Registers a client dynamically at an RFC 7591 registration endpoint with SSRF protection.

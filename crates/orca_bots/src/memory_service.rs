@@ -20,7 +20,7 @@ use orca_core::bot_memory::{
     apply_memory_undo, bot_memory_change, evaluate_readd_guard, forget_memory_fact,
     format_monthly_journal_lines, format_readd_archive_update, format_tidy_up_topic_file,
     is_valid_iso_date, parse_tidy_up_reply, recently_removed_from_history, tag_memory_changes,
-    validate_tidy_up_against_live, validate_tidy_up_draft,
+    validate_tidy_up_against_live, validate_tidy_up_draft_with_options,
 };
 use orca_core::bot_preamble::{
     BOT_MEMORY_TOPICS_KEPT_BYTES, BOT_MEMORY_TOPICS_MAX_FILES, BotMemoryDeltaTracker,
@@ -138,6 +138,7 @@ pub struct TidyUpPromptInput {
 pub enum TidyUpDraftResponse {
     RawReply(String),
     Draft(TidyUpDraft),
+    StructuredDraft(TidyUpDraft),
 }
 
 /// Output returned by a `TidyUpDraftProvider`.
@@ -677,15 +678,16 @@ impl BotMemoryService {
             }
         };
 
-        let draft = match provider_out.response {
+        let (draft, allow_new_topic_lines) = match provider_out.response {
             TidyUpDraftResponse::RawReply(raw) => match parse_tidy_up_reply(&raw) {
-                Ok(d) => d,
+                Ok(d) => (d, false),
                 Err(err) => {
                     self.record_tidy_up_failure(&bot.id, &mut state, &err.to_string())?;
                     return Err(OrcaBotsError::TidyUp(err));
                 }
             },
-            TidyUpDraftResponse::Draft(d) => d,
+            TidyUpDraftResponse::Draft(d) => (d, false),
+            TidyUpDraftResponse::StructuredDraft(d) => (d, true),
         };
 
         let ctx = TidyUpValidationContext {
@@ -699,7 +701,7 @@ impl BotMemoryService {
             history_row_id: Uuid::new_v4().to_string(),
         };
 
-        let plan = match validate_tidy_up_draft(&ctx, &draft) {
+        let plan = match validate_tidy_up_draft_with_options(&ctx, &draft, allow_new_topic_lines) {
             Ok(p) => p,
             Err(err) => {
                 self.record_tidy_up_failure(&bot.id, &mut state, &err.to_string())?;

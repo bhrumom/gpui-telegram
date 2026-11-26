@@ -12,7 +12,7 @@ use orca_bots::OrcaBotsFacade;
 use orca_core::LOCAL_EXECUTION_HOST_ID;
 use orca_core::orchestration_protocol::{RpcRequestEnvelope, RpcResponseEnvelope};
 use orca_core::workspace_layout::WorkspaceLayoutModel;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::accounts_usage::{AccountHomeManager, UsageRosterManager};
@@ -23,14 +23,15 @@ use crate::diff_review::{PersistentDiffReviewStore, TasksHubStore};
 use crate::hibernation::HibernationController;
 use crate::orchestration_engine::OrchestrationEngine;
 use crate::plugin_host::{PluginHostV2, SkillRecoveryReport, TransactionalSkillInstaller};
-use crate::ports_proxy::ListeningPortScanner;
+use crate::ports_proxy::{ListeningPortScanner, LocalhostWorktreeLabelProxy};
 use crate::profile_state::{
     InMemoryKeyringProvider, KeyringMasterKeyProvider, ProfileStateAuthority,
     ProtectedSecretPersistence,
 };
 use crate::pty_multiplex::{MultiplexConfig, PtyMultiplexController};
 use crate::rpc_dispatcher::{
-    DEFAULT_RPC_DEDUP_CAPACITY, E2eeV2SessionManager, RpcSubsystemHandles, UnifiedRpcDispatcher,
+    DEFAULT_RPC_DEDUP_CAPACITY, E2eeV2SessionManager, RegisteredWorktreePort, RpcSubsystemHandles,
+    UnifiedRpcDispatcher,
 };
 use crate::system_services::{
     ComputerUseService, EphemeralVmService, MobileEmulatorService, ShareableArtifactStore,
@@ -220,6 +221,17 @@ impl OrcaIdeFacade {
             watchdog,
             e2ee,
             layouts,
+            label_proxy: Arc::new(tokio::sync::OnceCell::new()),
+            registered_ports: Arc::new(RwLock::new(Vec::new())),
+            hook_server: Arc::new(tokio::sync::OnceCell::new()),
+            hook_endpoint_dir: config.data_dir.join("hook_server"),
+            mux_streams: Arc::new(RwLock::new(BTreeMap::new())),
+            hibernated_tabs: Arc::new(RwLock::new(BTreeMap::new())),
+            snapshot_writers: Arc::new(Mutex::new(BTreeMap::new())),
+            browser_tabs: Arc::new(RwLock::new(BTreeMap::new())),
+            browser_profiles: Arc::new(RwLock::new(BTreeMap::new())),
+            secrets: secrets.clone(),
+            closed_tab_tombstones: Arc::new(RwLock::new(BTreeMap::new())),
             bots,
         });
         let rpc_dispatcher = UnifiedRpcDispatcher::new(handles.clone(), config.rpc_dedup_capacity);
@@ -269,6 +281,18 @@ impl OrcaIdeFacade {
 
     pub fn port_scanner(&self) -> &ListeningPortScanner {
         &self.handles.port_scanner
+    }
+
+    pub fn label_proxy_port(&self) -> Option<u16> {
+        self.handles.label_proxy.get().map(|p| p.port())
+    }
+
+    pub async fn ensure_label_proxy(&self) -> Result<Arc<LocalhostWorktreeLabelProxy>> {
+        self.handles.ensure_label_proxy().await
+    }
+
+    pub fn registered_worktree_ports(&self) -> Vec<RegisteredWorktreePort> {
+        self.handles.registered_ports.read().clone()
     }
 
     pub fn pty(&self) -> &PtyMultiplexController {
@@ -358,6 +382,18 @@ impl OrcaIdeFacade {
     /// Dispatches a Unified Runtime RPC v3 request across all `orca_ide` and `orca_bots` namespaces.
     pub async fn dispatch_rpc(&self, req: RpcRequestEnvelope) -> RpcResponseEnvelope {
         self.rpc_dispatcher.dispatch(req).await
+    }
+
+    /// Dispatches a Unified Runtime RPC v3 request scoped to an authenticated caller profile
+    /// (e.g. `user:<id>`).
+    pub async fn dispatch_rpc_for_profile(
+        &self,
+        req: RpcRequestEnvelope,
+        caller_profile: &str,
+    ) -> RpcResponseEnvelope {
+        self.rpc_dispatcher
+            .dispatch_with_caller_profile(req, Some(caller_profile))
+            .await
     }
 
     /// Runs startup crash-recovery sweeps across worktree removals, transactional skill
@@ -763,4 +799,222 @@ mod tests {
 
         ide.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn sec01_hib02_sec03_rpc_regression_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bots = Arc::new(
+            orca_bots::OrcaBotsFacade::open(orca_bots::OrcaBotsConfig::isolated(
+                tmp.path().join("bots"),
+            ))
+            .unwrap(),
+        );
+        let ide = OrcaIdeFacade::open_with_bots(
+            OrcaIdeConfig::isolated(tmp.path().join("ide")),
+            bots.clone(),
+        )
+        .unwrap();
+
+        // SEC-01: User A creates artifact via RPC -> owned by user:100001; User B cannot update/unshare/delete/impersonate
+        let created = ide
+            .dispatch_rpc_for_profile(
+                rpc_req(
+                    "artifacts.share",
+                    json!({
+                        "title": "a.md",
+                        "content": "# User A",
+                        "user_confirmed_share": true
+                    }),
+                    3,
+                    CallerScope::Desktop,
+                    None,
+                ),
+                "user:100001",
+            )
+            .await;
+        assert!(created.ok, "user A publish failed: {created:?}");
+        let art = created.result.unwrap();
+        assert_eq!(art["profile_id"], "user:100001");
+        let art_id = art["artifact_id"].as_str().unwrap().to_string();
+
+        // User B impersonation on share, update, unshare, delete MUST all fail with permission_denied
+        for (method, params) in [
+            (
+                "artifacts.share",
+                json!({"title": "b.md", "content": "x", "user_confirmed_share": true, "profile_id": "user:100001"}),
+            ),
+            (
+                "artifacts.update",
+                json!({"artifact_id": art_id, "profile_id": "user:100001", "content": "pwned"}),
+            ),
+            (
+                "artifacts.update",
+                json!({"artifact_id": art_id, "content": "pwned"}),
+            ),
+            ("artifacts.unshare", json!({"artifact_id": art_id})),
+            ("artifacts.delete", json!({"artifact_id": art_id})),
+        ] {
+            let resp = ide
+                .dispatch_rpc_for_profile(
+                    rpc_req(method, params, 3, CallerScope::Desktop, None),
+                    "user:100002",
+                )
+                .await;
+            assert!(!resp.ok, "User B {method} must fail closed: {resp:?}");
+            assert_eq!(
+                resp.error.as_ref().map(|e| e.code.as_str()),
+                Some("permission_denied")
+            );
+        }
+
+        // HIB-02: Active unsettled orchestration dispatchId blocks hibernation.check & hibernation.sleep until completed
+        let run = ide
+            .orchestration()
+            .create_run(crate::orchestration_engine::CreateRunRequest {
+                run_id: None,
+                title: "hib02-run".into(),
+                coordinator_orca_session_id: None,
+                mailbox_is_local_only: true,
+                now_ms: Some(1_000),
+            })
+            .unwrap();
+        let task = ide
+            .orchestration()
+            .create_task(crate::orchestration_engine::CreateTaskRequest {
+                run_id: run.run_id.clone(),
+                task_id: None,
+                title: "unsettled".into(),
+                depends_on: vec![],
+                parent_id: None,
+                nesting_depth: None,
+                now_ms: Some(1_001),
+            })
+            .unwrap();
+        let started = ide
+            .orchestration()
+            .start_worker(crate::orchestration_engine::StartWorkerRequest {
+                run_id: run.run_id.clone(),
+                task_id: task.task_id.clone(),
+                dispatch_id: None,
+                host_id: None,
+                agent_id: "claude".into(),
+                worktree_id: None,
+                depth: None,
+                capability_manifest: None,
+                launch_token: None,
+                follow_up_of_dispatch_id: None,
+                keep_open: false,
+                tab_id: None,
+                pty_incarnation_id: None,
+                now_ms: Some(1_002),
+            })
+            .unwrap();
+        let disp_id = started.dispatch.dispatch_id.clone();
+
+        let hib_params = json!({
+            "sessionId": "hib02-sess",
+            "dispatchId": disp_id,
+            "state": "done",
+            "tabVisible": false,
+            "keystrokesSinceDone": 0,
+            "agent": "claude",
+            "idleMs": 1_800_000,
+            "windowMs": 1_800_000,
+            "mobileDriverActive": false,
+            "unsettledDispatchCount": 0,
+            "liveSubagentCount": 0
+        });
+        let chk = ide
+            .dispatch_rpc(rpc_req("hibernation.check", hib_params.clone(), 3, CallerScope::Desktop, None))
+            .await;
+        assert!(chk.ok);
+        assert_eq!(chk.result.as_ref().unwrap()["eligible"], false);
+        assert!(
+            chk.result.as_ref().unwrap()["failedChecks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "no_unsettled_dispatches")
+        );
+        let slp = ide
+            .dispatch_rpc(rpc_req("hibernation.sleep", hib_params.clone(), 3, CallerScope::Desktop, None))
+            .await;
+        assert!(!slp.ok);
+        assert_eq!(
+            slp.error.as_ref().map(|e| e.code.as_str()),
+            Some("hibernation_blocked")
+        );
+
+        // Settle the worker -> hibernation.check now eligible=true
+        ide.orchestration()
+            .complete_worker(crate::orchestration_engine::CompleteWorkerRequest {
+                dispatch_id: disp_id,
+                expected_generation: started.dispatch.generation,
+                succeeded: true,
+                exit_code: Some(0),
+                transcript_text: Some("done".into()),
+                keep_open: false,
+                setup_failed: false,
+                now_ms: Some(1_003),
+            })
+            .unwrap();
+        let chk_after = ide
+            .dispatch_rpc(rpc_req("hibernation.check", hib_params, 3, CallerScope::Desktop, None))
+            .await;
+        assert!(chk_after.ok);
+        assert_eq!(chk_after.result.as_ref().unwrap()["eligible"], true);
+
+        // SEC-03: webhooks.calls RPC MUST omit spoolPath, url, secret, raw body/headers
+        let bot = bots
+            .controller()
+            .create_bot(orca_bots::CreateBotRequest {
+                name: Some("Sec03Bot".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (hook, _) = bots
+            .webhook_engine()
+            .create_hook(orca_bots::CreateWebhookRequest {
+                bot_id: bot.id.clone(),
+                automation_id: "auto-1".into(),
+                adapter: orca_core::triggers_webhooks::WebhookAdapterId::Standard,
+                filters: Default::default(),
+                hourly_cap: None,
+                grace_minutes: None,
+                require_signature: false,
+                now_ms: 2_000,
+            })
+            .unwrap();
+        let ingested = bots
+            .webhook_engine()
+            .ingest_call(orca_bots::IngestWebhookCallRequest {
+                hook_id: hook.hook_id.clone(),
+                headers: BTreeMap::from([("x-secret-hdr".into(), "HDR_SENTINEL".into())]),
+                raw_body: br#"{"secret":"BODY_SENTINEL"}"#.to_vec(),
+                delivery_epoch: None,
+                idempotency_key: None,
+                now_ms: 2_001,
+            })
+            .unwrap();
+        let call_rpc = ide
+            .dispatch_rpc(rpc_req(
+                "webhooks.calls",
+                json!({ "call_id": ingested.call_id }),
+                3,
+                CallerScope::Desktop,
+                None,
+            ))
+            .await;
+        assert!(call_rpc.ok, "webhooks.calls failed: {call_rpc:?}");
+        let serialized = serde_json::to_string(&call_rpc.result.unwrap()).unwrap();
+        assert!(!serialized.contains("spoolPath"));
+        assert!(!serialized.contains("spool_path"));
+        assert!(!serialized.contains("webhooks_spool"));
+        assert!(!serialized.contains("BODY_SENTINEL"));
+        assert!(!serialized.contains("HDR_SENTINEL"));
+
+        ide.shutdown().await.unwrap();
+    }
 }
+

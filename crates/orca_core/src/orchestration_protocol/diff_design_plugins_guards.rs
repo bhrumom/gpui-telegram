@@ -393,8 +393,12 @@ impl PluginTier {
     }
 
     pub const fn requires_approval(self) -> bool {
-        !matches!(self, Self::Data)
+        matches!(self, Self::TrustedWorker)
     }
+}
+
+const fn default_hook_timeout_ms() -> u32 {
+    PLUGIN_ACTION_FALLBACK_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -407,7 +411,9 @@ pub enum PluginHookErrorPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginHookSpec {
     pub event: String,
+    #[serde(alias = "onError")]
     pub on_error: PluginHookErrorPolicy,
+    #[serde(default = "default_hook_timeout_ms", alias = "timeoutMs")]
     pub timeout_ms: u32,
 }
 
@@ -419,7 +425,7 @@ pub struct PluginManifestV2 {
     pub version: String,
     pub schema_version: u32,
     pub tier: PluginTier,
-    #[serde(default)]
+    #[serde(default, alias = "capabilities")]
     pub permissions: Vec<String>,
     #[serde(default)]
     pub tools: Vec<String>,

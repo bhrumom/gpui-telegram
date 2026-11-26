@@ -53,9 +53,25 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
+
+fn shared_client_runtime() -> Arc<Runtime> {
+    static CLIENT_RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    CLIENT_RT
+        .get_or_init(|| {
+            Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_name("gpui-tokio-client")
+                    .enable_all()
+                    .build()
+                    .expect("Failed to initialize shared client Tokio runtime"),
+            )
+        })
+        .clone()
+}
 
 pub struct TelegramClient {
     pub config: ClientConfig,
@@ -94,14 +110,7 @@ impl TelegramClient {
     }
 
     fn try_with_store(config: ClientConfig, local_store: LocalStore) -> Result<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("gpui-tokio-client")
-                .enable_all()
-                .build()
-                .expect("Failed to initialize client Tokio runtime"),
-        );
+        let runtime = shared_client_runtime();
 
         let tailnet_identity = if let Some(dir) = local_store.cache_dir() {
             TailnetIdentity::load_or_create(&dir)

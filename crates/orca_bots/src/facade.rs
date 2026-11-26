@@ -1,10 +1,13 @@
 //! Unified `Send + Sync` runtime facade (`OrcaBotsFacade`) orchestrating all `orca_bots`
 //! subsystems for M4 (Server / CLI / Telegram fusion) and M5 (GPUI Desktop).
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use orca_core::bot_ecosystem::{
     BotChatNode, BotImportCandidate, HandOverOutcome, NativeChatBotCard, UsageLimitContinue,
 };
@@ -14,6 +17,7 @@ use orca_core::bot_items::{
 use orca_core::bot_memory::JournalCloseAttribution;
 use orca_core::bot_types::OrcaBotRecord;
 use orca_core::{BotErrorCode, LOCAL_EXECUTION_HOST_ID};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::connectors_triggers::{
@@ -30,11 +34,69 @@ use crate::group_runtime::BotGroupRuntime;
 use crate::home_store::{BotHomeStore, WorktreeReleaseBotHome};
 use crate::items_store::{BotItemsStore, ItemCloseJournalTarget};
 use crate::look_around::{LookAroundEngine, UpNextStore};
-use crate::memory_service::BotMemoryService;
-use crate::shared_mcp::SharedMcpPool;
-use crate::tool_oauth::{BotToolOAuth, OAuthSecurityPolicy};
-use crate::tool_relay::{BotToolRelay, BotToolRelayConfig};
+use crate::memory_service::{BotMemoryService, BotTurnMemorySync, TurnMemorySyncResult};
+use crate::shared_mcp::{SharedMcpPool, SharedMcpServerConfig};
+use crate::tool_oauth::{BotToolOAuth, OAuthProviderConfig, OAuthSecurityPolicy};
+use crate::tool_relay::{BotRelayGrant, BotToolRelay, BotToolRelayConfig};
 use crate::{OrcaBotsError, Result};
+
+/// Host-level MCP server registry entry shared across F08 (`SharedMcpPool` + loopback relay)
+/// and F19 (`mcpServers.sync` agent config sync), supporting both `stdio` and `streamable-http`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMcpServerRecord {
+    pub name: String,
+    #[serde(default = "default_mcp_transport")]
+    pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+}
+
+fn default_mcp_transport() -> String {
+    "stdio".to_string()
+}
+
+impl HostMcpServerRecord {
+    /// Converts this record into a `SharedMcpServerConfig` when it represents a `stdio` server.
+    pub fn as_shared_stdio_config(&self) -> Option<SharedMcpServerConfig> {
+        let is_stdio = self.transport.trim().is_empty()
+            || self.transport.eq_ignore_ascii_case("stdio");
+        let cmd = self.command.as_deref()?.trim();
+        if !is_stdio || cmd.is_empty() {
+            return None;
+        }
+        Some(SharedMcpServerConfig {
+            command: cmd.to_string(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            cwd: self.cwd.clone(),
+        })
+    }
+}
+
+/// Host-side metadata for a per-bot registered tool (never stores secrets on bot disk).
+#[derive(Debug, Clone)]
+pub struct RegisteredBotTool {
+    pub bot_id: String,
+    pub name: String,
+    pub credential_id: String,
+    pub transport: String,
+    pub upstream_url: String,
+    pub oauth_issuer: Option<String>,
+    pub oauth_allow_loopback: bool,
+    pub oauth_provider: Option<OAuthProviderConfig>,
+}
 
 /// Configuration for initializing [`OrcaBotsFacade`].
 #[derive(Debug, Clone)]
@@ -94,6 +156,11 @@ pub struct OrcaBotsFacade {
     team_share: BotTeamShareEngine,
     import_engine: BotImportEngine,
     handover: WorkspaceHandoverCoordinator,
+    host_mcp_servers: StdMutex<BTreeMap<String, HostMcpServerRecord>>,
+    bot_tools: StdMutex<HashMap<(String, String), RegisteredBotTool>>,
+    bot_grants: StdMutex<HashMap<String, String>>,
+    delta_trackers: StdMutex<HashMap<(String, String), BotTurnMemorySync>>,
+    usage_limits: StdMutex<HashMap<String, UsageLimitContinue>>,
 }
 
 impl std::fmt::Debug for OrcaBotsFacade {
@@ -166,6 +233,11 @@ impl OrcaBotsFacade {
             team_share,
             import_engine,
             handover: WorkspaceHandoverCoordinator,
+            host_mcp_servers: StdMutex::new(BTreeMap::new()),
+            bot_tools: StdMutex::new(HashMap::new()),
+            bot_grants: StdMutex::new(HashMap::new()),
+            delta_trackers: StdMutex::new(HashMap::new()),
+            usage_limits: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -250,7 +322,7 @@ impl OrcaBotsFacade {
     }
 
     /// Starts (or returns the already-running) loopback `BotToolRelay` bound to `127.0.0.1:0`,
-    /// sharing this facade's `BotToolOAuth` manager.
+    /// sharing this facade's `BotToolOAuth` manager and `SharedMcpPool`.
     pub async fn start_tool_relay(&self) -> Result<Arc<BotToolRelay>> {
         let mut guard = self.tool_relay.lock().await;
         if let Some(ref relay) = *guard {
@@ -258,9 +330,17 @@ impl OrcaBotsFacade {
         }
         let cfg = BotToolRelayConfig {
             oauth: self.tool_oauth.clone(),
+            shared_mcp: Some(self.shared_mcp.clone()),
             ..Default::default()
         };
         let relay = Arc::new(BotToolRelay::start(cfg).await?);
+        if let Ok(servers) = self.host_mcp_servers.lock() {
+            for rec in servers.values() {
+                if let Some(stdio_cfg) = rec.as_shared_stdio_config() {
+                    let _ = relay.set_host_mcp_server(rec.name.clone(), stdio_cfg);
+                }
+            }
+        }
         *guard = Some(relay.clone());
         Ok(relay)
     }
@@ -268,6 +348,187 @@ impl OrcaBotsFacade {
     /// Returns the running loopback `BotToolRelay` if started.
     pub async fn tool_relay(&self) -> Option<Arc<BotToolRelay>> {
         self.tool_relay.lock().await.clone()
+    }
+
+    /// Registers or updates a host MCP server record (`stdio` or `streamable-http`),
+    /// propagating `stdio` servers to the live loopback relay if started.
+    pub async fn upsert_host_mcp_server(&self, record: HostMcpServerRecord) -> Result<HostMcpServerRecord> {
+        let name = record.name.trim().to_string();
+        if name.is_empty() {
+            return Err(OrcaBotsError::bot(
+                BotErrorCode::InvalidArgument,
+                "MCP server name must be non-empty.",
+            ));
+        }
+        if let Some(stdio_cfg) = record.as_shared_stdio_config() {
+            stdio_cfg.validate()?;
+            if let Some(relay) = self.tool_relay.lock().await.clone() {
+                relay.set_host_mcp_server(name.clone(), stdio_cfg)?;
+            }
+        } else {
+            let url = record.url.as_deref().map(str::trim).unwrap_or("");
+            if url.is_empty() {
+                return Err(OrcaBotsError::bot(
+                    BotErrorCode::InvalidArgument,
+                    "MCP server requires either stdio 'command' or streamable-http 'url'.",
+                ));
+            }
+        }
+        let mut map = self.host_mcp_servers.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "host_mcp_servers lock poisoned.")
+        })?;
+        map.insert(name, record.clone());
+        Ok(record)
+    }
+
+    /// Removes a host MCP server by `name`, stopping any pooled stdio child process.
+    pub async fn remove_host_mcp_server(&self, name: &str) -> Result<bool> {
+        let removed = {
+            let mut map = self.host_mcp_servers.lock().map_err(|_| {
+                OrcaBotsError::bot(BotErrorCode::InvalidArgument, "host_mcp_servers lock poisoned.")
+            })?;
+            map.remove(name).is_some()
+        };
+        if let Some(relay) = self.tool_relay.lock().await.clone() {
+            let _ = relay.remove_host_mcp_server(name);
+        }
+        let _ = self.shared_mcp.shutdown_server(name).await;
+        Ok(removed)
+    }
+
+    /// Lists all registered host MCP server records (`stdio` + `streamable-http`).
+    pub fn list_host_mcp_servers(&self) -> Result<Vec<HostMcpServerRecord>> {
+        let map = self.host_mcp_servers.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "host_mcp_servers lock poisoned.")
+        })?;
+        Ok(map.values().cloned().collect())
+    }
+
+    /// Records host-side metadata for a per-bot registered tool.
+    pub fn record_bot_tool(&self, tool: RegisteredBotTool) -> Result<()> {
+        let mut map = self.bot_tools.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "bot_tools lock poisoned.")
+        })?;
+        map.insert((tool.bot_id.clone(), tool.name.clone()), tool);
+        Ok(())
+    }
+
+    /// Fetches host-side metadata for a per-bot registered tool.
+    pub fn get_bot_tool(&self, bot_id: &str, tool_name: &str) -> Result<Option<RegisteredBotTool>> {
+        let map = self.bot_tools.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "bot_tools lock poisoned.")
+        })?;
+        Ok(map.get(&(bot_id.to_string(), tool_name.to_string())).cloned())
+    }
+
+    /// Lists all registered tool names for `bot_id`.
+    pub fn list_bot_tools(&self, bot_id: &str) -> Result<Vec<RegisteredBotTool>> {
+        let map = self.bot_tools.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "bot_tools lock poisoned.")
+        })?;
+        Ok(map
+            .values()
+            .filter(|t| t.bot_id == bot_id)
+            .cloned()
+            .collect())
+    }
+
+    /// Issues (or refreshes) a CSPRNG loopback relay bearer grant for `bot`, syncing its
+    /// `allow_host_mcp_servers` bit directly from `bot.connectors.uses_host_mcp_servers()`.
+    pub async fn issue_bot_relay_grant(&self, bot: &OrcaBotRecord) -> Result<(Arc<BotToolRelay>, String)> {
+        let relay = self.start_tool_relay().await?;
+        let token = {
+            let mut grants = self.bot_grants.lock().map_err(|_| {
+                OrcaBotsError::bot(BotErrorCode::InvalidArgument, "bot_grants lock poisoned.")
+            })?;
+            if let Some(existing) = grants.get(&bot.id) {
+                existing.clone()
+            } else {
+                let mut raw = [0u8; 24];
+                getrandom::getrandom(&mut raw).map_err(|e| {
+                    OrcaBotsError::bot(BotErrorCode::InvalidArgument, format!("CSPRNG failed: {e}"))
+                })?;
+                let tok = format!("orca_grant_{}", URL_SAFE_NO_PAD.encode(raw));
+                grants.insert(bot.id.clone(), tok.clone());
+                tok
+            }
+        };
+        let mut allowed_folders = HashSet::new();
+        allowed_folders.insert(bot.folder.as_str().to_string());
+        relay.register_bot_grant(BotRelayGrant {
+            bot_id: bot.id.clone(),
+            owner_id: "local-owner".to_string(),
+            token: token.clone(),
+            folder: bot.folder.as_str().to_string(),
+            allowed_folders,
+            allowed_tools: HashSet::new(),
+            allow_host_mcp_servers: bot.connectors.uses_host_mcp_servers(),
+        })?;
+        Ok((relay, token))
+    }
+
+    /// Toggles `host_mcp_servers` via `BotController::set_host_mcp_servers` and updates any
+    /// active relay grant immediately.
+    pub async fn set_bot_host_mcp_servers(
+        &self,
+        bot_id: &str,
+        enabled: bool,
+    ) -> Result<OrcaBotRecord> {
+        let updated = self.controller.set_host_mcp_servers(bot_id, enabled).await?;
+        if let Some(relay) = self.tool_relay.lock().await.clone() {
+            let _ = relay.set_bot_host_mcp_access(bot_id, enabled);
+        }
+        Ok(updated)
+    }
+
+    /// Computes and advances mid-session SHA-256 delta sync for `(bot.id, session_id)`.
+    /// The first call for a session captures the baseline and returns an empty delta.
+    pub fn sync_session_memory_delta(
+        &self,
+        bot: &OrcaBotRecord,
+        session_id: &str,
+        cli_cmd: Option<&str>,
+    ) -> Result<Option<TurnMemorySyncResult>> {
+        let mut map = self.delta_trackers.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "delta_trackers lock poisoned.")
+        })?;
+        let key = (bot.id.clone(), session_id.to_string());
+        if let Some(tracker) = map.get_mut(&key) {
+            let delta = tracker.sync_turn_memory_delta(&self.home_store, bot, cli_cmd)?;
+            Ok(Some(delta))
+        } else {
+            let tracker = BotTurnMemorySync::capture(&self.home_store, bot, cli_cmd)?;
+            map.insert(key, tracker);
+            Ok(None)
+        }
+    }
+
+    /// Stores or clears per-bot usage-limit auto-continue state.
+    pub fn set_usage_limit_continue(
+        &self,
+        bot_id: &str,
+        limit: Option<UsageLimitContinue>,
+    ) -> Result<()> {
+        let mut map = self.usage_limits.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "usage_limits lock poisoned.")
+        })?;
+        match limit {
+            Some(v) => {
+                map.insert(bot_id.to_string(), v);
+            }
+            None => {
+                map.remove(bot_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetches per-bot usage-limit auto-continue state if configured.
+    pub fn get_usage_limit_continue(&self, bot_id: &str) -> Result<Option<UsageLimitContinue>> {
+        let map = self.usage_limits.lock().map_err(|_| {
+            OrcaBotsError::bot(BotErrorCode::InvalidArgument, "usage_limits lock poisoned.")
+        })?;
+        Ok(map.get(bot_id).cloned())
     }
 
     /// Creates a bot via `BotController` and registers its home folder in `BotItemsStore`
@@ -644,6 +905,7 @@ mod tests {
                 folder: bot.folder.as_str().to_string(),
                 allowed_folders: folders,
                 allowed_tools: HashSet::new(),
+                allow_host_mcp_servers: false,
             })
             .expect("register grant");
 

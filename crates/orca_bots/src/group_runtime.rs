@@ -285,6 +285,15 @@ pub struct CreateBotGroupRequest {
     pub remote_members: Vec<RemoteBotMember>,
 }
 
+/// Request to update a multi-bot group's name, reply mode, local members, or remote members.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateBotGroupRequest {
+    pub name: Option<String>,
+    pub reply_mode: Option<BotGroupReplyMode>,
+    pub member_bot_ids: Option<Vec<String>>,
+    pub remote_members: Option<Vec<RemoteBotMember>>,
+}
+
 /// Request to post a message into a group room or sub-thread.
 #[derive(Debug, Clone)]
 pub struct PostGroupMessageRequest {
@@ -773,6 +782,60 @@ impl BotGroupRuntime {
         let conn = self.lock_conn()?;
         let mut group = Self::require_group_locked(&conn, group_id)?;
         group.reply_mode = reply_mode;
+        group.updated_at_ms = now_epoch_ms();
+        Self::persist_group_locked(&conn, &group)?;
+        Ok(group)
+    }
+
+    /// Updates a group's name, reply mode, local members (archiving removed members'
+    /// root + thread sessions into `former_session_ids`), and/or remote members.
+    pub fn update_group(
+        &self,
+        group_id: &str,
+        req: UpdateBotGroupRequest,
+    ) -> Result<BotGroup> {
+        let conn = self.lock_conn()?;
+        let mut group = Self::require_group_locked(&conn, group_id)?;
+        if let Some(name) = req.name {
+            group.name = name.trim().to_string();
+        }
+        if let Some(next_members) = req.member_bot_ids {
+            let next_set: HashSet<&str> = next_members.iter().map(String::as_str).collect();
+            let to_remove: Vec<String> = group
+                .member_bot_ids
+                .iter()
+                .filter(|id| !next_set.contains(id.as_str()))
+                .cloned()
+                .collect();
+            for old_id in to_remove {
+                group.remove_member(&old_id);
+            }
+            for bot_id in &next_members {
+                if !group.member_bot_ids.iter().any(|m| m == bot_id) {
+                    group.member_bot_ids.push(bot_id.clone());
+                }
+                group
+                    .session_ids
+                    .entry(bot_id.clone())
+                    .or_insert_with(|| format!("grp-sess-{}", Uuid::new_v4()));
+                for thread in &mut group.threads {
+                    thread
+                        .session_ids
+                        .entry(bot_id.clone())
+                        .or_insert_with(|| format!("grp-thr-sess-{}", Uuid::new_v4()));
+                }
+            }
+            group.member_bot_ids = next_members;
+        }
+        if let Some(reply_mode) = req.reply_mode {
+            group.reply_mode = reply_mode;
+        }
+        if let Some(remote_members) = req.remote_members {
+            for rm in &remote_members {
+                rm.validate()?;
+            }
+            group.remote_members = remote_members;
+        }
         group.updated_at_ms = now_epoch_ms();
         Self::persist_group_locked(&conn, &group)?;
         Ok(group)
@@ -1424,6 +1487,42 @@ impl BotGroupRuntime {
              ORDER BY created_at_ms ASC",
         )?;
         let mut rows = stmt.query(params![bot_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let payload_raw: String = row.get(7)?;
+            let payload: JsonValue = serde_json::from_str(&payload_raw)?;
+            let text = payload
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string();
+            out.push(GroupPendingMail {
+                id: row.get(0)?,
+                group_id: row.get(1)?,
+                thread_id: row.get(2)?,
+                message_id: row.get(3)?,
+                bot_id: row.get(4)?,
+                session_id: row.get(5)?,
+                reason: row.get(6)?,
+                text,
+                created_at_ms: row.get(8)?,
+                delivered_at_ms: row.get(9)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Lists all undelivered mail rows queued in `bot_group_pending` for `group_id`.
+    pub fn list_pending_for_group(&self, group_id: &str) -> Result<Vec<GroupPendingMail>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, group_id, thread_id, message_id, bot_id, session_id, reason,
+                    payload_json, created_at_ms, delivered_at_ms
+             FROM bot_group_pending
+             WHERE group_id = ?1 AND delivered_at_ms IS NULL
+             ORDER BY created_at_ms ASC",
+        )?;
+        let mut rows = stmt.query(params![group_id])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let payload_raw: String = row.get(7)?;

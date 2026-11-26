@@ -18,11 +18,15 @@ use gpui_telegram_proto::orca_contracts::{
     OrcaWebhookCreateRequest, OrcaWebhookPatchRequest,
 };
 use orca_bots::{
-    CreateAutomationRequest, CreateWebhookRequest, IngestWebhookCallRequest, WakeFrameKind,
+    BotAutomationRecord, CreateAutomationRequest, CreateWebhookRequest, IngestWebhookCallRequest,
+    WakeFrameKind, WebhookCallRecord, WebhookCliView,
 };
 use orca_core::triggers_webhooks::{
     validate_automation_event_triggers, AutomationBotResultsTo, AutomationBotRunsIn,
-    AutomationBotTarget, WatchPrStepAction, WatchPrStopReason, WatchPrWakeOutcome,
+    AutomationBotTarget, AutomationConnectorEventTrigger, AutomationEventKind,
+    AutomationEventSource, AutomationEventTrigger, AutomationGoogleTrigger,
+    AutomationWebhookTrigger, GitHubEventKind, OneShotWait, WatchPrStepAction, WatchPrStopReason,
+    WatchPrWakeOutcome, WebhookFilters, WebhookWhereClause, WebhookWhereOp,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -48,8 +52,146 @@ pub struct ListWebhooksQuery {
     pub bot_id: Option<String>,
 }
 
+/// Strictly secret-free wire view of a webhook (`WebhookCliView` + `"id"`).
+/// STRUCTURAL INVARIANT: NEVER includes `url`, `ingestUrl`, `secret`, or `signingSecret`.
+fn webhook_cli_view_to_json(view: &WebhookCliView) -> Value {
+    let mut val = serde_json::to_value(view).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".into(), json!(view.hook_id));
+    }
+    val
+}
+
+fn normalize_webhook_filter_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("body.")
+        || trimmed.starts_with("headers.")
+        || trimmed == "body"
+        || trimmed == "headers"
+        || trimmed.contains("__proto__")
+        || trimmed.contains("prototype")
+        || trimmed.contains("constructor")
+    {
+        trimmed.to_string()
+    } else {
+        format!("body.{trimmed}")
+    }
+}
+
+fn value_to_filter_strings(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(s) => vec![s.clone()],
+        Value::Bool(b) => vec![b.to_string()],
+        Value::Number(n) => vec![n.to_string()],
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(s) => Some(s.clone()),
+                Value::Bool(b) => Some(b.to_string()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_flexible_webhook_filters(val: &Value) -> Result<WebhookFilters, Response> {
+    if val.is_null() {
+        return Ok(WebhookFilters::default());
+    }
+    let Some(obj) = val.as_object() else {
+        return Err(orca_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Webhook filters/rules must be a JSON object.",
+        ));
+    };
+    let mut where_clauses = Vec::new();
+    if let Some(arr) = obj.get("where").and_then(Value::as_array) {
+        for item in arr {
+            let Some(cobj) = item.as_object() else {
+                return Err(orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "Each webhook 'where' clause must be an object.",
+                ));
+            };
+            let raw_path = cobj
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let path = normalize_webhook_filter_path(raw_path);
+            let raw_op = cobj
+                .get("op")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let op = match raw_op.trim() {
+                "=" | "==" | "eq" => WebhookWhereOp::Eq,
+                "!=" | "ne" | "neq" => WebhookWhereOp::NotEq,
+                "in" => WebhookWhereOp::In,
+                "contains" => WebhookWhereOp::Contains,
+                "exists" => WebhookWhereOp::Exists,
+                "!exists" | "not_exists" => WebhookWhereOp::NotExists,
+                other => {
+                    return Err(orca_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        format!("Unknown webhook filter operator '{other}'."),
+                    ));
+                }
+            };
+            let values = match op {
+                WebhookWhereOp::Exists | WebhookWhereOp::NotExists => Vec::new(),
+                _ => {
+                    if let Some(vs) = cobj.get("values") {
+                        value_to_filter_strings(vs)
+                    } else if let Some(v) = cobj.get("value") {
+                        value_to_filter_strings(v)
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+            where_clauses.push(WebhookWhereClause { path, op, values });
+        }
+    }
+    let pick = obj
+        .get("pick")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(normalize_webhook_filter_path)
+                .collect()
+        })
+        .unwrap_or_default();
+    let text_contains = obj
+        .get("textContains")
+        .or_else(|| obj.get("text_contains"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let subject_from = obj
+        .get("subjectFrom")
+        .or_else(|| obj.get("subject_from"))
+        .and_then(Value::as_str)
+        .map(normalize_webhook_filter_path);
+    let subject = obj
+        .get("subject")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(WebhookFilters {
+        where_clauses,
+        text_contains,
+        subject_from,
+        subject,
+        pick,
+    })
+}
+
 /// `GET /api/v1/orca/webhooks` — returns strictly secret-free `Vec<WebhookCliView>`.
-/// NEVER exposes `ingest_url` or `secret_key`.
+/// NEVER exposes `url`, `ingestUrl`, `secret`, or `signingSecret`.
 pub async fn list_webhooks(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
@@ -61,16 +203,19 @@ pub async fn list_webhooks(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     match state.orca_bots.webhook_engine().list_cli_views(bot_id) {
-        Ok(views) => Json(views).into_response(),
+        Ok(views) => {
+            let wire: Vec<Value> = views.iter().map(webhook_cli_view_to_json).collect();
+            Json(wire).into_response()
+        }
         Err(err) => map_bots_err(err),
     }
 }
 
 /// `POST /api/v1/orca/webhooks` — creates a host-managed webhook (`201 Created`).
 ///
-/// SECURITY INVARIANT (ZERO-LEAK): default response returns ONLY `WebhookCliView`
-/// (NEVER `ingest_url` or `secret_key`). Only includes `copy_card` when the caller
-/// explicitly opts in via UI-only `include_copy_card: true`.
+/// Returns the one-time `url`/`ingestUrl` and `secret`/`signingSecret` ONLY on creation;
+/// subsequent `GET /webhooks`, `GET /webhooks/{id}`, `GET /webhooks/{id}/calls`, and ALL
+/// `fabushi webhooks` CLI commands strictly omit them.
 pub async fn create_webhook(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
@@ -80,30 +225,45 @@ pub async fn create_webhook(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let filters = match req.filters.as_ref() {
+        Some(v) => match parse_flexible_webhook_filters(v) {
+            Ok(f) => f,
+            Err(resp) => return resp,
+        },
+        None => WebhookFilters::default(),
+    };
+    let automation_id = req
+        .automation_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("auto_{}", uuid::Uuid::new_v4().simple()));
     let create_req = CreateWebhookRequest {
         bot_id: req.bot_id,
-        automation_id: req.automation_id,
+        automation_id,
         adapter: req.adapter.unwrap_or_default(),
-        filters: req.filters.unwrap_or_default(),
+        filters,
         hourly_cap: req.hourly_cap,
         grace_minutes: req.grace_minutes,
         require_signature: req.require_signature.unwrap_or(false),
         now_ms: req.now_ms.unwrap_or_else(now_epoch_ms),
     };
-    match state.orca_bots.webhook_engine().create_hook(create_req) {
+    match state
+        .orca_bots
+        .webhook_engine()
+        .create_hook_named(create_req, req.name)
+    {
         Ok((cli_view, copy_card)) => {
-            if req.include_copy_card {
-                (
-                    StatusCode::CREATED,
-                    Json(json!({
-                        "webhook": cli_view,
-                        "copy_card": copy_card,
-                    })),
-                )
-                    .into_response()
-            } else {
-                (StatusCode::CREATED, Json(cli_view)).into_response()
+            let mut created = webhook_cli_view_to_json(&cli_view);
+            if let Some(obj) = created.as_object_mut() {
+                obj.insert("url".into(), json!(copy_card.ingest_url));
+                obj.insert("ingestUrl".into(), json!(copy_card.ingest_url));
+                obj.insert("secret".into(), json!(copy_card.secret_key));
+                obj.insert("signingSecret".into(), json!(copy_card.secret_key));
+                if req.include_copy_card {
+                    obj.insert("webhook".into(), webhook_cli_view_to_json(&cli_view));
+                    obj.insert("copy_card".into(), json!(copy_card));
+                }
             }
+            (StatusCode::CREATED, Json(created)).into_response()
         }
         Err(err) => map_bots_err(err),
     }
@@ -116,7 +276,7 @@ pub async fn show_webhook(
     Path(hook_id): Path<String>,
 ) -> Response {
     match state.orca_bots.webhook_engine().show_cli_view(&hook_id) {
-        Ok(view) => Json(view).into_response(),
+        Ok(view) => Json(webhook_cli_view_to_json(&view)).into_response(),
         Err(err) => map_bots_err(err),
     }
 }
@@ -134,7 +294,11 @@ pub async fn patch_webhook(
     };
     let engine = state.orca_bots.webhook_engine();
     let mut latest = None;
-    if let Some(filters) = req.filters {
+    if let Some(ref fval) = req.filters {
+        let filters = match parse_flexible_webhook_filters(fval) {
+            Ok(f) => f,
+            Err(resp) => return resp,
+        };
         match engine.update_hook_filters(&hook_id, filters) {
             Ok(view) => latest = Some(view),
             Err(err) => return map_bots_err(err),
@@ -147,9 +311,9 @@ pub async fn patch_webhook(
         }
     }
     match latest {
-        Some(view) => Json(view).into_response(),
+        Some(view) => Json(webhook_cli_view_to_json(&view)).into_response(),
         None => match engine.show_cli_view(&hook_id) {
-            Ok(view) => Json(view).into_response(),
+            Ok(view) => Json(webhook_cli_view_to_json(&view)).into_response(),
             Err(err) => map_bots_err(err),
         },
     }
@@ -280,6 +444,26 @@ pub struct WebhookCallsQuery {
     pub call_id: Option<String>,
 }
 
+fn webhook_call_to_wire_json(rec: &WebhookCallRecord) -> Value {
+    let state_str = if rec.filter_rejected {
+        "filtered"
+    } else {
+        rec.state.as_str()
+    };
+    json!({
+        "id": rec.call_id,
+        "callId": rec.call_id,
+        "hookId": rec.hook_id,
+        "botId": rec.bot_id,
+        "adapter": rec.adapter,
+        "epoch": rec.epoch,
+        "state": state_str,
+        "filterRejected": rec.filter_rejected,
+        "receivedAtMs": rec.received_at_ms,
+        "updatedAtMs": rec.updated_at_ms,
+    })
+}
+
 /// `GET /api/v1/orca/webhooks/{hook_id}/calls` — lists tracked calls for `hook_id`
 /// (or a single call when `?call_id=` is specified). NEVER exposes URL/secret/raw body.
 pub async fn list_webhook_calls(
@@ -300,7 +484,7 @@ pub async fn list_webhook_calls(
         .filter(|s| !s.is_empty())
     {
         return match engine.get_call(cid) {
-            Ok(rec) if rec.hook_id == hook_id => Json(rec).into_response(),
+            Ok(rec) if rec.hook_id == hook_id => Json(webhook_call_to_wire_json(&rec)).into_response(),
             Ok(_) => orca_err(
                 StatusCode::NOT_FOUND,
                 "not_found",
@@ -316,12 +500,217 @@ pub async fn list_webhook_calls(
         .get(&hook_id)
         .cloned()
         .unwrap_or_default();
-    Json(tracked).into_response()
+    let wire: Vec<Value> = tracked.iter().map(webhook_call_to_wire_json).collect();
+    Json(wire).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // 2. Automations & `watch-pr`
 // ---------------------------------------------------------------------------
+
+fn automation_to_wire_json(rec: &BotAutomationRecord) -> Value {
+    let local_only = rec.has_local_only_triggers();
+    let mut val = serde_json::to_value(rec).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("localOnly".into(), json!(local_only));
+        obj.insert(
+            "executionScope".into(),
+            json!(if local_only { "local" } else { "cloud" }),
+        );
+    }
+    val
+}
+
+fn parse_flexible_automation_trigger(
+    val: &Value,
+    idx: usize,
+) -> Result<AutomationEventTrigger, Response> {
+    if let Ok(t) = serde_json::from_value::<AutomationEventTrigger>(val.clone()) {
+        return Ok(t);
+    }
+    let Some(obj) = val.as_object() else {
+        return Err(orca_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Automation trigger must be a JSON object.",
+        ));
+    };
+    let src_str = obj
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let kind_str = obj
+        .get("kind")
+        .or_else(|| obj.get("event"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let source = AutomationEventSource::parse(src_str).ok_or_else(|| {
+        orca_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            format!("Unknown automation trigger source '{src_str}'."),
+        )
+    })?;
+    let trigger_id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("trg-{}-{}", source.as_str(), idx + 1));
+
+    match source {
+        AutomationEventSource::Slack
+        | AutomationEventSource::Github
+        | AutomationEventSource::Linear => {
+            let kind = AutomationEventKind::parse(src_str, kind_str).ok_or_else(|| {
+                orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    format!("Unknown event kind '{kind_str}' for source '{src_str}'."),
+                )
+            })?;
+            let str_vec = |k: &str| -> Vec<String> {
+                obj.get(k)
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let is_workflow_finished = matches!(
+                kind,
+                AutomationEventKind::Github(GitHubEventKind::WorkflowFinished)
+            );
+            let mut in_places = str_vec("in");
+            if is_workflow_finished && in_places.is_empty() && obj.get("in").is_none() {
+                in_places.push("github:1:1".to_string());
+            }
+            let run = match obj.get("run").and_then(Value::as_str) {
+                Some(r) => Some(r.to_owned()),
+                None if is_workflow_finished && obj.get("run").is_none() => Some("1".to_owned()),
+                None => None,
+            };
+            Ok(AutomationEventTrigger::Connector(
+                AutomationConnectorEventTrigger {
+                    id: trigger_id,
+                    kind,
+                    in_places,
+                    from: str_vec("from"),
+                    text_contains: obj
+                        .get("textContains")
+                        .or_else(|| obj.get("text_contains"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    subject: match obj.get("subject").and_then(Value::as_str) {
+                        Some(s) => Some(s.to_owned()),
+                        None if kind.is_pr_state_event() => Some("*".to_owned()),
+                        None => None,
+                    },
+                    label: obj
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    run,
+                    on_owner_message: obj
+                        .get("onOwnerMessage")
+                        .or_else(|| obj.get("on_owner_message"))
+                        .and_then(Value::as_bool),
+                    from_owner: obj
+                        .get("fromOwner")
+                        .or_else(|| obj.get("from_owner"))
+                        .and_then(Value::as_bool),
+                    names: Default::default(),
+                },
+            ))
+        }
+        AutomationEventSource::Gmail => {
+            if !kind_str.is_empty() && AutomationEventKind::parse(src_str, kind_str).is_none() {
+                return Err(orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    format!("Unknown event kind '{kind_str}' for source 'gmail'."),
+                ));
+            }
+            Ok(AutomationEventTrigger::Google(AutomationGoogleTrigger::Gmail {
+                id: trigger_id,
+                account: obj
+                    .get("account")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                from: Vec::new(),
+                to: Vec::new(),
+                subject_contains: obj
+                    .get("subjectContains")
+                    .or_else(|| obj.get("subject_contains"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                label: obj
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            }))
+        }
+        AutomationEventSource::Calendar => {
+            if !kind_str.is_empty() && AutomationEventKind::parse(src_str, kind_str).is_none() {
+                return Err(orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    format!("Unknown event kind '{kind_str}' for source 'calendar'."),
+                ));
+            }
+            Ok(AutomationEventTrigger::Google(
+                AutomationGoogleTrigger::Calendar {
+                    id: trigger_id,
+                    account: obj
+                        .get("account")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    calendar: obj
+                        .get("calendar")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    minutes_before: obj
+                        .get("minutesBefore")
+                        .or_else(|| obj.get("minutes_before"))
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32)
+                        .unwrap_or(15),
+                },
+            ))
+        }
+        AutomationEventSource::Webhook => {
+            if !kind_str.is_empty()
+                && !matches!(kind_str, "call" | "webhook" | "received")
+                && AutomationEventKind::parse(src_str, kind_str).is_none()
+            {
+                return Err(orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    format!("Unknown event kind '{kind_str}' for source 'webhook'."),
+                ));
+            }
+            let hook_rule = if trigger_id.starts_with("wh-wh_") {
+                trigger_id
+            } else {
+                format!("wh-wh_{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
+            };
+            let filters = match obj.get("filters").or_else(|| obj.get("rules")) {
+                Some(fv) => parse_flexible_webhook_filters(fv)?,
+                None => WebhookFilters::default(),
+            };
+            Ok(AutomationEventTrigger::Webhook(AutomationWebhookTrigger {
+                id: hook_rule,
+                rev: 1,
+                filters,
+            }))
+        }
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListAutomationsQuery {
@@ -349,13 +738,17 @@ pub async fn list_automations(
                 if let Some(bid) = bot_id {
                     list.retain(|a| a.bot_target.bot_id == bid);
                 }
-                Json(list).into_response()
+                let wire: Vec<Value> = list.iter().map(automation_to_wire_json).collect();
+                Json(wire).into_response()
             }
             Err(err) => map_bots_err(err),
         }
     } else {
         match engine.list_automations(bot_id) {
-            Ok(list) => Json(list).into_response(),
+            Ok(list) => {
+                let wire: Vec<Value> = list.iter().map(automation_to_wire_json).collect();
+                Json(wire).into_response()
+            }
             Err(err) => map_bots_err(err),
         }
     }
@@ -371,6 +764,68 @@ pub async fn create_automation(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let mut triggers = Vec::new();
+    if let Some(ref single) = req.trigger {
+        match parse_flexible_automation_trigger(single, 0) {
+            Ok(t) => triggers.push(t),
+            Err(resp) => return resp,
+        }
+    }
+    for (idx, raw_t) in req.triggers.iter().enumerate() {
+        match parse_flexible_automation_trigger(raw_t, triggers.len() + idx) {
+            Ok(t) => triggers.push(t),
+            Err(resp) => return resp,
+        }
+    }
+
+    let resolved_runs_in = if let Some(ref ri) = req.runs_in {
+        if let Some(s) = ri.as_str() {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "new" => AutomationBotRunsIn::New,
+                "chat" => AutomationBotRunsIn::Chat {
+                    session_id: req
+                        .chat_session_id
+                        .clone()
+                        .filter(|x| !x.trim().is_empty())
+                        .unwrap_or_else(|| "home".to_string()),
+                    title: None,
+                    home_if_gone: None,
+                    to_conversation: None,
+                },
+                _ => AutomationBotRunsIn::New,
+            }
+        } else {
+            serde_json::from_value(ri.clone()).unwrap_or(AutomationBotRunsIn::New)
+        }
+    } else if let Some(sid) = req
+        .chat_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        AutomationBotRunsIn::Chat {
+            session_id: sid.to_string(),
+            title: None,
+            home_if_gone: None,
+            to_conversation: None,
+        }
+    } else {
+        AutomationBotRunsIn::New
+    };
+
+    let resolved_results_to = if let Some(ref rt) = req.results_to {
+        if let Some(s) = rt.as_str() {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "chat" => AutomationBotResultsTo::Chat,
+                _ => AutomationBotResultsTo::Chat,
+            }
+        } else {
+            serde_json::from_value(rt.clone()).unwrap_or(AutomationBotResultsTo::Chat)
+        }
+    } else {
+        AutomationBotResultsTo::Chat
+    };
+
     let bot_target = match req.bot_target {
         Some(mut bt) => {
             if bt.bot_id.trim().is_empty() {
@@ -380,21 +835,8 @@ pub async fn create_automation(
         }
         None => AutomationBotTarget {
             bot_id: req.bot_id,
-            runs_in: match req
-                .chat_session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                Some(sid) => AutomationBotRunsIn::Chat {
-                    session_id: sid.to_string(),
-                    title: None,
-                    home_if_gone: None,
-                    to_conversation: None,
-                },
-                None => AutomationBotRunsIn::New,
-            },
-            results_to: AutomationBotResultsTo::Chat,
+            runs_in: resolved_runs_in,
+            results_to: resolved_results_to,
             agent_setup: None,
             let_bot_react: None,
             precheck: None,
@@ -402,16 +844,56 @@ pub async fn create_automation(
             missed_run_grace_minutes: None,
         },
     };
+
+    let dtstart_ms = if req.dtstart_ms.is_some() {
+        req.dtstart_ms
+    } else if let Some(ref sched) = req.schedule {
+        match sched.get("dtstart").and_then(Value::as_str) {
+            Some(s) if s.starts_with("9999-01-01") => None,
+            Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis()),
+            None => sched.get("dtstartMs").and_then(Value::as_i64),
+        }
+    } else {
+        None
+    };
+
+    let rrule = req.rrule.or_else(|| {
+        req.schedule
+            .as_ref()
+            .and_then(|s| s.get("rrule"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+
+    let prompt = req
+        .prompt
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("Handle automation {}", req.name));
+
     let now_ms = req.now_ms.map(|v| v.max(0) as u64).unwrap_or_else(now_epoch_u64);
+    let has_workflow_finished = triggers.iter().any(|t| {
+        matches!(
+            t,
+            AutomationEventTrigger::Connector(c)
+                if matches!(c.kind, AutomationEventKind::Github(GitHubEventKind::WorkflowFinished))
+        )
+    });
+    let once = req.once.or_else(|| {
+        has_workflow_finished.then_some(OneShotWait {
+            by: Some(now_ms.saturating_add(86_400_000)),
+        })
+    });
     let create_req = CreateAutomationRequest {
         name: req.name,
-        prompt: req.prompt,
+        prompt,
         enabled: req.enabled.unwrap_or(true),
         bot_target,
-        dtstart_ms: req.dtstart_ms,
-        rrule: req.rrule,
-        triggers: req.triggers,
-        once: req.once,
+        dtstart_ms,
+        rrule,
+        triggers,
+        once,
         now_ms,
     };
     match state
@@ -419,7 +901,7 @@ pub async fn create_automation(
         .automation_engine()
         .register_automation(create_req)
     {
-        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Ok(record) => (StatusCode::CREATED, Json(automation_to_wire_json(&record))).into_response(),
         Err(err) => map_bots_err(err),
     }
 }
@@ -555,6 +1037,20 @@ pub async fn start_watch_pr(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let pr_target = if let Some(pr) = req.pr.filter(|s| !s.trim().is_empty()) {
+        pr
+    } else if let (Some(repo), Some(num)) = (
+        req.repo.filter(|s| !s.trim().is_empty()),
+        req.pr_number,
+    ) {
+        format!("{repo}#{num}")
+    } else {
+        return orca_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Provide 'pr' (owner/repo#n) or both 'repo' and 'prNumber' for watch-pr.",
+        );
+    };
     let now_ms = req.now_ms.map(|v| v.max(0) as u64).unwrap_or_else(now_epoch_u64);
     let session_id = req
         .session_id
@@ -565,12 +1061,18 @@ pub async fn start_watch_pr(
     match state.orca_bots.automation_engine().watch_pr().start_watch(
         req.bot_id,
         session_id,
-        &req.pr,
+        &pr_target,
         now_ms,
         req.duration.as_deref(),
         req.ci_finished_supported.unwrap_or(true),
     ) {
-        Ok(watch) => (StatusCode::CREATED, Json(watch)).into_response(),
+        Ok(watch) => {
+            let mut val = serde_json::to_value(&watch).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("id".into(), json!(watch.watch_id));
+            }
+            (StatusCode::CREATED, Json(val)).into_response()
+        }
         Err(err) => map_bots_err(err),
     }
 }

@@ -49,7 +49,9 @@ pub const BASE_SNAPSHOT_CONTAMINATION_FILES: [&str; 3] = [
 /// Accessibility tree node used for compact `treeDiff` snapshots and emulator AX queries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxNode {
+    #[serde(alias = "id")]
     pub node_id: String,
+    #[serde(default = "default_ax_role")]
     pub role: String,
     #[serde(default)]
     pub label: String,
@@ -61,8 +63,74 @@ pub struct AxNode {
     pub bounds_bp: Option<(u16, u16, u16, u16)>,
 }
 
+fn default_ax_role() -> String {
+    "element".to_string()
+}
+
 const fn default_true() -> bool {
     true
+}
+
+/// Recursively flattens either a flat array of `AxNode` objects or a nested AX tree
+/// (`{id, role?, label?, enabled?, value?, children: [...]}`) into a flat `Vec<AxNode>`.
+pub fn flatten_ax_tree_value(value: &serde_json::Value) -> Vec<AxNode> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<AxNode>) {
+        match v {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                if let Some(id) = obj
+                    .get("node_id")
+                    .or_else(|| obj.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    let role = obj
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("element")
+                        .to_string();
+                    let label = obj
+                        .get("label")
+                        .or_else(|| obj.get("title"))
+                        .or_else(|| obj.get("text"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let value = obj
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned);
+                    let enabled = obj
+                        .get("enabled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true);
+                    let bounds_bp = obj
+                        .get("bounds_bp")
+                        .cloned()
+                        .and_then(|b| serde_json::from_value(b).ok());
+                    out.push(AxNode {
+                        node_id: id.to_string(),
+                        role,
+                        label,
+                        value,
+                        enabled,
+                        bounds_bp,
+                    });
+                }
+                if let Some(children) = obj.get("children") {
+                    walk(children, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &mut out);
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +311,8 @@ pub fn redact_stdin_secret_args(args: &[String]) -> Vec<String> {
 /// Safe Computer Use coordinator (`Send + Sync`).
 pub struct ComputerUseService {
     policy: RwLock<ComputerUsePolicy>,
+    app_trees: RwLock<BTreeMap<String, Vec<AxNode>>>,
+    audit_entries: Mutex<Vec<serde_json::Value>>,
 }
 
 impl Default for ComputerUseService {
@@ -257,10 +327,41 @@ impl fmt::Debug for ComputerUseService {
     }
 }
 
+fn default_app_ax_nodes(app: &str) -> Vec<AxNode> {
+    vec![
+        AxNode {
+            node_id: "root".to_string(),
+            role: "window".to_string(),
+            label: app.to_string(),
+            value: None,
+            enabled: true,
+            bounds_bp: Some((0, 0, 10_000, 10_000)),
+        },
+        AxNode {
+            node_id: "@e1".to_string(),
+            role: "button".to_string(),
+            label: "Submit".to_string(),
+            value: None,
+            enabled: true,
+            bounds_bp: Some((7_500, 8_800, 2_000, 700)),
+        },
+        AxNode {
+            node_id: "@e2".to_string(),
+            role: "textbox".to_string(),
+            label: "Input".to_string(),
+            value: Some(String::new()),
+            enabled: true,
+            bounds_bp: Some((500, 8_800, 6_500, 700)),
+        },
+    ]
+}
+
 impl ComputerUseService {
     pub fn new(policy: ComputerUsePolicy) -> Self {
         Self {
             policy: RwLock::new(policy),
+            app_trees: RwLock::new(BTreeMap::new()),
+            audit_entries: Mutex::new(Vec::new()),
         }
     }
 
@@ -274,6 +375,132 @@ impl ComputerUseService {
 
     pub fn approve_target(&self, target_id: impl Into<String>) {
         self.policy.write().approved_targets.insert(target_id.into());
+    }
+
+    /// Queries the observed AX tree for `app` (seeding standard window/controls when newly
+    /// queried) and filters by optional substring `query`.
+    pub fn get_app_state(&self, app: &str, query: Option<&str>) -> Vec<AxNode> {
+        let key = app.trim().to_string();
+        let all = {
+            let mut map = self.app_trees.write();
+            map.entry(key.clone())
+                .or_insert_with(|| default_app_ax_nodes(&key))
+                .clone()
+        };
+        let Some(q) = query.map(str::trim).filter(|s| !s.is_empty()) else {
+            return all;
+        };
+        let q_lc = q.to_ascii_lowercase();
+        let filtered: Vec<AxNode> = all
+            .iter()
+            .filter(|n| {
+                n.label.to_ascii_lowercase().contains(&q_lc)
+                    || n.node_id.to_ascii_lowercase().contains(&q_lc)
+                    || n.role.to_ascii_lowercase().contains(&q_lc)
+                    || n.value
+                        .as_deref()
+                        .is_some_and(|v| v.to_ascii_lowercase().contains(&q_lc))
+            })
+            .cloned()
+            .collect();
+        if filtered.is_empty() { all } else { filtered }
+    }
+
+    /// Computes compact AX tree diff between `before` and `after` (supporting both nested
+    /// `{id, children}` trees and flat `Vec<AxNode>`), updates observed app AX state with
+    /// `after`, and returns the `AxTreeDiffReport`.
+    pub fn diff_app_state(
+        &self,
+        app: Option<&str>,
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+    ) -> AxTreeDiffReport {
+        let before_nodes = flatten_ax_tree_value(before);
+        let after_nodes = flatten_ax_tree_value(after);
+        let report = compute_ax_tree_diff(&before_nodes, &after_nodes);
+        if !after_nodes.is_empty() {
+            let mut map = self.app_trees.write();
+            if let Some(a) = app.map(str::trim).filter(|s| !s.is_empty()) {
+                map.insert(a.to_string(), after_nodes);
+            } else {
+                // Update all currently tracked apps + default slot so subsequent waits observe the new tree.
+                if map.is_empty() {
+                    map.insert("default".to_string(), after_nodes);
+                } else {
+                    for nodes in map.values_mut() {
+                        *nodes = after_nodes.clone();
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    /// Builds a [`WaitProbeSnapshot`] from the currently observed AX tree for `app`.
+    pub fn observed_snapshot(&self, app: &str) -> WaitProbeSnapshot {
+        let key = app.trim();
+        let nodes = {
+            let map = self.app_trees.read();
+            map.get(key)
+                .or_else(|| map.get("default"))
+                .cloned()
+                .unwrap_or_else(|| default_app_ax_nodes(key))
+        };
+        let visible_text = nodes
+            .iter()
+            .map(|n| {
+                if let Some(ref val) = n.value {
+                    format!("{} {}", n.label, val)
+                } else {
+                    n.label.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        WaitProbeSnapshot {
+            window_title: key.to_string(),
+            visible_text,
+            nodes,
+        }
+    }
+
+    /// Records a strictly redacted computer-use audit entry (raw secrets are NEVER persisted).
+    pub fn record_audit(
+        &self,
+        app: &str,
+        action: &str,
+        target: &str,
+        background_delivery: bool,
+        redacted: bool,
+        now_ms: i64,
+    ) {
+        self.audit_entries.lock().push(serde_json::json!({
+            "app": app,
+            "action": action,
+            "target": target,
+            "background_delivery": background_delivery,
+            "steals_focus": !background_delivery,
+            "redacted": redacted,
+            "value": if redacted { "[REDACTED]" } else { "" },
+            "timestamp_ms": now_ms,
+        }));
+    }
+
+    /// Returns recorded computer-use audit log entries, optionally filtered by `app`.
+    pub fn audit_log(&self, app: Option<&str>) -> Vec<serde_json::Value> {
+        let filter = app.map(str::trim).filter(|s| !s.is_empty());
+        self.audit_entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                filter.is_none_or(|a| {
+                    e.get("app")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|ea| ea.eq_ignore_ascii_case(a))
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     /// Evaluates computer-use safety guards via `orca_core::orchestration_protocol::evaluate_computer_use_guard`.
@@ -656,9 +883,17 @@ impl ArtifactKind {
     }
 
     pub fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "html" | ".html" => Ok(Self::Html),
-            "md" | ".md" | "markdown" => Ok(Self::Markdown),
+        let norm = raw
+            .split(';')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_ascii_lowercase();
+        match norm.as_str() {
+            "html" | ".html" | "text/html" => Ok(Self::Html),
+            "md" | ".md" | "markdown" | "text/markdown" | "text/x-markdown" | "text/plain" => {
+                Ok(Self::Markdown)
+            }
             other => Err(OrcaIdeRuntimeError::invalid_argument(format!(
                 "unsupported artifact kind '{other}' (expected 'html' or 'markdown')"
             ))),
@@ -1257,6 +1492,60 @@ impl SleepAwareHangWatchdog {
             warning_count: g.warning_count,
             critical_count: g.critical_count,
             breadcrumbs: g.breadcrumbs.iter().cloned().collect(),
+        }
+    }
+
+    /// Evaluates a single heartbeat delta against real sleep-aware thresholds (`warning_stall_ms`,
+    /// `critical_stall_ms`, `sleep_jump_tolerance_ms`), suppressing false hang alerts when OS sleep
+    /// explains the delta while recording genuine awake `Warning` / `Critical` breadcrumbs.
+    pub fn evaluate_sleep_aware(
+        &self,
+        last_heartbeat_delta_ms: u64,
+        system_slept: bool,
+        wake_delta_ms: u64,
+        wall_ms: i64,
+        context: &str,
+    ) -> (&'static str, bool, u64) {
+        let mut g = self.inner.lock();
+        g.total_ticks = g.total_ticks.saturating_add(1);
+        let effective_awake_ms = if system_slept {
+            last_heartbeat_delta_ms.saturating_sub(wake_delta_ms)
+        } else {
+            last_heartbeat_delta_ms
+        };
+        if system_slept
+            && (wake_delta_ms > g.thresholds.sleep_jump_tolerance_ms
+                || effective_awake_ms < g.thresholds.warning_stall_ms)
+        {
+            g.sleep_wakes_ignored = g.sleep_wakes_ignored.saturating_add(1);
+            return ("ok", true, effective_awake_ms);
+        }
+        let sev = if effective_awake_ms >= g.thresholds.critical_stall_ms {
+            Some((StallSeverity::Critical, "critical"))
+        } else if effective_awake_ms >= g.thresholds.warning_stall_ms {
+            Some((StallSeverity::Warning, "warning"))
+        } else {
+            None
+        };
+        if let Some((severity, label)) = sev {
+            match severity {
+                StallSeverity::Warning => g.warning_count = g.warning_count.saturating_add(1),
+                StallSeverity::Critical => g.critical_count = g.critical_count.saturating_add(1),
+            }
+            let crumb = HangBreadcrumb {
+                recorded_at_wall_ms: wall_ms,
+                monotonic_delta_ms: effective_awake_ms,
+                wall_delta_ms: i64::try_from(last_heartbeat_delta_ms).unwrap_or(i64::MAX),
+                severity,
+                context: context.to_string(),
+            };
+            while g.breadcrumbs.len() >= g.thresholds.max_breadcrumbs.max(1) {
+                g.breadcrumbs.pop_front();
+            }
+            g.breadcrumbs.push_back(crumb);
+            (label, false, effective_awake_ms)
+        } else {
+            ("ok", false, effective_awake_ms)
         }
     }
 }

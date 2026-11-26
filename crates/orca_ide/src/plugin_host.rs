@@ -103,7 +103,27 @@ impl PluginContributionPoint {
 
     pub fn parse(raw: &str) -> Option<Self> {
         let norm = raw.trim().to_ascii_lowercase();
-        Self::ALL.into_iter().find(|p| p.as_str() == norm)
+        match norm.as_str() {
+            "panels" => Some(Self::Panels),
+            "custom_editors" | "customeditors" => Some(Self::CustomEditors),
+            "themes" => Some(Self::Themes),
+            "terminal_themes" | "terminalthemes" => Some(Self::TerminalThemes),
+            "icon_themes" | "iconthemes" => Some(Self::IconThemes),
+            "fonts" => Some(Self::Fonts),
+            "syntaxes" | "textmate_syntaxes" | "textmatesyntaxes" => Some(Self::TextmateSyntaxes),
+            "language_packs" | "languagepacks" => Some(Self::LanguagePacks),
+            "commands" | "menus" => Some(Self::Commands),
+            "keybindings" => Some(Self::Keybindings),
+            "vm_recipes" | "vmrecipes" => Some(Self::VmRecipes),
+            "settings" => Some(Self::Settings),
+            "status_bar_items" | "statusbaritems" | "statusbar" | "status_bar" => {
+                Some(Self::StatusBarItems)
+            }
+            "mcp_servers" | "mcpservers" => Some(Self::McpServers),
+            "events" => Some(Self::Events),
+            "hooks" | "action_replacements" | "actionreplacements" => Some(Self::Hooks),
+            _ => None,
+        }
     }
 
     /// Minimum [`PluginTier`] required to register this contribution point.
@@ -119,9 +139,9 @@ impl PluginContributionPoint {
             | Self::Keybindings
             | Self::VmRecipes
             | Self::Settings
-            | Self::McpServers => PluginTier::Declarative,
-            Self::Panels | Self::CustomEditors | Self::StatusBarItems => PluginTier::SandboxedUi,
-            Self::Events | Self::Hooks => PluginTier::TrustedWorker,
+            | Self::StatusBarItems => PluginTier::Declarative,
+            Self::Panels | Self::CustomEditors => PluginTier::SandboxedUi,
+            Self::McpServers | Self::Events | Self::Hooks => PluginTier::TrustedWorker,
         }
     }
 
@@ -180,18 +200,57 @@ fn is_reserved_or_invalid_slug(raw: &str) -> bool {
     reserved || !valid_chars
 }
 
+fn capability_requires_trusted_worker(cap: &str) -> bool {
+    let lc = cap.trim().to_ascii_lowercase();
+    lc == "network"
+        || lc == "shell"
+        || lc == "process"
+        || lc.starts_with("network.")
+        || lc.starts_with("network:")
+        || lc.starts_with("hooks.")
+        || lc.starts_with("hooks:")
+        || lc.starts_with("fs.")
+        || lc.starts_with("fs:")
+        || lc.starts_with("process.")
+        || lc.starts_with("process:")
+        || lc.starts_with("shell.")
+        || lc.starts_with("shell:")
+        || lc.starts_with("mcp.")
+        || lc.starts_with("mcp:")
+        || lc.starts_with("exec.")
+        || lc.starts_with("exec:")
+        || lc.starts_with("env.")
+        || lc.starts_with("env:")
+}
+
 /// Validates manifest, reserved publisher/ID rules, and tier-gating for every contribution point.
 pub fn validate_plugin_manifest_and_contributions(
     manifest: &PluginManifestV2,
     contributions: &[PluginContributionPoint],
 ) -> Result<()> {
     manifest.validate()?;
+    if is_reserved_or_invalid_slug(&manifest.id) {
+        return Err(OrcaIdeRuntimeError::invalid_argument(format!(
+            "reserved or invalid plugin id '{}'",
+            manifest.id
+        )));
+    }
     if let Some(pub_name) = &manifest.publisher
         && is_reserved_or_invalid_slug(pub_name)
     {
-        return Err(OrcaIdeRuntimeError::PluginValidation(
-            PluginValidationError::ReservedOrInvalidId(pub_name.clone()),
-        ));
+        return Err(OrcaIdeRuntimeError::invalid_argument(format!(
+            "reserved or invalid plugin publisher '{pub_name}'"
+        )));
+    }
+    if manifest.tier != PluginTier::TrustedWorker {
+        for perm in &manifest.permissions {
+            if capability_requires_trusted_worker(perm) {
+                return Err(OrcaIdeRuntimeError::invalid_argument(format!(
+                    "capability '{perm}' requires tier 'trusted-worker' (manifest tier is '{}')",
+                    manifest.tier.as_str()
+                )));
+            }
+        }
     }
     for &point in contributions {
         if !point.allowed_for_tier(manifest.tier) {
@@ -296,6 +355,7 @@ CREATE TABLE IF NOT EXISTS installed_plugins (
     plugin_id TEXT PRIMARY KEY,
     manifest_json TEXT NOT NULL,
     contributions_json TEXT NOT NULL DEFAULT '[]',
+    contributes_raw_json TEXT NOT NULL DEFAULT '{}',
     package_dir TEXT,
     fingerprint TEXT NOT NULL,
     audit_actor TEXT NOT NULL,
@@ -311,6 +371,15 @@ CREATE TABLE IF NOT EXISTS plugin_approvals (
 CREATE TABLE IF NOT EXISTS plugin_system_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    audit_actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
 );
 "#;
 
@@ -330,6 +399,8 @@ pub struct PluginValidationSummary {
 pub struct InstalledPluginRecord {
     pub manifest: PluginManifestV2,
     pub contributions: Vec<PluginContributionPoint>,
+    #[serde(default)]
+    pub contributes_raw: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_dir: Option<String>,
     pub fingerprint: String,
@@ -380,6 +451,10 @@ impl fmt::Debug for PluginHostV2 {
 fn init_plugin_host_inner(conn: Connection, default_enabled: bool) -> Result<PluginHostInner> {
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(PLUGIN_HOST_SCHEMA_SQL)?;
+    let _ = conn.execute(
+        "ALTER TABLE installed_plugins ADD COLUMN contributes_raw_json TEXT NOT NULL DEFAULT '{}'",
+        [],
+    );
 
     let enabled: bool = match conn
         .query_row(
@@ -416,31 +491,38 @@ fn init_plugin_host_inner(conn: Connection, default_enabled: bool) -> Result<Plu
     let mut plugins = BTreeMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT manifest_json, contributions_json, package_dir, fingerprint, audit_actor, installed_at_ms
+            "SELECT manifest_json, contributions_json, COALESCE(contributes_raw_json, '{}'),
+                    package_dir, fingerprint, audit_actor, installed_at_ms
              FROM installed_plugins",
         )?;
         let rows = stmt.query_map([], |r| {
             let m_raw: String = r.get(0)?;
             let c_raw: String = r.get(1)?;
+            let raw_contrib: String = r.get(2)?;
             Ok((
                 m_raw,
                 c_raw,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
+                raw_contrib,
+                r.get::<_, Option<String>>(3)?,
                 r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
             ))
         })?;
         for row in rows {
-            let (m_raw, c_raw, package_dir, fingerprint, audit_actor, installed_at_ms) = row?;
+            let (m_raw, c_raw, raw_contrib, package_dir, fingerprint, audit_actor, installed_at_ms) =
+                row?;
             let manifest: PluginManifestV2 = serde_json::from_str(&m_raw)?;
             let contributions: Vec<PluginContributionPoint> =
                 serde_json::from_str(&c_raw).unwrap_or_default();
+            let contributes_raw: serde_json::Value =
+                serde_json::from_str(&raw_contrib).unwrap_or_else(|_| serde_json::json!({}));
             plugins.insert(
                 manifest.id.clone(),
                 InstalledPluginRecord {
                     manifest,
                     contributions,
+                    contributes_raw,
                     package_dir,
                     fingerprint,
                     audit_actor,
@@ -531,12 +613,140 @@ impl PluginHostV2 {
         })
     }
 
+    /// Parses a Plugin V2 manifest from either a package directory (`<dir>/orca-plugin.json`)
+    /// or a direct JSON file path, scanning the package directory to compute `package_sha256`
+    /// when `sha256` is omitted and extracting camelCase/snake_case `contributes` keys.
+    pub fn load_manifest_from_path(
+        path: &Path,
+    ) -> Result<(
+        PluginManifestV2,
+        Vec<PluginContributionPoint>,
+        serde_json::Value,
+        Option<PathBuf>,
+    )> {
+        let (manifest_file, package_dir) = if path.is_dir() {
+            (path.join("orca-plugin.json"), Some(path.to_path_buf()))
+        } else {
+            (
+                path.to_path_buf(),
+                path.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(Path::to_path_buf),
+            )
+        };
+        if !manifest_file.is_file() {
+            return Err(OrcaIdeRuntimeError::not_found(format!(
+                "plugin manifest '{}' not found",
+                manifest_file.display()
+            )));
+        }
+        let pkg_sha = if let Some(ref dir) = package_dir {
+            scan_plugin_package_dir(dir)?.package_sha256
+        } else {
+            let bytes = fs::read(&manifest_file)?;
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            hex::encode(h.finalize())
+        };
+        let raw_text = fs::read_to_string(&manifest_file)?;
+        let mut raw_val: serde_json::Value = serde_json::from_str(&raw_text)?;
+        let (manifest, contributions, contributes_raw) =
+            Self::parse_manifest_value(&mut raw_val, Some(&pkg_sha))?;
+        Ok((manifest, contributions, contributes_raw, package_dir))
+    }
+
+    /// Parses an inline or file-loaded JSON value into `(PluginManifestV2, contributions, contributes_raw)`.
+    pub fn parse_manifest_value(
+        raw_val: &mut serde_json::Value,
+        fallback_sha256: Option<&str>,
+    ) -> Result<(
+        PluginManifestV2,
+        Vec<PluginContributionPoint>,
+        serde_json::Value,
+    )> {
+        let Some(obj) = raw_val.as_object_mut() else {
+            return Err(OrcaIdeRuntimeError::invalid_argument(
+                "plugin manifest must be a JSON object",
+            ));
+        };
+
+        let missing_sha = obj
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|s| s.trim().is_empty());
+        if missing_sha
+            && let Some(sha) = fallback_sha256
+        {
+            obj.insert("sha256".to_string(), serde_json::json!(sha));
+        }
+
+        let contributes_raw = obj
+            .get("contributes")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let mut contributions_set: BTreeSet<PluginContributionPoint> = BTreeSet::new();
+        let mut parsed_hooks: Vec<PluginHookSpec> = Vec::new();
+        if let Some(cmap) = contributes_raw.as_object() {
+            for (k, v) in cmap {
+                let point = PluginContributionPoint::parse(k).ok_or_else(|| {
+                    OrcaIdeRuntimeError::invalid_argument(format!(
+                        "unknown plugin contribution point '{k}'"
+                    ))
+                })?;
+                contributions_set.insert(point);
+                if k.eq_ignore_ascii_case("hooks")
+                    && let Some(arr) = v.as_array()
+                {
+                    for item in arr {
+                        let hook: PluginHookSpec = serde_json::from_value(item.clone())?;
+                        parsed_hooks.push(hook);
+                    }
+                }
+            }
+        }
+
+        let mut manifest: PluginManifestV2 = serde_json::from_value(serde_json::Value::Object(obj.clone()))?;
+        if manifest.hooks.is_empty() && !parsed_hooks.is_empty() {
+            manifest.hooks = parsed_hooks;
+        }
+        let contributions: Vec<PluginContributionPoint> = contributions_set.into_iter().collect();
+        Ok((manifest, contributions, contributes_raw))
+    }
+
     /// Installs (or upgrades) a validated Plugin V2 package into SQLite WAL storage.
     pub fn install_plugin(
         &self,
         manifest: PluginManifestV2,
         contributions: Vec<PluginContributionPoint>,
         package_dir: Option<&Path>,
+        now_ms: i64,
+    ) -> Result<InstalledPluginRecord> {
+        self.install_plugin_checked(
+            manifest,
+            contributions,
+            serde_json::json!({}),
+            package_dir,
+            None,
+            false,
+            false,
+            now_ms,
+        )
+    }
+
+    /// Atomically validates, checks enablement + capability fingerprint approval BEFORE
+    /// writing to SQLite, persists the plugin + optional approval + audit log row, and returns
+    /// the installed record. Unapproved `trusted-worker` plugins are NEVER persisted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_plugin_checked(
+        &self,
+        manifest: PluginManifestV2,
+        contributions: Vec<PluginContributionPoint>,
+        contributes_raw: serde_json::Value,
+        package_dir: Option<&Path>,
+        approve_fingerprint: Option<&str>,
+        auto_approve: bool,
+        enforce_approval: bool,
         now_ms: i64,
     ) -> Result<InstalledPluginRecord> {
         validate_plugin_manifest_and_contributions(&manifest, &contributions)?;
@@ -550,15 +760,64 @@ impl PluginHostV2 {
         let audit_actor = audit_actor_for_manifest(&manifest);
         let manifest_json = serde_json::to_string(&manifest)?;
         let contributions_json = serde_json::to_string(&contributions)?;
+        let contributes_raw_json = serde_json::to_string(&contributes_raw)?;
 
         let mut guard = self.inner.lock();
-        guard.conn.execute(
+        if enforce_approval && !guard.config.enabled {
+            return Err(OrcaIdeRuntimeError::ide(
+                OrcaIdeErrorCode::PluginSystemDisabled,
+                format!("cannot install plugin '{}': plugin system is disabled", manifest.id),
+            ));
+        }
+
+        let needs_approval = manifest.tier.requires_approval()
+            || !manifest.permissions.is_empty()
+            || !manifest.tools.is_empty()
+            || !manifest.hooks.is_empty();
+
+        let mut grant_approval = false;
+        if let Some(fp) = approve_fingerprint.map(str::trim).filter(|s| !s.is_empty()) {
+            if fp != fingerprint {
+                return Err(OrcaIdeRuntimeError::ide(
+                    OrcaIdeErrorCode::ApprovalRequired,
+                    format!(
+                        "fingerprint mismatch for plugin '{}': expected '{}', got '{}' (exit {})",
+                        manifest.id, fingerprint, fp, PLUGIN_APPROVAL_REQUIRED_EXIT_CODE
+                    ),
+                ));
+            }
+            grant_approval = true;
+        } else if auto_approve {
+            grant_approval = true;
+        }
+
+        if enforce_approval && needs_approval && !grant_approval {
+            let already_ok = guard.config.approved_plugin_ids.contains(&manifest.id)
+                && guard
+                    .config
+                    .approved_fingerprints
+                    .get(&manifest.id)
+                    .is_none_or(|f| f == &fingerprint);
+            if !already_ok {
+                return Err(OrcaIdeRuntimeError::ide(
+                    OrcaIdeErrorCode::ApprovalRequired,
+                    format!(
+                        "plugin '{}' requires explicit capability fingerprint approval (fingerprint={}, --approve {fingerprint}, exit {PLUGIN_APPROVAL_REQUIRED_EXIT_CODE})",
+                        manifest.id, fingerprint
+                    ),
+                ));
+            }
+        }
+
+        let tx = guard.conn.transaction()?;
+        tx.execute(
             "INSERT INTO installed_plugins
-                (plugin_id, manifest_json, contributions_json, package_dir, fingerprint, audit_actor, installed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                (plugin_id, manifest_json, contributions_json, contributes_raw_json, package_dir, fingerprint, audit_actor, installed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(plugin_id) DO UPDATE SET
                 manifest_json = excluded.manifest_json,
                 contributions_json = excluded.contributions_json,
+                contributes_raw_json = excluded.contributes_raw_json,
                 package_dir = excluded.package_dir,
                 fingerprint = excluded.fingerprint,
                 audit_actor = excluded.audit_actor,
@@ -567,15 +826,48 @@ impl PluginHostV2 {
                 &manifest.id,
                 &manifest_json,
                 &contributions_json,
+                &contributes_raw_json,
                 &package_dir_str,
                 &fingerprint,
                 &audit_actor,
                 now_ms,
             ],
         )?;
+        if grant_approval {
+            tx.execute(
+                "INSERT INTO plugin_approvals (plugin_id, fingerprint, approved_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(plugin_id) DO UPDATE SET
+                    fingerprint = excluded.fingerprint,
+                    approved_at_ms = excluded.approved_at_ms",
+                params![&manifest.id, &fingerprint, now_ms],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO plugin_audit_log (plugin_id, audit_actor, action, detail, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &manifest.id,
+                &audit_actor,
+                if grant_approval { "install_approved" } else { "install" },
+                format!("tier={} fingerprint={}", manifest.tier.as_str(), fingerprint),
+                now_ms,
+            ],
+        )?;
+        tx.commit()?;
+
+        if grant_approval {
+            guard.config.approved_plugin_ids.insert(manifest.id.clone());
+            guard
+                .config
+                .approved_fingerprints
+                .insert(manifest.id.clone(), fingerprint.clone());
+        }
+
         let record = InstalledPluginRecord {
             manifest: manifest.clone(),
             contributions,
+            contributes_raw,
             package_dir: package_dir_str,
             fingerprint,
             audit_actor,
@@ -616,6 +908,16 @@ impl PluginHostV2 {
                 approved_at_ms = excluded.approved_at_ms",
             params![plugin_id, &record.fingerprint, now_ms],
         )?;
+        let _ = guard.conn.execute(
+            "INSERT INTO plugin_audit_log (plugin_id, audit_actor, action, detail, created_at_ms)
+             VALUES (?1, ?2, 'approve', ?3, ?4)",
+            params![
+                plugin_id,
+                &record.audit_actor,
+                format!("fingerprint={}", record.fingerprint),
+                now_ms,
+            ],
+        );
         guard.config.approved_plugin_ids.insert(plugin_id.to_string());
         guard
             .config
@@ -641,6 +943,85 @@ impl PluginHostV2 {
 
     pub fn get_plugin(&self, plugin_id: &str) -> Option<InstalledPluginRecord> {
         self.inner.lock().plugins.get(plugin_id).cloned()
+    }
+
+    /// Aggregates registered contributions across all installed plugins.
+    pub fn all_contributions(&self) -> serde_json::Value {
+        let guard = self.inner.lock();
+        let mut by_plugin = serde_json::Map::new();
+        let mut by_point: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        for rec in guard.plugins.values() {
+            let qualified_id = match rec.manifest.publisher.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(pub_name) => format!("{pub_name}.{}", rec.manifest.id),
+                None => rec.manifest.id.clone(),
+            };
+            by_plugin.insert(
+                qualified_id.clone(),
+                serde_json::json!({
+                    "id": rec.manifest.id,
+                    "qualified_id": qualified_id,
+                    "tier": rec.manifest.tier.as_str(),
+                    "points": rec.contributions,
+                    "contributes": rec.contributes_raw,
+                }),
+            );
+            if let Some(cmap) = rec.contributes_raw.as_object() {
+                for (k, v) in cmap {
+                    let bucket = by_point.entry(k.clone()).or_default();
+                    if let Some(arr) = v.as_array() {
+                        bucket.extend(arr.iter().cloned());
+                    } else {
+                        bucket.push(v.clone());
+                    }
+                }
+            }
+        }
+        serde_json::json!({
+            "plugins": by_plugin,
+            "by_point": by_point,
+        })
+    }
+
+    /// Lists plugin audit log entries (optionally filtered by `plugin_id` or `publisher.id`).
+    pub fn list_audit_log(&self, plugin_id: Option<&str>) -> Result<Vec<serde_json::Value>> {
+        let filter = plugin_id.map(str::trim).filter(|s| !s.is_empty());
+        let guard = self.inner.lock();
+        let mut stmt = guard.conn.prepare(
+            "SELECT id, plugin_id, audit_actor, action, detail, created_at_ms
+             FROM plugin_audit_log
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, pid, actor, action, detail, created_at_ms) = row?;
+            if let Some(f) = filter {
+                let actor_match = actor == f || actor == format!("plugin:{f}");
+                let suffix_match = f.ends_with(&format!(".{pid}"));
+                if pid != f && !actor_match && !suffix_match {
+                    continue;
+                }
+            }
+            out.push(serde_json::json!({
+                "id": id,
+                "plugin_id": pid,
+                "actor": actor,
+                "audit_actor": actor,
+                "action": action,
+                "detail": detail,
+                "created_at_ms": created_at_ms,
+            }));
+        }
+        Ok(out)
     }
 
     /// Executes a plugin command override with a hard `<= 2_000ms`
@@ -742,19 +1123,95 @@ impl PluginHostV2 {
     }
 }
 
+/// Serializes a [`PluginValidationSummary`] with canonical REST/RPC/CLI wire keys.
+pub fn plugin_validation_to_wire_json(
+    summary: &PluginValidationSummary,
+    publisher: Option<&str>,
+) -> serde_json::Value {
+    let qualified_id = match publisher.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pub_name) => format!("{pub_name}.{}", summary.plugin_id),
+        None => summary.plugin_id.clone(),
+    };
+    serde_json::json!({
+        "valid": true,
+        "id": summary.plugin_id,
+        "plugin_id": summary.plugin_id,
+        "publisher": publisher,
+        "qualified_id": qualified_id,
+        "tier": summary.tier.as_str(),
+        "fingerprint": summary.fingerprint,
+        "capability_fingerprint": summary.fingerprint,
+        "audit_actor": summary.audit_actor,
+        "requires_approval": summary.requires_approval,
+        "approval_required": summary.requires_approval,
+        "approval_exit_code": summary.approval_exit_code,
+        "network_access": summary.tier == PluginTier::TrustedWorker,
+    })
+}
+
+/// Serializes an [`InstalledPluginRecord`] with canonical top-level REST/RPC/CLI wire keys.
+pub fn installed_plugin_to_wire_json(record: &InstalledPluginRecord) -> serde_json::Value {
+    let qualified_id = match record
+        .manifest
+        .publisher
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(pub_name) => format!("{pub_name}.{}", record.manifest.id),
+        None => record.manifest.id.clone(),
+    };
+    let mut val = serde_json::to_value(record).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".to_string(), serde_json::json!(record.manifest.id));
+        obj.insert("plugin_id".to_string(), serde_json::json!(record.manifest.id));
+        obj.insert(
+            "publisher".to_string(),
+            serde_json::json!(record.manifest.publisher),
+        );
+        obj.insert("qualified_id".to_string(), serde_json::json!(qualified_id));
+        obj.insert(
+            "tier".to_string(),
+            serde_json::json!(record.manifest.tier.as_str()),
+        );
+        obj.insert(
+            "capability_fingerprint".to_string(),
+            serde_json::json!(record.fingerprint),
+        );
+        obj.insert(
+            "network_access".to_string(),
+            serde_json::json!(record.manifest.tier == PluginTier::TrustedWorker),
+        );
+        obj.insert("valid".to_string(), serde_json::json!(true));
+    }
+    val
+}
+
 // ---------------------------------------------------------------------------
 // MCP Config Sync (Atomic JSON Merge + Secret Stripping for Bot Homes)
 // ---------------------------------------------------------------------------
 
-/// MCP server definition synchronized into agent config files.
+fn default_mcp_transport() -> String {
+    "stdio".to_string()
+}
+
+/// MCP server definition synchronized into agent config files (supports both `stdio` and
+/// `streamable-http` / `http` transports).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerEntry {
     pub name: String,
+    #[serde(default = "default_mcp_transport")]
+    pub transport: String,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_handle: Option<String>,
     #[serde(default)]
     pub source: String,
 }
@@ -818,27 +1275,70 @@ impl McpConfigSync {
         let mut secrets_stripped = 0usize;
         for entry in host_servers.iter().chain(plugin_servers.iter()) {
             let name = entry.name.trim();
-            if name.is_empty() || entry.command.trim().is_empty() {
+            if name.is_empty() {
                 return Err(OrcaIdeRuntimeError::invalid_argument(
-                    "MCP server entry name and command must be non-empty",
+                    "MCP server entry name must be non-empty",
                 ));
             }
-            let mut env_map = serde_json::Map::new();
-            for (k, v) in &entry.env {
-                if strip_secrets_for_bot_home && looks_like_secret_env(k, v) {
-                    secrets_stripped += 1;
-                    continue;
+            let transport_lc = entry.transport.trim().to_ascii_lowercase();
+            let is_http = matches!(
+                transport_lc.as_str(),
+                "streamable-http" | "http" | "sse" | "https"
+            ) || (entry.command.trim().is_empty() && entry.url.as_deref().is_some_and(|u| !u.trim().is_empty()));
+
+            if is_http {
+                let Some(url) = entry
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                else {
+                    return Err(OrcaIdeRuntimeError::invalid_argument(format!(
+                        "HTTP MCP server '{name}' requires non-empty 'url'"
+                    )));
+                };
+                let safe_handle = entry.credential_handle.as_deref().and_then(|h| {
+                    if strip_secrets_for_bot_home && looks_like_secret_env("VALUE", h) {
+                        secrets_stripped += 1;
+                        None
+                    } else {
+                        Some(h.to_string())
+                    }
+                });
+                let mut obj = serde_json::json!({
+                    "transport": if transport_lc.is_empty() { "streamable-http" } else { transport_lc.as_str() },
+                    "url": url,
+                });
+                if let Some(handle) = safe_handle
+                    && let Some(m) = obj.as_object_mut()
+                {
+                    m.insert("credential_handle".to_string(), serde_json::json!(handle));
                 }
-                env_map.insert(k.clone(), serde_json::Value::String(v.clone()));
+                merged.insert(name.to_string(), obj);
+            } else {
+                if entry.command.trim().is_empty() {
+                    return Err(OrcaIdeRuntimeError::invalid_argument(
+                        "MCP server entry name and command must be non-empty",
+                    ));
+                }
+                let mut env_map = serde_json::Map::new();
+                for (k, v) in &entry.env {
+                    if strip_secrets_for_bot_home && looks_like_secret_env(k, v) {
+                        secrets_stripped += 1;
+                        continue;
+                    }
+                    env_map.insert(k.clone(), serde_json::Value::String(v.clone()));
+                }
+                merged.insert(
+                    name.to_string(),
+                    serde_json::json!({
+                        "transport": "stdio",
+                        "command": entry.command,
+                        "args": entry.args,
+                        "env": env_map,
+                    }),
+                );
             }
-            merged.insert(
-                name.to_string(),
-                serde_json::json!({
-                    "command": entry.command,
-                    "args": entry.args,
-                    "env": env_map,
-                }),
-            );
         }
 
         let count = merged.len();
@@ -1148,6 +1648,36 @@ impl TransactionalSkillInstaller {
         Ok(report)
     }
 
+    /// Runs journaled transaction recovery plus cleans any orphaned `.txn-*` markers
+    /// and `*.staging` directories inside `target_root` while preserving committed skills.
+    pub fn recover_target_root(
+        &self,
+        target_root: &Path,
+        now_ms: i64,
+    ) -> Result<(SkillRecoveryReport, usize, usize)> {
+        let report = self.recover_interrupted_installs(now_ms)?;
+        let mut cleaned_markers = 0usize;
+        let mut cleaned_staging = 0usize;
+        if target_root.is_dir()
+            && let Ok(entries) = fs::read_dir(target_root)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(".txn-") && path.is_file() {
+                    if fs::remove_file(&path).is_ok() {
+                        cleaned_markers += 1;
+                    }
+                } else if name.ends_with(".staging") && path.is_dir() {
+                    if fs::remove_dir_all(&path).is_ok() {
+                        cleaned_staging += 1;
+                    }
+                }
+            }
+        }
+        Ok((report, cleaned_markers, cleaned_staging))
+    }
+
     pub fn get_record(&self, install_id: &str) -> Result<Option<SkillInstallRecord>> {
         let conn = self.conn.lock();
         let row = conn
@@ -1170,6 +1700,34 @@ impl TransactionalSkillInstaller {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Lists all committed skill install records ordered newest-first.
+    pub fn list_committed_skills(&self) -> Result<Vec<SkillInstallRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT install_id, skill_name, source_path, staging_dir, target_dir, state, updated_at_ms
+             FROM skill_install_journal
+             WHERE state = 'committed'
+             ORDER BY updated_at_ms DESC, skill_name ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let st: String = r.get(5)?;
+            Ok(SkillInstallRecord {
+                install_id: r.get(0)?,
+                skill_name: r.get(1)?,
+                source_path: r.get(2)?,
+                staging_dir: r.get(3)?,
+                target_dir: r.get(4)?,
+                state: SkillInstallState::parse(&st),
+                updated_at_ms: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 }
 
@@ -1330,9 +1888,12 @@ mod tests {
             &cfg_path,
             &[McpServerEntry {
                 name: "github".to_string(),
+                transport: "stdio".to_string(),
                 command: "npx".to_string(),
                 args: vec!["-y".to_string(), "@mcp/github".to_string()],
                 env,
+                url: None,
+                credential_handle: None,
                 source: "host".to_string(),
             }],
             &[],

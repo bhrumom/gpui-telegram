@@ -181,6 +181,61 @@ impl HibernationController {
         Ok(evaluate_hibernation(&input)?)
     }
 
+    /// Evaluates all 8 hibernation checks individually, returning
+    /// `(eligible, passed_checks, failed_checks, decision_label)` for REST/RPC/CLI surfaces.
+    pub fn evaluate_8_checks(
+        &self,
+        candidate: &HibernationCandidateState,
+        window_override_ms: Option<u64>,
+    ) -> (bool, Vec<&'static str>, Vec<&'static str>, &'static str) {
+        let threshold = window_override_ms.unwrap_or_else(|| self.idle_threshold_ms());
+        let resumable_with_handle = is_resumable_agent(&candidate.agent_id)
+            && candidate
+                .session_handle
+                .as_deref()
+                .is_some_and(|h| !h.trim().is_empty())
+            && !candidate.pinned_no_hibernate;
+
+        let checks: [(&'static str, bool); 8] = [
+            ("state_done", candidate.agent_state_is_done),
+            ("tab_not_visible", !candidate.tab_visible),
+            ("zero_keystrokes_since_done", candidate.keystrokes_since_done == 0),
+            ("resumable_agent", resumable_with_handle),
+            ("idle_window_elapsed", candidate.idle_duration_ms >= threshold),
+            (
+                "no_mobile_driver",
+                !candidate.mobile_driver_attached && !candidate.active_port_forward,
+            ),
+            (
+                "no_unsettled_dispatches",
+                !candidate.unsettled_orchestration_dispatch
+                    && !candidate.git_operation_in_progress
+                    && !candidate.pending_bot_approval
+                    && !candidate.unsynced_local_snapshot,
+            ),
+            ("zero_live_subagents", candidate.live_subagent_count == 0),
+        ];
+
+        let mut passed = Vec::with_capacity(8);
+        let mut failed = Vec::new();
+        for (name, ok) in checks {
+            if ok {
+                passed.push(name);
+            } else {
+                failed.push(name);
+            }
+        }
+        let eligible = failed.is_empty();
+        let decision = if eligible {
+            "hibernate_now"
+        } else if failed.len() == 1 && failed[0] == "idle_window_elapsed" {
+            "defer_not_idle_enough"
+        } else {
+            "blocked"
+        };
+        (eligible, passed, failed, decision)
+    }
+
     /// Evaluates `candidate` and, if clear & sufficiently idle, transitions
     /// `tab.leaf_state` from `TabLeafState::Live` to `TabLeafState::Sleeping`.
     pub fn hibernate_tab(

@@ -2458,6 +2458,12 @@ fn check_json_kv_entry(
     is_null: bool,
     str_val: Option<&str>,
 ) -> Result<(), BotBrowserError> {
+    if k.len() <= 2 && k.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        if let Some(s) = str_val {
+            scan_text_for_secret_leaks_with_depth(s, context, params, depth + 1)?;
+        }
+        return Ok(());
+    }
     scan_text_for_secret_leaks_with_depth(k, &format!("{context}.<key>"), params, depth)?;
     let k_trimmed = k.trim();
     let k_lower = k_trimmed.to_ascii_lowercase();
@@ -3217,6 +3223,18 @@ fn scan_json_object_brace_map(
     std::collections::HashMap<usize, (usize, usize)>,
     std::collections::HashSet<usize>,
 ) {
+    const IS_JSON_SYNTAX: [bool; 256] = {
+        let mut t = [false; 256];
+        t[b'"' as usize] = true;
+        t[b'\\' as usize] = true;
+        t[b'\n' as usize] = true;
+        t[b'\r' as usize] = true;
+        t[b'{' as usize] = true;
+        t[b'}' as usize] = true;
+        t[b'[' as usize] = true;
+        t[b']' as usize] = true;
+        t
+    };
     let mut matched = std::collections::HashMap::new();
     let mut unclosed = std::collections::HashSet::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
@@ -3224,51 +3242,63 @@ fn scan_json_object_brace_map(
     let mut escaped = false;
 
     let bytes = variant.as_bytes();
-    let mut iter = variant.char_indices().peekable();
-    while let Some((idx, ch)) = iter.next() {
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if !IS_JSON_SYNTAX[b as usize] {
+            if escaped {
+                escaped = false;
+            }
+            idx += 1;
+            continue;
+        }
         if in_str {
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if ch == '"' {
+            } else if b == b'"' {
                 in_str = false;
-            } else if ch == '\n' || ch == '\r' {
+            } else if b == b'\n' || b == b'\r' {
                 in_str = false;
                 for &(open_idx, _) in &stack {
-                    unclosed.insert(open_idx);
+                    if open_idx != usize::MAX {
+                        unclosed.insert(open_idx);
+                    }
                 }
                 stack.clear();
             }
+            idx += 1;
             continue;
         }
         if stack.is_empty() {
-            if ch == '{' {
+            if b == b'{' {
                 if bytes.get(idx + 1) == Some(&b'{') {
-                    iter.next();
+                    idx += 2;
                     continue;
                 }
                 let after = variant[idx + 1..].trim_start();
-                if after.starts_with(['"', '}']) {
+                if after.starts_with('"') || after.starts_with('}') {
                     stack.push((idx, 1));
                 }
             }
+            idx += 1;
             continue;
         }
-        match ch {
-            '"' => {
+        match b {
+            b'"' => {
                 in_str = true;
                 escaped = false;
             }
-            '{' | '[' => {
+            b'{' | b'[' => {
                 let abs_depth = stack.len() + 1;
-                if ch == '{' {
+                if b == b'{' {
                     stack.push((idx, abs_depth));
                 } else {
                     stack.push((usize::MAX, abs_depth));
                 }
             }
-            ']' => {
+            b']' => {
                 if let Some(&(open_idx, max_sub)) = stack.last() {
                     if open_idx == usize::MAX {
                         stack.pop();
@@ -3278,7 +3308,7 @@ fn scan_json_object_brace_map(
                     }
                 }
             }
-            '}' => {
+            b'}' => {
                 while let Some(&(open_idx, max_sub)) = stack.last() {
                     if open_idx == usize::MAX {
                         stack.pop();
@@ -3299,6 +3329,7 @@ fn scan_json_object_brace_map(
             }
             _ => {}
         }
+        idx += 1;
     }
     for (open_idx, _) in stack {
         if open_idx != usize::MAX {
@@ -3407,11 +3438,14 @@ fn scan_embedded_json_objects(
     let mut fail_skipped_opens: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut failed_parse_bytes = 0usize;
     let max_failed_parse_bytes = variant.len().saturating_mul(4).max(262_144);
-    for (idx, ch) in variant.char_indices() {
-        if idx >= last_colon || idx >= last_close {
-            break;
-        }
-        if idx < skip_until || ch != '{' {
+    let mut search_pos = 0usize;
+    let stop_at = last_colon.min(last_close);
+    while search_pos < stop_at
+        && let Some(rel) = variant[search_pos..stop_at].find('{')
+    {
+        let idx = search_pos + rel;
+        search_pos = idx + 1;
+        if idx < skip_until {
             continue;
         }
         if unclosed_braces.contains(&idx) {
@@ -3532,6 +3566,14 @@ fn scan_text_for_secret_leaks_with_depth(
 
     // Step A: Direct JSON container leaf — recurse structurally (including all duplicate keys).
     let trimmed_text = text.trim();
+    if trimmed_text.len() < 5
+        && !trimmed_text
+            .as_bytes()
+            .iter()
+            .any(|&b| matches!(b, b'=' | b':' | b'%' | b'+' | b'\\' | b'{' | b'['))
+    {
+        return Ok(());
+    }
     match try_parse_json_container_classified(trimmed_text) {
         ParsedJsonContainer::Parsed(val) => {
             scan_json_value_with_depth(
@@ -3622,7 +3664,7 @@ fn scan_text_for_secret_leaks_with_depth(
     }
 
     // Step C: Multi-pass decoding variants (Variant 0 always scanned first).
-    if !text.contains(['%', '+', '\\']) {
+    if !text.contains('%') && !text.contains('+') && !text.contains('\\') {
         let verified_spans = scan_embedded_json_objects(text, context, params, depth)?;
         scan_variant_clean(text, context, params, &verified_spans)?;
         return Ok(());
@@ -4405,14 +4447,15 @@ struct LineSegIndex {
     pair_sensitive: Vec<(usize, usize)>,
     bearer_segs: Vec<(usize, usize)>,
     basic_segs: Vec<(usize, usize)>,
+    backslash_positions: Vec<usize>,
 }
 
 impl LineSegIndex {
     fn build(text: &str, line_start: usize) -> Self {
-        let line_end = line_start
-            + text[line_start..]
-                .find(['\n', '\r'])
-                .unwrap_or(text.len() - line_start);
+        let tail = &text[line_start..];
+        let nl = tail.find('\n').unwrap_or(tail.len());
+        let cr = tail[..nl].find('\r').unwrap_or(nl);
+        let line_end = line_start + cr;
         let line = &text[line_start..line_end];
         let mut idx_obj = Self {
             line_start,
@@ -4447,66 +4490,120 @@ impl LineSegIndex {
             ("pass", "code"),
         ];
 
-        let mut cur = String::new();
+        let mut cur = String::with_capacity(24);
+        let mut cur_overflow = false;
         let mut cur_start = line_start;
-        let mut prev_seg = String::new();
+        let mut prev_seg = String::with_capacity(24);
+        let mut prev_overflow = false;
         let mut prev_start = line_start;
         let mut has_prev = false;
 
-        let mut flush_seg = |seg: &mut String, seg_start: usize, seg_end: usize| {
-            if seg.is_empty() {
+        let mut flush_seg = |seg: &mut String, overflow: &mut bool, seg_start: usize, seg_end: usize| {
+            if seg.is_empty() && !*overflow {
                 return;
             }
-            if SINGLE_SEGMENTS.contains(&seg.as_str()) {
-                idx_obj.single_sensitive.push((seg_start, seg_end));
-            }
-            if seg == "bearer" {
-                idx_obj.bearer_segs.push((seg_start, seg_end));
-            } else if seg == "basic" {
-                idx_obj.basic_segs.push((seg_start, seg_end));
-            }
-            if has_prev && PAIR_SEGMENTS.contains(&(prev_seg.as_str(), seg.as_str())) {
-                idx_obj.pair_sensitive.push((prev_start, seg_end));
+            if !*overflow {
+                if SINGLE_SEGMENTS.contains(&seg.as_str()) {
+                    idx_obj.single_sensitive.push((seg_start, seg_end));
+                }
+                if seg == "bearer" {
+                    idx_obj.bearer_segs.push((seg_start, seg_end));
+                } else if seg == "basic" {
+                    idx_obj.basic_segs.push((seg_start, seg_end));
+                }
+                if has_prev
+                    && !prev_overflow
+                    && PAIR_SEGMENTS.contains(&(prev_seg.as_str(), seg.as_str()))
+                {
+                    idx_obj.pair_sensitive.push((prev_start, seg_end));
+                }
             }
             std::mem::swap(&mut prev_seg, seg);
+            prev_overflow = *overflow;
             prev_start = seg_start;
             has_prev = true;
             seg.clear();
+            *overflow = false;
         };
 
-        let mut prev_ch: Option<char> = None;
-        let mut it = line.char_indices().peekable();
-        while let Some((rel_i, ch)) = it.next() {
-            let abs_i = line_start + rel_i;
-            if !ch.is_ascii_alphanumeric() {
-                flush_seg(&mut cur, cur_start, abs_i);
-                prev_ch = Some(ch);
+        let bytes = line.as_bytes();
+        let mut rel_i = 0usize;
+        let mut prev_b: u8 = 0;
+        let mut has_prev_b = false;
+        while rel_i < bytes.len() {
+            let b = bytes[rel_i];
+            if cur_overflow
+                && has_prev_b
+                && prev_b >= b'a'
+                && prev_b <= b'z'
+                && b >= b'a'
+                && b <= b'z'
+            {
+                while rel_i < bytes.len() {
+                    let nb = bytes[rel_i];
+                    if nb >= b'a' && nb <= b'z' {
+                        rel_i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                prev_b = b'a';
+                has_prev_b = true;
                 continue;
             }
-            if !cur.is_empty() {
-                let p = prev_ch.unwrap();
-                if ch.is_ascii_uppercase() {
-                    let next_is_lower = it.peek().is_some_and(|&(_, n)| n.is_ascii_lowercase());
-                    if p.is_ascii_lowercase()
-                        || p.is_ascii_digit()
-                        || (p.is_ascii_uppercase() && next_is_lower)
-                    {
-                        flush_seg(&mut cur, cur_start, abs_i);
+            let abs_i = line_start + rel_i;
+            if b >= 0x80 {
+                let ch = line[rel_i..].chars().next().unwrap();
+                flush_seg(&mut cur, &mut cur_overflow, cur_start, abs_i);
+                has_prev_b = false;
+                rel_i += ch.len_utf8();
+                continue;
+            }
+            let is_lower = b >= b'a' && b <= b'z';
+            let is_upper = b >= b'A' && b <= b'Z';
+            let is_digit = b >= b'0' && b <= b'9';
+            if !(is_lower || is_upper || is_digit) {
+                flush_seg(&mut cur, &mut cur_overflow, cur_start, abs_i);
+                if b == b'\\' {
+                    idx_obj.backslash_positions.push(abs_i);
+                }
+                prev_b = b;
+                has_prev_b = true;
+                rel_i += 1;
+                continue;
+            }
+            if !cur.is_empty() || cur_overflow {
+                let p = if has_prev_b { prev_b } else { 0 };
+                let p_lower = p >= b'a' && p <= b'z';
+                let p_upper = p >= b'A' && p <= b'Z';
+                let p_digit = p >= b'0' && p <= b'9';
+                if is_upper {
+                    let next_is_lower = rel_i + 1 < bytes.len()
+                        && bytes[rel_i + 1] >= b'a'
+                        && bytes[rel_i + 1] <= b'z';
+                    if p_lower || p_digit || (p_upper && next_is_lower) {
+                        flush_seg(&mut cur, &mut cur_overflow, cur_start, abs_i);
                         cur_start = abs_i;
                     }
-                } else if (ch.is_ascii_digit() && p.is_ascii_alphabetic())
-                    || (ch.is_ascii_lowercase() && p.is_ascii_digit())
-                {
-                    flush_seg(&mut cur, cur_start, abs_i);
+                } else if (is_digit && (p_lower || p_upper)) || (is_lower && p_digit) {
+                    flush_seg(&mut cur, &mut cur_overflow, cur_start, abs_i);
                     cur_start = abs_i;
                 }
             } else {
                 cur_start = abs_i;
             }
-            cur.push(ch.to_ascii_lowercase());
-            prev_ch = Some(ch);
+            if !cur_overflow {
+                if cur.len() < 20 {
+                    cur.push(if is_upper { (b + 32) as char } else { b as char });
+                } else {
+                    cur_overflow = true;
+                }
+            }
+            prev_b = b;
+            has_prev_b = true;
+            rel_i += 1;
         }
-        flush_seg(&mut cur, cur_start, line_end);
+        flush_seg(&mut cur, &mut cur_overflow, cur_start, line_end);
         idx_obj
     }
 
@@ -4515,6 +4612,13 @@ impl LineSegIndex {
         ranges
             .get(idx)
             .is_some_and(|&(s, e)| s >= key_start && e <= key_end)
+    }
+
+    fn has_backslash_in(&self, key_start: usize, key_end: usize) -> bool {
+        let idx = self.backslash_positions.partition_point(|&pos| pos < key_start);
+        self.backslash_positions
+            .get(idx)
+            .is_some_and(|&pos| pos < key_end)
     }
 
     fn query(&self, key_start: usize, key_end: usize) -> (bool, bool, bool) {
@@ -4582,9 +4686,34 @@ struct KvLineScanMemo {
 
 impl KvLineScanMemo {
     fn advance_to(&mut self, text: &str, target: usize) {
+        const FAST_SKIP_ADVANCE: [bool; 256] = {
+            let mut t = [false; 256];
+            let mut i = 0usize;
+            while i < 128 {
+                let b = i as u8;
+                if (b >= b'a' && b <= b'z')
+                    || (b >= b'A' && b <= b'Z')
+                    || (b >= b'0' && b <= b'9')
+                    || b == b'_'
+                    || b == b'-'
+                {
+                    t[i] = true;
+                }
+                i += 1;
+            }
+            t
+        };
         let bytes = text.as_bytes();
         let limit = target.min(bytes.len());
         while self.scanned_to < limit {
+            if self.cur_lbrack_run_start.is_none() {
+                while self.scanned_to < limit && FAST_SKIP_ADVANCE[bytes[self.scanned_to] as usize] {
+                    self.scanned_to += 1;
+                }
+                if self.scanned_to >= limit {
+                    break;
+                }
+            }
             let b = bytes[self.scanned_to];
             if b == b'\n' || b == b'\r' {
                 self.line_start = self.scanned_to + 1;
@@ -4636,24 +4765,37 @@ impl KvLineScanMemo {
                         self.line_lbracks.truncate(cp.lbracks_len);
                         self.line_quotes.truncate(cp.quotes_len);
                         self.line_quotes.push(self.scanned_to);
-                        if text[self.scanned_to + 1..]
-                            .chars()
-                            .next()
-                            .is_some_and(|nc| is_kv_ident_char(nc) || nc == '[')
-                        {
+                        let next_is_cont = bytes.get(self.scanned_to + 1).is_some_and(|&nb| {
+                            if nb < 0x80 {
+                                nb == b'[' || is_kv_ident_char(nb as char)
+                            } else {
+                                text[self.scanned_to + 1..]
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|nc| is_kv_ident_char(nc) || nc == '[')
+                            }
+                        });
+                        if next_is_cont {
                             self.line_sub_or_dots.push(self.scanned_to);
                             self.line_tight_sub_or_dots.push(self.scanned_to);
                         }
                     } else {
-                        if self.scanned_to > self.line_start
-                            && text[self.line_start..self.scanned_to]
-                                .chars()
-                                .next_back()
-                                .is_some_and(|pc| {
-                                    is_kv_ident_char(pc)
-                                        || matches!(pc, ']' | '.' | '[' | '"' | '\'')
-                                })
-                        {
+                        let prev_is_cont = self.scanned_to > self.line_start && {
+                            let pb = bytes[self.scanned_to - 1];
+                            if pb < 0x80 {
+                                matches!(pb, b']' | b'.' | b'[' | b'"' | b'\'')
+                                    || is_kv_ident_char(pb as char)
+                            } else {
+                                text[self.line_start..self.scanned_to]
+                                    .chars()
+                                    .next_back()
+                                    .is_some_and(|pc| {
+                                        is_kv_ident_char(pc)
+                                            || matches!(pc, ']' | '.' | '[' | '"' | '\'')
+                                    })
+                            }
+                        };
+                        if prev_is_cont {
                             self.line_sub_or_dots.push(self.scanned_to);
                             self.line_tight_sub_or_dots.push(self.scanned_to);
                         }
@@ -4823,11 +4965,16 @@ fn extract_kv_key_before_sep_with_memo<'a>(
                     let mut in_quote: Option<char> = None;
                     let mut idx = cursor;
                     while idx > memo.line_start {
-                        let (rel_idx, ch) = before_trim[memo.line_start..idx]
-                            .char_indices()
-                            .next_back()
-                            .unwrap();
-                        let abs_idx = memo.line_start + rel_idx;
+                        let prev_byte = bytes[idx - 1];
+                        let (abs_idx, ch) = if prev_byte < 0x80 {
+                            (idx - 1, prev_byte as char)
+                        } else {
+                            let (rel_idx, c) = before_trim[memo.line_start..idx]
+                                .char_indices()
+                                .next_back()
+                                .unwrap();
+                            (memo.line_start + rel_idx, c)
+                        };
                         idx = abs_idx;
                         if matches!(ch, '\n' | '\r') {
                             break;
@@ -4943,8 +5090,15 @@ fn extract_kv_key_before_sep_with_memo<'a>(
             } else {
                 &memo.squotes
             };
-            let pos_idx = q_positions.partition_point(|&p| p < inner_end);
-            let Some(quote_start) = pos_idx.checked_sub(1).map(|i| q_positions[i]) else {
+            let quote_start_opt = if q_positions.len() >= 2
+                && q_positions[q_positions.len() - 1] == inner_end
+            {
+                Some(q_positions[q_positions.len() - 2])
+            } else {
+                let pos_idx = q_positions.partition_point(|&p| p < inner_end);
+                pos_idx.checked_sub(1).map(|i| q_positions[i])
+            };
+            let Some(quote_start) = quote_start_opt else {
                 if saw_sub_or_dot {
                     cursor = inner_end;
                 }
@@ -5943,14 +6097,39 @@ fn advance_bracket_stack(text: &str, cursor: &mut usize, target: usize, stack: &
     if *cursor >= target {
         return;
     }
-    for ch in text[*cursor..target].chars() {
-        match ch {
-            '(' | '[' | '{' => stack.push(ch),
-            ')' | ']' | '}' => {
-                if let Some(expected_open) = matching_open_bracket(ch) {
-                    if stack.last().copied() == Some(expected_open) {
-                        stack.pop();
-                    }
+    const IS_BRACKET: [bool; 256] = {
+        let mut t = [false; 256];
+        t[b'(' as usize] = true;
+        t[b'[' as usize] = true;
+        t[b'{' as usize] = true;
+        t[b')' as usize] = true;
+        t[b']' as usize] = true;
+        t[b'}' as usize] = true;
+        t
+    };
+    let slice = &text.as_bytes()[*cursor..target];
+    let mut i = 0usize;
+    while i < slice.len() {
+        let b = slice[i];
+        i += 1;
+        if !IS_BRACKET[b as usize] {
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => stack.push(b as char),
+            b')' => {
+                if stack.last().copied() == Some('(') {
+                    stack.pop();
+                }
+            }
+            b']' => {
+                if stack.last().copied() == Some('[') {
+                    stack.pop();
+                }
+            }
+            b'}' => {
+                if stack.last().copied() == Some('{') {
+                    stack.pop();
                 }
             }
             _ => {}
@@ -6297,7 +6476,22 @@ fn is_safe_bearer_kv_rhs_text_prefix(
 ) -> bool {
     let mut local_memo = EnclosureOverflowMemo::default();
     let prefix = &s[..scan_limit.min(s.len())];
-    for (sep_idx, _) in prefix.match_indices([':', '=']) {
+    let mut next_eq = prefix.find('=').unwrap_or(usize::MAX);
+    let mut next_colon = prefix.find(':').unwrap_or(usize::MAX);
+    while next_eq != usize::MAX || next_colon != usize::MAX {
+        let sep_idx = if next_eq < next_colon {
+            let idx = next_eq;
+            next_eq = prefix[idx + 1..]
+                .find('=')
+                .map_or(usize::MAX, |r| idx + 1 + r);
+            idx
+        } else {
+            let idx = next_colon;
+            next_colon = prefix[idx + 1..]
+                .find(':')
+                .map_or(usize::MAX, |r| idx + 1 + r);
+            idx
+        };
         let rhs_raw = &s[sep_idx + 1..];
         let rhs = extract_auth_payload(rhs_raw);
         if let Some(ov) = rhs.enclosure_overflow {
@@ -6368,7 +6562,9 @@ fn is_safe_kv_same_line_trailing(
     if after_ws.is_empty() || after_ws.starts_with('\n') || after_ws.starts_with('\r') {
         return true;
     }
-    let line_end = tail_abs_start + rest.find(['\n', '\r']).unwrap_or(rest.len());
+    let nl = rest.find('\n').unwrap_or(rest.len());
+    let cr = rest[..nl].find('\r').unwrap_or(nl);
+    let line_end = tail_abs_start + cr;
     let same_line_tail = &text[tail_abs_start..line_end];
 
     let mut effective_tail = same_line_tail.trim_start();
@@ -6415,7 +6611,12 @@ fn is_safe_kv_same_line_trailing(
 
     let toks_slice = effective_tail[..scan_limit].trim_end();
     let mut toks = toks_slice.split_whitespace().peekable();
+    let mut last_safe_tok_a = "";
+    let mut last_safe_tok_b = "";
     while let Some(raw_tok) = toks.next() {
+        if raw_tok == last_safe_tok_a || raw_tok == last_safe_tok_b {
+            continue;
+        }
         let next_is_sep = toks
             .peek()
             .is_some_and(|n| *n == ":" || *n == "=" || n.starts_with([':', '=']));
@@ -6427,7 +6628,10 @@ fn is_safe_kv_same_line_trailing(
         };
         let is_kv_label = (raw_tok.ends_with([':', '=']) || next_is_sep)
             && has_following_val
-            && !raw_tok.contains(['"', '\'', '{', '}'])
+            && !raw_tok.contains('"')
+            && !raw_tok.contains('\'')
+            && !raw_tok.contains('{')
+            && !raw_tok.contains('}')
             && (is_safe_bearer_or_basic_value(key_name, true, true, params)
                 || is_clean_kv_key_identifier(key_name));
         if is_kv_label {
@@ -6436,6 +6640,8 @@ fn is_safe_kv_same_line_trailing(
         if !is_safe_bearer_or_basic_value(raw_tok, true, true, params) {
             return false;
         }
+        last_safe_tok_b = last_safe_tok_a;
+        last_safe_tok_a = raw_tok;
     }
     if !is_safe_bearer_kv_rhs_text_prefix(effective_tail, scan_limit, params) {
         return false;
@@ -6459,7 +6665,28 @@ struct BackwardCtxIndex {
 }
 
 impl BackwardCtxIndex {
-    fn build(text: &str, lower: &str) -> Self {
+    fn build(text: &str) -> Self {
+        const FAST_SKIP_BACKWARD: [bool; 256] = {
+            let mut t = [false; 256];
+            let mut i = 0usize;
+            while i < 128 {
+                let b = i as u8;
+                if (b >= b'a' && b <= b'z')
+                    || (b >= b'A' && b <= b'Z')
+                    || (b >= b'0' && b <= b'9')
+                    || matches!(
+                        b,
+                        b'_' | b',' | b'=' | b'-' | b'.' | b':' | b';' | b'&' | b'#' | b'!'
+                            | b'@' | b'$' | b'%' | b'^' | b'*' | b'+' | b'|' | b'~' | b'`'
+                            | b'\\' | b'>'
+                    )
+                {
+                    t[i] = true;
+                }
+                i += 1;
+            }
+            t
+        };
         let mut bracket_top_changes = vec![(0, None)];
         let mut stack: Vec<char> = Vec::new();
         let mut last_top: Option<char> = None;
@@ -6474,9 +6701,21 @@ impl BackwardCtxIndex {
         let mut next_nl: usize = 0;
 
         let bytes = text.as_bytes();
-        let mut it = text.char_indices().peekable();
-        while let Some((abs_i, c)) = it.next() {
-            let next_pos = abs_i + c.len_utf8();
+        let mut abs_i = 0usize;
+        while abs_i < bytes.len() {
+            while abs_i < bytes.len() && FAST_SKIP_BACKWARD[bytes[abs_i] as usize] {
+                abs_i += 1;
+            }
+            if abs_i >= bytes.len() {
+                break;
+            }
+            let b = bytes[abs_i];
+            let (c, next_pos) = if b < 0x80 {
+                (b as char, abs_i + 1)
+            } else {
+                let ch = text[abs_i..].chars().next().unwrap();
+                (ch, abs_i + ch.len_utf8())
+            };
             match c {
                 '(' | '[' | '{' => {
                     stack.push(c);
@@ -6501,7 +6740,7 @@ impl BackwardCtxIndex {
                 _ => {}
             }
 
-            if c == '{' && text[abs_i..].starts_with("{{") {
+            if c == '{' && bytes.get(abs_i + 1) == Some(&b'{') {
                 let search_from = abs_i + 2;
                 if next_dbrace < search_from {
                     next_dbrace = text[search_from..]
@@ -6515,9 +6754,15 @@ impl BackwardCtxIndex {
                 }
                 if next_dbrace < usize::MAX && next_dbrace < next_nl {
                     let ph_end = next_dbrace + 2;
-                    while it.peek().is_some_and(|&(ri, _)| ri < ph_end) {
-                        let (ri, pc) = it.next().unwrap();
-                        let p_next = ri + pc.len_utf8();
+                    let mut ri = next_pos;
+                    while ri < ph_end {
+                        let pb = bytes[ri];
+                        let (pc, p_next) = if pb < 0x80 {
+                            (pb as char, ri + 1)
+                        } else {
+                            let ch = text[ri..].chars().next().unwrap();
+                            (ch, ri + ch.len_utf8())
+                        };
                         match pc {
                             '(' | '[' | '{' => {
                                 stack.push(pc);
@@ -6541,20 +6786,18 @@ impl BackwardCtxIndex {
                             }
                             _ => {}
                         }
+                        ri = p_next;
                     }
+                    abs_i = ph_end;
                     continue;
                 }
-                if let Some(&(ri, pc)) = it.peek() {
-                    if ri == abs_i + 1 && pc == '{' {
-                        it.next();
-                        let p_next = ri + 1;
-                        stack.push('{');
-                        if last_top != Some('{') {
-                            bracket_top_changes.push((p_next, Some('{')));
-                            last_top = Some('{');
-                        }
-                    }
+                let p_next = abs_i + 2;
+                stack.push('{');
+                if last_top != Some('{') {
+                    bracket_top_changes.push((p_next, Some('{')));
+                    last_top = Some('{');
                 }
+                abs_i = p_next;
                 continue;
             }
 
@@ -6565,6 +6808,7 @@ impl BackwardCtxIndex {
                     b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b']' | b'%'
                 )
             {
+                abs_i = next_pos;
                 continue;
             }
 
@@ -6588,8 +6832,13 @@ impl BackwardCtxIndex {
             } else if c == '/' {
                 url_has_slash = true;
                 if !url_has_scheme && abs_i > last_url_prefix_start && bytes[abs_i - 1] == b'/' {
-                    let prefix_slice = &lower[last_url_prefix_start..=abs_i];
-                    if prefix_slice.ends_with("http://") || prefix_slice.ends_with("https://") {
+                    let prefix_bytes = &bytes[last_url_prefix_start..=abs_i];
+                    if (prefix_bytes.len() >= 7
+                        && prefix_bytes[prefix_bytes.len() - 7..].eq_ignore_ascii_case(b"http://"))
+                        || (prefix_bytes.len() >= 8
+                            && prefix_bytes[prefix_bytes.len() - 8..]
+                                .eq_ignore_ascii_case(b"https://"))
+                    {
                         url_has_scheme = true;
                     }
                 }
@@ -6599,6 +6848,7 @@ impl BackwardCtxIndex {
                     url_in_query_changes.push((next_pos, new_in_uq));
                 }
             }
+            abs_i = next_pos;
         }
 
         Self {
@@ -6624,7 +6874,7 @@ fn scan_variant_clean(
     params: &[ScriptParameter],
     verified_json_spans: &[(usize, usize)],
 ) -> Result<(), BotBrowserError> {
-    let lower = text.to_ascii_lowercase();
+    let text_has_backslash = text.contains('\\');
     let text_ptr = text.as_ptr() as usize;
     let in_verified_json = |pos: usize| verified_json_spans.iter().any(|&(s, e)| pos >= s && pos < e);
     let mut overflow_bearer_memo = EnclosureOverflowMemo::default();
@@ -6652,23 +6902,46 @@ fn scan_variant_clean(
     let mut key_cache_next = 0usize;
     let mut backward_ctx: Option<BackwardCtxIndex> = None;
 
+    const FAST_SKIP_URL_FWD: [bool; 256] = {
+        let mut t = [false; 256];
+        let mut i = 0usize;
+        while i < 128 {
+            let b = i as u8;
+            if (b >= b'a' && b <= b'z')
+                || (b >= b'A' && b <= b'Z')
+                || (b >= b'0' && b <= b'9')
+                || matches!(
+                    b,
+                    b'_' | b',' | b'=' | b'-' | b'.' | b':' | b';' | b'&' | b'#' | b']' | b')'
+                        | b'}' | b'>' | b'\\'
+                )
+            {
+                t[i] = true;
+            }
+            i += 1;
+        }
+        t
+    };
+
     // 1. Key-value assignment leaks (auth_token=..., authToken=..., auth_token_1=..., ct0=..., etc.)
     let text_bytes = text.as_bytes();
-    let mut sep_pos = 0usize;
-    while sep_pos < text_bytes.len() {
-        let b = text_bytes[sep_pos];
-        let sep_idx = sep_pos;
-        if b < 0x80 {
-            sep_pos += 1;
-            if b != b'=' && b != b':' {
-                continue;
-            }
+    let mut next_eq = text.find('=').unwrap_or(usize::MAX);
+    let mut next_colon = text.find(':').unwrap_or(usize::MAX);
+    while next_eq != usize::MAX || next_colon != usize::MAX {
+        let sep_idx = if next_eq < next_colon {
+            let idx = next_eq;
+            next_eq = text[idx + 1..]
+                .find('=')
+                .map_or(usize::MAX, |r| idx + 1 + r);
+            idx
         } else {
-            let ch = text[sep_pos..].chars().next().unwrap();
-            sep_pos += ch.len_utf8();
-            continue;
-        }
-        let ch = b as char;
+            let idx = next_colon;
+            next_colon = text[idx + 1..]
+                .find(':')
+                .map_or(usize::MAX, |r| idx + 1 + r);
+            idx
+        };
+        let ch = text_bytes[sep_idx] as char;
         if in_verified_json(sep_idx) {
             continue;
         }
@@ -6695,51 +6968,48 @@ fn scan_variant_clean(
         }
         let key_end = key_start + key.len();
         let (is_sensitive_key, has_bearer_seg, has_basic_seg, is_bearer_or_basic_key) =
-            if let Some(&(_, s, br, ba, bb)) = key_cache
-                .iter()
-                .flatten()
-                .find(|&&(cached_k, _, _, _, _)| cached_k == key)
+            if key.len() <= 128
+                && let Some(&(_, s, br, ba, bb)) = key_cache
+                    .iter()
+                    .flatten()
+                    .find(|&&(cached_k, _, _, _, _)| cached_k == key)
             {
                 (s, br, ba, bb)
             } else {
-                let (s, br, ba, bb) = if key.len() > 128 && !key.contains('\\') {
+                let mut fast_res: Option<(bool, bool, bool, bool)> = None;
+                if key.len() > 128 {
                     let seg_idx = kv_line_memo
                         .line_seg_index
                         .get_or_insert_with(|| LineSegIndex::build(text, kv_line_memo.line_start));
-                    let clean_start = key_start == seg_idx.line_start
-                        || !text.as_bytes()[key_start - 1].is_ascii_alphanumeric()
-                        || !text.as_bytes()[key_start].is_ascii_alphanumeric();
-                    let clean_end = key_end == seg_idx.line_end
-                        || !text.as_bytes()[key_end - 1].is_ascii_alphanumeric()
-                        || !text.as_bytes()[key_end].is_ascii_alphanumeric();
                     if key_start >= seg_idx.line_start
                         && key_end <= seg_idx.line_end
-                        && clean_start
-                        && clean_end
+                        && (!text_has_backslash || !seg_idx.has_backslash_in(key_start, key_end))
                     {
-                        let (s, br, ba) = seg_idx.query(key_start, key_end);
-                        let key_trimmed = key.trim();
-                        let bb = !s
-                            && (br || ba)
-                            && !key_trimmed.eq_ignore_ascii_case("bearer")
-                            && !key_trimmed.eq_ignore_ascii_case("basic");
-                        (s, br, ba, bb)
-                    } else {
-                        let key_segments = split_key_segments(key);
-                        let s = is_sensitive_json_key_with_segments(key, &key_segments);
-                        let br = key_segments.iter().any(|seg| seg == "bearer");
-                        let ba = key_segments.iter().any(|seg| seg == "basic");
-                        let key_trimmed = key.trim();
-                        let bb = !s
-                            && (br || ba)
-                            && !key_trimmed.eq_ignore_ascii_case("bearer")
-                            && !key_trimmed.eq_ignore_ascii_case("basic");
-                        (s, br, ba, bb)
+                        let clean_start = key_start == seg_idx.line_start
+                            || !text_bytes[key_start - 1].is_ascii_alphanumeric()
+                            || !text_bytes[key_start].is_ascii_alphanumeric();
+                        let clean_end = key_end == seg_idx.line_end
+                            || !text_bytes[key_end - 1].is_ascii_alphanumeric()
+                            || !text_bytes[key_end].is_ascii_alphanumeric();
+                        if clean_start && clean_end {
+                            let (s, br, ba) = seg_idx.query(key_start, key_end);
+                            let bb = !s
+                                && (br || ba)
+                                && {
+                                    let kt = key.trim();
+                                    !kt.eq_ignore_ascii_case("bearer")
+                                        && !kt.eq_ignore_ascii_case("basic")
+                                };
+                            fast_res = Some((s, br, ba, bb));
+                        }
                     }
+                }
+                let (s, br, ba, bb) = if let Some(res) = fast_res {
+                    res
                 } else {
                     let mut key_segments = split_key_segments(key);
                     let mut s = is_sensitive_json_key_with_segments(key, &key_segments);
-                    if !s && key.contains('\\') {
+                    if !s && text_has_backslash && key.contains('\\') {
                         let unesc = unescape_json_for_scan(key);
                         if unesc != key {
                             let unesc_segs = split_key_segments(&unesc);
@@ -6756,8 +7026,10 @@ fn scan_variant_clean(
                         && !key_trimmed.eq_ignore_ascii_case("basic");
                     (s, br, ba, bb)
                 };
-                key_cache[key_cache_next] = Some((key, s, br, ba, bb));
-                key_cache_next = (key_cache_next + 1) & 7;
+                if key.len() <= 128 {
+                    key_cache[key_cache_next] = Some((key, s, br, ba, bb));
+                    key_cache_next = (key_cache_next + 1) & 7;
+                }
                 (s, br, ba, bb)
             };
         if !is_sensitive_key && !is_bearer_or_basic_key {
@@ -6765,8 +7037,7 @@ fn scan_variant_clean(
         }
         let (open_bracket, in_url_query) =
             if key_start < kv_bracket_cursor || key_start < url_delim_cursor {
-                let ctx = backward_ctx
-                    .get_or_insert_with(|| BackwardCtxIndex::build(text, &lower));
+                let ctx = backward_ctx.get_or_insert_with(|| BackwardCtxIndex::build(text));
                 (
                     ctx.open_bracket_at(key_start),
                     ctx.url_in_query_at(key_start),
@@ -6774,10 +7045,22 @@ fn scan_variant_clean(
             } else {
                 advance_bracket_stack(text, &mut kv_bracket_cursor, key_start, &mut kv_bracket_stack);
                 let ob = kv_bracket_stack.last().copied();
-                let mut it = text[url_delim_cursor..key_start].char_indices().peekable();
-                while let Some((rel_i, c)) = it.next() {
-                    let abs_i = url_delim_cursor + rel_i;
-                    if c == '{' && text[abs_i..].starts_with("{{") {
+                let mut abs_i = url_delim_cursor;
+                while abs_i < key_start {
+                    while abs_i < key_start && FAST_SKIP_URL_FWD[text_bytes[abs_i] as usize] {
+                        abs_i += 1;
+                    }
+                    if abs_i >= key_start {
+                        break;
+                    }
+                    let b = text_bytes[abs_i];
+                    let (c, next_pos) = if b < 0x80 {
+                        (b as char, abs_i + 1)
+                    } else {
+                        let ch = text[abs_i..].chars().next().unwrap();
+                        (ch, abs_i + ch.len_utf8())
+                    };
+                    if c == '{' && text_bytes.get(abs_i + 1) == Some(&b'{') {
                         let search_from = abs_i + 2;
                         if fwd_next_dbrace < search_from {
                             fwd_next_dbrace = text[search_from..]
@@ -6790,29 +7073,24 @@ fn scan_variant_clean(
                                 .map_or(usize::MAX, |r| search_from + r);
                         }
                         if fwd_next_dbrace < key_start && fwd_next_dbrace < fwd_next_nl {
-                            let ph_end = fwd_next_dbrace + 2;
-                            while it
-                                .peek()
-                                .is_some_and(|&(ri, _)| url_delim_cursor + ri < ph_end)
-                            {
-                                it.next();
-                            }
+                            abs_i = fwd_next_dbrace + 2;
                             continue;
                         }
-                        it.next();
+                        abs_i = (abs_i + 2).min(key_start);
                         continue;
                     }
                     if c == '['
                         && abs_i > 0
                         && matches!(
-                            text.as_bytes()[abs_i - 1],
+                            text_bytes[abs_i - 1],
                             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b']' | b'%'
                         )
                     {
+                        abs_i = next_pos;
                         continue;
                     }
                     if c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '(' | '[' | '{') {
-                        last_url_prefix_start = abs_i + c.len_utf8();
+                        last_url_prefix_start = next_pos;
                         url_has_scheme = false;
                         url_has_qmark = false;
                         url_has_slash = false;
@@ -6822,16 +7100,21 @@ fn scan_variant_clean(
                         url_has_slash = true;
                         if !url_has_scheme
                             && abs_i > last_url_prefix_start
-                            && text.as_bytes()[abs_i - 1] == b'/'
+                            && text_bytes[abs_i - 1] == b'/'
                         {
-                            let prefix_slice = &lower[last_url_prefix_start..=abs_i];
-                            if prefix_slice.ends_with("http://")
-                                || prefix_slice.ends_with("https://")
+                            let prefix_bytes = &text_bytes[last_url_prefix_start..=abs_i];
+                            if (prefix_bytes.len() >= 7
+                                && prefix_bytes[prefix_bytes.len() - 7..]
+                                    .eq_ignore_ascii_case(b"http://"))
+                                || (prefix_bytes.len() >= 8
+                                    && prefix_bytes[prefix_bytes.len() - 8..]
+                                        .eq_ignore_ascii_case(b"https://"))
                             {
                                 url_has_scheme = true;
                             }
                         }
                     }
+                    abs_i = next_pos;
                 }
                 url_delim_cursor = key_start;
                 let in_uq = url_has_scheme
@@ -7002,17 +7285,17 @@ fn scan_variant_clean(
             }
             continue;
         }
-        let key_base_lower = key
+        let key_base = key
             .split('[')
             .next()
             .unwrap_or(key)
             .trim()
-            .trim_matches(['"', '\''])
-            .to_ascii_lowercase();
-        if key_base_lower == "authorization"
-            || key_base_lower.ends_with("-authorization")
-            || key_base_lower.ends_with("_authorization")
-        {
+            .trim_matches(|c| c == '"' || c == '\'');
+        let is_auth_key = key_base.len() >= 13
+            && key_base.as_bytes()[key_base.len() - 13..].eq_ignore_ascii_case(b"authorization")
+            && (key_base.len() == 13
+                || matches!(key_base.as_bytes()[key_base.len() - 14], b'-' | b'_'));
+        if is_auth_key {
             let mut after_closing_quote: Option<&str> = None;
             let scheme_after = {
                 let lower_after = after_sep.to_ascii_lowercase();
@@ -7128,10 +7411,15 @@ fn scan_variant_clean(
     }
 
     // 2. Bearer tokens ("Authorization: Bearer ..." or "Bearer <token>")
+    let lower = if text.contains('b') || text.contains('B') {
+        text.to_ascii_lowercase()
+    } else {
+        String::new()
+    };
     let mut search_from = 0usize;
     let mut bearer_bracket_stack: Vec<char> = Vec::new();
     let mut bearer_bracket_cursor = 0usize;
-    while let Some(rel_idx) = lower[search_from..].find("bearer") {
+    while !lower.is_empty() && let Some(rel_idx) = lower[search_from..].find("bearer") {
         let abs_idx = search_from + rel_idx;
         search_from = abs_idx + 6;
         if in_verified_json(abs_idx) {
@@ -7362,7 +7650,7 @@ fn scan_variant_clean(
     let mut search_from = 0usize;
     let mut basic_bracket_stack: Vec<char> = Vec::new();
     let mut basic_bracket_cursor = 0usize;
-    while let Some(rel_idx) = lower[search_from..].find("basic") {
+    while !lower.is_empty() && let Some(rel_idx) = lower[search_from..].find("basic") {
         let abs_idx = search_from + rel_idx;
         search_from = abs_idx + 5;
         if in_verified_json(abs_idx) {
@@ -7530,74 +7818,83 @@ fn scan_variant_clean(
     }
 
     // 4. Well-known API key prefixes and JWTs
-    for token in text.split(|c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '"' | '\''
-                    | '`'
-                    | '<'
-                    | '>'
-                    | ','
-                    | ';'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '='
-                    | ':'
-                    | '?'
-                    | '&'
-                    | '#'
-                    | '/'
-            )
-    }) {
-        if token.starts_with("sk-ant-") && token.len() >= 20 {
-            return Err(BotBrowserError::SecretLeakDetected(format!(
-                "Anthropic API key pattern detected in {context}"
-            )));
-        }
-        if token.starts_with("sk-proj-") && token.len() >= 20 {
-            return Err(BotBrowserError::SecretLeakDetected(format!(
-                "OpenAI project key pattern detected in {context}"
-            )));
-        }
-        if token.starts_with("sk-")
-            && token.len() >= 19
-            && token[3..]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(BotBrowserError::SecretLeakDetected(format!(
-                "API key 'sk-...' pattern detected in {context}"
-            )));
-        }
-        if (token.starts_with("ghp_")
-            || token.starts_with("gho_")
-            || token.starts_with("ghu_")
-            || token.starts_with("github_pat_"))
-            && token.len() >= 24
-        {
-            return Err(BotBrowserError::SecretLeakDetected(format!(
-                "GitHub token pattern detected in {context}"
-            )));
-        }
-        if token.starts_with("AKIA")
-            && token.len() == 20
-            && token[4..]
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        {
-            return Err(BotBrowserError::SecretLeakDetected(format!(
-                "AWS access key pattern detected in {context}"
-            )));
-        }
-        if token.starts_with("eyJ") && is_jwt_like(token) {
-            return Err(BotBrowserError::SecretLeakDetected(format!(
-                "plaintext JWT detected in {context}"
-            )));
+    if text.contains("sk-")
+        || text.contains("ghp_")
+        || text.contains("gho_")
+        || text.contains("ghu_")
+        || text.contains("github_pat_")
+        || text.contains("AKIA")
+        || text.contains("eyJ")
+    {
+        for token in text.split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\''
+                        | '`'
+                        | '<'
+                        | '>'
+                        | ','
+                        | ';'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '='
+                        | ':'
+                        | '?'
+                        | '&'
+                        | '#'
+                        | '/'
+                )
+        }) {
+            if token.starts_with("sk-ant-") && token.len() >= 20 {
+                return Err(BotBrowserError::SecretLeakDetected(format!(
+                    "Anthropic API key pattern detected in {context}"
+                )));
+            }
+            if token.starts_with("sk-proj-") && token.len() >= 20 {
+                return Err(BotBrowserError::SecretLeakDetected(format!(
+                    "OpenAI project key pattern detected in {context}"
+                )));
+            }
+            if token.starts_with("sk-")
+                && token.len() >= 19
+                && token[3..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(BotBrowserError::SecretLeakDetected(format!(
+                    "API key 'sk-...' pattern detected in {context}"
+                )));
+            }
+            if (token.starts_with("ghp_")
+                || token.starts_with("gho_")
+                || token.starts_with("ghu_")
+                || token.starts_with("github_pat_"))
+                && token.len() >= 24
+            {
+                return Err(BotBrowserError::SecretLeakDetected(format!(
+                    "GitHub token pattern detected in {context}"
+                )));
+            }
+            if token.starts_with("AKIA")
+                && token.len() == 20
+                && token[4..]
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            {
+                return Err(BotBrowserError::SecretLeakDetected(format!(
+                    "AWS access key pattern detected in {context}"
+                )));
+            }
+            if token.starts_with("eyJ") && is_jwt_like(token) {
+                return Err(BotBrowserError::SecretLeakDetected(format!(
+                    "plaintext JWT detected in {context}"
+                )));
+            }
         }
     }
 

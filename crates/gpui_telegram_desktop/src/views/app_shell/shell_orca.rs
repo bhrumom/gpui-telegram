@@ -275,6 +275,8 @@ impl AppShell {
     /// Opens the top-level `ScopedJumpPalette` (`Cmd+J`) overlay hydrated with live runtime items.
     pub fn open_scoped_jump_palette(&mut self, cx: &mut Context<Self>) -> Entity<ScopedJumpPalette> {
         self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+        self.occlude_browser_for_overlay(cx);
+        self.blur_composer_and_cancel_ime(cx);
         let rt = self.ensure_orca_runtime();
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();

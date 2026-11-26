@@ -7,10 +7,10 @@
 //! typo fuzzy repair over `vault_vocab`, retention pruning, tool-output purging,
 //! conversation forking, and cross-agent handoff prompt synthesis.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS vault_indexed_files (
     workspace_id TEXT NOT NULL,
     byte_offset INTEGER NOT NULL DEFAULT 0,
     prefix_hash TEXT NOT NULL,
+    anchor_prefix_len INTEGER NOT NULL DEFAULT 0,
+    anchor_prefix_hash TEXT NOT NULL DEFAULT '',
     generation INTEGER NOT NULL DEFAULT 0,
     incarnation TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
@@ -112,8 +114,11 @@ pub struct VaultIndexFileReport {
     pub session_id: String,
     pub reindexed_from_zero: bool,
     pub incremental_append: bool,
+    pub incremental: bool,
     pub bytes_indexed: usize,
+    pub byte_offset: usize,
     pub new_byte_offset: usize,
+    pub prefix_hash: String,
     pub messages_added: usize,
     pub generation: u64,
     pub incarnation: String,
@@ -130,10 +135,11 @@ pub struct VaultSearchCursor {
 /// Search parameters for [`AiVaultSearchEngine::search`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultSearchRequest {
+    #[serde(alias = "q")]
     pub query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "workspace", alias = "workspacePath", alias = "workspace_path", skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "agent", alias = "agentId", skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
@@ -150,6 +156,7 @@ const fn default_search_limit() -> usize {
 pub struct VaultSearchHit {
     pub session_id: String,
     pub agent_id: String,
+    pub agent: String,
     pub workspace_id: String,
     pub rank: f64,
     pub snippet: String,
@@ -260,16 +267,39 @@ pub fn damerau_levenshtein_distance(a: &str, b: &str) -> usize {
     dp[m][n]
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct VaultSourceManifest {
+    #[serde(default)]
+    opt_in: bool,
+    #[serde(default)]
+    sources: BTreeMap<String, VaultSourceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VaultSourceRecord {
+    session_id: String,
+    agent_id: String,
+    workspace_id: String,
+    file_path: String,
+}
+
 /// Cross-agent SQLite FTS5 transcript search engine (`Send + Sync`).
 pub struct AiVaultSearchEngine {
+    db_path: Option<PathBuf>,
     conn: Mutex<Connection>,
     rebuilt_on_open: bool,
+    rebuild_count: std::sync::atomic::AtomicU64,
 }
 
 impl fmt::Debug for AiVaultSearchEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AiVaultSearchEngine")
+            .field("db_path", &self.db_path)
             .field("rebuilt_on_open", &self.rebuilt_on_open)
+            .field(
+                "rebuild_count",
+                &self.rebuild_count.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -342,6 +372,7 @@ fn parse_transcript_chunk(chunk: &[u8], default_ts: i64) -> Vec<VaultMessageInpu
                 .to_string();
             let content = val
                 .get("content")
+                .or_else(|| val.get("text"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
@@ -496,16 +527,112 @@ fn rebuild_session_fts_and_vocab(conn: &Connection, session_id: &str) -> Result<
 }
 
 impl AiVaultSearchEngine {
+    fn manifest_path_for(db_path: &Path) -> PathBuf {
+        db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("ai_vault_sources.json")
+    }
+
+    fn load_source_manifest(db_path: &Path) -> VaultSourceManifest {
+        let p = Self::manifest_path_for(db_path);
+        fs::read_to_string(p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn persist_source_manifest(&self, mutate: impl FnOnce(&mut VaultSourceManifest)) {
+        let Some(ref db_p) = self.db_path else {
+            return;
+        };
+        let mut m = Self::load_source_manifest(db_p);
+        mutate(&mut m);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&m) {
+            let _ = fs::write(Self::manifest_path_for(db_p), bytes);
+        }
+    }
+
     /// Opens the AI Vault FTS5 SQLite cache via [`open_versioned_cache_db`] at schema v8.
-    /// Automatically rebuilds corrupt or stale-schema DBs.
+    /// Automatically rebuilds corrupt or stale-schema DBs once and replays recorded sources (`SM1-13`).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let db_path = path.as_ref().to_path_buf();
         let (conn, rebuilt) =
-            open_versioned_cache_db(path.as_ref(), VAULT_SCHEMA_VERSION, VAULT_SCHEMA_SQL)?;
+            open_versioned_cache_db(&db_path, VAULT_SCHEMA_VERSION, VAULT_SCHEMA_SQL)?;
+        // Safe additive migrations for pre-existing v8 DBs.
+        let _ = conn.execute(
+            "ALTER TABLE vault_indexed_files ADD COLUMN anchor_prefix_len INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE vault_indexed_files ADD COLUMN anchor_prefix_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let _ = ensure_vault_meta(&conn)?;
-        Ok(Self {
+        let engine = Self {
+            db_path: Some(db_path.clone()),
             conn: Mutex::new(conn),
             rebuilt_on_open: rebuilt,
-        })
+            rebuild_count: std::sync::atomic::AtomicU64::new(u64::from(rebuilt)),
+        };
+        if rebuilt {
+            let manifest = Self::load_source_manifest(&db_path);
+            if manifest.opt_in {
+                let _ = engine.set_opt_in(true);
+            }
+            let now_ms = crate::now_epoch_ms();
+            for src in manifest.sources.values() {
+                let fp = Path::new(&src.file_path);
+                if fp.is_file() {
+                    let _ = engine.index_transcript_file(
+                        fp,
+                        &src.session_id,
+                        &src.agent_id,
+                        &src.workspace_id,
+                        now_ms,
+                    );
+                }
+            }
+        }
+        Ok(engine)
+    }
+
+    /// Returns the on-disk cache SQLite path if durable.
+    pub fn cache_db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    /// Returns how many times the corrupt FTS5 cache has been auto-rebuilt on startup.
+    pub fn rebuild_count(&self) -> u64 {
+        self.rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Persists user opt-in state for AI Vault indexing in `vault_meta`.
+    pub fn set_opt_in(&self, enabled: bool) -> Result<bool> {
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO vault_meta (key, value) VALUES ('opt_in', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![if enabled { "true" } else { "false" }],
+            )?;
+        }
+        self.persist_source_manifest(|m| m.opt_in = enabled);
+        Ok(enabled)
+    }
+
+    /// Reads persisted opt-in state from `vault_meta` (defaults to `false`).
+    pub fn is_opt_in(&self) -> Result<bool> {
+        let conn = self.conn.lock();
+        let val: Option<String> = conn
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'opt_in'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(val.as_deref() == Some("true"))
     }
 
     /// Returns `true` if opening this cache DB detected corruption or stale `user_version`
@@ -540,45 +667,77 @@ impl AiVaultSearchEngine {
         }
         let bytes = fs::read(file_path)?;
         let file_key = file_path.to_string_lossy().to_string();
+        self.persist_source_manifest(|m| {
+            m.sources.insert(
+                session_id.to_string(),
+                VaultSourceRecord {
+                    session_id: session_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    file_path: file_key.clone(),
+                },
+            );
+        });
 
         let mut conn = self.conn.lock();
-        let prev: Option<(usize, String)> = conn
+        let prev: Option<(usize, String, usize, String)> = conn
             .query_row(
-                "SELECT byte_offset, prefix_hash FROM vault_indexed_files WHERE file_path = ?1",
+                "SELECT byte_offset, prefix_hash, anchor_prefix_len, anchor_prefix_hash
+                 FROM vault_indexed_files WHERE file_path = ?1",
                 params![&file_key],
-                |r| Ok((r.get::<_, i64>(0)?.max(0) as usize, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?.max(0) as usize,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?.max(0) as usize,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
             )
             .optional()?;
 
-        let (start_offset, reindexed_from_zero, incremental_append) = match prev {
-            Some((prev_offset, prev_hash)) if prev_offset > 0 && bytes.len() >= prev_offset => {
-                let current_prefix_hash = sha256_hex(&bytes[..prev_offset]);
-                if current_prefix_hash == prev_hash {
-                    if bytes.len() == prev_offset {
-                        let (generation, inc) = ensure_vault_meta(&conn)?;
-                        return Ok(VaultIndexFileReport {
-                            file_path: file_key,
-                            session_id: session_id.to_string(),
-                            reindexed_from_zero: false,
-                            incremental_append: false,
-                            bytes_indexed: 0,
-                            new_byte_offset: prev_offset,
-                            messages_added: 0,
-                            generation,
-                            incarnation: inc,
-                        });
-                    }
-                    (prev_offset, false, true)
-                } else {
-                    (0, true, false)
-                }
-            }
-            _ => (0, true, false),
-        };
-
-        let parsed = parse_transcript_chunk(&bytes[start_offset..], now_ms);
         let full_hash = sha256_hex(&bytes);
         let new_offset = bytes.len();
+
+        let (start_offset, reindexed_from_zero, incremental_append, anchor_len, anchor_hash) =
+            match prev {
+                Some((prev_offset, prev_hash, prev_anchor_len, prev_anchor_hash))
+                    if prev_offset > 0 && bytes.len() >= prev_offset =>
+                {
+                    let current_prefix_hash = sha256_hex(&bytes[..prev_offset]);
+                    if current_prefix_hash == prev_hash {
+                        let (eff_anchor_len, eff_anchor_hash) =
+                            if prev_anchor_len > 0 && !prev_anchor_hash.is_empty() {
+                                (prev_anchor_len, prev_anchor_hash)
+                            } else {
+                                (prev_offset, prev_hash)
+                            };
+                        if bytes.len() == prev_offset {
+                            let (generation, inc) = ensure_vault_meta(&conn)?;
+                            return Ok(VaultIndexFileReport {
+                                file_path: file_key,
+                                session_id: session_id.to_string(),
+                                reindexed_from_zero: false,
+                                incremental_append: false,
+                                incremental: false,
+                                bytes_indexed: 0,
+                                byte_offset: prev_offset,
+                                new_byte_offset: prev_offset,
+                                prefix_hash: eff_anchor_hash,
+                                messages_added: 0,
+                                generation,
+                                incarnation: inc,
+                            });
+                        }
+                        (prev_offset, false, true, eff_anchor_len, eff_anchor_hash)
+                    } else {
+                        (0, true, false, new_offset, full_hash.clone())
+                    }
+                }
+                _ => (0, true, false, new_offset, full_hash.clone()),
+            };
+
+        let parsed = parse_transcript_chunk(&bytes[start_offset..], now_ms);
 
         let tx = conn.transaction()?;
         if reindexed_from_zero {
@@ -625,14 +784,16 @@ impl AiVaultSearchEngine {
         let (generation, incarnation) = bump_generation(&tx)?;
         tx.execute(
             "INSERT INTO vault_indexed_files
-                (file_path, session_id, agent_id, workspace_id, byte_offset, prefix_hash, generation, incarnation, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (file_path, session_id, agent_id, workspace_id, byte_offset, prefix_hash, anchor_prefix_len, anchor_prefix_hash, generation, incarnation, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(file_path) DO UPDATE SET
                 session_id = excluded.session_id,
                 agent_id = excluded.agent_id,
                 workspace_id = excluded.workspace_id,
                 byte_offset = excluded.byte_offset,
                 prefix_hash = excluded.prefix_hash,
+                anchor_prefix_len = excluded.anchor_prefix_len,
+                anchor_prefix_hash = excluded.anchor_prefix_hash,
                 generation = excluded.generation,
                 incarnation = excluded.incarnation,
                 updated_at_ms = excluded.updated_at_ms",
@@ -643,6 +804,8 @@ impl AiVaultSearchEngine {
                 workspace_id,
                 new_offset as i64,
                 &full_hash,
+                anchor_len as i64,
+                &anchor_hash,
                 generation as i64,
                 &incarnation,
                 now_ms,
@@ -655,8 +818,11 @@ impl AiVaultSearchEngine {
             session_id: session_id.to_string(),
             reindexed_from_zero,
             incremental_append,
+            incremental: incremental_append,
             bytes_indexed: new_offset.saturating_sub(start_offset),
+            byte_offset: new_offset,
             new_byte_offset: new_offset,
+            prefix_hash: anchor_hash,
             messages_added: added,
             generation,
             incarnation,
@@ -769,9 +935,11 @@ fn query_fts5_hits(
             .take(16)
             .map(ToOwned::to_owned)
             .collect();
+        let agent_id: String = row.get(1)?;
         Ok(VaultSearchHit {
             session_id: row.get(0)?,
-            agent_id: row.get(1)?,
+            agent: agent_id.clone(),
+            agent_id,
             workspace_id: row.get(2)?,
             rank: row.get(3)?,
             snippet: row.get(4)?,
@@ -882,8 +1050,24 @@ impl AiVaultSearchEngine {
         )?;
 
         if hits.is_empty() && offset == 0 {
-            // Try split code identifiers first, then Damerau-Levenshtein typo repair.
-            let split_tokens = split_code_identifiers(&req.query);
+            // Try split code identifiers first (stripping unsplit compound terms that already
+            // missed exact search), then Damerau-Levenshtein typo repair.
+            let mut split_tokens = Vec::new();
+            for raw_word in req.query.split_whitespace() {
+                let w_lower = raw_word.trim().to_ascii_lowercase();
+                if w_lower.is_empty() {
+                    continue;
+                }
+                let sub: Vec<String> = split_code_identifiers(raw_word)
+                    .into_iter()
+                    .filter(|t| t != &w_lower)
+                    .collect();
+                if !sub.is_empty() {
+                    split_tokens.extend(sub);
+                } else {
+                    split_tokens.push(w_lower);
+                }
+            }
             if !split_tokens.is_empty()
                 && split_tokens != raw_tokens
                 && let Some(split_expr) = build_fts5_match_expr(&split_tokens)

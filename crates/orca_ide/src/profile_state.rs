@@ -2,12 +2,13 @@
 //! Versioned Cache Auto-Rebuild (`open_versioned_cache_db`), and Non-Destructive
 //! `ProtectedSecretPersistence` (`F16`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use sha2::{Digest, Sha256};
 
 use orca_core::orchestration_protocol::{
     AtomicSnapshot, AtomicSnapshotGenerationFence, ProtectedSecret, SealedProtectedSecret,
@@ -138,12 +139,15 @@ fn validate_non_empty_key(label: &str, raw: &str) -> Result<String> {
 /// Thread-safe (`Send + Sync`), WAL-backed SQLite v3 ProfileState authority supporting
 /// targeted dirty-domain writes with monotonic optimistic revision fencing.
 pub struct ProfileStateAuthority {
+    db_path: Option<PathBuf>,
     conn: Mutex<Connection>,
 }
 
 impl fmt::Debug for ProfileStateAuthority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProfileStateAuthority").finish()
+        f.debug_struct("ProfileStateAuthority")
+            .field("db_path", &self.db_path)
+            .finish()
     }
 }
 
@@ -159,6 +163,7 @@ impl ProfileStateAuthority {
         let conn = Connection::open(path)?;
         configure_profile_state_connection(&conn)?;
         Ok(Self {
+            db_path: Some(path.to_path_buf()),
             conn: Mutex::new(conn),
         })
     }
@@ -168,8 +173,221 @@ impl ProfileStateAuthority {
         let conn = Connection::open_in_memory()?;
         configure_profile_state_connection(&conn)?;
         Ok(Self {
+            db_path: None,
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Returns the on-disk SQLite DB path when durable.
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    fn breadcrumb_path_for(db_path: &Path) -> PathBuf {
+        let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+        parent.join("profile_state_recovery_breadcrumb.json")
+    }
+
+    /// Inspects ProfileState DB header integrity and optional legacy JSON divergence (`SM1-03`).
+    pub fn inspect_recovery(
+        &self,
+        db_override: Option<&Path>,
+        legacy_json_path: Option<&Path>,
+    ) -> serde_json::Value {
+        let target_db = db_override
+            .map(Path::to_path_buf)
+            .or_else(|| self.db_path.clone());
+        let mut corrupted = false;
+        let mut diverged = false;
+        let mut reasons: Vec<String> = Vec::new();
+
+        if let Some(ref db_p) = target_db {
+            if let Ok(raw) = fs::read(db_p) {
+                if raw.len() < 16 || &raw[..16] != b"SQLite format 3\0" {
+                    corrupted = true;
+                    reasons.push("sqlite_header_corrupted".to_string());
+                } else {
+                    match Connection::open_with_flags(
+                        db_p,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    ) {
+                        Ok(ro) => {
+                            let qc = ro.query_row("PRAGMA quick_check;", [], |r| {
+                                r.get::<_, String>(0)
+                            });
+                            if !matches!(qc.as_deref(), Ok("ok")) {
+                                corrupted = true;
+                                reasons.push("sqlite_quick_check_failed".to_string());
+                            }
+                        }
+                        Err(_) => {
+                            corrupted = true;
+                            reasons.push("sqlite_open_failed".to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(leg_p) = legacy_json_path
+            && leg_p.is_file()
+            && let Ok(text) = fs::read_to_string(leg_p)
+            && let Ok(leg_val) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            if let Some(leg_obj) = leg_val.as_object() {
+                for (dom, leg_payload) in leg_obj {
+                    let cur = self.get_domain(dom).ok().flatten().map(|d| d.payload);
+                    if cur.as_ref() != Some(leg_payload) {
+                        diverged = true;
+                        reasons.push(format!("legacy_json_diverged:{dom}"));
+                        break;
+                    }
+                }
+            } else {
+                diverged = true;
+                reasons.push("legacy_json_diverged".to_string());
+            }
+        }
+
+        let mut persisted_bc: Option<serde_json::Value> = None;
+        if let Some(ref db_p) = target_db {
+            let bc_path = Self::breadcrumb_path_for(db_p);
+            if corrupted || diverged {
+                let bc_obj = serde_json::json!({
+                    "corrupted": corrupted,
+                    "diverged": diverged,
+                    "reasons": reasons,
+                    "profile_db_path": db_p.to_string_lossy(),
+                    "recorded_at_ms": now_epoch_ms(),
+                });
+                let _ = fs::write(
+                    &bc_path,
+                    serde_json::to_vec_pretty(&bc_obj).unwrap_or_default(),
+                );
+                persisted_bc = Some(bc_obj);
+            } else if bc_path.is_file()
+                && let Ok(raw) = fs::read_to_string(&bc_path)
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            {
+                corrupted = v.get("corrupted").and_then(|x| x.as_bool()).unwrap_or(false);
+                diverged = v.get("diverged").and_then(|x| x.as_bool()).unwrap_or(false);
+                persisted_bc = Some(v);
+            }
+        }
+
+        let recovery_required = corrupted || diverged;
+        let actions = if recovery_required {
+            serde_json::json!([
+                { "id": "repair", "action": "repair", "label": "Selective Repair SQLite DB" },
+                { "id": "rollback", "action": "rollback", "label": "Rollback from Backup Snapshot" }
+            ])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::json!({
+            "profile_db_path": target_db.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "corrupted": corrupted,
+            "diverged": diverged,
+            "recovery_required": recovery_required,
+            "breadcrumb": persisted_bc,
+            "crash_breadcrumb": persisted_bc,
+            "actions": actions,
+            "options": actions,
+        })
+    }
+
+    /// Rebuilds the ProfileState SQLite DB cleanly from an exported backup JSON file (`SM1-03`).
+    pub fn rollback_from_backup(
+        &self,
+        backup_path: &Path,
+        now_ms: i64,
+    ) -> Result<serde_json::Value> {
+        let raw_text = fs::read_to_string(backup_path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw_text)?;
+
+        let mut domain_rows: Vec<(String, u32, serde_json::Value)> = Vec::new();
+        if let Some(arr) = parsed.get("domains").and_then(|v| v.as_array()) {
+            for entry in arr {
+                if let Some(dom) = entry.get("domain").and_then(|v| v.as_str()) {
+                    let ver = entry
+                        .get("domain_version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1) as u32;
+                    let payload = entry
+                        .get("payload")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    domain_rows.push((dom.to_string(), ver, payload));
+                }
+            }
+        } else if let Some(obj) = parsed.as_object() {
+            for (k, v) in obj {
+                if matches!(k.as_str(), "schema_version" | "document_parts") {
+                    continue;
+                }
+                domain_rows.push((k.clone(), 1, v.clone()));
+            }
+        }
+
+        let mut parts_by_domain: Vec<(String, Vec<(String, i64, serde_json::Value)>)> = Vec::new();
+        if let Some(parts_obj) = parsed.get("document_parts").and_then(|v| v.as_object()) {
+            for (dom, val) in parts_obj {
+                if let Some(arr) = val.as_array() {
+                    let mut list = Vec::new();
+                    for (idx, p) in arr.iter().enumerate() {
+                        if let Some(pk) = p.get("part_key").and_then(|x| x.as_str()) {
+                            let ord = p
+                                .get("ordinal")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or(idx as i64);
+                            let payload =
+                                p.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+                            list.push((pk.to_string(), ord, payload));
+                        }
+                    }
+                    parts_by_domain.push((dom.clone(), list));
+                }
+            }
+        }
+
+        if let Some(ref db_p) = self.db_path {
+            let mut conn_guard = self.conn.lock();
+            // Drop old handle before unlinking corrupt files, then open fresh SQLite v3 DB.
+            let mem_tmp = Connection::open_in_memory()?;
+            let old = std::mem::replace(&mut *conn_guard, mem_tmp);
+            drop(old);
+            unlink_sqlite_files(db_p);
+            let fresh = Connection::open(db_p)?;
+            configure_profile_state_connection(&fresh)?;
+            *conn_guard = fresh;
+            let _ = fs::remove_file(Self::breadcrumb_path_for(db_p));
+        } else {
+            let conn_guard = self.conn.lock();
+            conn_guard.execute("DELETE FROM profile_state_documents", [])?;
+            conn_guard.execute("DELETE FROM profile_state_document_parts", [])?;
+        }
+
+        let mutations: Vec<DirtyDomainMutation> = domain_rows
+            .into_iter()
+            .map(|(domain, domain_version, payload)| DirtyDomainMutation {
+                domain,
+                expected_revision: None,
+                domain_version,
+                payload,
+            })
+            .collect();
+        if !mutations.is_empty() {
+            let _ = self.write_dirty_domains(&mutations, now_ms)?;
+        }
+        for (dom, parts) in parts_by_domain {
+            let _ = self.replace_document_parts(&dom, &parts)?;
+        }
+
+        Ok(serde_json::json!({
+            "rolled_back": true,
+            "domains_restored": mutations.len(),
+            "profile_db_path": self.db_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        }))
     }
 
     /// Reads one persisted domain document.
@@ -340,6 +558,85 @@ impl ProfileStateAuthority {
             out.push(item?);
         }
         Ok(out)
+    }
+
+    /// Atomically replaces all document parts for `domain` inside one transaction.
+    pub fn replace_document_parts(
+        &self,
+        domain: &str,
+        parts: &[(String, i64, serde_json::Value)],
+    ) -> Result<Vec<ProfileStateDocumentPart>> {
+        let dom = validate_non_empty_key("domain", domain)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM profile_state_document_parts WHERE domain = ?1",
+            params![&dom],
+        )?;
+        let mut saved = Vec::with_capacity(parts.len());
+        for (raw_key, ordinal, payload) in parts {
+            let key = validate_non_empty_key("part_key", raw_key)?;
+            let payload_str = serde_json::to_string(payload)?;
+            let content_hash = canonical_json_sha256(payload);
+            tx.execute(
+                "INSERT INTO profile_state_document_parts
+                    (domain, part_key, ordinal, payload, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(domain, part_key) DO UPDATE SET
+                    ordinal = excluded.ordinal,
+                    payload = excluded.payload,
+                    content_hash = excluded.content_hash",
+                params![&dom, &key, *ordinal, &payload_str, &content_hash],
+            )?;
+            saved.push(ProfileStateDocumentPart {
+                domain: dom.clone(),
+                part_key: key,
+                ordinal: *ordinal,
+                payload: payload.clone(),
+                content_hash,
+            });
+        }
+        tx.commit()?;
+        saved.sort_by(|a, b| a.ordinal.cmp(&b.ordinal).then_with(|| a.part_key.cmp(&b.part_key)));
+        Ok(saved)
+    }
+
+    /// Lists all persisted document parts across all domains ordered by `(domain, ordinal, part_key)`.
+    pub fn list_all_document_parts(&self) -> Result<BTreeMap<String, Vec<ProfileStateDocumentPart>>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT domain, part_key, ordinal, payload, content_hash
+             FROM profile_state_document_parts
+             ORDER BY domain ASC, ordinal ASC, part_key ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let payload_raw: String = row.get(3)?;
+            let payload = serde_json::from_str(&payload_raw).unwrap_or(serde_json::Value::Null);
+            Ok(ProfileStateDocumentPart {
+                domain: row.get(0)?,
+                part_key: row.get(1)?,
+                ordinal: row.get(2)?,
+                payload,
+                content_hash: row.get(4)?,
+            })
+        })?;
+        let mut grouped: BTreeMap<String, Vec<ProfileStateDocumentPart>> = BTreeMap::new();
+        for item in rows {
+            let part = item?;
+            grouped.entry(part.domain.clone()).or_default().push(part);
+        }
+        Ok(grouped)
+    }
+
+    /// Exports all domains and all split document parts as a self-contained JSON bundle.
+    pub fn export_all(&self) -> Result<serde_json::Value> {
+        let domains = self.list_domains()?;
+        let parts = self.list_all_document_parts()?;
+        Ok(serde_json::json!({
+            "schema_version": PROFILE_STATE_SCHEMA_VERSION,
+            "domains": domains,
+            "parts": parts,
+        }))
     }
 
     /// Deletes a specific document part; returns `true` if a row was deleted.
@@ -610,6 +907,81 @@ impl AtomicSnapshotWriter {
         let snap: AtomicSnapshot<T> = serde_json::from_slice(&raw)?;
         snap.verify_integrity()?;
         Ok(Some(snap))
+    }
+
+    /// Stages a raw top-level JSON payload onto an fsynced sibling temp file reserved
+    /// with a monotonic generation token.
+    pub fn begin_async_stage_raw_json(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<StagedAsyncSnapshot> {
+        let bytes = serde_json::to_vec_pretty(payload)?;
+        let generation = {
+            let mut inner = self.inner.lock();
+            inner.fence.begin_async_write()
+        };
+        let temp_path = self.sibling_temp_path(&format!("async-g{generation}"));
+        write_and_sync_file(&temp_path, &bytes)?;
+        self.inner
+            .lock()
+            .active_async_temps
+            .insert(generation, temp_path.clone());
+        Ok(StagedAsyncSnapshot {
+            generation,
+            temp_path,
+        })
+    }
+
+    /// Performs an authoritative generation-fenced synchronous flush of raw top-level JSON
+    /// via temp write + `sync_all()` + atomic rename, unlinking any stale sibling `.tmp`
+    /// files so zero `*.tmp` leftovers remain on disk.
+    pub fn flush_sync_raw_json(&self, payload: &serde_json::Value) -> Result<u64> {
+        let bytes = serde_json::to_vec_pretty(payload)?;
+        let mut inner = self.inner.lock();
+        let stale_temps: Vec<PathBuf> = std::mem::take(&mut inner.active_async_temps)
+            .into_values()
+            .collect();
+        for stale in stale_temps {
+            let _ = fs::remove_file(stale);
+        }
+        let temp_path = self.sibling_temp_path("sync");
+        write_and_sync_file(&temp_path, &bytes)?;
+        fs::rename(&temp_path, &self.target_path)?;
+        let committed = inner.fence.commit_sync_flush();
+        Ok(committed)
+    }
+
+    /// Finalizes a previously staged async generation by number (`SM1-04`).
+    /// Returns `Ok(true)` if promoted to `target_path`, or `Ok(false)` if fenced by a newer
+    /// synchronous quit flush (and ensures the stale `.tmp` file is unlinked).
+    pub fn finalize_staged_generation(&self, generation: u64) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let temp_opt = inner.active_async_temps.remove(&generation);
+        let allowed = inner.fence.commit_async(generation).is_ok();
+        if !allowed {
+            if let Some(tmp) = temp_opt {
+                let _ = fs::remove_file(tmp);
+            }
+            return Ok(false);
+        }
+        let Some(tmp) = temp_opt else {
+            return Ok(false);
+        };
+        if !tmp.is_file() {
+            return Ok(false);
+        }
+        fs::rename(&tmp, &self.target_path)?;
+        Ok(true)
+    }
+
+    /// Reads raw top-level JSON from `target_path` if present.
+    pub fn read_raw_json(&self) -> Result<Option<serde_json::Value>> {
+        if !self.target_path.is_file() {
+            return Ok(None);
+        }
+        let raw = fs::read(&self.target_path)?;
+        let val: serde_json::Value = serde_json::from_slice(&raw)?;
+        Ok(Some(val))
     }
 }
 
@@ -1026,11 +1398,45 @@ impl ProtectedSecretPersistence {
     }
 
     pub fn sealed_slot_count(&self) -> usize {
-        self.envelope.lock().sealed_slots.len()
+        let guard = self.envelope.lock();
+        guard.sealed_slots.len() + guard.retained_blobs.len()
     }
 
     pub fn retained_blob_count(&self) -> usize {
         self.envelope.lock().retained_blobs.len()
+    }
+
+    pub fn list_slot_names(&self) -> Vec<String> {
+        let guard = self.envelope.lock();
+        let mut names: BTreeSet<String> = guard.sealed_slots.keys().cloned().collect();
+        names.extend(guard.retained_blobs.keys().cloned());
+        names.into_iter().collect()
+    }
+
+    /// Returns a deterministic SHA-256 hex digest over all sealed ciphertext bytes
+    /// (zero plaintext ever hashed or exposed).
+    pub fn combined_ciphertext_digest(&self) -> Option<String> {
+        let guard = self.envelope.lock();
+        let mut all: BTreeMap<&str, &SealedProtectedSecret> = BTreeMap::new();
+        for (k, v) in &guard.retained_blobs {
+            all.insert(k.as_str(), v);
+        }
+        for (k, v) in &guard.sealed_slots {
+            all.insert(k.as_str(), v);
+        }
+        if all.is_empty() {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        for (k, v) in all {
+            hasher.update(k.as_bytes());
+            hasher.update(b":");
+            hasher.update(v.nonce_b64.as_bytes());
+            hasher.update(b":");
+            hasher.update(v.ciphertext_b64.as_bytes());
+            hasher.update(b"\n");
+        }
+        Some(hex::encode(hasher.finalize()))
     }
 }
 

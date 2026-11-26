@@ -15,13 +15,16 @@ use axum::{
 };
 use orca_bots::WakeFrameKind;
 use orca_core::orchestration_protocol::{
-    ExecutionHostRecord, HostSelectionCriteria, MailboxMessageType, MailboxPriority, MailboxRoute,
-    MailboxTarget, OrchestrationTaskStatus,
+    ExecutionHostRecord, GateStatus, HostSelectionCriteria, MailboxMessage, MailboxMessageType,
+    MailboxPriority, MailboxRoute, MailboxTarget, OrchestrationTask, OrchestrationTaskStatus,
 };
+use orca_core::LOCAL_EXECUTION_HOST_ID;
 use orca_ide::orchestration_engine::{
     parse_mailbox_target, CheckMailboxRequest, CompleteWorkerRequest, CreateGateRequest,
-    CreateRunRequest, CreateTaskRequest, OrchestrationRunStatus, ResolveGateAction,
-    SendMessageRequest, StartWorkerRequest,
+    CreateRunRequest, CreateTaskRequest, DecisionGatePayload, DecisionGateRecord,
+    DispatchFederatedRequest, FederationRelayDirection, OrchestrationRunRecord,
+    OrchestrationRunStatus, ResolveGateAction, SendMessageRequest, StartWorkerRequest,
+    StartWorkerResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -39,6 +42,72 @@ pub struct ListRunsQuery {
     pub status: Option<String>,
 }
 
+fn run_to_wire_json(run: &OrchestrationRunRecord) -> Value {
+    let mut val = serde_json::to_value(run).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".into(), json!(run.run_id));
+        obj.insert("runId".into(), json!(run.run_id));
+        obj.insert("consumerGeneration".into(), json!(run.consumer_generation));
+        obj.insert(
+            "coordinatorSession".into(),
+            json!(run.coordinator_orca_session_id),
+        );
+    }
+    val
+}
+
+fn task_to_wire_json(task: &OrchestrationTask, parent_id: Option<&str>) -> Value {
+    let status_wire = match task.status {
+        OrchestrationTaskStatus::Succeeded => "completed",
+        OrchestrationTaskStatus::Pending => "pending",
+        OrchestrationTaskStatus::Ready => "ready",
+        OrchestrationTaskStatus::Running => "running",
+        OrchestrationTaskStatus::WaitingGate => "waiting_gate",
+        OrchestrationTaskStatus::Failed => "failed",
+        OrchestrationTaskStatus::Canceled => "canceled",
+    };
+    let mut val = serde_json::to_value(task).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".into(), json!(task.task_id));
+        obj.insert("taskId".into(), json!(task.task_id));
+        obj.insert("runId".into(), json!(task.run_id));
+        obj.insert("deps".into(), json!(task.depends_on));
+        obj.insert("parentId".into(), json!(parent_id));
+        obj.insert("status".into(), json!(status_wire));
+        obj.insert("taskStatus".into(), json!(task.status));
+    }
+    val
+}
+
+fn should_wake_coordinator(msg_type: MailboxMessageType) -> bool {
+    matches!(
+        msg_type,
+        MailboxMessageType::Question
+            | MailboxMessageType::DecisionGate
+            | MailboxMessageType::Escalation
+            | MailboxMessageType::WorkerDone
+    )
+}
+
+fn mailbox_msg_to_wire_json(seq: Option<i64>, msg: &MailboxMessage) -> Value {
+    let mut val = serde_json::to_value(msg).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".into(), json!(msg.message_id));
+        obj.insert("messageId".into(), json!(msg.message_id));
+        obj.insert("runId".into(), json!(msg.run_id));
+        obj.insert("type".into(), json!(msg.message_type.as_str()));
+        obj.insert("messageType".into(), json!(msg.message_type.as_str()));
+        obj.insert(
+            "wakeCoordinator".into(),
+            json!(should_wake_coordinator(msg.message_type)),
+        );
+        if let Some(s) = seq {
+            obj.insert("seq".into(), json!(s));
+        }
+    }
+    val
+}
+
 /// `POST /api/v1/orca/orchestration/runs` (`201 Created`).
 pub async fn create_run(
     _auth: AuthBearer,
@@ -50,7 +119,7 @@ pub async fn create_run(
         Err(resp) => return resp,
     };
     match state.orca_ide.orchestration().create_run(req) {
-        Ok(run) => (StatusCode::CREATED, Json(run)).into_response(),
+        Ok(run) => (StatusCode::CREATED, Json(run_to_wire_json(&run))).into_response(),
         Err(err) => map_ide_err(err),
     }
 }
@@ -74,7 +143,10 @@ pub async fn list_runs(
         None => None,
     };
     match state.orca_ide.orchestration().list_runs(status) {
-        Ok(runs) => Json(runs).into_response(),
+        Ok(runs) => {
+            let wire: Vec<Value> = runs.iter().map(run_to_wire_json).collect();
+            Json(wire).into_response()
+        }
         Err(err) => map_ide_err(err),
     }
 }
@@ -95,7 +167,7 @@ pub async fn get_run(
         Err(err) => return map_ide_err(err),
     };
     Json(json!({
-        "run": run,
+        "run": run_to_wire_json(&run),
         "ready_tasks": ready_tasks,
     }))
     .into_response()
@@ -111,8 +183,13 @@ pub async fn create_task(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let parent_id = req.parent_id.clone();
     match state.orca_ide.orchestration().create_task(req) {
-        Ok(task) => (StatusCode::CREATED, Json(task)).into_response(),
+        Ok(task) => (
+            StatusCode::CREATED,
+            Json(task_to_wire_json(&task, parent_id.as_deref())),
+        )
+            .into_response(),
         Err(err) => map_ide_err(err),
     }
 }
@@ -144,7 +221,7 @@ pub async fn transition_task(
         .transition_task(&req.run_id, &task_id, req.status, req.now_ms)
     {
         Ok((task, newly_ready)) => Json(json!({
-            "task": task,
+            "task": task_to_wire_json(&task, None),
             "newly_ready": newly_ready,
         }))
         .into_response(),
@@ -156,19 +233,136 @@ pub async fn transition_task(
 // 2. Generation-Fenced Workers, Terminal Archives & Resource Release
 // ---------------------------------------------------------------------------
 
+fn start_worker_response_json(
+    eng: &orca_ide::orchestration_engine::OrchestrationEngine,
+    res: &StartWorkerResult,
+    replayed: bool,
+) -> Value {
+    let mut val = serde_json::to_value(res).unwrap_or_else(|_| json!({}));
+    let is_remote = res.dispatch.host_id != LOCAL_EXECUTION_HOST_ID;
+    let home_auto_release_at = if is_remote {
+        Some(res.dispatch.created_at_ms.saturating_add(300_000))
+    } else {
+        None
+    };
+    let relay_items = if is_remote {
+        let existing = eng
+            .list_unacked_relay_items(&res.dispatch.dispatch_id, None)
+            .unwrap_or_default();
+        if existing.is_empty() {
+            let _ = eng.dispatch_federated(DispatchFederatedRequest {
+                dispatch_id: Some(res.dispatch.dispatch_id.clone()),
+                run_id: res.context.run_id.clone(),
+                task_id: res.context.task_id.clone(),
+                home_host_id: LOCAL_EXECUTION_HOST_ID.to_string(),
+                selection: HostSelectionCriteria {
+                    preferred_host_id: Some(res.dispatch.host_id.clone()),
+                    required_capabilities: Vec::new(),
+                    min_protocol_version: 1,
+                    max_heartbeat_age_ms: 86_400_000,
+                },
+                depth: Some(res.dispatch.nesting_depth),
+                home_auto_release_at_ms: home_auto_release_at,
+                now_ms: Some(res.dispatch.created_at_ms),
+            });
+            eng.enqueue_relay_item(
+                &res.dispatch.dispatch_id,
+                FederationRelayDirection::ToWorker,
+                json!({
+                    "kind": "dispatch",
+                    "runId": res.context.run_id,
+                    "taskId": res.context.task_id,
+                    "agentId": res.context.agent_id,
+                    "targetServer": res.dispatch.host_id,
+                }),
+                Some(res.dispatch.created_at_ms),
+            )
+            .ok()
+            .into_iter()
+            .collect()
+        } else {
+            existing
+        }
+    } else {
+        Vec::new()
+    };
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".into(), json!(res.dispatch.dispatch_id));
+        obj.insert("dispatchId".into(), json!(res.dispatch.dispatch_id));
+        obj.insert("runId".into(), json!(res.context.run_id));
+        obj.insert("taskId".into(), json!(res.context.task_id));
+        obj.insert("agent".into(), json!(res.context.agent_id));
+        obj.insert("worktree".into(), json!(res.context.worktree_id));
+        obj.insert("keepOpen".into(), json!(res.context.keep_open));
+        obj.insert("generation".into(), json!(res.dispatch.generation));
+        obj.insert("replayed".into(), json!(replayed));
+        if is_remote {
+            obj.insert("targetServer".into(), json!(res.dispatch.host_id));
+            obj.insert("homeAutoReleaseAt".into(), json!(home_auto_release_at));
+            obj.insert("federationRelayItems".into(), json!(relay_items));
+        }
+    }
+    val
+}
+
 /// `POST /api/v1/orca/orchestration/workers/start` (`201 Created`).
 pub async fn start_worker(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Response {
-    let req: StartWorkerRequest = match parse_json_body(&body) {
-        Ok(r) => r,
+    let raw_val: Value = match parse_json_body(&body) {
+        Ok(v) => v,
         Err(resp) => return resp,
     };
-    match state.orca_ide.orchestration().start_worker(req) {
-        Ok(res) => (StatusCode::CREATED, Json(res)).into_response(),
-        Err(err) => map_ide_err(err),
+    let req: StartWorkerRequest = match serde_json::from_value(raw_val.clone()) {
+        Ok(r) => r,
+        Err(err) => {
+            return orca_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                format!("Invalid StartWorkerRequest: {err}"),
+            );
+        }
+    };
+    let req_id = raw_val
+        .get("requestId")
+        .or_else(|| raw_val.get("request_id"))
+        .or_else(|| raw_val.get("operationId"))
+        .or_else(|| raw_val.get("operation_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let caller_fp = raw_val
+        .get("callerFingerprint")
+        .or_else(|| raw_val.get("caller_fingerprint"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default-caller");
+
+    let eng = state.orca_ide.orchestration();
+    if let Some(idemp_key) = req_id {
+        let now_ms = req.now_ms;
+        match eng.execute_idempotent(caller_fp, idemp_key, &raw_val, now_ms, |e| {
+            e.start_worker(req)
+        }) {
+            Ok((res, replayed)) => (
+                StatusCode::CREATED,
+                Json(start_worker_response_json(eng, &res, replayed)),
+            )
+                .into_response(),
+            Err(err) => map_ide_err(err),
+        }
+    } else {
+        match eng.start_worker(req) {
+            Ok(res) => (
+                StatusCode::CREATED,
+                Json(start_worker_response_json(eng, &res, false)),
+            )
+                .into_response(),
+            Err(err) => map_ide_err(err),
+        }
     }
 }
 
@@ -194,13 +388,29 @@ pub async fn read_worker_archive(
     State(state): State<Arc<AppState>>,
     Path(dispatch_id): Path<String>,
 ) -> Response {
-    match state
-        .orca_ide
-        .orchestration()
-        .read_worker_archive(&dispatch_id)
-    {
-        Ok(archives) => Json(archives).into_response(),
-        Err(err) => map_ide_err(err),
+    let eng = state.orca_ide.orchestration();
+    let archives = match eng.read_worker_archive(&dispatch_id) {
+        Ok(a) => a,
+        Err(err) => return map_ide_err(err),
+    };
+    let recipient = format!("dispatch:{dispatch_id}");
+    let inbox = eng
+        .check_mailbox(CheckMailboxRequest {
+            recipient_id: recipient,
+            dispatch_id: None,
+            expected_generation: None,
+            now_ms: None,
+        })
+        .unwrap_or_default();
+    if inbox.is_empty() {
+        Json(archives).into_response()
+    } else {
+        Json(json!({
+            "dispatchId": dispatch_id,
+            "archives": archives,
+            "messages": inbox,
+        }))
+        .into_response()
     }
 }
 
@@ -239,15 +449,27 @@ pub async fn release_worker(
 // 3. 9-Type Typed Mailbox, Questions & Decision/Review/Merge Gates
 // ---------------------------------------------------------------------------
 
+fn default_from_coordinator() -> String {
+    "coordinator".to_string()
+}
+
+fn default_status_msg_type() -> MailboxMessageType {
+    MailboxMessageType::Status
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SendOrchMessageBody {
     #[serde(alias = "runId")]
     pub run_id: String,
-    #[serde(alias = "fromId")]
+    #[serde(default = "default_from_coordinator", alias = "fromId", alias = "from")]
     pub from_id: String,
     #[serde(alias = "to")]
     pub target: Value,
-    #[serde(alias = "messageType")]
+    #[serde(
+        default = "default_status_msg_type",
+        alias = "messageType",
+        alias = "type"
+    )]
     pub message_type: MailboxMessageType,
     #[serde(default)]
     pub priority: MailboxPriority,
@@ -266,7 +488,7 @@ fn default_local_route() -> MailboxRoute {
 
 /// `POST /api/v1/orca/orchestration/messages` (`201 Created`).
 /// Accepts `target` (or `to`) as either a structured `MailboxTarget` JSON object
-/// OR a shorthand string (`"@all"`, `"@idle"`, `"@worktree:<id>"`, `"@<agent>"`, `"dispatch:<id>"`).
+/// OR a shorthand string (`"@all"`, `"@idle"`, `"@worktree:<id>"`, `"@agent:<name>"`, `"@<agent>"`, `"dispatch:<id>"`).
 /// Pushes a content-free `WakeFrameKind::Delivery` frame to `state.orca_wake_hub`.
 pub async fn send_message(
     _auth: AuthBearer,
@@ -315,7 +537,20 @@ pub async fn send_message(
             state
                 .orca_wake_hub
                 .notify_host("*", WakeFrameKind::Delivery);
-            (StatusCode::CREATED, Json(outcome)).into_response()
+            let mut val = serde_json::to_value(&outcome).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("message".into(), mailbox_msg_to_wire_json(None, &outcome.message));
+                obj.insert(
+                    "wakeCoordinator".into(),
+                    json!(should_wake_coordinator(outcome.message.message_type)),
+                );
+                if let Some(ref fu) = outcome.follow_up {
+                    obj.insert("followUpOfDispatchId".into(), json!(fu.original_dispatch_id));
+                    obj.insert("followUpDispatchId".into(), json!(fu.follow_up_dispatch_id));
+                    obj.insert("followUpTaskId".into(), json!(fu.follow_up_task_id));
+                }
+            }
+            (StatusCode::CREATED, Json(val)).into_response()
         }
         Err(err) => map_ide_err(err),
     }
@@ -323,55 +558,113 @@ pub async fn send_message(
 
 #[derive(Debug, Default, Deserialize)]
 pub struct CheckMailboxQuery {
-    #[serde(default)]
+    #[serde(default, alias = "recipientId")]
     pub recipient_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "runId")]
+    pub run_id: Option<String>,
+    #[serde(default, alias = "dispatchId")]
     pub dispatch_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "expectedGeneration")]
     pub expected_generation: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
 }
 
 /// `GET /api/v1/orca/orchestration/mailbox` (`200 OK`, `409 stale_dispatch`).
+/// Supports `?recipient_id=...`, `?dispatchId=...`, or `?runId=...`.
 pub async fn check_mailbox(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Query(query): Query<CheckMailboxQuery>,
 ) -> Response {
-    let Some(recipient_id) = query
+    let eng = state.orca_ide.orchestration();
+    let explicit_recipient = query
         .recipient_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
-    else {
-        return orca_err(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "Missing required query parameter 'recipient_id'.",
-        );
-    };
-    let req = CheckMailboxRequest {
-        recipient_id,
-        dispatch_id: query
-            .dispatch_id
-            .filter(|s| !s.trim().is_empty()),
-        expected_generation: query.expected_generation,
-        now_ms: query.now_ms,
-    };
-    match state.orca_ide.orchestration().check_mailbox(req) {
-        Ok(deliveries) => Json(deliveries).into_response(),
-        Err(err) => map_ide_err(err),
+        .or_else(|| {
+            query
+                .dispatch_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|did| {
+                    if did.starts_with("dispatch:") {
+                        did.to_string()
+                    } else {
+                        format!("dispatch:{did}")
+                    }
+                })
+        });
+
+    if let Some(recipient_id) = explicit_recipient {
+        let req = CheckMailboxRequest {
+            recipient_id,
+            dispatch_id: if query.expected_generation.is_some() {
+                query.dispatch_id.filter(|s| !s.trim().is_empty())
+            } else {
+                None
+            },
+            expected_generation: query.expected_generation,
+            now_ms: query.now_ms,
+        };
+        return match eng.check_mailbox(req) {
+            Ok(deliveries) => {
+                let wire: Vec<Value> = deliveries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        let msg_wire = mailbox_msg_to_wire_json(Some((i + 1) as i64), &d.message);
+                        let mut v = msg_wire;
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("delivery_id".into(), json!(d.delivery_id));
+                            obj.insert("recipient_id".into(), json!(d.recipient_id));
+                            obj.insert("state".into(), json!(d.state));
+                            obj.insert("message".into(), json!(d.message));
+                        }
+                        v
+                    })
+                    .collect();
+                Json(wire).into_response()
+            }
+            Err(err) => map_ide_err(err),
+        };
     }
+
+    if let Some(run_id) = query
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return match eng.list_run_mailbox(run_id) {
+            Ok(msgs) => {
+                let wire: Vec<Value> = msgs
+                    .iter()
+                    .map(|(seq, m)| mailbox_msg_to_wire_json(Some(*seq), m))
+                    .collect();
+                Json(wire).into_response()
+            }
+            Err(err) => map_ide_err(err),
+        };
+    }
+
+    orca_err(
+        StatusCode::BAD_REQUEST,
+        "invalid_argument",
+        "Missing required query parameter 'recipient_id', 'dispatchId', or 'runId'.",
+    )
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AskQuestionBody {
-    #[serde(alias = "runId")]
-    pub run_id: String,
-    #[serde(alias = "dispatchId")]
+    #[serde(default, alias = "runId")]
+    pub run_id: Option<String>,
+    #[serde(alias = "dispatchId", alias = "dispatch")]
     pub dispatch_id: String,
+    #[serde(alias = "question")]
     pub prompt: String,
     #[serde(default, alias = "nowMs")]
     pub now_ms: Option<i64>,
@@ -387,15 +680,51 @@ pub async fn ask_question(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    match state.orca_ide.orchestration().ask_question(
-        &req.run_id,
-        &req.dispatch_id,
-        &req.prompt,
-        req.now_ms,
-    ) {
-        Ok(q) => (StatusCode::CREATED, Json(q)).into_response(),
+    let eng = state.orca_ide.orchestration();
+    let run_id = match req.run_id.filter(|s| !s.trim().is_empty()) {
+        Some(r) => r,
+        None => match eng.lookup_dispatch_run_task(&req.dispatch_id) {
+            Ok((r, _)) => r,
+            Err(err) => return map_ide_err(err),
+        },
+    };
+    match eng.ask_question(&run_id, &req.dispatch_id, &req.prompt, req.now_ms) {
+        Ok(q) => {
+            let mut val = serde_json::to_value(&q).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("id".into(), json!(q.question_id));
+                obj.insert("questionId".into(), json!(q.question_id));
+                obj.insert("status".into(), json!("pending"));
+            }
+            (StatusCode::CREATED, Json(val)).into_response()
+        }
         Err(err) => map_ide_err(err),
     }
+}
+
+fn gate_to_wire_json(gate: &DecisionGateRecord, decision_label: Option<&str>) -> Value {
+    let is_resolved = matches!(gate.status, GateStatus::Approved | GateStatus::Rejected);
+    let mut val = serde_json::to_value(gate).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".into(), json!(gate.gate_id));
+        obj.insert("gateId".into(), json!(gate.gate_id));
+        obj.insert("runId".into(), json!(gate.run_id));
+        obj.insert("taskId".into(), json!(gate.task_id));
+        obj.insert("gateStatus".into(), json!(gate.status));
+        if is_resolved {
+            obj.insert("status".into(), json!("resolved"));
+            let dec = decision_label.unwrap_or(match gate.status {
+                GateStatus::Approved => "approve",
+                GateStatus::Rejected => "reject",
+                _ => "pending",
+            });
+            obj.insert("decision".into(), json!(dec));
+        } else {
+            obj.insert("wakeQueued".into(), json!(true));
+            obj.insert("wakeCoordinator".into(), json!(true));
+        }
+    }
+    val
 }
 
 /// `POST /api/v1/orca/orchestration/gates` (`201 Created`).
@@ -404,53 +733,136 @@ pub async fn create_gate(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Response {
-    let req: CreateGateRequest = match parse_json_body(&body) {
-        Ok(r) => r,
+    let val: Value = match parse_json_body(&body) {
+        Ok(v) => v,
         Err(resp) => return resp,
     };
-    match state.orca_ide.orchestration().create_gate(req) {
-        Ok(gate) => (StatusCode::CREATED, Json(gate)).into_response(),
+    let eng = state.orca_ide.orchestration();
+    let req: CreateGateRequest = if let Ok(parsed) = serde_json::from_value::<CreateGateRequest>(val.clone()) {
+        parsed
+    } else {
+        let dispatch_id = val
+            .get("dispatchId")
+            .or_else(|| val.get("dispatch_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let lookup = dispatch_id.and_then(|d| eng.lookup_dispatch_run_task(d).ok());
+        let run_id = val
+            .get("runId")
+            .or_else(|| val.get("run_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| lookup.as_ref().map(|(r, _)| r.clone()))
+            .unwrap_or_default();
+        let task_id = val
+            .get("taskId")
+            .or_else(|| val.get("task_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| lookup.as_ref().map(|(_, t)| t.clone()))
+            .unwrap_or_default();
+        if run_id.trim().is_empty() || task_id.trim().is_empty() {
+            return orca_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "Missing 'runId'/'taskId' (or resolvable 'dispatchId') for gate creation.",
+            );
+        }
+        let payload = if let Some(p) = val.get("payload") {
+            match serde_json::from_value(p.clone()) {
+                Ok(dp) => dp,
+                Err(err) => {
+                    return orca_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        format!("Invalid gate payload: {err}"),
+                    );
+                }
+            }
+        } else {
+            let prompt = val
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("Approve decision gate?")
+                .to_string();
+            DecisionGatePayload::Decision {
+                prompt,
+                resolution_note: None,
+            }
+        };
+        CreateGateRequest {
+            run_id,
+            task_id,
+            gate_id: val
+                .get("gateId")
+                .or_else(|| val.get("gate_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            payload,
+            deadline_ms: val
+                .get("deadlineMs")
+                .or_else(|| val.get("deadline_ms"))
+                .and_then(Value::as_i64),
+            now_ms: val
+                .get("nowMs")
+                .or_else(|| val.get("now_ms"))
+                .and_then(Value::as_i64),
+        }
+    };
+    match eng.create_gate(req) {
+        Ok(gate) => (StatusCode::CREATED, Json(gate_to_wire_json(&gate, None))).into_response(),
         Err(err) => map_ide_err(err),
     }
 }
 
-fn parse_resolve_gate_action(val: &Value) -> Result<ResolveGateAction, Response> {
+fn parse_resolve_gate_action(val: &Value) -> Result<(ResolveGateAction, Option<String>), Response> {
     let target = match val.get("action") {
         Some(inner) if inner.is_object() => inner.clone(),
         _ => val.clone(),
     };
     if let Ok(action) = serde_json::from_value::<ResolveGateAction>(target.clone()) {
-        return Ok(action);
+        return Ok((action, None));
     }
-    if let Some(obj) = target.as_object()
-        && let Some(act_str) = obj.get("action").and_then(Value::as_str)
-    {
-        let actor = obj
-            .get("actor")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("owner")
-            .to_string();
-        return match act_str.trim().to_ascii_lowercase().as_str() {
-            "approve" => Ok(ResolveGateAction::Approve {
-                actor,
-                note: obj.get("note").and_then(Value::as_str).map(ToOwned::to_owned),
-            }),
-            "reject" | "deny" => Ok(ResolveGateAction::Reject {
-                actor,
-                reason: obj
-                    .get("reason")
-                    .or_else(|| obj.get("note"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-            }),
-            "evaluate_only" | "evaluate" => Ok(ResolveGateAction::EvaluateOnly),
-            other => Err(orca_err(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                format!("Unsupported gate resolve action '{other}'."),
-            )),
-        };
+    if let Some(obj) = target.as_object() {
+        let act_or_dec = obj
+            .get("action")
+            .or_else(|| obj.get("decision"))
+            .and_then(Value::as_str);
+        if let Some(act_str) = act_or_dec {
+            let actor = obj
+                .get("actor")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("owner")
+                .to_string();
+            let note = obj
+                .get("note")
+                .or_else(|| obj.get("rationale"))
+                .or_else(|| obj.get("reason"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let raw_dec = act_str.trim().to_string();
+            return match raw_dec.to_ascii_lowercase().as_str() {
+                "approve" | "approved" | "yes" | "accept" | "allow" => Ok((
+                    ResolveGateAction::Approve { actor, note },
+                    Some(raw_dec),
+                )),
+                "reject" | "rejected" | "deny" | "denied" | "no" | "defer" | "decline" => Ok((
+                    ResolveGateAction::Reject {
+                        actor,
+                        reason: note,
+                    },
+                    Some(raw_dec),
+                )),
+                "evaluate_only" | "evaluate" => Ok((ResolveGateAction::EvaluateOnly, Some(raw_dec))),
+                other => Err(orca_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    format!("Unsupported gate resolve action/decision '{other}'."),
+                )),
+            };
+        }
     }
     Err(orca_err(
         StatusCode::BAD_REQUEST,
@@ -470,20 +882,28 @@ pub async fn resolve_gate(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let action = match parse_resolve_gate_action(&val) {
-        Ok(a) => a,
+    let (action, raw_decision) = match parse_resolve_gate_action(&val) {
+        Ok(pair) => pair,
         Err(resp) => return resp,
     };
     let now_ms = val
         .get("now_ms")
         .or_else(|| val.get("nowMs"))
         .and_then(Value::as_i64);
-    match state
-        .orca_ide
-        .orchestration()
-        .resolve_gate(&id, action, now_ms)
-    {
-        Ok(gate) => Json(gate).into_response(),
+    let eng = state.orca_ide.orchestration();
+    match eng.resolve_gate(&id, action, now_ms) {
+        Ok(gate) => {
+            let dec_str = raw_decision.as_deref().unwrap_or(match gate.status {
+                GateStatus::Approved => "approve",
+                GateStatus::Rejected => "reject",
+                _ => "pending",
+            });
+            if let Ok(Some(disp_id)) = eng.lookup_dispatch_for_task(&gate.task_id) {
+                let note = format!("gate {} resolved: {}", gate.gate_id, dec_str);
+                let _ = eng.record_worker_archive(&disp_id, &note, now_ms);
+            }
+            Json(gate_to_wire_json(&gate, Some(dec_str))).into_response()
+        }
         Err(err) => map_ide_err(err),
     }
 }

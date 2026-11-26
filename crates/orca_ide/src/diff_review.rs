@@ -1,7 +1,7 @@
 //! Persistent Diff Annotations, Local Per-Line AI-vs-Human Attribution,
 //! Conventional Commit / Stacked PR Draft Composer, and Multi-Forge Tasks Hub (`F17`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS diff_annotations (
     author_json TEXT NOT NULL,
     resolved INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL
+    updated_at_ms INTEGER NOT NULL,
+    repo_path TEXT NOT NULL DEFAULT '',
+    anchor_line_text TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_diff_annotations_file_line
@@ -88,9 +90,45 @@ pub struct AttributionExport {
     pub unknown_lines: usize,
 }
 
+/// Serializes a [`DiffAnnotation`] with canonical REST/RPC/CLI wire aliases
+/// (`id`, `line`, `file`, optional `repo_path`, `orphaned`, `anchor_status`).
+pub fn diff_annotation_to_wire_json(
+    ann: &DiffAnnotation,
+    repo_path: Option<&str>,
+) -> serde_json::Value {
+    diff_annotation_to_wire_json_with_orphan(ann, repo_path, false)
+}
+
+/// Serializes a [`DiffAnnotation`] including explicit `orphaned` / `anchor_status` state.
+pub fn diff_annotation_to_wire_json_with_orphan(
+    ann: &DiffAnnotation,
+    repo_path: Option<&str>,
+    orphaned: bool,
+) -> serde_json::Value {
+    let mut val = serde_json::to_value(ann).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("id".to_string(), serde_json::json!(ann.annotation_id));
+        obj.insert("line".to_string(), serde_json::json!(ann.line_start));
+        obj.insert("file".to_string(), serde_json::json!(ann.file_path));
+        obj.insert("orphaned".to_string(), serde_json::json!(orphaned));
+        obj.insert(
+            "anchor_status".to_string(),
+            serde_json::json!(if orphaned { "orphaned" } else { "anchored" }),
+        );
+        if let Some(rp) = repo_path
+            && !rp.trim().is_empty()
+        {
+            obj.insert("repo_path".to_string(), serde_json::json!(rp));
+        }
+    }
+    val
+}
+
 struct DiffReviewInner {
     conn: Connection,
     annotations: DiffAnnotationStore,
+    annotation_meta: BTreeMap<String, (String, Option<String>)>,
+    orphaned_ids: BTreeSet<String>,
     attributions: FileAttributionMap,
 }
 
@@ -113,19 +151,34 @@ impl fmt::Debug for PersistentDiffReviewStore {
 fn init_diff_review_inner(conn: Connection) -> Result<DiffReviewInner> {
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(DIFF_REVIEW_SCHEMA_SQL)?;
+    let _ = conn.execute(
+        "ALTER TABLE diff_annotations ADD COLUMN repo_path TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE diff_annotations ADD COLUMN anchor_line_text TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE diff_annotations ADD COLUMN orphaned INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 
     let mut annotations = DiffAnnotationStore::default();
+    let mut annotation_meta = BTreeMap::new();
+    let mut orphaned_ids = BTreeSet::new();
     {
         let mut stmt = conn.prepare(
             "SELECT annotation_id, file_path, side, line_start, line_end, body,
-                    author_json, resolved, created_at_ms, updated_at_ms
+                    author_json, resolved, created_at_ms, updated_at_ms,
+                    COALESCE(repo_path, ''), anchor_line_text, COALESCE(orphaned, 0)
              FROM diff_annotations",
         )?;
         let rows = stmt.query_map([], |r| {
             let side_raw: String = r.get(2)?;
             let author_raw: String = r.get(6)?;
             let author = serde_json::from_str(&author_raw).unwrap_or(LineAttribution::Unknown);
-            Ok(DiffAnnotation {
+            let ann = DiffAnnotation {
                 annotation_id: r.get(0)?,
                 file_path: r.get(1)?,
                 side: str_to_diff_side(&side_raw),
@@ -136,10 +189,18 @@ fn init_diff_review_inner(conn: Connection) -> Result<DiffReviewInner> {
                 resolved: r.get::<_, i64>(7)? != 0,
                 created_at_ms: r.get(8)?,
                 updated_at_ms: r.get(9)?,
-            })
+            };
+            let repo_path: String = r.get(10)?;
+            let anchor_line_text: Option<String> = r.get(11)?;
+            let is_orph: bool = r.get::<_, i64>(12)? != 0;
+            Ok((ann, repo_path, anchor_line_text, is_orph))
         })?;
         for row in rows {
-            let ann = row?;
+            let (ann, repo_path, anchor_line_text, is_orph) = row?;
+            annotation_meta.insert(ann.annotation_id.clone(), (repo_path, anchor_line_text));
+            if is_orph {
+                orphaned_ids.insert(ann.annotation_id.clone());
+            }
             annotations
                 .annotations
                 .insert(ann.annotation_id.clone(), ann);
@@ -173,6 +234,8 @@ fn init_diff_review_inner(conn: Connection) -> Result<DiffReviewInner> {
     Ok(DiffReviewInner {
         conn,
         annotations,
+        annotation_meta,
+        orphaned_ids,
         attributions,
     })
 }
@@ -198,15 +261,60 @@ impl PersistentDiffReviewStore {
         })
     }
 
-    /// Persists a new line-anchored diff annotation validated by `DiffAnnotationStore`.
-    pub fn add_annotation(&self, annotation: DiffAnnotation) -> Result<DiffAnnotation> {
+    /// Persists a new line-anchored diff annotation validated by `DiffAnnotationStore`,
+    /// capturing optional `repo_path` and `anchor_line_text` (auto-read from disk if absent).
+    pub fn add_annotation_with_context(
+        &self,
+        annotation: DiffAnnotation,
+        repo_path: Option<&str>,
+        anchor_line_text: Option<&str>,
+    ) -> Result<DiffAnnotation> {
+        let fp_trimmed = annotation.file_path.trim();
+        if fp_trimmed.is_empty()
+            || fp_trimmed.starts_with('/')
+            || fp_trimmed.starts_with('\\')
+            || fp_trimmed.contains('\0')
+            || Path::new(fp_trimmed)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
+        {
+            return Err(OrcaIdeRuntimeError::invalid_argument(format!(
+                "invalid relative file_path '{}'",
+                annotation.file_path
+            )));
+        }
+        if annotation.line_start == 0 || annotation.line_end < annotation.line_start {
+            return Err(OrcaIdeRuntimeError::invalid_argument(
+                "line_start must be >= 1 and line_end >= line_start",
+            ));
+        }
+        if annotation.body.trim().is_empty() {
+            return Err(OrcaIdeRuntimeError::invalid_argument(
+                "annotation body must be non-empty",
+            ));
+        }
+        let rp = repo_path.map(str::trim).unwrap_or("").to_string();
+        let resolved_anchor = match anchor_line_text {
+            Some(txt) => Some(txt.to_string()),
+            None if !rp.is_empty() && annotation.line_start >= 1 => {
+                let full_path = Path::new(&rp).join(&annotation.file_path);
+                fs::read_to_string(&full_path).ok().and_then(|content| {
+                    content
+                        .lines()
+                        .nth((annotation.line_start - 1) as usize)
+                        .map(ToOwned::to_owned)
+                })
+            }
+            None => None,
+        };
+
         let mut guard = self.inner.lock();
         guard.annotations.add(annotation.clone())?;
         let author_json = serde_json::to_string(&annotation.author)?;
         if let Err(err) = guard.conn.execute(
             "INSERT INTO diff_annotations
-                (annotation_id, file_path, side, line_start, line_end, body, author_json, resolved, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (annotation_id, file_path, side, line_start, line_end, body, author_json, resolved, created_at_ms, updated_at_ms, repo_path, anchor_line_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &annotation.annotation_id,
                 &annotation.file_path,
@@ -218,12 +326,22 @@ impl PersistentDiffReviewStore {
                 i64::from(annotation.resolved),
                 annotation.created_at_ms,
                 annotation.updated_at_ms,
+                &rp,
+                &resolved_anchor,
             ],
         ) {
             guard.annotations.annotations.remove(&annotation.annotation_id);
             return Err(OrcaIdeRuntimeError::Sqlite(err));
         }
+        guard
+            .annotation_meta
+            .insert(annotation.annotation_id.clone(), (rp, resolved_anchor));
         Ok(annotation)
+    }
+
+    /// Persists a new line-anchored diff annotation validated by `DiffAnnotationStore`.
+    pub fn add_annotation(&self, annotation: DiffAnnotation) -> Result<DiffAnnotation> {
+        self.add_annotation_with_context(annotation, None, None)
     }
 
     /// Lists diff annotations (optionally scoped to one file, optionally including resolved).
@@ -232,29 +350,58 @@ impl PersistentDiffReviewStore {
         file_path: Option<&str>,
         include_resolved: bool,
     ) -> Vec<DiffAnnotation> {
+        self.list_annotations_scoped(None, file_path, include_resolved)
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect()
+    }
+
+    /// Lists diff annotations optionally filtered by `repo_path` and/or `file_path`.
+    pub fn list_annotations_scoped(
+        &self,
+        repo_path: Option<&str>,
+        file_path: Option<&str>,
+        include_resolved: bool,
+    ) -> Vec<(DiffAnnotation, String)> {
+        let rp_filter = repo_path.map(str::trim).filter(|s| !s.is_empty());
+        let fp_filter = file_path.map(str::trim).filter(|s| !s.is_empty());
         let guard = self.inner.lock();
-        if let Some(fp) = file_path {
-            return guard
-                .annotations
-                .filter_by_file(fp, include_resolved)
-                .into_iter()
-                .cloned()
-                .collect();
-        }
-        let mut out: Vec<DiffAnnotation> = guard
+        let mut out: Vec<(DiffAnnotation, String)> = guard
             .annotations
             .annotations
             .values()
             .filter(|a| include_resolved || !a.resolved)
-            .cloned()
+            .filter(|a| fp_filter.is_none_or(|fp| a.file_path == fp))
+            .filter_map(|a| {
+                let rp = guard
+                    .annotation_meta
+                    .get(&a.annotation_id)
+                    .map(|(r, _)| r.clone())
+                    .unwrap_or_default();
+                if let Some(target_rp) = rp_filter
+                    && rp != target_rp
+                {
+                    return None;
+                }
+                Some((a.clone(), rp))
+            })
             .collect();
-        out.sort_by(|a, b| {
+        out.sort_by(|(a, _), (b, _)| {
             a.file_path
                 .cmp(&b.file_path)
                 .then_with(|| a.line_start.cmp(&b.line_start))
                 .then_with(|| a.annotation_id.cmp(&b.annotation_id))
         });
         out
+    }
+
+    pub fn annotation_repo_path(&self, annotation_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .annotation_meta
+            .get(annotation_id)
+            .map(|(r, _)| r.clone())
+            .filter(|r| !r.is_empty())
     }
 
     pub fn resolve_annotation(&self, annotation_id: &str, now_ms: i64) -> Result<DiffAnnotation> {
@@ -328,12 +475,201 @@ impl PersistentDiffReviewStore {
         Ok(updated)
     }
 
+    /// Re-anchors persisted annotations for `(repo_path, file_path)` against live edits
+    /// using `git diff -U0 HEAD -- <file_path>` hunks and stored `anchor_line_text`.
+    pub fn reanchor_file(
+        &self,
+        repo_path: &Path,
+        file_path: &str,
+        now_ms: i64,
+    ) -> Result<Vec<DiffAnnotation>> {
+        let rp_str = repo_path.to_string_lossy().to_string();
+        let disk_lines: Vec<String> = fs::read_to_string(repo_path.join(file_path))
+            .map(|s| s.lines().map(ToOwned::to_owned).collect())
+            .unwrap_or_default();
+
+        // Parse unified diff hunks (`@@ -old_s[,old_c] +new_s[,new_c] @@`).
+        let mut hunks: Vec<(u32, u32, u32, u32)> = Vec::new();
+        if let Ok(out) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["diff", "-U0", "HEAD", "--", file_path])
+            .output()
+            && out.status.success()
+        {
+            let diff_txt = String::from_utf8_lossy(&out.stdout);
+            for line in diff_txt.lines() {
+                if let Some(rest) = line.strip_prefix("@@ -")
+                    && let Some((hdr, _)) = rest.split_once(" @@")
+                    && let Some((old_part, new_part)) = hdr.split_once(" +")
+                {
+                    let parse_pair = |p: &str| -> Option<(u32, u32)> {
+                        if let Some((s, c)) = p.split_once(',') {
+                            Some((s.parse().ok()?, c.parse().ok()?))
+                        } else {
+                            Some((p.parse().ok()?, 1))
+                        }
+                    };
+                    if let (Some((os, oc)), Some((ns, nc))) =
+                        (parse_pair(old_part), parse_pair(new_part))
+                    {
+                        hunks.push((os, oc, ns, nc));
+                    }
+                }
+            }
+        }
+
+        let shift_line = |orig: u32| -> u32 {
+            let mut delta: i64 = 0;
+            for &(os, oc, ns, nc) in &hunks {
+                if oc == 0 {
+                    // Pure insertion immediately after line `os` (`os == 0` = top of file).
+                    if orig > os {
+                        delta += i64::from(nc);
+                    }
+                } else if orig >= os.saturating_add(oc) {
+                    delta += i64::from(nc) - i64::from(oc);
+                } else if orig >= os {
+                    let mapped = ns.saturating_add((orig - os).min(nc.saturating_sub(1)));
+                    return mapped.max(1);
+                }
+            }
+            (i64::from(orig) + delta).max(1) as u32
+        };
+
+        let mut guard = self.inner.lock();
+        let target_ids: Vec<String> = guard
+            .annotations
+            .annotations
+            .values()
+            .filter(|a| {
+                a.file_path == file_path
+                    && guard
+                        .annotation_meta
+                        .get(&a.annotation_id)
+                        .is_none_or(|(r, _)| r.is_empty() || r == &rp_str)
+            })
+            .map(|a| a.annotation_id.clone())
+            .collect();
+
+        let mut updated = Vec::new();
+        let mut newly_orphaned: Vec<String> = Vec::new();
+        for aid in target_ids {
+            let anchor_text = guard
+                .annotation_meta
+                .get(&aid)
+                .and_then(|(_, txt)| txt.clone());
+            let Some(ann) = guard.annotations.annotations.get_mut(&aid) else {
+                continue;
+            };
+            let span = ann.line_end.saturating_sub(ann.line_start);
+
+            // If anchor text already matches at the current line, avoid double-shifting.
+            let already_anchored = anchor_text.as_deref().is_some_and(|at| {
+                disk_lines
+                    .get(ann.line_start.saturating_sub(1) as usize)
+                    .is_some_and(|cur| cur == at)
+            });
+
+            if !already_anchored {
+                let hunk_deleted_anchor = hunks
+                    .iter()
+                    .any(|&(os, oc, _, nc)| oc > 0 && nc == 0 && ann.line_start >= os && ann.line_start < os.saturating_add(oc));
+                let text_exists_anywhere = anchor_text
+                    .as_deref()
+                    .is_some_and(|at| disk_lines.iter().any(|l| l == at));
+                if (anchor_text.is_some() && !text_exists_anywhere) || (hunk_deleted_anchor && !text_exists_anywhere) {
+                    newly_orphaned.push(aid.clone());
+                    ann.updated_at_ms = now_ms;
+                    updated.push(ann.clone());
+                    continue;
+                }
+
+                let hunk_start = shift_line(ann.line_start);
+                let hunk_matches_anchor = anchor_text.as_deref().is_some_and(|at| {
+                    disk_lines
+                        .get(hunk_start.saturating_sub(1) as usize)
+                        .is_some_and(|cur| cur == at)
+                });
+                let new_start = if !hunks.is_empty() && (anchor_text.is_none() || hunk_matches_anchor) {
+                    hunk_start
+                } else if let Some(ref at) = anchor_text {
+                    disk_lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| line.as_str() == at.as_str())
+                        .map(|(idx, _)| (idx + 1) as u32)
+                        .min_by_key(|&ln| ln.abs_diff(ann.line_start))
+                        .unwrap_or(hunk_start)
+                } else {
+                    hunk_start
+                };
+                ann.line_start = new_start.max(1);
+                ann.line_end = ann.line_start.saturating_add(span);
+                ann.updated_at_ms = now_ms;
+            }
+            updated.push(ann.clone());
+        }
+
+        for oid in &newly_orphaned {
+            guard.orphaned_ids.insert(oid.clone());
+        }
+        let orphaned_snapshot = guard.orphaned_ids.clone();
+
+        let tx = guard.conn.transaction()?;
+        for ann in &updated {
+            let is_orph = i64::from(orphaned_snapshot.contains(&ann.annotation_id));
+            tx.execute(
+                "UPDATE diff_annotations
+                 SET line_start = ?1, line_end = ?2, updated_at_ms = ?3, orphaned = ?4
+                 WHERE annotation_id = ?5",
+                params![
+                    ann.line_start as i64,
+                    ann.line_end as i64,
+                    ann.updated_at_ms,
+                    is_orph,
+                    &ann.annotation_id,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Returns whether the annotation with `annotation_id` has been marked orphaned.
+    pub fn is_orphaned(&self, annotation_id: &str) -> bool {
+        self.inner.lock().orphaned_ids.contains(annotation_id)
+    }
+
     /// Formats all unresolved annotations into a single coherent `"Send to agent"` batch prompt.
     pub fn build_agent_batch_prompt(&self, file_path: Option<&str>) -> String {
-        self.inner
-            .lock()
-            .annotations
-            .build_agent_batch_prompt(file_path)
+        self.build_agent_batch_prompt_scoped(None, file_path)
+    }
+
+    /// Formats unresolved annotations scoped by optional `(repo_path, file_path)` into a
+    /// single coherent `"Send to agent"` batch prompt, keeping annotations pinned/unresolved.
+    pub fn build_agent_batch_prompt_scoped(
+        &self,
+        repo_path: Option<&str>,
+        file_path: Option<&str>,
+    ) -> String {
+        let items = self.list_annotations_scoped(repo_path, file_path, false);
+        if items.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec![format!(
+            "Address these {} diff review annotation(s):",
+            items.len()
+        )];
+        for (ann, _) in items {
+            let loc = if ann.line_start == ann.line_end {
+                format!("L{}", ann.line_start)
+            } else {
+                format!("L{}-L{}", ann.line_start, ann.line_end)
+            };
+            lines.push(format!("- {}:{}: {}", ann.file_path, loc, ann.body));
+        }
+        lines.join("\n")
     }
 
     /// Records AI (or worker/bot) provenance for `line_start..=line_end` in the local DB only.
@@ -619,7 +955,7 @@ pub fn compose_commit_and_pr_draft(req: &CommitPrDraftRequest) -> Result<CommitP
 // Multi-Forge Tasks Hub (GitHub, GitLab, Linear, Jira)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskForge {
     GitHub,
@@ -749,6 +1085,7 @@ const fn default_tasks_limit() -> usize {
 /// Persistent SQLite WAL multi-forge Tasks Hub unifying GitHub, GitLab, Linear, and Jira (`Send + Sync`).
 pub struct TasksHubStore {
     conn: Mutex<Connection>,
+    hidden_providers: Mutex<BTreeSet<TaskForge>>,
 }
 
 impl fmt::Debug for TasksHubStore {
@@ -795,6 +1132,7 @@ impl TasksHubStore {
         init_tasks_hub_conn(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            hidden_providers: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -803,10 +1141,22 @@ impl TasksHubStore {
         init_tasks_hub_conn(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            hidden_providers: Mutex::new(BTreeSet::new()),
         })
     }
 
-    /// Upserts a forge task, normalizing Jira/Linear key casing automatically.
+    /// Toggles whether tasks from `forge` appear in `list_tasks` results.
+    pub fn set_provider_visibility(&self, forge: TaskForge, visible: bool) {
+        let mut hidden = self.hidden_providers.lock();
+        if visible {
+            hidden.remove(&forge);
+        } else {
+            hidden.insert(forge);
+        }
+    }
+
+    /// Upserts a forge task, normalizing Jira/Linear key casing automatically and deduplicating
+    /// equivalent keys (`eng-42` == `ENG-42`) on the same forge.
     pub fn upsert_task(&self, mut record: HubTaskRecord) -> Result<HubTaskRecord> {
         if record.task_id.trim().is_empty() || record.title.trim().is_empty() {
             return Err(OrcaIdeRuntimeError::invalid_argument(
@@ -814,8 +1164,20 @@ impl TasksHubStore {
             ));
         }
         record.external_key = normalize_task_key(record.forge, &record.external_key)?;
+        let canonical_prefix = format!("{}:", record.forge.as_str());
+        if record.task_id.starts_with(&canonical_prefix)
+            || record.task_id.eq_ignore_ascii_case(&record.external_key)
+        {
+            record.task_id = format!("{}:{}", record.forge.as_str(), record.external_key);
+        }
         let labels_json = serde_json::to_string(&record.labels)?;
         let conn = self.conn.lock();
+        // Remove any legacy cased duplicate for the same (forge, normalized external_key).
+        let _ = conn.execute(
+            "DELETE FROM hub_tasks
+             WHERE forge = ?1 AND UPPER(external_key) = UPPER(?2) AND task_id != ?3",
+            params![record.forge.as_str(), &record.external_key, &record.task_id],
+        );
         conn.execute(
             "INSERT INTO hub_tasks
                 (task_id, forge, external_key, title, description, status, assignee,
@@ -863,6 +1225,25 @@ impl TasksHubStore {
         Ok(row)
     }
 
+    /// Looks up a task by `task_id` or case-insensitive `external_key` (e.g., `"GH-101"`).
+    pub fn get_task_by_key(&self, key: &str) -> Result<Option<HubTaskRecord>> {
+        let trimmed = key.trim();
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT task_id, forge, external_key, title, description, status, assignee,
+                        labels_json, artifact_url, repo_or_project, updated_at_ms
+                 FROM hub_tasks
+                 WHERE task_id = ?1 OR external_key = ?1 OR UPPER(external_key) = UPPER(?1)
+                 ORDER BY updated_at_ms DESC
+                 LIMIT 1",
+                params![trimmed],
+                row_to_hub_task,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn list_tasks(&self, filter: &TasksHubFilter) -> Result<Vec<HubTaskRecord>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -889,10 +1270,14 @@ impl TasksHubStore {
             filter.limit.min(500)
         };
 
+        let hidden_snapshot = self.hidden_providers.lock().clone();
         let mut out = Vec::new();
         let rows = stmt.query_map([], row_to_hub_task)?;
         for item in rows {
             let task = item?;
+            if filter.forge.is_none() && hidden_snapshot.contains(&task.forge) {
+                continue;
+            }
             if let Some(f) = filter.forge
                 && task.forge != f
             {

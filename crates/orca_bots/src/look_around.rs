@@ -50,6 +50,14 @@ pub struct StartedSuggestion {
     pub composer_ask: String,
 }
 
+/// Returned when a single Up Next suggestion is submitted directly via REST/CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedSuggestionResult {
+    pub suggestion: Suggestion,
+    pub deduped: bool,
+    pub credential_link_stripped: bool,
+}
+
 /// Persistent per-bot store for Look Around schedule and Up Next suggestions.
 #[derive(Debug, Clone)]
 pub struct UpNextStore {
@@ -162,6 +170,94 @@ impl UpNextStore {
         persisted.dismissed_keys.insert(key, now_ms);
         self.save_unlocked(bot_id, &persisted)?;
         Ok(suggestion)
+    }
+
+    /// Submits a single suggestion directly into a bot's Up Next queue while enforcing:
+    /// - Read-only Look Around agent guard (`claude`/`codex`).
+    /// - Field length bounds (`title` 1..=80, `why` 1..=400, `ask` 1..=2000).
+    /// - Credential-bearing link stripping (`link_carries_credential` / `sanitize_suggestion_link`).
+    /// - Canonical `suggestion_key` deduplication (GitHub PR/Issue, Linear issue, normalized title)
+    ///   across both live and dismissed suggestions.
+    /// - Max 5 live suggestions cap (`SUGGESTION_LIMITS.max_per_run`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_suggestion(
+        &self,
+        bot_id: &str,
+        agent: BotAgentId,
+        title: String,
+        why: String,
+        ask: String,
+        link: Option<String>,
+        now_ms: i64,
+    ) -> Result<SubmittedSuggestionResult> {
+        ensure_look_around_agent(agent)?;
+        let title_trimmed = title.trim();
+        let why_trimmed = why.trim();
+        let ask_trimmed = ask.trim();
+        if title_trimmed.is_empty()
+            || title_trimmed.chars().count() > SUGGESTION_LIMITS.title_max
+            || why_trimmed.is_empty()
+            || why_trimmed.chars().count() > SUGGESTION_LIMITS.why_max
+            || ask_trimmed.is_empty()
+            || ask_trimmed.chars().count() > SUGGESTION_LIMITS.ask_max
+        {
+            return Err(OrcaBotsError::bot(
+                BotErrorCode::InvalidArgument,
+                "Suggestion title/why/ask must be non-empty and within length limits (80/400/2000).",
+            ));
+        }
+        let had_cred_link = link.as_deref().is_some_and(link_carries_credential);
+        let sanitized_link = sanitize_suggestion_link(link.as_deref());
+        let key = suggestion_key(title_trimmed, sanitized_link.as_deref());
+
+        let _guard = self.lock_store()?;
+        let mut persisted = self.load_unlocked(bot_id)?;
+        if let Some(existing) = persisted
+            .suggestions
+            .iter()
+            .find(|s| suggestion_key(&s.title, s.link.as_deref()) == key)
+            .cloned()
+        {
+            return Ok(SubmittedSuggestionResult {
+                suggestion: existing,
+                deduped: true,
+                credential_link_stripped: had_cred_link,
+            });
+        }
+        if persisted.dismissed_keys.contains_key(&key) {
+            return Ok(SubmittedSuggestionResult {
+                suggestion: Suggestion {
+                    id: format!("sug-{}", uuid::Uuid::new_v4()),
+                    title: title_trimmed.to_string(),
+                    why: why_trimmed.to_string(),
+                    ask: ask_trimmed.to_string(),
+                    link: sanitized_link,
+                    created_at_ms: Some(now_ms),
+                },
+                deduped: true,
+                credential_link_stripped: had_cred_link,
+            });
+        }
+
+        let created = Suggestion {
+            id: format!("sug-{}", uuid::Uuid::new_v4()),
+            title: title_trimmed.to_string(),
+            why: why_trimmed.to_string(),
+            ask: ask_trimmed.to_string(),
+            link: sanitized_link,
+            created_at_ms: Some(now_ms),
+        };
+        created.validate()?;
+        if persisted.suggestions.len() < SUGGESTION_LIMITS.max_per_run {
+            persisted.suggestions.push(created.clone());
+        }
+        persisted.state = UpNextState::Ready;
+        self.save_unlocked(bot_id, &persisted)?;
+        Ok(SubmittedSuggestionResult {
+            suggestion: created,
+            deduped: false,
+            credential_link_stripped: had_cred_link,
+        })
     }
 
     fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
@@ -533,6 +629,7 @@ mod tests {
                     every: Some(LookAroundEvery::Every4h),
                     weekdays_only: Some(true),
                     focus: Some(Some("PR reviews".to_string())),
+                    since_ms: None,
                 },
                 wed_0900,
             )

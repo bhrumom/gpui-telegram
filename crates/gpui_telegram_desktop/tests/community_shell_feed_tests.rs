@@ -492,7 +492,7 @@ fn test_community_icons_extra_invariant_and_svg_load() {
 #[test]
 fn test_nav_rail_community_entry_badges_and_shortcut_digits() {
     let mut rail = NavRail::new();
-    assert_eq!(rail.items.len(), 11);
+    assert_eq!(rail.items.len(), 13);
     let comm_item = rail
         .items
         .iter()
@@ -3006,8 +3006,13 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
         let _ = shell.update(&mut app, |s, cx| {
             s.apply_theme_selection(mode, None, None, cx);
             assert_eq!(s.active_panel, ActiveWorkspacePanel::Community);
-            // 2a. Cmd+J Contacts modal -> Escape
+            // 2a. Contacts modal -> Escape (and verify Cmd+J opens ScopedJumpPalette without stealing composer focus)
             assert!(s.handle_shortcut_key("j", false, cx));
+            assert!(s.orca_jump_palette.is_some());
+            assert!(s.handle_non_char_key("escape", false, cx));
+            assert!(s.orca_jump_palette.is_none());
+            assert!(!s.composer.read(cx).is_input_focused);
+            s.open_modal_dialog("Contacts", ModalDialogKind::Contacts, 420.0, 500.0, cx);
             assert!(s.modal_container.read(cx).is_modal_active());
             assert!(s.composer.read(cx).is_compose_isolated);
         });
@@ -3018,14 +3023,14 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
             assert!(!s.composer.read(cx).is_compose_isolated);
             assert!(
                 !s.composer.read(cx).is_input_focused,
-                "F15-R4-D2 ({mode:?}): Cmd+J Esc must NOT focus hidden composer synchronously"
+                "F15-R4-D2 ({mode:?}): Contacts Esc must NOT focus hidden composer synchronously"
             );
         });
         host.draw(&mut app);
         let _ = shell.update(&mut app, |s, cx| {
             assert!(
                 !s.composer.read(cx).is_input_focused,
-                "F15-R4-D2 ({mode:?}): Cmd+J Esc must NOT focus hidden composer post-flush"
+                "F15-R4-D2 ({mode:?}): Contacts Esc must NOT focus hidden composer post-flush"
             );
             // Clicking sidebar search immediately after must NOT be clobbered by composer observer!
             s.sidebar.update(cx, |sb, scx| {
@@ -3036,7 +3041,7 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
         let _ = shell.update(&mut app, |s, cx| {
             assert!(
                 s.sidebar.read(cx).search_focused,
-                "F15-R4-D2 ({mode:?}): FocusSearch after Cmd+J Esc must stay focused"
+                "F15-R4-D2 ({mode:?}): FocusSearch after Contacts Esc must stay focused"
             );
             assert!(!s.composer.read(cx).is_input_focused);
             s.sidebar.update(cx, |sb, scx| {
@@ -3046,9 +3051,9 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
         });
         host.draw(&mut app);
 
-        // 2b. Cmd+J Contacts modal -> Mouse close (dismiss_top)
+        // 2b. Contacts modal -> Mouse close (dismiss_top)
         let _ = shell.update(&mut app, |s, cx| {
-            assert!(s.handle_shortcut_key("j", false, cx));
+            s.open_modal_dialog("Contacts", ModalDialogKind::Contacts, 420.0, 500.0, cx);
         });
         host.draw(&mut app);
         let _ = shell.update(&mut app, |s, cx| {
@@ -3063,7 +3068,7 @@ async fn body_r5_shell_occlusion_compose_modal_and_remote_hub_cleanup(mut app: A
             assert!(!s.composer.read(cx).is_compose_isolated);
             assert!(
                 !s.composer.read(cx).is_input_focused,
-                "F15-R4-D2 ({mode:?}): Cmd+J mouse close must NOT focus hidden composer"
+                "F15-R4-D2 ({mode:?}): Contacts mouse close must NOT focus hidden composer"
             );
         });
 

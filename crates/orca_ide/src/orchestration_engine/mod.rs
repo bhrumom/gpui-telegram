@@ -103,14 +103,21 @@ pub struct OrchestrationRunRecord {
 /// Request to create an orchestration run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRunRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "runId", skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "coordinatorOrcaSessionId",
+        alias = "coordinatorSession",
+        alias = "coordinator_session",
+        alias = "coordinatorSessionId",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub coordinator_orca_session_id: Option<String>,
-    #[serde(default = "default_local_only")]
+    #[serde(default = "default_local_only", alias = "mailboxIsLocalOnly")]
     pub mailbox_is_local_only: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "nowMs", skip_serializing_if = "Option::is_none")]
     pub now_ms: Option<i64>,
 }
 
@@ -121,17 +128,18 @@ const fn default_local_only() -> bool {
 /// Request to add a DAG task into an existing run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskRequest {
+    #[serde(alias = "runId")]
     pub run_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "taskId", skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     pub title: String,
-    #[serde(default)]
+    #[serde(default, alias = "deps", alias = "dependsOn")]
     pub depends_on: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "parentId", skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "nestingDepth", skip_serializing_if = "Option::is_none")]
     pub nesting_depth: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "nowMs", skip_serializing_if = "Option::is_none")]
     pub now_ms: Option<i64>,
 }
 
@@ -678,6 +686,55 @@ impl OrchestrationEngine {
         let _run = Self::get_run_inner(&conn, run_id)?;
         let dag = Self::load_dag(&conn, run_id)?;
         Ok(dag.ready_tasks().into_iter().cloned().collect())
+    }
+
+    /// Lists all tasks in `run_id` along with their persisted `parent_id` across restarts.
+    pub fn list_tasks_with_parent(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<(OrchestrationTask, Option<String>)>> {
+        let conn = self.conn.lock();
+        let _run = Self::get_run_inner(&conn, run_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, run_id, title, deps, parent_id, status, assigned_host_id,
+                    assigned_dispatch_id, nesting_depth, created_at_ms, updated_at_ms
+             FROM tasks WHERE run_id = ?1 ORDER BY created_at_ms ASC, task_id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let deps: Vec<String> = serde_json::from_str(&r.3)?;
+            let task = OrchestrationTask {
+                task_id: r.0,
+                run_id: r.1,
+                title: r.2,
+                depends_on: deps,
+                status: str_to_task_status(&r.5)?,
+                assigned_host_id: r.6,
+                assigned_dispatch_id: r.7,
+                nesting_depth: u32::try_from(r.8.max(1)).unwrap_or(1),
+                created_at_ms: r.9,
+                updated_at_ms: r.10,
+            };
+            out.push((task, r.4));
+        }
+        Ok(out)
     }
 
     pub(crate) fn load_dag(conn: &Connection, run_id: &str) -> Result<OrchestrationDag> {

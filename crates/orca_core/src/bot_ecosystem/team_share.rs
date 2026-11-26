@@ -28,6 +28,7 @@ pub const TEAM_SHARE_OFFER_HKDF_INFO: &[u8] = b"orca-team-share-offer-v1";
 pub const TEAM_SHARE_OFFER_SIG_DOMAIN: &[u8] = b"orca-team-share-offer-sig-v1\0";
 pub const TEAM_SHARE_HELD_MSG_HKDF_INFO: &[u8] = b"orca-team-share-held-message-v1";
 pub const TEAM_SHARE_SEND_PROOF_PURPOSE: &[u8] = b"share-send\0";
+pub const TEAM_SHARE_HOST_KEY_COMMITMENT_DOMAIN: &[u8] = b"orca-team-share-host-key-v1\0";
 
 // ---------------------------------------------------------------------------
 // Identity Keypairs & Low-Level Crypto Primitives
@@ -510,6 +511,53 @@ pub fn verify_share_send_proof(
     verify_ed25519_bytes(sender_ed25519_pub, &digest, proof_sig)
 }
 
+/// Computes a domain-separated SHA-256 commitment binding `host_key` to
+/// `(share_id, bot_id, client_message_id)` without ever exposing raw `host_key` plaintext.
+pub fn compute_team_share_host_key_commitment(
+    host_key: &str,
+    share_id: &str,
+    bot_id: &str,
+    client_message_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(TEAM_SHARE_HOST_KEY_COMMITMENT_DOMAIN);
+    for part in [
+        share_id.as_bytes(),
+        bot_id.as_bytes(),
+        client_message_id.as_bytes(),
+        host_key.as_bytes(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    BASE64_STD.encode(digest)
+}
+
+/// Verifies `supplied_host_key` against `expected_commitment_b64` in constant time.
+pub fn verify_team_share_host_key_commitment(
+    expected_commitment_b64: &str,
+    supplied_host_key: &str,
+    share_id: &str,
+    bot_id: &str,
+    client_message_id: &str,
+) -> bool {
+    let Ok(expected_bytes) = decode_b64_fixed::<32>(expected_commitment_b64, "host_key_commitment")
+    else {
+        return false;
+    };
+    let actual_b64 =
+        compute_team_share_host_key_commitment(supplied_host_key, share_id, bot_id, client_message_id);
+    let Ok(actual_bytes) = decode_b64_fixed::<32>(&actual_b64, "host_key_commitment") else {
+        return false;
+    };
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= std::hint::black_box(expected_bytes[i] ^ actual_bytes[i]);
+    }
+    std::hint::black_box(diff) == 0
+}
+
 /// Plaintext payload sealed inside [`SealedTeamShareHeldMessage`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamShareHeldMessagePayload {
@@ -519,6 +567,8 @@ pub struct TeamShareHeldMessagePayload {
     pub sender_name: String,
     pub text: String,
     pub sent_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_commitment: Option<String>,
 }
 
 /// E2EE held-message envelope forwarded via relay while recipient host is offline.
@@ -1050,6 +1100,7 @@ mod tests {
             sender_name: "Alice".to_string(),
             text: "Please check PR #418 before merge.".to_string(),
             sent_at_ms: 1_764_000_000_000,
+            host_key_commitment: None,
         };
 
         let sealed = seal_team_share_held_message(&alice, &bob.public_identity(), &payload)

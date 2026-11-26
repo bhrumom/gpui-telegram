@@ -4,8 +4,13 @@
 //! `ClosedTerminalTabTombstone` Registry (`F14`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, OnceLock};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
 
 use bytes::{Bytes, BytesMut};
 use orca_core::workspace_layout::{
@@ -87,6 +92,23 @@ impl HeadlessVtBuffer {
 
     pub fn cursor_position(&self) -> (usize, usize) {
         (self.cursor_row, self.cursor_col)
+    }
+
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.cols, self.rows)
+    }
+
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        let new_cols = cols.max(1);
+        let new_rows = rows.max(1);
+        for row in &mut self.grid {
+            row.resize(new_cols, ' ');
+        }
+        self.grid.resize_with(new_rows, || vec![' '; new_cols]);
+        self.cols = new_cols;
+        self.rows = new_rows;
+        self.cursor_row = self.cursor_row.min(new_rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(new_cols.saturating_sub(1));
     }
 
     pub fn current_cursor(&self) -> u64 {
@@ -357,6 +379,7 @@ pub enum DaemonTransientFact {
     Mode2031Subscribe,
     Mode2031Unsubscribe,
     ForegroundChanged { process: String },
+    Osc52ClipboardWrite { text: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -522,6 +545,18 @@ fn parse_osc_fact(osc: &str, facts: &mut Vec<DaemonTransientFact>) {
                 facts.push(DaemonTransientFact::CommandFinished { exit_code });
             }
         }
+        "52" => {
+            if let Some((_sel, b64)) = body.split_once(';') {
+                let trimmed = b64.trim();
+                if trimmed != "?"
+                    && !trimmed.is_empty()
+                    && let Ok(decoded) = BASE64_STD.decode(trimmed)
+                    && let Ok(text) = String::from_utf8(decoded)
+                {
+                    facts.push(DaemonTransientFact::Osc52ClipboardWrite { text });
+                }
+            }
+        }
         "7501" => {
             for token in body.split([';', '&', ',']) {
                 if let Some((k, v)) = token.split_once('=') {
@@ -624,8 +659,11 @@ struct PtySessionState {
     incarnation_id: PtyIncarnationId,
     vt: HeadlessVtBuffer,
     facts: TransientFactExtractor,
+    allow_osc52_clipboard: bool,
+    side_effects: Vec<DaemonTransientFact>,
     background: bool,
     cold_park_dirty: bool,
+    pushed_raw_bytes_while_hidden: usize,
     pending_queue: VecDeque<Bytes>,
     pending_bytes: usize,
     credit_remaining: usize,
@@ -634,6 +672,8 @@ struct PtySessionState {
     dropped_bytes: usize,
     attached_clients: BTreeSet<String>,
     agent_owner: Option<String>,
+    child_stdin: Option<Arc<std::sync::Mutex<ChildStdin>>>,
+    child_proc: Option<Arc<std::sync::Mutex<Child>>>,
 }
 
 struct MultiplexInner {
@@ -727,6 +767,21 @@ impl PtyMultiplexController {
         title: impl Into<String>,
         now_ms: i64,
     ) -> Result<PtyIncarnationId> {
+        self.create_session_with_options(tab_id, pane_id, title, None, None, false, now_ms)
+    }
+
+    /// Creates a new PTY session with explicit VT dimensions and OSC 52 clipboard write policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_options(
+        &self,
+        tab_id: impl Into<String>,
+        pane_id: &str,
+        title: impl Into<String>,
+        cols: Option<usize>,
+        rows: Option<usize>,
+        allow_osc52_clipboard: bool,
+        now_ms: i64,
+    ) -> Result<PtyIncarnationId> {
         let tab_id = tab_id.into();
         let mut guard = self.inner.lock();
         guard.layout.prune_expired_tombstones(now_ms);
@@ -761,15 +816,20 @@ impl PtyMultiplexController {
         guard.layout.open_tab(pane_id, tab, now_ms)?;
 
         let cfg = guard.config.clone();
+        let vt_cols = cols.unwrap_or(cfg.vt_cols).max(1);
+        let vt_rows = rows.unwrap_or(cfg.vt_rows).max(1);
         guard.sessions.insert(
             tab_id.clone(),
             PtySessionState {
                 tab_id,
                 incarnation_id: incarnation.clone(),
-                vt: HeadlessVtBuffer::new(cfg.vt_cols, cfg.vt_rows, cfg.vt_scrollback),
+                vt: HeadlessVtBuffer::new(vt_cols, vt_rows, cfg.vt_scrollback),
                 facts: TransientFactExtractor::new(),
+                allow_osc52_clipboard,
+                side_effects: Vec::new(),
                 background: false,
                 cold_park_dirty: false,
+                pushed_raw_bytes_while_hidden: 0,
                 pending_queue: VecDeque::new(),
                 pending_bytes: 0,
                 credit_remaining: cfg.initial_credit_bytes,
@@ -778,9 +838,150 @@ impl PtyMultiplexController {
                 dropped_bytes: 0,
                 attached_clients: BTreeSet::new(),
                 agent_owner: None,
+                child_stdin: None,
+                child_proc: None,
             },
         );
         Ok(incarnation)
+    }
+
+    /// Spawns a live `/bin/sh` child process attached to an existing PTY session, piping its
+    /// stdout & stderr asynchronously into `PtyMultiplexController::ingest_pty_output`.
+    pub fn spawn_shell_for_session(pty: &Arc<Self>, tab_id: &str) -> Result<()> {
+        let mut child = Command::new("/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| OrcaIdeRuntimeError::Io(std::io::Error::other(format!("spawn /bin/sh failed: {e}"))))?;
+
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let child_arc = Arc::new(std::sync::Mutex::new(child));
+        let stdin_arc = stdin.map(|s| Arc::new(std::sync::Mutex::new(s)));
+
+        {
+            let mut guard = pty.inner.lock();
+            let session = guard.sessions.get_mut(tab_id).ok_or_else(|| {
+                OrcaIdeRuntimeError::ide(
+                    OrcaIdeErrorCode::TabNotFound,
+                    format!("PTY session '{tab_id}' not found"),
+                )
+            })?;
+            session.child_stdin = stdin_arc;
+            session.child_proc = Some(child_arc);
+        }
+
+        if let Some(mut out) = stdout {
+            let pty_weak = Arc::downgrade(pty);
+            let tid = tab_id.to_string();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = out.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let Some(strong) = pty_weak.upgrade() else {
+                        break;
+                    };
+                    if strong.ingest_pty_output(&tid, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        if let Some(mut err_pipe) = stderr {
+            let pty_weak = Arc::downgrade(pty);
+            let tid = tab_id.to_string();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = err_pipe.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let Some(strong) = pty_weak.upgrade() else {
+                        break;
+                    };
+                    if strong.ingest_pty_output(&tid, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Writes bytes to the live shell stdin for `tab_id` (falling back to VT ingest if no shell).
+    pub fn write_stdin(&self, tab_id: &str, data: &[u8]) -> Result<()> {
+        let stdin_opt = {
+            let guard = self.inner.lock();
+            let session = guard.sessions.get(tab_id).ok_or_else(|| {
+                OrcaIdeRuntimeError::ide(
+                    OrcaIdeErrorCode::TabNotFound,
+                    format!("PTY session '{tab_id}' not found"),
+                )
+            })?;
+            session.child_stdin.clone()
+        };
+        if let Some(stdin_arc) = stdin_opt {
+            if let Ok(mut w) = stdin_arc.lock() {
+                w.write_all(data)?;
+                let _ = w.flush();
+            }
+            Ok(())
+        } else {
+            let _ = self.ingest_pty_output(tab_id, data)?;
+            Ok(())
+        }
+    }
+
+    /// Resizes the headless VT grid for `tab_id` and returns `(cols, rows)`.
+    pub fn resize_session(&self, tab_id: &str, cols: usize, rows: usize) -> Result<(usize, usize)> {
+        let mut guard = self.inner.lock();
+        let session = guard.sessions.get_mut(tab_id).ok_or_else(|| {
+            OrcaIdeRuntimeError::ide(
+                OrcaIdeErrorCode::TabNotFound,
+                format!("PTY session '{tab_id}' not found"),
+            )
+        })?;
+        session.vt.resize(cols, rows);
+        Ok(session.vt.dimensions())
+    }
+
+    pub fn session_dimensions(&self, tab_id: &str) -> Result<(usize, usize)> {
+        let guard = self.inner.lock();
+        let session = guard.sessions.get(tab_id).ok_or_else(|| {
+            OrcaIdeRuntimeError::ide(
+                OrcaIdeErrorCode::TabNotFound,
+                format!("PTY session '{tab_id}' not found"),
+            )
+        })?;
+        Ok(session.vt.dimensions())
+    }
+
+    /// Drains all extracted off-UI transient side-effect facts accumulated for `tab_id`.
+    pub fn take_side_effects(&self, tab_id: &str) -> Result<Vec<DaemonTransientFact>> {
+        let mut guard = self.inner.lock();
+        let session = guard.sessions.get_mut(tab_id).ok_or_else(|| {
+            OrcaIdeRuntimeError::ide(
+                OrcaIdeErrorCode::TabNotFound,
+                format!("PTY session '{tab_id}' not found"),
+            )
+        })?;
+        Ok(std::mem::take(&mut session.side_effects))
+    }
+
+    /// Returns `(background, pushed_raw_bytes_while_hidden)` for cold-park verification.
+    pub fn get_view_state(&self, tab_id: &str) -> Result<(bool, usize)> {
+        let guard = self.inner.lock();
+        let session = guard.sessions.get(tab_id).ok_or_else(|| {
+            OrcaIdeRuntimeError::ide(
+                OrcaIdeErrorCode::TabNotFound,
+                format!("PTY session '{tab_id}' not found"),
+            )
+        })?;
+        Ok((session.background, session.pushed_raw_bytes_while_hidden))
     }
 
     /// Attaches a client to an active PTY session; refuses tombstoned or missing tabs with `TabNotFound`.
@@ -817,6 +1018,18 @@ impl PtyMultiplexController {
             )
         })?;
         session.attached_clients.remove(client_id);
+        Ok(())
+    }
+
+    pub fn detach_all_clients(&self, tab_id: &str) -> Result<()> {
+        let mut guard = self.inner.lock();
+        let session = guard.sessions.get_mut(tab_id).ok_or_else(|| {
+            OrcaIdeRuntimeError::ide(
+                OrcaIdeErrorCode::TabNotFound,
+                format!("PTY session '{tab_id}' not found"),
+            )
+        })?;
+        session.attached_clients.clear();
         Ok(())
     }
 
@@ -880,7 +1093,13 @@ impl PtyMultiplexController {
         })?;
 
         session.vt.feed(chunk);
-        let facts = session.facts.feed(chunk);
+        let raw_facts = session.facts.feed(chunk);
+        let allow_osc52 = session.allow_osc52_clipboard;
+        let facts: Vec<DaemonTransientFact> = raw_facts
+            .into_iter()
+            .filter(|f| allow_osc52 || !matches!(f, DaemonTransientFact::Osc52ClipboardWrite { .. }))
+            .collect();
+        session.side_effects.extend(facts.iter().cloned());
 
         if chunk.is_empty() {
             return Ok(facts);
@@ -1133,7 +1352,13 @@ impl PtyMultiplexController {
             }
         }
 
-        guard.sessions.remove(&req.tab_id);
+        if let Some(removed) = guard.sessions.remove(&req.tab_id)
+            && let Some(child_arc) = removed.child_proc
+            && let Ok(mut child) = child_arc.lock()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let tombstone = guard.layout.close_tab(&req.tab_id, req.now_ms)?;
         sync_tombstones_to_db(&guard)?;
         Ok(tombstone)

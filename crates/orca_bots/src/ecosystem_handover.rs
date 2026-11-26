@@ -27,6 +27,7 @@ use orca_core::bot_ecosystem::{
     redact_bot_text, scan_bot_text, scan_bot_text_risks, seal_team_share_held_message,
     seal_team_share_offer, skill_relative_path, suggest_hand_over_bot, templates_by_category,
     transition_team_share_offer, validate_bot_import_candidate, validate_bot_package_v1,
+    verify_team_share_host_key_commitment,
 };
 use orca_core::bot_types::{
     BotAgentId, BotImportedFrom, BotLookAroundConfig, BotMascotId, BotName, OrcaBotRecord,
@@ -148,25 +149,70 @@ impl BotTemplateInstaller {
             )
         })?;
 
-        let desired_name = custom_name_opt
+        let explicit_name = custom_name_opt
             .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .unwrap_or(tmpl.name)
-            .to_string();
+            .filter(|n| !n.is_empty());
 
-        let mut bot = controller
-            .create_bot(CreateBotRequest {
-                name: Some(desired_name),
-                agent: tmpl.default_agent,
-                mascot: Some(tmpl.mascot),
-                avatar_color: Some(tmpl.avatar_color.to_string()),
-                avatar_outfit: tmpl.outfit.map(|o| o.as_str().to_string()),
-                custom_soul: Some(tmpl.soul_md.to_string()),
-                template_id: Some(tmpl.id.to_string()),
-                first_run: false,
-                ..Default::default()
-            })
-            .await?;
+        let mut bot = if let Some(custom) = explicit_name {
+            controller
+                .create_bot(CreateBotRequest {
+                    name: Some(custom.to_string()),
+                    agent: tmpl.default_agent,
+                    mascot: Some(tmpl.mascot),
+                    avatar_color: Some(tmpl.avatar_color.to_string()),
+                    avatar_outfit: tmpl.outfit.map(|o| o.as_str().to_string()),
+                    custom_soul: Some(tmpl.soul_md.to_string()),
+                    template_id: Some(tmpl.id.to_string()),
+                    first_run: false,
+                    ..Default::default()
+                })
+                .await?
+        } else {
+            let mut created = None;
+            let mut last_err = None;
+            for attempt in 1u32..=99 {
+                let candidate = if attempt == 1 {
+                    tmpl.name.to_string()
+                } else {
+                    format!("{} {}", tmpl.name, attempt)
+                };
+                match controller
+                    .create_bot(CreateBotRequest {
+                        name: Some(candidate),
+                        agent: tmpl.default_agent,
+                        mascot: Some(tmpl.mascot),
+                        avatar_color: Some(tmpl.avatar_color.to_string()),
+                        avatar_outfit: tmpl.outfit.map(|o| o.as_str().to_string()),
+                        custom_soul: Some(tmpl.soul_md.to_string()),
+                        template_id: Some(tmpl.id.to_string()),
+                        first_run: false,
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(b) => {
+                        created = Some(b);
+                        break;
+                    }
+                    Err(OrcaBotsError::Bot(e)) if e.code == BotErrorCode::BotNameTaken => {
+                        last_err = Some(OrcaBotsError::Bot(e));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            match created {
+                Some(b) => b,
+                None => {
+                    return Err(last_err.unwrap_or_else(|| {
+                        OrcaBotsError::bot(
+                            BotErrorCode::BotNameTaken,
+                            format!("Template '{}' default bot name slots exhausted.", tmpl.name),
+                        )
+                    }));
+                }
+            }
+        };
 
         if let Some(preset) = tmpl.look_around_preset {
             bot = controller
@@ -947,6 +993,26 @@ impl BotTeamShareEngine {
         expected_bot_id: &str,
         msg: &SealedTeamShareHeldMessage,
     ) -> Result<TeamShareHeldMessagePayload> {
+        self.open_held_message_strict_with_host_key(
+            expected_sender_ed25519_b64,
+            expected_share_id,
+            expected_bot_id,
+            None,
+            msg,
+        )
+    }
+
+    /// Strictly opens and verifies a single sealed held message alongside its cryptographic
+    /// `hostKey` commitment **BEFORE** committing `client_message_id` into the replay guard,
+    /// so missing/wrong `hostKey` attempts fail closed without burning the replay slot.
+    pub fn open_held_message_strict_with_host_key(
+        &self,
+        expected_sender_ed25519_b64: &str,
+        expected_share_id: &str,
+        expected_bot_id: &str,
+        expected_host_key: Option<&str>,
+        msg: &SealedTeamShareHeldMessage,
+    ) -> Result<TeamShareHeldMessagePayload> {
         let opened = open_team_share_held_message(
             &self.identity,
             Some(expected_sender_ed25519_b64),
@@ -954,6 +1020,37 @@ impl BotTeamShareEngine {
             Some(expected_bot_id),
             msg,
         )?;
+        match (&opened.host_key_commitment, expected_host_key) {
+            (Some(expected_commitment), Some(supplied_hk)) => {
+                if supplied_hk.trim().is_empty()
+                    || !verify_team_share_host_key_commitment(
+                        expected_commitment,
+                        supplied_hk,
+                        &opened.share_id,
+                        &opened.bot_id,
+                        &opened.client_message_id,
+                    )
+                {
+                    return Err(OrcaBotsError::bot(
+                        BotErrorCode::InvalidArgument,
+                        "Held message hostKey binding mismatch.",
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(OrcaBotsError::bot(
+                    BotErrorCode::InvalidArgument,
+                    "Held message requires matching hostKey binding.",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(OrcaBotsError::bot(
+                    BotErrorCode::InvalidArgument,
+                    "Held message carries no hostKey binding.",
+                ));
+            }
+            (None, None) => {}
+        }
         let mut guard = self.lock_state()?;
         let dedup_key = (opened.share_id.clone(), opened.client_message_id.clone());
         if !guard.processed_client_message_ids.insert(dedup_key) {
@@ -2154,6 +2251,7 @@ mod tests {
             sender_name: "Alice".to_string(),
             text: "Please inspect prod latency.".to_string(),
             sent_at_ms: 12_000,
+            host_key_commitment: None,
         };
         let sealed_msg = host_a
             .seal_held_message(&host_b.public_identity(), &held_payload)
@@ -2437,4 +2535,82 @@ mod tests {
                 .is_some_and(|s| s.starts_with("Continues at "))
         );
     }
+
+    #[test]
+    fn sec02_host_key_omission_rejected_and_wrong_key_never_burns_replay_slot() {
+        use orca_core::bot_ecosystem::compute_team_share_host_key_commitment;
+
+        let host_a = BotTeamShareEngine::generate("host-sec02-a").expect("host a");
+        let host_b = BotTeamShareEngine::generate("host-sec02-b").expect("host b");
+        let host_key = "hk-valid-secret";
+        let payload = TeamShareHeldMessagePayload {
+            share_id: "share-sec02".to_string(),
+            bot_id: "bot-sec02".to_string(),
+            client_message_id: "cmsg-sec02-1".to_string(),
+            sender_name: "Owner".to_string(),
+            text: "TOP_SECRET_SEC02_PAYLOAD".to_string(),
+            sent_at_ms: 20_000,
+            host_key_commitment: Some(compute_team_share_host_key_commitment(
+                host_key,
+                "share-sec02",
+                "bot-sec02",
+                "cmsg-sec02-1",
+            )),
+        };
+        let sealed = host_a
+            .seal_held_message(&host_b.public_identity(), &payload)
+            .expect("seal");
+        let sender_pub = host_a.public_identity().ed25519_public_b64;
+
+        // 1. Omitted hostKey MUST fail closed and NOT burn replay slot.
+        assert!(
+            host_b
+                .open_held_message_strict_with_host_key(
+                    &sender_pub,
+                    "share-sec02",
+                    "bot-sec02",
+                    None,
+                    &sealed,
+                )
+                .is_err()
+        );
+        // 2. Wrong hostKey MUST fail closed and NOT burn replay slot.
+        assert!(
+            host_b
+                .open_held_message_strict_with_host_key(
+                    &sender_pub,
+                    "share-sec02",
+                    "bot-sec02",
+                    Some("hk-WRONG"),
+                    &sealed,
+                )
+                .is_err()
+        );
+        // 3. Subsequent legitimate open with matching hostKey MUST succeed.
+        let opened = host_b
+            .open_held_message_strict_with_host_key(
+                &sender_pub,
+                "share-sec02",
+                "bot-sec02",
+                Some(host_key),
+                &sealed,
+            )
+            .expect("valid hostKey must succeed after failed probes");
+        assert_eq!(opened.text, "TOP_SECRET_SEC02_PAYLOAD");
+        assert_eq!(opened.sender_name, "Owner");
+        assert_ne!(opened.sender_name, host_key);
+        // 4. Replay of the already-opened message MUST now be rejected by replay guard.
+        assert!(
+            host_b
+                .open_held_message_strict_with_host_key(
+                    &sender_pub,
+                    "share-sec02",
+                    "bot-sec02",
+                    Some(host_key),
+                    &sealed,
+                )
+                .is_err()
+        );
+    }
 }
+

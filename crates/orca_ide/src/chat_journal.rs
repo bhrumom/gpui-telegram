@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS journal_chat_state (
     context_boundary INTEGER NOT NULL DEFAULT 0,
     queue_revision INTEGER NOT NULL DEFAULT 0,
     draft_text TEXT NOT NULL DEFAULT '',
+    draft_attachments_json TEXT NOT NULL DEFAULT '[]',
     updated_at_ms INTEGER NOT NULL
 );
 
@@ -339,6 +340,10 @@ fn init_journal_schema(conn: &Connection) -> Result<()> {
          PRAGMA busy_timeout = 5000;",
     )?;
     conn.execute_batch(JOURNAL_SCHEMA_SQL)?;
+    let _ = conn.execute(
+        "ALTER TABLE journal_chat_state ADD COLUMN draft_attachments_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
     conn.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1237,6 +1242,376 @@ impl ChatJournalStore {
             now_ms,
         )?;
         Self::load_snapshot(&conn, &fork_id)
+    }
+
+    /// Saves unsent draft text alongside structured attachment metadata durably in SQLite WAL.
+    pub fn save_draft_with_attachments(
+        &self,
+        session_id: &str,
+        draft_text: &str,
+        attachments: &[serde_json::Value],
+        now_ms: Option<i64>,
+    ) -> Result<(String, Vec<serde_json::Value>)> {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let conn = self.conn.lock();
+        let _snap = Self::load_snapshot(&conn, session_id)?;
+        let att_json = serde_json::to_string(attachments)?;
+        conn.execute(
+            "UPDATE journal_chat_state
+             SET draft_text = ?1, draft_attachments_json = ?2, updated_at_ms = ?3
+             WHERE session_id = ?4",
+            params![draft_text, &att_json, now_ms, session_id],
+        )?;
+        Ok((draft_text.to_string(), attachments.to_vec()))
+    }
+
+    /// Loads durable unsent draft text and attachment metadata across restarts.
+    pub fn get_draft_with_attachments(
+        &self,
+        session_id: &str,
+    ) -> Result<(String, Vec<serde_json::Value>)> {
+        let conn = self.conn.lock();
+        let _snap = Self::load_snapshot(&conn, session_id)?;
+        let (text, att_json): (String, String) = conn.query_row(
+            "SELECT draft_text, COALESCE(draft_attachments_json, '[]')
+             FROM journal_chat_state WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let attachments: Vec<serde_json::Value> = serde_json::from_str(&att_json).unwrap_or_default();
+        Ok((text, attachments))
+    }
+
+    /// Enqueues a follow-up submission while an existing current turn is still working (`current = 0`).
+    pub fn enqueue_followup_submission(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        prompt_text: &str,
+        attachments: Vec<serde_json::Value>,
+        now_ms: Option<i64>,
+    ) -> Result<SubmissionAttemptRecord> {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let conn = self.conn.lock();
+        let snap = Self::load_snapshot(&conn, session_id)?;
+        let attempt_id = format!("sub-{}", Uuid::new_v4());
+        let att_json = serde_json::to_string(&attachments)?;
+        conn.execute(
+            "INSERT INTO journal_submission_attempts
+             (attempt_id, session_id, operation_id, prompt_text, attachments_json,
+              current, status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 'queued', ?6)",
+            params![&attempt_id, session_id, operation_id, prompt_text, &att_json, now_ms],
+        )?;
+        conn.execute(
+            "UPDATE journal_chat_state
+             SET queue_revision = queue_revision + 1, updated_at_ms = ?1
+             WHERE session_id = ?2",
+            params![now_ms, session_id],
+        )?;
+        Self::record_event(
+            &conn,
+            session_id,
+            snap.chat_state.last_sequence,
+            snap.chat_state.epoch,
+            "submission_queued",
+            &serde_json::json!({ "attempt_id": &attempt_id, "prompt_text": prompt_text }),
+            now_ms,
+        )?;
+        Ok(SubmissionAttemptRecord {
+            attempt_id,
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            prompt_text: prompt_text.to_string(),
+            attachments,
+            current: false,
+            status: SubmissionStatus::Queued,
+            created_at_ms: now_ms,
+        })
+    }
+
+    /// Lists all submission attempts for `session_id` (both current and queued follow-ups).
+    pub fn list_submissions(&self, session_id: &str) -> Result<Vec<SubmissionAttemptRecord>> {
+        let conn = self.conn.lock();
+        let _snap = Self::load_snapshot(&conn, session_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT attempt_id, session_id, operation_id, prompt_text, attachments_json,
+                    current, status, created_at_ms
+             FROM journal_submission_attempts
+             WHERE session_id = ?1
+             ORDER BY created_at_ms ASC, rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let status = match r.6.as_str() {
+                "steered" => SubmissionStatus::Steered,
+                "canceled" => SubmissionStatus::Canceled,
+                "sent" => SubmissionStatus::Sent,
+                _ => SubmissionStatus::Queued,
+            };
+            out.push(SubmissionAttemptRecord {
+                attempt_id: r.0,
+                session_id: r.1,
+                operation_id: r.2,
+                prompt_text: r.3,
+                attachments: serde_json::from_str(&r.4).unwrap_or_default(),
+                current: r.5,
+                status,
+                created_at_ms: r.7,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Records a context boundary (e.g., `/clear`), incrementing `context_boundary` and
+    /// appending a new provider handle onto `provider_handle_chain`.
+    pub fn record_context_boundary(
+        &self,
+        session_id: &str,
+        reason: Option<&str>,
+        new_provider_handle: Option<String>,
+        now_ms: Option<i64>,
+    ) -> Result<AgentSessionSnapshot> {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let conn = self.conn.lock();
+        let snap = Self::load_snapshot(&conn, session_id)?;
+        let mut chain = snap.session.provider_handle_chain.clone();
+        let next_handle = new_provider_handle
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(|| format!("hdl-{}-{}", snap.session.agent_id, Uuid::new_v4().simple()));
+        if !chain.contains(&next_handle) {
+            chain.push(next_handle.clone());
+        }
+        let chain_json = serde_json::to_string(&chain)?;
+        conn.execute(
+            "UPDATE agent_session_records
+             SET provider_handle_chain = ?1, updated_at_ms = ?2
+             WHERE session_id = ?3",
+            params![&chain_json, now_ms, session_id],
+        )?;
+        conn.execute(
+            "UPDATE journal_chat_state
+             SET context_boundary = context_boundary + 1, epoch = epoch + 1, updated_at_ms = ?1
+             WHERE session_id = ?2",
+            params![now_ms, session_id],
+        )?;
+        Self::record_event(
+            &conn,
+            session_id,
+            snap.chat_state.last_sequence,
+            snap.chat_state.epoch + 1,
+            "context_boundary",
+            &serde_json::json!({
+                "reason": reason.unwrap_or("/clear"),
+                "new_provider_handle": next_handle,
+            }),
+            now_ms,
+        )?;
+        Self::load_snapshot(&conn, session_id)
+    }
+
+    /// Updates an existing journal item's `payload_json` (e.g., settling an interactive prompt).
+    pub fn update_item_payload(
+        &self,
+        session_id: &str,
+        item_id: &str,
+        payload_json: serde_json::Value,
+        now_ms: Option<i64>,
+    ) -> Result<JournalItemRecord> {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let conn = self.conn.lock();
+        let snap = Self::load_snapshot(&conn, session_id)?;
+        let serialized = serde_json::to_string(&payload_json)?;
+        let updated = conn.execute(
+            "UPDATE journal_items SET payload_json = ?1 WHERE session_id = ?2 AND item_id = ?3",
+            params![&serialized, session_id, item_id],
+        )?;
+        if updated == 0 {
+            return Err(OrcaIdeRuntimeError::not_found(format!(
+                "journal item '{item_id}' not found in session '{session_id}'"
+            )));
+        }
+        Self::record_event(
+            &conn,
+            session_id,
+            snap.chat_state.last_sequence,
+            snap.chat_state.epoch,
+            "item_updated",
+            &serde_json::json!({ "item_id": item_id }),
+            now_ms,
+        )?;
+        let row: (String, String, i64, i64, String, Option<String>, String, i64) = conn.query_row(
+            "SELECT item_id, session_id, sequence, epoch, item_kind, provider_item_id,
+                    payload_json, created_at_ms
+             FROM journal_items
+             WHERE session_id = ?1 AND item_id = ?2",
+            params![session_id, item_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )?;
+        Ok(JournalItemRecord {
+            item_id: row.0,
+            session_id: row.1,
+            sequence: row.2,
+            epoch: row.3,
+            item_kind: row.4,
+            provider_item_id: row.5,
+            payload_json: serde_json::from_str(&row.6)?,
+            created_at_ms: row.7,
+        })
+    }
+
+    /// Explicitly sets `view_mode` in-place on `session_id` without flipping unexpectedly.
+    pub fn set_view_mode(
+        &self,
+        session_id: &str,
+        target_mode: TabViewMode,
+        new_provider_handle: Option<String>,
+        now_ms: Option<i64>,
+    ) -> Result<AgentSessionSnapshot> {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let conn = self.conn.lock();
+        let snap = Self::load_snapshot(&conn, session_id)?;
+        let mut chain = snap.session.provider_handle_chain.clone();
+        if let Some(h) = new_provider_handle.filter(|h| !h.trim().is_empty())
+            && !chain.contains(&h)
+        {
+            chain.push(h);
+        }
+        let chain_json = serde_json::to_string(&chain)?;
+        conn.execute(
+            "UPDATE agent_session_records
+             SET view_mode = ?1, provider_handle_chain = ?2, updated_at_ms = ?3
+             WHERE session_id = ?4",
+            params![view_mode_to_str(target_mode), &chain_json, now_ms, session_id],
+        )?;
+        Self::load_snapshot(&conn, session_id)
+    }
+
+    /// Continues a session into a new session of `target_view_mode`, cloning non-tombstoned
+    /// transcript items, optionally enforcing `!active_cli_owner`, setting `active_cli_owner`
+    /// on the new session, and optionally appending a fresh handle to `provider_handle_chain`.
+    pub fn continue_in_new_session(
+        &self,
+        source_session_id: &str,
+        target_view_mode: TabViewMode,
+        require_no_active_cli: bool,
+        set_new_active_cli_owner: bool,
+        append_new_handle: bool,
+        now_ms: Option<i64>,
+    ) -> Result<AgentSessionSnapshot> {
+        let now_ms = now_ms.unwrap_or_else(now_epoch_ms);
+        let conn = self.conn.lock();
+        let src = Self::load_snapshot(&conn, source_session_id)?;
+        if require_no_active_cli && src.session.active_cli_owner {
+            return Err(OrcaIdeRuntimeError::active_cli_owner(format!(
+                "cannot continue session '{source_session_id}' while an active CLI owner is still running"
+            )));
+        }
+        let mut chain = src.session.provider_handle_chain.clone();
+        if chain.is_empty() {
+            chain.push(format!("hdl-{}-{}", src.session.agent_id, Uuid::new_v4().simple()));
+        }
+        if append_new_handle {
+            chain.push(format!("hdl-{}-{}", src.session.agent_id, Uuid::new_v4().simple()));
+        }
+        let target_id = format!("sess-cont-{}", Uuid::new_v4());
+        let chain_json = serde_json::to_string(&chain)?;
+        conn.execute(
+            "INSERT INTO agent_session_records
+             (session_id, workspace_id, host_id, agent_id, view_mode, active_cli_owner,
+              provider_handle_chain, adopted_native_id, parent_session_id, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![
+                &target_id,
+                &src.session.workspace_id,
+                &src.session.host_id,
+                &src.session.agent_id,
+                view_mode_to_str(target_view_mode),
+                i32::from(set_new_active_cli_owner),
+                &chain_json,
+                &src.session.adopted_native_id,
+                source_session_id,
+                now_ms
+            ],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT i.epoch, i.item_kind, i.provider_item_id, i.payload_json, i.created_at_ms
+             FROM journal_items i
+             LEFT JOIN journal_item_tombstones t
+               ON t.session_id = i.session_id AND t.item_id = i.item_id
+             WHERE i.session_id = ?1 AND t.item_id IS NULL
+             ORDER BY i.sequence ASC",
+        )?;
+        let src_items = stmt
+            .query_map(params![source_session_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut last_seq = 0_i64;
+        let max_epoch = src.chat_state.epoch.max(1);
+        for (idx, (epoch, kind, provider_item_id, pjson, created_at)) in
+            src_items.into_iter().enumerate()
+        {
+            let seq = i64::try_from(idx + 1).unwrap_or(1);
+            last_seq = seq;
+            let new_item_id = format!("item-{}", Uuid::new_v4());
+            conn.execute(
+                "INSERT INTO journal_items
+                 (item_id, session_id, sequence, epoch, item_kind, provider_item_id, payload_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &new_item_id,
+                    &target_id,
+                    seq,
+                    epoch,
+                    &kind,
+                    &provider_item_id,
+                    &pjson,
+                    created_at
+                ],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO journal_chat_state
+             (session_id, epoch, last_sequence, highest_fence, context_boundary,
+              queue_revision, draft_text, draft_attachments_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?3, 0, 0, '', '[]', ?4)",
+            params![&target_id, max_epoch, last_seq, now_ms],
+        )?;
+        Self::load_snapshot(&conn, &target_id)
     }
 
     /// Replays durable journal events strictly after `after_sequence` in deterministic order.

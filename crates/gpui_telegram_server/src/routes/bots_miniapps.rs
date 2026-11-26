@@ -5320,7 +5320,7 @@ pub(crate) fn sanitize_css_color(raw: &str) -> Option<String> {
     }
     if let Some(hex) = trimmed.strip_prefix('#') {
         if matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Some(format!("#{}", hex.to_ascii_lowercase()));
+            return Some(format!("#{hex}"));
         }
         return None;
     }

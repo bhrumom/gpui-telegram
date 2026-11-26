@@ -801,6 +801,14 @@ impl WorktreeManager {
     }
 
     pub fn create_worktree(&self, req: CreateWorktreeRequest) -> Result<WorktreeRecord> {
+        self.create_worktree_with_auto_flag(req, None)
+    }
+
+    pub fn create_worktree_with_auto_flag(
+        &self,
+        req: CreateWorktreeRequest,
+        auto_generated_name: Option<bool>,
+    ) -> Result<WorktreeRecord> {
         let repo_root = normalize_absolute_or_clean_path(&req.repo_root.to_string_lossy())?;
         let worktree_path = normalize_absolute_or_clean_path(&req.worktree_path.to_string_lossy())?;
 
@@ -816,7 +824,7 @@ impl WorktreeManager {
                         "branch_name must be non-empty without control characters",
                     ));
                 }
-                let creature = is_creature_branch_name(&trimmed);
+                let creature = auto_generated_name.unwrap_or_else(|| is_creature_branch_name(&trimmed));
                 (trimmed, creature)
             }
             None => (
@@ -992,7 +1000,7 @@ impl WorktreeManager {
                 reason: FirstWorkRenameSkipReason::AlreadyRenamed,
             });
         }
-        if !wt.is_creature_named || !is_creature_branch_name(&wt.branch_name) {
+        if !wt.is_creature_named {
             return Ok(FirstWorkRenameOutcome::Skipped {
                 reason: FirstWorkRenameSkipReason::NotCreatureNamed,
             });

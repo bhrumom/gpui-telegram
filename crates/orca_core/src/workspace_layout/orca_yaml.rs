@@ -2048,7 +2048,7 @@ fn extract_env_recipes(seq: &[YamlValue]) -> Result<Vec<OrcaYamlEnvironmentRecip
         };
         out.push(OrcaYamlEnvironmentRecipe {
             name,
-            create: get_str("create"),
+            create: get_str("create").or_else(|| get_str("command")),
             suspend: get_str("suspend"),
             resume: get_str("resume"),
             destroy: get_str("destroy"),

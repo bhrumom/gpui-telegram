@@ -209,7 +209,7 @@ pub fn map_ide_err(err: OrcaIdeRuntimeError) -> Response {
         }
         OrcaIdeRuntimeError::Conflict(m) => orca_err(StatusCode::CONFLICT, "conflict", m),
         OrcaIdeRuntimeError::ProfileStateRevisionConflict { .. } => {
-            orca_err(StatusCode::CONFLICT, "conflict", err.to_string())
+            orca_err(StatusCode::CONFLICT, "revision_conflict", err.to_string())
         }
         OrcaIdeRuntimeError::InvalidArgument(m) => {
             orca_err(StatusCode::BAD_REQUEST, "invalid_argument", m)

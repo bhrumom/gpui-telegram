@@ -1890,9 +1890,12 @@ impl OrcaIdeSurfaceState {
         {
             servers.push(McpServerEntry {
                 name: self.mcp_server_name_draft.trim().to_string(),
+                transport: "stdio".to_string(),
                 command: self.mcp_server_cmd_draft.trim().to_string(),
                 args: Vec::new(),
                 env: BTreeMap::new(),
+                url: None,
+                credential_handle: None,
                 source: "desktop-ide".to_string(),
             });
         }

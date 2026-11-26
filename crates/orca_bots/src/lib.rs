@@ -26,6 +26,7 @@ pub mod memory_service;
 pub mod shared_mcp;
 pub mod tool_oauth;
 pub mod tool_relay;
+pub mod wire_json;
 
 use orca_core::bot_memory::{BotMemoryError, TidyUpError, TidyUpErrorCode};
 use orca_core::{BotError, BotErrorCode};
@@ -183,11 +184,11 @@ pub use ecosystem_handover::{
     WorkspaceHandoverOutcome, WorkspaceLineageAdapter, is_forbidden_foreign_file,
     suggested_bot_name, suggested_bot_purpose,
 };
-pub use facade::{OrcaBotsConfig, OrcaBotsFacade};
+pub use facade::{HostMcpServerRecord, OrcaBotsConfig, OrcaBotsFacade, RegisteredBotTool};
 pub use group_runtime::{
     BotGroupRuntime, CreateBotGroupRequest, GroupMessageRecord, GroupMessageRequester,
     GroupMessageSender, GroupOperationRecord, GroupPendingMail, GroupSidebarEntry,
-    GroupWorkerOperation, PostGroupMessageRequest, PostedGroupMessage,
+    GroupWorkerOperation, PostGroupMessageRequest, PostedGroupMessage, UpdateBotGroupRequest,
 };
 pub use home_store::{BotHomeStore, WorktreeReleaseBotHome};
 pub use items_store::{
@@ -196,7 +197,7 @@ pub use items_store::{
 };
 pub use look_around::{
     LookAroundEngine, LookAroundProvider, LookAroundRunInput, LookAroundRunOutcome,
-    PersistedUpNextState, StartedSuggestion, UpNextStore,
+    PersistedUpNextState, StartedSuggestion, SubmittedSuggestionResult, UpNextStore,
 };
 pub use memory_service::{
     BotMemoryService, BotTurnMemorySync, ExtractedOwnerChats, TidyUpChatTranscript,
@@ -212,9 +213,10 @@ pub use shared_mcp::{
 pub use tool_oauth::{
     ATTEMPT_TTL_SECS, BotToolOAuth, DynamicClientRegistrationRequest,
     DynamicClientRegistrationResponse, OAuthAuthorizationStart, OAuthCallbackParams,
-    OAuthProviderConfig, OAuthSecurityPolicy, OAuthTokenRecord, PkcePair, REFRESH_MARGIN_SECS,
-    REVOKE_DEADLINE_SECS, TOKEN_DEADLINE_SECS, generate_pkce_pair, is_blocked_ip,
-    resolve_and_validate_oauth_url, validate_oauth_endpoint_url, validate_resource_indicator,
+    OAuthProviderConfig, OAuthSecurityPolicy, OAuthServerMetadata, OAuthTokenRecord, PkcePair,
+    REFRESH_MARGIN_SECS, REVOKE_DEADLINE_SECS, TOKEN_DEADLINE_SECS, generate_pkce_pair,
+    is_blocked_ip, resolve_and_validate_oauth_url, validate_oauth_endpoint_url,
+    validate_resource_indicator,
 };
 pub use tool_relay::{
     BotRelayGrant, BotToolRelay, BotToolRelayConfig, BoundedMcpSessionMap,

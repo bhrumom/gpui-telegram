@@ -257,7 +257,7 @@ impl OrcaIdeRuntimeError {
                 E2eeV2Error::InvalidSignature => "invalid_signature",
                 _ => "e2ee_error",
             },
-            Self::ProfileStateRevisionConflict { .. } => "conflict",
+            Self::ProfileStateRevisionConflict { .. } => "revision_conflict",
             Self::Http(_) => "io_error",
             Self::Sqlite(_) => "storage_error",
             Self::Io(_) => "io_error",
@@ -399,7 +399,8 @@ pub use worktree_manager::{
 pub use diff_review::{
     AttributionExport, CommitPrDraft, CommitPrDraftRequest, DiffFileChange, HubTaskRecord,
     PersistentDiffReviewStore, TaskForge, TasksHubFilter, TasksHubStore,
-    compose_commit_and_pr_draft, expand_issue_command_template, normalize_task_key,
+    compose_commit_and_pr_draft, diff_annotation_to_wire_json, expand_issue_command_template,
+    normalize_task_key,
 };
 pub use facade::{IdeStartupSyncReport, OrcaIdeConfig, OrcaIdeFacade};
 pub use plugin_host::{
@@ -407,7 +408,8 @@ pub use plugin_host::{
     PLUGIN_CONTRIBUTION_POINT_COUNT, PLUGIN_MAX_SINGLE_FILE_BYTES, PluginCommandExecution,
     PluginContributionPoint, PluginHostV2, PluginPackageScanReport, PluginValidationSummary,
     SecuritySurface, SkillInstallRecord, SkillInstallState, SkillRecoveryReport,
-    TransactionalSkillInstaller, audit_actor_for_manifest, scan_plugin_package_dir,
+    TransactionalSkillInstaller, audit_actor_for_manifest, installed_plugin_to_wire_json,
+    plugin_validation_to_wire_json, scan_plugin_package_dir,
     validate_plugin_manifest_and_contributions,
 };
 pub use profile_state::{
@@ -429,7 +431,7 @@ pub use system_services::{
     SttBackendMode, SttDictationService, SttStatus, VmDoctorReport, VmLifecycleOp, VmRecipePlan,
     WaitCondition, WaitProbeSnapshot, WatchdogStatus, WatchdogThresholds, WatchdogTickOutcome,
     bp_to_norm_float, cap_emulator_ax_tree, cleanup_dictation_text, compute_ax_tree_diff,
-    norm_float_to_bp, redact_stdin_secret_args,
+    flatten_ax_tree_value, norm_float_to_bp, redact_stdin_secret_args,
 };
 pub use vault_search::{
     AiVaultSearchEngine, VAULT_SCHEMA_VERSION, VaultIndexFileReport, VaultMessageInput,

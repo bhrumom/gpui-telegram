@@ -6,7 +6,7 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use orca_core::RUNTIME_PROTOCOL_VERSION;
+use orca_core::{E2EE_V2_KEY_SCHEDULE_BYTES, RUNTIME_PROTOCOL_VERSION};
 use orca_core::orchestration_protocol::{
     E2EE_V2_PROTOCOL_ID, E2eeTransportKind, E2eeV2Error, E2eeV2Frame, E2eeV2HandshakeTranscript,
     E2eeV2KeySchedule, E2eeV2Role, E2eeV2Session, generate_ed25519_keypair, generate_nonce_32,
@@ -25,7 +25,9 @@ pub struct E2eeHandshakeInitRequest {
     pub transport: E2eeTransportKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_host_id: Option<String>,
+    #[serde(alias = "client_ephemeral_pubkey", alias = "clientEphemeralPubkey")]
     pub client_ephemeral_pub_b64: String,
+    #[serde(alias = "client_nonce", alias = "clientNonce")]
     pub client_nonce_b64: String,
     #[serde(default = "default_proto_ver")]
     pub protocol_version: u32,
@@ -49,6 +51,18 @@ pub struct E2eeHandshakeServerResponse {
     pub server_nonce_b64: String,
     pub server_identity_pub_b64: String,
     pub transcript_signature_b64: String,
+    #[serde(default)]
+    pub responder_ephemeral_pubkey: String,
+    #[serde(default)]
+    pub desktop_nonce: String,
+    #[serde(default)]
+    pub transcript_hash: String,
+    #[serde(default)]
+    pub key_schedule_bytes: usize,
+    #[serde(default)]
+    pub mobile_to_desktop_key: String,
+    #[serde(default)]
+    pub desktop_to_mobile_key: String,
 }
 
 struct IdentitySecretSeed([u8; 32]);
@@ -134,11 +148,17 @@ impl E2eeV2SessionManager {
             server_nonce,
             protocol_version: negotiated,
         };
+        let transcript_hash_hex = hex::encode(transcript.transcript_hash());
         let signature = transcript.sign(&self.identity_secret.0);
         let schedule_res =
             E2eeV2KeySchedule::derive(&server_ephemeral_sec, &client_ephemeral_pub, &transcript);
         server_ephemeral_sec.zeroize();
         let schedule = schedule_res?;
+
+        let mobile_to_desktop_key = BASE64_STD.encode(schedule.client_to_server_key());
+        let desktop_to_mobile_key = BASE64_STD.encode(schedule.server_to_client_key());
+        let server_ephemeral_pub_b64 = BASE64_STD.encode(server_ephemeral_pub);
+        let server_nonce_b64 = BASE64_STD.encode(server_nonce);
 
         let session = E2eeV2Session::new(E2eeV2Role::Server, negotiated, schedule);
         let session_id = session.session_id_hex();
@@ -148,10 +168,16 @@ impl E2eeV2SessionManager {
             session_id,
             protocol: E2EE_V2_PROTOCOL_ID.to_string(),
             protocol_version: negotiated,
-            server_ephemeral_pub_b64: BASE64_STD.encode(server_ephemeral_pub),
-            server_nonce_b64: BASE64_STD.encode(server_nonce),
+            responder_ephemeral_pubkey: server_ephemeral_pub_b64.clone(),
+            desktop_nonce: server_nonce_b64.clone(),
+            server_ephemeral_pub_b64,
+            server_nonce_b64,
             server_identity_pub_b64: BASE64_STD.encode(self.identity_public),
             transcript_signature_b64: BASE64_STD.encode(signature),
+            transcript_hash: transcript_hash_hex,
+            key_schedule_bytes: E2EE_V2_KEY_SCHEDULE_BYTES,
+            mobile_to_desktop_key,
+            desktop_to_mobile_key,
         })
     }
 

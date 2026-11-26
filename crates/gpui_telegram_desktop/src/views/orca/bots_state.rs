@@ -1016,6 +1016,7 @@ impl OrcaBotsSurfaceState {
                     every,
                     weekdays_only,
                     focus: None,
+                    since_ms: None,
                 },
                 now_ms,
             )
