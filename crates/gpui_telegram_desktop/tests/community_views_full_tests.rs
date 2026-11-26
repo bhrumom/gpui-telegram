@@ -291,7 +291,7 @@ impl HeadlessShellHost {
         }
         let _ = self.shell.update(app, |s, cx| {
             s.app.sync_viewport_size(width, height);
-            let sb_w = s.sidebar.read(cx).effective_width();
+            let sb_w = s.apple_sidebar.read(cx).effective_width();
             if let Some(cw) = s.community_workspace.clone() {
                 cw.update(cx, |cw, wcx| {
                     cw.set_host_sidebar_width(sb_w);
@@ -359,6 +359,16 @@ async fn open_community_host(
     client.community().set_force_local(true);
     let auth = test_auth(user_id, username);
     client.set_auth_session(auth.clone());
+    // Production local DBs start empty (zero fake data); explicitly seed UI test fixture here.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(1_700_000_000_000);
+    let _ = client
+        .community()
+        .local_runtime()
+        .store()
+        .seed_if_empty(now_ms);
 
     let client_for_win = Arc::clone(&client);
     let auth_for_win = auth.clone();

@@ -209,13 +209,11 @@ impl LocalCommunityRuntime {
     }
 
     fn init_from_store(store: CommunityStore, db_path: Option<PathBuf>) -> Result<Self> {
-        let now_ms = now_millis();
         store.with_conn(|conn| {
             conn.execute_batch(META_TABLE_SQL)
                 .map_err(|e| TelegramError::Database(format!("create community_client_meta: {e}")))
         })?;
-        store.seed_if_empty(now_ms)?;
-        store.with_transaction(|tx| ensure_guest_actor_conn(tx, now_ms))?;
+        store.purge_starter_seed_data()?;
 
         let (persisted_owner, persisted_active) = store.with_conn(|conn| {
             let owner = read_meta_conn(conn, META_KEY_OWNER_USER_ID)?
@@ -295,8 +293,6 @@ impl LocalCommunityRuntime {
     ) -> Result<String> {
         tx.execute_batch(ACCOUNT_SWITCH_WIPE_SQL)
             .map_err(|e| TelegramError::Database(format!("wipe community account scope: {e}")))?;
-        ops::seed_if_empty_tx(tx, now_ms)?;
-        ensure_guest_actor_conn(tx, now_ms)?;
         ops::sync_telegram_identities_tx(tx, human_input, &[], now_ms)?;
         let human_id = human_actor_id(user_id as i64);
         write_meta_conn(tx, META_KEY_OWNER_USER_ID, &user_id.to_string())?;

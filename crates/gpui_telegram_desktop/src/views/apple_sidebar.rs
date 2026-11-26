@@ -10,7 +10,6 @@ use gpui_telegram_proto::creations::CreationKind;
 
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::content_hub::apple_primitives::{creation_kind_accent, creation_kind_label};
 use crate::views::content_hub::ContentHubSection;
 
 /// Expanded Apple sidebar width in logical pixels.
@@ -65,11 +64,15 @@ pub enum AppleSidebarEvent {
     SelectCreationKindFilter(Option<CreationKind>),
     ToggleCollapsed(bool),
     OpenCreatorBot(Option<CreationKind>),
+    OpenAccountMenu,
+    OpenSettings,
 }
 
 /// Apple HIG primary navigation sidebar entity.
 pub struct AppleAppSidebar {
     pub active_section: AppleSidebarSection,
+    pub highlight_active_section: bool,
+    pub settings_active: bool,
     pub is_collapsed: bool,
     pub creations_drawer_open: bool,
     pub creations_filters_expanded: bool,
@@ -78,6 +81,9 @@ pub struct AppleAppSidebar {
     pub community_unread_count: u32,
     pub creations_count: usize,
     pub pending_review_count: usize,
+    pub account_name: String,
+    pub account_initials: String,
+    pub is_connected: bool,
     pub palette: TdesktopThemePalette,
     pub language_id: String,
 }
@@ -88,14 +94,19 @@ impl AppleAppSidebar {
     pub fn new(palette: TdesktopThemePalette, language_id: impl Into<String>) -> Self {
         Self {
             active_section: AppleSidebarSection::Chats,
+            highlight_active_section: true,
+            settings_active: false,
             is_collapsed: false,
             creations_drawer_open: false,
-            creations_filters_expanded: true,
+            creations_filters_expanded: false,
             active_creation_kind_filter: None,
             unread_chats_count: 0,
             community_unread_count: 0,
             creations_count: 0,
             pending_review_count: 0,
+            account_name: String::new(),
+            account_initials: String::new(),
+            is_connected: false,
             palette,
             language_id: language_id.into(),
         }
@@ -119,6 +130,26 @@ impl AppleAppSidebar {
 
     pub fn set_active_section(&mut self, section: AppleSidebarSection) {
         self.active_section = section;
+        self.highlight_active_section = true;
+    }
+
+    pub fn set_highlight_active_section(&mut self, highlight: bool) {
+        self.highlight_active_section = highlight;
+    }
+
+    pub fn set_settings_active(&mut self, active: bool) {
+        self.settings_active = active;
+    }
+
+    pub fn set_account_info(
+        &mut self,
+        name: impl Into<String>,
+        initials: impl Into<String>,
+        is_connected: bool,
+    ) {
+        self.account_name = name.into();
+        self.account_initials = initials.into();
+        self.is_connected = is_connected;
     }
 
     pub fn set_collapsed(&mut self, collapsed: bool) {
@@ -150,16 +181,22 @@ impl AppleAppSidebar {
 
     pub fn reset_for_logout_or_account_switch(&mut self) {
         self.active_section = AppleSidebarSection::Chats;
+        self.highlight_active_section = true;
+        self.settings_active = false;
         self.creations_drawer_open = false;
         self.active_creation_kind_filter = None;
         self.unread_chats_count = 0;
         self.community_unread_count = 0;
         self.creations_count = 0;
         self.pending_review_count = 0;
+        self.account_name.clear();
+        self.account_initials.clear();
+        self.is_connected = false;
     }
 
     pub fn select_section(&mut self, section: AppleSidebarSection, cx: &mut Context<Self>) {
         self.active_section = section;
+        self.highlight_active_section = true;
         cx.emit(AppleSidebarEvent::SelectSection(section));
         cx.notify();
     }
@@ -192,7 +229,7 @@ impl AppleAppSidebar {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let pal = self.palette;
-        let is_active = self.active_section == section;
+        let is_active = self.highlight_active_section && self.active_section == section;
         let collapsed = self.is_collapsed;
         let active_bg = pal.row_active_rgba();
         let hover_bg = pal.row_hover_rgba();
@@ -232,10 +269,12 @@ impl AppleAppSidebar {
                     .flex()
                     .items_center()
                     .gap(px(9.0))
+                    .min_w(px(0.0))
                     .child(tg_icon(icon, 18.0, icon_color))
                     .when(!collapsed, |el| {
                         el.child(
                             div()
+                                .truncate()
                                 .text_size(px(13.0))
                                 .font_weight(if is_active {
                                     FontWeight::SEMIBOLD
@@ -251,6 +290,7 @@ impl AppleAppSidebar {
                 el.when_some(badge, |b_el, badge_txt| {
                     b_el.child(
                         div()
+                            .flex_shrink_0()
                             .px(px(6.0))
                             .py(px(1.0))
                             .rounded(px(999.0))
@@ -298,9 +338,9 @@ impl Render for AppleAppSidebar {
         let pal = self.palette;
         let lang = self.language_id.clone();
         let collapsed = self.is_collapsed;
-        let drawer_open = self.creations_drawer_open;
-        let active_filter = self.active_creation_kind_filter;
+        let settings_active = self.settings_active;
         let hover_bg = pal.row_hover_rgba();
+        let active_bg = TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14);
 
         let unread_badge = (self.unread_chats_count > 0).then(|| {
             if self.unread_chats_count > 99 {
@@ -316,70 +356,111 @@ impl Render for AppleAppSidebar {
                 self.community_unread_count.to_string()
             }
         });
-        let creations_badge = (self.creations_count > 0).then(|| self.creations_count.to_string());
-        let pending_review_label = (self.pending_review_count > 0).then(|| {
-            let count_txt = if self.pending_review_count > 99 {
-                "99+".to_string()
-            } else {
-                self.pending_review_count.to_string()
-            };
-            format!("{} {}", tr_str(&lang, "待审", "Review"), count_txt)
-        });
         let chats_collapsed_dot = (self.unread_chats_count > 0).then_some(pal.unread_badge_bg);
         let community_collapsed_dot =
             (self.community_unread_count > 0).then_some(pal.unread_badge_bg);
-        let creations_collapsed_dot = (self.pending_review_count > 0).then_some(0xFF9F0A);
+
+        let avatar_grad = pal.peer_avatar_gradient(1);
+        let display_name = if self.account_name.trim().is_empty() {
+            tr_str(&lang, "我的账号", "Account").to_string()
+        } else {
+            self.account_name.clone()
+        };
+        let initials = if self.account_initials.trim().is_empty() {
+            display_name
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "U".to_string())
+        } else {
+            self.account_initials.clone()
+        };
+
+        let collapse_btn = div()
+            .id("apple-sidebar-collapse-btn")
+            .cursor_pointer()
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded(px(6.0))
+            .hover(move |s| s.bg(hover_bg))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.toggle_collapsed(cx)),
+            )
+            .child(tg_icon(
+                if collapsed {
+                    IconName::SidebarLeftOpen
+                } else {
+                    IconName::SidebarLeftClose
+                },
+                16.0,
+                pal.icon_fg,
+            ));
 
         div()
             .id("apple-app-sidebar")
             .w(px(self.effective_width()))
             .h_full()
             .flex_shrink_0()
+            .overflow_hidden()
             .bg(pal.sidebar_bg_rgba())
             .border_r_1()
             .border_color(pal.separator_rgba())
             .flex()
             .flex_col()
-            .child(
+            .child(if cfg!(target_os = "macos") && collapsed {
+                // Keep macOS traffic-light strip clear of interactive buttons when collapsed to 68px
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("apple-sidebar-top-clearance")
+                            .w_full()
+                            .h(px(38.0))
+                            .flex_shrink_0()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(34.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(collapse_btn),
+                    )
+                    .into_any_element()
+            } else {
+                let top_h = if cfg!(target_os = "macos") {
+                    TOP_CLEARANCE_HEIGHT
+                } else {
+                    44.0
+                };
                 div()
                     .id("apple-sidebar-top-clearance")
                     .w_full()
-                    .h(px(TOP_CLEARANCE_HEIGHT))
+                    .h(px(top_h))
                     .flex_shrink_0()
                     .px(px(10.0))
                     .window_control_area(WindowControlArea::Drag)
                     .flex()
                     .items_center()
-                    .justify_end()
-                    .child(
-                        div()
-                            .id("apple-sidebar-collapse-btn")
-                            .cursor_pointer()
-                            .w(px(28.0))
-                            .h(px(28.0))
-                            .rounded(px(6.0))
-                            .hover(move |s| s.bg(hover_bg))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.toggle_collapsed(cx)),
-                            )
-                            .child(tg_icon(
-                                if collapsed {
-                                    IconName::SidebarLeftOpen
-                                } else {
-                                    IconName::SidebarLeftClose
-                                },
-                                16.0,
-                                pal.icon_fg,
-                            )),
-                    ),
-            )
+                    .when(collapsed, |row| row.justify_center())
+                    .when(!collapsed, |row| row.justify_end())
+                    .child(collapse_btn)
+                    .into_any_element()
+            })
             .child(
                 div()
                     .flex_1()
+                    .min_h(px(0.0))
                     .w_full()
                     .px(px(10.0))
                     .py(px(6.0))
@@ -457,207 +538,110 @@ impl Render for AppleAppSidebar {
                         None,
                         None,
                         cx,
-                    ))
-                    .child(div().my(px(6.0)).w_full().h(px(1.0)).bg(pal.separator_rgba()))
-                    .when(!collapsed, |el| {
-                        el.child(
-                            div()
-                                .px(px(10.0))
-                                .pb(px(2.0))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(6.0))
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_secondary))
-                                        .child(tr_str(&lang, "云端创作", "Cloud Studio")),
-                                )
-                                .when_some(pending_review_label, |hdr, badge_txt| {
-                                    hdr.child(
-                                        div()
-                                            .id("apple-sidebar-pending-review-badge")
-                                            .cursor_pointer()
-                                            .px(px(6.0))
-                                            .py(px(1.0))
-                                            .rounded(px(999.0))
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                0xFF9F0A, 0.18,
-                                            ))
-                                            .text_size(px(10.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xFF9F0A))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.select_section(
-                                                        AppleSidebarSection::MyCreations,
-                                                        cx,
-                                                    );
-                                                }),
-                                            )
-                                            .child(badge_txt),
-                                    )
-                                }),
-                        )
-                    })
-                    .child(self.render_nav_row(
-                        "apple-sidebar-nav-creations",
-                        AppleSidebarSection::MyCreations,
-                        IconName::HubCreations,
-                        0xAF52DE,
-                        tr_str(&lang, "我的创作", "My Creations"),
-                        creations_badge,
-                        creations_collapsed_dot,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .id("apple-sidebar-quick-drawer-toggle")
-                            .cursor_pointer()
-                            .w_full()
-                            .h(px(32.0))
-                            .px(px(if collapsed { 0.0 } else { 10.0 }))
-                            .rounded(px(8.0))
-                            .flex()
-                            .items_center()
-                            .when(collapsed, |el| el.justify_center())
-                            .when(!collapsed, |el| el.justify_between().gap(px(8.0)))
-                            .when(drawer_open, |el| {
-                                el.bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
-                            })
-                            .when(!drawer_open, |el| el.hover(move |s| s.bg(hover_bg)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.toggle_creations_drawer(cx)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(tg_icon(
-                                        IconName::SidebarPanel,
-                                        16.0,
-                                        if drawer_open { pal.accent } else { pal.icon_fg },
-                                    ))
-                                    .when(!collapsed, |el| {
-                                        el.child(
-                                            div()
-                                                .text_size(px(12.0))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(if drawer_open {
-                                                    pal.accent
-                                                } else {
-                                                    pal.text_secondary
-                                                }))
-                                                .child(tr_str(&lang, "快速作品抽屉", "Quick Drawer")),
-                                        )
-                                    }),
-                            ),
-                    )
-                    .when(!collapsed && self.creations_filters_expanded, |el| {
-                        let kinds: &[(Option<CreationKind>, &'static str)] = &[
-                            (None, "apple-sidebar-filter-all"),
-                            (Some(CreationKind::Book), "apple-sidebar-filter-book"),
-                            (Some(CreationKind::Music), "apple-sidebar-filter-music"),
-                            (Some(CreationKind::Game), "apple-sidebar-filter-game"),
-                            (Some(CreationKind::App), "apple-sidebar-filter-app"),
-                        ];
-                        el.child(
-                            div()
-                                .pt(px(4.0))
-                                .px(px(6.0))
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(4.0))
-                                .children(kinds.iter().map(|(kind_opt, pill_id)| {
-                                    let is_sel = active_filter == *kind_opt;
-                                    let k_copy = *kind_opt;
-                                    let label = match k_copy {
-                                        None => tr_str(&lang, "全部", "All"),
-                                        Some(k) => creation_kind_label(k, &lang),
-                                    };
-                                    let accent =
-                                        k_copy.map(creation_kind_accent).unwrap_or(pal.accent);
-                                    div()
-                                        .id(*pill_id)
-                                        .cursor_pointer()
-                                        .px(px(7.0))
-                                        .py(px(2.0))
-                                        .rounded(px(999.0))
-                                        .bg(if is_sel {
-                                            TdesktopThemePalette::rgba_with_alpha(accent, 0.22)
-                                        } else {
-                                            pal.row_hover_rgba()
-                                        })
-                                        .text_size(px(11.0))
-                                        .font_weight(if is_sel {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::NORMAL
-                                        })
-                                        .text_color(rgb(if is_sel {
-                                            accent
-                                        } else {
-                                            pal.text_secondary
-                                        }))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.active_creation_kind_filter = k_copy;
-                                                cx.emit(
-                                                    AppleSidebarEvent::SelectCreationKindFilter(
-                                                        k_copy,
-                                                    ),
-                                                );
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(label)
-                                })),
-                        )
-                    }),
+                    )),
             )
+            // Persistent Apple-HIG Account & Settings footer (always reachable across every section)
             .child(
                 div()
-                    .p(px(10.0))
+                    .w_full()
+                    .flex_shrink_0()
+                    .px(px(10.0))
+                    .py(px(8.0))
                     .border_t_1()
                     .border_color(pal.separator_rgba())
+                    .flex()
+                    .when(collapsed, |el| el.flex_col().items_center().gap(px(6.0)))
+                    .when(!collapsed, |el| el.items_center().justify_between().gap(px(6.0)))
                     .child(
                         div()
-                            .id("apple-sidebar-creator-bot-cta")
+                            .id("apple-sidebar-account-btn")
                             .cursor_pointer()
-                            .w_full()
-                            .h(px(34.0))
-                            .px(px(if collapsed { 0.0 } else { 10.0 }))
-                            .rounded(px(9.0))
-                            .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
-                            .hover(move |s| {
-                                s.bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.22))
-                            })
+                            .when(!collapsed, |el| el.flex_1().min_w(px(0.0)).px(px(6.0)).py(px(4.0)))
+                            .when(collapsed, |el| el.w(px(32.0)).h(px(32.0)).justify_center())
+                            .rounded(px(8.0))
+                            .hover(move |s| s.bg(hover_bg))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .gap(px(6.0))
+                            .gap(px(8.0))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|_this, _, _, cx| {
-                                    cx.emit(AppleSidebarEvent::OpenCreatorBot(None));
+                                    cx.emit(AppleSidebarEvent::OpenAccountMenu);
                                 }),
                             )
-                            .child(tg_icon(IconName::HubSparkles, 16.0, pal.accent))
+                            .child(
+                                div()
+                                    .relative()
+                                    .w(px(24.0))
+                                    .h(px(24.0))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(rgb(avatar_grad.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0xFFFFFF))
+                                    .child(initials)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .bottom(px(-1.0))
+                                            .right(px(-1.0))
+                                            .w(px(7.5))
+                                            .h(px(7.5))
+                                            .rounded_full()
+                                            .bg(if self.is_connected {
+                                                rgb(pal.online_dot_fg)
+                                            } else {
+                                                rgb(pal.muted_badge_bg)
+                                            })
+                                            .border_1()
+                                            .border_color(rgb(pal.dialogs_bg)),
+                                    ),
+                            )
                             .when(!collapsed, |el| {
                                 el.child(
                                     div()
-                                        .text_size(px(12.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.accent))
-                                        .child(tr_str(&lang, "Bot 创作", "Creator Bot")),
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(pal.text_primary))
+                                        .child(display_name),
                                 )
                             }),
+                    )
+                    .child(
+                        div()
+                            .id("apple-sidebar-settings-btn")
+                            .cursor_pointer()
+                            .flex_shrink_0()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(7.0))
+                            .when(settings_active, |el| el.bg(active_bg))
+                            .hover(move |s| if settings_active { s } else { s.bg(hover_bg) })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_this, _, _, cx| {
+                                    cx.emit(AppleSidebarEvent::OpenSettings);
+                                }),
+                            )
+                            .child(tg_icon(
+                                IconName::SettingsGear,
+                                15.0,
+                                if settings_active {
+                                    pal.accent
+                                } else {
+                                    pal.icon_fg
+                                },
+                            )),
                     ),
             )
     }

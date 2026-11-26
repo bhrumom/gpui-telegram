@@ -5,15 +5,13 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_proto::creations::{
-    CatalogSortMode, CreationKind, CreationReviewStatus, GameUserState, PublicCatalogItemDto,
+    CatalogSortMode, CreationReviewStatus, GameUserState, PublicCatalogItemDto,
     UpsertCreationStateRequest, UserCreationDto,
 };
 
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::{
-    macos_primary_pill_btn, macos_secondary_pill_btn,
-};
+use crate::views::app_shell::modal_container::macos_secondary_pill_btn;
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_shelf_header, cover_artwork_box, empty_state_card_shell,
     filter_pill, hero_banner, rating_pill, render_editable_field_box, review_status_badge,
@@ -31,16 +29,14 @@ pub const GAMES_SUB_TABS: &[(&str, &str, &str)] = &[
     ("arcade", "街机", "Arcade"),
     ("charts", "排行榜", "Charts"),
     ("library", "我的游戏", "Library"),
-    ("my_games", "我的创作", "My Games"),
 ];
 
 pub fn normalize_games_sub_tab(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "discover" | "featured" | "home" => "discover",
+        "discover" | "featured" | "home" | "my_games" | "my_creations" | "mine" => "discover",
         "arcade" | "play" => "arcade",
         "charts" | "top" | "leaderboard" => "charts",
         "library" | "saved" => "library",
-        "my_games" | "my_creations" | "mine" => "my_games",
         _ => "discover",
     }
 }
@@ -63,6 +59,7 @@ fn render_game_card(
         .id(SharedString::from(format!("games-card-{cid}")))
         .cursor_pointer()
         .w(px(276.0))
+        .max_w_full()
         .rounded(px(14.0))
         .bg(pal.card_surface_rgba())
         .border_1()
@@ -143,6 +140,7 @@ fn render_game_card(
             div()
                 .id(SharedString::from(format!("games-card-play-{cid_play}")))
                 .cursor_pointer()
+                .flex_shrink_0()
                 .px(px(12.0))
                 .py(px(5.0))
                 .rounded(px(999.0))
@@ -188,7 +186,6 @@ fn render_game_detail_card(
     let leaderboard = ws.active_leaderboard.clone();
 
     let detail_launch = detail.clone();
-    let detail_pub = detail.clone();
     let cid_lib = cid.clone();
     let cid_lb = cid.clone();
 
@@ -234,7 +231,8 @@ fn render_game_detail_card(
                 .child(
                     div()
                         .flex_1()
-                        .min_w(px(260.0))
+                        .min_w(px(240.0))
+                        .max_w_full()
                         .flex()
                         .flex_col()
                         .gap(px(7.0))
@@ -351,26 +349,7 @@ fn render_game_detail_card(
                                             });
                                         }),
                                     ),
-                                )
-                                .when(is_own, |el| {
-                                    el.child(
-                                        macos_secondary_pill_btn(
-                                            "games-detail-publish-btn",
-                                            tr_str(&lang, "推送审核上架", "Publish & Review"),
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |_this, _, _, cx| {
-                                                cx.emit(
-                                                    ContentHubEvent::OpenPublishModalForCreation(
-                                                        detail_pub.clone(),
-                                                    ),
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                }),
+                                ),
                         ),
                 ),
         )
@@ -446,23 +425,31 @@ fn render_game_detail_card(
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
-                        .child(apple_shelf_header(
-                            tr_str(&lang, "云端排行榜 · Game Center", "Cloud Leaderboard"),
-                            Some(format!(
-                                "{} {}",
-                                leaderboard.len(),
-                                tr_str(&lang, "名玩家", "players")
-                            )),
-                            pal,
-                        ))
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(apple_shelf_header(
+                                    tr_str(&lang, "云端排行榜 · Game Center", "Cloud Leaderboard"),
+                                    Some(format!(
+                                        "{} {}",
+                                        leaderboard.len(),
+                                        tr_str(&lang, "名玩家", "players")
+                                    )),
+                                    pal,
+                                )),
+                        )
                         .child(
                             macos_secondary_pill_btn(
                                 "games-leaderboard-refresh-btn",
                                 tr_str(&lang, "刷新榜单", "Refresh"),
                                 pal,
                             )
+                            .flex_shrink_0()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |_this, _, _, cx| {
@@ -501,14 +488,18 @@ fn render_game_detail_card(
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(px(10.0))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
                                     .flex()
                                     .items_center()
                                     .gap(px(10.0))
                                     .child(
                                         div()
                                             .w(px(28.0))
+                                            .flex_shrink_0()
                                             .text_size(px(13.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(rgb(medal_color))
@@ -516,6 +507,9 @@ fn render_game_detail_card(
                                     )
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .truncate()
                                             .text_size(px(13.0))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(rgb(pal.text_primary))
@@ -528,6 +522,7 @@ fn render_game_detail_card(
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(rgb(GAMES_ACCENT))
@@ -590,13 +585,6 @@ pub fn render_games_hub_view(
         .cloned()
         .collect();
 
-    let my_games: Vec<UserCreationDto> = ws
-        .my_creations
-        .iter()
-        .filter(|c| c.deleted_at_ms.is_none() && c.kind == CreationKind::Game)
-        .cloned()
-        .collect();
-
     let selected_detail = ws.resolve_selected_detail_creation();
     let sort_options: &[(CatalogSortMode, &'static str, &'static str, &'static str)] = &[
         (CatalogSortMode::Featured, "games-sort-featured", "精选", "Featured"),
@@ -614,6 +602,7 @@ pub fn render_games_hub_view(
         // Header + Sub-nav + Search
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(24.0))
                 .py(px(14.0))
                 .border_b_1()
@@ -671,10 +660,11 @@ pub fn render_games_hub_view(
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    div().w(px(220.0)).child(
+                                    div().w(px(220.0)).max_w_full().child(
                                         render_editable_field_box(
                                             "content-hub-catalog-search-input",
                                             &search_field,
@@ -693,25 +683,10 @@ pub fn render_games_hub_view(
                                             }),
                                         ),
                                     ),
-                                )
-                                .child(
-                                    macos_primary_pill_btn(
-                                        "games-create-bot-btn",
-                                        tr_str(&lang, "+ Bot 做游戏", "+ Build Game"),
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_this, _, _, cx| {
-                                            cx.emit(ContentHubEvent::OpenCreatorBot(Some(
-                                                CreationKind::Game,
-                                            )));
-                                        }),
-                                    ),
                                 ),
                         ),
                 )
-                .when(selected_detail.is_none() && active_tab != "my_games", |el| {
+                .when(selected_detail.is_none(), |el| {
                     el.child(
                         div()
                             .flex()
@@ -763,6 +738,7 @@ pub fn render_games_hub_view(
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .children(sort_options.iter().map(|&(mode, id, zh, en)| {
@@ -777,7 +753,22 @@ pub fn render_games_hub_view(
                                                     cx.notify();
                                                 }),
                                             )
-                                    })),
+                                    }))
+                                    .child(
+                                        macos_secondary_pill_btn(
+                                            "games-refresh-btn",
+                                            tr_str(&lang, "刷新", "Refresh"),
+                                            pal,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_this, _, _, cx| {
+                                                cx.emit(ContentHubEvent::RefreshCatalog(
+                                                    ContentHubSection::Games,
+                                                ));
+                                            }),
+                                        ),
+                                    ),
                             ),
                     )
                 }),
@@ -797,145 +788,7 @@ pub fn render_games_hub_view(
                 .when_some(selected_detail.clone(), |el, detail| {
                     el.child(render_game_detail_card(ws, detail, cx))
                 })
-                .when(selected_detail.is_none() && active_tab == "my_games", |el| {
-                    el.child(apple_shelf_header(
-                        tr_str(&lang, "我的云端游戏作品", "My Cloud Games"),
-                        Some(format!("{} {}", my_games.len(), tr_str(&lang, "款", "games"))),
-                        pal,
-                    ))
-                    .when(my_games.is_empty(), |inner| {
-                        let cta = macos_primary_pill_btn(
-                            "games-my-empty-cta",
-                            tr_str(&lang, "用 @CreatorStudioBot 制作第一款游戏", "Create Your First Game"),
-                            pal,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::OpenCreatorBot(Some(CreationKind::Game)));
-                            }),
-                        );
-                        inner.child(empty_state_card_shell(
-                            IconName::HubGames,
-                            tr_str(&lang, "还没有云端游戏作品", "No Cloud Games Yet"),
-                            tr_str(
-                                &lang,
-                                "使用 @CreatorStudioBot /newgame 创作益智、问答、贪吃蛇、街机或互动小说游戏。",
-                                "Use @CreatorStudioBot /newgame to craft playable games saved to your cloud.",
-                            ),
-                            cta,
-                            pal,
-                        ))
-                    })
-                    .when(!my_games.is_empty(), |inner| {
-                        inner.child(div().flex().flex_col().gap(px(10.0)).children(
-                            my_games.iter().map(|g| {
-                                let g_play = g.clone();
-                                let g_pub = g.clone();
-                                apple_grouped_card(pal)
-                                    .p(px(14.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(14.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(12.0))
-                                            .child(cover_artwork_box(
-                                                &g.cover,
-                                                56.0,
-                                                56.0,
-                                                12.0,
-                                                GAMES_ACCENT,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(4.0))
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(8.0))
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(15.0))
-                                                                    .font_weight(
-                                                                        FontWeight::SEMIBOLD,
-                                                                    )
-                                                                    .text_color(rgb(
-                                                                        pal.text_primary,
-                                                                    ))
-                                                                    .child(g.title.clone()),
-                                                            )
-                                                            .child(review_status_badge(
-                                                                g.review_status,
-                                                                &lang,
-                                                                pal,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(12.0))
-                                                            .text_color(rgb(pal.text_secondary))
-                                                            .child(g.summary.clone()),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(
-                                                macos_secondary_pill_btn(
-                                                    SharedString::from(format!(
-                                                        "my-game-play-{}",
-                                                        g.creation_id
-                                                    )),
-                                                    tr_str(&lang, "▶ 试玩", "▶ Test Play"),
-                                                    pal,
-                                                )
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_this, _, _, cx| {
-                                                        cx.emit(
-                                                            ContentHubEvent::LaunchGameSession {
-                                                                creation: g_play.clone(),
-                                                            },
-                                                        );
-                                                    }),
-                                                ),
-                                            )
-                                            .child(
-                                                macos_primary_pill_btn(
-                                                    SharedString::from(format!(
-                                                        "my-game-publish-{}",
-                                                        g.creation_id
-                                                    )),
-                                                    tr_str(&lang, "推送审核", "Publish"),
-                                                    pal,
-                                                )
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_this, _, _, cx| {
-                                                        cx.emit(
-                                                            ContentHubEvent::OpenPublishModalForCreation(
-                                                                g_pub.clone(),
-                                                            ),
-                                                        );
-                                                    }),
-                                                ),
-                                            ),
-                                    )
-                            }),
-                        ))
-                    })
-                })
-                .when(selected_detail.is_none() && active_tab != "my_games", |el| {
+                .when(selected_detail.is_none(), |el| {
                     let list = if active_tab == "library" {
                         library_games.clone()
                     } else {
@@ -1009,12 +862,15 @@ pub fn render_games_hub_view(
                                         )
                                         .child(
                                             div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
                                                 .flex()
                                                 .items_center()
                                                 .gap(px(10.0))
                                                 .child(
                                                     div()
                                                         .w(px(24.0))
+                                                        .flex_shrink_0()
                                                         .text_size(px(14.0))
                                                         .font_weight(FontWeight::BOLD)
                                                         .text_color(rgb(if rank < 3 {
@@ -1033,10 +889,13 @@ pub fn render_games_hub_view(
                                                 ))
                                                 .child(
                                                     div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
                                                         .flex()
                                                         .flex_col()
                                                         .child(
                                                             div()
+                                                                .truncate()
                                                                 .text_size(px(13.0))
                                                                 .font_weight(FontWeight::SEMIBOLD)
                                                                 .text_color(rgb(pal.text_primary))
@@ -1044,6 +903,7 @@ pub fn render_games_hub_view(
                                                         )
                                                         .child(
                                                             div()
+                                                                .truncate()
                                                                 .text_size(px(11.0))
                                                                 .text_color(rgb(pal.text_secondary))
                                                                 .child(format!(
@@ -1055,7 +915,15 @@ pub fn render_games_hub_view(
                                                         ),
                                                 ),
                                         )
-                                        .child(rating_pill(item.rating_avg, item.rating_count, pal))
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .child(rating_pill(
+                                                    item.rating_avg,
+                                                    item.rating_count,
+                                                    pal,
+                                                )),
+                                        )
                                 })),
                         )
                     })
@@ -1071,17 +939,17 @@ pub fn render_games_hub_view(
                                 pal,
                             ))
                             .when(list.is_empty(), |empty_el| {
-                                let cta = macos_primary_pill_btn(
-                                    "games-empty-bot-cta",
-                                    tr_str(&lang, "用 @CreatorStudioBot 创作游戏", "Build with @CreatorStudioBot"),
+                                let cta = macos_secondary_pill_btn(
+                                    "games-empty-refresh-btn",
+                                    tr_str(&lang, "刷新游戏", "Refresh Games"),
                                     pal,
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|_this, _, _, cx| {
-                                        cx.emit(ContentHubEvent::OpenCreatorBot(Some(
-                                            CreationKind::Game,
-                                        )));
+                                        cx.emit(ContentHubEvent::RefreshCatalog(
+                                            ContentHubSection::Games,
+                                        ));
                                     }),
                                 );
                                 empty_el.child(empty_state_card_shell(
@@ -1089,8 +957,8 @@ pub fn render_games_hub_view(
                                     tr_str(&lang, "暂无公开上架游戏", "No Published Games Yet"),
                                     tr_str(
                                         &lang,
-                                        "使用 @CreatorStudioBot 创作小游戏并审核上架后，会立即出现在这里供大家游玩。",
-                                        "Games approved for public listing appear here ready to play.",
+                                        "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布游戏，审核上架后会显示在这里。",
+                                        "Chat with @CreatorStudioBot directly in Messages to build and publish games. Published games appear here.",
                                     ),
                                     cta,
                                     pal,

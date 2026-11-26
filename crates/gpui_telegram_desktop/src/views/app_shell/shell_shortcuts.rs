@@ -493,17 +493,14 @@ impl AppShell {
                 true
             }
             "b" | "\\" => {
-                if matches!(
-                    self.active_panel,
-                    ActiveWorkspacePanel::Chats
-                        | ActiveWorkspacePanel::Browser
-                        | ActiveWorkspacePanel::Community
-                        | ActiveWorkspacePanel::OrcaBots
-                        | ActiveWorkspacePanel::OrcaIde
-                ) {
+                if self.active_panel == ActiveWorkspacePanel::Chats {
                     self.sidebar.update(cx, |sb, sb_cx| {
                         sb.toggle_collapsed_from_user();
                         sb_cx.notify();
+                    });
+                } else {
+                    self.apple_sidebar.update(cx, |sb, sb_cx| {
+                        sb.toggle_collapsed(sb_cx);
                     });
                 }
                 true

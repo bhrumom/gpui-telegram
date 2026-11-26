@@ -1283,7 +1283,9 @@ impl AppShell {
         self.occlude_browser_for_overlay(cx);
         self.prepare_for_media_or_call_overlay_open(cx);
         let peer = self.stage.read(cx).chat_title.clone();
-        let overlay = cx.new(|_| CallOverlay::new(peer));
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id().to_string();
+        let overlay = cx.new(|_| CallOverlay::new_live(peer, None, None, pal, &lang));
         self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_talk_mode, cx);
         self.rtc_talk.talk_mode_overlay = Some(overlay);
         self.reconcile_chat_scoped_toasts(cx);
@@ -1296,12 +1298,7 @@ impl AppShell {
     }
 
     pub fn show_remote_computer(&mut self, cx: &mut Context<Self>) {
-        self.occlude_browser_for_overlay(cx);
-        self.prepare_for_computer_overlay_open(cx);
-        let overlay = cx.new(|_| ComputerWorkbench::new("Dev-Workstation-01".to_string()));
-        self.attach_overlay_close_observer(&overlay, |ov| ov.should_close, Self::hide_remote_computer, cx);
-        self.overlays.computer_overlay = Some(overlay);
-        self.reconcile_chat_scoped_toasts(cx);
+        self.open_remote_computers_hub(cx);
     }
 
     pub fn hide_remote_computer(&mut self, cx: &mut Context<Self>) {
@@ -2590,8 +2587,27 @@ impl Render for AppShell {
             }
         }
 
+        if self.is_authenticated {
+            let (acc_name, acc_initials, is_conn) = {
+                let r = self.nav_rail.read(cx);
+                (
+                    r.account_name.clone(),
+                    r.account_initials.clone(),
+                    r.is_connected,
+                )
+            };
+            self.apple_sidebar.update(cx, |sb, _| {
+                if sb.account_name != acc_name
+                    || sb.account_initials != acc_initials
+                    || sb.is_connected != is_conn
+                {
+                    sb.set_account_info(acc_name, acc_initials, is_conn);
+                }
+            });
+        }
+
         if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Community {
-            let sb_w = self.sidebar.read(cx).effective_width();
+            let sb_w = self.apple_sidebar.read(cx).effective_width();
             let occluded = self.has_community_visual_occlusion_overlay(cx);
             if let Some(cw) = self.community_workspace.clone() {
                 if occluded && cw.read(cx).has_focused_text_input() {
@@ -2604,8 +2620,12 @@ impl Render for AppShell {
                         w.blur_active_input(wcx);
                     });
                 } else {
-                    cw.update(cx, |w, _| {
+                    cw.update(cx, |w, wcx| {
+                        let changed = (w.host_sidebar_width_px - sb_w).abs() >= 0.5;
                         w.set_host_sidebar_width(sb_w);
+                        if changed {
+                            wcx.notify();
+                        }
                     });
                 }
             }
@@ -2703,7 +2723,14 @@ impl Render for AppShell {
         let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
         let hide_composer = self.should_hide_composer(cx);
         let in_content_hub = matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_));
-        let quick_drawer_open = self.content_hub.read(cx).quick_drawer_open;
+        let in_full_workspace = matches!(
+            self.active_panel,
+            ActiveWorkspacePanel::Browser
+                | ActiveWorkspacePanel::Community
+                | ActiveWorkspacePanel::OrcaBots
+                | ActiveWorkspacePanel::OrcaIde
+        );
+        let show_chat_sidebar = !in_content_hub && !in_full_workspace;
         let publish_review_modal_open = self.is_publish_review_modal_active(cx);
         let has_blocking_overlay = contacts_open
             || creation_modal.is_some()
@@ -2749,11 +2776,8 @@ impl Render for AppShell {
             .child(ime_canvas)
             .when_some(update_banner, |el, banner| el.child(banner))
             .child(
-                div().flex_1().w_full().min_h(px(0.0)).flex()
+                div().flex_1().w_full().min_h(px(0.0)).flex().overflow_hidden()
                     .child(self.apple_sidebar.clone())
-                    .when(quick_drawer_open, |el| {
-                        el.child(self.render_quick_creations_drawer_pane(cx))
-                    })
                     .when(in_content_hub, |el| {
                         el.child(
                             div()
@@ -2765,46 +2789,69 @@ impl Render for AppShell {
                                 .child(self.content_hub.clone()),
                         )
                     })
-                    .when(!in_content_hub, |el| {
-                        el.child(self.sidebar.clone())
-                        .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
-                            if let Some(ref bw) = self.browser_workspace {
-                                row.child(bw.clone())
-                            } else {
-                                row
-                            }
-                        })
-                        .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
-                            if let Some(ref cw) = self.community_workspace {
-                                row.child(cw.clone())
-                            } else {
-                                row
-                            }
-                        })
-                        .when(self.active_panel == ActiveWorkspacePanel::OrcaBots, |row| {
-                            if let Some(ref ob) = self.orca_bots_workspace {
-                                row.child(ob.clone())
-                            } else {
-                                row
-                            }
-                        })
-                        .when(self.active_panel == ActiveWorkspacePanel::OrcaIde, |row| {
-                            if let Some(ref oi) = self.orca_ide_workspace {
-                                row.child(oi.clone())
-                            } else {
-                                row
-                            }
-                        })
-                        .when(
-                            !matches!(
-                                self.active_panel,
-                                ActiveWorkspacePanel::Browser
-                                    | ActiveWorkspacePanel::Community
-                                    | ActiveWorkspacePanel::OrcaBots
-                                    | ActiveWorkspacePanel::OrcaIde
-                            ),
-                            |row| {
+                    .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
+                        if let Some(ref bw) = self.browser_workspace {
                             row.child(
+                                div()
+                                    .id("app-shell-browser-slot")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(bw.clone()),
+                            )
+                        } else {
+                            row
+                        }
+                    })
+                    .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
+                        if let Some(ref cw) = self.community_workspace {
+                            row.child(
+                                div()
+                                    .id("app-shell-community-slot")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(cw.clone()),
+                            )
+                        } else {
+                            row
+                        }
+                    })
+                    .when(self.active_panel == ActiveWorkspacePanel::OrcaBots, |row| {
+                        if let Some(ref ob) = self.orca_bots_workspace {
+                            row.child(
+                                div()
+                                    .id("app-shell-orca-bots-slot")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(ob.clone()),
+                            )
+                        } else {
+                            row
+                        }
+                    })
+                    .when(self.active_panel == ActiveWorkspacePanel::OrcaIde, |row| {
+                        if let Some(ref oi) = self.orca_ide_workspace {
+                            row.child(
+                                div()
+                                    .id("app-shell-orca-ide-slot")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(oi.clone()),
+                            )
+                        } else {
+                            row
+                        }
+                    })
+                    .when(show_chat_sidebar, |row| {
+                        row.child(self.sidebar.clone())
+                            .child(
                                 div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
                                     .bg(rgb(pal.stage_bg))
                                     .child(
@@ -2842,7 +2889,6 @@ impl Render for AppShell {
                                     .into_any_element(),
                             )
                             .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
-                        })
                     }),
             )
             .when(show_conn_banner && !has_blocking_overlay, |el| {
@@ -2856,7 +2902,7 @@ impl Render for AppShell {
                         .id("app-shell-connecting-pill")
                         .absolute()
                         .bottom(px(pal.scaled_px(14.0)))
-                        .left(px(pal.scaled_px(14.0)))
+                        .right(px(pal.scaled_px(14.0)))
                         .px(px(pal.scaled_px(12.0)))
                         .py(px(pal.scaled_px(6.0)))
                         .rounded(px(999.0))

@@ -19,10 +19,11 @@ use gpui_telegram_media::{
 };
 use gpui_telegram_proto::cards::{GenerativeCard, GenerativeCardLayout, GenerativeComponent};
 use gpui_telegram_proto::creations::{
-    BookChapter, BookPage, BookPayload, BookRichBlock, BotRecommendationItem, CardPair, ChordEvent,
-    CoverArtwork, CreateCreationRequest, CreationKind, CreationPayload, CreationVisibility,
-    GameAchievementDef, GameCategory, GameEngineKind, GamePayload, GameSpec, GridPuzzleLevel,
-    InstrumentSpec, MusicPayload, MusicTrack, NoteEvent, StoryChoice, StoryNode,
+    AppStoreListingPayload, BookChapter, BookPage, BookPayload, BookRichBlock,
+    BotRecommendationItem, CardPair, ChordEvent, CoverArtwork, CreateCreationRequest, CreationKind,
+    CreationPayload, CreationReviewStatus, CreationVisibility, GameAchievementDef, GameCategory,
+    GameEngineKind, GamePayload, GameSpec, GridPuzzleLevel, InstrumentSpec, MusicPayload,
+    MusicTrack, NoteEvent, ReviewDecision, ReviewDecisionRequest, StoryChoice, StoryNode,
     SubmitReviewRequest, SyncedLyricLine, SynthWaveform, TriviaQuestion, UpdateCreationRequest,
     UserCreationDto, CREATOR_STUDIO_BOT_USER_ID, CREATOR_STUDIO_BOT_USERNAME,
     MIN_CREATION_SUMMARY_CHARS,
@@ -63,6 +64,10 @@ pub(crate) fn creator_studio_commands() -> Vec<BotCommandSpec> {
             description: "创作云端游戏: /newgame 标题 | 简介".into(),
         },
         BotCommandSpec {
+            command: "newapp".into(),
+            description: "创作云端应用: /newapp 标题 | 简介".into(),
+        },
+        BotCommandSpec {
             command: "mycreations".into(),
             description: "查看我的云端作品: /mycreations [book|music|game|app]".into(),
         },
@@ -73,6 +78,18 @@ pub(crate) fn creator_studio_commands() -> Vec<BotCommandSpec> {
         BotCommandSpec {
             command: "submitwork".into(),
             description: "推送作品审核上架: /submitwork <creation_id>".into(),
+        },
+        BotCommandSpec {
+            command: "withdraw".into(),
+            description: "撤回待审核作品: /withdraw <creation_id>".into(),
+        },
+        BotCommandSpec {
+            command: "unpublish".into(),
+            description: "下架已发布作品: /unpublish <creation_id>".into(),
+        },
+        BotCommandSpec {
+            command: "deletework".into(),
+            description: "删除我的作品: /deletework <creation_id>".into(),
         },
         BotCommandSpec {
             command: "recommend".into(),
@@ -1042,8 +1059,8 @@ pub(crate) fn sanitize_recommendation_reason(reason: &str) -> String {
 pub(crate) fn build_creator_studio_welcome_reply() -> CreatorBotReply {
     let card = GenerativeCard {
         card_id: new_card_id("welcome"),
-        title: "Creator Studio · 云端创作与公开推荐助手".into(),
-        subtitle: Some("创作图书、音乐与迷你游戏，自动保存到你的云端作品库，并支持一键提交审核上架与公开推荐。".into()),
+        title: "Creator Studio · 对话式创作与发布助手".into(),
+        subtitle: Some("直接在消息里对话即可创作图书、音乐、游戏与应用，并完成编辑、提交审核、上架与管理。".into()),
         layout: GenerativeCardLayout::VerticalStack,
         components: vec![
             GenerativeComponent::Badge {
@@ -1052,47 +1069,41 @@ pub(crate) fn build_creator_studio_welcome_reply() -> CreatorBotReply {
             },
             GenerativeComponent::Text {
                 text: "常用命令 / Commands:\n\
-• /newbook <标题> | <简介> — 创作多章节图书草稿\n\
-• /newmusic <标题> | <简介> — 创作含音频合成与波形的音乐\n\
+• /newbook <标题> | <简介> — 创作多章节图书\n\
+• /newmusic <标题> | <简介> — 创作含音频合成的音乐\n\
 • /newgame <标题> | <简介> — 创作可游玩互动迷你游戏\n\
-• /mycreations [book|music|game|app] — 查看我的云端作品\n\
+• /newapp <标题> | <简介> — 创作应用并上架 App Store\n\
+• /mycreations [book|music|game|app] — 查看并管理我的作品\n\
 • /editwork <creation_id> title=<新标题> [summary=<新简介>] — 编辑作品\n\
-• /submitwork <creation_id> — 推送作品审核上架\n\
+• /submitwork <creation_id> — 推送审核上架\n\
+• /withdraw <creation_id> · /unpublish <creation_id> · /deletework <creation_id>\n\
 • /recommend [books|music|games|appstore|all] [关键词] — 推荐已公开上架作品"
                     .into(),
                 bold: false,
                 color: None,
             },
             GenerativeComponent::Text {
-                text: "也可以直接用中英文自然语言告诉我你想创作的图书、音乐或游戏！".into(),
+                text: "也可以直接用中英文自然语言告诉我你想创作或发布的图书、音乐、游戏或应用！".into(),
                 bold: false,
                 color: None,
             },
         ],
         status: Some("ready".into()),
     };
-    let keyboard = vec![
-        vec![
-            InlineKeyboardButton {
-                text: "📚 我的云端作品 (/mycreations)".into(),
-                callback_data: Some("/mycreations".into()),
-                url: None,
-                web_app_url: None,
-            },
-            InlineKeyboardButton {
-                text: "✨ 热门公开推荐 (/recommend)".into(),
-                callback_data: Some("/recommend".into()),
-                url: None,
-                web_app_url: None,
-            },
-        ],
-        vec![InlineKeyboardButton {
-            text: "🗂 打开「我的创作」面板".into(),
-            callback_data: None,
-            url: Some("tg://apple/creations".into()),
+    let keyboard = vec![vec![
+        InlineKeyboardButton {
+            text: "📚 我的作品 (/mycreations)".into(),
+            callback_data: Some("/mycreations".into()),
+            url: None,
             web_app_url: None,
-        }],
-    ];
+        },
+        InlineKeyboardButton {
+            text: "✨ 热门公开推荐 (/recommend)".into(),
+            callback_data: Some("/recommend".into()),
+            url: None,
+            web_app_url: None,
+        },
+    ]];
     CreatorBotReply { card, keyboard }
 }
 
@@ -1486,7 +1497,39 @@ async fn create_bot_work_and_reply(
             )
         }
         CreationKind::App => {
-            return build_error_card("Unsupported Bot Creation Kind", "Use /newbook, /newmusic, or /newgame.");
+            let app_payload = AppStoreListingPayload {
+                developer_name: author.clone(),
+                version_string: "1.0.0".into(),
+                release_notes: "Initial release".into(),
+                category: "Utilities".into(),
+                long_description: summary.clone(),
+                screenshots: Vec::new(),
+                size_label: "Cloud App".into(),
+                price_label: "Free".into(),
+                permissions: Vec::new(),
+                linked_miniapp: None,
+                ui_schema_json: Some(serde_json::json!({
+                    "version": 1,
+                    "title": title,
+                    "summary": summary,
+                    "components": [
+                        {
+                            "type": "header",
+                            "title": title,
+                            "subtitle": summary
+                        },
+                        {
+                            "type": "text",
+                            "text": summary
+                        }
+                    ]
+                })),
+            };
+            (
+                vec!["Utilities".into(), "App".into()],
+                vec!["creator-studio".into(), "app".into()],
+                CreationPayload::App(app_payload),
+            )
         }
     };
 
@@ -1520,7 +1563,7 @@ async fn create_bot_work_and_reply(
             let card = GenerativeCard {
                 card_id: new_card_id("created"),
                 title: format!("{} {} ({})", kind_icon(dto.kind), dto.title, dto.creation_id),
-                subtitle: Some(format!("已保存到你的云端创作库 · {kind_label}")),
+                subtitle: Some(format!("已保存到云端 · {kind_label}")),
                 layout: GenerativeCardLayout::VerticalStack,
                 components: vec![
                     GenerativeComponent::Badge {
@@ -1537,7 +1580,7 @@ async fn create_bot_work_and_reply(
                     },
                     GenerativeComponent::Button {
                         id: format!("open_{}", dto.creation_id),
-                        label: "在「我的创作」中打开".into(),
+                        label: "预览作品".into(),
                         action_payload: deep_link.clone(),
                     },
                 ],
@@ -1821,12 +1864,20 @@ fn handle_submitwork_reply(
                     ],
                     status: Some("pending_review".into()),
                 },
-                keyboard: vec![vec![InlineKeyboardButton {
-                    text: "查看我的作品状态".into(),
-                    callback_data: None,
-                    url: Some(link),
-                    web_app_url: None,
-                }]],
+                keyboard: vec![vec![
+                    InlineKeyboardButton {
+                        text: "预览作品".into(),
+                        callback_data: None,
+                        url: Some(link),
+                        web_app_url: None,
+                    },
+                    InlineKeyboardButton {
+                        text: "↩ 撤回审核".into(),
+                        callback_data: Some(format!("/withdraw {}", dto.creation_id)),
+                        url: None,
+                        web_app_url: None,
+                    },
+                ]],
             }
         }
         Err(CreationOpError::ValidationFailed(errors)) => {
@@ -1866,6 +1917,326 @@ fn handle_submitwork_reply(
             }
         }
         Err(err) => build_error_card("Submit Rejected", &format_creation_op_error(&err)),
+    }
+}
+
+fn emit_public_catalog_changed_to_hub(
+    hub: &GatewayHub,
+    creation_id: &str,
+    kind: CreationKind,
+    action: Option<&'static str>,
+) {
+    if let Some(act) = action {
+        let event = UpdateEvent::PublicCatalogChanged {
+            creation_id: creation_id.to_string(),
+            kind,
+            action: act.to_string(),
+        };
+        hub.broadcast_to_all(WsServerFrame::Update(event));
+    }
+}
+
+fn handle_withdraw_reply(
+    state: &Arc<AppState>,
+    sender_id: UserId,
+    raw_args: &str,
+) -> CreatorBotReply {
+    let creation_id = raw_args.split_whitespace().next().unwrap_or("").trim();
+    if creation_id.is_empty() {
+        return build_error_card("Invalid /withdraw Syntax", "Usage: /withdraw <creation_id>");
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    match state
+        .db
+        .withdraw_creation_review(creation_id, sender_id, now_ms)
+    {
+        Ok(dto) => {
+            emit_user_creation_changed_to_hub(&state.gateway_hub, &dto);
+            CreatorBotReply {
+                card: GenerativeCard {
+                    card_id: new_card_id("withdrawn"),
+                    title: format!("已撤回审核：{} ({})", dto.title, dto.creation_id),
+                    subtitle: Some(format!("当前状态: {} · rev {}", dto.review_status.as_str(), dto.cloud_revision)),
+                    layout: GenerativeCardLayout::VerticalStack,
+                    components: vec![GenerativeComponent::Text {
+                        text: format!(
+                            "作品 {} 已撤回至草稿状态，编辑完成后可随时使用 /submitwork {} 重新提交审核。",
+                            dto.creation_id, dto.creation_id
+                        ),
+                        bold: false,
+                        color: None,
+                    }],
+                    status: Some("draft".into()),
+                },
+                keyboard: vec![vec![InlineKeyboardButton {
+                    text: "🚀 重新提交审核".into(),
+                    callback_data: Some(format!("/submitwork {}", dto.creation_id)),
+                    url: None,
+                    web_app_url: None,
+                }]],
+            }
+        }
+        Err(err) => build_error_card("Withdraw Rejected", &format_creation_op_error(&err)),
+    }
+}
+
+fn handle_unpublish_reply(
+    state: &Arc<AppState>,
+    sender_id: UserId,
+    raw_args: &str,
+) -> CreatorBotReply {
+    let creation_id = raw_args.split_whitespace().next().unwrap_or("").trim();
+    if creation_id.is_empty() {
+        return build_error_card("Invalid /unpublish Syntax", "Usage: /unpublish <creation_id>");
+    }
+    let is_admin = crate::routes::hermes::caller_is_admin(state, sender_id);
+    let now_ms = Utc::now().timestamp_millis();
+    match state
+        .db
+        .unpublish_creation(creation_id, sender_id, is_admin, now_ms)
+    {
+        Ok(res) => {
+            emit_user_creation_changed_to_hub(&state.gateway_hub, &res.creation);
+            emit_public_catalog_changed_to_hub(
+                &state.gateway_hub,
+                &res.creation.creation_id,
+                res.creation.kind,
+                res.catalog_ws_action,
+            );
+            CreatorBotReply {
+                card: GenerativeCard {
+                    card_id: new_card_id("unpublished"),
+                    title: format!("已下架作品：{} ({})", res.creation.title, res.creation.creation_id),
+                    subtitle: Some(format!("当前状态: {}", res.creation.review_status.as_str())),
+                    layout: GenerativeCardLayout::VerticalStack,
+                    components: vec![GenerativeComponent::Text {
+                        text: format!(
+                            "作品 {} 已从公开商店下架。如需重新发布，请发送 /submitwork {}。",
+                            res.creation.creation_id, res.creation.creation_id
+                        ),
+                        bold: false,
+                        color: None,
+                    }],
+                    status: Some("unpublished".into()),
+                },
+                keyboard: vec![vec![InlineKeyboardButton {
+                    text: "🚀 重新提交上架".into(),
+                    callback_data: Some(format!("/submitwork {}", res.creation.creation_id)),
+                    url: None,
+                    web_app_url: None,
+                }]],
+            }
+        }
+        Err(err) => build_error_card("Unpublish Rejected", &format_creation_op_error(&err)),
+    }
+}
+
+fn handle_deletework_reply(
+    state: &Arc<AppState>,
+    sender_id: UserId,
+    raw_args: &str,
+) -> CreatorBotReply {
+    let creation_id = raw_args.split_whitespace().next().unwrap_or("").trim();
+    if creation_id.is_empty() {
+        return build_error_card("Invalid /deletework Syntax", "Usage: /deletework <creation_id>");
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    match state.db.soft_delete_creation(creation_id, sender_id, now_ms) {
+        Ok(res) => {
+            emit_user_creation_changed_to_hub(&state.gateway_hub, &res.creation);
+            emit_public_catalog_changed_to_hub(
+                &state.gateway_hub,
+                &res.creation.creation_id,
+                res.creation.kind,
+                res.catalog_ws_action,
+            );
+            CreatorBotReply {
+                card: GenerativeCard {
+                    card_id: new_card_id("deleted"),
+                    title: format!("已删除作品：{} ({})", res.creation.title, res.creation.creation_id),
+                    subtitle: Some("作品已从云端作品库与公开目录移除".into()),
+                    layout: GenerativeCardLayout::VerticalStack,
+                    components: vec![GenerativeComponent::Text {
+                        text: format!("作品 {} 已删除。", res.creation.creation_id),
+                        bold: false,
+                        color: None,
+                    }],
+                    status: Some("deleted".into()),
+                },
+                keyboard: vec![vec![InlineKeyboardButton {
+                    text: "📚 查看剩余作品".into(),
+                    callback_data: Some("/mycreations".into()),
+                    url: None,
+                    web_app_url: None,
+                }]],
+            }
+        }
+        Err(err) => build_error_card("Delete Rejected", &format_creation_op_error(&err)),
+    }
+}
+
+fn handle_reviewqueue_reply(
+    state: &Arc<AppState>,
+    sender_id: UserId,
+) -> CreatorBotReply {
+    if !crate::routes::hermes::caller_is_admin(state, sender_id) {
+        return build_error_card("Forbidden", "仅管理员可查看和审批待审核队列。");
+    }
+    let list = match state
+        .db
+        .list_creation_review_queue(Some(CreationReviewStatus::PendingReview), None)
+    {
+        Ok(r) => r.items,
+        Err(e) => return build_error_card("Review Queue Error", &e.to_string()),
+    };
+    if list.is_empty() {
+        return CreatorBotReply {
+            card: GenerativeCard {
+                card_id: new_card_id("rq_empty"),
+                title: "待审核队列 (0)".into(),
+                subtitle: Some("当前没有待审核的作品。".into()),
+                layout: GenerativeCardLayout::VerticalStack,
+                components: vec![GenerativeComponent::Text {
+                    text: "暂无待审核作品。".into(),
+                    bold: false,
+                    color: None,
+                }],
+                status: Some("empty".into()),
+            },
+            keyboard: Vec::new(),
+        };
+    }
+    let mut lines = Vec::new();
+    let mut keyboard = Vec::new();
+    for item in list.iter().take(6) {
+        lines.push(format!(
+            "• {} {} ({}) — by {}",
+            kind_icon(item.kind),
+            item.title,
+            item.creation_id,
+            item.author_display_name
+        ));
+        keyboard.push(vec![
+            InlineKeyboardButton {
+                text: format!("✅ 通过 {}", item.title.chars().take(12).collect::<String>()),
+                callback_data: Some(format!("/approve {}", item.creation_id)),
+                url: None,
+                web_app_url: None,
+            },
+            InlineKeyboardButton {
+                text: "⭐ 精选通过".into(),
+                callback_data: Some(format!("/approve {} featured", item.creation_id)),
+                url: None,
+                web_app_url: None,
+            },
+        ]);
+    }
+    CreatorBotReply {
+        card: GenerativeCard {
+            card_id: new_card_id("rq_list"),
+            title: format!("待审核队列 ({})", list.len()),
+            subtitle: Some("点击下方按钮可直接通过上架，或发送 /reject <id> | <原因> 退回。".into()),
+            layout: GenerativeCardLayout::VerticalStack,
+            components: vec![GenerativeComponent::Text {
+                text: lines.join("\n"),
+                bold: false,
+                color: None,
+            }],
+            status: Some("pending_review".into()),
+        },
+        keyboard,
+    }
+}
+
+fn handle_review_decision_reply(
+    state: &Arc<AppState>,
+    sender_id: UserId,
+    raw_args: &str,
+    approve: bool,
+) -> CreatorBotReply {
+    if !crate::routes::hermes::caller_is_admin(state, sender_id) {
+        return build_error_card("Forbidden", "仅管理员可执行上架审核操作。");
+    }
+    let (creation_id, extra) = if let Some(idx) = raw_args.find('|').or_else(|| raw_args.find('｜')) {
+        let sep_len = if raw_args[idx..].starts_with('｜') { '｜'.len_utf8() } else { 1 };
+        (raw_args[..idx].trim(), Some(raw_args[idx + sep_len..].trim()))
+    } else {
+        let mut parts = raw_args.splitn(2, char::is_whitespace);
+        (
+            parts.next().unwrap_or("").trim(),
+            parts.next().map(str::trim).filter(|s| !s.is_empty()),
+        )
+    };
+    if creation_id.is_empty() {
+        return build_error_card(
+            "Invalid Review Syntax",
+            if approve {
+                "Usage: /approve <creation_id> [featured]"
+            } else {
+                "Usage: /reject <creation_id> | <reason>"
+            },
+        );
+    }
+    let is_unlisted = approve
+        && extra.is_some_and(|s| s.eq_ignore_ascii_case("unlisted") || s.contains("仅链接"));
+    let decision = if approve {
+        ReviewDecision::Approve
+    } else {
+        ReviewDecision::Reject
+    };
+    let req = ReviewDecisionRequest {
+        decision,
+        visibility: if approve {
+            Some(if is_unlisted {
+                CreationVisibility::Unlisted
+            } else {
+                CreationVisibility::Public
+            })
+        } else {
+            None
+        },
+        reason: if approve {
+            None
+        } else {
+            Some(extra.unwrap_or("请完善作品内容后重新提交").to_string())
+        },
+        notes: extra.map(ToString::to_string),
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    match state
+        .db
+        .review_creation_decision(creation_id, sender_id, &req, now_ms)
+    {
+        Ok(res) => {
+            emit_user_creation_changed_to_hub(&state.gateway_hub, &res.creation);
+            emit_public_catalog_changed_to_hub(
+                &state.gateway_hub,
+                &res.creation.creation_id,
+                res.creation.kind,
+                res.catalog_ws_action,
+            );
+            let action_txt = if approve { "已审核通过并公开上架" } else { "已退回修改" };
+            CreatorBotReply {
+                card: GenerativeCard {
+                    card_id: new_card_id("reviewed"),
+                    title: format!("{action_txt}：{} ({})", res.creation.title, res.creation.creation_id),
+                    subtitle: Some(format!("状态: {}", res.creation.review_status.as_str())),
+                    layout: GenerativeCardLayout::VerticalStack,
+                    components: vec![GenerativeComponent::Text {
+                        text: format!(
+                            "作品 {} 当前状态为 {}。",
+                            res.creation.creation_id,
+                            res.creation.review_status.as_str()
+                        ),
+                        bold: false,
+                        color: None,
+                    }],
+                    status: Some(res.creation.review_status.as_str().into()),
+                },
+                keyboard: Vec::new(),
+            }
+        }
+        Err(err) => build_error_card("Review Decision Rejected", &format_creation_op_error(&err)),
     }
 }
 
@@ -2252,9 +2623,30 @@ pub async fn handle_creator_studio_message(
                 )
                 .await;
             }
+            "/newapp" => {
+                let Some((title, summary)) = parse_title_and_summary(rest) else {
+                    return build_error_card("Usage", "Usage: /newapp <title> | <summary>");
+                };
+                return create_bot_work_and_reply(
+                    state,
+                    chat_id,
+                    sender_id,
+                    CreationKind::App,
+                    &title,
+                    summary.as_deref(),
+                    None,
+                )
+                .await;
+            }
             "/mycreations" => return handle_mycreations_reply(state, sender_id, rest),
             "/editwork" => return handle_editwork_reply(state, sender_id, rest),
             "/submitwork" => return handle_submitwork_reply(state, sender_id, rest),
+            "/withdraw" => return handle_withdraw_reply(state, sender_id, rest),
+            "/unpublish" => return handle_unpublish_reply(state, sender_id, rest),
+            "/deletework" => return handle_deletework_reply(state, sender_id, rest),
+            "/reviewqueue" => return handle_reviewqueue_reply(state, sender_id),
+            "/approve" => return handle_review_decision_reply(state, sender_id, rest, true),
+            "/reject" => return handle_review_decision_reply(state, sender_id, rest, false),
             "/recommend" => return handle_recommend_reply(state, rest),
             _ => return build_creator_studio_welcome_reply(),
         }
@@ -2294,6 +2686,7 @@ async fn handle_creator_studio_natural_language(
         || trimmed.contains("写个")
         || trimmed.contains("做一")
         || trimmed.contains("做个")
+        || trimmed.contains("发布")
         || trimmed.contains("生成");
 
     if wants_recommend && !wants_create {
@@ -2333,6 +2726,9 @@ async fn handle_creator_studio_natural_language(
             || trimmed.contains("图书")
             || trimmed.contains("小说")
             || trimmed.contains("一本书");
+        let is_app = lower.contains("app")
+            || trimmed.contains("应用")
+            || trimmed.contains("工具");
 
         if is_music {
             let title = extract_nl_title(trimmed, "Untitled Cloud Track");
@@ -2367,6 +2763,19 @@ async fn handle_creator_studio_natural_language(
                 chat_id,
                 sender_id,
                 CreationKind::Book,
+                &title,
+                Some(trimmed),
+                None,
+            )
+            .await;
+        }
+        if is_app {
+            let title = extract_nl_title(trimmed, "Untitled Cloud App");
+            return create_bot_work_and_reply(
+                state,
+                chat_id,
+                sender_id,
+                CreationKind::App,
                 &title,
                 Some(trimmed),
                 None,

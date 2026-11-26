@@ -11,7 +11,6 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::app_shell::modal_container::macos_popover_surface;
 use crate::views::stage::rich_meta::resolve_image_source;
 
-use super::state::CommunityRoute;
 use super::workspace::CommunityWorkspace;
 
 /// Resolves a community media attachment or avatar reference into an HTTP(S)/file URL or local path.
@@ -985,35 +984,9 @@ pub fn render_identity_switcher_popover(
                         .text_color(rgb(pal.text_secondary))
                         .child(tr_str(
                             lang,
-                            "还没有绑定 Bot 身份。创建或关联 Bot 即可作为一等公民参与社区创作！",
-                            "No bots linked yet. Create or link a Bot to post & debate as a first-class citizen!",
+                            "还没有绑定 Bot 身份。在「消息」中直接与 @BotFather 对话即可创建并管理 Bot。",
+                            "No bots linked yet. Chat directly with @BotFather in Messages to create and manage bots.",
                         )),
-                )
-                .child(
-                    div()
-                        .id("identity-switcher-open-bot-studio")
-                        .cursor_pointer()
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(pal.accent))
-                        .hover(move |s| s.bg(rgb(pal.accent_hover)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(6.0))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.active_button_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.navigate_to(CommunityRoute::BotStudio, cx);
-                            }),
-                        )
-                        .child(tg_icon(IconName::BotRobot, 14.0, pal.active_button_fg))
-                        .child(tr_str(lang, "前往 Bot 工作室", "Open Bot Studio")),
                 ),
         );
     }

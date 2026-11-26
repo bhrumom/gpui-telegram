@@ -1190,7 +1190,7 @@ fn render_stat_pill(label: &str, value: String, pal: &TdesktopThemePalette) -> D
 fn render_bot_citizenship_card(
     ws: &CommunityWorkspace,
     actor: &CommunityActorDto,
-    cx: &mut Context<CommunityWorkspace>,
+    _cx: &mut Context<CommunityWorkspace>,
 ) -> Div {
     let pal = ws.palette;
     let lang = ws.language_id.as_str();
@@ -1201,7 +1201,6 @@ fn render_bot_citizenship_card(
         0.5
     };
     let trust_pct = (trust * 100.0).round() as u32;
-    let is_owned = ws.is_viewer_owned_actor(&actor.actor_id);
 
     div()
         .p(px(13.0))
@@ -1319,29 +1318,7 @@ fn render_bot_citizenship_card(
                                         .bg(rgb(pal.success)),
                                 ),
                         ),
-                )
-                .when(is_owned, |row| {
-                    row.child(
-                        div()
-                            .id("profile-bot-open-studio")
-                            .cursor_pointer()
-                            .px(px(9.0))
-                            .py(px(4.0))
-                            .rounded_full()
-                            .bg(rgb(bot_bg))
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(bot_fg))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.navigate_to(CommunityRoute::BotStudio, cx);
-                                }),
-                            )
-                            .child(tr_str(lang, "在 Bot 工作室管理", "Manage in Bot Studio")),
-                    )
-                }),
+                ),
         )
 }
 
@@ -1690,7 +1667,6 @@ fn render_profile_tab_body(
         }
         ActorProfileTab::BotActivity => {
             let a = &prof.actor;
-            let is_owned = ws.is_viewer_owned_actor(&a.actor_id);
             div()
                 .p(px(13.0))
                 .rounded(px(10.0))
@@ -1726,32 +1702,6 @@ fn render_profile_tab_body(
                             format_compact_count(a.awardee_karma),
                         )),
                 )
-                .when(is_owned, |col| {
-                    col.child(
-                        div()
-                            .flex()
-                            .child(
-                                div()
-                                    .id("profile-bot-activity-studio")
-                                    .cursor_pointer()
-                                    .px(px(12.0))
-                                    .py(px(6.0))
-                                    .rounded_full()
-                                    .bg(rgb(pal.accent))
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.active_button_fg))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.navigate_to(CommunityRoute::BotStudio, cx);
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "前往 Bot 工作室测试发帖", "Summon / Test in Bot Studio")),
-                            ),
-                    )
-                })
         }
     }
 }
@@ -1813,13 +1763,15 @@ pub fn render_edit_profile_modal(
     let card = macos_modal_card("community-edit-profile-modal-card", pal)
         .w(px(pal.scaled_px(560.0).min(620.0)))
         .max_w_full()
-        .max_h(px(660.0))
+        .h(px(660.0))
+        .max_h_full()
         .flex()
         .flex_col()
         .overflow_hidden()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(16.0))
                 .py(px(12.0))
                 .border_b_1()

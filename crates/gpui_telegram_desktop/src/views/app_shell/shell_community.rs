@@ -89,7 +89,7 @@ impl AppShell {
 
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
-        let sidebar_w = self.sidebar.read(cx).effective_width();
+        let sidebar_w = self.apple_sidebar.read(cx).effective_width();
         let owned_actor_ids = self.collect_shell_owned_community_actor_ids();
 
         let cw = if let Some(existing) = self.community_workspace.clone() {

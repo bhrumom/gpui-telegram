@@ -415,7 +415,7 @@ async fn test_01_creator_studio_bot_seeding_and_29_toolset_invariant() {
     assert_eq!(creator_bot["username"], CREATOR_STUDIO_BOT_USERNAME);
     assert_eq!(creator_bot["is_official"], true);
     assert_eq!(creator_bot["is_inline"], true);
-    assert_eq!(creator_bot["commands"].as_array().unwrap().len(), 9);
+    assert_eq!(creator_bot["commands"].as_array().unwrap().len(), 13);
 
     // Discoverable via GET /api/v1/bots/profile/CreatorStudioBot & peers/resolve
     let (s_prof, prof) = http_json(
@@ -2597,6 +2597,235 @@ async fn test_16_iter4_utf8_editwork_empty_sq_escapes_and_inline_query_q_fallbac
 
     state.shutdown();
 }
+
+#[tokio::test]
+async fn test_17_in_message_bot_publishing_lifecycle_search_aliases_and_zero_fake_catalog() {
+    let (_dir, cfg, state, app) = make_temp_state();
+    let (alice_uid, alice_tok) = register_user(&app, "alice_m3_17", "Alice", None).await;
+    let (admin_uid, admin_tok) = register_user(&app, "admin_m3_17", "Admin", None).await;
+    promote_admin(&state, admin_uid);
+
+    // 1. Fresh server has ZERO legacy fake stickers/GIFs and ZERO legacy demo bots (777010..777012)
+    let (st_stk, stk_body) = http_json(&app, "GET", "/api/v1/stickers/sets", Some(&alice_tok), None).await;
+    assert_eq!(st_stk, StatusCode::OK, "stickers/sets failed: {stk_body}");
+    assert_eq!(
+        stk_body["sets"].as_array().map_or(0, Vec::len),
+        0,
+        "fresh server must have zero hardcoded fake sticker sets: {stk_body}"
+    );
+    let (st_gif, gif_body) = http_json(&app, "GET", "/api/v1/gifs/search?q=", Some(&alice_tok), None).await;
+    assert_eq!(st_gif, StatusCode::OK, "gifs/search failed: {gif_body}");
+    assert_eq!(
+        gif_body["gifs"].as_array().map_or(0, Vec::len),
+        0,
+        "fresh server must have zero hardcoded fake GIFs: {gif_body}"
+    );
+
+    // 2. Global search in Messages finds @CreatorStudioBot via Chinese aliases ("创作", "发布", "图书")
+    //    and never exposes legacy demo bots 777010/777011/777012.
+    for kw in ["创作", "发布", "图书"] {
+        let enc: String = url::form_urlencoded::byte_serialize(kw.as_bytes()).collect();
+        let (st_s, s_body) = http_json(
+            &app,
+            "GET",
+            &format!("/api/v1/search?q={enc}&category=all"),
+            Some(&alice_tok),
+            None,
+        )
+        .await;
+        assert_eq!(st_s, StatusCode::OK, "search '{kw}' failed: {s_body}");
+        let results = s_body["results"].as_array().expect("results array");
+        assert!(
+            results.iter().any(|r| r["bot_user_id"].as_i64() == Some(CREATOR_STUDIO_BOT_USER_ID)),
+            "global search for '{kw}' must discover @CreatorStudioBot in Messages: {s_body}"
+        );
+        for legacy_demo_bot in [777_010i64, 777_011, 777_012] {
+            assert!(
+                !results.iter().any(|r| r["bot_user_id"].as_i64() == Some(legacy_demo_bot)),
+                "legacy demo bot {legacy_demo_bot} must not appear in global search"
+            );
+        }
+    }
+
+    // 3. Opening DM with @CreatorStudioBot sends welcome card directly in Messages chat
+    //    and omits any standalone "tg://apple/creations" panel button.
+    let (alice_chat, initial_msg_count) = open_creator_bot_dm(&app, &alice_tok).await;
+    assert!(
+        initial_msg_count >= 1,
+        "opening @CreatorStudioBot DM must deliver welcome card directly inside Messages"
+    );
+    let (_, dm_msgs) = http_json(
+        &app,
+        "GET",
+        &format!("/api/v1/chats/{alice_chat}/messages?limit=20"),
+        Some(&alice_tok),
+        None,
+    )
+    .await;
+    let dm_str = dm_msgs.to_string();
+    assert!(
+        !dm_str.contains("tg://apple/creations"),
+        "welcome card must not point to removed standalone creations panel: {dm_str}"
+    );
+
+    // 4. Full in-message publishing lifecycle for an App:
+    //    /newapp -> /submitwork -> /withdraw -> /submitwork -> /reviewqueue -> /reject -> /submitwork -> /approve -> /unpublish -> /deletework
+    let app_rep = send_bot_cmd_and_wait(
+        &app,
+        &alice_tok,
+        alice_chat,
+        "/newapp Cloud Notes | Fast minimalist markdown workspace app for daily notes",
+    )
+    .await;
+    let app_id = extract_creation_id_from_reply(&app_rep);
+    let (st_get, app_dto) = http_json(&app, "GET", &format!("/api/v1/creations/{app_id}"), Some(&alice_tok), None).await;
+    assert_eq!(st_get, StatusCode::OK, "fetch created app failed: {app_dto}");
+    assert_eq!(app_dto["kind"], "app");
+    assert_eq!(app_dto["owner_user_id"], alice_uid as i64);
+
+    // Submit -> pending_review
+    let sub1 = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, &format!("/submitwork {app_id}")).await;
+    assert!(sub1.to_string().contains("pending_review"), "submit1 failed: {sub1}");
+
+    // Withdraw -> draft
+    let wd = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, &format!("/withdraw {app_id}")).await;
+    assert!(wd.to_string().contains("draft"), "withdraw failed: {wd}");
+    let (_, after_wd) = http_json(&app, "GET", &format!("/api/v1/creations/{app_id}"), Some(&alice_tok), None).await;
+    assert_eq!(after_wd["review_status"], "draft");
+
+    // Re-submit -> pending_review
+    let sub2 = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, &format!("/submitwork {app_id}")).await;
+    assert!(sub2.to_string().contains("pending_review"), "submit2 failed: {sub2}");
+
+    // Non-admin /reviewqueue and /approve must be rejected cleanly
+    let non_admin_rq = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, "/reviewqueue").await;
+    assert!(non_admin_rq.to_string().contains("Forbidden"), "non-admin /reviewqueue must be forbidden: {non_admin_rq}");
+    let non_admin_ap = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, &format!("/approve {app_id}")).await;
+    assert!(non_admin_ap.to_string().contains("Forbidden"), "non-admin /approve must be forbidden: {non_admin_ap}");
+
+    // Admin reviews via in-message @CreatorStudioBot DM: /reviewqueue -> /reject -> re-submit -> /approve
+    let (admin_chat, _) = open_creator_bot_dm(&app, &admin_tok).await;
+    let rq = send_bot_cmd_and_wait(&app, &admin_tok, admin_chat, "/reviewqueue").await;
+    assert!(rq.to_string().contains(&app_id), "admin /reviewqueue must list {app_id}: {rq}");
+
+    let rej = send_bot_cmd_and_wait(
+        &app,
+        &admin_tok,
+        admin_chat,
+        &format!("/reject {app_id} | Please expand description"),
+    )
+    .await;
+    assert!(rej.to_string().contains("rejected"), "admin /reject failed: {rej}");
+    let (_, after_rej) = http_json(&app, "GET", &format!("/api/v1/creations/{app_id}"), Some(&alice_tok), None).await;
+    assert_eq!(after_rej["review_status"], "rejected");
+
+    // Re-submit and approve in-message
+    let _ = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, &format!("/submitwork {app_id}")).await;
+    let ap = send_bot_cmd_and_wait(&app, &admin_tok, admin_chat, &format!("/approve {app_id}")).await;
+    assert!(ap.to_string().contains("published"), "admin /approve failed: {ap}");
+
+    // Public catalog now contains the approved app
+    let (st_cat, cat_body) = http_json(&app, "GET", "/api/v1/catalog/appstore", Some(&alice_tok), None).await;
+    assert_eq!(st_cat, StatusCode::OK, "catalog/apps failed: {cat_body}");
+    assert!(
+        cat_body.to_string().contains(&app_id),
+        "approved app must appear in public catalog/apps: {cat_body}"
+    );
+
+    // Owner /unpublish removes it from public catalog
+    let unp = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, &format!("/unpublish {app_id}")).await;
+    assert!(unp.to_string().contains("unpublished"), "/unpublish failed: {unp}");
+    let (_, cat_after_unp) = http_json(&app, "GET", "/api/v1/catalog/appstore", Some(&alice_tok), None).await;
+    assert!(
+        !cat_after_unp.to_string().contains(&app_id),
+        "unpublished app must disappear from public catalog/apps: {cat_after_unp}"
+    );
+
+    // Owner /deletework soft-deletes the work
+    let del = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, &format!("/deletework {app_id}")).await;
+    assert!(
+        del.to_string().contains("已删除") || del.to_string().contains("deleted"),
+        "/deletework failed: {del}"
+    );
+    let my_after_del = send_bot_cmd_and_wait(&app, &alice_tok, alice_chat, "/mycreations").await;
+    assert!(
+        !my_after_del.to_string().contains(&app_id),
+        "deleted work must not appear in /mycreations: {my_after_del}"
+    );
+
+    // 5. Upgrade purge test: inject legacy fake sticker pack + GIF + real user sticker pack,
+    //    cold-restart AppState, verify fake rows are purged while real user pack is preserved.
+    state
+        .db
+        .pool()
+        .with_writer(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO sticker_sets(set_id, short_name, title, is_animated, is_video, is_official, created_at_ms)
+                 VALUES ('pack_durov', 'durov_classic', 'Durov Classic', 0, 0, 1, 1000)",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO stickers(sticker_id, set_id, emoji, mime_type, width, height, file_id, lottie_json, sort_order)
+                 VALUES ('builtin_stk_1', 'pack_durov', '😎', 'image/webp', 512, 512, NULL, NULL, 0)",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO sticker_sets(set_id, short_name, title, is_animated, is_video, is_official, created_at_ms)
+                 VALUES ('pack_real_user', 'real_pack', 'Real Pack', 0, 0, 0, 2000)",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO gifs_catalog(gif_id, title, tags, width, height, duration_secs, mime_type, url, preview_url, created_at_ms)
+                 VALUES ('gif_celebrate', 'Celebrate', 'party', 320, 240, 3, 'image/gif', 'https://example.invalid/c.gif', 'https://example.invalid/c.png', 1000)",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO gifs_catalog(gif_id, title, tags, width, height, duration_secs, mime_type, url, preview_url, created_at_ms)
+                 VALUES ('gif_real_upload', 'Real Upload', 'real', 320, 240, 3, 'image/gif', 'https://cdn.example/real.gif', 'https://cdn.example/real.png', 2000)",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .expect("inject legacy + real sticker/gif rows");
+
+    state.shutdown();
+    drop(app);
+    drop(state);
+
+    let state2 = Arc::new(AppState::try_new(cfg).expect("reopen AppState for purge check"));
+    let app2 = build_router_with_state(state2.clone());
+    let (_, login_b) = http_json(
+        &app2,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(json!({
+            "username": "alice_m3_17",
+            "password": "StrongPassword123!",
+            "device_name": "PurgeCheck"
+        })),
+    )
+    .await;
+    let tok2 = login_b["token"].as_str().unwrap().to_string();
+
+    let (_, stk2) = http_json(&app2, "GET", "/api/v1/stickers/sets", Some(&tok2), None).await;
+    let sets2 = stk2["sets"].as_array().expect("sets array");
+    assert_eq!(sets2.len(), 1, "only real user sticker pack should survive restart purge: {stk2}");
+    assert_eq!(sets2[0]["set_id"], "pack_real_user");
+
+    let (_, gif2) = http_json(&app2, "GET", "/api/v1/gifs/search?q=", Some(&tok2), None).await;
+    let gifs2 = gif2["gifs"].as_array().expect("gifs array");
+    assert_eq!(gifs2.len(), 1, "only real user GIF should survive restart purge: {gif2}");
+    assert_eq!(gifs2[0]["id"], "gif_real_upload");
+
+    state2.shutdown();
+}
+
 
 
 

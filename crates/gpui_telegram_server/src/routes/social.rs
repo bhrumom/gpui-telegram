@@ -15,7 +15,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub async fn stickers_sets(auth: AuthBearer, State(state): State<Arc<AppState>>) -> Response {
-    let _ = state.db.seed_default_catalog_if_empty();
     match state.db.list_sticker_sets(auth.user_id) {
         Ok(sets) => (StatusCode::OK, Json(json!({ "sets": sets }))).into_response(),
         Err(e) => map_telegram_err(e),
@@ -31,7 +30,6 @@ pub async fn stickers_install(auth: AuthBearer, State(state): State<Arc<AppState
 }
 
 pub async fn gifs_search(_auth: AuthBearer, State(state): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Response {
-    let _ = state.db.seed_default_catalog_if_empty();
     let query = q.get("q").map(String::as_str).unwrap_or("");
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(24).clamp(1, 50);
     match state.db.search_gifs(query, limit) {

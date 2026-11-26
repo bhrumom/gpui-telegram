@@ -350,6 +350,12 @@ impl GlobalTasksWorkspace {
         let mut s = Self::new();
         s.palette = palette;
         s.language_id = language_id.to_string();
+        s.status_summary = HermesStatusDto::default();
+        s.toolsets.clear();
+        s.snapshot_frozen_label.clear();
+        s.soul_persona_draft.clear();
+        s.active_api_mode.clear();
+        s.fallback_chain_draft.clear();
         s
     }
 

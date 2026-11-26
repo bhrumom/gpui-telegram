@@ -208,6 +208,7 @@ fn render_arcade_dodge_canvas(
     div()
         .id("game-arcade-dodge-canvas-wrap")
         .w(px(520.0))
+        .max_w_full()
         .h(px(340.0))
         .rounded(px(14.0))
         .overflow_hidden()
@@ -290,6 +291,7 @@ fn render_snake_grid_canvas(
     div()
         .id("game-snake-grid-canvas-wrap")
         .w(px(460.0))
+        .max_w_full()
         .h(px(340.0))
         .rounded(px(14.0))
         .overflow_hidden()
@@ -428,6 +430,7 @@ pub fn render_game_runtime_sheet(
         // Top Apple Arcade Game HUD bar
         .child(
             div()
+                .flex_shrink_0()
                 .w_full()
                 .px(px(20.0))
                 .py(px(12.0))
@@ -744,6 +747,7 @@ pub fn render_game_runtime_sheet(
                         hint,
                         ..
                     } => apple_grouped_card(pal)
+                        .w_full()
                         .max_w(px(520.0))
                         .p(px(18.0))
                         .flex()
@@ -754,8 +758,10 @@ pub fn render_game_runtime_sheet(
                             div()
                                 .w_full()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .justify_between()
+                                .gap(px(8.0))
                                 .child(
                                     div()
                                         .text_size(px(14.0))
@@ -785,7 +791,7 @@ pub fn render_game_runtime_sheet(
                                         }),
                                 ),
                         )
-                        .child(div().flex().flex_col().gap(px(6.0)).children(
+                        .child(div().max_w_full().overflow_hidden().flex().flex_col().gap(px(6.0)).children(
                             grid.iter().enumerate().map(|(r, row)| {
                                 div().flex().gap(px(6.0)).children(row.iter().enumerate().map(
                                     |(c, &val)| {
@@ -863,6 +869,7 @@ pub fn render_game_runtime_sheet(
                         remaining_ms,
                         ..
                     } => apple_grouped_card(pal)
+                        .w_full()
                         .max_w(px(620.0))
                         .p(px(20.0))
                         .flex()
@@ -1000,6 +1007,7 @@ pub fn render_game_runtime_sheet(
                         ending_badge,
                         ..
                     } => apple_grouped_card(pal)
+                        .w_full()
                         .max_w(px(640.0))
                         .p(px(22.0))
                         .flex()
@@ -1095,6 +1103,7 @@ pub fn render_game_runtime_sheet(
                     } => {
                         let grid_w = ((cols.max(2) as f32) * 86.0).min(560.0);
                         apple_grouped_card(pal)
+                            .w_full()
                             .max_w(px(620.0))
                             .p(px(18.0))
                             .flex()
@@ -1111,7 +1120,7 @@ pub fn render_game_runtime_sheet(
                                         tr_str(&lang, "步数", "Moves")
                                     )),
                             )
-                            .child(div().w(px(grid_w)).flex().flex_wrap().gap(px(8.0)).children(
+                            .child(div().w(px(grid_w)).max_w_full().flex().flex_wrap().justify_center().gap(px(8.0)).children(
                                 cards.iter().map(|card| {
                                     let r = card.row;
                                     let c = card.col;

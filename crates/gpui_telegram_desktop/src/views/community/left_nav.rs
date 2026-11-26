@@ -122,6 +122,7 @@ pub fn render_left_nav(
         .w(px(nav_w))
         .flex_shrink_0()
         .h_full()
+        .overflow_hidden()
         .bg(rgb(pal.dialogs_bg))
         .border_r_1()
         .border_color(pal.separator_rgba())
@@ -144,14 +145,18 @@ pub fn render_left_nav(
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap(px(6.0))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(7.0))
                                 .child(tg_icon(IconName::CommunityGlobe, 18.0, pal.accent))
                                 .child(
                                     div()
+                                        .truncate()
                                         .text_size(px(14.5))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(rgb(pal.text_primary))
@@ -160,6 +165,7 @@ pub fn render_left_nav(
                         )
                         .child(
                             div()
+                                .flex_shrink_0()
                                 .px(px(6.0))
                                 .py(px(2.0))
                                 .rounded_full()
@@ -220,16 +226,6 @@ pub fn render_left_nav(
                     &pal,
                     cx,
                     |this, cx| this.navigate_to(CommunityRoute::ModQueue(None), cx),
-                ))
-                .child(render_nav_item(
-                    "community-nav-bot-studio",
-                    IconName::BotRobot,
-                    tr_str(lang, "Bot 工作室", "Bot Studio"),
-                    matches!(route, CommunityRoute::BotStudio),
-                    0,
-                    &pal,
-                    cx,
-                    |this, cx| this.navigate_to(CommunityRoute::BotStudio, cx),
                 ))
                 // Primary "New Post" CTA
                 .child(
@@ -474,9 +470,9 @@ fn render_left_nav_footer(
             a.bot_badge,
         ),
         None => (
-            "u:local".to_string(),
-            tr_str(lang, "当前身份", "Active Identity").to_string(),
-            "citizen".to_string(),
+            String::new(),
+            tr_str(lang, "未同步身份", "Syncing Account").to_string(),
+            String::new(),
             ActorKind::Human,
             None,
             "classic".to_string(),
@@ -560,13 +556,15 @@ fn render_left_nav_footer(
                                     lang,
                                 )),
                         )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(10.5))
-                                .text_color(rgb(pal.text_secondary))
-                                .child(format!("@{handle}")),
-                        ),
+                        .when(!handle.is_empty(), |col| {
+                            col.child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child(format!("@{handle}")),
+                            )
+                        }),
                 )
                 .child(tg_icon(IconName::ChevronDown, 12.0, pal.text_secondary)),
         )
@@ -678,6 +676,8 @@ pub fn render_compact_top_nav(
         .gap(px(6.0))
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
                 .flex()
                 .items_center()
                 .flex_wrap()
@@ -724,14 +724,6 @@ pub fn render_compact_top_nav(
                     0,
                     Box::new(|this, cx| this.navigate_to(CommunityRoute::ModQueue(None), cx)),
                 ))
-                .child(chip(
-                    "compact-nav-bot-studio",
-                    IconName::BotRobot,
-                    tr_str(lang, "Bot", "Bots"),
-                    matches!(route, CommunityRoute::BotStudio),
-                    0,
-                    Box::new(|this, cx| this.navigate_to(CommunityRoute::BotStudio, cx)),
-                ))
                 .child(
                     div()
                         .id("compact-new-post-btn")
@@ -765,6 +757,7 @@ pub fn render_compact_top_nav(
             div()
                 .id("compact-act-as-btn")
                 .cursor_pointer()
+                .flex_shrink_0()
                 .px(px(6.0))
                 .py(px(3.0))
                 .rounded_full()
@@ -797,8 +790,8 @@ pub fn render_compact_top_nav(
                         &pal,
                     ),
                     None => render_actor_avatar(
-                        "u:local",
-                        "U",
+                        "",
+                        "",
                         ActorKind::Human,
                         None,
                         "classic",

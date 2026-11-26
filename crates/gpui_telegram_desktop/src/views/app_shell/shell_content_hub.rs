@@ -417,16 +417,23 @@ fn format_creation_mutation_error(lang: &str, err: HttpClientError) -> (String, 
 impl AppShell {
     /// Synchronizes `AppleAppSidebar`'s active highlight to match `self.active_panel`.
     pub fn sync_apple_sidebar_to_active_panel(&mut self, cx: &mut Context<Self>) {
-        let target = match self.active_panel {
+        let (target, highlight) = match self.active_panel {
+            ActiveWorkspacePanel::Chats => (AppleSidebarSection::Chats, true),
             ActiveWorkspacePanel::ContentHub(sec) => {
-                AppleSidebarSection::from_content_hub_section(sec)
+                (AppleSidebarSection::from_content_hub_section(sec), true)
             }
-            ActiveWorkspacePanel::Community => AppleSidebarSection::Community,
-            _ => AppleSidebarSection::Chats,
+            ActiveWorkspacePanel::Community => (AppleSidebarSection::Community, true),
+            _ => (AppleSidebarSection::Chats, false),
         };
+        let settings_active = self.active_panel == ActiveWorkspacePanel::Settings;
         self.apple_sidebar.update(cx, |sb, scx| {
-            if sb.active_section != target {
+            if sb.active_section != target
+                || sb.highlight_active_section != highlight
+                || sb.settings_active != settings_active
+            {
                 sb.set_active_section(target);
+                sb.set_highlight_active_section(highlight);
+                sb.set_settings_active(settings_active);
                 scx.notify();
             }
         });
@@ -802,6 +809,13 @@ impl AppShell {
                 cx.notify();
             }
             AppleSidebarEvent::ToggleCollapsed(_) => {
+                let sb_w = self.apple_sidebar.read(cx).effective_width();
+                if let Some(cw) = self.community_workspace.clone() {
+                    cw.update(cx, |w, wcx| {
+                        w.set_host_sidebar_width(sb_w);
+                        wcx.notify();
+                    });
+                }
                 cx.notify();
             }
             AppleSidebarEvent::OpenCreatorBot(kind_opt) => {
@@ -809,9 +823,25 @@ impl AppShell {
                     CreationKind::Book => "/newbook ",
                     CreationKind::Music => "/newmusic ",
                     CreationKind::Game => "/newgame ",
-                    CreationKind::App => "/mycreations",
+                    CreationKind::App => "/newapp ",
                 });
                 self.open_creator_studio_bot_chat(cmd, cx);
+            }
+            AppleSidebarEvent::OpenAccountMenu => {
+                self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                self.toggle_account_popover(cx);
+                if self.sidebar.read(cx).is_account_popover_open {
+                    self.blur_composer_and_cancel_ime(cx);
+                    self.blur_community_if_focused(cx);
+                }
+                cx.notify();
+            }
+            AppleSidebarEvent::OpenSettings => {
+                self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                self.handle_main_menu_command(
+                    crate::views::main_menu_drawer::MainMenuCommand::Settings,
+                    cx,
+                );
             }
         }
     }
@@ -1058,6 +1088,7 @@ impl AppShell {
             .top_0()
             .left_0()
             .size_full()
+            .p(px(16.0))
             .occlude()
             .bg(macos_modal_backdrop_rgba(pal))
             .flex()
@@ -1071,6 +1102,8 @@ impl AppShell {
                 macos_modal_card("publish-review-modal-box", pal)
                     .w(px(modal_w))
                     .h(px(modal_h))
+                    .max_w_full()
+                    .max_h_full()
                     .flex()
                     .flex_col()
                     .overflow_hidden()
@@ -1432,6 +1465,16 @@ impl AppShell {
                 if let Ok(dto) = res {
                     let is_owner =
                         Some(dto.owner_user_id) == shell.session_sync.user_id.map(|u| u as i64);
+                    let redirect_section = (dto.deleted_at_ms.is_none()
+                        && shell.active_panel
+                            == ActiveWorkspacePanel::ContentHub(ContentHubSection::MyCreations)
+                        && shell
+                            .content_hub
+                            .read(cx)
+                            .selected_creation_id
+                            .as_deref()
+                            == Some(dto.creation_id.as_str()))
+                    .then(|| ContentHubSection::from_creation_kind(dto.kind));
                     let modal_closed_by_delete = shell.content_hub.update(cx, |h, hcx| {
                         let was_modal_open = h.publish_modal.is_open;
                         if dto.deleted_at_ms.is_some() {
@@ -1473,9 +1516,17 @@ impl AppShell {
                                 h.selected_detail_creation = Some(dto);
                             }
                         }
+                        if let Some(target_sec) = redirect_section {
+                            h.active_section = target_sec;
+                            h.active_sub_tab = target_sec.default_sub_tab().to_string();
+                        }
                         hcx.notify();
                         was_modal_open && !h.publish_modal.is_open
                     });
+                    if let Some(target_sec) = redirect_section {
+                        shell.active_panel = ActiveWorkspacePanel::ContentHub(target_sec);
+                        shell.sync_apple_sidebar_to_active_panel(cx);
+                    }
                     if modal_closed_by_delete
                         && !shell.overlays.is_passcode_locked
                         && shell.overlays.computer_overlay.is_none()

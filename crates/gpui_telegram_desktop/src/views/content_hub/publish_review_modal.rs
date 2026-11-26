@@ -1199,11 +1199,13 @@ pub fn render_publish_review_modal_body(
         .overflow_hidden()
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(20.0))
                 .py(px(14.0))
                 .border_b_1()
                 .border_color(pal.separator_rgba())
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap(px(12.0))
@@ -1310,6 +1312,7 @@ fn render_creator_submit_tab(
     div()
         .id("publish-modal-submit-scroll")
         .flex_1()
+        .min_h(px(0.0))
         .w_full()
         .overflow_y_scroll()
         .p(px(20.0))
@@ -1327,17 +1330,22 @@ fn render_creator_submit_tab(
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.0))
                             .flex()
                             .items_center()
                             .gap(px(10.0))
                             .child(cover_artwork_box(&base.cover, 44.0, 44.0, 9.0, accent))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.0))
                                     .child(
                                         div()
+                                            .truncate()
                                             .text_size(px(13.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(pal.text_primary))
@@ -1406,8 +1414,10 @@ fn render_creator_submit_tab(
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
+                .gap(px(8.0))
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -1418,6 +1428,7 @@ fn render_creator_submit_tab(
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap(px(6.0))
                         .child(
@@ -1644,6 +1655,7 @@ fn render_reviewer_queue_tab(
     div()
         .id("publish-modal-reviewer-scroll")
         .flex_1()
+        .min_h(px(0.0))
         .w_full()
         .overflow_y_scroll()
         .p(px(20.0))
@@ -1728,16 +1740,21 @@ fn render_reviewer_queue_tab(
                         })
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(10.0))
                                 .child(cover_artwork_box(&item.cover, 40.0, 40.0, 8.0, accent))
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
                                         .flex()
                                         .flex_col()
                                         .child(
                                             div()
+                                                .truncate()
                                                 .text_size(px(14.0))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(pal.text_primary))
@@ -1745,6 +1762,7 @@ fn render_reviewer_queue_tab(
                                         )
                                         .child(
                                             div()
+                                                .truncate()
                                                 .text_size(px(11.0))
                                                 .text_color(rgb(pal.text_secondary))
                                                 .child(format!(

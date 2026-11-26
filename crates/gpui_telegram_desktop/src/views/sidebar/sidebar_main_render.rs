@@ -110,6 +110,7 @@ impl Render for ChatSidebar {
                 row_active_id,
                 self.hovered_rail_item,
                 self.hovered_rail_dialog_id,
+                self.has_leading_app_sidebar,
                 &palette,
                 &lang_id,
                 cx,
@@ -141,7 +142,7 @@ impl Render for ChatSidebar {
             cx,
             |this, action, cx| this.handle_unified_action(action, cx),
         );
-        let community_pill = (!is_search_focused).then(|| {
+        let community_pill = (!is_search_focused && !self.has_leading_app_sidebar).then(|| {
             render_expanded_community_entry_pill(
                 &nav_snapshot,
                 &palette,
@@ -152,6 +153,7 @@ impl Render for ChatSidebar {
         });
         let footer = render_expanded_gemini_footer(
             &nav_snapshot,
+            self.has_leading_app_sidebar,
             &palette,
             &lang_id,
             cx,

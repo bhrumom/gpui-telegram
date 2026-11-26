@@ -4,15 +4,13 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_proto::creations::{
-    BookPayload, CatalogSortMode, CreationKind, CreationPayload, CreationReviewStatus,
-    PublicCatalogItemDto, UpsertCreationStateRequest, UserCreationDto,
+    BookPayload, CatalogSortMode, CreationPayload, CreationReviewStatus, PublicCatalogItemDto,
+    UpsertCreationStateRequest, UserCreationDto,
 };
 
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::{
-    macos_primary_pill_btn, macos_secondary_pill_btn,
-};
+use crate::views::app_shell::modal_container::macos_secondary_pill_btn;
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_progress_bar, apple_shelf_header, cover_artwork_box,
     empty_state_card_shell, filter_pill, hero_banner, rating_pill, render_editable_field_box,
@@ -31,15 +29,13 @@ pub const BOOKS_SUB_TABS: &[(&str, &str, &str)] = &[
     ("reading_now", "正在阅读", "Reading Now"),
     ("library", "书库", "Library"),
     ("book_store", "书城", "Book Store"),
-    ("my_books", "我的图书", "My Books"),
 ];
 
 pub fn normalize_books_sub_tab(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "reading_now" | "reading" | "now" => "reading_now",
+        "reading_now" | "reading" | "now" | "my_books" | "my_creations" | "mine" => "reading_now",
         "library" | "saved" => "library",
         "book_store" | "store" | "discover" => "book_store",
-        "my_books" | "my_creations" | "mine" => "my_books",
         _ => "reading_now",
     }
 }
@@ -216,7 +212,6 @@ fn render_book_detail_card(
     let payload_for_read = payload.clone();
     let cid_for_lib = cid.clone();
     let cid_for_fav = cid.clone();
-    let detail_for_pub = detail.clone();
 
     div()
         .id("apple-books-detail-panel")
@@ -261,7 +256,8 @@ fn render_book_detail_card(
                 .child(
                     div()
                         .flex_1()
-                        .min_w(px(260.0))
+                        .min_w(px(240.0))
+                        .max_w_full()
                         .flex()
                         .flex_col()
                         .gap(px(8.0))
@@ -342,6 +338,7 @@ fn render_book_detail_card(
                             el.child(
                                 div()
                                     .w(px(240.0))
+                                    .max_w_full()
                                     .flex()
                                     .flex_col()
                                     .gap(px(4.0))
@@ -450,26 +447,7 @@ fn render_book_detail_card(
                                             });
                                         }),
                                     ),
-                                )
-                                .when(is_own, |el| {
-                                    el.child(
-                                        macos_secondary_pill_btn(
-                                            "books-detail-publish-btn",
-                                            tr_str(&lang, "推送审核上架", "Publish & Review"),
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |_this, _, _, cx| {
-                                                cx.emit(
-                                                    ContentHubEvent::OpenPublishModalForCreation(
-                                                        detail_for_pub.clone(),
-                                                    ),
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                }),
+                                ),
                         )
                         // Blurb
                         .child(
@@ -519,6 +497,7 @@ fn render_book_detail_card(
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(px(10.0))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -542,6 +521,9 @@ fn render_book_detail_card(
                             )
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(rgb(pal.text_primary))
@@ -549,6 +531,7 @@ fn render_book_detail_card(
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .text_size(px(11.0))
                                     .text_color(rgb(pal.text_secondary))
                                     .child(format!(
@@ -605,13 +588,6 @@ pub fn render_books_hub_view(
         })
         .collect();
 
-    let my_books: Vec<UserCreationDto> = ws
-        .my_creations
-        .iter()
-        .filter(|c| c.deleted_at_ms.is_none() && c.kind == CreationKind::Book)
-        .cloned()
-        .collect();
-
     let reading_now_items: Vec<(PublicCatalogItemDto, f32)> = filtered_books
         .iter()
         .filter_map(|item| {
@@ -655,6 +631,7 @@ pub fn render_books_hub_view(
         // Top Apple Books Header + Segmented Sub-Navigation + Search
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(24.0))
                 .py(px(14.0))
                 .border_b_1()
@@ -712,10 +689,11 @@ pub fn render_books_hub_view(
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    div().w(px(220.0)).child(
+                                    div().w(px(220.0)).max_w_full().child(
                                         render_editable_field_box(
                                             "content-hub-catalog-search-input",
                                             &search_field,
@@ -734,25 +712,10 @@ pub fn render_books_hub_view(
                                             }),
                                         ),
                                     ),
-                                )
-                                .child(
-                                    macos_primary_pill_btn(
-                                        "books-create-bot-btn",
-                                        tr_str(&lang, "+ Bot 写书", "+ Write Book"),
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_this, _, _, cx| {
-                                            cx.emit(ContentHubEvent::OpenCreatorBot(Some(
-                                                CreationKind::Book,
-                                            )));
-                                        }),
-                                    ),
                                 ),
                         ),
                 )
-                .when(selected_detail.is_none() && active_tab != "my_books", |el| {
+                .when(selected_detail.is_none(), |el| {
                     el.child(
                         div()
                             .flex()
@@ -804,6 +767,7 @@ pub fn render_books_hub_view(
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .children(sort_options.iter().map(|&(mode, id, zh, en)| {
@@ -853,152 +817,7 @@ pub fn render_books_hub_view(
                 .when_some(selected_detail.clone(), |el, detail| {
                     el.child(render_book_detail_card(ws, detail, cx))
                 })
-                .when(selected_detail.is_none() && active_tab == "my_books", |el| {
-                    el.child(apple_shelf_header(
-                        tr_str(&lang, "我的云端图书作品", "My Cloud Books"),
-                        Some(format!("{} {}", my_books.len(), tr_str(&lang, "本", "books"))),
-                        pal,
-                    ))
-                    .when(my_books.is_empty(), |inner| {
-                        let cta = macos_primary_pill_btn(
-                            "books-my-empty-cta",
-                            tr_str(&lang, "用 @CreatorStudioBot 创作第一本书", "Write Your First Book"),
-                            pal,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::OpenCreatorBot(Some(CreationKind::Book)));
-                            }),
-                        );
-                        inner.child(empty_state_card_shell(
-                            IconName::HubBooks,
-                            tr_str(&lang, "还没有云端图书作品", "No Cloud Books Yet"),
-                            tr_str(
-                                &lang,
-                                "在聊天中使用 @CreatorStudioBot 的 /newbook 命令创作图书，完成后可一键推送审核上架。",
-                                "Use @CreatorStudioBot /newbook to author books saved to your cloud library.",
-                            ),
-                            cta,
-                            pal,
-                        ))
-                    })
-                    .when(!my_books.is_empty(), |inner| {
-                        inner.child(div().flex().flex_col().gap(px(10.0)).children(
-                            my_books.iter().map(|book| {
-                                let b_read = book.clone();
-                                let b_pub = book.clone();
-                                let bp = extract_book_payload(book);
-                                apple_grouped_card(pal)
-                                    .p(px(14.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(14.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(12.0))
-                                            .child(cover_artwork_box(
-                                                &book.cover,
-                                                56.0,
-                                                84.0,
-                                                6.0,
-                                                BOOKS_ACCENT,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(4.0))
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(8.0))
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(15.0))
-                                                                    .font_weight(
-                                                                        FontWeight::SEMIBOLD,
-                                                                    )
-                                                                    .text_color(rgb(
-                                                                        pal.text_primary,
-                                                                    ))
-                                                                    .child(book.title.clone()),
-                                                            )
-                                                            .child(review_status_badge(
-                                                                book.review_status,
-                                                                &lang,
-                                                                pal,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(12.0))
-                                                            .text_color(rgb(pal.text_secondary))
-                                                            .child(book.summary.clone()),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(
-                                                macos_secondary_pill_btn(
-                                                    SharedString::from(format!(
-                                                        "my-book-read-{}",
-                                                        book.creation_id
-                                                    )),
-                                                    tr_str(&lang, "试读", "Read"),
-                                                    pal,
-                                                )
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        let saved = this
-                                                            .my_creation_states
-                                                            .get(&b_read.creation_id);
-                                                        this.book_reader =
-                                                            Some(BookReaderState::open(
-                                                                &b_read,
-                                                                bp.clone(),
-                                                                saved,
-                                                                this.palette,
-                                                            ));
-                                                        cx.notify();
-                                                    }),
-                                                ),
-                                            )
-                                            .child(
-                                                macos_primary_pill_btn(
-                                                    SharedString::from(format!(
-                                                        "my-book-publish-{}",
-                                                        book.creation_id
-                                                    )),
-                                                    tr_str(&lang, "推送审核", "Publish"),
-                                                    pal,
-                                                )
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_this, _, _, cx| {
-                                                        cx.emit(
-                                                            ContentHubEvent::OpenPublishModalForCreation(
-                                                                b_pub.clone(),
-                                                            ),
-                                                        );
-                                                    }),
-                                                ),
-                                            ),
-                                    )
-                            }),
-                        ))
-                    })
-                })
-                .when(selected_detail.is_none() && active_tab != "my_books", |el| {
+                .when(selected_detail.is_none(), |el| {
                     let display_list: Vec<(PublicCatalogItemDto, Option<f32>, bool)> =
                         match active_tab {
                             "library" => library_items
@@ -1070,15 +889,15 @@ pub fn render_books_hub_view(
                         pal,
                     ))
                     .when(display_list.is_empty(), |inner| {
-                        let cta = macos_primary_pill_btn(
-                            "books-empty-bot-cta",
-                            tr_str(&lang, "用 @CreatorStudioBot 创作图书", "Write with @CreatorStudioBot"),
+                        let cta = macos_secondary_pill_btn(
+                            "books-empty-refresh-btn",
+                            tr_str(&lang, "刷新书城", "Refresh Books"),
                             pal,
                         )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::OpenCreatorBot(Some(CreationKind::Book)));
+                                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Books));
                             }),
                         );
                         inner.child(empty_state_card_shell(
@@ -1090,8 +909,8 @@ pub fn render_books_hub_view(
                             },
                             tr_str(
                                 &lang,
-                                "在书城中将喜欢的作品加入书库，或使用 @CreatorStudioBot 创作并审核上架。",
-                                "Add books from the store or publish your own with @CreatorStudioBot.",
+                                "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布图书，审核上架后会显示在这里。",
+                                "Chat with @CreatorStudioBot directly in Messages to create and publish books. Published titles appear here.",
                             ),
                             cta,
                             pal,

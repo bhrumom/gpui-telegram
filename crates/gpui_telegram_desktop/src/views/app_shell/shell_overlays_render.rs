@@ -8,7 +8,6 @@ use gpui_telegram_proto::miniapp_contracts::{
     MiniAppControlMode, MiniAppTakeoverEvent, GROK_AVATAR_SHAPES,
 };
 
-use crate::app::session::send_as_peers::SendAsKey;
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, trigger_grok_avatar_bounce, trigger_grok_avatar_spin,
     GrokBotAvatarProps, GrokPersonaState, GROK_COLOR_PALETTE,
@@ -17,7 +16,7 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::app_shell::shell_actions::localize_call_state;
 use crate::views::app_shell::shell_panels::{render_empty_panel_notice, render_panel_header};
 use crate::views::app_shell::shell_truth::{
-    derive_initials, format_authoritative_timestamp, peer_subtitle_for_dialog, ClientCallFence,
+    derive_initials, format_authoritative_timestamp, peer_subtitle_for_dialog,
 };
 use crate::views::app_shell::modal_container::{
     macos_modal_backdrop_rgba, macos_modal_card, macos_popover_surface, macos_primary_pill_btn,
@@ -122,11 +121,14 @@ impl AppShell {
         let w = pal.scaled_px(width_px).min(1080.0);
         let h = pal.scaled_px(height_px).min(820.0);
         modal_backdrop_shell(backdrop_id, macos_modal_backdrop_rgba(pal))
+            .p(px(16.0))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_workspace_modal_to_chats(cx)))
             .child(
                 macos_modal_card(box_id, pal)
                     .w(px(w))
                     .h(px(h))
+                    .max_w_full()
+                    .max_h_full()
                     .flex()
                     .flex_col()
                     .overflow_hidden()
@@ -1842,6 +1844,7 @@ impl AppShell {
                     .left(px(pal.scaled_px(10.0)))
                     .bottom(if is_collapsed { px(pal.scaled_px(52.0)) } else { px(pal.scaled_px(58.0)) })
                     .w(px(pal.scaled_px(240.0)))
+                    .max_h(px(520.0))
                     .p(px(pal.scaled_px(6.0)))
                     .flex()
                     .flex_col()
@@ -1850,11 +1853,7 @@ impl AppShell {
                     .child(menu_row("account-popover-profile", IconName::ContactsUsers, tr_str(lang, "个人资料", "Profile"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::MyProfile, cx)))
                     .child(menu_row("account-popover-saved", IconName::SavedMessages, tr_str(lang, "收藏夹", "Saved"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::SavedMessages, cx)))
                     .child(menu_row("account-popover-connectors", IconName::TerminalMcp, tr_str(lang, "连接器", "Connectors"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::McpTools, cx)))
-                    .child(menu_row("account-popover-fabushi", IconName::BotRobot, tr_str(lang, "新建智能体 · Fabushi Bot", "New Fabushi Bot"), pal.accent, false, |this, cx| this.open_fabushi_creator_modal(cx)))
-                    .child(menu_row("account-popover-botfather", IconName::BotRobot, tr_str(lang, "BotFather · 创建机器人/小程序", "BotFather · Create Bot/App"), pal.accent, false, |this, cx| this.open_botfather_chat(cx)))
-                    .child(menu_row("account-popover-miniapps", IconName::FolderBots, tr_str(lang, "小程序中心", "Mini Apps Center"), pal.text_primary, false, |this, cx| this.open_miniapps_center(cx)))
                     .child(menu_row("account-popover-browser", IconName::ScreenShare, tr_str(lang, "内置浏览器 · 自动化应用", "Built-in Browser & Apps"), pal.accent, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Browser, cx)))
-                    .child(menu_row("account-popover-community", IconName::CommunityGlobe, tr_str(lang, "社区 · Reddit × X", "Community · Reddit × X"), pal.accent, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Community, cx)))
                     .child(menu_row("account-popover-settings", IconName::SettingsGear, tr_str(lang, "设置", "Settings"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Settings, cx)))
                     .when(has_passcode, |col| {
                         col.child(menu_row(
@@ -1876,6 +1875,14 @@ impl AppShell {
                         pal.text_primary,
                         false,
                         |this, cx| this.handle_main_menu_command(MainMenuCommand::ToggleNightMode, cx),
+                    ))
+                    .child(menu_row(
+                        "account-popover-language",
+                        IconName::CommunityGlobe,
+                        tr_str(lang, "切换语言 (EN)", "Switch Language (中文)"),
+                        pal.text_primary,
+                        false,
+                        |this, cx| this.toggle_language(cx),
                     ))
                     .child(menu_row("account-popover-logout", IconName::BackArrow, tr_str(lang, "退出登录", "Log Out"), pal.danger, true, |this, cx| this.handle_main_menu_command(MainMenuCommand::Logout, cx))),
             )

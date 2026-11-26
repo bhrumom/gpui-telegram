@@ -11,9 +11,7 @@ use gpui_telegram_proto::creations::{
 
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::{
-    macos_primary_pill_btn, macos_secondary_pill_btn,
-};
+use crate::views::app_shell::modal_container::macos_secondary_pill_btn;
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_shelf_header, cover_artwork_box, creation_kind_accent,
     creation_kind_label, empty_state_card_shell, filter_pill, parse_hex_color, rating_pill,
@@ -122,7 +120,8 @@ fn render_today_editorial_card(
         .id(SharedString::from(format!("appstore-today-hero-{cid}")))
         .cursor_pointer()
         .flex_1()
-        .min_w(px(300.0))
+        .min_w(px(280.0))
+        .max_w_full()
         .rounded(px(16.0))
         .overflow_hidden()
         .bg(linear_gradient(
@@ -195,12 +194,16 @@ fn render_today_editorial_card(
                 .gap(px(10.0))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
                         .gap(px(10.0))
                         .child(cover_artwork_box(&item.cover, 40.0, 40.0, 10.0, accent))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
                                 .flex()
                                 .flex_col()
                                 .child(
@@ -208,6 +211,7 @@ fn render_today_editorial_card(
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(0xFFFFFF))
+                                        .truncate()
                                         .child(item.title.clone()),
                                 )
                                 .child(
@@ -216,6 +220,7 @@ fn render_today_editorial_card(
                                         .text_color(TdesktopThemePalette::rgba_with_alpha(
                                             0xFFFFFF, 0.78,
                                         ))
+                                        .truncate()
                                         .child(format!(
                                             "{} · {}",
                                             creation_kind_label(item.kind, lang),
@@ -228,6 +233,7 @@ fn render_today_editorial_card(
                     div()
                         .id(SharedString::from(format!("appstore-today-cta-{cid_cta}")))
                         .cursor_pointer()
+                        .flex_shrink_0()
                         .px(px(14.0))
                         .py(px(5.0))
                         .rounded(px(999.0))
@@ -288,6 +294,7 @@ fn render_app_store_row_card(
         .id(SharedString::from(format!("appstore-row-{cid}")))
         .cursor_pointer()
         .w(px(292.0))
+        .max_w_full()
         .p(px(10.0))
         .rounded(px(12.0))
         .bg(pal.card_surface_rgba())
@@ -415,7 +422,6 @@ fn render_app_detail_card(
         .and_then(|ap| ap.linked_miniapp.clone());
 
     let cid_install = cid.clone();
-    let detail_pub = detail.clone();
     let linked_for_btn = linked_miniapp.clone();
 
     div()
@@ -471,7 +477,8 @@ fn render_app_detail_card(
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(220.0))
+                                .min_w(px(200.0))
+                                .max_w_full()
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.0))
@@ -565,26 +572,7 @@ fn render_app_detail_card(
                                                     tr_str(&lang, "获取", "Get").to_string()
                                                 })
                                         }),
-                                )
-                                .when(is_own, |el| {
-                                    el.child(
-                                        macos_secondary_pill_btn(
-                                            "appstore-detail-publish-btn",
-                                            tr_str(&lang, "推送审核上架", "Publish & Review"),
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |_this, _, _, cx| {
-                                                cx.emit(
-                                                    ContentHubEvent::OpenPublishModalForCreation(
-                                                        detail_pub.clone(),
-                                                    ),
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                }),
+                                ),
                         ),
                 )
                 // Horizontal App Store metadata bar
@@ -850,6 +838,7 @@ pub fn render_app_store_hub_view(
         // Top Header + 7 App Store tabs + Search
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(24.0))
                 .py(px(14.0))
                 .border_b_1()
@@ -907,10 +896,11 @@ pub fn render_app_store_hub_view(
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    div().w(px(220.0)).child(
+                                    div().w(px(220.0)).max_w_full().child(
                                         render_editable_field_box(
                                             "content-hub-catalog-search-input",
                                             &search_field,
@@ -951,12 +941,14 @@ pub fn render_app_store_hub_view(
                     el.child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
                             .gap(px(8.0))
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .children(sort_options.iter().map(|&(mode, id, zh, en)| {
@@ -972,19 +964,6 @@ pub fn render_app_store_hub_view(
                                                 }),
                                             )
                                     })),
-                            )
-                            .child(
-                                macos_primary_pill_btn(
-                                    "appstore-open-studio-bot-btn",
-                                    tr_str(&lang, "打开 @CreatorStudioBot", "Open @CreatorStudioBot"),
-                                    pal,
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_this, _, _, cx| {
-                                        cx.emit(ContentHubEvent::OpenCreatorBot(None));
-                                    }),
-                                ),
                             ),
                     )
                 }),
@@ -1040,7 +1019,6 @@ pub fn render_app_store_hub_view(
                                 ("图书 · Books", "Books", ContentHubSection::Books, 0xFF9500),
                                 ("音乐 · Music", "Music", ContentHubSection::Music, 0xFA2D48),
                                 ("游戏 · Games", "Games", ContentHubSection::Games, 0x5856D6),
-                                ("我的创作 · Cloud Studio", "My Creations", ContentHubSection::MyCreations, 0x30D158),
                             ];
                             inner.child(div().flex().flex_wrap().gap(px(12.0)).children(
                                 cats.iter().map(|&(zh, en, sec, accent)| {
@@ -1048,6 +1026,7 @@ pub fn render_app_store_hub_view(
                                         .id(SharedString::from(format!("appstore-cat-{sec:?}")))
                                         .cursor_pointer()
                                         .w(px(210.0))
+                                        .max_w_full()
                                         .p(px(16.0))
                                         .rounded(px(14.0))
                                         .bg(TdesktopThemePalette::rgba_with_alpha(accent, 0.16))
@@ -1090,6 +1069,7 @@ pub fn render_app_store_hub_view(
                                                 .then(|| app.web_url.clone());
                                             apple_grouped_card(pal)
                                                 .w(px(292.0))
+                                                .max_w_full()
                                                 .p(px(12.0))
                                                 .flex()
                                                 .items_center()
@@ -1129,6 +1109,7 @@ pub fn render_app_store_hub_view(
                                                             app.bot_username, app.short_name
                                                         )))
                                                         .cursor_pointer()
+                                                        .flex_shrink_0()
                                                         .px(px(12.0))
                                                         .py(px(5.0))
                                                         .rounded(px(999.0))
@@ -1213,15 +1194,17 @@ pub fn render_app_store_hub_view(
                         )
                         // Empty state when truly empty
                         .when(tab_items.is_empty() && filtered_miniapps.is_empty(), |inner| {
-                            let cta = macos_primary_pill_btn(
-                                "appstore-empty-cta",
-                                tr_str(&lang, "用 @CreatorStudioBot 创作并上架", "Create with @CreatorStudioBot"),
+                            let cta = macos_secondary_pill_btn(
+                                "appstore-empty-refresh-btn",
+                                tr_str(&lang, "刷新 App Store", "Refresh App Store"),
                                 pal,
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|_this, _, _, cx| {
-                                    cx.emit(ContentHubEvent::OpenCreatorBot(None));
+                                    cx.emit(ContentHubEvent::RefreshCatalog(
+                                        ContentHubSection::AppStore,
+                                    ));
                                 }),
                             );
                             inner.child(empty_state_card_shell(
@@ -1233,8 +1216,8 @@ pub fn render_app_store_hub_view(
                                 },
                                 tr_str(
                                     &lang,
-                                    "公开发布的应用、Mini Apps 以及精选图书/音乐/游戏将汇聚在这里。",
-                                    "Published apps, Mini Apps, and featured creations appear here automatically.",
+                                    "在「消息」中直接与 @CreatorStudioBot 或 @BotFather 对话即可创作并上架应用、Mini Apps 与作品。",
+                                    "Chat with @CreatorStudioBot or @BotFather directly in Messages to create and publish apps and Mini Apps.",
                                 ),
                                 cta,
                                 pal,

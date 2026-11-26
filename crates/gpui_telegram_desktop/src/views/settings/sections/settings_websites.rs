@@ -58,6 +58,7 @@ impl SettingsWebsitesSections {
     }
 
     pub fn sync_from_domains(&mut self, domains: &[String]) {
+        let client_os = format!("GPUI Desktop / {}", std::env::consts::OS);
         self.websites = domains
             .iter()
             .enumerate()
@@ -65,9 +66,9 @@ impl SettingsWebsitesSections {
                 id: 501 + idx as u64,
                 domain: domain.clone(),
                 bot_name: "Telegram Login".into(),
-                browser: "GPUI Desktop / macOS".into(),
-                ip: "127.0.0.1".into(),
-                location: "Local".into(),
+                browser: client_os.clone(),
+                ip: "-".into(),
+                location: "-".into(),
             })
             .collect();
     }
@@ -127,9 +128,9 @@ impl SettingsWebsitesSections {
             id: next_id,
             domain: trimmed.to_string(),
             bot_name: "Telegram Login".into(),
-            browser: "GPUI Desktop / macOS".into(),
-            ip: "127.0.0.1".into(),
-            location: "Local".into(),
+            browser: format!("GPUI Desktop / {}", std::env::consts::OS),
+            ip: "-".into(),
+            location: "-".into(),
         });
         self.pending_sync = true;
         self.status_message = Some(if self.language_id.starts_with("zh") {

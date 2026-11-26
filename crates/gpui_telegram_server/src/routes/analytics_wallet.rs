@@ -184,6 +184,7 @@ pub async fn search_unified(
             if let Ok(bots) = state.db.list_all_bots() {
                 for bot in bots {
                     let is_botfather = bot.bot_user_id == crate::db::miniapp_store::BOTFATHER_USER_ID as i64;
+                    let is_creator_studio = bot.bot_user_id == gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID;
                     let q_ok = q_lower.is_empty()
                         || bot.username.to_lowercase().contains(q_clean)
                         || bot.display_name.to_lowercase().contains(&q_lower)
@@ -191,7 +192,12 @@ pub async fn search_unified(
                         || (is_botfather
                             && ("机器人之父".contains(&q_lower)
                                 || q_lower.contains("机器人")
-                                || q_lower.contains("botfather")));
+                                || q_lower.contains("botfather")))
+                        || (is_creator_studio
+                            && ("创作助手发布图书音乐游戏应用".contains(&q_lower)
+                                || q_lower.contains("创作")
+                                || q_lower.contains("发布")
+                                || q_lower.contains("creator")));
                     if q_ok {
                         global_bots.push(
                             crate::routes::bots_miniapps::bot_record_to_entry_for_viewer(

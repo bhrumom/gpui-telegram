@@ -375,7 +375,7 @@ pub fn default_pomodoro_ui_schema() -> Value {
                 id: "task".to_string(),
                 kind: MiniAppWidgetType::TextInput,
                 label: "当前专注目标".to_string(),
-                value: "完成 GPUI Telegram 核心开发".to_string(),
+                value: String::new(),
                 placeholder: Some("输入你要专注完成的任务...".to_string()),
                 ..Default::default()
             },
@@ -395,8 +395,8 @@ pub fn default_pomodoro_ui_schema() -> Value {
                 id: "completed_sessions".to_string(),
                 kind: MiniAppWidgetType::Counter,
                 label: "今日完成番茄".to_string(),
-                value: "3 个".to_string(),
-                count: 3,
+                value: "0 个".to_string(),
+                count: 0,
                 min: Some(0),
                 max: Some(48),
                 ..Default::default()
@@ -405,16 +405,16 @@ pub fn default_pomodoro_ui_schema() -> Value {
                 id: "focus_minutes".to_string(),
                 kind: MiniAppWidgetType::MetricCard,
                 label: "累计专注时长".to_string(),
-                value: "75 分钟".to_string(),
+                value: "0 分钟".to_string(),
                 subtitle: Some("状态: ready".to_string()),
-                count: 75,
+                count: 0,
                 ..Default::default()
             },
             MiniAppUiWidget {
                 id: "ai_summary".to_string(),
                 kind: MiniAppWidgetType::Text,
                 label: "AI 专注教练".to_string(),
-                value: "当前节奏很稳，建议开启 25 分钟免打扰深度冲刺。".to_string(),
+                value: "输入任务后即可开始专注计时。".to_string(),
                 variant: Some("callout".to_string()),
                 ..Default::default()
             },
@@ -460,7 +460,7 @@ pub fn default_splitbill_ui_schema() -> Value {
                 id: "item_name".to_string(),
                 kind: MiniAppWidgetType::TextInput,
                 label: "消费项目".to_string(),
-                value: "团队咖啡与午餐".to_string(),
+                value: String::new(),
                 placeholder: Some("例如：周末火锅、咖啡拼单...".to_string()),
                 ..Default::default()
             },
@@ -468,16 +468,16 @@ pub fn default_splitbill_ui_schema() -> Value {
                 id: "amount".to_string(),
                 kind: MiniAppWidgetType::TextInput,
                 label: "总金额 (CNY)".to_string(),
-                value: "180".to_string(),
-                placeholder: Some("180".to_string()),
+                value: String::new(),
+                placeholder: Some("输入金额".to_string()),
                 ..Default::default()
             },
             MiniAppUiWidget {
                 id: "split_count".to_string(),
                 kind: MiniAppWidgetType::Counter,
                 label: "分摊人数".to_string(),
-                value: "3 人".to_string(),
-                count: 3,
+                value: "1 人".to_string(),
+                count: 1,
                 min: Some(1),
                 max: Some(50),
                 ..Default::default()
@@ -486,15 +486,15 @@ pub fn default_splitbill_ui_schema() -> Value {
                 id: "per_person".to_string(),
                 kind: MiniAppWidgetType::MetricCard,
                 label: "每人应付 (AA)".to_string(),
-                value: "¥60.00".to_string(),
-                subtitle: Some("累计 1 笔消费".to_string()),
+                value: "¥0.00".to_string(),
+                subtitle: Some("累计 0 笔消费".to_string()),
                 ..Default::default()
             },
             MiniAppUiWidget {
                 id: "ai_summary".to_string(),
                 kind: MiniAppWidgetType::Text,
                 label: "分账实时账本".to_string(),
-                value: "共计 1 笔消费 ¥180.00，每人应付 ¥60.00。".to_string(),
+                value: "暂无消费记录，记入一笔后将自动计算 AA。".to_string(),
                 variant: Some("callout".to_string()),
                 ..Default::default()
             },
@@ -521,7 +521,7 @@ pub fn default_splitbill_ui_schema() -> Value {
         settings_button_visible: false,
         copilot_suggestions: vec![
             "汇总所有 AA 账单并发到群里".to_string(),
-            "按 4 人重新均摊计算".to_string(),
+            "按人数重新均摊计算".to_string(),
         ],
     };
     serde_json::to_value(schema).unwrap_or_else(|_| json!({}))
@@ -540,7 +540,7 @@ pub fn default_pollmaster_ui_schema() -> Value {
                 id: "topic".to_string(),
                 kind: MiniAppWidgetType::TextInput,
                 label: "投票议题".to_string(),
-                value: "本周版本发布窗口选择".to_string(),
+                value: String::new(),
                 placeholder: Some("输入决策议题...".to_string()),
                 ..Default::default()
             },
@@ -548,11 +548,11 @@ pub fn default_pollmaster_ui_schema() -> Value {
                 id: "selected_option".to_string(),
                 kind: MiniAppWidgetType::Select,
                 label: "投票选项".to_string(),
-                value: "方案 A: 周五晚发布".to_string(),
+                value: "选项 A".to_string(),
                 options: vec![
-                    "方案 A: 周五晚发布".to_string(),
-                    "方案 B: 周六上午灰度".to_string(),
-                    "方案 C: 下周一全量".to_string(),
+                    "选项 A".to_string(),
+                    "选项 B".to_string(),
+                    "选项 C".to_string(),
                 ],
                 ..Default::default()
             },
@@ -560,16 +560,16 @@ pub fn default_pollmaster_ui_schema() -> Value {
                 id: "total_votes".to_string(),
                 kind: MiniAppWidgetType::MetricCard,
                 label: "累计投票".to_string(),
-                value: "7 票".to_string(),
-                subtitle: Some("方案 A 领先".to_string()),
-                count: 7,
+                value: "0 票".to_string(),
+                subtitle: Some("等待投票".to_string()),
+                count: 0,
                 ..Default::default()
             },
             MiniAppUiWidget {
                 id: "ai_summary".to_string(),
                 kind: MiniAppWidgetType::Text,
                 label: "实时票数与 AI 结论".to_string(),
-                value: "当前「方案 A: 周五晚发布」领先（4/7 票，占比 57%）。".to_string(),
+                value: "暂无投票记录。".to_string(),
                 variant: Some("callout".to_string()),
                 ..Default::default()
             },
@@ -1154,7 +1154,7 @@ impl ServerDatabase {
         self.pool.with_reader(|conn| {
             let mut stmt = conn
                 .prepare(&format!(
-                    "SELECT {BOT_COLS} FROM bots_registry ORDER BY is_official DESC, created_at ASC"
+                    "SELECT {BOT_COLS} FROM bots_registry WHERE bot_user_id NOT IN (777010, 777011, 777012) ORDER BY is_official DESC, created_at ASC"
                 ))
                 .map_db()?;
             let rows = stmt

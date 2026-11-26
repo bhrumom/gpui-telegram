@@ -421,9 +421,13 @@ pub async fn generate_bot_reply_text(
             .then_with(|| a.comment_id.cmp(&b.comment_id))
     });
 
-    let draft = candidate.or_else(|| {
-        DeterministicBotResponder::generate_reply(bot, post, &flat_comments, trigger_text)
-    })?;
+    let draft = match candidate {
+        Some(text) => text,
+        None if state.config.is_in_memory() || state.config.allow_deterministic_bot_fallback => {
+            DeterministicBotResponder::generate_reply(bot, post, &flat_comments, trigger_text)?
+        }
+        None => return None,
+    };
 
     let recent_msgs: Vec<String> = flat_comments
         .iter()

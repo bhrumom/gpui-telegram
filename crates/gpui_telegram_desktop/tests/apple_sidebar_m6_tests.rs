@@ -769,13 +769,16 @@ fn test_m6_game_runtime_sheet_launches_all_7_specs_and_scores() {
 
 #[test]
 fn test_m6_sub_tab_normalization_and_canonical_counts() {
-    assert_eq!(BOOKS_SUB_TABS.len(), 4);
-    assert_eq!(MUSIC_SUB_TABS.len(), 5);
-    assert_eq!(GAMES_SUB_TABS.len(), 5);
+    assert_eq!(BOOKS_SUB_TABS.len(), 3);
+    assert_eq!(MUSIC_SUB_TABS.len(), 4);
+    assert_eq!(GAMES_SUB_TABS.len(), 4);
     assert_eq!(APPSTORE_SUB_TABS.len(), 7);
     assert_eq!(normalize_books_sub_tab("store"), "book_store");
+    assert_eq!(normalize_books_sub_tab("my_books"), "reading_now");
     assert_eq!(normalize_music_sub_tab("listen_now"), "home");
+    assert_eq!(normalize_music_sub_tab("my_music"), "home");
     assert_eq!(normalize_games_sub_tab("top"), "charts");
+    assert_eq!(normalize_games_sub_tab("my_games"), "discover");
     assert_eq!(normalize_appstore_sub_tab("discover"), "today");
 }
 
@@ -1044,7 +1047,54 @@ fn body_radio_and_all_four_verticals_state_flow(cx: &mut App) {
         assert!(h.music_engine.queue().is_empty());
         assert!(h.book_reader.is_none());
         assert!(h.active_game.is_none());
+
+        // Switching to Community syncs AppleAppSidebar effective_width (never stacking ChatSidebar width)
+        s.open_community_workspace(cx);
+        assert_eq!(s.active_panel, ActiveWorkspacePanel::Community);
+        let expected_w = s.apple_sidebar.read(cx).effective_width();
+        let cw = s.community_workspace().cloned().expect("mounted community workspace");
+        assert!(
+            (cw.read(cx).host_sidebar_width_px - expected_w).abs() < 0.5,
+            "CommunityWorkspace host_sidebar_width_px must match AppleAppSidebar effective_width ({expected_w})"
+        );
     });
+}
+
+#[test]
+fn test_v1617_zero_fake_live_views_and_sidebar_layout_invariants() {
+    use gpui_telegram_desktop::views::call_overlay::CallOverlay;
+    use gpui_telegram_desktop::views::computer_workbench::ComputerWorkbench;
+    use gpui_telegram_desktop::views::global_tasks_workspace::GlobalTasksWorkspace;
+    use gpui_telegram_desktop::views::settings::sections::settings_calls::SettingsCallsSections;
+
+    let palette = TdesktopThemePalette::build(TdesktopThemeMode::Night, 0x007AFF, 14, 16);
+
+    // 1. CallOverlay::new_live has zero fake outputs or synthetic E2EE emojis
+    let call = CallOverlay::new_live("Peer".into(), None, None, palette, "zh-CN");
+    assert!(call.available_outputs.is_empty(), "CallOverlay::new_live must not seed fake audio outputs");
+    assert!(call.e2ee_emojis.is_empty(), "CallOverlay::new_live must not seed fake E2EE emojis");
+
+    // 2. SettingsCallsSections::new_live has zero hardcoded FaceTime/Built-in devices
+    let calls_cfg = SettingsCallsSections::new_live(palette, "zh-CN");
+    assert!(calls_cfg.available_inputs.is_empty());
+    assert!(calls_cfg.available_outputs.is_empty());
+    assert!(calls_cfg.available_cameras.is_empty());
+    assert!(calls_cfg.input_device.is_empty());
+    assert!(calls_cfg.output_device.is_empty());
+    assert!(calls_cfg.camera_device.is_empty());
+
+    // 3. ComputerWorkbench::new_live has zero fake displays or synthetic connection state
+    let wb = ComputerWorkbench::new_live(String::new(), palette, "zh-CN");
+    assert!(wb.displays.is_empty(), "ComputerWorkbench::new_live must not seed fake displays");
+    assert!(!wb.is_connected);
+    assert!(wb.device.ip_address.is_empty());
+
+    // 4. GlobalTasksWorkspace::new_live has zero fake healthy/toolset counts
+    let gt = GlobalTasksWorkspace::new_live(palette, "zh-CN");
+    assert!(!gt.status_summary.healthy);
+    assert_eq!(gt.status_summary.toolsets_count, 0);
+    assert_eq!(gt.status_summary.tools_count, 0);
+    assert!(gt.toolsets.is_empty());
 }
 
 #[test]
@@ -1061,3 +1111,4 @@ fn test_m6_gpui_keyboard_escape_review_ime_and_eviction() {
 fn test_m6_gpui_radio_and_all_four_verticals_state_flow() {
     run_in_headless_subprocess("test_m6_gpui_radio_and_all_four_verticals_state_flow");
 }
+

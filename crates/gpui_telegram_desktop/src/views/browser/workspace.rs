@@ -3448,13 +3448,15 @@ impl Render for BrowserWorkspace {
             .flex()
             .flex_col()
             .flex_1()
-            .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
+            .h_full()
+            .overflow_hidden()
             .bg(rgb(pal.window_bg))
             // Top Toolbar
             .child(
                 div()
+                    .flex_shrink_0()
                     .w_full()
                     .px(px(12.0))
                     .py(px(8.0))
@@ -3462,6 +3464,7 @@ impl Render for BrowserWorkspace {
                     .border_b_1()
                     .border_color(pal.separator_rgba())
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.0))
                     .child(

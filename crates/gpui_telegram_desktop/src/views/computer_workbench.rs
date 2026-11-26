@@ -407,6 +407,7 @@ impl ComputerWorkbench {
         s.device.resolution = String::new();
         s.device.latency_ms = 0;
         s.device.fps = 0;
+        s.displays.clear();
         s.is_connected = false;
         s.palette = palette;
         s.language_id = language_id.to_string();

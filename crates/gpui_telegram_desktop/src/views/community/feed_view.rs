@@ -514,9 +514,9 @@ fn render_inline_quick_post(
             a.avatar_color,
         ),
         None => (
-            "u:local".to_string(),
-            "Citizen".to_string(),
-            "citizen".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
             ActorKind::Human,
             None,
             "classic".to_string(),
@@ -524,7 +524,9 @@ fn render_inline_quick_post(
         ),
     };
 
-    let act_as_label = if lang.starts_with("zh") {
+    let act_as_label = if handle.is_empty() {
+        tr_str(lang, "选择发言身份", "Select identity").to_string()
+    } else if lang.starts_with("zh") {
         format!("以 @{handle} 发言")
     } else {
         format!("Posting as @{handle}")
@@ -715,11 +717,14 @@ fn render_inline_quick_post(
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap(px(8.0))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .text_size(px(11.5))
                         .text_color(rgb(if val_err.is_some() {
                             pal.danger
@@ -733,6 +738,7 @@ fn render_inline_quick_post(
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap(px(6.0))
@@ -740,6 +746,7 @@ fn render_inline_quick_post(
                             div()
                                 .id("quick-post-full-composer-btn")
                                 .cursor_pointer()
+                                .flex_shrink_0()
                                 .px(px(10.0))
                                 .py(px(6.0))
                                 .rounded_full()
@@ -765,6 +772,7 @@ fn render_inline_quick_post(
                             div()
                                 .id("quick-post-submit-btn")
                                 .cursor_pointer()
+                                .flex_shrink_0()
                                 .px(px(14.0))
                                 .py(px(6.0))
                                 .rounded_full()
@@ -803,7 +811,9 @@ pub fn render_quick_post_community_picker_popover(
 
     macos_popover_surface("quick-post-comm-popover", pal)
         .w(px(260.0))
+        .max_w_full()
         .max_h(px(320.0))
+        .overflow_y_scroll()
         .p(px(8.0))
         .flex()
         .flex_col()
@@ -988,6 +998,9 @@ pub fn render_algo_tuner_popover(
 
     macos_popover_surface("community-algo-tuner-popover", pal)
         .w(px(pal.scaled_px(350.0)))
+        .max_w_full()
+        .max_h(px(540.0))
+        .overflow_y_scroll()
         .p(px(14.0))
         .flex()
         .flex_col()

@@ -790,6 +790,7 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
 /// left and minimal workspace action icons (Tasks, Remote, Contacts, Calls, Settings) on the right.
 pub fn render_expanded_gemini_footer<V: 'static>(
     nav: &UnifiedNavSnapshot,
+    has_leading_app_sidebar: bool,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
@@ -990,13 +991,15 @@ pub fn render_expanded_gemini_footer<V: 'static>(
                     0,
                     UnifiedSidebarAction::SelectDestination(browser_target),
                 ))
-                .child(render_dock_icon_btn(
-                    "top-action-community",
-                    IconName::CommunityGlobe,
-                    nav.active_destination == NavDestination::Community,
-                    nav.community_unread,
-                    UnifiedSidebarAction::SelectDestination(community_target),
-                ))
+                .when(!has_leading_app_sidebar, |dock| {
+                    dock.child(render_dock_icon_btn(
+                        "top-action-community",
+                        IconName::CommunityGlobe,
+                        nav.active_destination == NavDestination::Community,
+                        nav.community_unread,
+                        UnifiedSidebarAction::SelectDestination(community_target),
+                    ))
+                })
                 .child(render_dock_icon_btn(
                     "top-action-contacts",
                     IconName::ContactsUsers,

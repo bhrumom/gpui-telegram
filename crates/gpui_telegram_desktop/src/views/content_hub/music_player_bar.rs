@@ -336,6 +336,7 @@ pub fn render_music_player_bar(
                         div()
                             .id("music-player-aux-scroll")
                             .flex_1()
+                            .min_h(px(0.0))
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
@@ -497,9 +498,11 @@ pub fn render_music_player_bar(
         .child(
             div()
                 .id("apple-music-player-bar")
+                .flex_shrink_0()
                 .w_full()
                 .h(px(70.0))
                 .px(px(18.0))
+                .overflow_hidden()
                 .bg(pal.card_surface_rgba())
                 .border_t_1()
                 .border_color(pal.separator_rgba())
@@ -511,7 +514,7 @@ pub fn render_music_player_bar(
                 .child(
                     div()
                         .w(px(230.0))
-                        .min_w(px(160.0))
+                        .min_w(px(120.0))
                         .flex()
                         .items_center()
                         .gap(px(10.0))
@@ -594,6 +597,7 @@ pub fn render_music_player_bar(
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.0))
                         .max_w(px(480.0))
                         .flex()
                         .flex_col()

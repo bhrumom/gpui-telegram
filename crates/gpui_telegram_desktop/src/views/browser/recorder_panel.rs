@@ -107,11 +107,7 @@ impl Default for RecorderPanelState {
     fn default() -> Self {
         Self {
             profile_draft: "default".to_string(),
-            available_profiles: vec![
-                "default".to_string(),
-                "x-social".to_string(),
-                "work".to_string(),
-            ],
+            available_profiles: vec!["default".to_string()],
             cookie_import_draft: String::new(),
             cookie_status_message: None,
             cookie_error_message: None,
@@ -126,11 +122,10 @@ impl Default for RecorderPanelState {
             recorded_dom_count: 0,
             event_logs: Vec::new(),
             next_log_seq: 1,
-            distill_name_draft: "Recorded Browser Flow".to_string(),
-            distill_version_draft: "1.0.0".to_string(),
-            distill_category_draft: "general".to_string(),
-            distill_description_draft: "Reusable browser automation distilled from session trace"
-                .to_string(),
+            distill_name_draft: String::new(),
+            distill_version_draft: String::new(),
+            distill_category_draft: String::new(),
+            distill_description_draft: String::new(),
             distill_error: None,
             local_scripts: Vec::new(),
             selected_script_id: None,

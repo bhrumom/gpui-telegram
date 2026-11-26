@@ -551,6 +551,7 @@ pub fn render_book_reader(
         // Top Apple Books reader toolbar
         .child(
             div()
+                .flex_shrink_0()
                 .w_full()
                 .h(px(50.0))
                 .px(px(18.0))
@@ -956,6 +957,7 @@ pub fn render_book_reader(
                                 div()
                                     .id("book-reader-toc-scroll")
                                     .flex_1()
+                                    .min_h(px(0.0))
                                     .overflow_y_scroll()
                                     .p(px(10.0))
                                     .flex()
@@ -1162,6 +1164,7 @@ pub fn render_book_reader(
         // Bottom reading progress & page turn footer
         .child(
             div()
+                .flex_shrink_0()
                 .w_full()
                 .h(px(52.0))
                 .px(px(20.0))
@@ -1195,6 +1198,7 @@ pub fn render_book_reader(
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.0))
                         .max_w(px(420.0))
                         .flex()
                         .flex_col()

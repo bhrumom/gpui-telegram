@@ -469,7 +469,7 @@ impl CommunityWorkspace {
         let Some(bot) = selected_bot else {
             self.emit_action(
                 CommunityWorkspaceAction::ShowToast {
-                    text: tr_str(&lang, "暂无可用的 Bot 协作者，请先在 Bot 工作室创建", "No Bot co-author available yet. Create one in Bot Studio.")
+                    text: tr_str(&lang, "暂无可用的 Bot 协作者，请在「消息」中与 @BotFather 对话创建", "No Bot co-author available yet. Chat with @BotFather in Messages to create one.")
                         .to_string(),
                     is_error: true,
                 },
@@ -1325,7 +1325,8 @@ pub fn render_composer_modal(
     let card = macos_modal_card("community-composer-modal-card", pal)
         .w(px(pal.scaled_px(680.0).min(740.0)))
         .max_w_full()
-        .max_h(px(680.0))
+        .h(px(680.0))
+        .max_h_full()
         .flex()
         .flex_col()
         .overflow_hidden()
@@ -1333,11 +1334,13 @@ pub fn render_composer_modal(
         // Modal Header: Title + Act-As Switcher + Drafts Toggle + Close
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(16.0))
                 .py(px(12.0))
                 .border_b_1()
                 .border_color(pal.separator_rgba())
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap(px(8.0))
@@ -1541,8 +1544,6 @@ pub fn render_composer_modal(
                 })
                 // Main format-specific inputs
                 .child(render_composer_fields_section(ws, cx))
-                // Bot Co-Author Helper
-                .child(render_bot_coauthor_section(ws, cx))
                 // Flags (NSFW / Spoiler) & Schedule Picker
                 .child(render_flags_and_schedule_bar(ws, cx)),
         )
@@ -2752,200 +2753,6 @@ fn render_thread_subpanel(
                     cx,
                 ))
         }))
-}
-
-fn render_bot_coauthor_section(
-    ws: &CommunityWorkspace,
-    cx: &mut Context<CommunityWorkspace>,
-) -> Div {
-    let pal = ws.palette;
-    let lang = ws.language_id.as_str();
-    let bots = ws.collect_composer_bots();
-    let selected_bot_id = ws.state.composer.co_author_bot_id.clone();
-    let suggestion = ws.state.composer.bot_coauthor_suggestion.clone();
-    let (_, bot_bg, bot_fg) = TdesktopThemePalette::bot_hue_colors("violet", pal.mode.is_dark());
-
-    div()
-        .p(px(10.0))
-        .rounded(px(9.0))
-        .bg(pal.card_surface_rgba())
-        .border_1()
-        .border_color(pal.hairline_border_rgba())
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .flex_wrap()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(5.0))
-                        .text_size(px(11.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.text_primary))
-                        .child(tg_icon(IconName::BotRobot, 13.5, bot_fg))
-                        .child(tr_str(lang, "邀请 Bot 协作创作 (Bot Co-Author)", "Ask Bot Co-Author")),
-                )
-                .child(
-                    div()
-                        .id("composer-bot-coauthor-run")
-                        .cursor_pointer()
-                        .px(px(9.0))
-                        .py(px(4.0))
-                        .rounded_full()
-                        .bg(rgb(bot_bg))
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(bot_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.generate_bot_coauthor_suggestion(cx);
-                            }),
-                        )
-                        .child(tr_str(lang, "✨ 生成协作润色草稿", "✨ Draft with Bot")),
-                ),
-        )
-        .when(!bots.is_empty(), |col| {
-            col.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(px(5.0))
-                    .child(
-                        div()
-                            .id("composer-coauthor-none")
-                            .cursor_pointer()
-                            .px(px(7.0))
-                            .py(px(3.0))
-                            .rounded_full()
-                            .bg(if selected_bot_id.is_none() {
-                                TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16)
-                            } else {
-                                pal.service_pill_rgba()
-                            })
-                            .text_size(px(10.5))
-                            .text_color(rgb(pal.text_secondary))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.state.composer.co_author_bot_id = None;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(tr_str(lang, "无协作者", "None")),
-                    )
-                    .children(bots.into_iter().take(6).map(|b| {
-                        let active = selected_bot_id.as_deref() == Some(b.actor_id.as_str());
-                        let bid = b.actor_id.clone();
-                        div()
-                            .id(SharedString::from(format!("composer-coauthor-{}", b.actor_id)))
-                            .cursor_pointer()
-                            .px(px(8.0))
-                            .py(px(3.0))
-                            .rounded_full()
-                            .bg(if active { rgb(bot_bg).into() } else { pal.service_pill_rgba() })
-                            .text_size(px(10.5))
-                            .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-                            .text_color(rgb(if active { bot_fg } else { pal.text_primary }))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.state.composer.co_author_bot_id = Some(bid.clone());
-                                    cx.notify();
-                                }),
-                            )
-                            .child(format!("@{}", b.handle))
-                    })),
-            )
-        })
-        .child(render_composer_input_box(
-            "composer-bot-prompt",
-            &ws.state.composer.bot_prompt,
-            tr_str(lang, "可选：给 Bot 协作者的指令（如：补充性能基准对比）…", "Optional Bot prompt (e.g. add benchmark tradeoffs)…"),
-            ActiveCommunityInput::ComposerBotPrompt,
-            30.0,
-            ws,
-            cx,
-        ))
-        .when_some(suggestion, |col, text| {
-            let append_txt = text.clone();
-            col.child(
-                div()
-                    .p(px(8.0))
-                    .rounded(px(7.0))
-                    .bg(rgb(pal.dialogs_bg))
-                    .border_l_2()
-                    .border_color(rgb(bot_fg))
-                    .flex()
-                    .flex_col()
-                    .gap(px(5.0))
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(rgb(pal.text_primary))
-                            .child(text),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .id("composer-coauthor-insert")
-                                    .cursor_pointer()
-                                    .px(px(8.0))
-                                    .py(px(3.5))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(pal.accent))
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.active_button_fg))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.insert_composer_markdown_block(&append_txt, cx);
-                                            this.state.composer.bot_coauthor_suggestion = None;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "插入正文", "Insert into Body")),
-                            )
-                            .child(
-                                div()
-                                    .id("composer-coauthor-dismiss")
-                                    .cursor_pointer()
-                                    .px(px(8.0))
-                                    .py(px(3.5))
-                                    .rounded(px(6.0))
-                                    .bg(pal.service_pill_rgba())
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(pal.text_secondary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.state.composer.bot_coauthor_suggestion = None;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "忽略", "Dismiss")),
-                            ),
-                    ),
-            )
-        })
 }
 
 fn render_flags_and_schedule_bar(

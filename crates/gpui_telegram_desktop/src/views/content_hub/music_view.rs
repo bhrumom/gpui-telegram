@@ -12,9 +12,7 @@ use gpui_telegram_proto::creations::{
 
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::{
-    macos_primary_pill_btn, macos_secondary_pill_btn,
-};
+use crate::views::app_shell::modal_container::macos_secondary_pill_btn;
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_shelf_header, cover_artwork_box, empty_state_card_shell,
     filter_pill, format_duration_ms, format_duration_secs, hero_banner, rating_pill,
@@ -32,16 +30,14 @@ pub const MUSIC_SUB_TABS: &[(&str, &str, &str)] = &[
     ("new", "发现", "New"),
     ("radio", "电台", "Radio"),
     ("library", "资料库", "Library"),
-    ("my_music", "我的音乐", "My Music"),
 ];
 
 pub fn normalize_music_sub_tab(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "home" | "listen_now" | "for_you" => "home",
+        "home" | "listen_now" | "for_you" | "my_music" | "my_creations" | "mine" => "home",
         "new" | "browse" | "discover" | "charts" => "new",
         "radio" => "radio",
         "library" | "loved" | "saved" => "library",
-        "my_music" | "my_creations" | "mine" => "my_music",
         _ => "home",
     }
 }
@@ -282,7 +278,6 @@ fn render_music_album_detail(
 
     let detail_play = detail.clone();
     let detail_shuffle = detail.clone();
-    let detail_pub = detail.clone();
     let cid_lib = cid.clone();
     let cid_love = cid.clone();
 
@@ -494,26 +489,7 @@ fn render_music_album_detail(
                                             });
                                         }),
                                     ),
-                                )
-                                .when(is_own, |el| {
-                                    el.child(
-                                        macos_secondary_pill_btn(
-                                            "music-detail-publish-btn",
-                                            tr_str(&lang, "推送审核上架", "Publish & Review"),
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |_this, _, _, cx| {
-                                                cx.emit(
-                                                    ContentHubEvent::OpenPublishModalForCreation(
-                                                        detail_pub.clone(),
-                                                    ),
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                }),
+                                ),
                         ),
                 ),
         )
@@ -566,12 +542,15 @@ fn render_music_album_detail(
                         )
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(12.0))
                                 .child(
                                     div()
                                         .w(px(22.0))
+                                        .flex_shrink_0()
                                         .text_size(px(12.0))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(if is_active {
@@ -587,10 +566,13 @@ fn render_music_album_detail(
                                 )
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
                                         .flex()
                                         .flex_col()
                                         .child(
                                             div()
+                                                .truncate()
                                                 .text_size(px(13.0))
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .text_color(rgb(if is_active {
@@ -602,6 +584,7 @@ fn render_music_album_detail(
                                         )
                                         .child(
                                             div()
+                                                .truncate()
                                                 .text_size(px(11.0))
                                                 .text_color(rgb(pal.text_secondary))
                                                 .child(format!(
@@ -615,6 +598,7 @@ fn render_music_album_detail(
                         )
                         .child(
                             div()
+                                .flex_shrink_0()
                                 .text_size(px(12.0))
                                 .text_color(rgb(pal.text_secondary))
                                 .child(format_duration_secs(u64::from(tr.duration_secs))),
@@ -746,13 +730,6 @@ pub fn render_music_hub_view(
         .cloned()
         .collect();
 
-    let my_music: Vec<UserCreationDto> = ws
-        .my_creations
-        .iter()
-        .filter(|c| c.deleted_at_ms.is_none() && c.kind == CreationKind::Music)
-        .cloned()
-        .collect();
-
     let selected_detail = ws.resolve_selected_detail_creation();
     let sort_options: &[(CatalogSortMode, &'static str, &'static str, &'static str)] = &[
         (CatalogSortMode::Featured, "music-sort-featured", "精选", "Featured"),
@@ -805,6 +782,7 @@ pub fn render_music_hub_view(
         // Header + Sub-nav + Search
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(24.0))
                 .py(px(14.0))
                 .border_b_1()
@@ -862,10 +840,11 @@ pub fn render_music_hub_view(
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    div().w(px(220.0)).child(
+                                    div().w(px(220.0)).max_w_full().child(
                                         render_editable_field_box(
                                             "content-hub-catalog-search-input",
                                             &search_field,
@@ -884,26 +863,11 @@ pub fn render_music_hub_view(
                                             }),
                                         ),
                                     ),
-                                )
-                                .child(
-                                    macos_primary_pill_btn(
-                                        "music-create-bot-btn",
-                                        tr_str(&lang, "+ Bot 作曲", "+ Compose"),
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_this, _, _, cx| {
-                                            cx.emit(ContentHubEvent::OpenCreatorBot(Some(
-                                                CreationKind::Music,
-                                            )));
-                                        }),
-                                    ),
                                 ),
                         ),
                 )
                 .when(
-                    selected_detail.is_none() && active_tab != "my_music" && active_tab != "radio",
+                    selected_detail.is_none() && active_tab != "radio",
                     |el| {
                         el.child(
                             div()
@@ -957,6 +921,7 @@ pub fn render_music_hub_view(
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_wrap()
                                         .items_center()
                                         .gap(px(6.0))
                                         .children(sort_options.iter().map(|&(mode, id, zh, en)| {
@@ -976,7 +941,22 @@ pub fn render_music_hub_view(
                                                     cx.notify();
                                                 }),
                                             )
-                                        })),
+                                        }))
+                                        .child(
+                                            macos_secondary_pill_btn(
+                                                "music-refresh-btn",
+                                                tr_str(&lang, "刷新", "Refresh"),
+                                                pal,
+                                            )
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|_this, _, _, cx| {
+                                                    cx.emit(ContentHubEvent::RefreshCatalog(
+                                                        ContentHubSection::Music,
+                                                    ));
+                                                }),
+                                            ),
+                                        ),
                                 ),
                         )
                     },
@@ -1019,6 +999,7 @@ pub fn render_music_hub_view(
                                 .id(SharedString::from(format!("music-radio-{sid}")))
                                 .cursor_pointer()
                                 .w(px(260.0))
+                                .max_w_full()
                                 .rounded(px(14.0))
                                 .p(px(18.0))
                                 .bg(linear_gradient(
@@ -1069,148 +1050,8 @@ pub fn render_music_hub_view(
                         }),
                     ))
                 })
-                .when(selected_detail.is_none() && active_tab == "my_music", |el| {
-                    el.child(apple_shelf_header(
-                        tr_str(&lang, "我的云端音乐作品", "My Cloud Music"),
-                        Some(format!("{} {}", my_music.len(), tr_str(&lang, "张", "works"))),
-                        pal,
-                    ))
-                    .when(my_music.is_empty(), |inner| {
-                        let cta = macos_primary_pill_btn(
-                            "music-my-empty-cta",
-                            tr_str(&lang, "用 @CreatorStudioBot 创作第一首音乐", "Compose Your First Track"),
-                            pal,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::OpenCreatorBot(Some(CreationKind::Music)));
-                            }),
-                        );
-                        inner.child(empty_state_card_shell(
-                            IconName::HubMusic,
-                            tr_str(&lang, "还没有云端音乐作品", "No Cloud Music Yet"),
-                            tr_str(
-                                &lang,
-                                "使用 @CreatorStudioBot 的 /newmusic 命令创作带旋律、和弦与歌词的音乐作品。",
-                                "Use @CreatorStudioBot /newmusic to compose tracks with synthesized WAV audio & lyrics.",
-                            ),
-                            cta,
-                            pal,
-                        ))
-                    })
-                    .when(!my_music.is_empty(), |inner| {
-                        inner.child(div().flex().flex_col().gap(px(10.0)).children(
-                            my_music.iter().map(|m| {
-                                let m_play = m.clone();
-                                let m_pub = m.clone();
-                                apple_grouped_card(pal)
-                                    .p(px(14.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(14.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(12.0))
-                                            .child(cover_artwork_box(
-                                                &m.cover,
-                                                56.0,
-                                                56.0,
-                                                8.0,
-                                                MUSIC_ACCENT,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(4.0))
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(8.0))
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(15.0))
-                                                                    .font_weight(
-                                                                        FontWeight::SEMIBOLD,
-                                                                    )
-                                                                    .text_color(rgb(
-                                                                        pal.text_primary,
-                                                                    ))
-                                                                    .child(m.title.clone()),
-                                                            )
-                                                            .child(review_status_badge(
-                                                                m.review_status,
-                                                                &lang,
-                                                                pal,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(12.0))
-                                                            .text_color(rgb(pal.text_secondary))
-                                                            .child(m.summary.clone()),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(
-                                                macos_secondary_pill_btn(
-                                                    SharedString::from(format!(
-                                                        "my-music-play-{}",
-                                                        m.creation_id
-                                                    )),
-                                                    tr_str(&lang, "▶ 试听", "▶ Play"),
-                                                    pal,
-                                                )
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_this, _, _, cx| {
-                                                        cx.emit(
-                                                            ContentHubEvent::PlayMusicCreation {
-                                                                creation: m_play.clone(),
-                                                                track_index: 0,
-                                                                shuffle: false,
-                                                            },
-                                                        );
-                                                    }),
-                                                ),
-                                            )
-                                            .child(
-                                                macos_primary_pill_btn(
-                                                    SharedString::from(format!(
-                                                        "my-music-publish-{}",
-                                                        m.creation_id
-                                                    )),
-                                                    tr_str(&lang, "推送审核", "Publish"),
-                                                    pal,
-                                                )
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_this, _, _, cx| {
-                                                        cx.emit(
-                                                            ContentHubEvent::OpenPublishModalForCreation(
-                                                                m_pub.clone(),
-                                                            ),
-                                                        );
-                                                    }),
-                                                ),
-                                            ),
-                                    )
-                            }),
-                        ))
-                    })
-                })
                 .when(
-                    selected_detail.is_none() && active_tab != "my_music" && active_tab != "radio",
+                    selected_detail.is_none() && active_tab != "radio",
                     |el| {
                         let list = if active_tab == "library" {
                             library_music.clone()
@@ -1243,17 +1084,17 @@ pub fn render_music_hub_view(
                             pal,
                         ))
                         .when(list.is_empty(), |inner| {
-                            let cta = macos_primary_pill_btn(
-                                "music-empty-bot-cta",
-                                tr_str(&lang, "用 @CreatorStudioBot 创作音乐", "Compose with @CreatorStudioBot"),
+                            let cta = macos_secondary_pill_btn(
+                                "music-empty-refresh-btn",
+                                tr_str(&lang, "刷新曲库", "Refresh Music"),
                                 pal,
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|_this, _, _, cx| {
-                                    cx.emit(ContentHubEvent::OpenCreatorBot(Some(
-                                        CreationKind::Music,
-                                    )));
+                                    cx.emit(ContentHubEvent::RefreshCatalog(
+                                        ContentHubSection::Music,
+                                    ));
                                 }),
                             );
                             inner.child(empty_state_card_shell(
@@ -1261,8 +1102,8 @@ pub fn render_music_hub_view(
                                 tr_str(&lang, "暂无公开上架音乐", "No Published Music Yet"),
                                 tr_str(
                                     &lang,
-                                    "使用 @CreatorStudioBot 创作音乐并审核上架后，专辑与曲目会展示在这里。",
-                                    "Published albums appear here ready for instant synthesized playback.",
+                                    "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布音乐，审核上架后会展示在这里。",
+                                    "Chat with @CreatorStudioBot directly in Messages to compose and publish music. Published albums appear here.",
                                 ),
                                 cta,
                                 pal,
@@ -1329,12 +1170,15 @@ pub fn render_music_hub_view(
                                                     )
                                                     .child(
                                                         div()
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(10.0))
                                                             .child(
                                                                 div()
                                                                     .w(px(22.0))
+                                                                    .flex_shrink_0()
                                                                     .text_size(px(13.0))
                                                                     .font_weight(FontWeight::BOLD)
                                                                     .text_color(rgb(if rank < 3 {
@@ -1353,10 +1197,13 @@ pub fn render_music_hub_view(
                                                             ))
                                                             .child(
                                                                 div()
+                                                                    .flex_1()
+                                                                    .min_w(px(0.0))
                                                                     .flex()
                                                                     .flex_col()
                                                                     .child(
                                                                         div()
+                                                                            .truncate()
                                                                             .text_size(px(13.0))
                                                                             .font_weight(
                                                                                 FontWeight::SEMIBOLD,
@@ -1374,6 +1221,7 @@ pub fn render_music_hub_view(
                                                                     )
                                                                     .child(
                                                                         div()
+                                                                            .truncate()
                                                                             .text_size(px(11.0))
                                                                             .text_color(rgb(
                                                                                 pal.text_secondary,
@@ -1387,6 +1235,7 @@ pub fn render_music_hub_view(
                                                     )
                                                     .child(
                                                         div()
+                                                            .flex_shrink_0()
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(10.0))

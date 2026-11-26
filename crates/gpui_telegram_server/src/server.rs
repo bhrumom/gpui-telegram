@@ -500,18 +500,22 @@ impl AppState {
                 }
             }
         }
-        let _ = db.seed_default_catalog_if_empty();
+        let _ = db.purge_legacy_builtin_sticker_gif_catalog();
         let _ = db.seed_botfather_and_flagship_apps();
         let _ = ensure_default_ai_bot(&db);
         let _ = ensure_creator_studio_bot(&db);
 
-        // Idempotent starter Community seeding (8 communities, Humans+Bots, posts, comments, lists)
-        let seed_now_ms = Utc::now().timestamp_millis();
-        if let Err(err) = db.pool().with_transaction(|tx| {
-            gpui_telegram_community::store::ops::seed_if_empty_tx(tx, seed_now_ms)
-        }) {
-            tracing::warn!("Community seed_if_empty_tx failed: {}", err);
-        }
+        // Idempotently purge any legacy starter fake/seed Community rows while preserving all real user data
+        let purged_community_seed_rows = match db
+            .pool()
+            .with_transaction(gpui_telegram_community::store::ops::purge_starter_seed_data_tx)
+        {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!("Community purge_starter_seed_data_tx failed: {}", err);
+                0
+            }
+        };
 
         // Dedicated Tantivy BM25 Community search index (`<db_path>.community.idx` on disk; in_ram otherwise)
         let community_search_indexer = if config.is_in_memory() || db.pool().path().is_none() {
@@ -534,6 +538,12 @@ impl AppState {
                     }),
             )
         };
+        if purged_community_seed_rows > 0 && community_search_indexer.doc_count() > 0 {
+            for idx in 1..=30 {
+                let _ = community_search_indexer.delete_post(&format!("seed_post_{idx:02}"));
+            }
+            let _ = community_search_indexer.commit();
+        }
         if community_search_indexer.doc_count() == 0 {
             let posts_res = db.pool().with_reader(|conn| {
                 let mut stmt = conn
@@ -795,7 +805,9 @@ impl AppState {
         gateway_hub.set_event_bus(event_bus.clone());
 
         let push_hub = Arc::new(crate::push::PushGatewayHub::new(db.clone()));
-        push_hub.register_dispatcher(Arc::new(crate::push::dispatchers::MockPushDispatcher::new()));
+        if config.is_in_memory() {
+            push_hub.register_dispatcher(Arc::new(crate::push::dispatchers::MockPushDispatcher::new()));
+        }
         push_hub.register_dispatcher(Arc::new(crate::push::dispatchers::ApnsDispatcher::new(
             "org.telegram.GPUI",
         )));
@@ -3365,6 +3377,13 @@ async fn auth_alipay_simulate_scan(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AlipaySimulateScanRequest>,
 ) -> Response {
+    if !state.config.is_in_memory() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "mock_disabled", "message": "Simulated Alipay OAuth is disabled in production" })),
+        )
+            .into_response();
+    }
     let attempt = match state.db.get_oauth_attempt(&req.attempt_id) {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -3813,10 +3832,10 @@ pub(crate) fn ensure_creator_studio_bot(db: &crate::db::ServerDatabase) -> UserI
     let now_ms = Utc::now().timestamp_millis();
     let username = gpui_telegram_proto::CREATOR_STUDIO_BOT_USERNAME;
     let display_name = "Creator Studio";
-    let bio = "Official Creator Studio Bot — create cloud Books, Music & Games and discover public creations.";
-    let description = "创作图书、音乐与迷你游戏并保存到云端，支持一键提交审核上架与公开作品推荐。";
-    let about = "Official Apple-style Creative Hub & Public Recommendation Bot (@CreatorStudioBot).";
-    let persona = "You are Creator Studio, an official assistant helping users author cloud Books, Music, and Games and discover published public creations.";
+    let bio = "Official Creator Studio Bot — create & publish cloud Books, Music, Games & Apps directly in chat.";
+    let description = "在消息聊天中创作图书、音乐、游戏与应用并保存到云端，支持提交审核上架、撤回、下架与公开作品推荐。";
+    let about = "Official Creative Hub & Public Recommendation Bot (@CreatorStudioBot).";
+    let persona = "You are Creator Studio, an official assistant helping users author and publish cloud Books, Music, Games, and Apps directly via chat.";
     let commands_json = serde_json::to_string(&crate::routes::creator_bot::creator_studio_commands())
         .unwrap_or_else(|_| "[]".to_string());
     let bot_token = crate::routes::creator_bot::CREATOR_STUDIO_BOT_TOKEN;

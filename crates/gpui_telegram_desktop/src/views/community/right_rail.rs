@@ -168,10 +168,15 @@ fn render_trending_card(
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap(px(6.0))
                         .text_size(px(10.0))
                         .text_color(rgb(pal.text_secondary))
-                        .child(topic.category.clone())
-                        .child(format!("{}H · {}B", topic.human_posts_count, topic.bot_posts_count)),
+                        .child(div().flex_1().min_w(px(0.0)).truncate().child(topic.category.clone()))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .child(format!("{}H · {}B", topic.human_posts_count, topic.bot_posts_count)),
+                        ),
                 )
                 .child(
                     div()
@@ -212,12 +217,15 @@ fn render_recommended_communities_card(
                 .gap(px(6.0))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
                         .gap(px(6.0))
                         .child(tg_icon(IconName::CommunityGlobe, 14.5, pal.accent))
                         .child(
                             div()
+                                .truncate()
                                 .text_size(px(13.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(pal.text_primary))
@@ -228,6 +236,7 @@ fn render_recommended_communities_card(
                     div()
                         .id("rail-create-community-btn")
                         .cursor_pointer()
+                        .flex_shrink_0()
                         .px(px(7.0))
                         .py(px(2.5))
                         .rounded_full()
@@ -533,14 +542,18 @@ fn render_bot_pulse_card(
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap(px(6.0))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
                         .gap(px(6.0))
                         .child(tg_icon(IconName::BotRobot, 15.0, 0x8B5CF6))
                         .child(
                             div()
+                                .truncate()
                                 .text_size(px(13.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(pal.text_primary))
@@ -549,6 +562,7 @@ fn render_bot_pulse_card(
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .px(px(6.0))
                         .py(px(1.5))
                         .rounded_full()
@@ -559,6 +573,18 @@ fn render_bot_pulse_card(
                         .child(format!("{bot_posts_count} live")),
                 ),
         )
+        .when(bots.is_empty(), |col| {
+            col.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        lang,
+                        "在「消息」中直接与 Bot 对话即可发布内容或管理 Bot。",
+                        "Chat directly with bots in Messages to publish and manage bots.",
+                    )),
+            )
+        })
         .children(bots.into_iter().map(|b| {
             let handle = b.handle.clone();
             let shape = if b.avatar_shape.is_empty() {
@@ -625,30 +651,4 @@ fn render_bot_pulse_card(
                         ),
                 )
         }))
-        .child(
-            div()
-                .id("rail-open-bot-studio")
-                .cursor_pointer()
-                .w_full()
-                .py(px(6.0))
-                .rounded(px(8.0))
-                .bg(TdesktopThemePalette::rgba_with_alpha(0x8B5CF6, 0.14))
-                .hover(move |s| s.bg(TdesktopThemePalette::rgba_with_alpha(0x8B5CF6, 0.24)))
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(5.0))
-                .text_size(px(11.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(0x8B5CF6))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.navigate_to(CommunityRoute::BotStudio, cx);
-                    }),
-                )
-                .child(tg_icon(IconName::BotRobot, 13.0, 0x8B5CF6))
-                .child(tr_str(lang, "在 Bot 工作室创建/管理 Bot", "Open Bot Studio")),
-        )
 }

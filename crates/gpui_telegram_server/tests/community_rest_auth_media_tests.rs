@@ -23,6 +23,7 @@ fn test_state(dir: &TempDir, db_name: &str) -> (Arc<AppState>, axum::Router) {
     let mut cfg = ServerConfig::default();
     cfg.database_url = dir.path().join(db_name).display().to_string();
     cfg.media_storage_path = dir.path().join("media").display().to_string();
+    cfg.allow_deterministic_bot_fallback = true;
     let state = Arc::new(AppState::try_new(cfg).expect("AppState::try_new"));
     let router = build_router_with_state(state.clone());
     (state, router)
@@ -104,13 +105,13 @@ async fn test_v42_migration_idempotency_startup_seed_and_tantivy_index_path() {
         .with_writer(|conn| gpui_telegram_server::db::migrations::run_migrations(conn))
         .expect("Re-running run_migrations must be idempotent");
 
-    // 2. Community Tantivy directory uses `<db_path>.community.idx` (zero forbidden substrings)
+    // 2. Community Tantivy directory uses `<db_path>.community.idx` and starts with ZERO fake seed posts
     let idx_dir = dir.path().join("comm_v42.db.community.idx");
     assert!(idx_dir.is_dir(), "Expected persistent community index at {}", idx_dir.display());
-    assert!(
-        state.community_search_indexer.doc_count() >= 20,
-        "Seeded published posts must be indexed immediately on startup, got {}",
-        state.community_search_indexer.doc_count()
+    assert_eq!(
+        state.community_search_indexer.doc_count(),
+        0,
+        "Fresh startup must NOT auto-seed fake starter community posts"
     );
 
     // 3. Server status advertises "community" capability
@@ -119,7 +120,7 @@ async fn test_v42_migration_idempotency_startup_seed_and_tantivy_index_path() {
     let caps = status_val["capabilities"].as_array().unwrap();
     assert!(caps.iter().any(|c| c.as_str() == Some("community")));
 
-    // 4. Seeded feed & search work immediately for a freshly registered user
+    // 4. Fresh feed starts empty (zero fake seed data); real user post is indexed & searchable immediately
     let (_uid, tok) = register_user(&app, "alice_v42").await;
     let bearer = format!("Bearer {tok}");
     let (st, feed_val) = send_req(
@@ -133,7 +134,23 @@ async fn test_v42_migration_idempotency_startup_seed_and_tantivy_index_path() {
     .await;
     assert_eq!(st, StatusCode::OK, "feed error: {feed_val}");
     let feed: FeedResponseDto = serde_json::from_value(feed_val).unwrap();
-    assert!(!feed.items.is_empty(), "Starter seeded feed must be non-empty");
+    assert!(feed.items.is_empty(), "Fresh community feed must contain zero fake seed posts");
+
+    let (st, created_val) = send_req(
+        &app,
+        Method::POST,
+        "/api/v1/community/posts",
+        Some(&bearer),
+        None,
+        Some(json!({
+            "title": "Real Rust GPUI Engineering Note",
+            "body": "Authentic user post about rust zero-copy architecture."
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "create post error: {created_val}");
+    let created_post: CreatePostResponse = serde_json::from_value(created_val).unwrap();
+    let real_post_id = created_post.post.post_id.clone();
 
     let (st, search_val) = send_req(
         &app,
@@ -146,7 +163,52 @@ async fn test_v42_migration_idempotency_startup_seed_and_tantivy_index_path() {
     .await;
     assert_eq!(st, StatusCode::OK, "search error: {search_val}");
     let search: CommunitySearchResultDto = serde_json::from_value(search_val).unwrap();
-    assert!(search.total_hits > 0, "Seeded Rust content should be searchable immediately");
+    assert!(
+        search.posts.iter().any(|p| p.post_id == real_post_id),
+        "Real user Rust post must be indexed and searchable immediately"
+    );
+
+    // 5. Simulate legacy DB containing fake seed_* rows and verify startup upgrade purge deletes
+    //    all seed_* data while preserving 100% of real user posts.
+    let now_ms = Utc::now().timestamp_millis();
+    state
+        .db
+        .pool()
+        .with_transaction(|tx| gpui_telegram_community::store::ops::seed_if_empty_tx(tx, now_ms))
+        .expect("inject legacy seed data");
+    drop(app);
+    drop(state);
+
+    let (restarted_state, restarted_app) = test_state(&dir, "comm_v42.db");
+    let seed_left: i64 = restarted_state
+        .db
+        .pool()
+        .with_reader(|conn| {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM community_posts WHERE post_id LIKE 'seed_post_%')
+                      + (SELECT COUNT(*) FROM communities WHERE community_id LIKE 'seed_comm_%')
+                      + (SELECT COUNT(*) FROM community_lists WHERE list_id LIKE 'seed_list_%')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))
+        })
+        .unwrap();
+    assert_eq!(seed_left, 0, "Startup purge must remove all legacy seed_* rows");
+
+    let (st, feed_after_val) = send_req(
+        &restarted_app,
+        Method::GET,
+        "/api/v1/community/feed?tab=for_you&limit=20",
+        Some(&bearer),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let feed_after: FeedResponseDto = serde_json::from_value(feed_after_val).unwrap();
+    assert_eq!(feed_after.items.len(), 1);
+    assert_eq!(feed_after.items[0].post.post_id, real_post_id);
 }
 
 #[tokio::test]

@@ -3036,8 +3036,9 @@ impl EntityInputHandler for AppShell {
                 } else {
                     (chip_count as f32 * 82.0).min(320.0)
                 };
+                let apple_w = self.apple_sidebar.read(cx).effective_width();
                 let caret_x = element_bounds.origin.x
-                    + px(sb_width + 82.0 + chip_offset + (char_count as f32 * 8.0).min(260.0));
+                    + px(apple_w + sb_width + 82.0 + chip_offset + (char_count as f32 * 8.0).min(260.0));
                 let caret_y =
                     element_bounds.origin.y + px(if title_focused { 66.0 } else { 22.0 });
                 Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))))
@@ -3050,7 +3051,9 @@ impl EntityInputHandler for AppShell {
                 Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))))
             }
             ShellInputTarget::BotAssistCard => {
-                let caret_x = (element_bounds.origin.x + px(420.0)
+                let apple_w = self.apple_sidebar.read(cx).effective_width();
+                let sb_w = self.sidebar.read(cx).effective_width();
+                let caret_x = (element_bounds.origin.x + px(apple_w + sb_w + 60.0)
                     + px((char_count as f32 * 7.5).min(240.0)))
                 .min(element_bounds.origin.x + element_bounds.size.width - px(80.0));
                 let caret_y = (element_bounds.origin.y + element_bounds.size.height - px(220.0))
@@ -3065,8 +3068,9 @@ impl EntityInputHandler for AppShell {
                 Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))))
             }
             ShellInputTarget::BrowserInput => {
+                let apple_w = self.apple_sidebar.read(cx).effective_width();
                 let caret_x = element_bounds.origin.x
-                    + px(360.0)
+                    + px(apple_w + 140.0)
                     + px((char_count as f32 * 7.5).min(360.0));
                 Some(Bounds::new(
                     point(caret_x, element_bounds.origin.y + px(28.0)),
@@ -3077,17 +3081,18 @@ impl EntityInputHandler for AppShell {
             | ShellInputTarget::OrcaBotsInput
             | ShellInputTarget::OrcaIdeInput => {
                 let apple_w = self.apple_sidebar.read(cx).effective_width();
-                let sb_w = self.sidebar.read(cx).effective_width();
                 let caret_x = element_bounds.origin.x
-                    + px(apple_w + sb_w + 260.0 + (char_count as f32 * 8.0).min(420.0));
+                    + px(apple_w + 260.0 + (char_count as f32 * 8.0).min(420.0));
                 Some(Bounds::new(
                     point(caret_x, element_bounds.origin.y + px(140.0)),
                     size(px(2.0), px(18.0)),
                 ))
             }
             ShellInputTarget::StageSearch => {
+                let apple_w = self.apple_sidebar.read(cx).effective_width();
+                let sb_w = self.sidebar.read(cx).effective_width();
                 let caret_x = element_bounds.origin.x
-                    + px(360.0)
+                    + px(apple_w + sb_w + 48.0)
                     + px((char_count as f32 * 8.0).min(280.0));
                 Some(Bounds::new(
                     point(caret_x, element_bounds.origin.y + px(84.0)),
@@ -3095,9 +3100,10 @@ impl EntityInputHandler for AppShell {
                 ))
             }
             ShellInputTarget::SidebarSearch => {
+                let apple_w = self.apple_sidebar.read(cx).effective_width();
                 let sb_chars = self.sidebar.read(cx).search_query.chars().count();
                 let caret_x = element_bounds.origin.x
-                    + px(96.0)
+                    + px(apple_w + 48.0)
                     + px((sb_chars as f32 * 7.5).min(200.0));
                 Some(Bounds::new(
                     point(caret_x, element_bounds.origin.y + px(22.0)),
@@ -3115,8 +3121,11 @@ impl EntityInputHandler for AppShell {
                         advance + 14.0
                     };
                 }
-                let max_w = (f32::from(element_bounds.size.width) - 818.0).max(100.0);
-                let caret_x = element_bounds.origin.x + px(458.0 + advance.clamp(0.0, max_w));
+                let apple_w = self.apple_sidebar.read(cx).effective_width();
+                let sb_w = self.sidebar.read(cx).effective_width();
+                let base_x = apple_w + sb_w + 64.0;
+                let max_w = (f32::from(element_bounds.size.width) - base_x - 140.0).max(100.0);
+                let caret_x = element_bounds.origin.x + px(base_x + advance.clamp(0.0, max_w));
                 let caret_y = element_bounds.origin.y + element_bounds.size.height - px(36.0);
                 Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(20.0))))
             }
