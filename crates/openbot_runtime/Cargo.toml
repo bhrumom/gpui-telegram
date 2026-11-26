@@ -1,0 +1,57 @@
+[package]
+name = "openbot_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Internal workspace crates
+openbot_contracts = { workspace = true }
+openbot_storage = { workspace = true }
+bot-browser = { workspace = true }
+gpui_telegram_coding = { workspace = true }
+magpie_gateway = { workspace = true }
+
+# Async, networking & HTTP
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization & storage
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, features = ["functions", "hooks", "limits"] }
+
+# Crypto, identity & encoding
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+getrandom = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true }
+
+# Concurrency, errors & observability
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# Direct locked crate versions (Cargo.lock verified)
+chrono-tz = "0.10"
+regex = "1"
+hex = "0.4"
+url = "2"
+percent-encoding = "2.3"
+unicode-normalization = "0.1"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+tempfile = "3"

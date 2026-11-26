@@ -5768,6 +5768,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "openbot_runtime"
+version = "1.6.15"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bot-browser",
+ "chacha20poly1305",
+ "chrono",
+ "chrono-tz",
+ "flate2",
+ "futures",
+ "getrandom 0.2.17",
+ "gpui_telegram_coding",
+ "hex",
+ "hkdf",
+ "hmac",
+ "image",
+ "magpie_gateway",
+ "openbot_contracts",
+ "openbot_storage",
+ "parking_lot",
+ "percent-encoding",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+ "url",
+ "uuid",
+ "zeroize",
+ "zip",
+]
+
+[[package]]
 name = "openbot_storage"
 version = "1.6.15"
 dependencies = [
