@@ -325,6 +325,7 @@ pub async fn execute_unified(
         UnifiedCommand::MiniApp { op } => handle_miniapp(opts, &backend, op).await,
         UnifiedCommand::Task { op } => handle_task(opts, &backend, op).await,
         UnifiedCommand::Mcp { op } => handle_mcp(opts, &backend, op).await,
+        UnifiedCommand::Orca(cmd) => crate::orca_commands::execute_orca(opts, &backend, cmd).await,
     }
 }
 

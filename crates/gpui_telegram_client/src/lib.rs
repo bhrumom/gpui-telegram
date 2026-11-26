@@ -92,8 +92,7 @@ pub use net::{
     InstallAutomationAppResponse, InstalledAutomationApp, ListAutomationAppsQuery,
     ListAutomationAppsResponse, ListInstalledAutomationAppsResponse, PublishAutomationAppRequest,
     RecordAutomationRunRequest, RecordAutomationRunResponse, UninstallAutomationAppResponse,
-    AUTOMATION_APP_SCHEMA_VERSION_V1,
-    CodeSceneHttpClient,
+    AUTOMATION_APP_SCHEMA_VERSION_V1, CodeSceneHttpClient, OrcaClient, OrcaClientError,
 };
 pub use gpui_telegram_proto::code_scene_contracts::*;
 pub use session_persistence::{

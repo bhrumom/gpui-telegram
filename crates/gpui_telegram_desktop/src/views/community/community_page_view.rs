@@ -288,6 +288,9 @@ impl CommunityWorkspace {
         };
         let req = UpdateCommunityWikiRequest { markdown, summary };
         self.state.community_wiki_saving = true;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let my_comm_gen = self.state.community_gen;
+        let submitter_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let reload_slug = slug.clone();
@@ -298,24 +301,32 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != submitter_actor_id
+                {
+                    return;
+                }
                 this.state.community_wiki_saving = false;
+                let still_same_comm_gen = this.state.community_gen == my_comm_gen;
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(rev)) => {
-                        this.state.community_wiki_editing = false;
-                        this.state.community_wiki_preview_rev = None;
-                        if matches!(
-                            this.state.active_input,
-                            ActiveCommunityInput::CommunityWikiMarkdown
-                                | ActiveCommunityInput::CommunityWikiSummary
-                        ) {
-                            this.state.blur_input();
-                        }
-                        if let Some(ref mut det) = this.state.community_detail {
-                            if det.community.slug.eq_ignore_ascii_case(&reload_slug) {
-                                det.community.wiki_markdown = rev.markdown.clone();
-                                det.community.wiki_revision = rev.revision;
-                                det.wiki_revisions.insert(0, rev);
+                        if still_same_comm_gen {
+                            this.state.community_wiki_editing = false;
+                            this.state.community_wiki_preview_rev = None;
+                            if matches!(
+                                this.state.active_input,
+                                ActiveCommunityInput::CommunityWikiMarkdown
+                                    | ActiveCommunityInput::CommunityWikiSummary
+                            ) {
+                                this.state.blur_input();
+                            }
+                            if let Some(ref mut det) = this.state.community_detail {
+                                if det.community.slug.eq_ignore_ascii_case(&reload_slug) {
+                                    det.community.wiki_markdown = rev.markdown.clone();
+                                    det.community.wiki_revision = rev.revision;
+                                    det.wiki_revisions.insert(0, rev);
+                                }
                             }
                         }
                         this.emit_action(
@@ -406,6 +417,9 @@ impl CommunityWorkspace {
             return;
         }
         self.state.community_rules_saving = true;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let my_comm_gen = self.state.community_gen;
+        let submitter_actor_id = self.state.active_actor_id.clone();
         let req = UpdateCommunityRequest {
             rules: Some(rules),
             ..Default::default()
@@ -419,15 +433,23 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != submitter_actor_id
+                {
+                    return;
+                }
                 this.state.community_rules_saving = false;
+                let still_same_comm_gen = this.state.community_gen == my_comm_gen;
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(updated)) => {
                         this.state.community_new_rule_title.clear();
                         this.state.community_new_rule_desc.clear();
-                        if let Some(ref mut det) = this.state.community_detail {
-                            if det.community.slug.eq_ignore_ascii_case(&updated.slug) {
-                                det.community = updated;
+                        if still_same_comm_gen {
+                            if let Some(ref mut det) = this.state.community_detail {
+                                if det.community.slug.eq_ignore_ascii_case(&updated.slug) {
+                                    det.community = updated;
+                                }
                             }
                         }
                         this.emit_action(
@@ -534,6 +556,10 @@ impl CommunityWorkspace {
         };
         self.state.create_community.submitting = true;
         self.state.create_community.error = None;
+        self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
+        let my_comm_gen = self.state.communities_gen;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let submitter_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -545,14 +571,22 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.active_actor_id != submitter_actor_id
+                {
+                    return;
+                }
                 this.state.create_community.submitting = false;
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok((created, list))) => {
-                        if let Some(l) = list {
-                            this.state.communities = l.communities;
-                        } else if !this.state.communities.iter().any(|c| c.slug == created.slug) {
-                            this.state.communities.insert(0, created.clone());
+                        if this.state.communities_gen == my_comm_gen {
+                            if let Some(l) = list {
+                                this.state.communities = l.communities;
+                            } else if !this.state.communities.iter().any(|c| c.slug == created.slug)
+                            {
+                                this.state.communities.insert(0, created.clone());
+                            }
                         }
                         this.close_create_community_modal(cx);
                         this.emit_action(

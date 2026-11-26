@@ -37,6 +37,13 @@ pub enum CliError {
 
     #[error("Check error: {0}")]
     CheckError(String),
+
+    #[error("{code}: {message}")]
+    OrcaError {
+        code: String,
+        message: String,
+        exit_code: i32,
+    },
 }
 
 impl CliError {
@@ -49,6 +56,7 @@ impl CliError {
             Self::Unauthorized(_) => 3,
             Self::ApprovalRequired { .. } | Self::Forbidden(_) => 4,
             Self::Http(_) | Self::ServerError { .. } | Self::Execution(_) => 1,
+            Self::OrcaError { exit_code, .. } => *exit_code,
         }
     }
 
@@ -64,11 +72,18 @@ impl CliError {
             Self::ServerError { .. } => "server_error",
             Self::Execution(_) => "execution_error",
             Self::CheckError(_) => "check_error",
+            Self::OrcaError { .. } => "orca_error",
         }
     }
 
     pub fn to_json(&self) -> Value {
         match self {
+            Self::OrcaError { code, message, .. } => json!({
+                "error": {
+                    "code": code,
+                    "message": message,
+                },
+            }),
             Self::ApprovalRequired {
                 action,
                 gate_id,
@@ -91,11 +106,26 @@ impl CliError {
             Self::ServerError { status, body } => {
                 let code = body
                     .get("error")
+                    .and_then(|v| v.get("code"))
                     .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        body.get("error_detail")
+                            .and_then(|v| v.get("code"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .or_else(|| body.get("error").and_then(|v| v.as_str()))
+                    .or_else(|| body.get("code").and_then(|v| v.as_str()))
                     .unwrap_or("server_error");
                 let message = body
-                    .get("message")
+                    .get("error")
+                    .and_then(|v| v.get("message"))
                     .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        body.get("error_detail")
+                            .and_then(|v| v.get("message"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .or_else(|| body.get("message").and_then(|v| v.as_str()))
                     .map(String::from)
                     .unwrap_or_else(|| format!("Server returned status {status}"));
                 json!({

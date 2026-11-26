@@ -13,6 +13,7 @@ pub mod code_scene_client;
 pub mod hermes_client;
 pub mod http_client;
 pub mod http_helpers;
+pub mod orca_client;
 pub mod proxy;
 pub mod tailnet;
 pub mod ws_channel;
@@ -143,5 +144,6 @@ pub use gpui_telegram_proto::automation_apps::{
 };
 pub use code_scene_client::CodeSceneHttpClient;
 pub use gpui_telegram_proto::code_scene_contracts::*;
+pub use orca_client::{OrcaClient, OrcaClientError};
 pub use ws_channel::WsChannel;
 pub use ws_transport::{connect_ws_with_proxy, ConnectionStatus, WsConnectError, WsTransport};

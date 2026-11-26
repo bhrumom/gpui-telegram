@@ -194,6 +194,7 @@ impl CommunityWorkspace {
             folder: Some(target_folder.clone()),
             remove: None,
         };
+        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -203,6 +204,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen {
+                    return;
+                }
                 match res {
                     Ok(Ok(resp)) => {
                         this.state.reconcile_bookmark(&resp);
@@ -237,6 +241,7 @@ impl CommunityWorkspace {
             folder: None,
             remove: Some(true),
         };
+        let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -246,6 +251,9 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen {
+                    return;
+                }
                 if let Ok(Ok(resp)) = res {
                     this.state.reconcile_bookmark(&resp);
                 }
@@ -368,6 +376,7 @@ impl CommunityWorkspace {
             return;
         }
         let editing_id = self.state.list_editor.editing_list_id.clone();
+        let editing_id_cb = editing_id.clone();
         let description = self.state.list_editor.description.trim().to_string();
         let kind = self.state.list_editor.kind;
         let is_private = self.state.list_editor.is_private;
@@ -375,8 +384,16 @@ impl CommunityWorkspace {
         let member_actor_ids = self.state.list_editor.member_actor_ids.clone();
         let community_slugs = self.state.list_editor.community_slugs.clone();
 
+        if let Some(ref lid) = editing_id {
+            self.state.list_membership_dirty.remove(lid);
+        }
         self.state.list_editor.submitting = true;
         self.state.list_editor.error = None;
+        self.state.lists_gen = self.state.lists_gen.wrapping_add(1);
+        let my_lists_gen = self.state.lists_gen;
+        let my_actor_gen = self.state.actor_switch_gen;
+        let my_actor_epoch = self.state.list_membership_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
@@ -417,21 +434,46 @@ impl CommunityWorkspace {
             .await;
 
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.list_membership_gen != my_actor_epoch
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    return;
+                }
                 this.state.list_editor.submitting = false;
                 let lang = this.language_id.clone();
                 match res {
                     Ok((Ok(saved), lists)) => {
-                        if let Some(l) = lists {
-                            this.state.lists = l.lists;
-                        } else if let Some(pos) = this
-                            .state
-                            .lists
-                            .iter()
-                            .position(|x| x.list_id == saved.list_id)
-                        {
-                            this.state.lists[pos] = saved.clone();
-                        } else {
-                            this.state.lists.insert(0, saved.clone());
+                        let edited_was_in_flight = editing_id_cb
+                            .as_ref()
+                            .is_some_and(|lid| this.state.list_membership_in_flight.contains_key(lid));
+                        if this.state.lists_gen == my_lists_gen {
+                            if let Some(l) = lists {
+                                this.state.merge_refreshed_lists(l.lists);
+                            } else if let Some(pos) = this
+                                .state
+                                .lists
+                                .iter()
+                                .position(|x| x.list_id == saved.list_id)
+                            {
+                                this.state.lists[pos] = saved.clone();
+                            } else {
+                                this.state.lists.insert(0, saved.clone());
+                            }
+                        }
+                        if let Some(ref lid) = editing_id_cb {
+                            if let Some(pos) = this.state.lists.iter().position(|x| &x.list_id == lid) {
+                                this.state.lists[pos] = saved.clone();
+                            }
+                            if edited_was_in_flight {
+                                // A pre-editor quick-toggle flight is still running; mark dirty so
+                                // once it finishes it flushes the editor's authoritative saved state.
+                                this.state.list_membership_dirty.insert(lid.clone());
+                            } else {
+                                this.state.list_membership_dirty.remove(lid);
+                                this.state.list_membership_needs_feed_reload.remove(lid);
+                                this.state.list_membership_last_synced.remove(lid);
+                            }
                         }
                         this.state.list_editor_open = false;
                         if this.state.active_input.is_list_editor_input() {
@@ -460,55 +502,63 @@ impl CommunityWorkspace {
     }
 
     pub fn toggle_list_pinned(&mut self, list_id: String, pinned: bool, cx: &mut Context<Self>) {
-        if let Some(l) = self.state.lists.iter_mut().find(|x| x.list_id == list_id) {
-            l.is_pinned = pinned;
+        if self.state.list_deleting.contains(&list_id) {
+            return;
         }
-        let facade = self.facade.clone();
-        let handle = facade.runtime_handle().clone();
+        let Some(pos) = self.state.lists.iter().position(|x| x.list_id == list_id) else {
+            return;
+        };
+        if !self.state.list_membership_last_synced.contains_key(&list_id) {
+            let prev = &self.state.lists[pos];
+            self.state.list_membership_last_synced.insert(
+                list_id.clone(),
+                (
+                    prev.is_pinned,
+                    prev.member_actor_ids.clone(),
+                    prev.community_slugs.clone(),
+                ),
+            );
+        }
+        self.state.lists[pos].is_pinned = pinned;
         cx.notify();
-        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-            let res = run_on_community_tokio(&handle, async move {
-                facade
-                    .update_list(
-                        &list_id,
-                        &UpdateCommunityListRequest {
-                            is_pinned: Some(pinned),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-            })
-            .await;
-            let _ = weak.update(app, |this, cx| {
-                if let Ok(Ok(updated)) = res {
-                    if let Some(pos) = this
-                        .state
-                        .lists
-                        .iter()
-                        .position(|x| x.list_id == updated.list_id)
-                    {
-                        this.state.lists[pos] = updated;
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.enqueue_list_sync(list_id, false, cx);
     }
 
     pub fn delete_list_action(&mut self, list_id: String, cx: &mut Context<Self>) {
+        if self.state.list_deleting.contains(&list_id) {
+            return;
+        }
+        self.state.list_deleting.insert(list_id.clone());
+        self.state.list_membership_dirty.remove(&list_id);
+        self.state.list_membership_needs_feed_reload.remove(&list_id);
+        let my_actor_gen = self.state.actor_switch_gen;
+        let my_actor_epoch = self.state.list_membership_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         let del_id = list_id.clone();
+        cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
                 facade.delete_list(&del_id).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                if this.state.actor_switch_gen != my_actor_gen
+                    || this.state.list_membership_gen != my_actor_epoch
+                    || this.state.active_actor_id != expected_actor_id
+                {
+                    return;
+                }
+                this.state.list_deleting.remove(&list_id);
                 let lang = this.language_id.clone();
                 match res {
                     Ok(Ok(_)) => {
+                        this.state.lists_gen = this.state.lists_gen.wrapping_add(1);
+                        this.state.list_membership_in_flight.remove(&list_id);
+                        this.state.list_membership_dirty.remove(&list_id);
+                        this.state.list_membership_needs_feed_reload.remove(&list_id);
+                        this.state.list_membership_last_synced.remove(&list_id);
                         this.state.lists.retain(|l| l.list_id != list_id);
                         if this.state.selected_list_id.as_deref() == Some(list_id.as_str()) {
                             this.state.selected_list_id =
@@ -549,26 +599,35 @@ impl CommunityWorkspace {
         actor_id: String,
         cx: &mut Context<Self>,
     ) {
-        let (members, slugs) = {
-            let Some(existing) = self.state.lists.iter_mut().find(|l| l.list_id == list_id) else {
-                return;
-            };
-            if let Some(pos) = existing
-                .member_actor_ids
-                .iter()
-                .position(|id| id == &actor_id)
-            {
-                existing.member_actor_ids.remove(pos);
-            } else {
-                existing.member_actor_ids.push(actor_id);
-            }
-            (
-                existing.member_actor_ids.clone(),
-                existing.community_slugs.clone(),
-            )
+        if self.state.list_deleting.contains(&list_id) {
+            return;
+        }
+        let Some(pos) = self.state.lists.iter().position(|l| l.list_id == list_id) else {
+            return;
         };
+        if !self.state.list_membership_last_synced.contains_key(&list_id) {
+            let prev = &self.state.lists[pos];
+            self.state.list_membership_last_synced.insert(
+                list_id.clone(),
+                (
+                    prev.is_pinned,
+                    prev.member_actor_ids.clone(),
+                    prev.community_slugs.clone(),
+                ),
+            );
+        }
+        let existing = &mut self.state.lists[pos];
+        if let Some(idx) = existing
+            .member_actor_ids
+            .iter()
+            .position(|id| id == &actor_id)
+        {
+            existing.member_actor_ids.remove(idx);
+        } else {
+            existing.member_actor_ids.push(actor_id);
+        }
         cx.notify();
-        self.persist_list_membership(list_id, Some(members), Some(slugs), cx);
+        self.enqueue_list_sync(list_id, true, cx);
     }
 
     pub fn toggle_selected_list_community(
@@ -577,67 +636,164 @@ impl CommunityWorkspace {
         slug: String,
         cx: &mut Context<Self>,
     ) {
-        let (members, slugs) = {
-            let Some(existing) = self.state.lists.iter_mut().find(|l| l.list_id == list_id) else {
-                return;
-            };
-            if let Some(pos) = existing
-                .community_slugs
-                .iter()
-                .position(|s| s.eq_ignore_ascii_case(&slug))
-            {
-                existing.community_slugs.remove(pos);
-            } else {
-                existing.community_slugs.push(slug);
-            }
-            (
-                existing.member_actor_ids.clone(),
-                existing.community_slugs.clone(),
-            )
+        if self.state.list_deleting.contains(&list_id) {
+            return;
+        }
+        let Some(pos) = self.state.lists.iter().position(|l| l.list_id == list_id) else {
+            return;
         };
+        if !self.state.list_membership_last_synced.contains_key(&list_id) {
+            let prev = &self.state.lists[pos];
+            self.state.list_membership_last_synced.insert(
+                list_id.clone(),
+                (
+                    prev.is_pinned,
+                    prev.member_actor_ids.clone(),
+                    prev.community_slugs.clone(),
+                ),
+            );
+        }
+        let existing = &mut self.state.lists[pos];
+        if let Some(idx) = existing
+            .community_slugs
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(&slug))
+        {
+            existing.community_slugs.remove(idx);
+        } else {
+            existing.community_slugs.push(slug);
+        }
         cx.notify();
-        self.persist_list_membership(list_id, Some(members), Some(slugs), cx);
+        self.enqueue_list_sync(list_id, true, cx);
     }
 
-    fn persist_list_membership(
-        &mut self,
-        list_id: String,
-        member_actor_ids: Option<Vec<String>>,
-        community_slugs: Option<Vec<String>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.state.list_membership_gen = self.state.list_membership_gen.wrapping_add(1);
-        let my_gen = self.state.list_membership_gen;
+    fn enqueue_list_sync(&mut self, list_id: String, reload_feed: bool, cx: &mut Context<Self>) {
+        if self.state.list_deleting.contains(&list_id) {
+            return;
+        }
+        if reload_feed {
+            self.state
+                .list_membership_needs_feed_reload
+                .insert(list_id.clone());
+        }
+        if self.state.list_membership_in_flight.contains_key(&list_id) {
+            // Single-flight per-list coalescing: NEVER spawn a concurrent update_list!
+            self.state.list_membership_dirty.insert(list_id);
+            return;
+        }
+        self.flush_list_sync(list_id, cx);
+    }
+
+    fn flush_list_sync(&mut self, list_id: String, cx: &mut Context<Self>) {
+        if self.state.list_deleting.contains(&list_id) {
+            self.state.list_membership_dirty.remove(&list_id);
+            self.state.list_membership_needs_feed_reload.remove(&list_id);
+            self.state.list_membership_last_synced.remove(&list_id);
+            return;
+        }
+        let Some(snapshot) = self
+            .state
+            .lists
+            .iter()
+            .find(|x| x.list_id == list_id)
+            .cloned()
+        else {
+            self.state.list_membership_dirty.remove(&list_id);
+            self.state.list_membership_needs_feed_reload.remove(&list_id);
+            self.state.list_membership_last_synced.remove(&list_id);
+            return;
+        };
+
+        self.state.list_membership_dirty.remove(&list_id);
+        self.state.list_membership_flight_seq =
+            self.state.list_membership_flight_seq.wrapping_add(1);
+        let my_flight_seq = self.state.list_membership_flight_seq;
+        let my_actor_epoch = self.state.list_membership_gen;
+        let expected_actor_id = self.state.active_actor_id.clone();
+        self.state
+            .list_membership_in_flight
+            .insert(list_id.clone(), my_flight_seq);
+
         let req = UpdateCommunityListRequest {
-            member_actor_ids,
-            community_slugs,
+            is_pinned: Some(snapshot.is_pinned),
+            member_actor_ids: Some(snapshot.member_actor_ids),
+            community_slugs: Some(snapshot.community_slugs),
             ..Default::default()
         };
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
-        let reload_id = list_id.clone();
+        let req_list_id = list_id.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                facade.update_list(&list_id, &req).await
+                facade.update_list(&req_list_id, &req).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.list_membership_gen != my_gen {
+                // Guard 1: Actor switch occurred (ABA-proof across A -> B -> A).
+                if this.state.list_membership_gen != my_actor_epoch
+                    || this.state.active_actor_id != expected_actor_id
+                {
                     return;
                 }
+                // Guard 2: Flight token ownership.
+                if this.state.list_membership_in_flight.get(&list_id).copied()
+                    != Some(my_flight_seq)
+                {
+                    return;
+                }
+                this.state.list_membership_in_flight.remove(&list_id);
+
+                // Guard 3: List is being deleted or already removed.
+                let Some(pos) = this.state.lists.iter().position(|x| x.list_id == list_id) else {
+                    this.state.list_membership_dirty.remove(&list_id);
+                    this.state.list_membership_needs_feed_reload.remove(&list_id);
+                    this.state.list_membership_last_synced.remove(&list_id);
+                    cx.notify();
+                    return;
+                };
+                if this.state.list_deleting.contains(&list_id) {
+                    this.state.list_membership_dirty.remove(&list_id);
+                    this.state.list_membership_needs_feed_reload.remove(&list_id);
+                    this.state.list_membership_last_synced.remove(&list_id);
+                    cx.notify();
+                    return;
+                }
+
+                let is_dirty = this.state.list_membership_dirty.remove(&list_id);
                 match res {
                     Ok(Ok(updated)) => {
-                        if let Some(pos) = this
-                            .state
-                            .lists
-                            .iter()
-                            .position(|x| x.list_id == updated.list_id)
-                        {
-                            this.state.lists[pos] = updated;
+                        this.state.list_membership_last_synced.insert(
+                            list_id.clone(),
+                            (
+                                updated.is_pinned,
+                                updated.member_actor_ids.clone(),
+                                updated.community_slugs.clone(),
+                            ),
+                        );
+                        if is_dirty {
+                            // Preserve optimistic state.lists[pos] and flush strictly next.
+                            this.flush_list_sync(list_id, cx);
+                            return;
                         }
-                        this.load_selected_list_feed(reload_id, cx);
+                        this.state.lists[pos] = updated;
+                        this.state.list_membership_last_synced.remove(&list_id);
+                        if this.state.list_membership_needs_feed_reload.remove(&list_id)
+                            && this.state.selected_list_id.as_deref() == Some(list_id.as_str())
+                        {
+                            this.load_selected_list_feed(list_id, cx);
+                        }
                     }
                     Ok(Err(e)) => {
+                        this.state.list_membership_dirty.remove(&list_id);
+                        this.state.list_membership_needs_feed_reload.remove(&list_id);
+                        if let Some((prev_pinned, prev_members, prev_slugs)) =
+                            this.state.list_membership_last_synced.remove(&list_id)
+                        {
+                            let entry = &mut this.state.lists[pos];
+                            entry.is_pinned = prev_pinned;
+                            entry.member_actor_ids = prev_members;
+                            entry.community_slugs = prev_slugs;
+                        }
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: e.to_string(),
@@ -646,7 +802,18 @@ impl CommunityWorkspace {
                             cx,
                         );
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        this.state.list_membership_dirty.remove(&list_id);
+                        this.state.list_membership_needs_feed_reload.remove(&list_id);
+                        if let Some((prev_pinned, prev_members, prev_slugs)) =
+                            this.state.list_membership_last_synced.remove(&list_id)
+                        {
+                            let entry = &mut this.state.lists[pos];
+                            entry.is_pinned = prev_pinned;
+                            entry.member_actor_ids = prev_members;
+                            entry.community_slugs = prev_slugs;
+                        }
+                    }
                 }
                 cx.notify();
             });

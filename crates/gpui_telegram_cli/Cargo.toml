@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 gpui_telegram_core = { workspace = true }
 gpui_telegram_proto = { workspace = true }
+orca_core = { workspace = true }
 fabushi_remote_engine = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

@@ -261,6 +261,18 @@ pub(crate) fn try_consume_global(
             opts.output_format = Some(fmt);
             Ok(GlobalConsumeResult::Consumed)
         }
+        "--json" if eq_val.is_none() => {
+            let next_is_payload = args.get(*idx + 1).is_some_and(|next| {
+                let t = next.trim();
+                t == "-" || t.starts_with('{') || t.starts_with('[')
+            });
+            if next_is_payload {
+                Ok(GlobalConsumeResult::NotGlobal)
+            } else {
+                opts.output_format = Some(OutputFormat::Json);
+                Ok(GlobalConsumeResult::Consumed)
+            }
+        }
         "--json-output" => {
             if eq_val.is_some() {
                 return Err(CliError::Usage(
