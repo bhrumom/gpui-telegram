@@ -182,6 +182,9 @@ impl CommunityWorkspace {
         } else {
             None
         };
+        let target_kind_cb = target_kind.clone();
+        let target_id_cb = target_id.clone();
+        let flair_cb = flair.clone();
         let req = ModActionRequest {
             action,
             target_kind,
@@ -204,6 +207,17 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != submitter_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reconcile_mod_action_caches_and_routes(
+                            &reload_slug,
+                            action,
+                            &target_kind_cb,
+                            &target_id_cb,
+                            flair_cb.as_deref(),
+                            false,
+                            cx,
+                        );
+                    }
                     return;
                 }
                 let lang = this.language_id.clone();
@@ -211,14 +225,15 @@ impl CommunityWorkspace {
                     Ok(Ok(_)) => {
                         this.state.mod_reason_draft.clear();
                         this.state.mod_flair_draft.clear();
-                        if this
-                            .state
-                            .mod_slug
-                            .as_deref()
-                            .is_some_and(|s| s.eq_ignore_ascii_case(&reload_slug))
-                        {
-                            this.load_mod_queue(reload_slug, cx);
-                        }
+                        this.reconcile_mod_action_caches_and_routes(
+                            &reload_slug,
+                            action,
+                            &target_kind_cb,
+                            &target_id_cb,
+                            flair_cb.as_deref(),
+                            true,
+                            cx,
+                        );
                         this.emit_action(
                             CommunityWorkspaceAction::ShowToast {
                                 text: tr_str(&lang, "审核操作已执行", "Moderation action applied")
@@ -386,15 +401,13 @@ impl CommunityWorkspace {
         };
         let slug = comm.slug.clone();
         let slug_key = slug.to_ascii_lowercase();
+        let mut next_rules = comm.automod_rules.clone();
+        next_rules.push(new_rule);
         self.state
             .automod_last_synced
             .entry(slug_key)
             .or_insert_with(|| comm.automod_rules.clone());
-        if let Some(ref mut mc) = self.state.mod_community {
-            if mc.slug.eq_ignore_ascii_case(&slug) {
-                mc.automod_rules.push(new_rule);
-            }
-        }
+        self.state.patch_community_automod_rules(&slug, &next_rules);
         self.persist_automod_rules(slug, true, cx);
     }
 
@@ -411,17 +424,17 @@ impl CommunityWorkspace {
             return;
         };
         let slug_key = slug.to_ascii_lowercase();
+        let mut next_rules = prev_rules.clone();
+        for r in &mut next_rules {
+            if r.rule_id == rule_id {
+                r.enabled = !r.enabled;
+            }
+        }
         self.state
             .automod_last_synced
             .entry(slug_key)
             .or_insert(prev_rules);
-        if let Some(ref mut mc) = self.state.mod_community {
-            for r in &mut mc.automod_rules {
-                if r.rule_id == rule_id {
-                    r.enabled = !r.enabled;
-                }
-            }
-        }
+        self.state.patch_community_automod_rules(&slug, &next_rules);
         self.persist_automod_rules(slug, false, cx);
     }
 
@@ -438,13 +451,13 @@ impl CommunityWorkspace {
             return;
         };
         let slug_key = slug.to_ascii_lowercase();
+        let mut next_rules = prev_rules.clone();
+        next_rules.retain(|r| r.rule_id != rule_id);
         self.state
             .automod_last_synced
             .entry(slug_key)
             .or_insert(prev_rules);
-        if let Some(ref mut mc) = self.state.mod_community {
-            mc.automod_rules.retain(|r| r.rule_id != rule_id);
-        }
+        self.state.patch_community_automod_rules(&slug, &next_rules);
         self.persist_automod_rules(slug, false, cx);
     }
 
@@ -455,7 +468,14 @@ impl CommunityWorkspace {
         }
         if self.state.automod_in_flight.contains_key(&slug_key) {
             self.state.automod_dirty.insert(slug_key);
-            self.state.automod_draft.saving = true;
+            if self
+                .state
+                .mod_slug
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&slug))
+            {
+                self.state.automod_draft.saving = true;
+            }
             cx.notify();
             return;
         }
@@ -470,11 +490,20 @@ impl CommunityWorkspace {
             .as_ref()
             .filter(|c| c.slug.eq_ignore_ascii_case(&slug))
             .map(|c| c.automod_rules.clone())
+            .or_else(|| {
+                self.state
+                    .find_community(&slug)
+                    .map(|c| c.automod_rules.clone())
+            })
         else {
             self.state.automod_dirty.remove(&slug_key);
             self.state.automod_reset_draft_pending.remove(&slug_key);
             self.state.automod_last_synced.remove(&slug_key);
-            self.state.automod_draft.saving = !self.state.automod_in_flight.is_empty();
+            self.state.automod_draft.saving = self
+                .state
+                .mod_slug
+                .as_deref()
+                .is_some_and(|s| self.state.automod_in_flight.contains_key(&s.to_ascii_lowercase()));
             cx.notify();
             return;
         };
@@ -487,8 +516,15 @@ impl CommunityWorkspace {
         self.state
             .automod_in_flight
             .insert(slug_key.clone(), my_flight_seq);
-        self.state.automod_draft.saving = true;
-        self.state.automod_draft.error = None;
+        if self
+            .state
+            .mod_slug
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(&slug))
+        {
+            self.state.automod_draft.saving = true;
+            self.state.automod_draft.error = None;
+        }
 
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
@@ -506,10 +542,44 @@ impl CommunityWorkspace {
             let _ = weak.update(app, |this, cx| {
                 // Fence 1: Actor switch occurred (ABA-proof via actor_switch_gen + actor_id).
                 // Never clear another actor's saving state or write submitter's `viewer_role`
-                // into `mod_community`, `communities`, or `community_detail`.
+                // into `mod_community`, `communities`, or `community_detail`; still apply
+                // public field-scoped `automod_rules` patch + Case B reloads on commit.
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != submitter_actor_id
                 {
+                    if let Ok(Ok(updated)) = res {
+                        this.state.automod_rules_gen =
+                            this.state.automod_rules_gen.wrapping_add(1);
+                        this.state
+                            .patch_community_automod_rules(&updated.slug, &updated.automod_rules);
+                        if this.state.communities_loading {
+                            this.reload_communities_list(cx);
+                        }
+                        if this.state.community_loading
+                            && matches!(
+                                &this.state.route,
+                                CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(&slug)
+                            )
+                        {
+                            this.load_community_page(slug.clone(), cx);
+                        }
+                        if this.state.mod_loading
+                            && this
+                                .state
+                                .mod_slug
+                                .as_deref()
+                                .is_some_and(|s| s.eq_ignore_ascii_case(&slug))
+                        {
+                            this.load_mod_queue(slug, cx);
+                        }
+                        if this.state.search_loading
+                            && matches!(this.state.route, CommunityRoute::Explore { .. })
+                        {
+                            let q = this.state.explore_search_draft.trim().to_string();
+                            this.execute_search(q, this.state.search_tab, cx);
+                        }
+                        cx.notify();
+                    }
                     return;
                 }
                 // Fence 2: Flight token ownership.
@@ -533,31 +603,46 @@ impl CommunityWorkspace {
                         this.state
                             .automod_last_synced
                             .insert(slug_key.clone(), updated.automod_rules.clone());
-                        let effective_rules = if is_dirty && still_same_slug {
+                        let effective_rules = if is_dirty {
                             this.state
                                 .mod_community
                                 .as_ref()
                                 .filter(|mc| mc.slug.eq_ignore_ascii_case(&updated.slug))
                                 .map(|mc| mc.automod_rules.clone())
+                                .or_else(|| {
+                                    this.state
+                                        .find_community(&updated.slug)
+                                        .map(|c| c.automod_rules.clone())
+                                })
                                 .unwrap_or_else(|| updated.automod_rules.clone())
                         } else {
                             updated.automod_rules.clone()
                         };
                         this.state
                             .patch_community_automod_rules(&updated.slug, &effective_rules);
-                        if this.state.automod_reset_draft_pending.remove(&slug_key) {
+                        if this.state.automod_reset_draft_pending.remove(&slug_key)
+                            && still_same_slug
+                        {
                             this.state.automod_draft = AutoModRuleDraft::default();
                             if this.state.active_input.is_automod_input() {
                                 this.state.blur_input();
                             }
                         }
-                        if is_dirty && still_same_slug {
+                        if is_dirty {
                             // Newer optimistic rule toggles arrived mid-flight: preserve optimistic
-                            // `mod_community.automod_rules` and flush latest snapshot strictly next.
+                            // `automod_rules` and flush latest snapshot strictly next (even across slug switches).
                             this.flush_automod_rules_sync(slug, cx);
                             return;
                         }
-                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
+                        this.state.automod_draft.saving = this
+                            .state
+                            .mod_slug
+                            .as_deref()
+                            .is_some_and(|s| {
+                                this.state
+                                    .automod_in_flight
+                                    .contains_key(&s.to_ascii_lowercase())
+                            });
                         this.state.automod_last_synced.remove(&slug_key);
                         if still_same_slug {
                             let need_seed_mod_comm = this
@@ -597,19 +682,29 @@ impl CommunityWorkspace {
                             let q = this.state.explore_search_draft.trim().to_string();
                             this.execute_search(q, this.state.search_tab, cx);
                         }
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "AutoMod 规则已更新", "AutoMod rules saved")
-                                    .to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
+                        if still_same_slug {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "AutoMod 规则已更新", "AutoMod rules saved")
+                                        .to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Ok(Err(e)) => {
                         this.state.automod_dirty.remove(&slug_key);
                         this.state.automod_reset_draft_pending.remove(&slug_key);
-                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
+                        this.state.automod_draft.saving = this
+                            .state
+                            .mod_slug
+                            .as_deref()
+                            .is_some_and(|s| {
+                                this.state
+                                    .automod_in_flight
+                                    .contains_key(&s.to_ascii_lowercase())
+                            });
                         if let Some(prev_rules) = this.state.automod_last_synced.remove(&slug_key) {
                             this.state.patch_community_automod_rules(&slug, &prev_rules);
                         }
@@ -633,12 +728,22 @@ impl CommunityWorkspace {
                             let q = this.state.explore_search_draft.trim().to_string();
                             this.execute_search(q, this.state.search_tab, cx);
                         }
-                        this.state.automod_draft.error = Some(e.to_string());
+                        if still_same_slug {
+                            this.state.automod_draft.error = Some(e.to_string());
+                        }
                     }
                     Err(e) => {
                         this.state.automod_dirty.remove(&slug_key);
                         this.state.automod_reset_draft_pending.remove(&slug_key);
-                        this.state.automod_draft.saving = !this.state.automod_in_flight.is_empty();
+                        this.state.automod_draft.saving = this
+                            .state
+                            .mod_slug
+                            .as_deref()
+                            .is_some_and(|s| {
+                                this.state
+                                    .automod_in_flight
+                                    .contains_key(&s.to_ascii_lowercase())
+                            });
                         if let Some(prev_rules) = this.state.automod_last_synced.remove(&slug_key) {
                             this.state.patch_community_automod_rules(&slug, &prev_rules);
                         }
@@ -662,7 +767,9 @@ impl CommunityWorkspace {
                             let q = this.state.explore_search_draft.trim().to_string();
                             this.execute_search(q, this.state.search_tab, cx);
                         }
-                        this.state.automod_draft.error = Some(e);
+                        if still_same_slug {
+                            this.state.automod_draft.error = Some(e);
+                        }
                     }
                 }
                 cx.notify();

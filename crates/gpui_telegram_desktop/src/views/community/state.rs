@@ -9,10 +9,10 @@ use gpui_telegram_proto::community_contracts::{
     CommunityCommentDto, CommunityDetailResponse, CommunityListDto, CommunityListKind,
     CommunityMemberRole, CommunityNotificationDto, CommunityNotificationKind, CommunityPostDto,
     CommunityRuleDto, CommunitySearchResultDto, CommunitySearchSort, CommunitySearchTab,
-    FeedItemDto, FeedSort, FeedTab, FollowActionResponse, JoinCommunityResponse, ModLogEntryDto,
-    ModQueueItemDto, ModQueueStatus, PollDto, PostAwardDto, PostDetailResponse, PostStatus,
-    RepostResponse, SubCommunityDto, TimeWindow, ToggleActionResponse, TrendingTopicDto,
-    VoteResponse,
+    FeedItemDto, FeedSort, FeedTab, FollowActionResponse, JoinCommunityResponse, ModActionKind,
+    ModLogEntryDto, ModQueueItemDto, ModQueueStatus, PollDto, PostAwardDto, PostDetailResponse,
+    PostStatus, RepostResponse, SubCommunityDto, TimeWindow, ToggleActionResponse,
+    TrendingTopicDto, VoteResponse,
 };
 
 use crate::views::composer::formatting_bar::TextStyleKind;
@@ -751,6 +751,7 @@ pub struct CommunityWorkspaceState {
     pub active_actor_id: String,
     pub known_owned_actor_ids: HashSet<String>,
     pub runtime_mode: CommunityRuntimeMode,
+    pub identities_loading: bool,
     pub identities_gen: u64,
     pub actor_switch_gen: u64,
 
@@ -850,6 +851,8 @@ pub struct CommunityWorkspaceState {
     pub detail_edit_comment_draft: String,
     pub detail_edit_comment_saving: bool,
     pub detail_edit_comment_save_seq: u64,
+    /// Monotonic per-comment edit sequence (bumped ONLY on save start; NEVER bumped on nav or actor switch).
+    pub comment_edit_entity_save_seq: HashMap<String, u64>,
     pub detail_loading_more_comment_ids: HashSet<String>,
     pub detail_comment_more_cursors: HashMap<String, String>,
     pub detail_summon_bot_id: Option<String>,
@@ -864,6 +867,9 @@ pub struct CommunityWorkspaceState {
 
     // F18 Rich Multi-Format Composer modal state
     pub composer: ComposerModalState,
+    /// Monotonic per-post edit/publish sequence across `submit_composer` Edit & `publish_draft_now`
+    /// (bumped ONLY on save start; NEVER cleared on nav or actor switch).
+    pub post_edit_entity_save_seq: HashMap<String, u64>,
 
     // F19 Community Page & Create Community modal state
     pub community_detail: Option<CommunityDetailResponse>,
@@ -882,10 +888,14 @@ pub struct CommunityWorkspaceState {
     pub community_wiki_preview_rev: Option<u32>,
     pub community_wiki_saving: bool,
     pub community_wiki_save_seq: u64,
+    /// Monotonic per-slug wiki save sequence (bumped ONLY on save start; NEVER bumped on nav or actor switch).
+    pub community_wiki_entity_save_seq: HashMap<String, u64>,
     pub community_new_rule_title: String,
     pub community_new_rule_desc: String,
     pub community_rules_saving: bool,
     pub community_rules_save_seq: u64,
+    /// Monotonic per-slug rules save sequence (bumped ONLY on save start; NEVER bumped on nav or actor switch).
+    pub community_rules_entity_save_seq: HashMap<String, u64>,
     pub create_community: CreateCommunityDraft,
     pub community_loading: bool,
     pub community_error: Option<String>,
@@ -1037,6 +1047,7 @@ impl Default for CommunityWorkspaceState {
             active_actor_id: String::new(),
             known_owned_actor_ids: HashSet::new(),
             runtime_mode: CommunityRuntimeMode::LocalFallback,
+            identities_loading: false,
             identities_gen: 0,
             actor_switch_gen: 0,
             active_tab: FeedTab::ForYou,
@@ -1126,6 +1137,7 @@ impl Default for CommunityWorkspaceState {
             detail_edit_comment_draft: String::new(),
             detail_edit_comment_saving: false,
             detail_edit_comment_save_seq: 0,
+            comment_edit_entity_save_seq: HashMap::new(),
             detail_loading_more_comment_ids: HashSet::new(),
             detail_comment_more_cursors: HashMap::new(),
             detail_summon_bot_id: None,
@@ -1138,6 +1150,7 @@ impl Default for CommunityWorkspaceState {
             detail_error: None,
             detail_gen: 0,
             composer: ComposerModalState::default(),
+            post_edit_entity_save_seq: HashMap::new(),
             community_detail: None,
             community_posts: Vec::new(),
             community_tab: CommunityPageTab::Posts,
@@ -1154,10 +1167,12 @@ impl Default for CommunityWorkspaceState {
             community_wiki_preview_rev: None,
             community_wiki_saving: false,
             community_wiki_save_seq: 0,
+            community_wiki_entity_save_seq: HashMap::new(),
             community_new_rule_title: String::new(),
             community_new_rule_desc: String::new(),
             community_rules_saving: false,
             community_rules_save_seq: 0,
+            community_rules_entity_save_seq: HashMap::new(),
             create_community: CreateCommunityDraft::default(),
             community_loading: false,
             community_error: None,
@@ -1953,7 +1968,8 @@ impl CommunityWorkspaceState {
         }
     }
 
-    /// Removes a deleted post from all feed/community/saved/profile/search caches.
+    /// Removes a deleted post from all feed/community/saved/profile/search/detail-chain caches
+    /// and clears per-post flight & UI state.
     pub fn remove_post_from_caches(&mut self, post_id: &str) {
         self.feed_items.retain(|i| i.post.post_id != post_id);
         self.community_posts.retain(|i| i.post.post_id != post_id);
@@ -1968,7 +1984,36 @@ impl CommunityWorkspaceState {
         if let Some(ref mut sr) = self.search_result {
             sr.posts.retain(|p| p.post_id != post_id);
         }
+        if let Some(ref mut det) = self.detail_post {
+            det.thread_chain.retain(|p| p.post_id != post_id);
+            det.quote_chain.retain(|p| p.post_id != post_id);
+        }
         self.composer.drafts.retain(|p| p.post_id != post_id);
+        if self
+            .composer
+            .origin_preview
+            .as_ref()
+            .is_some_and(|p| p.post_id == post_id)
+        {
+            self.composer.origin_preview = None;
+        }
+        if self.bookmark_moving_post_id.as_deref() == Some(post_id) {
+            self.bookmark_moving_post_id = None;
+        }
+        self.revealed_post_veils.remove(post_id);
+        self.poll_breakdown_by_post.remove(post_id);
+        self.hidden_post_ids.remove(post_id);
+        if matches!(
+            &self.active_popover,
+            Some(
+                CommunityPopover::ExplainPost(id)
+                    | CommunityPopover::AwardPost(id)
+                    | CommunityPopover::QuotePost(id)
+                    | CommunityPopover::SummonBotPicker(id)
+            ) if id == post_id
+        ) {
+            self.active_popover = None;
+        }
         self.bookmark_in_flight.remove(post_id);
         self.bookmark_dirty.remove(post_id);
         self.bookmark_pending_target.remove(post_id);
@@ -1991,6 +2036,153 @@ impl CommunityWorkspaceState {
         self.poll_vote_dirty.remove(post_id);
         self.poll_vote_pending_options.remove(post_id);
         self.poll_vote_last_synced.remove(post_id);
+    }
+
+    /// Removes a deleted comment from all client caches (hard-removing leaf comments and
+    /// tombstoning parent comments in `detail_post.comments` to preserve child subtrees,
+    /// while unconditionally pruning `actor_profile.recent_comments`), clearing per-comment
+    /// flight/UI state and decrementing post comment counts once.
+    pub fn remove_comment_from_caches(&mut self, comment_id: &str) {
+        let found_meta = self
+            .find_comment(comment_id)
+            .map(|c| (c.post_id.clone(), !c.is_deleted && !c.is_removed));
+        self.comment_vote_in_flight.remove(comment_id);
+        self.comment_vote_dirty.remove(comment_id);
+        self.comment_vote_pending_dir.remove(comment_id);
+        self.comment_vote_last_synced.remove(comment_id);
+        self.comment_like_in_flight.remove(comment_id);
+        self.comment_like_pending_toggle.remove(comment_id);
+        self.comment_like_pending_liked.remove(comment_id);
+        self.comment_like_last_synced.remove(comment_id);
+        self.detail_collapsed_comments.remove(comment_id);
+        self.detail_loading_more_comment_ids.remove(comment_id);
+        self.detail_comment_more_cursors.remove(comment_id);
+        if self.detail_reply_parent_id.as_deref() == Some(comment_id) {
+            self.detail_reply_parent_id = None;
+        }
+        if self.detail_focused_comment_id.as_deref() == Some(comment_id) {
+            self.detail_focused_comment_id = None;
+        }
+        if matches!(
+            &self.active_popover,
+            Some(CommunityPopover::AwardComment(id)) if id == comment_id
+        ) {
+            self.active_popover = None;
+        }
+        if self.detail_editing_comment_id.as_deref() == Some(comment_id) {
+            self.detail_editing_comment_id = None;
+            self.detail_edit_comment_draft.clear();
+            if self.active_input == ActiveCommunityInput::DetailEditComment {
+                self.blur_input();
+            }
+        }
+        if let Some(ref mut prof) = self.actor_profile {
+            prof.recent_comments.retain(|c| c.comment_id != comment_id);
+        }
+        fn prune_or_tombstone(nodes: &mut Vec<CommunityCommentDto>, cid: &str) -> bool {
+            if let Some(idx) = nodes.iter().position(|c| c.comment_id == cid) {
+                let has_children =
+                    !nodes[idx].children.is_empty() || nodes[idx].more_children_count > 0;
+                if has_children {
+                    nodes[idx].body = "[deleted]".to_string();
+                    nodes[idx].is_deleted = true;
+                    nodes[idx].is_removed = true;
+                } else {
+                    nodes.remove(idx);
+                }
+                return true;
+            }
+            for n in nodes.iter_mut() {
+                if prune_or_tombstone(&mut n.children, cid) {
+                    return true;
+                }
+            }
+            false
+        }
+        if let Some(ref mut det) = self.detail_post {
+            prune_or_tombstone(&mut det.comments, comment_id);
+        }
+        if let Some((post_id, true)) = found_meta {
+            if let Some(ref mut det) = self.detail_post {
+                if det.post.post_id == post_id {
+                    det.total_comments = det.total_comments.saturating_sub(1);
+                }
+            }
+            self.visit_post_mut(&post_id, |p| {
+                p.comments_count = p.comments_count.saturating_sub(1);
+            });
+        }
+    }
+
+    /// Applies public moderation action state changes across all cached posts/comments.
+    pub fn apply_mod_action_to_caches(
+        &mut self,
+        action: ModActionKind,
+        target_kind: &str,
+        target_id: &str,
+        flair: Option<&str>,
+    ) {
+        if target_kind.eq_ignore_ascii_case("post") {
+            match action {
+                ModActionKind::Remove => {
+                    self.remove_post_from_caches(target_id);
+                    if let Some(ref mut det) = self.detail_post {
+                        if det.post.post_id == target_id {
+                            det.post.is_removed = true;
+                        }
+                    }
+                }
+                ModActionKind::Approve => {
+                    self.visit_post_mut(target_id, |p| p.is_removed = false);
+                }
+                ModActionKind::Lock | ModActionKind::Unlock => {
+                    let locked = action == ModActionKind::Lock;
+                    self.visit_post_mut(target_id, |p| p.is_locked = locked);
+                }
+                ModActionKind::Pin | ModActionKind::Unpin => {
+                    let pinned = action == ModActionKind::Pin;
+                    self.visit_post_mut(target_id, |p| p.is_pinned = pinned);
+                    if !pinned {
+                        if let Some(ref mut cdet) = self.community_detail {
+                            cdet.pinned_posts.retain(|p| p.post_id != target_id);
+                        }
+                    }
+                }
+                ModActionKind::Distinguish | ModActionKind::Undistinguish => {
+                    let dist = action == ModActionKind::Distinguish;
+                    self.visit_post_mut(target_id, |p| p.is_mod_distinguished = dist);
+                }
+                ModActionKind::SetPostFlair => {
+                    let next_flair = flair
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string);
+                    self.visit_post_mut(target_id, |p| p.flair = next_flair.clone());
+                }
+                _ => {}
+            }
+        } else if target_kind.eq_ignore_ascii_case("comment") {
+            match action {
+                ModActionKind::Remove => {
+                    self.visit_comment_mut(target_id, |c| c.is_removed = true);
+                    if let Some(ref mut prof) = self.actor_profile {
+                        prof.recent_comments.retain(|c| c.comment_id != target_id);
+                    }
+                }
+                ModActionKind::Approve => {
+                    self.visit_comment_mut(target_id, |c| c.is_removed = false);
+                }
+                ModActionKind::Pin | ModActionKind::Unpin => {
+                    let stickied = action == ModActionKind::Pin;
+                    self.visit_comment_mut(target_id, |c| c.is_stickied = stickied);
+                }
+                ModActionKind::Distinguish | ModActionKind::Undistinguish => {
+                    let dist = action == ModActionKind::Distinguish;
+                    self.visit_comment_mut(target_id, |c| c.is_mod_distinguished = dist);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Optimistically applies a vote toggle (`1 | -1`, toggling to `0` if already active).
@@ -2513,6 +2705,150 @@ impl CommunityWorkspaceState {
         }
     }
 
+    /// Surgical upsert for a newly registered Bot citizen into `state.identities` (Dead End #4):
+    /// NEVER overwrites `state.identities` with a full snapshot, preserving concurrent edits on
+    /// sibling owned Human/Bot actors.
+    pub fn upsert_registered_bot_actor(&mut self, actor: &CommunityActorDto) {
+        if let Some(ref mut ids) = self.identities {
+            if let Some(ex) = ids
+                .bot_actors
+                .iter_mut()
+                .find(|b| b.actor_id == actor.actor_id)
+            {
+                apply_edited_actor_metadata(ex, actor);
+            } else {
+                ids.bot_actors.push(actor.clone());
+            }
+            if let Some(ex) = ids
+                .all_actors
+                .iter_mut()
+                .find(|a| a.actor_id == actor.actor_id)
+            {
+                apply_edited_actor_metadata(ex, actor);
+            } else {
+                ids.all_actors.push(actor.clone());
+            }
+        }
+    }
+
+    /// Synchronously scrubs ALL viewer-specific flags across retained caches and drops off-route
+    /// secondary snapshots on `switch_active_actor`, preventing stale Actor A state leakage and
+    /// `find_actor` / `find_post` off-route shadowing.
+    pub fn scrub_viewer_state_on_actor_switch(&mut self) {
+        fn scrub_actor(a: &mut CommunityActorDto) {
+            a.is_following = false;
+            a.is_muted = false;
+            a.is_blocked = false;
+        }
+        fn scrub_community(c: &mut SubCommunityDto) {
+            c.viewer_role = None;
+            c.is_joined = false;
+            c.notifications_enabled = false;
+        }
+        fn scrub_post(p: &mut CommunityPostDto) {
+            p.viewer_vote = 0;
+            p.viewer_liked = false;
+            p.viewer_reposted = false;
+            p.viewer_bookmarked = false;
+            p.viewer_bookmark_folder = None;
+            if let Some(ref mut poll) = p.poll {
+                poll.viewer_voted_option_ids.clear();
+            }
+        }
+        fn scrub_comments(cs: &mut [CommunityCommentDto]) {
+            for c in cs {
+                c.viewer_vote = 0;
+                c.viewer_liked = false;
+                if !c.children.is_empty() {
+                    scrub_comments(&mut c.children);
+                }
+            }
+        }
+
+        if let Some(ref mut ids) = self.identities {
+            ids.active_actor_id = self.active_actor_id.clone();
+            if let Some(ref mut h) = ids.human_actor {
+                scrub_actor(h);
+            }
+            for b in &mut ids.bot_actors {
+                scrub_actor(b);
+            }
+            for a in &mut ids.all_actors {
+                scrub_actor(a);
+            }
+        }
+        for a in &mut self.recommended_actors {
+            scrub_actor(a);
+        }
+        if matches!(self.route, CommunityRoute::ActorProfile(_)) {
+            if let Some(ref mut prof) = self.actor_profile {
+                scrub_actor(&mut prof.actor);
+                for p in &mut prof.recent_posts {
+                    scrub_post(p);
+                }
+                scrub_comments(&mut prof.recent_comments);
+            }
+        } else {
+            self.actor_profile = None;
+        }
+        if matches!(self.route, CommunityRoute::Explore { .. }) {
+            if let Some(ref mut sr) = self.search_result {
+                for a in &mut sr.actors {
+                    scrub_actor(a);
+                }
+                for p in &mut sr.posts {
+                    scrub_post(p);
+                }
+                for c in &mut sr.communities {
+                    scrub_community(c);
+                }
+            }
+        } else {
+            self.search_result = None;
+        }
+        if matches!(self.route, CommunityRoute::CommunityPage(_)) {
+            if let Some(ref mut det) = self.community_detail {
+                scrub_community(&mut det.community);
+                for m in &mut det.moderators {
+                    scrub_actor(m);
+                }
+                for p in &mut det.pinned_posts {
+                    scrub_post(p);
+                }
+            }
+            for it in &mut self.community_posts {
+                scrub_post(&mut it.post);
+            }
+        } else {
+            self.community_detail = None;
+            self.community_posts.clear();
+            self.community_next_cursor = None;
+        }
+        for c in &mut self.communities {
+            scrub_community(c);
+        }
+        if matches!(self.route, CommunityRoute::PostDetail(_)) {
+            if let Some(ref mut det) = self.detail_post {
+                scrub_post(&mut det.post);
+                for p in &mut det.thread_chain {
+                    scrub_post(p);
+                }
+                for p in &mut det.quote_chain {
+                    scrub_post(p);
+                }
+                scrub_comments(&mut det.comments);
+            }
+        } else {
+            self.detail_post = None;
+        }
+        for it in &mut self.feed_items {
+            scrub_post(&mut it.post);
+        }
+        self.notifications.clear();
+        self.unread_notifications = 0;
+        self.community_bell_enabled.clear();
+    }
+
     pub fn reconcile_mute_block(
         &mut self,
         actor_id: &str,
@@ -2795,12 +3131,34 @@ impl CommunityWorkspaceState {
             }
         }
         if self.automod_in_flight.contains_key(&slug_key) || self.automod_dirty.contains(&slug_key) {
-            if let Some(mc) = self
+            if let Some(rules) = self
                 .mod_community
                 .as_ref()
                 .filter(|c| c.slug.eq_ignore_ascii_case(&comm.slug))
+                .map(|c| &c.automod_rules)
+                .or_else(|| {
+                    self.communities
+                        .iter()
+                        .find(|c| c.slug.eq_ignore_ascii_case(&comm.slug))
+                        .map(|c| &c.automod_rules)
+                })
+                .or_else(|| {
+                    self.community_detail
+                        .as_ref()
+                        .map(|d| &d.community)
+                        .filter(|c| c.slug.eq_ignore_ascii_case(&comm.slug))
+                        .map(|c| &c.automod_rules)
+                })
+                .or_else(|| {
+                    self.search_result.as_ref().and_then(|sr| {
+                        sr.communities
+                            .iter()
+                            .find(|c| c.slug.eq_ignore_ascii_case(&comm.slug))
+                            .map(|c| &c.automod_rules)
+                    })
+                })
             {
-                comm.automod_rules = mc.automod_rules.clone();
+                comm.automod_rules = rules.clone();
             }
         }
     }

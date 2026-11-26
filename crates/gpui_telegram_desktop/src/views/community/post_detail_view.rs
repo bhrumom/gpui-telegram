@@ -171,9 +171,17 @@ impl CommunityWorkspace {
                 CommunityRoute::PostDetail(p) => Some(p.clone()),
                 _ => None,
             });
+        let cid_cb = cid.clone();
         self.state.detail_edit_comment_save_seq =
             self.state.detail_edit_comment_save_seq.wrapping_add(1);
-        let my_save_seq = self.state.detail_edit_comment_save_seq;
+        let my_session_seq = self.state.detail_edit_comment_save_seq;
+        let entity_entry = self
+            .state
+            .comment_edit_entity_save_seq
+            .entry(cid.clone())
+            .or_insert(0);
+        *entity_entry = entity_entry.wrapping_add(1);
+        let my_entity_seq = *entity_entry;
         self.state.detail_edit_comment_saving = true;
         let req = UpdateCommentRequest { body };
         let my_actor_gen = self.state.actor_switch_gen;
@@ -187,26 +195,32 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen
-                    || this.state.active_actor_id != expected_actor_id
-                {
-                    return;
-                }
-                let still_current_save = this.state.detail_edit_comment_save_seq == my_save_seq;
-                if still_current_save {
+                let same_actor = this.state.actor_switch_gen == my_actor_gen
+                    && this.state.active_actor_id == expected_actor_id;
+                let still_current_editor_session =
+                    same_actor && this.state.detail_edit_comment_save_seq == my_session_seq;
+                let is_latest_entity_save = this
+                    .state
+                    .comment_edit_entity_save_seq
+                    .get(&cid_cb)
+                    .copied()
+                    == Some(my_entity_seq);
+                if still_current_editor_session {
                     this.state.detail_edit_comment_saving = false;
                 }
                 match res {
                     Ok(Ok(updated)) => {
-                        if still_current_save {
+                        if is_latest_entity_save {
                             this.state.visit_comment_mut(&updated.comment_id, |c| {
                                 c.body = updated.body.clone();
                                 c.updated_at_ms = c.updated_at_ms.max(updated.updated_at_ms);
                             });
+                        }
+                        if still_current_editor_session {
                             this.cancel_edit_comment(cx);
                         }
                         this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
-                        if still_current_save {
+                        if still_current_editor_session {
                             let lang = this.language_id.clone();
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast {
@@ -219,7 +233,7 @@ impl CommunityWorkspace {
                         cx.notify();
                     }
                     Ok(Err(e)) => {
-                        if still_current_save {
+                        if still_current_editor_session {
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast {
                                     text: e.to_string(),
@@ -227,11 +241,13 @@ impl CommunityWorkspace {
                                 },
                                 cx,
                             );
+                            cx.notify();
                         }
-                        cx.notify();
                     }
                     Err(_) => {
-                        cx.notify();
+                        if still_current_editor_session {
+                            cx.notify();
+                        }
                     }
                 }
             });
@@ -298,6 +314,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
+                    }
                     return;
                 }
                 if this.state.comment_vote_in_flight.get(&comment_id).copied()
@@ -426,6 +445,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
+                    }
                     return;
                 }
                 if this.state.comment_like_in_flight.get(&comment_id).copied()
@@ -508,6 +530,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_comment_route_if_loading(detail_pid.as_deref(), cx);
+                    }
                     return;
                 }
                 match res {
@@ -538,15 +563,6 @@ impl CommunityWorkspace {
     }
 
     pub fn delete_comment_action(&mut self, comment_id: String, cx: &mut Context<Self>) {
-        let reload_pid = self
-            .state
-            .detail_post
-            .as_ref()
-            .map(|d| d.post.post_id.clone())
-            .or_else(|| match &self.state.route {
-                CommunityRoute::PostDetail(p) => Some(p.clone()),
-                _ => None,
-            });
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
@@ -558,48 +574,38 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen
-                    || this.state.active_actor_id != expected_actor_id
-                {
-                    return;
-                }
+                let same_actor = this.state.actor_switch_gen == my_actor_gen
+                    && this.state.active_actor_id == expected_actor_id;
                 match res {
                     Ok(Ok(_)) => {
-                        this.state.comment_vote_in_flight.remove(&comment_id);
-                        this.state.comment_vote_dirty.remove(&comment_id);
-                        this.state.comment_vote_pending_dir.remove(&comment_id);
-                        this.state.comment_vote_last_synced.remove(&comment_id);
-                        this.state.comment_like_in_flight.remove(&comment_id);
-                        this.state.comment_like_pending_toggle.remove(&comment_id);
-                        this.state.comment_like_pending_liked.remove(&comment_id);
-                        this.state.comment_like_last_synced.remove(&comment_id);
-                        if let Some(ref mut prof) = this.state.actor_profile {
-                            prof.recent_comments.retain(|c| c.comment_id != comment_id);
+                        this.state.remove_comment_from_caches(&comment_id);
+                        if let CommunityRoute::PostDetail(id) = this.state.route.clone() {
+                            this.load_post_detail(id, cx);
+                        } else {
+                            this.reload_comment_route_if_loading(None, cx);
                         }
-                        if let Some(pid) = reload_pid {
-                            if this.state.route == CommunityRoute::PostDetail(pid.clone()) {
-                                this.load_post_detail(pid, cx);
-                            }
+                        if same_actor {
+                            let lang = this.language_id.clone();
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "评论已删除", "Comment deleted").to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
                         }
-                        if this.state.profile_loading {
-                            if let CommunityRoute::ActorProfile(h) = this.state.route.clone() {
-                                this.load_actor_profile(h, cx);
-                            }
-                        }
-                        let lang = this.language_id.clone();
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "评论已删除", "Comment deleted").to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
+                        cx.notify();
                     }
                     Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
-                            cx,
-                        );
+                        if same_actor {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e.to_string(),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Err(_) => {}
                 }
@@ -680,15 +686,8 @@ impl CommunityWorkspace {
         action: ModActionKind,
         cx: &mut Context<Self>,
     ) {
-        let reload_pid = self
-            .state
-            .detail_post
-            .as_ref()
-            .map(|d| d.post.post_id.clone())
-            .or_else(|| match &self.state.route {
-                CommunityRoute::PostDetail(p) => Some(p.clone()),
-                _ => None,
-            });
+        let slug_cb = community_slug.clone();
+        let cid_cb = comment_id.clone();
         let req = ModActionRequest {
             action,
             target_kind: "comment".to_string(),
@@ -707,32 +706,41 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen
-                    || this.state.active_actor_id != expected_actor_id
-                {
-                    return;
-                }
+                let same_actor = this.state.actor_switch_gen == my_actor_gen
+                    && this.state.active_actor_id == expected_actor_id;
                 match res {
                     Ok(Ok(_)) => {
-                        if let Some(pid) = reload_pid {
-                            if this.state.route == CommunityRoute::PostDetail(pid.clone()) {
-                                this.load_post_detail(pid, cx);
-                            }
-                        }
-                        let lang = this.language_id.clone();
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "版务操作已生效", "Moderator action applied").to_string(),
-                                is_error: false,
-                            },
+                        this.reconcile_mod_action_caches_and_routes(
+                            &slug_cb,
+                            action,
+                            "comment",
+                            &cid_cb,
+                            None,
+                            false,
                             cx,
                         );
+                        if same_actor {
+                            let lang = this.language_id.clone();
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "版务操作已生效", "Moderator action applied")
+                                        .to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
-                            cx,
-                        );
+                        if same_actor {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e.to_string(),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Err(_) => {}
                 }
@@ -748,10 +756,12 @@ impl CommunityWorkspace {
         action: ModActionKind,
         cx: &mut Context<Self>,
     ) {
+        let slug_cb = community_slug.clone();
+        let pid_cb = post_id.clone();
         let req = ModActionRequest {
             action,
             target_kind: "post".to_string(),
-            target_id: post_id.clone(),
+            target_id: post_id,
             reason: Some("Moderator action from Post Detail".to_string()),
             flair: None,
             queue_item_id: None,
@@ -766,30 +776,41 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen
-                    || this.state.active_actor_id != expected_actor_id
-                {
-                    return;
-                }
+                let same_actor = this.state.actor_switch_gen == my_actor_gen
+                    && this.state.active_actor_id == expected_actor_id;
                 match res {
                     Ok(Ok(_)) => {
-                        if this.state.route == CommunityRoute::PostDetail(post_id.clone()) {
-                            this.load_post_detail(post_id, cx);
-                        }
-                        let lang = this.language_id.clone();
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "帖子版务操作已更新", "Post moderation updated").to_string(),
-                                is_error: false,
-                            },
+                        this.reconcile_mod_action_caches_and_routes(
+                            &slug_cb,
+                            action,
+                            "post",
+                            &pid_cb,
+                            None,
+                            false,
                             cx,
                         );
+                        if same_actor {
+                            let lang = this.language_id.clone();
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "帖子版务操作已更新", "Post moderation updated")
+                                        .to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
-                            cx,
-                        );
+                        if same_actor {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e.to_string(),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Err(_) => {}
                 }
@@ -810,11 +831,8 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
-                if this.state.actor_switch_gen != my_actor_gen
-                    || this.state.active_actor_id != expected_actor_id
-                {
-                    return;
-                }
+                let same_actor = this.state.actor_switch_gen == my_actor_gen
+                    && this.state.active_actor_id == expected_actor_id;
                 match res {
                     Ok(Ok(_)) => {
                         this.state.remove_post_from_caches(&post_id);
@@ -866,25 +884,37 @@ impl CommunityWorkspace {
                                 this.load_selected_list_feed(lid, cx);
                             }
                         }
-                        let lang = this.language_id.clone();
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast {
-                                text: tr_str(&lang, "帖子已删除", "Post deleted").to_string(),
-                                is_error: false,
-                            },
-                            cx,
-                        );
-                        if navigate_back {
-                            this.go_back(cx);
+                        if this.state.composer.drafts_loading {
+                            this.load_composer_drafts(cx);
+                        }
+                        if same_actor {
+                            let lang = this.language_id.clone();
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: tr_str(&lang, "帖子已删除", "Post deleted").to_string(),
+                                    is_error: false,
+                                },
+                                cx,
+                            );
+                            if navigate_back && on_deleted_detail {
+                                this.go_back(cx);
+                            } else {
+                                cx.notify();
+                            }
                         } else {
                             cx.notify();
                         }
                     }
                     Ok(Err(e)) => {
-                        this.emit_action(
-                            CommunityWorkspaceAction::ShowToast { text: e.to_string(), is_error: true },
-                            cx,
-                        );
+                        if same_actor {
+                            this.emit_action(
+                                CommunityWorkspaceAction::ShowToast {
+                                    text: e.to_string(),
+                                    is_error: true,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     Err(_) => {}
                 }
@@ -1015,6 +1045,11 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if let Ok(Ok(ref r)) = res {
+                        if r.triggered {
+                            this.reload_detail_if_loading_post(&reload_pid, true, cx);
+                        }
+                    }
                     return;
                 }
                 this.state.detail_summon_pending = false;
@@ -1043,7 +1078,12 @@ impl CommunityWorkspace {
                                 cx,
                             );
                             if still_on_post {
+                                if this.state.feed_loading || this.state.feed_loading_more {
+                                    this.load_feed(cx);
+                                }
                                 this.load_post_detail(reload_pid, cx);
+                            } else {
+                                this.reload_detail_if_loading_post(&reload_pid, true, cx);
                             }
                         } else {
                             let reason = if r.reason.trim().is_empty() {

@@ -145,6 +145,9 @@ fn dispatch_headless_target(target: &str, use_underscore_exit: bool) -> ! {
         "test_m5_r10_field_scoped_patches_and_symmetric_serialization" => {
             |app| Box::pin(body_r10_field_scoped_patches_and_symmetric_serialization(app))
         }
+        "test_m5_r11_identity_switch_seq_decoupling_and_cross_route_deletes" => {
+            |app| Box::pin(body_r11_identity_switch_seq_decoupling_and_cross_route_deletes(app))
+        }
         other => {
             eprintln!("unknown community M5 headless gpui test target: {other}");
             exit_headless_child(101, use_underscore_exit);
@@ -12958,17 +12961,21 @@ async fn run_r9_t04_to_t06(
             w.state.feed_loading,
             "T9-05 setup: background load_feed must still be in flight"
         );
-        // feed_items STILL holds alice's stale viewer_vote == +1!
+        // Wave r11: switch_active_actor synchronously scrubs feed_items viewer_vote to 0.
+        let feed_post = &mut w
+            .state
+            .feed_items
+            .iter_mut()
+            .find(|it| it.post.post_id == srv.p_main)
+            .unwrap()
+            .post;
         assert_eq!(
-            w.state
-                .feed_items
-                .iter()
-                .find(|it| it.post.post_id == srv.p_main)
-                .unwrap()
-                .post
-                .viewer_vote,
-            1
+            feed_post.viewer_vote, 0,
+            "T9-05 (R11): switch_active_actor must synchronously scrub stale feed_items viewer_vote"
         );
+        // Re-inject stale viewer_vote=+1 on off-route feed_items to still prove find_post
+        // prioritizes active PostDetail over off-route feed_items.
+        feed_post.viewer_vote = 1;
         w.vote_post(srv.p_main.clone(), 1, cx);
     });
     assert!(
@@ -16508,12 +16515,2503 @@ async fn run_r10_t05_to_t08(
     });
 }
 
+#[test]
+fn test_m5_r11_identity_switch_seq_decoupling_and_cross_route_deletes() {
+    run_in_headless_subprocess("test_m5_r11_identity_switch_seq_decoupling_and_cross_route_deletes");
+}
 
+struct R11MockState {
+    alice_id: String,
+    bot_a_id: String,
+    bob_id: String,
+    slug_rust: String,
+    slug_python: String,
+    p_part1: String,
+    p_part2: String,
+    p_quoted: String,
+    p_mod_rem: String,
+    p_mod_lock: String,
+    c_leaf: String,
+    c_leaf2: String,
+    c_parent: String,
+    c_child: String,
+    c_edit: String,
 
+    display_names: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    registered_bots: std::sync::Mutex<Vec<CommunityActorDto>>,
+    follows: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    blocks: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    mutes: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 
+    comm_wiki: std::sync::Mutex<std::collections::HashMap<String, (String, u32)>>,
+    comm_wiki_revs: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            Vec<gpui_telegram_proto::community_contracts::CommunityWikiRevisionDto>,
+        >,
+    >,
+    comm_rules: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            Vec<gpui_telegram_proto::community_contracts::CommunityRuleDto>,
+        >,
+    >,
+    comm_automod: std::sync::Mutex<std::collections::HashMap<String, Vec<AutoModRuleDto>>>,
 
+    deleted_posts: std::sync::Mutex<std::collections::HashSet<String>>,
+    locked_posts: std::sync::Mutex<std::collections::HashSet<String>>,
+    removed_posts: std::sync::Mutex<std::collections::HashSet<String>>,
+    comment_bodies: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    deleted_comments: std::sync::Mutex<std::collections::HashSet<String>>,
+    comment_updated_ts: std::sync::atomic::AtomicI64,
 
+    // Deterministic delay knobs & atomic counters
+    identities_get_received: std::sync::atomic::AtomicUsize,
+    actor_patch_pre_delays_by_name: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    actor_patch_received: std::sync::atomic::AtomicUsize,
+    actor_patch_completed: std::sync::atomic::AtomicUsize,
+    register_bot_pre_delay_ms: std::sync::atomic::AtomicU64,
+    register_bot_received: std::sync::atomic::AtomicUsize,
+    register_bot_completed: std::sync::atomic::AtomicUsize,
+    profile_get_post_delay_ms: std::sync::atomic::AtomicU64,
+    profile_get_received: std::sync::atomic::AtomicUsize,
+    profile_get_completed: std::sync::atomic::AtomicUsize,
+    search_pre_delay_ms: std::sync::atomic::AtomicU64,
+    search_received: std::sync::atomic::AtomicUsize,
+    search_completed: std::sync::atomic::AtomicUsize,
+    follow_calls: std::sync::atomic::AtomicUsize,
+    follow_completed: std::sync::atomic::AtomicUsize,
+    block_completed: std::sync::atomic::AtomicUsize,
 
+    wiki_pre_delays_by_md: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    wiki_post_delays_by_md: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    wiki_put_received: std::sync::atomic::AtomicUsize,
+    wiki_put_completed: std::sync::atomic::AtomicUsize,
+    rules_pre_delays_by_last_title: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    rules_post_delays_by_last_title: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    rules_patch_received: std::sync::atomic::AtomicUsize,
+    rules_patch_completed: std::sync::atomic::AtomicUsize,
+    automod_pre_delay_ms: std::sync::atomic::AtomicU64,
+    automod_patch_received: std::sync::atomic::AtomicUsize,
+    automod_patch_completed: std::sync::atomic::AtomicUsize,
 
+    comment_patch_pre_delays_by_body: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    comment_patch_post_delays_by_body: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    comment_patch_received: std::sync::atomic::AtomicUsize,
+    comment_patch_completed: std::sync::atomic::AtomicUsize,
 
+    delete_post_pre_delay_ms: std::sync::atomic::AtomicU64,
+    delete_post_received: std::sync::atomic::AtomicUsize,
+    delete_post_completed: std::sync::atomic::AtomicUsize,
+    delete_comment_pre_delay_ms: std::sync::atomic::AtomicU64,
+    delete_comment_received: std::sync::atomic::AtomicUsize,
+    delete_comment_completed: std::sync::atomic::AtomicUsize,
+    detail_get_post_delay_ms: std::sync::atomic::AtomicU64,
+    detail_get_received: std::sync::atomic::AtomicUsize,
+    detail_get_completed: std::sync::atomic::AtomicUsize,
+    mod_action_completed: std::sync::atomic::AtomicUsize,
+}
+
+impl R11MockState {
+    fn build_actor(&self, actor_id: &str, viewer: &str) -> CommunityActorDto {
+        if let Some(reg) = self
+            .registered_bots
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|b| b.actor_id == actor_id)
+            .cloned()
+        {
+            return reg;
+        }
+        let is_bot = actor_id.starts_with("b:");
+        let handle = if actor_id == self.alice_id {
+            "r11_alice"
+        } else if actor_id == self.bot_a_id {
+            "r11_bot_a"
+        } else {
+            "r11_bob"
+        };
+        let display_name = self
+            .display_names
+            .lock()
+            .unwrap()
+            .get(actor_id)
+            .cloned()
+            .unwrap_or_else(|| handle.to_string());
+        let follows = self.follows.lock().unwrap();
+        let blocks = self.blocks.lock().unwrap();
+        let mutes = self.mutes.lock().unwrap();
+        let is_following = follows.contains(&(viewer.to_string(), actor_id.to_string()));
+        let is_blocked = blocks.contains(&(viewer.to_string(), actor_id.to_string()));
+        let is_muted = mutes.contains(&(viewer.to_string(), actor_id.to_string()));
+        let followers_count = follows.iter().filter(|(_, tgt)| tgt == actor_id).count() as u64;
+        let mut a = mock_actor_dto(
+            actor_id,
+            if is_bot { ActorKind::Bot } else { ActorKind::Human },
+            handle,
+            &display_name,
+        );
+        a.bio = "Wave r11 citizen".to_string();
+        a.linked_user_id = Some(911001);
+        if is_bot {
+            a.owner_user_id = Some(911001);
+        }
+        a.is_following = is_following;
+        a.is_blocked = is_blocked;
+        a.is_muted = is_muted;
+        a.followers_count = followers_count;
+        a
+    }
+
+    fn build_community(&self, slug: &str, viewer: &str) -> SubCommunityDto {
+        let (wiki_markdown, wiki_revision) = self
+            .comm_wiki
+            .lock()
+            .unwrap()
+            .get(slug)
+            .cloned()
+            .unwrap_or_else(|| ("# Initial Wiki".to_string(), 1));
+        let rules = self
+            .comm_rules
+            .lock()
+            .unwrap()
+            .get(slug)
+            .cloned()
+            .unwrap_or_default();
+        let automod_rules = self
+            .comm_automod
+            .lock()
+            .unwrap()
+            .get(slug)
+            .cloned()
+            .unwrap_or_default();
+        let is_owner = viewer == self.alice_id;
+        let role = if is_owner {
+            Some(CommunityMemberRole::Owner)
+        } else {
+            None
+        };
+        let mut c = mock_community_dto(slug, &self.alice_id, role);
+        c.rules = rules;
+        c.automod_rules = automod_rules;
+        c.wiki_markdown = wiki_markdown;
+        c.wiki_revision = wiki_revision;
+        c.member_count = 12;
+        c.is_joined = is_owner;
+        c.allow_bots = true;
+        c
+    }
+
+    fn build_post(&self, post_id: &str, viewer: &str) -> CommunityPostDto {
+        let is_locked = self.locked_posts.lock().unwrap().contains(post_id);
+        let is_removed = self.removed_posts.lock().unwrap().contains(post_id);
+        let mut p = mock_post_dto(post_id, &self.alice_id, false, None, 0);
+        p.community_slug = Some(self.slug_rust.clone());
+        p.author_handle = "r11_alice".to_string();
+        p.author_display_name = "Alice R11".to_string();
+        p.format = PostFormat::Article;
+        p.title = Some(format!("Title {post_id}"));
+        p.body = format!("Body {post_id}");
+        p.is_locked = is_locked;
+        p.is_removed = is_removed;
+        p.viewer_vote = if viewer == self.alice_id { 1 } else { 0 };
+        p.upvotes = 1;
+        p.score = 1;
+        p
+    }
+
+    fn build_comment(
+        &self,
+        cid: &str,
+        post_id: &str,
+        children: Vec<CommunityCommentDto>,
+    ) -> CommunityCommentDto {
+        let is_del = self.deleted_comments.lock().unwrap().contains(cid);
+        let body = if is_del {
+            "[deleted]".to_string()
+        } else {
+            self.comment_bodies
+                .lock()
+                .unwrap()
+                .get(cid)
+                .cloned()
+                .unwrap_or_else(|| format!("Body {cid}"))
+        };
+        CommunityCommentDto {
+            comment_id: cid.to_string(),
+            post_id: post_id.to_string(),
+            parent_comment_id: None,
+            depth: 0,
+            path: cid.to_string(),
+            author_actor_id: self.alice_id.clone(),
+            author_handle: "r11_alice".to_string(),
+            author_display_name: "Alice R11".to_string(),
+            author_kind: ActorKind::Human,
+            author_verified_tier: VerifiedTier::None,
+            author_bot_badge: None,
+            author_avatar_shape: "circle".to_string(),
+            author_avatar_color: "blue".to_string(),
+            is_op: true,
+            body,
+            media: Vec::new(),
+            upvotes: 0,
+            downvotes: 0,
+            score: 0,
+            likes_count: 0,
+            awards: Vec::new(),
+            viewer_vote: 0,
+            viewer_liked: false,
+            is_stickied: false,
+            is_mod_distinguished: false,
+            is_removed: is_del,
+            is_deleted: is_del,
+            children,
+            more_children_count: 0,
+            created_at_ms: 1_750_000_000_000,
+            updated_at_ms: self.comment_updated_ts.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    fn build_post_detail_comments(&self, post_id: &str) -> Vec<CommunityCommentDto> {
+        if post_id != self.p_part2 {
+            return Vec::new();
+        }
+        let del = self.deleted_comments.lock().unwrap().clone();
+        let mut out = Vec::new();
+        if !del.contains(&self.c_edit) {
+            out.push(self.build_comment(&self.c_edit, post_id, Vec::new()));
+        }
+        if !del.contains(&self.c_leaf) {
+            out.push(self.build_comment(&self.c_leaf, post_id, Vec::new()));
+        }
+        if !del.contains(&self.c_leaf2) {
+            out.push(self.build_comment(&self.c_leaf2, post_id, Vec::new()));
+        }
+        let child = if !del.contains(&self.c_child) {
+            vec![self.build_comment(&self.c_child, post_id, Vec::new())]
+        } else {
+            Vec::new()
+        };
+        // Parent stays tombstoned when deleted if child exists!
+        if !del.contains(&self.c_parent) || !child.is_empty() {
+            out.push(self.build_comment(&self.c_parent, post_id, child));
+        }
+        out
+    }
+}
+
+fn spawn_r11_server(
+    rt: &tokio::runtime::Handle,
+) -> (std::net::SocketAddr, Arc<R11MockState>, AbortOnDrop) {
+    use gpui_telegram_proto::community_contracts::{
+        CommunityRuleDto, CommunityWikiRevisionDto, FollowActionResponse, ModActionRequest,
+        ModLogEntryDto, RegisterBotActorRequest, UpdateCommentRequest, UpdateCommunityActorRequest,
+        UpdateCommunityRequest, UpdateCommunityWikiRequest,
+    };
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut display_names = std::collections::HashMap::new();
+    display_names.insert("u:911001".to_string(), "Alice V1".to_string());
+    display_names.insert("b:911002".to_string(), "Bot V1".to_string());
+    display_names.insert("u:911300".to_string(), "Bob R11".to_string());
+
+    let mut comm_wiki = std::collections::HashMap::new();
+    comm_wiki.insert("r11_rust".to_string(), ("# Rust Wiki V1".to_string(), 1));
+    comm_wiki.insert("r11_python".to_string(), ("# Python Wiki V1".to_string(), 1));
+
+    let mut comm_rules = std::collections::HashMap::new();
+    comm_rules.insert(
+        "r11_rust".to_string(),
+        vec![CommunityRuleDto {
+            id: "r11_rule_1".to_string(),
+            title: "Rule One".to_string(),
+            description: "Be kind".to_string(),
+            order: 1,
+        }],
+    );
+    comm_rules.insert("r11_python".to_string(), Vec::new());
+
+    let mut comm_automod = std::collections::HashMap::new();
+    comm_automod.insert(
+        "r11_rust".to_string(),
+        vec![AutoModRuleDto {
+            rule_id: "am_r11_1".to_string(),
+            community_id: "comm_r11_rust".to_string(),
+            name: "Spam Guard R11".to_string(),
+            enabled: false,
+            priority: 10,
+            keywords: vec!["spam".to_string()],
+            regex_pattern: None,
+            min_author_karma: None,
+            min_account_age_secs: None,
+            max_links: None,
+            block_duplicate_spam: false,
+            apply_to_bots: true,
+            apply_to_humans: true,
+            action: AutoModActionKind::FlagForReview,
+            assign_flair: None,
+            auto_reply_template: None,
+            created_at_ms: 1_750_000_000_000,
+        }],
+    );
+    comm_automod.insert("r11_python".to_string(), Vec::new());
+
+    let mut comment_bodies = std::collections::HashMap::new();
+    comment_bodies.insert("cm_r11_edit".to_string(), "Edit Target Initial".to_string());
+    comment_bodies.insert("cm_r11_leaf".to_string(), "Leaf Comment 1".to_string());
+    comment_bodies.insert("cm_r11_leaf2".to_string(), "Leaf Comment 2".to_string());
+    comment_bodies.insert("cm_r11_parent".to_string(), "Parent Comment".to_string());
+    comment_bodies.insert("cm_r11_child".to_string(), "Child Comment".to_string());
+
+    let state = Arc::new(R11MockState {
+        alice_id: "u:911001".to_string(),
+        bot_a_id: "b:911002".to_string(),
+        bob_id: "u:911300".to_string(),
+        slug_rust: "r11_rust".to_string(),
+        slug_python: "r11_python".to_string(),
+        p_part1: "post_r11_part1".to_string(),
+        p_part2: "post_r11_part2".to_string(),
+        p_quoted: "post_r11_quoted".to_string(),
+        p_mod_rem: "post_r11_mod_rem".to_string(),
+        p_mod_lock: "post_r11_mod_lock".to_string(),
+        c_leaf: "cm_r11_leaf".to_string(),
+        c_leaf2: "cm_r11_leaf2".to_string(),
+        c_parent: "cm_r11_parent".to_string(),
+        c_child: "cm_r11_child".to_string(),
+        c_edit: "cm_r11_edit".to_string(),
+        display_names: std::sync::Mutex::new(display_names),
+        registered_bots: std::sync::Mutex::new(Vec::new()),
+        follows: std::sync::Mutex::new(std::collections::HashSet::new()),
+        blocks: std::sync::Mutex::new(std::collections::HashSet::new()),
+        mutes: std::sync::Mutex::new(std::collections::HashSet::new()),
+        comm_wiki: std::sync::Mutex::new(comm_wiki),
+        comm_wiki_revs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        comm_rules: std::sync::Mutex::new(comm_rules),
+        comm_automod: std::sync::Mutex::new(comm_automod),
+        deleted_posts: std::sync::Mutex::new(std::collections::HashSet::new()),
+        locked_posts: std::sync::Mutex::new(std::collections::HashSet::new()),
+        removed_posts: std::sync::Mutex::new(std::collections::HashSet::new()),
+        comment_bodies: std::sync::Mutex::new(comment_bodies),
+        deleted_comments: std::sync::Mutex::new(std::collections::HashSet::new()),
+        comment_updated_ts: AtomicI64::new(1_750_000_000_000),
+        identities_get_received: AtomicUsize::new(0),
+        actor_patch_pre_delays_by_name: std::sync::Mutex::new(std::collections::HashMap::new()),
+        actor_patch_received: AtomicUsize::new(0),
+        actor_patch_completed: AtomicUsize::new(0),
+        register_bot_pre_delay_ms: AtomicU64::new(0),
+        register_bot_received: AtomicUsize::new(0),
+        register_bot_completed: AtomicUsize::new(0),
+        profile_get_post_delay_ms: AtomicU64::new(0),
+        profile_get_received: AtomicUsize::new(0),
+        profile_get_completed: AtomicUsize::new(0),
+        search_pre_delay_ms: AtomicU64::new(0),
+        search_received: AtomicUsize::new(0),
+        search_completed: AtomicUsize::new(0),
+        follow_calls: AtomicUsize::new(0),
+        follow_completed: AtomicUsize::new(0),
+        block_completed: AtomicUsize::new(0),
+        wiki_pre_delays_by_md: std::sync::Mutex::new(std::collections::HashMap::new()),
+        wiki_post_delays_by_md: std::sync::Mutex::new(std::collections::HashMap::new()),
+        wiki_put_received: AtomicUsize::new(0),
+        wiki_put_completed: AtomicUsize::new(0),
+        rules_pre_delays_by_last_title: std::sync::Mutex::new(std::collections::HashMap::new()),
+        rules_post_delays_by_last_title: std::sync::Mutex::new(std::collections::HashMap::new()),
+        rules_patch_received: AtomicUsize::new(0),
+        rules_patch_completed: AtomicUsize::new(0),
+        automod_pre_delay_ms: AtomicU64::new(0),
+        automod_patch_received: AtomicUsize::new(0),
+        automod_patch_completed: AtomicUsize::new(0),
+        comment_patch_pre_delays_by_body: std::sync::Mutex::new(std::collections::HashMap::new()),
+        comment_patch_post_delays_by_body: std::sync::Mutex::new(std::collections::HashMap::new()),
+        comment_patch_received: AtomicUsize::new(0),
+        comment_patch_completed: AtomicUsize::new(0),
+        delete_post_pre_delay_ms: AtomicU64::new(0),
+        delete_post_received: AtomicUsize::new(0),
+        delete_post_completed: AtomicUsize::new(0),
+        delete_comment_pre_delay_ms: AtomicU64::new(0),
+        delete_comment_received: AtomicUsize::new(0),
+        delete_comment_completed: AtomicUsize::new(0),
+        detail_get_post_delay_ms: AtomicU64::new(0),
+        detail_get_received: AtomicUsize::new(0),
+        detail_get_completed: AtomicUsize::new(0),
+        mod_action_completed: AtomicUsize::new(0),
+    });
+
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind r11 server");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    let addr = std_listener.local_addr().expect("r11 local_addr");
+    let st_accept = Arc::clone(&state);
+    let join = rt.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let st = Arc::clone(&st_accept);
+            tokio::spawn(async move {
+                let mut buf = Vec::with_capacity(8192);
+                let mut tmp = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let Ok(n) = sock.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let hdr = String::from_utf8_lossy(&buf[..pos]);
+                            for line in hdr.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(he) = header_end {
+                        if buf.len() >= he + content_len {
+                            break;
+                        }
+                    }
+                }
+                let he = header_end.unwrap();
+                let hdr_str = String::from_utf8_lossy(&buf[..he]).to_string();
+                let mut lines = hdr_str.lines();
+                let req_line = lines.next().unwrap_or_default();
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET").to_string();
+                let raw_target = parts.next().unwrap_or("/").to_string();
+                let (raw_path, _query) = raw_target
+                    .split_once('?')
+                    .map(|(p, q)| (p.to_string(), q.to_string()))
+                    .unwrap_or((raw_target, String::new()));
+                let path = raw_path.replace("%3A", ":").replace("%3a", ":");
+                let mut acting_actor: Option<String> = None;
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("x-community-actor-id") {
+                            acting_actor = Some(v.trim().to_string());
+                        }
+                    }
+                }
+                let viewer = acting_actor.unwrap_or_else(|| st.alice_id.clone());
+                let body_bytes = &buf[he..he + content_len];
+
+                let (status, resp_body): (&str, String) = if method == "GET"
+                    && path == "/api/v1/community/identities"
+                {
+                    st.identities_get_received.fetch_add(1, Ordering::SeqCst);
+                    let human = st.build_actor(&st.alice_id, &viewer);
+                    let mut bot_actors = vec![st.build_actor(&st.bot_a_id, &viewer)];
+                    bot_actors.extend(st.registered_bots.lock().unwrap().iter().cloned());
+                    let mut all_actors = vec![human.clone()];
+                    all_actors.extend(bot_actors.iter().cloned());
+                    let resp = CommunityIdentitiesResponse {
+                        active_actor_id: viewer.clone(),
+                        human_actor: Some(human),
+                        bot_actors,
+                        all_actors,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "POST" && path == "/api/v1/community/identities/bot" {
+                    let req: RegisterBotActorRequest =
+                        serde_json::from_slice(body_bytes).expect("r11 reg bot");
+                    st.register_bot_received.fetch_add(1, Ordering::SeqCst);
+                    let pre = st.register_bot_pre_delay_ms.swap(0, Ordering::SeqCst);
+                    if pre > 0 {
+                        tokio::time::sleep(Duration::from_millis(pre)).await;
+                    }
+                    let mut actor = mock_actor_dto(
+                        &format!("b:r11_{}", req.handle),
+                        ActorKind::Bot,
+                        &req.handle,
+                        &req.display_name,
+                    );
+                    actor.bio = req.bio.unwrap_or_default();
+                    actor.avatar_shape = req.avatar_shape.unwrap_or_else(|| "orb".to_string());
+                    actor.avatar_color = req.avatar_color.unwrap_or_else(|| "indigo".to_string());
+                    actor.owner_user_id = Some(911001);
+                    actor.linked_user_id = Some(911999);
+                    actor.bot_badge = req.bot_badge;
+                    actor.bot_model = req.bot_model;
+                    actor.bot_capabilities = req.bot_capabilities;
+                    actor.bot_autonomy_mode = req.bot_autonomy_mode;
+                    actor.bot_persona = req.bot_persona;
+                    st.registered_bots.lock().unwrap().push(actor.clone());
+                    st.register_bot_completed.fetch_add(1, Ordering::SeqCst);
+                    let payload = serde_json::json!({
+                        "actor": actor,
+                        "bot_token": "tok_r11_new",
+                        "bot_user_id": 911999,
+                        "username": req.handle,
+                    });
+                    ("200 OK", payload.to_string())
+                } else if method == "GET" && path == "/api/v1/community/algo-prefs" {
+                    ("200 OK", serde_json::to_string(&AlgoPreferencesDto::default()).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/trending" {
+                    ("200 OK", serde_json::to_string(&TrendingResponse::default()).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/notifications" {
+                    ("200 OK", serde_json::to_string(&NotificationsListResponse::default()).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/lists" {
+                    ("200 OK", serde_json::to_string(&CommunityListsResponse::default()).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/search" {
+                    st.search_received.fetch_add(1, Ordering::SeqCst);
+                    let pre = st.search_pre_delay_ms.swap(0, Ordering::SeqCst);
+                    if pre > 0 {
+                        tokio::time::sleep(Duration::from_millis(pre)).await;
+                    }
+                    let snap = CommunitySearchResultDto {
+                        query: String::new(),
+                        tab: CommunitySearchTab::Top,
+                        posts: vec![st.build_post(&st.p_part2, &viewer)],
+                        actors: vec![
+                            st.build_actor(&st.bot_a_id, &viewer),
+                            st.build_actor(&st.bob_id, &viewer),
+                        ],
+                        communities: vec![
+                            st.build_community(&st.slug_rust, &viewer),
+                            st.build_community(&st.slug_python, &viewer),
+                        ],
+                        total_hits: 2,
+                        next_offset: None,
+                    };
+                    st.search_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&snap).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/communities" {
+                    let resp = ListCommunitiesResponse {
+                        communities: vec![
+                            st.build_community(&st.slug_rust, &viewer),
+                            st.build_community(&st.slug_python, &viewer),
+                        ],
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET"
+                    && path.starts_with("/api/v1/community/communities/")
+                    && !path.ends_with("/mod-queue")
+                    && !path.ends_with("/mod-logs")
+                {
+                    let slug = path
+                        .trim_start_matches("/api/v1/community/communities/")
+                        .to_string();
+                    let wiki_revisions = st
+                        .comm_wiki_revs
+                        .lock()
+                        .unwrap()
+                        .get(&slug)
+                        .cloned()
+                        .unwrap_or_default();
+                    let resp = CommunityDetailResponse {
+                        community: st.build_community(&slug, &viewer),
+                        pinned_posts: Vec::new(),
+                        moderators: vec![
+                            st.build_actor(&st.alice_id, &viewer),
+                            st.build_actor(&st.bob_id, &viewer),
+                        ],
+                        wiki_revisions,
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "PUT"
+                    && path.starts_with("/api/v1/community/communities/")
+                    && path.ends_with("/wiki")
+                {
+                    let slug = path
+                        .trim_start_matches("/api/v1/community/communities/")
+                        .trim_end_matches("/wiki")
+                        .to_string();
+                    let req: UpdateCommunityWikiRequest =
+                        serde_json::from_slice(body_bytes).expect("r11 wiki");
+                    st.wiki_put_received.fetch_add(1, Ordering::SeqCst);
+                    let pre = st
+                        .wiki_pre_delays_by_md
+                        .lock()
+                        .unwrap()
+                        .remove(&req.markdown)
+                        .unwrap_or(0);
+                    if pre > 0 {
+                        tokio::time::sleep(Duration::from_millis(pre)).await;
+                    }
+                    let rev_num = {
+                        let mut wk = st.comm_wiki.lock().unwrap();
+                        let next_rev = wk.get(&slug).map(|x| x.1 + 1).unwrap_or(2);
+                        wk.insert(slug.clone(), (req.markdown.clone(), next_rev));
+                        next_rev
+                    };
+                    let rev = CommunityWikiRevisionDto {
+                        revision: rev_num,
+                        editor_actor_id: viewer.clone(),
+                        editor_handle: "r11_alice".to_string(),
+                        markdown: req.markdown.clone(),
+                        summary: req.summary,
+                        created_at_ms: 1_750_000_005_000 + i64::from(rev_num),
+                    };
+                    st.comm_wiki_revs
+                        .lock()
+                        .unwrap()
+                        .entry(slug)
+                        .or_default()
+                        .insert(0, rev.clone());
+                    let post = st
+                        .wiki_post_delays_by_md
+                        .lock()
+                        .unwrap()
+                        .remove(&req.markdown)
+                        .unwrap_or(0);
+                    if post > 0 {
+                        tokio::time::sleep(Duration::from_millis(post)).await;
+                    }
+                    st.wiki_put_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&rev).unwrap())
+                } else if method == "PATCH" && path.starts_with("/api/v1/community/communities/") {
+                    let slug = path
+                        .trim_start_matches("/api/v1/community/communities/")
+                        .to_string();
+                    let req: UpdateCommunityRequest =
+                        serde_json::from_slice(body_bytes).expect("r11 patch comm");
+                    if let Some(am) = req.automod_rules {
+                        st.automod_patch_received.fetch_add(1, Ordering::SeqCst);
+                        let pre = st.automod_pre_delay_ms.swap(0, Ordering::SeqCst);
+                        if pre > 0 {
+                            tokio::time::sleep(Duration::from_millis(pre)).await;
+                        }
+                        st.comm_automod.lock().unwrap().insert(slug.clone(), am);
+                        let snap = st.build_community(&slug, &viewer);
+                        st.automod_patch_completed.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", serde_json::to_string(&snap).unwrap())
+                    } else {
+                        let rules = req.rules.unwrap_or_default();
+                        let last_title =
+                            rules.last().map(|r| r.title.clone()).unwrap_or_default();
+                        st.rules_patch_received.fetch_add(1, Ordering::SeqCst);
+                        let pre = st
+                            .rules_pre_delays_by_last_title
+                            .lock()
+                            .unwrap()
+                            .remove(&last_title)
+                            .unwrap_or(0);
+                        if pre > 0 {
+                            tokio::time::sleep(Duration::from_millis(pre)).await;
+                        }
+                        st.comm_rules.lock().unwrap().insert(slug.clone(), rules);
+                        let snap = st.build_community(&slug, &viewer);
+                        let post = st
+                            .rules_post_delays_by_last_title
+                            .lock()
+                            .unwrap()
+                            .remove(&last_title)
+                            .unwrap_or(0);
+                        if post > 0 {
+                            tokio::time::sleep(Duration::from_millis(post)).await;
+                        }
+                        st.rules_patch_completed.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", serde_json::to_string(&snap).unwrap())
+                    }
+                } else if method == "GET" && path.ends_with("/mod-queue") {
+                    ("200 OK", serde_json::to_string(&ModQueueResponse::default()).unwrap())
+                } else if method == "GET" && path.ends_with("/mod-logs") {
+                    ("200 OK", serde_json::to_string(&ModLogsResponse::default()).unwrap())
+                } else if method == "POST" && path.ends_with("/mod-actions") {
+                    let req: ModActionRequest =
+                        serde_json::from_slice(body_bytes).expect("r11 mod action");
+                    if req.target_kind.eq_ignore_ascii_case("post") {
+                        match req.action {
+                            ModActionKind::Remove => {
+                                st.removed_posts.lock().unwrap().insert(req.target_id.clone());
+                            }
+                            ModActionKind::Lock => {
+                                st.locked_posts.lock().unwrap().insert(req.target_id.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    st.mod_action_completed.fetch_add(1, Ordering::SeqCst);
+                    let entry = ModLogEntryDto {
+                        log_id: "ml_r11_1".to_string(),
+                        community_id: "comm_r11_rust".to_string(),
+                        moderator_actor_id: viewer,
+                        moderator_handle: "r11_alice".to_string(),
+                        moderator_kind: ActorKind::Human,
+                        action: req.action,
+                        target_kind: req.target_kind,
+                        target_id: req.target_id,
+                        reason: req.reason,
+                        rule_triggered: None,
+                        created_at_ms: 1_750_000_020_000,
+                    };
+                    ("200 OK", serde_json::to_string(&entry).unwrap())
+                } else if method == "GET" && path == "/api/v1/community/feed" {
+                    let del = st.deleted_posts.lock().unwrap().clone();
+                    let rem = st.removed_posts.lock().unwrap().clone();
+                    let all_pids = [
+                        st.p_part1.as_str(),
+                        st.p_part2.as_str(),
+                        st.p_quoted.as_str(),
+                        st.p_mod_rem.as_str(),
+                        st.p_mod_lock.as_str(),
+                    ];
+                    let items: Vec<FeedItemDto> = all_pids
+                        .into_iter()
+                        .filter(|pid| !del.contains(*pid) && !rem.contains(*pid))
+                        .map(|pid| FeedItemDto {
+                            post: st.build_post(pid, &viewer),
+                            rank_score: 100.0,
+                            explanation: None,
+                            is_exploration_slot: false,
+                        })
+                        .collect();
+                    let resp = FeedResponseDto {
+                        items,
+                        next_cursor: None,
+                        ..Default::default()
+                    };
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "GET" && path.starts_with("/api/v1/community/posts/") {
+                    let pid = path.trim_start_matches("/api/v1/community/posts/").to_string();
+                    st.detail_get_received.fetch_add(1, Ordering::SeqCst);
+                    let del = st.deleted_posts.lock().unwrap().clone();
+                    let resp = if pid == st.p_part2 {
+                        let mut thread_chain = Vec::new();
+                        if !del.contains(&st.p_part1) {
+                            thread_chain.push(st.build_post(&st.p_part1, &viewer));
+                        }
+                        thread_chain.push(st.build_post(&st.p_part2, &viewer));
+                        let mut quote_chain = Vec::new();
+                        if !del.contains(&st.p_quoted) {
+                            quote_chain.push(st.build_post(&st.p_quoted, &viewer));
+                        }
+                        let comments = st.build_post_detail_comments(&pid);
+                        let total_comments = comments.len() as u64;
+                        PostDetailResponse {
+                            post: st.build_post(&pid, &viewer),
+                            thread_chain,
+                            quote_chain,
+                            comments,
+                            total_comments,
+                        }
+                    } else {
+                        PostDetailResponse {
+                            post: st.build_post(&pid, &viewer),
+                            thread_chain: Vec::new(),
+                            quote_chain: Vec::new(),
+                            comments: Vec::new(),
+                            total_comments: 0,
+                        }
+                    };
+                    let post = st.detail_get_post_delay_ms.swap(0, Ordering::SeqCst);
+                    if post > 0 {
+                        tokio::time::sleep(Duration::from_millis(post)).await;
+                    }
+                    st.detail_get_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "DELETE" && path.starts_with("/api/v1/community/posts/") {
+                    let pid = path.trim_start_matches("/api/v1/community/posts/").to_string();
+                    st.delete_post_received.fetch_add(1, Ordering::SeqCst);
+                    let pre = st.delete_post_pre_delay_ms.swap(0, Ordering::SeqCst);
+                    if pre > 0 {
+                        tokio::time::sleep(Duration::from_millis(pre)).await;
+                    }
+                    st.deleted_posts.lock().unwrap().insert(pid.clone());
+                    st.delete_post_completed.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        serde_json::to_string(&DeleteEntityResponse {
+                            id: pid,
+                            deleted: true,
+                        })
+                        .unwrap(),
+                    )
+                } else if method == "PATCH" && path.starts_with("/api/v1/community/comments/") {
+                    let cid = path
+                        .trim_start_matches("/api/v1/community/comments/")
+                        .to_string();
+                    let req: UpdateCommentRequest =
+                        serde_json::from_slice(body_bytes).expect("r11 patch cm");
+                    st.comment_patch_received.fetch_add(1, Ordering::SeqCst);
+                    let pre = st
+                        .comment_patch_pre_delays_by_body
+                        .lock()
+                        .unwrap()
+                        .remove(&req.body)
+                        .unwrap_or(0);
+                    if pre > 0 {
+                        tokio::time::sleep(Duration::from_millis(pre)).await;
+                    }
+                    st.comment_bodies
+                        .lock()
+                        .unwrap()
+                        .insert(cid.clone(), req.body.clone());
+                    st.comment_updated_ts.fetch_add(500, Ordering::SeqCst);
+                    let snap = st.build_comment(&cid, &st.p_part2, Vec::new());
+                    let post = st
+                        .comment_patch_post_delays_by_body
+                        .lock()
+                        .unwrap()
+                        .remove(&req.body)
+                        .unwrap_or(0);
+                    if post > 0 {
+                        tokio::time::sleep(Duration::from_millis(post)).await;
+                    }
+                    st.comment_patch_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&snap).unwrap())
+                } else if method == "DELETE" && path.starts_with("/api/v1/community/comments/") {
+                    let cid = path
+                        .trim_start_matches("/api/v1/community/comments/")
+                        .to_string();
+                    st.delete_comment_received.fetch_add(1, Ordering::SeqCst);
+                    let pre = st.delete_comment_pre_delay_ms.swap(0, Ordering::SeqCst);
+                    if pre > 0 {
+                        tokio::time::sleep(Duration::from_millis(pre)).await;
+                    }
+                    st.deleted_comments.lock().unwrap().insert(cid.clone());
+                    st.delete_comment_completed.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        serde_json::to_string(&DeleteEntityResponse {
+                            id: cid,
+                            deleted: true,
+                        })
+                        .unwrap(),
+                    )
+                } else if method == "GET" && path.starts_with("/api/v1/community/actors/") {
+                    let key = path.trim_start_matches("/api/v1/community/actors/");
+                    let aid = if key == "r11_bob" || key == st.bob_id {
+                        st.bob_id.clone()
+                    } else if key == "r11_bot_a" || key == st.bot_a_id {
+                        st.bot_a_id.clone()
+                    } else {
+                        st.alice_id.clone()
+                    };
+                    st.profile_get_received.fetch_add(1, Ordering::SeqCst);
+                    let del_c = st.deleted_comments.lock().unwrap().clone();
+                    let recent_comments: Vec<CommunityCommentDto> =
+                        [st.c_edit.as_str(), st.c_leaf.as_str(), st.c_leaf2.as_str()]
+                            .into_iter()
+                            .filter(|cid| !del_c.contains(*cid))
+                            .map(|cid| st.build_comment(cid, &st.p_part2, Vec::new()))
+                            .collect();
+                    let resp = ActorProfileResponse {
+                        actor: st.build_actor(&aid, &viewer),
+                        recent_posts: vec![st.build_post(&st.p_part2, &viewer)],
+                        recent_comments,
+                        moderated_communities: Vec::new(),
+                    };
+                    let post = st.profile_get_post_delay_ms.swap(0, Ordering::SeqCst);
+                    if post > 0 {
+                        tokio::time::sleep(Duration::from_millis(post)).await;
+                    }
+                    st.profile_get_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&resp).unwrap())
+                } else if method == "PATCH" && path.starts_with("/api/v1/community/actors/") {
+                    let aid = path
+                        .trim_start_matches("/api/v1/community/actors/")
+                        .to_string();
+                    let req: UpdateCommunityActorRequest =
+                        serde_json::from_slice(body_bytes).expect("r11 patch actor");
+                    st.actor_patch_received.fetch_add(1, Ordering::SeqCst);
+                    let pre = req
+                        .display_name
+                        .as_deref()
+                        .and_then(|n| {
+                            st.actor_patch_pre_delays_by_name
+                                .lock()
+                                .unwrap()
+                                .remove(n)
+                        })
+                        .unwrap_or(0);
+                    if pre > 0 {
+                        tokio::time::sleep(Duration::from_millis(pre)).await;
+                    }
+                    if let Some(name) = req.display_name {
+                        st.display_names.lock().unwrap().insert(aid.clone(), name);
+                    }
+                    let mut snap = st.build_actor(&aid, &viewer);
+                    snap.is_following = false;
+                    snap.is_muted = false;
+                    snap.is_blocked = false;
+                    st.actor_patch_completed.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", serde_json::to_string(&snap).unwrap())
+                } else if (method == "POST" || method == "DELETE")
+                    && path.starts_with("/api/v1/community/actors/")
+                    && path.ends_with("/follow")
+                {
+                    let target_id = path
+                        .trim_start_matches("/api/v1/community/actors/")
+                        .trim_end_matches("/follow")
+                        .to_string();
+                    st.follow_calls.fetch_add(1, Ordering::SeqCst);
+                    let want = method == "POST";
+                    let is_blocked = st
+                        .blocks
+                        .lock()
+                        .unwrap()
+                        .contains(&(viewer.clone(), target_id.clone()));
+                    if want && is_blocked {
+                        st.follow_completed.fetch_add(1, Ordering::SeqCst);
+                        ("403 Forbidden", r#"{"error":"blocked"}"#.to_string())
+                    } else {
+                        let cnt = {
+                            let mut f = st.follows.lock().unwrap();
+                            if want {
+                                f.insert((viewer.clone(), target_id.clone()));
+                            } else {
+                                f.remove(&(viewer.clone(), target_id.clone()));
+                            }
+                            f.iter().filter(|(_, t)| t == &target_id).count() as u64
+                        };
+                        st.follow_completed.fetch_add(1, Ordering::SeqCst);
+                        let resp = FollowActionResponse {
+                            actor_id: target_id,
+                            is_following: want,
+                            followers_count: cnt,
+                        };
+                        ("200 OK", serde_json::to_string(&resp).unwrap())
+                    }
+                } else if (method == "POST" || method == "DELETE")
+                    && path == "/api/v1/community/mutes-blocks"
+                {
+                    let req: MuteBlockRequest =
+                        serde_json::from_slice(body_bytes).expect("r11 mb");
+                    let want = method == "POST";
+                    if req.action == MuteBlockActionKind::Block {
+                        let mut b = st.blocks.lock().unwrap();
+                        if want {
+                            b.insert((viewer.clone(), req.target_value.clone()));
+                            st.follows
+                                .lock()
+                                .unwrap()
+                                .remove(&(viewer.clone(), req.target_value.clone()));
+                        } else {
+                            b.remove(&(viewer.clone(), req.target_value.clone()));
+                        }
+                        st.block_completed.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        let mut m = st.mutes.lock().unwrap();
+                        if want {
+                            m.insert((viewer.clone(), req.target_value.clone()));
+                        } else {
+                            m.remove(&(viewer.clone(), req.target_value.clone()));
+                        }
+                    }
+                    if want {
+                        let dto = CommunityMuteBlockDto {
+                            id: "mb_r11_1".to_string(),
+                            owner_actor_id: viewer,
+                            target_kind: MuteBlockTargetKind::Actor,
+                            target_value: req.target_value,
+                            action: req.action,
+                            reason: None,
+                            created_at_ms: 1_750_000_000_000,
+                        };
+                        ("200 OK", serde_json::to_string(&dto).unwrap())
+                    } else {
+                        (
+                            "200 OK",
+                            serde_json::to_string(&DeleteEntityResponse {
+                                id: req.target_value,
+                                deleted: true,
+                            })
+                            .unwrap(),
+                        )
+                    }
+                } else {
+                    ("404 Not Found", r#"{"error":"r11_not_found"}"#.to_string())
+                };
+
+                let http = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = sock.write_all(http.as_bytes()).await;
+            });
+        }
+    });
+
+    (addr, state, AbortOnDrop(join))
+}
+
+async fn body_r11_identity_switch_seq_decoupling_and_cross_route_deletes(mut app: AsyncApp) {
+    let dir = tempfile::TempDir::new().expect("r11 tempdir");
+    let rt_dir = tempfile::TempDir::new().expect("r11 rt tempdir");
+    let rt_holder = TelegramClient::open_with_dir(
+        ClientConfig {
+            server_url: "http://127.0.0.1:9".to_string(),
+            max_reconnect_attempts: 0,
+            ..Default::default()
+        },
+        rt_dir.path(),
+    )
+    .expect("open r11 rt holder");
+    let (addr, srv, _server_guard) = spawn_r11_server(rt_holder.runtime().handle());
+
+    let client = Arc::new(
+        TelegramClient::open_with_dir(
+            ClientConfig {
+                server_url: format!("http://{addr}"),
+                max_reconnect_attempts: 0,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .expect("open r11 client"),
+    );
+    let auth = test_auth(911001, "r11_alice");
+    client.set_auth_session(auth.clone());
+    let client_win = Arc::clone(&client);
+    let auth_win = auth.clone();
+    let shell = app
+        .update(|cx| {
+            let _rt_guard = client_win.runtime().enter();
+            cx.new(|cx| {
+                let mut s = AppShell::new_with_client(client_win.clone(), cx);
+                s.apply_authenticated_session(auth_win.clone(), cx);
+                s
+            })
+        })
+        .expect("mount r11 AppShell");
+    let _ = shell.update(&mut app, |s, cx| s.open_community_workspace(cx));
+    let cw = shell
+        .read_with(&app, |s, _| s.community_workspace.clone().unwrap())
+        .unwrap();
+
+    assert!(
+        pump_until(&mut app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.feed_loading
+                && !st.identities_loading
+                && !st.communities_loading
+                && !st.recommended_actors_loading
+                && st.identities.is_some()
+                && st.communities.len() == 2
+                && !st.recommended_actors.is_empty()
+                && st.feed_items.iter().any(|it| it.post.post_id == srv.p_part2)
+        })
+        .await,
+        "R11 workspace must bootstrap cleanly"
+    );
+
+    run_r11_t01_to_t03(&mut app, &cw, &srv).await;
+    run_r11_t04(&mut app, &cw, &srv).await;
+    run_r11_t05_to_t06(&mut app, &cw, &srv).await;
+
+    drop(rt_holder);
+}
+
+async fn run_r11_t01_to_t03(
+    app: &mut AsyncApp,
+    cw: &Entity<CommunityWorkspace>,
+    srv: &Arc<R11MockState>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // ------------------------------------------------------------------
+    // T11-01 (R10-R2-1): Cross-actor-switch Case B reload in submit_edit_profile
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ActorProfile("r11_bot_a".to_string()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == srv.bot_a_id)
+        })
+        .await,
+        "T11-01 setup: ActorProfile(r11_bot_a) must load"
+    );
+    let ap_rx1 = srv.actor_patch_received.load(Ordering::SeqCst);
+    let ap_done1 = srv.actor_patch_completed.load(Ordering::SeqCst);
+    let pg_rx1 = srv.profile_get_received.load(Ordering::SeqCst);
+    let pg_done1 = srv.profile_get_completed.load(Ordering::SeqCst);
+    srv.actor_patch_pre_delays_by_name
+        .lock()
+        .unwrap()
+        .insert("Bot V2".to_string(), 180);
+    srv.profile_get_post_delay_ms.store(380, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        let a = w.state.actor_profile.as_ref().unwrap().actor.clone();
+        w.open_edit_profile_modal(a, cx);
+        w.state.edit_profile.display_name = "Bot V2".to_string();
+        w.submit_edit_profile(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.actor_patch_received.load(Ordering::SeqCst) > ap_rx1
+        })
+        .await,
+        "T11-01: PATCH /actors/b:911002 must arrive in pre-commit delay"
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.switch_active_actor(srv.bot_a_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            cw.read(cx).state.profile_loading
+                && srv.profile_get_received.load(Ordering::SeqCst) > pg_rx1
+        })
+        .await,
+        "T11-01: switch_active_actor GET #1 must read stale Bot V1 while profile_loading"
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && !st.feed_loading
+                && !st.communities_loading
+                && !st.recommended_actors_loading
+                && srv.actor_patch_completed.load(Ordering::SeqCst) > ap_done1
+                && srv.profile_get_completed.load(Ordering::SeqCst) >= pg_done1 + 2
+        })
+        .await,
+        "T11-01: cross-actor-switch submit_edit_profile must fire reload_actor_route_if_loading"
+    );
+    assert!(
+        srv.profile_get_received.load(Ordering::SeqCst) >= pg_rx1 + 2,
+        "T11-01 (R10-R2-1): reload_actor_route_if_loading must fire GET #2 after PATCH commits"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert_eq!(
+            w.state.actor_profile.as_ref().unwrap().actor.display_name,
+            "Bot V2",
+            "T11-01 (R10-R2-1): actor_profile must converge to Bot V2 (no Bot V1 reversion!)"
+        );
+        let ids = w.state.identities.as_ref().unwrap();
+        assert_eq!(
+            ids.bot_actors
+                .iter()
+                .find(|b| b.actor_id == srv.bot_a_id)
+                .unwrap()
+                .display_name,
+            "Bot V2",
+            "T11-01: identities.bot_actors must hold Bot V2"
+        );
+    });
+
+    // Switch back to Alice and wait settle
+    let _ = cw.update(app, |w, cx| {
+        w.switch_active_actor(srv.alice_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && !st.feed_loading
+                && !st.communities_loading
+                && !st.recommended_actors_loading
+        })
+        .await
+    );
+
+    // ------------------------------------------------------------------
+    // T11-02 (R10-HUNT-1a / 1b / 1c): Zero full-snapshot state.identities overwrites
+    // ------------------------------------------------------------------
+    let id_rx_before = srv.identities_get_received.load(Ordering::SeqCst);
+
+    // (2a) Slow pre-commit save_selected_bot_edits("CrossBot V2") vs fast submit_edit_profile("CrossAlice V2")
+    let ap_rx2a = srv.actor_patch_received.load(Ordering::SeqCst);
+    let ap_done2a = srv.actor_patch_completed.load(Ordering::SeqCst);
+    srv.actor_patch_pre_delays_by_name
+        .lock()
+        .unwrap()
+        .insert("CrossBot V2".to_string(), 240);
+    let _ = cw.update(app, |w, cx| {
+        let bot_a = w
+            .state
+            .identities
+            .as_ref()
+            .unwrap()
+            .bot_actors
+            .iter()
+            .find(|b| b.actor_id == srv.bot_a_id)
+            .unwrap()
+            .clone();
+        w.select_bot_for_studio(bot_a, cx);
+        w.state.bot_studio_edit.display_name = "CrossBot V2".to_string();
+        w.save_selected_bot_edits(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.actor_patch_received.load(Ordering::SeqCst) > ap_rx2a
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        let alice = w
+            .state
+            .identities
+            .as_ref()
+            .unwrap()
+            .human_actor
+            .clone()
+            .unwrap();
+        w.open_edit_profile_modal(alice, cx);
+        w.state.edit_profile.display_name = "CrossAlice V2".to_string();
+        w.submit_edit_profile(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.bot_studio_edit.saving
+                && !st.edit_profile.submitting
+                && srv.actor_patch_completed.load(Ordering::SeqCst) >= ap_done2a + 2
+        })
+        .await,
+        "T11-02a: both cross-actor edits must settle"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let ids = w.state.identities.as_ref().unwrap();
+        assert_eq!(ids.human_actor.as_ref().unwrap().display_name, "CrossAlice V2");
+        assert_eq!(
+            ids.bot_actors
+                .iter()
+                .find(|b| b.actor_id == srv.bot_a_id)
+                .unwrap()
+                .display_name,
+            "CrossBot V2"
+        );
+        assert_eq!(
+            ids.all_actors
+                .iter()
+                .find(|a| a.actor_id == srv.alice_id)
+                .unwrap()
+                .display_name,
+            "CrossAlice V2"
+        );
+        assert_eq!(
+            ids.all_actors
+                .iter()
+                .find(|a| a.actor_id == srv.bot_a_id)
+                .unwrap()
+                .display_name,
+            "CrossBot V2"
+        );
+    });
+
+    // (2b) Symmetric: slow submit_edit_profile("CrossAlice V2B") vs fast save_selected_bot_edits("CrossBot V2B")
+    let ap_rx2b = srv.actor_patch_received.load(Ordering::SeqCst);
+    let ap_done2b = srv.actor_patch_completed.load(Ordering::SeqCst);
+    srv.actor_patch_pre_delays_by_name
+        .lock()
+        .unwrap()
+        .insert("CrossAlice V2B".to_string(), 240);
+    let _ = cw.update(app, |w, cx| {
+        let alice = w
+            .state
+            .identities
+            .as_ref()
+            .unwrap()
+            .human_actor
+            .clone()
+            .unwrap();
+        w.open_edit_profile_modal(alice, cx);
+        w.state.edit_profile.display_name = "CrossAlice V2B".to_string();
+        w.submit_edit_profile(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.actor_patch_received.load(Ordering::SeqCst) > ap_rx2b
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        let bot_a = w
+            .state
+            .identities
+            .as_ref()
+            .unwrap()
+            .bot_actors
+            .iter()
+            .find(|b| b.actor_id == srv.bot_a_id)
+            .unwrap()
+            .clone();
+        w.select_bot_for_studio(bot_a, cx);
+        w.state.bot_studio_edit.display_name = "CrossBot V2B".to_string();
+        w.save_selected_bot_edits(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.bot_studio_edit.saving
+                && !st.edit_profile.submitting
+                && srv.actor_patch_completed.load(Ordering::SeqCst) >= ap_done2b + 2
+        })
+        .await,
+        "T11-02b: symmetric cross-actor edits must settle"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let ids = w.state.identities.as_ref().unwrap();
+        assert_eq!(ids.human_actor.as_ref().unwrap().display_name, "CrossAlice V2B");
+        assert_eq!(
+            ids.bot_actors
+                .iter()
+                .find(|b| b.actor_id == srv.bot_a_id)
+                .unwrap()
+                .display_name,
+            "CrossBot V2B"
+        );
+    });
+
+    // (2c) Slow pre-commit submit_register_bot("r11_new_bot") vs fast submit_edit_profile("CrossAlice V3")
+    let rb_rx = srv.register_bot_received.load(Ordering::SeqCst);
+    let rb_done = srv.register_bot_completed.load(Ordering::SeqCst);
+    let ap_done2c = srv.actor_patch_completed.load(Ordering::SeqCst);
+    srv.register_bot_pre_delay_ms.store(240, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.state.bot_studio_name = "New Bot R11".to_string();
+        w.state.bot_studio_handle = "r11_new_bot".to_string();
+        w.submit_register_bot(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.register_bot_received.load(Ordering::SeqCst) > rb_rx
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        let alice = w
+            .state
+            .identities
+            .as_ref()
+            .unwrap()
+            .human_actor
+            .clone()
+            .unwrap();
+        w.open_edit_profile_modal(alice, cx);
+        w.state.edit_profile.display_name = "CrossAlice V3".to_string();
+        w.submit_edit_profile(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.bot_studio_submitting
+                && !st.edit_profile.submitting
+                && srv.register_bot_completed.load(Ordering::SeqCst) > rb_done
+                && srv.actor_patch_completed.load(Ordering::SeqCst) > ap_done2c
+        })
+        .await,
+        "T11-02c: register_bot + concurrent human edit must both settle"
+    );
+    assert_eq!(
+        srv.identities_get_received.load(Ordering::SeqCst),
+        id_rx_before,
+        "T11-02 (Dead End #4): ZERO redundant GET /identities calls during edits or registration!"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let ids = w.state.identities.as_ref().unwrap();
+        assert_eq!(ids.human_actor.as_ref().unwrap().display_name, "CrossAlice V3");
+        assert!(
+            ids.bot_actors.iter().any(|b| b.handle == "r11_new_bot"),
+            "T11-02c: newly registered r11_new_bot must stay in identities.bot_actors"
+        );
+        assert!(
+            ids.all_actors.iter().any(|a| a.handle == "r11_new_bot"),
+            "T11-02c: newly registered r11_new_bot must stay in identities.all_actors"
+        );
+    });
+
+    // ------------------------------------------------------------------
+    // T11-03 (R10-HUNT-2a/2b + R10-ADV-NEW-3): switch_active_actor recommended_actors reload + scrubbing
+    // ------------------------------------------------------------------
+    // (3a) Mid-bootstrap actor switch while bootstrap search is stalled
+    let sr_rx3a = srv.search_received.load(Ordering::SeqCst);
+    srv.search_pre_delay_ms.store(260, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.state.recommended_actors.clear();
+        w.bootstrap_initial_load(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            cw.read(cx).state.recommended_actors_loading
+                && srv.search_received.load(Ordering::SeqCst) > sr_rx3a
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.switch_active_actor(srv.bot_a_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.recommended_actors_loading
+                && !st.feed_loading
+                && !st.communities_loading
+                && !st.profile_loading
+                && !st.recommended_actors.is_empty()
+        })
+        .await,
+        "T11-03a: switch_active_actor mid-bootstrap must reload non-empty recommended_actors"
+    );
+
+    // (3b) Human blocks Bob, navigates to Feed, switches to Bot -> synchronous scrub + Bot follows Bob!
+    let _ = cw.update(app, |w, cx| {
+        w.switch_active_actor(srv.alice_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.recommended_actors_loading
+                && !st.feed_loading
+                && !st.communities_loading
+                && !st.profile_loading
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.execute_search(String::new(), CommunitySearchTab::Top, cx);
+        w.load_community_page(srv.slug_rust.clone(), cx);
+        w.navigate_to(CommunityRoute::ActorProfile("r11_bob".to_string()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.search_loading
+                && !st.community_loading
+                && !st.profile_loading
+                && st.search_result.is_some()
+                && st.community_detail.is_some()
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.actor.actor_id == srv.bob_id)
+        })
+        .await
+    );
+    let blk_done3b = srv.block_completed.load(Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_block_actor(srv.bob_id.clone(), false, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            cw.read(cx).state.actor_block_in_flight.is_empty()
+                && srv.block_completed.load(Ordering::SeqCst) > blk_done3b
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        assert!(w.state.actor_profile.as_ref().unwrap().actor.is_blocked);
+        w.navigate_to(CommunityRoute::Feed, cx);
+        w.switch_active_actor(srv.bot_a_id.clone(), cx);
+        // Synchronous scrubbing + off-route drop assertions:
+        assert!(
+            w.state.actor_profile.is_none(),
+            "T11-03b: off-route actor_profile must be dropped on switch_active_actor"
+        );
+        assert!(
+            w.state.search_result.is_none(),
+            "T11-03b: off-route search_result must be dropped on switch_active_actor"
+        );
+        assert!(
+            w.state.community_detail.is_none(),
+            "T11-03b: off-route community_detail must be dropped on switch_active_actor"
+        );
+        assert!(
+            w.state
+                .recommended_actors
+                .iter()
+                .all(|a| !a.is_blocked && !a.is_following && !a.is_muted),
+            "T11-03b: recommended_actors must be synchronously scrubbed on switch_active_actor"
+        );
+        assert!(
+            w.state
+                .feed_items
+                .iter()
+                .all(|i| i.post.viewer_vote == 0 && !i.post.viewer_liked && !i.post.viewer_bookmarked),
+            "T11-03b: feed_items viewer flags must be synchronously scrubbed"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.recommended_actors_loading && !st.feed_loading && !st.communities_loading
+        })
+        .await
+    );
+    let fl_calls_before = srv.follow_calls.load(Ordering::SeqCst);
+    let fl_done_before = srv.follow_completed.load(Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_follow_actor(srv.bob_id.clone(), true, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            cw.read(cx).state.actor_follow_in_flight.is_empty()
+                && srv.follow_completed.load(Ordering::SeqCst) > fl_done_before
+        })
+        .await,
+        "T11-03b: Bot must be able to follow Bob after Human blocked Bob"
+    );
+    assert_eq!(
+        srv.follow_calls.load(Ordering::SeqCst),
+        fl_calls_before + 1,
+        "T11-03b: follow_calls must increment (not silently suppressed by stale Human block!)"
+    );
+    assert!(
+        srv.follows
+            .lock()
+            .unwrap()
+            .contains(&(srv.bot_a_id.clone(), srv.bob_id.clone())),
+        "T11-03b: server must record (bot_a, bob) follow"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let bob = w
+            .state
+            .recommended_actors
+            .iter()
+            .find(|a| a.actor_id == srv.bob_id)
+            .unwrap();
+        assert!(
+            bob.is_following && !bob.is_blocked,
+            "T11-03b: Bot UI must show Bob is_following=true, is_blocked=false"
+        );
+    });
+
+    // Restore Alice for T11-04..06
+    let _ = cw.update(app, |w, cx| {
+        w.switch_active_actor(srv.alice_id.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.recommended_actors_loading && !st.feed_loading && !st.communities_loading
+        })
+        .await
+    );
+}
+
+async fn run_r11_t04(
+    app: &mut AsyncApp,
+    cw: &Entity<CommunityWorkspace>,
+    srv: &Arc<R11MockState>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // ------------------------------------------------------------------
+    // T11-04a (R10-ADV-NEW-4): Save #1 on r11_rust -> nav to r11_python and STAY on r11_python
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.execute_search(String::new(), CommunitySearchTab::Top, cx);
+        w.load_mod_queue(srv.slug_rust.clone(), cx);
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_rust.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.search_loading
+                && !st.mod_loading
+                && !st.community_loading
+                && st.search_result.is_some()
+                && st
+                    .mod_community
+                    .as_ref()
+                    .is_some_and(|c| c.slug == srv.slug_rust)
+                && st
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_rust)
+        })
+        .await
+    );
+    let wk_rx4a = srv.wiki_put_received.load(Ordering::SeqCst);
+    let wk_done4a = srv.wiki_put_completed.load(Ordering::SeqCst);
+    let rp_rx4a = srv.rules_patch_received.load(Ordering::SeqCst);
+    let rp_done4a = srv.rules_patch_completed.load(Ordering::SeqCst);
+    srv.wiki_pre_delays_by_md
+        .lock()
+        .unwrap()
+        .insert("# Wiki NavAway".to_string(), 240);
+    srv.rules_pre_delays_by_last_title
+        .lock()
+        .unwrap()
+        .insert("Rule NavAway".to_string(), 240);
+    let _ = cw.update(app, |w, cx| {
+        w.state.community_wiki_editing = true;
+        w.state.community_wiki_draft = "# Wiki NavAway".to_string();
+        w.save_community_wiki(srv.slug_rust.clone(), cx);
+        w.state.community_new_rule_title = "Rule NavAway".to_string();
+        w.add_community_rule(srv.slug_rust.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.wiki_put_received.load(Ordering::SeqCst) > wk_rx4a
+                && srv.rules_patch_received.load(Ordering::SeqCst) > rp_rx4a
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_python.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading
+                && st
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_python)
+        })
+        .await
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            srv.wiki_put_completed.load(Ordering::SeqCst) > wk_done4a
+                && srv.rules_patch_completed.load(Ordering::SeqCst) > rp_done4a
+                && st
+                    .communities
+                    .iter()
+                    .find(|c| c.slug == srv.slug_rust)
+                    .is_some_and(|c| {
+                        c.wiki_markdown == "# Wiki NavAway"
+                            && c.rules.iter().any(|r| r.title == "Rule NavAway")
+                    })
+        })
+        .await,
+        "T11-04a (R10-ADV-NEW-4): staying on r11_python must STILL patch off-route r11_rust caches!"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let mc = w.state.mod_community.as_ref().unwrap();
+        assert_eq!(mc.wiki_markdown, "# Wiki NavAway");
+        assert!(mc.rules.iter().any(|r| r.title == "Rule NavAway"));
+        let sr_rust = w
+            .state
+            .search_result
+            .as_ref()
+            .unwrap()
+            .communities
+            .iter()
+            .find(|c| c.slug == srv.slug_rust)
+            .unwrap();
+        assert_eq!(sr_rust.wiki_markdown, "# Wiki NavAway");
+        assert!(sr_rust.rules.iter().any(|r| r.title == "Rule NavAway"));
+    });
+
+    // ------------------------------------------------------------------
+    // T11-04b (R10-HUNT-3a/3b): Save #1 on r11_rust -> nav to r11_python -> nav BACK to r11_rust (NO Save #2)
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_rust.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading
+                && st
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_rust)
+        })
+        .await
+    );
+    let wk_rx4b = srv.wiki_put_received.load(Ordering::SeqCst);
+    let wk_done4b = srv.wiki_put_completed.load(Ordering::SeqCst);
+    let rp_rx4b = srv.rules_patch_received.load(Ordering::SeqCst);
+    let rp_done4b = srv.rules_patch_completed.load(Ordering::SeqCst);
+    srv.wiki_pre_delays_by_md
+        .lock()
+        .unwrap()
+        .insert("# Wiki NavBack".to_string(), 320);
+    srv.rules_pre_delays_by_last_title
+        .lock()
+        .unwrap()
+        .insert("Rule NavBack".to_string(), 320);
+    let _ = cw.update(app, |w, cx| {
+        w.state.community_wiki_editing = true;
+        w.state.community_wiki_draft = "# Wiki NavBack".to_string();
+        w.save_community_wiki(srv.slug_rust.clone(), cx);
+        w.state.community_new_rule_title = "Rule NavBack".to_string();
+        w.add_community_rule(srv.slug_rust.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.wiki_put_received.load(Ordering::SeqCst) > wk_rx4b
+                && srv.rules_patch_received.load(Ordering::SeqCst) > rp_rx4b
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_python.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading
+                && st
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_python)
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_rust.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading
+                && st
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_rust)
+        })
+        .await
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading
+                && srv.wiki_put_completed.load(Ordering::SeqCst) > wk_done4b
+                && srv.rules_patch_completed.load(Ordering::SeqCst) > rp_done4b
+                && st.community_detail.as_ref().is_some_and(|d| {
+                    d.community.wiki_markdown == "# Wiki NavBack"
+                        && d.community.rules.iter().any(|r| r.title == "Rule NavBack")
+                })
+        })
+        .await,
+        "T11-04b (R10-HUNT-3a/3b): nav-away-and-back without Save #2 MUST converge Wiki & Rules!"
+    );
+
+    // ------------------------------------------------------------------
+    // T11-04c (R10-HUNT-3c): Comment Edit nav-away-and-back without Save #2
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.p_part2)
+        })
+        .await
+    );
+    let cm_rx4c = srv.comment_patch_received.load(Ordering::SeqCst);
+    let cm_done4c = srv.comment_patch_completed.load(Ordering::SeqCst);
+    srv.comment_patch_pre_delays_by_body
+        .lock()
+        .unwrap()
+        .insert("Comment NavBack".to_string(), 320);
+    let _ = cw.update(app, |w, cx| {
+        w.start_edit_comment(srv.c_edit.clone(), "Edit Target Initial".to_string(), cx);
+        w.state.detail_edit_comment_draft = "Comment NavBack".to_string();
+        w.submit_edit_comment(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.comment_patch_received.load(Ordering::SeqCst) > cm_rx4c
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part1.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.p_part1)
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.p_part2)
+        })
+        .await
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            srv.comment_patch_completed.load(Ordering::SeqCst) > cm_done4c
+                && st.detail_post.as_ref().is_some_and(|d| {
+                    d.comments
+                        .iter()
+                        .any(|c| c.comment_id == srv.c_edit && c.body == "Comment NavBack")
+                })
+        })
+        .await,
+        "T11-04c (R10-HUNT-3c): comment edit nav-away-and-back without Save #2 MUST converge!"
+    );
+
+    // ------------------------------------------------------------------
+    // T11-04d (Explorer 2 §4 #1): AutoMod Cross-Slug Nav Twin
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ModQueue(Some(srv.slug_rust.clone())), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.mod_loading
+                && st
+                    .mod_community
+                    .as_ref()
+                    .is_some_and(|c| c.slug == srv.slug_rust)
+        })
+        .await
+    );
+    let am_rx = srv.automod_patch_received.load(Ordering::SeqCst);
+    let am_done = srv.automod_patch_completed.load(Ordering::SeqCst);
+    srv.automod_pre_delay_ms.store(260, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.toggle_automod_rule_enabled("am_r11_1".to_string(), cx);
+        assert!(w.state.automod_draft.saving);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.automod_patch_received.load(Ordering::SeqCst) > am_rx
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ModQueue(Some(srv.slug_python.clone())), cx);
+        assert!(
+            !w.state.automod_draft.saving,
+            "T11-04d: automod_draft.saving must be scoped to active mod_slug (r11_python)"
+        );
+        assert!(
+            w.state.automod_in_flight.contains_key(&srv.slug_rust),
+            "T11-04d: load_mod_queue(r11_python) must NOT wipe r11_rust's automod_in_flight token"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.mod_loading
+                && st.automod_in_flight.is_empty()
+                && srv.automod_patch_completed.load(Ordering::SeqCst) > am_done
+        })
+        .await,
+        "T11-04d: cross-slug AutoMod PATCH must complete cleanly without dropping token"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let rust_comm = w
+            .state
+            .communities
+            .iter()
+            .find(|c| c.slug == srv.slug_rust)
+            .unwrap();
+        assert!(
+            rust_comm.automod_rules[0].enabled,
+            "T11-04d: communities[r11_rust] must reflect committed AutoMod toggle after slug switch"
+        );
+    });
+
+    // ------------------------------------------------------------------
+    // T11-04e (Regressions: BUG-HUNT-6, R9-HUNT-3a/3b, R10-COMMENT-ABA)
+    // ------------------------------------------------------------------
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_rust.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_loading
+                && st
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_rust)
+        })
+        .await
+    );
+    // BUG-HUNT-6: same-slug reload keeps community_wiki_saving == true
+    let wk_done_bh6 = srv.wiki_put_completed.load(Ordering::SeqCst);
+    srv.wiki_pre_delays_by_md
+        .lock()
+        .unwrap()
+        .insert("# BugHunt6".to_string(), 180);
+    let _ = cw.update(app, |w, cx| {
+        w.state.community_wiki_editing = true;
+        w.state.community_wiki_draft = "# BugHunt6".to_string();
+        w.save_community_wiki(srv.slug_rust.clone(), cx);
+        w.load_community_page(srv.slug_rust.clone(), cx);
+        assert!(
+            w.state.community_wiki_saving,
+            "T11-04e (BUG-HUNT-6): same-slug reload must preserve community_wiki_saving"
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_wiki_saving
+                && !st.community_loading
+                && srv.wiki_put_completed.load(Ordering::SeqCst) > wk_done_bh6
+        })
+        .await
+    );
+
+    // R9-HUNT-3a/3b: Wiki & Rules ABA with Save #2 (Save #1 post-delay 280ms vs Save #2 0ms)
+    let wk_rx_aba = srv.wiki_put_received.load(Ordering::SeqCst);
+    let wk_done_aba = srv.wiki_put_completed.load(Ordering::SeqCst);
+    let rp_rx_aba = srv.rules_patch_received.load(Ordering::SeqCst);
+    let rp_done_aba = srv.rules_patch_completed.load(Ordering::SeqCst);
+    srv.wiki_post_delays_by_md
+        .lock()
+        .unwrap()
+        .insert("# Wiki ABA V1".to_string(), 280);
+    srv.rules_post_delays_by_last_title
+        .lock()
+        .unwrap()
+        .insert("Rule ABA V1".to_string(), 280);
+    let _ = cw.update(app, |w, cx| {
+        w.state.community_wiki_editing = true;
+        w.state.community_wiki_draft = "# Wiki ABA V1".to_string();
+        w.save_community_wiki(srv.slug_rust.clone(), cx);
+        w.state.community_new_rule_title = "Rule ABA V1".to_string();
+        w.add_community_rule(srv.slug_rust.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.wiki_put_received.load(Ordering::SeqCst) > wk_rx_aba
+                && srv.rules_patch_received.load(Ordering::SeqCst) > rp_rx_aba
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_python.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.community_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_python)
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_rust.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.community_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .community_detail
+                    .as_ref()
+                    .is_some_and(|d| d.community.slug == srv.slug_rust)
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.state.community_wiki_editing = true;
+        w.state.community_wiki_draft = "# Wiki ABA V2".to_string();
+        w.save_community_wiki(srv.slug_rust.clone(), cx);
+        w.state.community_new_rule_title = "Rule ABA V2".to_string();
+        w.add_community_rule(srv.slug_rust.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.community_wiki_saving
+                && !st.community_rules_saving
+                && !st.community_loading
+                && srv.wiki_put_completed.load(Ordering::SeqCst) >= wk_done_aba + 2
+                && srv.rules_patch_completed.load(Ordering::SeqCst) >= rp_done_aba + 2
+        })
+        .await
+    );
+    // Deterministic loopback barrier to ensure Save #1's GPUI callback has drained
+    let _ = cw.update(app, |w, cx| w.load_notifications(cx));
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.notifications_loading
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let det = w.state.community_detail.as_ref().unwrap();
+        assert_eq!(
+            det.community.wiki_markdown, "# Wiki ABA V2",
+            "T11-04e (R9-HUNT-3a): stale Wiki Save #1 must NOT clobber Save #2!"
+        );
+        assert_eq!(
+            det.community.rules.last().map(|r| r.title.as_str()),
+            Some("Rule ABA V2"),
+            "T11-04e (R9-HUNT-3b): stale Rules Save #1 must NOT clobber Save #2!"
+        );
+    });
+
+    // R10-COMMENT-ABA: Comment Edit Save #1 (post-delay 280ms) vs Save #2 (0ms)
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.detail_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.p_part2)
+        })
+        .await
+    );
+    let cm_rx_aba = srv.comment_patch_received.load(Ordering::SeqCst);
+    let cm_done_aba = srv.comment_patch_completed.load(Ordering::SeqCst);
+    srv.comment_patch_post_delays_by_body
+        .lock()
+        .unwrap()
+        .insert("Comment ABA V1".to_string(), 280);
+    let _ = cw.update(app, |w, cx| {
+        w.start_edit_comment(srv.c_edit.clone(), "Comment NavBack".to_string(), cx);
+        w.state.detail_edit_comment_draft = "Comment ABA V1".to_string();
+        w.submit_edit_comment(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.comment_patch_received.load(Ordering::SeqCst) > cm_rx_aba
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part1.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.detail_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.p_part1)
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.detail_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| d.post.post_id == srv.p_part2)
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.start_edit_comment(srv.c_edit.clone(), "Comment ABA V1".to_string(), cx);
+        w.state.detail_edit_comment_draft = "Comment ABA V2".to_string();
+        w.submit_edit_comment(cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            !cw.read(cx).state.detail_edit_comment_saving
+                && srv.comment_patch_completed.load(Ordering::SeqCst) >= cm_done_aba + 2
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| w.load_notifications(cx));
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.notifications_loading
+        })
+        .await
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let cm = w
+            .state
+            .detail_post
+            .as_ref()
+            .unwrap()
+            .comments
+            .iter()
+            .find(|c| c.comment_id == srv.c_edit)
+            .unwrap();
+        assert_eq!(
+            cm.body, "Comment ABA V2",
+            "T11-04e (R10-COMMENT-ABA): stale Comment Save #1 must NOT clobber Save #2!"
+        );
+    });
+}
+
+async fn run_r11_t05_to_t06(
+    app: &mut AsyncApp,
+    cw: &Entity<CommunityWorkspace>,
+    srv: &Arc<R11MockState>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // ------------------------------------------------------------------
+    // T11-05 (R10-ADV-NEW-1 / 1B + ModQueue Sibling)
+    // ------------------------------------------------------------------
+    // (5a) Thread chain pruning on settled PostDetail(p_part2)
+    let dp_rx5a = srv.delete_post_received.load(Ordering::SeqCst);
+    let dp_done5a = srv.delete_post_completed.load(Ordering::SeqCst);
+    srv.delete_post_pre_delay_ms.store(240, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::Feed, cx);
+        w.delete_post_action(srv.p_part1.clone(), false, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.delete_post_received.load(Ordering::SeqCst) > dp_rx5a
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st.detail_post.as_ref().is_some_and(|d| {
+                    d.post.post_id == srv.p_part2
+                        && d.thread_chain.iter().any(|p| p.post_id == srv.p_part1)
+                })
+        })
+        .await,
+        "T11-05a setup: PostDetail(p_part2) must settle with p_part1 in thread_chain before DELETE commits"
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            srv.delete_post_completed.load(Ordering::SeqCst) > dp_done5a
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| !d.thread_chain.iter().any(|p| p.post_id == srv.p_part1))
+        })
+        .await,
+        "T11-05a (R10-ADV-NEW-1): settled detail_post.thread_chain MUST prune deleted p_part1!"
+    );
+
+    // (5b) Quote chain pruning on settled PostDetail(p_part2)
+    let dp_rx5b = srv.delete_post_received.load(Ordering::SeqCst);
+    let dp_done5b = srv.delete_post_completed.load(Ordering::SeqCst);
+    srv.delete_post_pre_delay_ms.store(240, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::Feed, cx);
+        w.delete_post_action(srv.p_quoted.clone(), false, cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.delete_post_received.load(Ordering::SeqCst) > dp_rx5b
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st.detail_post.as_ref().is_some_and(|d| {
+                    d.post.post_id == srv.p_part2
+                        && d.quote_chain.iter().any(|p| p.post_id == srv.p_quoted)
+                })
+        })
+        .await,
+        "T11-05b setup: PostDetail(p_part2) must settle with p_quoted in quote_chain"
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            srv.delete_post_completed.load(Ordering::SeqCst) > dp_done5b
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| !d.quote_chain.iter().any(|p| p.post_id == srv.p_quoted))
+        })
+        .await,
+        "T11-05b (R10-ADV-NEW-1B): settled detail_post.quote_chain MUST prune deleted p_quoted!"
+    );
+
+    // (5c) ModQueue sibling: Remove & Lock from ModQueue immediately syncs off-route feed_items & community_posts
+    let _ = cw.update(app, |w, cx| {
+        w.load_feed(cx);
+        w.navigate_to(CommunityRoute::CommunityPage(srv.slug_rust.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.feed_loading
+                && !st.community_loading
+                && st.feed_items.iter().any(|i| i.post.post_id == srv.p_mod_rem)
+                && st
+                    .community_posts
+                    .iter()
+                    .any(|i| i.post.post_id == srv.p_mod_lock)
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ModQueue(Some(srv.slug_rust.clone())), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            !cw.read(cx).state.mod_loading
+                && cw
+                    .read(cx)
+                    .state
+                    .mod_community
+                    .as_ref()
+                    .is_some_and(|c| c.slug == srv.slug_rust)
+        })
+        .await
+    );
+    let ma_done = srv.mod_action_completed.load(Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.execute_mod_console_action(
+            srv.slug_rust.clone(),
+            ModActionKind::Remove,
+            "post".to_string(),
+            srv.p_mod_rem.clone(),
+            None,
+            cx,
+        );
+        w.execute_mod_console_action(
+            srv.slug_rust.clone(),
+            ModActionKind::Lock,
+            "post".to_string(),
+            srv.p_mod_lock.clone(),
+            None,
+            cx,
+        );
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.mod_loading
+                && srv.mod_action_completed.load(Ordering::SeqCst) >= ma_done + 2
+                && !st.feed_items.iter().any(|i| i.post.post_id == srv.p_mod_rem)
+                && st
+                    .feed_items
+                    .iter()
+                    .find(|i| i.post.post_id == srv.p_mod_lock)
+                    .is_some_and(|i| i.post.is_locked)
+        })
+        .await,
+        "T11-05c: ModQueue Remove & Lock must sync off-route feed_items & community_posts"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert!(!w
+            .state
+            .community_posts
+            .iter()
+            .any(|i| i.post.post_id == srv.p_mod_rem));
+        assert!(w
+            .state
+            .community_posts
+            .iter()
+            .find(|i| i.post.post_id == srv.p_mod_lock)
+            .unwrap()
+            .post
+            .is_locked);
+    });
+
+    // ------------------------------------------------------------------
+    // T11-06 (R10-ADV-NEW-2 / 2B + Parent Tombstone)
+    // ------------------------------------------------------------------
+    // (6a) Case B (R10-ADV-NEW-2): Delete c_leaf from cold ActorProfile -> open slow PostDetail(p_part2)
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ActorProfile("r11_alice".to_string()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.recent_comments.iter().any(|c| c.comment_id == srv.c_leaf))
+        })
+        .await
+    );
+    let dc_rx6a = srv.delete_comment_received.load(Ordering::SeqCst);
+    let dc_done6a = srv.delete_comment_completed.load(Ordering::SeqCst);
+    let dg_rx6a = srv.detail_get_received.load(Ordering::SeqCst);
+    let dg_done6a = srv.detail_get_completed.load(Ordering::SeqCst);
+    srv.delete_comment_pre_delay_ms.store(140, Ordering::SeqCst);
+    srv.detail_get_post_delay_ms.store(360, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        // Cold ActorProfile: detail_post is None (so old pre-captured reload_pid was None!)
+        w.state.detail_post = None;
+        w.delete_comment_action(srv.c_leaf.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.delete_comment_received.load(Ordering::SeqCst) > dc_rx6a
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            cw.read(cx).state.detail_loading
+                && srv.detail_get_received.load(Ordering::SeqCst) > dg_rx6a
+        })
+        .await,
+        "T11-06a: GET #1 must read pre-delete c_leaf while detail_loading"
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && srv.delete_comment_completed.load(Ordering::SeqCst) > dc_done6a
+                && srv.detail_get_completed.load(Ordering::SeqCst) >= dg_done6a + 2
+        })
+        .await,
+        "T11-06a (R10-ADV-NEW-2): delete_comment_action MUST fence stale GET #1 and reload PostDetail!"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert!(!w
+            .state
+            .detail_post
+            .as_ref()
+            .unwrap()
+            .comments
+            .iter()
+            .any(|c| c.comment_id == srv.c_leaf));
+        assert!(!w
+            .state
+            .actor_profile
+            .as_ref()
+            .unwrap()
+            .recent_comments
+            .iter()
+            .any(|c| c.comment_id == srv.c_leaf));
+    });
+
+    // (6b) Settled (R10-ADV-NEW-2B): Delete c_leaf2 from cold ActorProfile -> fast PostDetail settles WITH c_leaf2 -> DELETE settles
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::ActorProfile("r11_alice".to_string()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.profile_loading
+                && st
+                    .actor_profile
+                    .as_ref()
+                    .is_some_and(|p| p.recent_comments.iter().any(|c| c.comment_id == srv.c_leaf2))
+        })
+        .await
+    );
+    let dc_rx6b = srv.delete_comment_received.load(Ordering::SeqCst);
+    let dc_done6b = srv.delete_comment_completed.load(Ordering::SeqCst);
+    srv.delete_comment_pre_delay_ms.store(240, Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.state.detail_post = None;
+        w.delete_comment_action(srv.c_leaf2.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |_| {
+            srv.delete_comment_received.load(Ordering::SeqCst) > dc_rx6b
+        })
+        .await
+    );
+    let _ = cw.update(app, |w, cx| {
+        w.navigate_to(CommunityRoute::PostDetail(srv.p_part2.clone()), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(4), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && st.detail_post.as_ref().is_some_and(|d| {
+                    d.post.post_id == srv.p_part2
+                        && d.comments.iter().any(|c| c.comment_id == srv.c_leaf2)
+                })
+        })
+        .await,
+        "T11-06b setup: fast PostDetail must settle with c_leaf2 still present before DELETE commits"
+    );
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && srv.delete_comment_completed.load(Ordering::SeqCst) > dc_done6b
+                && st
+                    .detail_post
+                    .as_ref()
+                    .is_some_and(|d| !d.comments.iter().any(|c| c.comment_id == srv.c_leaf2))
+        })
+        .await,
+        "T11-06b (R10-ADV-NEW-2B): settled PostDetail MUST prune c_leaf2 once DELETE commits!"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        assert!(!w
+            .state
+            .actor_profile
+            .as_ref()
+            .unwrap()
+            .recent_comments
+            .iter()
+            .any(|c| c.comment_id == srv.c_leaf2));
+    });
+
+    // (6c) Parent comment deletion tombstones c_parent while preserving child c_child
+    let dc_done6c = srv.delete_comment_completed.load(Ordering::SeqCst);
+    let _ = cw.update(app, |w, cx| {
+        w.delete_comment_action(srv.c_parent.clone(), cx);
+    });
+    assert!(
+        pump_until(app, Duration::from_secs(5), |cx| {
+            let st = &cw.read(cx).state;
+            !st.detail_loading
+                && srv.delete_comment_completed.load(Ordering::SeqCst) > dc_done6c
+                && st.detail_post.as_ref().is_some_and(|d| {
+                    d.comments
+                        .iter()
+                        .find(|c| c.comment_id == srv.c_parent)
+                        .is_some_and(|c| c.is_deleted && c.body == "[deleted]")
+                })
+        })
+        .await,
+        "T11-06c: parent delete must tombstone c_parent as [deleted]"
+    );
+    let _ = cw.read_with(app, |w, _| {
+        let parent = w
+            .state
+            .detail_post
+            .as_ref()
+            .unwrap()
+            .comments
+            .iter()
+            .find(|c| c.comment_id == srv.c_parent)
+            .expect("tombstoned c_parent must remain in tree");
+        assert!(parent.is_deleted && parent.body == "[deleted]");
+        assert!(
+            parent.children.iter().any(|ch| ch.comment_id == srv.c_child),
+            "T11-06c: child c_child must be preserved under tombstoned c_parent"
+        );
+    });
+}
 

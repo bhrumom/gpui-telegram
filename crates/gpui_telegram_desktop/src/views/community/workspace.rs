@@ -224,6 +224,7 @@ impl CommunityWorkspace {
             }
         }
         self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
+        self.state.identities_loading = true;
         let my_id_gen = self.state.identities_gen;
         let my_actor_gen = self.state.actor_switch_gen;
         let facade = self.facade.clone();
@@ -233,10 +234,14 @@ impl CommunityWorkspace {
                 facade.sync_identities(&human, &owned_bots).await
             })
             .await;
-            if let Ok(Ok(ids)) = res {
-                let _ = weak.update(app, |this, cx| {
-                    if this.state.identities_gen != my_id_gen {
-                        return;
+            let _ = weak.update(app, |this, cx| {
+                if this.state.identities_gen != my_id_gen {
+                    return;
+                }
+                this.state.identities_loading = false;
+                if let Ok(Ok(mut ids)) = res {
+                    if !this.state.active_actor_id.is_empty() {
+                        ids.active_actor_id = this.state.active_actor_id.clone();
                     }
                     if this.state.actor_switch_gen != my_actor_gen
                         && !this.state.active_actor_id.is_empty()
@@ -248,10 +253,51 @@ impl CommunityWorkspace {
                         return;
                     }
                     this.apply_identities_response(ids, cx);
-                });
-            }
+                } else {
+                    cx.notify();
+                }
+            });
         })
         .detach();
+    }
+
+    pub(super) fn reload_identities(&mut self, cx: &mut Context<Self>) {
+        self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
+        self.state.identities_loading = true;
+        let my_id_gen = self.state.identities_gen;
+        let facade = self.facade.clone();
+        let rt_handle = facade.runtime_handle().clone();
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res =
+                run_on_community_tokio(&rt_handle, async move { facade.get_identities().await })
+                    .await;
+            let _ = weak.update(app, |this, cx| {
+                if this.state.identities_gen != my_id_gen {
+                    return;
+                }
+                this.state.identities_loading = false;
+                if let Ok(Ok(mut id_resp)) = res {
+                    if this.state.active_actor_id.is_empty() && !id_resp.active_actor_id.is_empty()
+                    {
+                        this.state.active_actor_id = id_resp.active_actor_id.clone();
+                        this.facade
+                            .set_active_actor_id(Some(id_resp.active_actor_id.clone()));
+                    } else if !this.state.active_actor_id.is_empty() {
+                        id_resp.active_actor_id = this.state.active_actor_id.clone();
+                    }
+                    this.state.identities = Some(id_resp);
+                    this.ensure_bot_studio_selected_hydrated(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn reload_identities_if_loading_or_empty(&mut self, cx: &mut Context<Self>) {
+        if self.state.identities_loading || self.state.identities.is_none() {
+            self.reload_identities(cx);
+        }
     }
 }
 
@@ -261,6 +307,7 @@ impl CommunityWorkspace {
     pub fn bootstrap_initial_load(&mut self, cx: &mut Context<Self>) {
         self.load_feed(cx);
         self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
+        self.state.identities_loading = true;
         let my_id_gen = self.state.identities_gen;
         let my_actor_gen = self.state.actor_switch_gen;
         self.state.communities_gen = self.state.communities_gen.wrapping_add(1);
@@ -314,13 +361,16 @@ impl CommunityWorkspace {
                     let _ = weak.update(app, |this, cx| {
                         this.state.runtime_mode = mode;
                         if this.state.identities_gen == my_id_gen {
-                            if let Some(id_resp) = ids {
+                            this.state.identities_loading = false;
+                            if let Some(mut id_resp) = ids {
                                 if this.state.active_actor_id.is_empty()
                                     && !id_resp.active_actor_id.is_empty()
                                 {
                                     this.state.active_actor_id = id_resp.active_actor_id.clone();
                                     this.facade
                                         .set_active_actor_id(Some(id_resp.active_actor_id.clone()));
+                                } else if !this.state.active_actor_id.is_empty() {
+                                    id_resp.active_actor_id = this.state.active_actor_id.clone();
                                 }
                                 this.state.identities = Some(id_resp);
                                 this.ensure_bot_studio_selected_hydrated(cx);
@@ -393,6 +443,9 @@ impl CommunityWorkspace {
                 }
                 Err(_) => {
                     let _ = weak.update(app, |this, cx| {
+                        if this.state.identities_gen == my_id_gen {
+                            this.state.identities_loading = false;
+                        }
                         if this.state.communities_gen == my_comm_gen
                             && this.state.actor_switch_gen == my_actor_gen
                         {
@@ -1266,6 +1319,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if let Ok(Ok(created)) = res {
+                        this.reload_detail_if_loading_post(&created.post.post_id, true, cx);
+                    }
                     return;
                 }
                 this.state.quick_post_submitting = false;
@@ -1547,6 +1603,60 @@ impl CommunityWorkspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reconcile_mod_action_caches_and_routes(
+        &mut self,
+        slug: &str,
+        action: ModActionKind,
+        target_kind: &str,
+        target_id: &str,
+        flair: Option<&str>,
+        force_reload_matching_mod_queue: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.state
+            .apply_mod_action_to_caches(action, target_kind, target_id, flair);
+        if target_kind.eq_ignore_ascii_case("post") {
+            let on_target_detail = matches!(
+                &self.state.route,
+                CommunityRoute::PostDetail(id) if id == target_id
+            );
+            let on_pin_comm = matches!(action, ModActionKind::Pin | ModActionKind::Unpin)
+                && matches!(
+                    &self.state.route,
+                    CommunityRoute::CommunityPage(s) if s.eq_ignore_ascii_case(slug)
+                );
+            if on_target_detail {
+                if self.state.feed_loading || self.state.feed_loading_more {
+                    self.load_feed(cx);
+                }
+                self.load_post_detail(target_id.to_string(), cx);
+            } else if on_pin_comm {
+                if self.state.feed_loading || self.state.feed_loading_more {
+                    self.load_feed(cx);
+                }
+                self.load_community_page(slug.to_string(), cx);
+            } else {
+                self.reload_detail_if_loading_post(target_id, true, cx);
+            }
+        } else if target_kind.eq_ignore_ascii_case("comment") {
+            if let CommunityRoute::PostDetail(id) = self.state.route.clone() {
+                self.load_post_detail(id, cx);
+            } else {
+                self.reload_comment_route_if_loading(None, cx);
+            }
+        }
+        let matching_mod_slug = self
+            .state
+            .mod_slug
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(slug));
+        if matching_mod_slug && (force_reload_matching_mod_queue || self.state.mod_loading) {
+            self.load_mod_queue(slug.to_string(), cx);
+        }
+        cx.notify();
+    }
+
     pub fn vote_post(&mut self, post_id: String, clicked_dir: i8, cx: &mut Context<Self>) {
         let (next_dir, snap) = self.state.apply_optimistic_vote(&post_id, clicked_dir);
         if !self.state.post_vote_last_synced.contains_key(&post_id) {
@@ -1595,6 +1705,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
+                    }
                     return;
                 }
                 if this.state.post_vote_in_flight.get(&post_id).copied() != Some(my_flight_seq) {
@@ -1704,6 +1817,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
+                    }
                     return;
                 }
                 if this.state.post_like_in_flight.get(&post_id).copied() != Some(my_flight_seq) {
@@ -1806,6 +1922,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
+                    }
                     return;
                 }
                 if this.state.post_repost_in_flight.get(&post_id).copied() != Some(my_flight_seq) {
@@ -1884,6 +2003,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if let Ok(Ok(created)) = res {
+                        this.reload_detail_if_loading_post(&created.post.post_id, true, cx);
+                    }
                     return;
                 }
                 match res {
@@ -2016,6 +2138,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_detail_if_loading_post(&post_id, true, cx);
+                    }
                     return;
                 }
                 if this.state.poll_vote_in_flight.get(&post_id).copied() != Some(my_flight_seq) {
@@ -2098,6 +2223,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_detail_if_loading_post(&pid_cb, true, cx);
+                    }
                     return;
                 }
                 match res {
@@ -2182,19 +2310,11 @@ impl CommunityWorkspace {
         self.state.actor_switch_gen = self.state.actor_switch_gen.wrapping_add(1);
         let my_actor_gen = self.state.actor_switch_gen;
 
-        // 1. Immediately revoke ALL cached viewer_role fields synchronously so unauthorized actors
-        //    never retain the previous actor's moderator permissions on any route.
-        for c in &mut self.state.communities {
-            c.viewer_role = None;
-        }
-        if let Some(ref mut det) = self.state.community_detail {
-            det.community.viewer_role = None;
-        }
-        if let Some(ref mut sr) = self.state.search_result {
-            for c in &mut sr.communities {
-                c.viewer_role = None;
-            }
-        }
+        // 1. Synchronously scrub ALL viewer-specific flags across retained caches and drop
+        //    off-route secondary snapshots so previous actor permissions/blocks/votes never leak
+        //    or shadow the new actor's freshly loaded state.
+        self.state.scrub_viewer_state_on_actor_switch();
+        self.emit_action(CommunityWorkspaceAction::UnreadCountChanged(0), cx);
         self.state.mod_community = None;
         self.state.mod_queue.clear();
         self.state.mod_logs.clear();
@@ -2280,6 +2400,11 @@ impl CommunityWorkspace {
         // available until the fresh actor-scoped `load_post_detail` completes.
         self.state.detail_gen = self.state.detail_gen.wrapping_add(1);
         self.state.detail_loading = false;
+        self.state.detail_editing_comment_id = None;
+        self.state.detail_edit_comment_draft.clear();
+        if self.state.active_input == ActiveCommunityInput::DetailEditComment {
+            self.state.blur_input();
+        }
         self.state.detail_edit_comment_saving = false;
         self.state.detail_edit_comment_save_seq =
             self.state.detail_edit_comment_save_seq.wrapping_add(1);
@@ -2356,9 +2481,10 @@ impl CommunityWorkspace {
         self.load_feed(cx);
         self.load_notifications(cx);
 
-        // Generation-guarded communities refresh for the new actor's viewer_role memberships,
-        // and automatic ModQueue re-evaluation when switching identities on ModQueue.
+        // Generation-guarded communities & recommended-actors refreshes for the new actor's
+        // viewer_role / follow / mute / block state, and automatic ModQueue re-evaluation.
         self.reload_communities_list(cx);
+        self.reload_recommended_actors(cx);
 
         // Off-route concurrent refresh of lists for the new actor (e.g. LeftNav pinned lists).
         if !matches!(self.state.route, CommunityRoute::BookmarksLists) {
@@ -2460,6 +2586,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != submitter_actor_id
                 {
+                    if let Ok(Ok(ref resp)) = res {
+                        this.reload_community_join_route_if_loading(&resp.community_slug, cx);
+                    }
                     return;
                 }
                 if this.state.community_join_in_flight.get(&slug_key).copied()
@@ -2601,6 +2730,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_actor_route_if_loading(cx);
+                    }
                     return;
                 }
                 if this.state.actor_follow_in_flight.get(&actor_id).copied()
@@ -2901,13 +3033,37 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_detail_if_loading_post(&reload_pid, true, cx);
+                    }
                     return;
                 }
                 match res {
-                    Ok(Ok(_)) => {
-                        if this.state.route == CommunityRoute::PostDetail(reload_pid.clone()) {
-                            this.load_post_detail(reload_pid, cx);
+                    Ok(Ok(resp)) => {
+                        if !resp.comment.is_removed && !resp.comment.is_deleted {
+                            this.state.visit_post_mut(&reload_pid, |p| {
+                                p.comments_count = p.comments_count.saturating_add(1);
+                            });
+                            if let Some(ref mut prof) = this.state.actor_profile {
+                                if prof.actor.actor_id == resp.comment.author_actor_id
+                                    && !prof
+                                        .recent_comments
+                                        .iter()
+                                        .any(|c| c.comment_id == resp.comment.comment_id)
+                                {
+                                    prof.recent_comments.insert(0, resp.comment);
+                                }
+                            }
                         }
+                        if this.state.route == CommunityRoute::PostDetail(reload_pid.clone()) {
+                            if this.state.feed_loading || this.state.feed_loading_more {
+                                this.load_feed(cx);
+                            }
+                            this.load_post_detail(reload_pid, cx);
+                        } else {
+                            this.reload_detail_if_loading_post(&reload_pid, true, cx);
+                        }
+                        cx.notify();
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -3314,11 +3470,10 @@ impl CommunityWorkspace {
         self.state.mod_loading = true;
         self.state.mod_error = None;
         if !same_slug {
-            self.state.automod_draft.saving = false;
-            self.state.automod_in_flight.clear();
-            self.state.automod_dirty.clear();
-            self.state.automod_reset_draft_pending.clear();
-            self.state.automod_last_synced.clear();
+            self.state.automod_draft.saving = self
+                .state
+                .automod_in_flight
+                .contains_key(&slug.to_ascii_lowercase());
         }
         let status_filter = self.state.mod_status_filter;
         let facade = self.facade.clone();
@@ -3416,6 +3571,8 @@ impl CommunityWorkspace {
             );
             return;
         }
+        let target_kind_cb = target_kind.clone();
+        let target_id_cb = target_id.clone();
         let req = ModActionRequest {
             action,
             target_kind,
@@ -3438,18 +3595,30 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != submitter_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reconcile_mod_action_caches_and_routes(
+                            &reload_slug,
+                            action,
+                            &target_kind_cb,
+                            &target_id_cb,
+                            None,
+                            false,
+                            cx,
+                        );
+                    }
                     return;
                 }
                 match res {
                     Ok(Ok(_)) => {
-                        if this
-                            .state
-                            .mod_slug
-                            .as_deref()
-                            .is_some_and(|s| s.eq_ignore_ascii_case(&reload_slug))
-                        {
-                            this.load_mod_queue(reload_slug, cx);
-                        }
+                        this.reconcile_mod_action_caches_and_routes(
+                            &reload_slug,
+                            action,
+                            &target_kind_cb,
+                            &target_id_cb,
+                            None,
+                            true,
+                            cx,
+                        );
                     }
                     Ok(Err(e)) => {
                         this.emit_action(

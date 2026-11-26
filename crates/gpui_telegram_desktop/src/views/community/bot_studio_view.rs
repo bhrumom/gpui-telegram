@@ -468,23 +468,19 @@ impl CommunityWorkspace {
         };
         self.state.bot_studio_submitting = true;
         self.state.bot_studio_error = None;
-        self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
-        let my_id_gen = self.state.identities_gen;
         let facade = self.facade.clone();
         let handle = facade.runtime_handle().clone();
         cx.notify();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                let created = facade.register_bot_actor(&req).await;
-                let ids = facade.get_identities().await.ok();
-                (created, ids)
+                facade.register_bot_actor(&req).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
                 this.state.bot_studio_submitting = false;
                 match res {
-                    Ok((Ok(reg), ids)) => {
+                    Ok(Ok(reg)) => {
                         this.state.bot_studio_name.clear();
                         this.state.bot_studio_handle.clear();
                         this.state.bot_studio_bio.clear();
@@ -498,11 +494,9 @@ impl CommunityWorkspace {
                         this.state
                             .known_owned_actor_ids
                             .insert(reg.actor.actor_id.clone());
-                        if this.state.identities_gen == my_id_gen {
-                            if let Some(i) = ids {
-                                this.state.identities = Some(i);
-                            }
-                        }
+                        this.state.upsert_registered_bot_actor(&reg.actor);
+                        this.reload_identities_if_loading_or_empty(cx);
+                        this.reload_actor_route_if_loading(cx);
                         this.select_bot_for_studio(reg.actor, cx);
                         let lang = this.language_id.clone();
                         this.emit_action(
@@ -518,7 +512,7 @@ impl CommunityWorkspace {
                             cx,
                         );
                     }
-                    Ok((Err(e), _)) => {
+                    Ok(Err(e)) => {
                         this.state.bot_studio_error = Some(e.to_string());
                     }
                     Err(e) => {
@@ -599,8 +593,6 @@ impl CommunityWorkspace {
         let my_save_seq = self.state.bot_studio_edit_save_seq;
         self.state.bot_studio_edit.saving = true;
         self.state.bot_studio_edit.error = None;
-        self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
-        let my_id_gen = self.state.identities_gen;
         let actor_edit_entry = self
             .state
             .actor_edit_seq
@@ -615,9 +607,7 @@ impl CommunityWorkspace {
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                let updated = facade.update_actor(&actor_id, &req).await;
-                let ids = facade.get_identities().await.ok();
-                (updated, ids)
+                facade.update_actor(&actor_id, &req).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
@@ -625,7 +615,6 @@ impl CommunityWorkspace {
                 let still_current_save = this.state.bot_studio_edit_save_seq == my_save_seq
                     && this.state.bot_studio_selected_bot_id.as_deref()
                         == Some(actor_id_cb.as_str());
-                let latest_identities = this.state.identities_gen == my_id_gen;
                 let is_latest_actor_edit = this
                     .state
                     .actor_edit_seq
@@ -636,20 +625,14 @@ impl CommunityWorkspace {
                     this.state.bot_studio_edit.saving = false;
                 }
                 match res {
-                    Ok((Ok(updated), ids)) => {
-                        if latest_identities {
-                            if let Some(i) = ids {
-                                this.state.identities = Some(i);
-                            }
-                        }
+                    Ok(Ok(updated)) => {
                         if is_latest_actor_edit {
                             this.state.patch_edited_actor_metadata(&updated);
                         }
+                        this.reload_identities_if_loading_or_empty(cx);
                         this.reload_actor_route_if_loading(cx);
                         if still_current_save && is_latest_actor_edit {
                             this.select_bot_for_studio(updated, cx);
-                        }
-                        if is_latest_actor_edit {
                             this.emit_action(
                                 CommunityWorkspaceAction::ShowToast {
                                     text: tr_str(
@@ -664,7 +647,7 @@ impl CommunityWorkspace {
                             );
                         }
                     }
-                    Ok((Err(e), _)) => {
+                    Ok(Err(e)) => {
                         if still_current_save {
                             this.state.bot_studio_edit.error = Some(e.to_string());
                         }
@@ -750,6 +733,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if let Ok(Ok(created)) = res {
+                        this.reload_detail_if_loading_post(&created.post.post_id, true, cx);
+                    }
                     return;
                 }
                 this.state.bot_studio_test_submitting = false;
@@ -871,6 +857,11 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if let Ok(Ok(ref resp)) = res {
+                        if resp.triggered {
+                            this.reload_detail_if_loading_post(&jump_pid, true, cx);
+                        }
+                    }
                     return;
                 }
                 this.state.bot_studio_test_submitting = false;

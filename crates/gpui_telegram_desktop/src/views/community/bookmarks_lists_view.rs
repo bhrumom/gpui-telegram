@@ -329,6 +329,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_detail_if_loading_post(&post_id, false, cx);
+                    }
                     return;
                 }
                 // Guard 2: Flight token ownership & deleted-post cancellation fence.

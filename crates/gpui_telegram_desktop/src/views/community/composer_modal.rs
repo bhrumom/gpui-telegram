@@ -656,6 +656,13 @@ impl CommunityWorkspace {
             status: Some(PostStatus::Published),
             ..Default::default()
         };
+        let post_edit_entry = self
+            .state
+            .post_edit_entity_save_seq
+            .entry(post_id.clone())
+            .or_insert(0);
+        *post_edit_entry = post_edit_entry.wrapping_add(1);
+        let my_post_edit_seq = *post_edit_entry;
         let my_actor_gen = self.state.actor_switch_gen;
         let expected_actor_id = self.state.active_actor_id.clone();
         let facade = self.facade.clone();
@@ -667,15 +674,32 @@ impl CommunityWorkspace {
             })
             .await;
             let _ = weak.update(app, |this, cx| {
+                let is_latest_post_edit = this
+                    .state
+                    .post_edit_entity_save_seq
+                    .get(&post_id)
+                    .copied()
+                    == Some(my_post_edit_seq);
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if let Ok(Ok(updated)) = res {
+                        if is_latest_post_edit {
+                            this.state.patch_edited_post_metadata(&updated);
+                        }
+                        this.reload_detail_if_loading_post(&updated.post_id, true, cx);
+                        cx.notify();
+                    }
                     return;
                 }
                 match res {
                     Ok(Ok(updated)) => {
-                        this.state.patch_edited_post_metadata(&updated);
-                        this.state.composer.drafts.retain(|d| d.post_id != post_id);
+                        if is_latest_post_edit {
+                            this.state.patch_edited_post_metadata(&updated);
+                            this.state.composer.drafts.retain(|d| d.post_id != post_id);
+                        }
+                        let was_feed_loading =
+                            this.state.feed_loading || this.state.feed_loading_more;
                         this.reload_detail_if_loading_post(&post_id, true, cx);
                         if this.state.composer.drafts_loading {
                             this.load_composer_drafts(cx);
@@ -688,7 +712,9 @@ impl CommunityWorkspace {
                             },
                             cx,
                         );
-                        this.load_feed(cx);
+                        if !was_feed_loading {
+                            this.load_feed(cx);
+                        }
                     }
                     Ok(Err(e)) => {
                         this.emit_action(
@@ -1081,6 +1107,14 @@ impl CommunityWorkspace {
             };
             self.state.composer.submitting = true;
             self.state.composer.validation_error = None;
+            let post_edit_entry = self
+                .state
+                .post_edit_entity_save_seq
+                .entry(edit_id.clone())
+                .or_insert(0);
+            *post_edit_entry = post_edit_entry.wrapping_add(1);
+            let my_post_edit_seq = *post_edit_entry;
+            let edit_id_cb = edit_id.clone();
             let my_actor_gen = self.state.actor_switch_gen;
             let expected_actor_id = self.state.active_actor_id.clone();
             let facade = self.facade.clone();
@@ -1092,9 +1126,22 @@ impl CommunityWorkspace {
                 })
                 .await;
                 let _ = weak.update(app, |this, cx| {
+                    let is_latest_post_edit = this
+                        .state
+                        .post_edit_entity_save_seq
+                        .get(&edit_id_cb)
+                        .copied()
+                        == Some(my_post_edit_seq);
                     if this.state.actor_switch_gen != my_actor_gen
                         || this.state.active_actor_id != expected_actor_id
                     {
+                        if let Ok(Ok(updated)) = res {
+                            if is_latest_post_edit {
+                                this.state.patch_edited_post_metadata(&updated);
+                            }
+                            this.reload_detail_if_loading_post(&updated.post_id, true, cx);
+                            cx.notify();
+                        }
                         return;
                     }
                     this.state.composer.submitting = false;
@@ -1102,7 +1149,9 @@ impl CommunityWorkspace {
                     match res {
                         Ok(Ok(updated)) => {
                             let updated_pid = updated.post_id.clone();
-                            this.state.patch_edited_post_metadata(&updated);
+                            if is_latest_post_edit {
+                                this.state.patch_edited_post_metadata(&updated);
+                            }
                             let was_feed_loading =
                                 this.state.feed_loading || this.state.feed_loading_more;
                             this.reload_detail_if_loading_post(&updated_pid, true, cx);
@@ -1162,6 +1211,11 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if let Ok(Ok(resp)) = res {
+                        if requested_status == PostStatus::Published {
+                            this.reload_detail_if_loading_post(&resp.post.post_id, true, cx);
+                        }
+                    }
                     return;
                 }
                 this.state.composer.submitting = false;

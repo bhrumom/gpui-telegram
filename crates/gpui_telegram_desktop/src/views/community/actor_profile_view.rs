@@ -346,6 +346,9 @@ impl CommunityWorkspace {
                 if this.state.actor_switch_gen != my_actor_gen
                     || this.state.active_actor_id != expected_actor_id
                 {
+                    if res.as_ref().is_ok_and(Result::is_ok) {
+                        this.reload_actor_route_if_loading(cx);
+                    }
                     return;
                 }
                 if this.state.actor_block_in_flight.get(&actor_id).copied() != Some(my_flight_seq)
@@ -592,8 +595,6 @@ impl CommunityWorkspace {
         let aid_cb = aid.clone();
         self.state.edit_profile.submitting = true;
         self.state.edit_profile.error = None;
-        self.state.identities_gen = self.state.identities_gen.wrapping_add(1);
-        let my_id_gen = self.state.identities_gen;
         let actor_edit_entry = self.state.actor_edit_seq.entry(aid.clone()).or_insert(0);
         *actor_edit_entry = actor_edit_entry.wrapping_add(1);
         let my_actor_edit_seq = *actor_edit_entry;
@@ -603,9 +604,7 @@ impl CommunityWorkspace {
         cx.notify();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let res = run_on_community_tokio(&handle, async move {
-                let updated = facade.update_actor(&aid, &req).await?;
-                let ids = facade.get_identities().await.ok();
-                Ok::<_, gpui_telegram_core::TelegramError>((updated, ids))
+                facade.update_actor(&aid, &req).await
             })
             .await;
             let _ = weak.update(app, |this, cx| {
@@ -616,22 +615,14 @@ impl CommunityWorkspace {
                     .copied()
                     == Some(my_actor_edit_seq);
                 if this.state.actor_switch_gen != my_actor_gen {
-                    let mut changed = false;
-                    if let Ok(Ok((updated, ids))) = res {
-                        if this.state.identities_gen == my_id_gen {
-                            if let Some(id_resp) = ids {
-                                this.state.identities = Some(id_resp);
-                                this.ensure_bot_studio_selected_hydrated(cx);
-                                changed = true;
-                            }
-                        }
+                    if let Ok(Ok(updated)) = res {
                         if is_latest_actor_edit {
                             this.state.patch_edited_actor_metadata(&updated);
                             this.sync_bot_studio_edit_metadata_if_matching(&updated);
-                            changed = true;
                         }
-                    }
-                    if changed {
+                        this.ensure_bot_studio_selected_hydrated(cx);
+                        this.reload_identities_if_loading_or_empty(cx);
+                        this.reload_actor_route_if_loading(cx);
                         cx.notify();
                     }
                     return;
@@ -639,16 +630,13 @@ impl CommunityWorkspace {
                 this.state.edit_profile.submitting = false;
                 let lang = this.language_id.clone();
                 match res {
-                    Ok(Ok((updated, ids))) => {
-                        if this.state.identities_gen == my_id_gen {
-                            if let Some(id_resp) = ids {
-                                this.apply_identities_response(id_resp, cx);
-                            }
-                        }
+                    Ok(Ok(updated)) => {
                         if is_latest_actor_edit {
                             this.state.patch_edited_actor_metadata(&updated);
                             this.sync_bot_studio_edit_metadata_if_matching(&updated);
                         }
+                        this.ensure_bot_studio_selected_hydrated(cx);
+                        this.reload_identities_if_loading_or_empty(cx);
                         this.reload_actor_route_if_loading(cx);
                         this.close_edit_profile_modal(cx);
                         this.emit_action(
