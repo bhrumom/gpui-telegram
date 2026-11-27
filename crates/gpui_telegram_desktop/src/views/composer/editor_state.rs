@@ -261,7 +261,7 @@ fn next_word_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
-/// Detects active `@mention`, `/command`, `#hashtag`, or `:emoji:` token immediately before cursor.
+/// Detects active `@mention`, `/command`, `$skill`, `#hashtag`, or `:emoji:` token immediately before cursor.
 pub fn detect_autocomplete_trigger(text: &str, cursor: usize) -> Option<(char, String, usize)> {
     let cur = clamp_char_boundary(text, cursor);
     let prefix = &text[..cur];
@@ -273,7 +273,9 @@ pub fn detect_autocomplete_trigger(text: &str, cursor: usize) -> Option<(char, S
         .unwrap_or(0);
     let token = &prefix[token_start..];
     let first = token.chars().next()?;
-    if matches!(first, '@' | '/' | '#' | ':') && !token[first.len_utf8()..].contains(':') {
+    if first == '$'
+        || (matches!(first, '@' | '/' | '#' | ':') && !token[first.len_utf8()..].contains(':'))
+    {
         Some((first, token.to_string(), token_start))
     } else {
         None

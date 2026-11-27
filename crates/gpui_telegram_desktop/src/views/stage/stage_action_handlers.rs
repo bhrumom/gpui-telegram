@@ -169,6 +169,10 @@ impl ConversationStage {
     pub fn apply_topbar_action(&mut self, action: TopBarUiAction) {
         match action {
             TopBarUiAction::ToggleInspector => self.toggle_inspector(),
+            TopBarUiAction::ToggleBotCompanion => {
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::ToggleBotCompanion);
+            }
             TopBarUiAction::ToggleSearch => {
                 self.more_menu_open = false;
                 self.ttl_submenu_open = false;

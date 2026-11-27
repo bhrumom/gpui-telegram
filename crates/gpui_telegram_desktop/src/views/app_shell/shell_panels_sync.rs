@@ -756,6 +756,20 @@ impl AppShell {
             | InspectorAction::SaveBotComputerConfig { .. }) => {
                 let _ = self.handle_computer_inspector_action(act, cx);
             }
+            act @ (InspectorAction::AddBotMemory(_)
+            | InspectorAction::DeleteBotMemory(_)
+            | InspectorAction::TidyBotMemories
+            | InspectorAction::InstallBotSkill { .. }
+            | InspectorAction::ToggleBotSkill { .. }
+            | InspectorAction::CreatePresetRoutine { .. }
+            | InspectorAction::ToggleBotRoutine { .. }
+            | InspectorAction::RunBotRoutineNow { .. }
+            | InspectorAction::CreateStarterWorkflow
+            | InspectorAction::RunBotWorkflow { .. }
+            | InspectorAction::DecideBotWorkflowApproval { .. }
+            | InspectorAction::OpenBotCompanion(_)) => {
+                let _ = self.handle_bot_fusion_inspector_action(act, cx);
+            }
             InspectorAction::PatchFabushiBot { bot_id, req } => {
                 let Some(fence) = self.capture_client_fence() else {
                     return;

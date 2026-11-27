@@ -207,6 +207,9 @@ pub struct ContextInspector {
     pub add_member_candidates: Vec<AddMemberCandidate>,
     pub add_member_search_input: Option<Entity<TextInputController>>,
     pub pending_add_member_user_id: Option<u64>,
+    pub bot_fusion: BotFusionSnapshot,
+    pub memory_draft: String,
+    pub memory_input: Option<Entity<TextInputController>>,
 }
 
 impl ContextInspector {
@@ -261,6 +264,9 @@ impl ContextInspector {
             add_member_candidates: Vec::new(),
             add_member_search_input: None,
             pending_add_member_user_id: None,
+            bot_fusion: BotFusionSnapshot::default(),
+            memory_draft: String::new(),
+            memory_input: None,
         }
     }
 
@@ -624,6 +630,40 @@ impl ContextInspector {
         if self.add_member_search_input.is_none() {
             self.add_member_search_input = Some(cx.new(|_| TextInputController::new()));
         }
+        if self.memory_input.is_none() {
+            self.memory_input = Some(cx.new(|_| TextInputController::new()));
+        }
+    }
+
+    /// Synchronizes the live Native Bot Fusion snapshot (Memory, Skills, MCP, Routines, Workflows, Queue).
+    pub fn set_bot_fusion_snapshot(&mut self, snap: BotFusionSnapshot) {
+        let same_agent = !snap.fabushi_agent_id.is_empty()
+            && self.bot_fusion.fabushi_agent_id == snap.fabushi_agent_id;
+        if !same_agent {
+            self.memory_draft.clear();
+            if self.bot_config_focus == BotConfigFocusField::MemoryDraft {
+                self.bot_config_focus = BotConfigFocusField::None;
+            }
+        }
+        if let Some(ref mut fab) = self.active_fabushi_bot {
+            if !snap.fabushi_agent_id.is_empty() && fab.agent_id == snap.fabushi_agent_id {
+                fab.memory_entries_count = snap.memories.len();
+                fab.skills_count = snap.skills.iter().filter(|s| s.enabled).count();
+            }
+        }
+        self.bot_fusion = snap;
+    }
+
+    /// Emits `InspectorAction::AddBotMemory` when `memory_draft` is non-empty and resets the draft.
+    pub fn submit_memory_draft(&mut self) -> bool {
+        let text = self.memory_draft.trim().to_string();
+        if text.is_empty() {
+            return false;
+        }
+        self.memory_draft.clear();
+        self.bot_config_focus = BotConfigFocusField::None;
+        self.pending_action = Some(InspectorAction::AddBotMemory(text));
+        true
     }
 
     pub fn sync_computers(&mut self, computers: Vec<ComputerNodeDto>) {
@@ -719,7 +759,9 @@ impl ContextInspector {
                 || (self.subpage == InspectorSubpage::Main
                     && matches!(
                         self.bot_config_focus,
-                        BotConfigFocusField::CodingWorkspace | BotConfigFocusField::CodingModel
+                        BotConfigFocusField::CodingWorkspace
+                            | BotConfigFocusField::CodingModel
+                            | BotConfigFocusField::MemoryDraft
                     )))
     }
 
@@ -732,6 +774,7 @@ impl ContextInspector {
             BotConfigFocusField::Model => self.model_input.as_ref(),
             BotConfigFocusField::CodingWorkspace => self.coding_workspace_input.as_ref(),
             BotConfigFocusField::CodingModel => self.coding_model_input.as_ref(),
+            BotConfigFocusField::MemoryDraft => self.memory_input.as_ref(),
             BotConfigFocusField::None => None,
         }
     }
@@ -745,6 +788,7 @@ impl ContextInspector {
             BotConfigFocusField::Model => &self.bot_draft_model,
             BotConfigFocusField::CodingWorkspace => &self.coding_draft_workspace,
             BotConfigFocusField::CodingModel => &self.coding_draft_model_override,
+            BotConfigFocusField::MemoryDraft => &self.memory_draft,
             BotConfigFocusField::None => "",
         }
     }
@@ -758,6 +802,7 @@ impl ContextInspector {
             BotConfigFocusField::Model => Some(&mut self.bot_draft_model),
             BotConfigFocusField::CodingWorkspace => Some(&mut self.coding_draft_workspace),
             BotConfigFocusField::CodingModel => Some(&mut self.coding_draft_model_override),
+            BotConfigFocusField::MemoryDraft => Some(&mut self.memory_draft),
             BotConfigFocusField::None => None,
         }
     }
@@ -830,6 +875,7 @@ impl ContextInspector {
                     BotConfigFocusField::Model => BotConfigFocusField::Persona,
                     BotConfigFocusField::CodingWorkspace => BotConfigFocusField::CodingModel,
                     BotConfigFocusField::CodingModel => BotConfigFocusField::CodingWorkspace,
+                    BotConfigFocusField::MemoryDraft => BotConfigFocusField::None,
                     BotConfigFocusField::None => BotConfigFocusField::None,
                 };
                 cx.notify();
@@ -847,6 +893,13 @@ impl ContextInspector {
                     }
                     return true;
                 }
+                if self.bot_config_focus == BotConfigFocusField::MemoryDraft {
+                    if !self.submit_memory_draft() {
+                        self.bot_config_focus = BotConfigFocusField::None;
+                    }
+                    cx.notify();
+                    return true;
+                }
                 if self.bot_config_focus == BotConfigFocusField::Persona {
                     self.bot_draft_persona.push('\n');
                     cx.notify();
@@ -854,6 +907,11 @@ impl ContextInspector {
                     self.bot_config_focus = BotConfigFocusField::None;
                     cx.notify();
                 }
+                true
+            }
+            "escape" if self.bot_config_focus == BotConfigFocusField::MemoryDraft => {
+                self.bot_config_focus = BotConfigFocusField::None;
+                cx.notify();
                 true
             }
             "escape" if self.is_add_member_search_active() => {

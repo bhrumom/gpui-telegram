@@ -31,6 +31,7 @@ pub mod semantic_tree;
 pub mod session;
 pub mod shell_actions;
 pub mod shell_bot_browser;
+pub mod shell_bot_fusion;
 pub mod shell_calls_rtc;
 pub mod shell_coding_host;
 pub mod shell_community;
@@ -128,6 +129,7 @@ pub use shell_actions::{
     shell_tasks_to_acp_entries,
 };
 pub use shell_bot_browser::ShellBotBrowserState;
+pub use shell_bot_fusion::ShellBotFusionState;
 pub use shell_content_hub::ShellContentHubState;
 pub use shell_panels::{
     localized_panel_label, parse_acp_tasks, parse_mcp_servers, parse_mcp_tools,

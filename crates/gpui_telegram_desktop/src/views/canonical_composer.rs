@@ -218,6 +218,10 @@ pub struct CanonicalComposer {
     pub bot_ac_matches: Vec<BotSlashCommandItem>,
     pub bot_ac_selected: usize,
     pub(crate) bot_ac_pinned_by_button: bool,
+    pub bot_dollar_items: Vec<crate::views::drawer::BotFusionDollarCandidate>,
+    pub dollar_ac_visible: bool,
+    pub dollar_ac_matches: Vec<crate::views::drawer::BotFusionDollarCandidate>,
+    pub dollar_ac_selected: usize,
     pub context_ref_hint_open: bool,
     pub send_on_enter: bool,
     pub suggest_stickers_by_emoji: bool,
@@ -282,6 +286,10 @@ impl CanonicalComposer {
             bot_ac_matches: Vec::new(),
             bot_ac_selected: 0,
             bot_ac_pinned_by_button: false,
+            bot_dollar_items: Vec::new(),
+            dollar_ac_visible: false,
+            dollar_ac_matches: Vec::new(),
+            dollar_ac_selected: 0,
             context_ref_hint_open: false,
             send_on_enter: true,
             suggest_stickers_by_emoji: true,
@@ -596,6 +604,40 @@ impl CanonicalComposer {
         self.bot_ac_matches.clear();
         self.bot_ac_selected = 0;
         self.bot_ac_pinned_by_button = false;
+        self.sync_autocomplete();
+    }
+
+    pub fn set_bot_dollar_candidates(
+        &mut self,
+        items: Vec<crate::views::drawer::BotFusionDollarCandidate>,
+    ) {
+        if self.is_compose_isolated {
+            return;
+        }
+        self.bot_dollar_items = items;
+        self.sync_autocomplete();
+    }
+
+    pub fn clear_bot_dollar_candidates(&mut self) {
+        self.bot_dollar_items.clear();
+        self.dollar_ac_visible = false;
+        self.dollar_ac_matches.clear();
+        self.dollar_ac_selected = 0;
+    }
+
+    pub fn open_dollar_picker(&mut self) {
+        if self.bot_dollar_items.is_empty() {
+            return;
+        }
+        let cur_text = self.text().to_string();
+        if !cur_text.ends_with('$') {
+            if !cur_text.is_empty() && !cur_text.ends_with(' ') {
+                self.editor.insert_at_cursor(&mut self.ime_machine, " $");
+            } else {
+                self.editor.insert_at_cursor(&mut self.ime_machine, "$");
+            }
+        }
+        self.is_input_focused = true;
         self.sync_autocomplete();
     }
 

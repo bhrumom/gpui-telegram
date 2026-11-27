@@ -160,13 +160,36 @@ pub fn resolve_grok_persona_color(agent_id: &str, color: Option<&str>) -> String
     GROK_AVATAR_FALLBACK_COLOR_IDS[grok_shipped_color_index(agent_id)].to_string()
 }
 
-/// Resolves an optional persona avatar shape into a Grok dynamic shape ID or `"classic"`,
-/// mapping legacy aliases and falling back deterministically via `grok_shipped_shape_hash(agent_id)`.
+/// Returns `true` when `normalized` (already trimmed & lowercased) is a safe OpenBot
+/// Plush (`plush`, `plush:<id>`) or Bloub (`bloub`, `bloub:<id>`) avatar spec.
+pub fn is_valid_openbot_avatar_shape(normalized: &str) -> bool {
+    if normalized == "plush" || normalized == "bloub" {
+        return true;
+    }
+    let Some(rest) = normalized
+        .strip_prefix("plush:")
+        .or_else(|| normalized.strip_prefix("bloub:"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 48
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Resolves an optional persona avatar shape into a Grok dynamic shape ID, an OpenBot
+/// `plush:*` / `bloub:*` avatar spec, or `"classic"`, mapping legacy aliases and falling
+/// back deterministically via `grok_shipped_shape_hash(agent_id)`.
 pub fn resolve_grok_persona_shape(agent_id: &str, shape: Option<&str>) -> String {
     if let Some(raw) = shape {
         let normalized = raw.trim().to_ascii_lowercase();
         if normalized == CLASSIC_INITIALS_AVATAR_SHAPE {
             return CLASSIC_INITIALS_AVATAR_SHAPE.to_string();
+        }
+        if is_valid_openbot_avatar_shape(&normalized) {
+            return normalized;
         }
         let mapped = match normalized.as_str() {
             "circle" | "round" => "blob",
@@ -183,7 +206,7 @@ pub fn resolve_grok_persona_shape(agent_id: &str, shape: Option<&str>) -> String
         .to_string()
 }
 
-/// Normalizes an optional avatar shape against the Grok/Fabushi shape catalog.
+/// Normalizes an optional avatar shape against the unified Fabushi/OpenBot/Grok shape catalog.
 pub fn normalize_fabushi_avatar_shape(raw: &str, seed: &str) -> String {
     let trimmed = raw.trim();
     let opt = (!trimmed.is_empty()).then_some(trimmed);

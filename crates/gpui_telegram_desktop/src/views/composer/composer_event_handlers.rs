@@ -144,6 +144,40 @@ impl CanonicalComposer {
                     self.context_ref_hint_open = false;
                     self.autocomplete.hide();
                 }
+            } else if trigger == '$' {
+                let q = token.trim_start_matches('$').to_ascii_lowercase();
+                self.bot_ac_visible = false;
+                self.bot_ac_matches.clear();
+                self.bot_ac_pinned_by_button = false;
+                self.hermes_ac_visible = false;
+                self.hermes_ac_matches.clear();
+                self.hermes_ac_pinned_by_button = false;
+                self.context_ref_hint_open = false;
+                self.autocomplete.hide();
+                if !self.bot_dollar_items.is_empty() {
+                    let mut prefix = Vec::new();
+                    let mut substr = Vec::new();
+                    for item in &self.bot_dollar_items {
+                        let clean = item.token.trim().trim_start_matches('$').to_ascii_lowercase();
+                        if q.is_empty() || clean.starts_with(&q) {
+                            prefix.push(item.clone());
+                        } else if clean.contains(&q)
+                            || item.title.to_ascii_lowercase().contains(&q)
+                            || item.subtitle.to_ascii_lowercase().contains(&q)
+                        {
+                            substr.push(item.clone());
+                        }
+                    }
+                    prefix.extend(substr);
+                    self.dollar_ac_matches = prefix;
+                    if self.dollar_ac_selected >= self.dollar_ac_matches.len() {
+                        self.dollar_ac_selected = 0;
+                    }
+                    self.dollar_ac_visible = !self.dollar_ac_matches.is_empty();
+                } else {
+                    self.dollar_ac_visible = false;
+                    self.dollar_ac_matches.clear();
+                }
             } else if trigger == '@' {
                 self.bot_ac_visible = false;
                 self.bot_ac_matches.clear();
@@ -151,6 +185,8 @@ impl CanonicalComposer {
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
                 self.hermes_ac_pinned_by_button = false;
+                self.dollar_ac_visible = false;
+                self.dollar_ac_matches.clear();
                 self.context_ref_hint_open = true;
                 self.autocomplete.show_filtered(&token);
             } else if trigger == '#' {
@@ -160,6 +196,8 @@ impl CanonicalComposer {
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
                 self.hermes_ac_pinned_by_button = false;
+                self.dollar_ac_visible = false;
+                self.dollar_ac_matches.clear();
                 self.context_ref_hint_open = false;
                 self.autocomplete.show_filtered(&token);
             } else {
@@ -169,6 +207,8 @@ impl CanonicalComposer {
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
                 self.hermes_ac_pinned_by_button = false;
+                self.dollar_ac_visible = false;
+                self.dollar_ac_matches.clear();
                 self.context_ref_hint_open = false;
                 self.autocomplete.hide();
             }
@@ -187,6 +227,8 @@ impl CanonicalComposer {
                 self.hermes_ac_matches.clear();
                 self.hermes_ac_pinned_by_button = false;
             }
+            self.dollar_ac_visible = false;
+            self.dollar_ac_matches.clear();
             self.context_ref_hint_open = false;
             let trimmed = text.trim();
             if self.suggest_stickers_by_emoji
@@ -221,6 +263,25 @@ impl CanonicalComposer {
             }
         }
         self.sync_bot_menu_compact_state(None);
+    }
+
+    pub fn select_dollar_autocomplete_index(&mut self, idx: usize) {
+        self.ime_machine.on_ime_cancel();
+        if let Some(item) = self.dollar_ac_matches.get(idx).cloned() {
+            let clean = item.token.trim().trim_start_matches('$');
+            let insert = format!("${clean} ");
+            let cur = self.ime_machine.cursor_index;
+            let text = self.ime_machine.text().to_string();
+            if matches!(detect_autocomplete_trigger(&text, cur), Some(('$', _, _))) {
+                self.replace_active_trigger_token(&insert);
+            } else {
+                self.editor.insert_at_cursor(&mut self.ime_machine, &insert);
+            }
+            self.dollar_ac_visible = false;
+            self.dollar_ac_matches.clear();
+            self.dollar_ac_selected = 0;
+            self.sync_bot_menu_compact_state(None);
+        }
     }
 
     pub fn select_bot_autocomplete_index(&mut self, idx: usize) {
@@ -492,7 +553,35 @@ impl CanonicalComposer {
         }
 
         if !self.ime_machine.is_composing() {
-            if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
+            if self.dollar_ac_visible && !self.dollar_ac_matches.is_empty() {
+                let len = self.dollar_ac_matches.len();
+                match ks.key.as_str() {
+                    "up" => {
+                        self.dollar_ac_selected = if self.dollar_ac_selected == 0 {
+                            len.saturating_sub(1)
+                        } else {
+                            self.dollar_ac_selected - 1
+                        };
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "down" => {
+                        self.dollar_ac_selected = (self.dollar_ac_selected + 1) % len;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "tab" => {
+                        let idx = self.dollar_ac_selected.min(len.saturating_sub(1));
+                        self.select_dollar_autocomplete_index(idx);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    _ => {}
+                }
+            } else if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
                 let len = self.bot_ac_matches.len();
                 match ks.key.as_str() {
                     "up" => {
@@ -590,6 +679,15 @@ impl CanonicalComposer {
             "delete" => self.editor.delete_forward(&mut self.ime_machine),
             "enter" => {
                 if !self.ime_machine.is_composing() && !shift {
+                    if self.dollar_ac_visible && !self.dollar_ac_matches.is_empty() {
+                        let idx = self
+                            .dollar_ac_selected
+                            .min(self.dollar_ac_matches.len().saturating_sub(1));
+                        self.select_dollar_autocomplete_index(idx);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
                     if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
                         let idx = self.bot_ac_selected.min(self.bot_ac_matches.len().saturating_sub(1));
                         self.select_bot_autocomplete_index(idx);
@@ -636,6 +734,9 @@ impl CanonicalComposer {
                 self.bot_ac_matches.clear();
                 self.bot_ac_selected = 0;
                 self.bot_ac_pinned_by_button = false;
+                self.dollar_ac_visible = false;
+                self.dollar_ac_matches.clear();
+                self.dollar_ac_selected = 0;
                 self.hermes_ac_visible = false;
                 self.hermes_ac_matches.clear();
                 self.hermes_ac_pinned_by_button = false;
@@ -848,6 +949,115 @@ impl CanonicalComposer {
         } else {
             None
         };
+        if self.dollar_ac_visible && !self.dollar_ac_matches.is_empty() {
+            let pal = self.palette;
+            let matches = self.dollar_ac_matches.clone();
+            let total_matches = matches.len();
+            let sel = self.dollar_ac_selected.min(total_matches.saturating_sub(1));
+            let window_start = if total_matches > 8 && sel >= 5 {
+                (sel - 4).min(total_matches - 8)
+            } else {
+                0
+            };
+            let visible_rows: Vec<(usize, crate::views::drawer::BotFusionDollarCandidate)> = matches
+                .into_iter()
+                .enumerate()
+                .skip(window_start)
+                .take(8)
+                .collect();
+            return Some(
+                div()
+                    .id("composer-bot-dollar-popup")
+                    .mb(px(6.0))
+                    .w(px(380.0))
+                    .max_h(px(280.0))
+                    .overflow_y_scroll()
+                    .rounded(px(12.0))
+                    .bg(rgb(pal.menu_bg))
+                    .border_1()
+                    .border_color(rgb(pal.border_fg))
+                    .shadow_lg()
+                    .p(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(visible_rows.into_iter().map(|(idx, item)| {
+                        let is_sel = idx == sel;
+                        let token_lbl = format!("${}", item.token.trim().trim_start_matches('$'));
+                        div()
+                            .id(SharedString::from(format!("bot-dollar-row-{idx}")))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(8.0))
+                            .when(is_sel, |d| d.bg(rgb(pal.input_bg)))
+                            .hover(move |s| s.bg(rgb(pal.menu_hover_bg)))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.select_dollar_autocomplete_index(idx);
+                                    this.sync_bot_menu_compact_state(Some(cx));
+                                    cx.notify();
+                                }),
+                            )
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(pal.accent))
+                                                    .child(token_lbl),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(pal.text_primary))
+                                                    .truncate()
+                                                    .child(item.title),
+                                            ),
+                                    )
+                                    .when(!item.subtitle.is_empty(), |col| {
+                                        col.child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(pal.text_secondary))
+                                                .truncate()
+                                                .child(item.subtitle),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded_full()
+                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.accent))
+                                    .child(item.badge),
+                            )
+                    }))
+                    .into_any_element(),
+            );
+        }
         if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
             let pal = self.palette;
             let matches = self.bot_ac_matches.clone();

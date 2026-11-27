@@ -88,6 +88,124 @@ pub enum BotConfigFocusField {
     Model,
     CodingWorkspace,
     CodingModel,
+    MemoryDraft,
+}
+
+/// Active tab of the inline Bot Companion SidePanel beside `ConversationStage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BotCompanionTab {
+    #[default]
+    Workflow,
+    Knowledge,
+    Activity,
+}
+
+/// Live memory entry belonging to the currently selected native Bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionMemoryItem {
+    pub id: String,
+    pub content: String,
+    pub origin: String,
+    pub updated_at: String,
+}
+
+/// Live skill installed on the currently selected native Bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionSkillItem {
+    pub skill_id: String,
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+}
+
+/// Registered MCP server available to the currently selected native Bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionMcpItem {
+    pub id: String,
+    pub name: String,
+    pub transport: String,
+    pub enabled: bool,
+}
+
+/// Scheduled routine owned by the currently selected native Bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionRoutineItem {
+    pub id: String,
+    pub name: String,
+    pub schedule_label: String,
+    pub active: bool,
+    pub instruction: String,
+}
+
+/// Workflow summary associated with the active Bot workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionWorkflowItem {
+    pub id: String,
+    pub title: String,
+    pub step_count: usize,
+    pub last_run_status: Option<String>,
+    pub last_run_id: Option<String>,
+    pub pending_approval_node: Option<String>,
+    pub node_labels: Vec<String>,
+}
+
+/// Queued message waiting in the Bot's OpenBot DrainScheduler mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionQueueItem {
+    pub delivery_id: String,
+    pub text: String,
+    pub status: String,
+}
+
+/// Interactive `ask_ui` card surfaced directly above `CanonicalComposer` (e.g. Workflow approval gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionAskCard {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub node_id: String,
+    pub title: String,
+    pub prompt: String,
+}
+
+/// Collapsible execution step entry rendered in Bot Activity & inline steps timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionStepItem {
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+}
+
+/// `$` composer trigger candidate exposing THIS Bot's Skills, Routines, Workflows & quick actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotFusionDollarCandidate {
+    pub token: String,
+    pub title: String,
+    pub subtitle: String,
+    pub badge: String,
+}
+
+/// Authoritative snapshot of OpenBot/Orca native capabilities bound 1:1 to the active Fabushi Bot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BotFusionSnapshot {
+    pub fabushi_agent_id: String,
+    pub openbot_agent_id: String,
+    pub bot_display_name: String,
+    pub memories: Vec<BotFusionMemoryItem>,
+    pub skills: Vec<BotFusionSkillItem>,
+    pub mcp_servers: Vec<BotFusionMcpItem>,
+    pub routines: Vec<BotFusionRoutineItem>,
+    pub workflows: Vec<BotFusionWorkflowItem>,
+    pub queue_items: Vec<BotFusionQueueItem>,
+    pub queue_paused: bool,
+    pub active_turn_id: Option<String>,
+    pub ask_cards: Vec<BotFusionAskCard>,
+    pub recent_steps: Vec<BotFusionStepItem>,
+    pub side_question_last: Option<(String, String)>,
+    pub dollar_candidates: Vec<BotFusionDollarCandidate>,
+    pub companion_open: bool,
+    pub companion_tab: BotCompanionTab,
+    pub selected_workflow_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +249,40 @@ pub enum InspectorAction {
     OpenAddBotToGroup(u64),
     ReportBot(u64),
     ToggleBlockBot(u64),
+    // Native Bot Fusion (OpenBot + Orca unified inside existing Bot Inspector)
+    AddBotMemory(String),
+    DeleteBotMemory(String),
+    TidyBotMemories,
+    InstallBotSkill {
+        slug: String,
+        name: String,
+        description: String,
+    },
+    ToggleBotSkill {
+        skill_id: String,
+        enabled: bool,
+    },
+    CreatePresetRoutine {
+        preset: String,
+    },
+    ToggleBotRoutine {
+        routine_id: String,
+        active: bool,
+    },
+    RunBotRoutineNow {
+        routine_id: String,
+    },
+    CreateStarterWorkflow,
+    RunBotWorkflow {
+        workflow_id: String,
+    },
+    DecideBotWorkflowApproval {
+        workflow_id: String,
+        run_id: String,
+        node_id: String,
+        approve: bool,
+    },
+    OpenBotCompanion(BotCompanionTab),
 }
 
 /// Live AI provider & model catalog synchronized from Settings (`MagpieStateDto` + discovered subscriptions).

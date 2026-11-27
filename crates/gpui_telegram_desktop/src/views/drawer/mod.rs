@@ -54,8 +54,10 @@ pub mod bot_computer_inspector;
 pub mod inspector_panels;
 pub mod inspector_tabs;
 pub use inspector_tabs::{
-    BotConfigFocusField, InspectorAction, InspectorAiModelCatalog, InspectorSubpage, InspectorTab,
-    InspectorTabsView, MemberItem, MembersTabModel, ProfileTabModel, SharedFileItem,
-    SharedLinkItem, SharedMediaItem, SharedMediaSubTab, SharedMediaTabModel, SharedVoiceItem,
-    SettingsTabModel,
+    BotCompanionTab, BotConfigFocusField, BotFusionAskCard, BotFusionDollarCandidate,
+    BotFusionMcpItem, BotFusionMemoryItem, BotFusionQueueItem, BotFusionRoutineItem,
+    BotFusionSkillItem, BotFusionSnapshot, BotFusionStepItem, BotFusionWorkflowItem,
+    InspectorAction, InspectorAiModelCatalog, InspectorSubpage, InspectorTab, InspectorTabsView,
+    MemberItem, MembersTabModel, ProfileTabModel, SharedFileItem, SharedLinkItem, SharedMediaItem,
+    SharedMediaSubTab, SharedMediaTabModel, SharedVoiceItem, SettingsTabModel,
 };

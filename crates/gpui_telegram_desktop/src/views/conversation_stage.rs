@@ -417,6 +417,7 @@ pub enum StageAction {
         approval_id: String,
         decision: ToolApprovalDecision,
     },
+    ToggleBotCompanion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,6 +438,7 @@ pub struct ConversationStage {
     pub pinned_message: Option<String>,
     pub messages: Vec<MessageItemModel>,
     pub is_inspector_open: bool,
+    pub is_bot_companion_open: bool,
     pub pending_call_request: bool,
     pub pending_video_call: bool,
     pub pending_media_url: Option<(String, bool)>,
@@ -561,6 +563,7 @@ impl ConversationStage {
             pinned_message: None,
             messages: Vec::new(),
             is_inspector_open: false,
+            is_bot_companion_open: false,
             pending_call_request: false,
             pending_video_call: false,
             pending_media_url: None,
@@ -1401,6 +1404,7 @@ impl Render for ConversationStage {
                 self.search_match_cursor,
                 self.search_match_ids.len(),
                 self.is_inspector_open,
+                self.is_bot_companion_open,
                 self.more_menu_open,
                 &self.palette,
                 &self.lang_id,

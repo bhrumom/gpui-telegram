@@ -10,7 +10,9 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
-use crate::components::avatar::parse_fabushi_hex_color;
+use crate::components::avatar::{
+    parse_fabushi_hex_color, OPENBOT_BLOUB_AVATAR_PRESETS, OPENBOT_PLUSH_AVATAR_PRESETS,
+};
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, trigger_grok_avatar_bounce, trigger_grok_avatar_spin,
     GrokBotAvatarProps, GrokPersonaState, GROK_COLOR_PALETTE,
@@ -23,6 +25,24 @@ use gpui_telegram_proto::miniapp_contracts::{
 use gpui_telegram_proto::{
     CodingAgentBotConfig, CodingPermissionMode, CodingProviderKind, DetectedCodingProvider,
 };
+use orca_core::bot_ecosystem::templates::{
+    BotTemplate, BotTemplateCategory, BUILTIN_BOT_TEMPLATES,
+};
+
+fn template_category_label_zh(cat: BotTemplateCategory) -> &'static str {
+    match cat {
+        BotTemplateCategory::Coding => "编程",
+        BotTemplateCategory::Releases => "发布",
+        BotTemplateCategory::Support => "支持",
+        BotTemplateCategory::Planning => "规划",
+        BotTemplateCategory::Ops => "运维",
+        BotTemplateCategory::Personal => "个人",
+    }
+}
+
+fn template_plush_avatar_spec(idx: usize) -> &'static str {
+    OPENBOT_PLUSH_AVATAR_PRESETS[idx % OPENBOT_PLUSH_AVATAR_PRESETS.len()].0
+}
 
 fn parse_coding_extra_args(raw: &str) -> Vec<String> {
     let mut args = Vec::new();
@@ -144,7 +164,8 @@ fn classic_preview_initials(label: &str) -> String {
 }
 
 /// Dialog box for creating a first-class Fabushi Bot (`Agent` aggregate),
-/// generating a full Bot + Mini App via natural language, or connecting a managed token.
+/// instantiating from 24 built-in role templates, generating a full Bot + Mini App via
+/// natural language, or connecting a managed token.
 /// Target symbol in ledger: `CreateManagedBotBoxPeers`.
 #[derive(Debug, Clone)]
 pub struct CreateManagedBotBoxPeers {
@@ -158,6 +179,8 @@ pub struct CreateManagedBotBoxPeers {
     pub avatar_shape: String,
     pub avatar_color: String,
     pub use_dynamic_avatar: bool,
+    /// Active avatar style tab: `0` = OpenBot Plush 3D, `1` = OpenBot Bloub, `2` = Grok Geometry.
+    pub avatar_style_tab: u8,
     pub preferred_model: String,
     pub thinking_level: String,
     pub approval_mode: String,
@@ -165,7 +188,11 @@ pub struct CreateManagedBotBoxPeers {
     pub is_submitting: bool,
     pub is_fabushi_mode: bool,
     pub is_coding_agent_mode: bool,
+    pub is_template_mode: bool,
     pub is_ai_mode: bool,
+    pub template_category_filter: Option<BotTemplateCategory>,
+    pub selected_template_id: Option<String>,
+    pub selected_template_skills: Vec<String>,
     pub detected_coding_providers: Vec<DetectedCodingProvider>,
     pub selected_coding_provider: CodingProviderKind,
     pub coding_workspace_path: String,
@@ -196,8 +223,8 @@ impl CreateManagedBotBoxPeers {
     pub fn new() -> Self {
         Self {
             is_visible: true,
-            width: px(510.0),
-            height: px(520.0),
+            width: px(540.0),
+            height: px(540.0),
             bot_name: String::new(),
             bot_username: String::new(),
             bot_token: String::new(),
@@ -205,6 +232,7 @@ impl CreateManagedBotBoxPeers {
             avatar_shape: "blob".to_string(),
             avatar_color: "blue".to_string(),
             use_dynamic_avatar: true,
+            avatar_style_tab: 0,
             preferred_model: String::new(),
             thinking_level: "medium".to_string(),
             approval_mode: "prompt".to_string(),
@@ -212,7 +240,11 @@ impl CreateManagedBotBoxPeers {
             is_submitting: false,
             is_fabushi_mode: false,
             is_coding_agent_mode: false,
+            is_template_mode: false,
             is_ai_mode: true,
+            template_category_filter: None,
+            selected_template_id: None,
+            selected_template_skills: Vec::new(),
             detected_coding_providers: Vec::new(),
             selected_coding_provider: CodingProviderKind::ClaudeCode,
             coding_workspace_path: String::new(),
@@ -234,7 +266,45 @@ impl CreateManagedBotBoxPeers {
         }
     }
 
-    /// Returns `(avatar_shape, avatar_color)` matching whether Grok dynamic character mode is active.
+    /// Pre-fills the unified Fabushi Bot form from one of the 24 built-in templates.
+    pub fn apply_template(&mut self, tpl: &BotTemplate, idx: usize) {
+        self.bot_name = tpl.name.to_string();
+        let slug: String = tpl
+            .id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .collect();
+        self.bot_username = format!("{slug}_bot");
+        let soul = tpl.soul_md.trim();
+        self.description = if soul.is_empty() {
+            tpl.tagline.to_string()
+        } else {
+            format!("{} — {}", tpl.tagline, soul.lines().take(3).collect::<Vec<_>>().join(" "))
+        };
+        self.avatar_shape = template_plush_avatar_spec(idx).to_string();
+        self.avatar_color = tpl.avatar_color.to_string();
+        self.use_dynamic_avatar = true;
+        self.avatar_style_tab = 0;
+        self.selected_template_id = Some(tpl.id.to_string());
+        self.selected_template_skills = tpl.bundled_skills.iter().map(|s| (*s).to_string()).collect();
+        self.is_template_mode = false;
+        self.is_coding_agent_mode = false;
+        self.is_fabushi_mode = true;
+        self.is_ai_mode = false;
+        self.active_field = 1;
+        self.status_message = Some(format!(
+            "✓ Loaded template '{}' ({} skills)",
+            tpl.name,
+            tpl.bundled_skills.len()
+        ));
+    }
+
+    /// Takes any bundled skills associated with the selected template for local OpenBot provisioning.
+    pub fn take_selected_template_skills(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.selected_template_skills)
+    }
+
+    /// Returns `(avatar_shape, avatar_color)` matching whether dynamic character mode is active.
     pub fn effective_avatar_choice(&self) -> (Option<String>, Option<String>) {
         if self.use_dynamic_avatar {
             (
@@ -306,6 +376,7 @@ impl CreateManagedBotBoxPeers {
         self.is_visible = true;
         self.is_coding_agent_mode = true;
         self.is_fabushi_mode = false;
+        self.is_template_mode = false;
         self.is_ai_mode = false;
         self.active_field = 10;
         self.is_submitting = false;
@@ -319,8 +390,20 @@ impl CreateManagedBotBoxPeers {
         self.is_visible = true;
         self.is_coding_agent_mode = false;
         self.is_fabushi_mode = true;
+        self.is_template_mode = false;
         self.is_ai_mode = false;
         self.active_field = 1;
+        self.is_submitting = false;
+        self.status_message = None;
+    }
+
+    pub fn open_template_creator(&mut self) {
+        self.is_visible = true;
+        self.is_coding_agent_mode = false;
+        self.is_fabushi_mode = false;
+        self.is_template_mode = true;
+        self.is_ai_mode = false;
+        self.active_field = 0;
         self.is_submitting = false;
         self.status_message = None;
     }
@@ -329,6 +412,7 @@ impl CreateManagedBotBoxPeers {
         self.is_visible = true;
         self.is_coding_agent_mode = false;
         self.is_fabushi_mode = false;
+        self.is_template_mode = false;
         self.is_ai_mode = true;
         self.active_field = 0;
         self.is_submitting = false;
@@ -681,6 +765,17 @@ impl CreateManagedBotBoxPeers {
             });
 
         let right_controls = if self.use_dynamic_avatar {
+            let style_tab = self.avatar_style_tab.min(2);
+            let style_tabs: [(u8, &str); 3] = [
+                (0, tr_str(lang, "毛绒 Plush", "Plush 3D")),
+                (1, tr_str(lang, "拟人 Bloub", "Bloub")),
+                (2, tr_str(lang, "几何 Grok", "Geometric")),
+            ];
+            let choices: Vec<(&'static str, &'static str)> = match style_tab {
+                0 => OPENBOT_PLUSH_AVATAR_PRESETS.to_vec(),
+                1 => OPENBOT_BLOUB_AVATAR_PRESETS.to_vec(),
+                _ => GROK_AVATAR_SHAPES.iter().map(|&s| (s, s)).collect(),
+            };
             div()
                 .flex()
                 .flex_col()
@@ -690,19 +785,64 @@ impl CreateManagedBotBoxPeers {
                 .child(
                     div()
                         .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .children(style_tabs.into_iter().map(|(tab_id, label)| {
+                            let active = style_tab == tab_id;
+                            div()
+                                .id(SharedString::from(format!("fab-avatar-style-tab-{tab_id}")))
+                                .cursor_pointer()
+                                .px(px(8.0))
+                                .py(px(2.5))
+                                .rounded(px(999.0))
+                                .bg(if active {
+                                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16)
+                                } else {
+                                    rgb(pal.input_bg).into()
+                                })
+                                .border_1()
+                                .border_color(if active {
+                                    rgb(pal.accent).into()
+                                } else {
+                                    pal.separator_rgba()
+                                })
+                                .text_size(px(10.5))
+                                .font_weight(if active {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(rgb(if active {
+                                    pal.accent
+                                } else {
+                                    pal.text_secondary
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.avatar_style_tab = tab_id;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(label)
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
                         .flex_wrap()
                         .gap(px(4.0))
-                        .children(GROK_AVATAR_SHAPES.iter().enumerate().map(|(idx, &shape)| {
+                        .children(choices.into_iter().enumerate().map(|(idx, (shape, label))| {
                             let active = self.avatar_shape.eq_ignore_ascii_case(shape);
                             let shape_owned = shape.to_string();
-                            let opt_id = format!("create-bot-shape-opt-{idx}");
+                            let opt_id = format!("create-bot-shape-opt-{style_tab}-{idx}");
                             let btn_bg = if active {
                                 TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
                             } else {
                                 rgb(pal.input_bg).into()
                             };
                             div()
-                                .id(SharedString::from(format!("fab-shape-pick-{idx}")))
+                                .id(SharedString::from(format!("fab-shape-pick-{style_tab}-{idx}")))
                                 .cursor_pointer()
                                 .px(px(6.0))
                                 .py(px(3.0))
@@ -727,7 +867,7 @@ impl CreateManagedBotBoxPeers {
                                             opt_id.as_str(),
                                             shape,
                                             &self.avatar_color,
-                                            28.0,
+                                            26.0,
                                         )
                                         .with_state(GrokPersonaState::Idle)
                                         .with_paused(true)
@@ -747,7 +887,7 @@ impl CreateManagedBotBoxPeers {
                                         } else {
                                             pal.text_secondary
                                         }))
-                                        .child(shape),
+                                        .child(label),
                                 )
                         })),
                 )
@@ -1262,6 +1402,228 @@ impl CreateManagedBotBoxPeers {
             .child(permission_pills)
             .child(toggles_row)
     }
+    fn render_template_gallery_panel(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let active_cat = self.template_category_filter;
+        let is_zh = lang.starts_with("zh");
+
+        let mut cat_row = div().flex().flex_wrap().items_center().gap(px(4.0)).child(
+            div()
+                .id("tpl-cat-all")
+                .cursor_pointer()
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(px(999.0))
+                .bg(if active_cat.is_none() {
+                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
+                } else {
+                    rgb(pal.card_bg).into()
+                })
+                .border_1()
+                .border_color(if active_cat.is_none() {
+                    rgb(pal.accent).into()
+                } else {
+                    pal.separator_rgba()
+                })
+                .text_size(px(10.5))
+                .font_weight(if active_cat.is_none() {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(rgb(if active_cat.is_none() {
+                    pal.accent
+                } else {
+                    pal.text_secondary
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.template_category_filter = None;
+                        cx.notify();
+                    }),
+                )
+                .child(tr_str(lang, "全部 (24)", "All (24)")),
+        );
+
+        for (idx, cat) in BotTemplateCategory::ALL.into_iter().enumerate() {
+            let selected = active_cat == Some(cat);
+            let label = if is_zh {
+                template_category_label_zh(cat)
+            } else {
+                cat.label()
+            };
+            cat_row = cat_row.child(
+                div()
+                    .id(SharedString::from(format!("tpl-cat-{idx}")))
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(999.0))
+                    .bg(if selected {
+                        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
+                    } else {
+                        rgb(pal.card_bg).into()
+                    })
+                    .border_1()
+                    .border_color(if selected {
+                        rgb(pal.accent).into()
+                    } else {
+                        pal.separator_rgba()
+                    })
+                    .text_size(px(10.5))
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(rgb(if selected {
+                        pal.accent
+                    } else {
+                        pal.text_secondary
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.template_category_filter = Some(cat);
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+
+        let mut grid = div()
+            .id("create-bot-template-grid")
+            .w_full()
+            .max_h(px(230.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_wrap()
+            .gap(px(6.0));
+
+        for (idx, tpl) in BUILTIN_BOT_TEMPLATES.iter().enumerate() {
+            if let Some(filter_cat) = active_cat {
+                if tpl.category != filter_cat {
+                    continue;
+                }
+            }
+            let selected = self.selected_template_id.as_deref() == Some(tpl.id);
+            let plush_spec = template_plush_avatar_spec(idx);
+            let tpl_copy = *tpl;
+            let skill_badge = if is_zh {
+                format!("{} 项技能", tpl.bundled_skills.len())
+            } else {
+                format!("{} skills", tpl.bundled_skills.len())
+            };
+            grid = grid.child(
+                div()
+                    .id(SharedString::from(format!("bot-tpl-card-{idx}")))
+                    .cursor_pointer()
+                    .w(px(244.0))
+                    .p(px(8.0))
+                    .rounded(px(10.0))
+                    .bg(if selected {
+                        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14)
+                    } else {
+                        rgb(pal.card_bg).into()
+                    })
+                    .border_1()
+                    .border_color(if selected {
+                        rgb(pal.accent).into()
+                    } else {
+                        pal.separator_rgba()
+                    })
+                    .hover(|s| s.bg(rgb(pal.hover_bg)))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.apply_template(&tpl_copy, idx);
+                            trigger_grok_avatar_bounce("create-bot-modal-preview");
+                            cx.notify();
+                        }),
+                    )
+                    .child(render_grok_bot_avatar(
+                        GrokBotAvatarProps::new(
+                            format!("tpl-prev-{idx}"),
+                            plush_spec,
+                            tpl.avatar_color,
+                            34.0,
+                        )
+                        .with_state(GrokPersonaState::Idle)
+                        .with_paused(true)
+                        .with_surface_bg(pal.card_bg),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(pal.text_primary))
+                                            .child(tpl.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px(px(5.0))
+                                            .py(px(1.0))
+                                            .rounded(px(999.0))
+                                            .bg(TdesktopThemePalette::rgba_with_alpha(
+                                                pal.accent, 0.14,
+                                            ))
+                                            .text_size(px(9.5))
+                                            .text_color(rgb(pal.accent))
+                                            .child(skill_badge),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .child(tpl.tagline),
+                            ),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        lang,
+                        "选择一个角色模板，自动填充人设、毛绒形象与内置技能并创建为原生消息机器人：",
+                        "Pick a role template to pre-fill persona, Plush avatar, and bundled skills as a native Bot:",
+                    )),
+            )
+            .child(cat_row)
+            .child(grid)
+    }
 }
 
 impl Render for CreateManagedBotBoxPeers {
@@ -1272,10 +1634,13 @@ impl Render for CreateManagedBotBoxPeers {
         let pal = self.palette;
         let lang = self.language_id.as_str();
         let is_coding = self.is_coding_agent_mode;
-        let is_fabushi = self.is_fabushi_mode && !is_coding;
-        let is_ai = self.is_ai_mode && !is_coding && !is_fabushi;
+        let is_template = self.is_template_mode && !is_coding;
+        let is_fabushi = self.is_fabushi_mode && !is_coding && !is_template;
+        let is_ai = self.is_ai_mode && !is_coding && !is_template && !is_fabushi;
         let prompt = self.nl_prompt.clone();
-        let can_submit = if is_coding || is_fabushi {
+        let can_submit = if is_template {
+            false
+        } else if is_coding || is_fabushi {
             self.is_valid() && !self.is_submitting
         } else if is_ai {
             !prompt.trim().is_empty() && !self.is_submitting
@@ -1297,7 +1662,7 @@ impl Render for CreateManagedBotBoxPeers {
 
         div()
             .id("create-managed-bot-modal")
-            .w(if is_coding { px(560.0) } else { self.width })
+            .w(if is_coding || is_template { px(560.0) } else { self.width })
             .min_h(self.height)
             .p(px(16.0))
             .rounded(px(14.0))
@@ -1327,6 +1692,8 @@ impl Render for CreateManagedBotBoxPeers {
                                     .text_color(rgb(pal.text_primary))
                                     .child(if is_coding {
                                         tr_str(lang, "新建编程智能体 (Coding Agent)", "New Coding Agent Bot")
+                                    } else if is_template {
+                                        tr_str(lang, "从角色模板创建机器人 (24 套)", "Create Bot from Template (24)")
                                     } else if is_fabushi {
                                         tr_str(lang, "新建 Fabushi Bot 智能体", "New Fabushi Bot Agent")
                                     } else if is_ai {
@@ -1365,17 +1732,33 @@ impl Render for CreateManagedBotBoxPeers {
                             .bg(rgb(if is_fabushi { pal.accent } else { pal.card_bg }))
                             .flex()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_fabushi { 0xFFFFFF } else { pal.text_primary }))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                this.is_coding_agent_mode = false;
-                                this.is_fabushi_mode = true;
-                                this.is_ai_mode = false;
-                                this.active_field = 1;
+                                this.open_fabushi_creator();
                                 cx.notify();
                             }))
-                            .child(tr_str(lang, "✦ Fabushi", "✦ Fabushi")),
+                            .child(tr_str(lang, "✦ 智能体", "✦ Agent")),
+                    )
+                    .child(
+                        div()
+                            .id("create-bot-tab-templates")
+                            .cursor_pointer()
+                            .flex_1()
+                            .py(px(6.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(if is_template { pal.accent } else { pal.card_bg }))
+                            .flex()
+                            .justify_center()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if is_template { 0xFFFFFF } else { pal.text_primary }))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.open_template_creator();
+                                cx.notify();
+                            }))
+                            .child(tr_str(lang, "📦 模板(24)", "📦 Templates")),
                     )
                     .child(
                         div()
@@ -1387,14 +1770,14 @@ impl Render for CreateManagedBotBoxPeers {
                             .bg(rgb(if is_coding { pal.accent } else { pal.card_bg }))
                             .flex()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_coding { 0xFFFFFF } else { pal.text_primary }))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                 this.open_coding_agent_creator();
                                 cx.notify();
                             }))
-                            .child(tr_str(lang, "💻 编程智能体", "💻 Coding Agent")),
+                            .child(tr_str(lang, "💻 编程", "💻 Coding")),
                     )
                     .child(
                         div()
@@ -1406,17 +1789,14 @@ impl Render for CreateManagedBotBoxPeers {
                             .bg(rgb(if is_ai { pal.accent } else { pal.card_bg }))
                             .flex()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_ai { 0xFFFFFF } else { pal.text_primary }))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                this.is_coding_agent_mode = false;
-                                this.is_fabushi_mode = false;
-                                this.is_ai_mode = true;
-                                this.active_field = 0;
+                                this.open_ai_creator();
                                 cx.notify();
                             }))
-                            .child(tr_str(lang, "⚡ 一句话生成", "⚡ One-Click AI")),
+                            .child(tr_str(lang, "⚡ 一句话", "⚡ AI")),
                     )
                     .child(
                         div()
@@ -1425,23 +1805,25 @@ impl Render for CreateManagedBotBoxPeers {
                             .flex_1()
                             .py(px(6.0))
                             .rounded(px(8.0))
-                            .bg(rgb(if !is_coding && !is_fabushi && !is_ai { pal.accent } else { pal.card_bg }))
+                            .bg(rgb(if !is_coding && !is_template && !is_fabushi && !is_ai { pal.accent } else { pal.card_bg }))
                             .flex()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if !is_coding && !is_fabushi && !is_ai { 0xFFFFFF } else { pal.text_primary }))
+                            .text_color(rgb(if !is_coding && !is_template && !is_fabushi && !is_ai { 0xFFFFFF } else { pal.text_primary }))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                 this.is_coding_agent_mode = false;
+                                this.is_template_mode = false;
                                 this.is_fabushi_mode = false;
                                 this.is_ai_mode = false;
                                 this.active_field = 1;
                                 cx.notify();
                             }))
-                            .child(tr_str(lang, "🔑 高级 / Token", "🔑 Advanced")),
+                            .child(tr_str(lang, "🔑 Token", "🔑 Token")),
                     ),
             )
-            .child(avatar_chooser_card)
+            .when(!is_template, |el| el.child(avatar_chooser_card))
+            .when(is_template, |el| el.child(self.render_template_gallery_panel(pal, lang, cx)))
             .when(is_coding, |el| el.child(self.render_coding_agent_panel(pal, lang, cx)))
             .when(is_fabushi, |el| {
                 let fab_fields: [(u8, &str, &str, String); 4] = [
@@ -1618,7 +2000,7 @@ impl Render for CreateManagedBotBoxPeers {
                         ),
                 )
             })
-            .when(!is_coding && !is_fabushi && !is_ai, |el| {
+            .when(!is_coding && !is_template && !is_fabushi && !is_ai, |el| {
                 let fields: [(u8, &str, String); 3] = [
                     (1, "Bot Name", self.bot_name.clone()),
                     (2, "@username (must end with bot)", self.bot_username.clone()),

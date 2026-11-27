@@ -21,7 +21,8 @@ use crate::views::drawer::inspector_panels::{
     apple_switch_pill, muse_collapsible_header, muse_icon_row,
 };
 use crate::views::drawer::inspector_tabs::{
-    BotConfigFocusField, InspectorAction, InspectorAiModelCatalog, InspectorSubpage,
+    BotCompanionTab, BotConfigFocusField, InspectorAction, InspectorAiModelCatalog,
+    InspectorSubpage,
 };
 use crate::views::ContextInspector;
 
@@ -394,6 +395,120 @@ pub fn render_bot_avatar_editor_popover(
         fab_bg
     };
 
+    let mut plush_row = div().flex().flex_wrap().items_center().gap(px(5.0));
+    for (idx, &(spec, _label)) in crate::components::avatar::OPENBOT_PLUSH_AVATAR_PRESETS
+        .iter()
+        .enumerate()
+    {
+        let selected = fab.avatar_shape.eq_ignore_ascii_case(spec);
+        let shape_owned = spec.to_string();
+        let agent_for_bounce = fab.agent_id.clone();
+        plush_row = plush_row.child(
+            div()
+                .id(SharedString::from(format!("fabushi-insp-plush-{idx}")))
+                .cursor_pointer()
+                .p(px(3.0))
+                .rounded(px(9.0))
+                .bg(if selected {
+                    TdesktopThemePalette::rgba_with_alpha(highlight_fg, 0.18)
+                } else {
+                    rgb(pal.input_bg).into()
+                })
+                .border_1()
+                .border_color(if selected {
+                    rgb(highlight_fg).into()
+                } else {
+                    pal.separator_rgba()
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        trigger_grok_avatar_bounce(&agent_for_bounce);
+                        this.pending_action = Some(InspectorAction::PatchFabushiBot {
+                            bot_id: target_bot_id,
+                            req: PatchFabushiBotRequest {
+                                avatar_shape: Some(shape_owned.clone()),
+                                coding_agent: None,
+                                ..Default::default()
+                            },
+                        });
+                        cx.notify();
+                    }),
+                )
+                .child(render_grok_bot_avatar(
+                    GrokBotAvatarProps::new(
+                        format!("insp-plush-{idx}"),
+                        spec,
+                        &fab.avatar_color,
+                        24.0,
+                    )
+                    .with_state(GrokPersonaState::Idle)
+                    .with_paused(true)
+                    .with_surface_bg(pal.card_bg),
+                )),
+        );
+    }
+
+    let mut bloub_row = div().flex().flex_wrap().items_center().gap(px(5.0));
+    for (idx, &(spec, _label)) in crate::components::avatar::OPENBOT_BLOUB_AVATAR_PRESETS
+        .iter()
+        .enumerate()
+    {
+        let selected = fab.avatar_shape.eq_ignore_ascii_case(spec);
+        let shape_owned = spec.to_string();
+        let agent_for_bounce = fab.agent_id.clone();
+        bloub_row = bloub_row.child(
+            div()
+                .id(SharedString::from(format!("fabushi-insp-bloub-{idx}")))
+                .cursor_pointer()
+                .p(px(3.0))
+                .rounded(px(9.0))
+                .bg(if selected {
+                    TdesktopThemePalette::rgba_with_alpha(highlight_fg, 0.18)
+                } else {
+                    rgb(pal.input_bg).into()
+                })
+                .border_1()
+                .border_color(if selected {
+                    rgb(highlight_fg).into()
+                } else {
+                    pal.separator_rgba()
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        trigger_grok_avatar_bounce(&agent_for_bounce);
+                        this.pending_action = Some(InspectorAction::PatchFabushiBot {
+                            bot_id: target_bot_id,
+                            req: PatchFabushiBotRequest {
+                                avatar_shape: Some(shape_owned.clone()),
+                                coding_agent: None,
+                                ..Default::default()
+                            },
+                        });
+                        cx.notify();
+                    }),
+                )
+                .child(render_grok_bot_avatar(
+                    GrokBotAvatarProps::new(
+                        format!("insp-bloub-{idx}"),
+                        spec,
+                        &fab.avatar_color,
+                        22.0,
+                    )
+                    .with_state(GrokPersonaState::Idle)
+                    .with_paused(true)
+                    .with_surface_bg(pal.card_bg),
+                )),
+        );
+    }
+
     let mut shape_row = div().flex().flex_wrap().items_center().gap(px(5.0));
     for (idx, &shape) in GROK_AVATAR_SHAPES.iter().enumerate() {
         let selected = fab.avatar_shape.eq_ignore_ascii_case(shape);
@@ -549,7 +664,7 @@ pub fn render_bot_avatar_editor_popover(
         .border_color(pal.separator_rgba())
         .flex()
         .flex_col()
-        .gap(px(8.0))
+        .gap(px(7.0))
         .child(
             div()
                 .flex()
@@ -560,7 +675,7 @@ pub fn render_bot_avatar_editor_popover(
                         .text_size(px(11.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(pal.text_secondary))
-                        .child(tr_str(lang, "自定义智能体形象", "Customize Avatar")),
+                        .child(tr_str(lang, "自定义智能体形象 (Plush / Bloub / 几何)", "Customize Avatar (Plush / Bloub / Geo)")),
                 )
                 .child(
                     div()
@@ -578,6 +693,26 @@ pub fn render_bot_avatar_editor_popover(
                         )
                         .child(tr_str(lang, "完成", "Done")),
                 ),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(pal.text_secondary))
+                .child(tr_str(lang, "毛绒 3D (Plush)", "Plush 3D")),
+        )
+        .child(plush_row)
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(pal.text_secondary))
+                .child(tr_str(lang, "拟人轮廓 (Bloub)", "Bloub")),
+        )
+        .child(bloub_row)
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(pal.text_secondary))
+                .child(tr_str(lang, "几何 & 经典", "Geometric & Classic")),
         )
         .child(shape_row)
         .child(color_row)
@@ -947,6 +1082,10 @@ pub fn render_bot_agent_and_computer_tab(
                 cx,
             ));
         }
+
+        out = out.child(render_bot_fusion_inspector_sections(
+            inspector, pal, lang, cx,
+        ));
     }
 
     let mut comp_sec = div().w_full().flex().flex_col().gap(px(6.0)).child(
@@ -997,6 +1136,666 @@ pub fn render_bot_agent_and_computer_tab(
     }
 
     out.child(comp_sec).into_any_element()
+}
+
+const QUICK_BOT_SKILLS: [(&str, &str, &str, &str); 4] = [
+    ("code-review", "代码审查", "Code Review", "自动审查 PR 变更与安全隐患"),
+    ("web-research", "深度检索", "Web Research", "多来源交叉验证并输出结构化摘要"),
+    ("daily-digest", "每日简报", "Daily Digest", "汇总当天重点议题与行动项"),
+    ("release-notes", "发布说明", "Release Notes", "整理变更日志并生成发布摘要"),
+];
+
+/// Native OpenBot + Orca capabilities fused directly inside the Bot Inspector (`记忆 / 技能 / 定时任务 / 工作流`).
+fn render_bot_fusion_inspector_sections(
+    inspector: &ContextInspector,
+    pal: TdesktopThemePalette,
+    lang: &str,
+    cx: &mut Context<ContextInspector>,
+) -> AnyElement {
+    let is_zh = lang.starts_with("zh");
+    let snap = &inspector.bot_fusion;
+    let mem_collapsed = inspector.is_section_collapsed("bot-sec-memory");
+    let skills_collapsed = inspector.is_section_collapsed("bot-sec-skills");
+    let routines_collapsed = inspector.is_section_collapsed("bot-sec-routines");
+    let wf_collapsed = inspector.is_section_collapsed("bot-sec-workflows");
+
+    let (mem_text, mem_preedit) = if let Some(ref ctrl) = inspector.memory_input {
+        ctrl.read(cx).text_and_preedit(inspector.memory_draft.clone())
+    } else {
+        (inspector.memory_draft.clone(), None)
+    };
+    let mem_focused = inspector.bot_config_focus == BotConfigFocusField::MemoryDraft;
+
+    // 1. Memory section
+    let mem_title = format!(
+        "{} ({})",
+        tr_str(lang, "记忆与知识", "Memory & Knowledge"),
+        snap.memories.len()
+    );
+    let mut mem_sec = div().w_full().flex().flex_col().gap(px(6.0)).child(
+        muse_collapsible_header(
+            "bot-sec-memory-hdr",
+            "bot-sec-memory",
+            &mem_title,
+            mem_collapsed,
+            pal,
+            cx,
+        ),
+    );
+    if !mem_collapsed {
+        let input_row = div()
+            .px(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .id("bot-fusion-memory-input")
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(28.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(pal.input_bg))
+                    .border_1()
+                    .border_color(if mem_focused {
+                        rgb(pal.accent).into()
+                    } else {
+                        pal.separator_rgba()
+                    })
+                    .cursor_text()
+                    .flex()
+                    .items_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.ensure_bot_inputs(cx);
+                            this.bot_config_focus = BotConfigFocusField::MemoryDraft;
+                            cx.notify();
+                        }),
+                    )
+                    .child(render_ime_text_preview(
+                        &mem_text,
+                        mem_preedit.as_deref(),
+                        tr_str(lang, "输入一条记忆，回车记住…", "Add a memory, press Enter…"),
+                        mem_focused,
+                        false,
+                        pal.text_primary,
+                        pal,
+                    )),
+            )
+            .child(
+                div()
+                    .id("bot-fusion-memory-add-btn")
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(pal.accent))
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xFFFFFF))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if this.submit_memory_draft() {
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(tr_str(lang, "+ 记住", "+ Save")),
+            );
+
+        mem_sec = mem_sec.child(input_row);
+
+        if snap.memories.is_empty() {
+            mem_sec = mem_sec.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(11.0))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(tr_str(
+                        lang,
+                        "暂无专属记忆 · 输入偏好或上下文让该 Bot 长期记住",
+                        "No memories yet · Add preferences or facts for this bot",
+                    )),
+            );
+        } else {
+            for (idx, mem) in snap.memories.iter().take(6).enumerate() {
+                let mem_id = mem.id.clone();
+                mem_sec = mem_sec.child(
+                    div()
+                        .id(SharedString::from(format!("bot-fusion-mem-row-{idx}")))
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(pal.input_bg))
+                        .border_1()
+                        .border_color(pal.separator_rgba())
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(px(11.5))
+                                .text_color(rgb(pal.text_primary))
+                                .child(mem.content.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("bot-fusion-mem-del-{idx}")))
+                                .cursor_pointer()
+                                .px(px(4.0))
+                                .rounded(px(4.0))
+                                .text_size(px(11.0))
+                                .text_color(rgb(pal.text_secondary))
+                                .hover(|s| s.text_color(rgb(pal.danger)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.pending_action =
+                                            Some(InspectorAction::DeleteBotMemory(mem_id.clone()));
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("×"),
+                        ),
+                );
+            }
+            mem_sec = mem_sec.child(
+                div()
+                    .px(px(4.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .id("bot-fusion-memory-tidy-btn")
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(999.0))
+                            .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.12))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(pal.accent))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_action = Some(InspectorAction::TidyBotMemories);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "去重整理记忆", "Tidy Memories")),
+                    )
+                    .child(
+                        div()
+                            .id("bot-fusion-memory-open-panel")
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgb(pal.accent))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_action = Some(InspectorAction::OpenBotCompanion(
+                                        BotCompanionTab::Knowledge,
+                                    ));
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "在工作台展开 →", "Open in Panel →")),
+                    ),
+            );
+        }
+    }
+
+    // 2. Skills & MCP section
+    let skills_title = format!(
+        "{} ({})",
+        tr_str(lang, "技能与 MCP", "Skills & MCP"),
+        snap.skills.len()
+    );
+    let mut skills_sec = div().w_full().flex().flex_col().gap(px(6.0)).child(
+        muse_collapsible_header(
+            "bot-sec-skills-hdr",
+            "bot-sec-skills",
+            &skills_title,
+            skills_collapsed,
+            pal,
+            cx,
+        ),
+    );
+    if !skills_collapsed {
+        for (idx, sk) in snap.skills.iter().take(6).enumerate() {
+            let sid = sk.skill_id.clone();
+            let next_enabled = !sk.enabled;
+            skills_sec = skills_sec.child(
+                div()
+                    .id(SharedString::from(format!("bot-fusion-skill-row-{idx}")))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(pal.input_bg))
+                    .border_1()
+                    .border_color(pal.separator_rgba())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.text_primary))
+                                    .truncate()
+                                    .child(format!("${}", sk.slug)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .truncate()
+                                    .child(sk.name.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("bot-fusion-skill-toggle-{idx}")))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.pending_action = Some(InspectorAction::ToggleBotSkill {
+                                        skill_id: sid.clone(),
+                                        enabled: next_enabled,
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .child(apple_switch_pill(sk.enabled, pal)),
+                    ),
+            );
+        }
+
+        let mut quick_chips = div().px(px(4.0)).flex().flex_wrap().gap(px(5.0));
+        let mut has_uninstalled = false;
+        for (idx, &(slug, zh, en, desc)) in QUICK_BOT_SKILLS.iter().enumerate() {
+            if snap.skills.iter().any(|s| s.slug.eq_ignore_ascii_case(slug)) {
+                continue;
+            }
+            has_uninstalled = true;
+            let s_slug = slug.to_string();
+            let s_name = if is_zh { zh } else { en }.to_string();
+            let s_desc = desc.to_string();
+            quick_chips = quick_chips.child(
+                div()
+                    .id(SharedString::from(format!("bot-fusion-skill-quick-{idx}")))
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(999.0))
+                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.10))
+                    .border_1()
+                    .border_color(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.25))
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(pal.accent))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.pending_action = Some(InspectorAction::InstallBotSkill {
+                                slug: s_slug.clone(),
+                                name: s_name.clone(),
+                                description: s_desc.clone(),
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .child(format!("+ {}", if is_zh { zh } else { en })),
+            );
+        }
+        if has_uninstalled {
+            skills_sec = skills_sec.child(quick_chips);
+        }
+        if !snap.mcp_servers.is_empty() {
+            skills_sec = skills_sec.child(
+                div()
+                    .px(px(8.0))
+                    .text_size(px(10.5))
+                    .text_color(rgb(pal.text_secondary))
+                    .child(format!(
+                        "MCP: {} {}",
+                        snap.mcp_servers.len(),
+                        tr_str(lang, "个已接入服务", "connected servers")
+                    )),
+            );
+        }
+    }
+
+    // 3. Routines section
+    let routines_title = format!(
+        "{} ({})",
+        tr_str(lang, "定时任务", "Routines"),
+        snap.routines.len()
+    );
+    let mut routines_sec = div().w_full().flex().flex_col().gap(px(6.0)).child(
+        muse_collapsible_header(
+            "bot-sec-routines-hdr",
+            "bot-sec-routines",
+            &routines_title,
+            routines_collapsed,
+            pal,
+            cx,
+        ),
+    );
+    if !routines_collapsed {
+        for (idx, rt) in snap.routines.iter().take(5).enumerate() {
+            let rid_toggle = rt.id.clone();
+            let rid_run = rt.id.clone();
+            let next_active = !rt.active;
+            routines_sec = routines_sec.child(
+                div()
+                    .id(SharedString::from(format!("bot-fusion-routine-row-{idx}")))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(pal.input_bg))
+                    .border_1()
+                    .border_color(pal.separator_rgba())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.text_primary))
+                                    .truncate()
+                                    .child(rt.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .truncate()
+                                    .child(rt.schedule_label.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("bot-fusion-routine-run-{idx}")))
+                                    .cursor_pointer()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(6.0))
+                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.pending_action =
+                                                Some(InspectorAction::RunBotRoutineNow {
+                                                    routine_id: rid_run.clone(),
+                                                });
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "运行", "Run")),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("bot-fusion-routine-tgl-{idx}")))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.pending_action =
+                                                Some(InspectorAction::ToggleBotRoutine {
+                                                    routine_id: rid_toggle.clone(),
+                                                    active: next_active,
+                                                });
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(apple_switch_pill(rt.active, pal)),
+                            ),
+                    ),
+            );
+        }
+
+        routines_sec = routines_sec.child(
+            div()
+                .px(px(4.0))
+                .flex()
+                .flex_wrap()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .id("bot-fusion-routine-preset-daily")
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(3.0))
+                        .rounded(px(999.0))
+                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.10))
+                        .border_1()
+                        .border_color(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.25))
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(pal.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.pending_action = Some(InspectorAction::CreatePresetRoutine {
+                                    preset: "daily".to_string(),
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "+ 每日早报 09:00", "+ Daily 09:00")),
+                )
+                .child(
+                    div()
+                        .id("bot-fusion-routine-preset-hourly")
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(3.0))
+                        .rounded(px(999.0))
+                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.10))
+                        .border_1()
+                        .border_color(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.25))
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(pal.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.pending_action = Some(InspectorAction::CreatePresetRoutine {
+                                    preset: "hourly".to_string(),
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "+ 每小时巡检", "+ Hourly Check")),
+                ),
+        );
+    }
+
+    // 4. Workflows section
+    let wf_title = format!(
+        "{} ({})",
+        tr_str(lang, "工作流与画布", "Workflows & Canvas"),
+        snap.workflows.len()
+    );
+    let mut wf_sec = div().w_full().flex().flex_col().gap(px(6.0)).child(
+        muse_collapsible_header(
+            "bot-sec-workflows-hdr",
+            "bot-sec-workflows",
+            &wf_title,
+            wf_collapsed,
+            pal,
+            cx,
+        ),
+    );
+    if !wf_collapsed {
+        for (idx, wf) in snap.workflows.iter().take(4).enumerate() {
+            let wid = wf.id.clone();
+            let status_txt = wf
+                .last_run_status
+                .clone()
+                .unwrap_or_else(|| format!("{} steps", wf.step_count));
+            wf_sec = wf_sec.child(
+                div()
+                    .id(SharedString::from(format!("bot-fusion-wf-row-{idx}")))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(pal.input_bg))
+                    .border_1()
+                    .border_color(pal.separator_rgba())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.text_primary))
+                                    .truncate()
+                                    .child(wf.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(pal.text_secondary))
+                                    .truncate()
+                                    .child(status_txt),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("bot-fusion-wf-run-{idx}")))
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(pal.accent))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xFFFFFF))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.pending_action = Some(InspectorAction::RunBotWorkflow {
+                                        workflow_id: wid.clone(),
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "▶ 运行", "▶ Run")),
+                    ),
+            );
+        }
+
+        wf_sec = wf_sec.child(
+            div()
+                .px(px(4.0))
+                .flex()
+                .flex_wrap()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .id("bot-fusion-wf-create-starter")
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(999.0))
+                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.12))
+                        .border_1()
+                        .border_color(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.28))
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(pal.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.pending_action = Some(InspectorAction::CreateStarterWorkflow);
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "+ 新建审批工作流", "+ New Approval Flow")),
+                )
+                .child(
+                    div()
+                        .id("bot-fusion-wf-open-companion")
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(999.0))
+                        .bg(rgb(pal.input_bg))
+                        .border_1()
+                        .border_color(pal.separator_rgba())
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(pal.text_primary))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.pending_action = Some(InspectorAction::OpenBotCompanion(
+                                    BotCompanionTab::Workflow,
+                                ));
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "打开伴生工作台", "Open Workbench")),
+                ),
+        );
+    }
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(mem_sec)
+        .child(skills_sec)
+        .child(routines_sec)
+        .child(wf_sec)
+        .into_any_element()
 }
 
 /// Tab 4 (`InspectorTab::Settings` on a bot): clean notification, auto-delete, and safety actions.

@@ -2369,6 +2369,9 @@ impl AppShell {
                 } => {
                     self.open_sender_dm_by_user_id(user_id, sender_name, cx);
                 }
+                StageAction::ToggleBotCompanion => {
+                    self.toggle_bot_companion_panel(None, cx);
+                }
                 StageAction::DecideToolApproval {
                     approval_id,
                     decision,

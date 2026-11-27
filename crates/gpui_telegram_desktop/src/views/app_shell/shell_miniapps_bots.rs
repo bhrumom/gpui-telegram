@@ -364,11 +364,12 @@ impl AppShell {
         box_ent: &Entity<CreateManagedBotBoxPeers>,
         cx: &mut Context<Self>,
     ) {
-        let (fabushi_req, nl_prompt, creds, closed, av_shape, av_color) =
+        let (fabushi_req, template_skills, nl_prompt, creds, closed, av_shape, av_color) =
             box_ent.update(cx, |b, _| {
                 let (av_shape, av_color) = b.effective_avatar_choice();
                 (
                     b.take_submit_fabushi(),
+                    b.take_selected_template_skills(),
                     b.take_submit_nl(),
                     b.take_submit_credentials(),
                     b.take_close(),
@@ -418,6 +419,10 @@ impl AppShell {
                         Ok(created) => {
                             let is_coding_bot = created.bot.coding_agent.is_some();
                             upsert_fabushi_bot_summary(shell, created.bot.clone());
+                            shell.provision_openbot_agent_for_fabushi(
+                                &created.bot,
+                                &template_skills,
+                            );
                             let lang = shell.active_lang_id();
                             let toast_msg = format!(
                                 "{} @{}",

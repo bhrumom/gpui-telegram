@@ -110,6 +110,9 @@ impl NavigationStateMachineSimulator {
             NavDestination::OrcaIde => {
                 self.active_panel = ActiveWorkspacePanel::OrcaIde;
             }
+            NavDestination::OpenBot => {
+                self.active_panel = ActiveWorkspacePanel::OpenBot;
+            }
         }
     }
 
@@ -153,6 +156,9 @@ impl NavigationStateMachineSimulator {
                 }
                 NavDestination::OrcaIde => {
                     self.active_panel = ActiveWorkspacePanel::OrcaIde;
+                }
+                NavDestination::OpenBot => {
+                    self.active_panel = ActiveWorkspacePanel::OpenBot;
                 }
             }
         } else {

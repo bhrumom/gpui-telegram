@@ -1185,7 +1185,9 @@ impl AppShell {
             }
         }
         if let Some(text) = submitted {
-            self.append_outgoing_text(text, cx);
+            if !self.try_handle_bot_fusion_dollar_command(&text, cx) {
+                self.append_outgoing_text(text, cx);
+            }
         }
         if let Some(text) = silent_text {
             self.send_rich_text_options(text, true, None, cx);

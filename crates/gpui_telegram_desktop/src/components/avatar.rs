@@ -144,7 +144,35 @@ fn is_usable_custom_avatar_url(url: &str) -> bool {
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
 }
 
-fn is_openbot_prefixed_shape(shape: &str) -> bool {
+/// Curated OpenBot Plush 3D character & felt-shape avatar specs (`plush:*`) shared by
+/// the Create Bot dialog and Bot Inspector avatar editor.
+pub const OPENBOT_PLUSH_AVATAR_PRESETS: [(&str, &str); 10] = [
+    ("plush:nexo", "Nexo"),
+    ("plush:vita", "Vita"),
+    ("plush:cloe", "Cloe"),
+    ("plush:malu", "Malu"),
+    ("plush:yoshi", "Yoshi"),
+    ("plush:fred", "Fred"),
+    ("plush:squircle", "Squircle"),
+    ("plush:nuage", "Nuage"),
+    ("plush:fantome", "Fantome"),
+    ("plush:poulpe", "Poulpe"),
+];
+
+/// Curated OpenBot flat parametric Bloub avatar specs (`bloub:*`) shared by the Create Bot
+/// dialog and Bot Inspector avatar editor.
+pub const OPENBOT_BLOUB_AVATAR_PRESETS: [(&str, &str); 8] = [
+    ("bloub:squircle", "Squircle"),
+    ("bloub:cercle", "Cercle"),
+    ("bloub:galet", "Galet"),
+    ("bloub:nuage", "Nuage"),
+    ("bloub:hexagone", "Hex"),
+    ("bloub:fantome", "Fantome"),
+    ("bloub:meduse", "Meduse"),
+    ("bloub:poulpe", "Poulpe"),
+];
+
+pub(crate) fn is_openbot_prefixed_shape(shape: &str) -> bool {
     let lower = shape.trim().to_ascii_lowercase();
     lower == "bloub"
         || lower == "plush"
@@ -152,7 +180,7 @@ fn is_openbot_prefixed_shape(shape: &str) -> bool {
         || lower.starts_with("plush:")
 }
 
-fn render_openbot_prefixed_avatar(
+pub(crate) fn render_openbot_prefixed_avatar(
     raw_shape: &str,
     color_hex: String,
     label: &str,

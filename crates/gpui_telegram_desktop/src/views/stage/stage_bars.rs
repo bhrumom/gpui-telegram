@@ -44,6 +44,7 @@ pub enum TopBarUiAction {
     ClearHistory,
     ExportChat,
     ToggleMuteChat,
+    ToggleBotCompanion,
 }
 
 fn format_ttl_badge(ttl_seconds: u32, lang_id: &str) -> String {
@@ -101,6 +102,7 @@ pub fn render_stage_top_bar<V: 'static>(
         search_match_cursor,
         search_match_total,
         is_inspector_open,
+        false,
         more_menu_open,
         palette,
         lang_id,
@@ -129,6 +131,7 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
     search_match_cursor: usize,
     search_match_total: usize,
     is_inspector_open: bool,
+    is_bot_companion_open: bool,
     more_menu_open: bool,
     palette: &TdesktopThemePalette,
     lang_id: &str,
@@ -277,6 +280,7 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
     let a_insp2 = on_action.clone();
     let a_search = on_action.clone();
     let a_more = on_action.clone();
+    let a_companion = on_action.clone();
     let ttl_header_label = (message_ttl_seconds > 0).then(|| format_ttl_badge(message_ttl_seconds, lang_id));
     let ttl_badge_el: Option<AnyElement> = ttl_header_label.map(|ttl_lbl| {
         div()
@@ -591,6 +595,59 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
                     )
                 });
 
+            let show_companion_btn = is_bot_chat || active_fabushi_bot.is_some();
+            let a_comp_apple = a_companion.clone();
+            let companion_pill = show_companion_btn.then(|| {
+                div()
+                    .id("tb-bot-companion")
+                    .cursor_pointer()
+                    .px(px(palette.scaled_px(9.0)))
+                    .py(px(palette.scaled_px(4.5)))
+                    .rounded_full()
+                    .bg(if is_bot_companion_open {
+                        rgb(palette.accent).into()
+                    } else {
+                        TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14)
+                    })
+                    .hover(|s| {
+                        s.bg(if is_bot_companion_open {
+                            rgb(palette.accent).into()
+                        } else {
+                            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.24)
+                        })
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            a_comp_apple(this, TopBarUiAction::ToggleBotCompanion, cx);
+                        }),
+                    )
+                    .child(tg_icon(
+                        IconName::BotRobot,
+                        palette.scaled_px(12.5),
+                        if is_bot_companion_open {
+                            0xFFFFFF
+                        } else {
+                            palette.accent
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(palette.scaled_px(11.5)))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if is_bot_companion_open {
+                                0xFFFFFF
+                            } else {
+                                palette.accent
+                            }))
+                            .child(tr_str(lang_id, "工作台", "Workbench")),
+                    )
+            });
+
             let right_actions_pill = div()
                 .id("topbar-right-actions-pill")
                 .absolute()
@@ -607,6 +664,7 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
                 .flex()
                 .items_center()
                 .gap(px(2.0))
+                .when_some(companion_pill, |row, btn| row.child(btn))
                 .child(search_btn)
                 .child(info_btn)
                 .child(more_btn);
@@ -689,6 +747,42 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
                     ),
             )
             .when(has_chat, |el| {
+                let show_companion_btn = is_bot_chat || active_fabushi_bot.is_some();
+                let a_comp_classic = a_companion.clone();
+                let companion_btn = show_companion_btn.then(|| {
+                    div()
+                        .id("tb-bot-companion")
+                        .cursor_pointer()
+                        .px(px(9.0))
+                        .py(px(5.0))
+                        .rounded(px(8.0))
+                        .bg(if is_bot_companion_open {
+                            rgb(palette.accent).into()
+                        } else {
+                            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14)
+                        })
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_comp_classic(this, TopBarUiAction::ToggleBotCompanion, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(palette.scaled_px(11.5)))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if is_bot_companion_open {
+                                    0xFFFFFF
+                                } else {
+                                    palette.accent
+                                }))
+                                .child(tr_str(lang_id, "工作台", "Workbench")),
+                        )
+                });
                 let search_btn = top_icon_btn("tb-search", IconName::Search, search_open, palette, cx, move |this, cx| {
                     a_search(this, TopBarUiAction::ToggleSearch, cx);
                 });
@@ -702,6 +796,7 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
                     .flex()
                     .items_center()
                     .gap(px(4.0))
+                    .when_some(companion_btn, |row, btn| row.child(btn))
                     .child(search_btn)
                     .child(info_btn)
                     .child(more_btn);

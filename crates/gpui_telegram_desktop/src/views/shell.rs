@@ -37,7 +37,7 @@ use crate::views::app_shell::{
     resolve_active_target_chat_id,
     shell_theme::tdesktop_mode_for_window_appearance,
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
-    ShellBotBrowserState, ShellContentHubState, ShellPanelState,
+    ShellBotBrowserState, ShellBotFusionState, ShellContentHubState, ShellPanelState,
 };
 use crate::views::chat_sidebar::{BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel};
 use crate::views::composer::field_autocomplete::MentionRow;
@@ -168,6 +168,7 @@ pub struct AppShell {
     pub coding_host: ShellCodingHostState,
     pub magpie_local: ShellMagpieLocalState,
     pub bot_browser: ShellBotBrowserState,
+    pub bot_fusion: ShellBotFusionState,
     pub theme_state: ShellThemeVisualState,
     pub last_window_appearance: Option<WindowAppearance>,
     pub scheduled_toast_id: Option<u64>,
@@ -301,6 +302,7 @@ impl AppShell {
             coding_host: ShellCodingHostState::new(),
             magpie_local: ShellMagpieLocalState::new(),
             bot_browser: ShellBotBrowserState::new(),
+            bot_fusion: ShellBotFusionState::default(),
             theme_state: init_theme_state,
             last_window_appearance: None,
             scheduled_toast_id: None,
@@ -1158,6 +1160,7 @@ impl AppShell {
         self.community_pending_share = None;
         self.community_ime_preedit_input_gen = None;
         self.bot_browser.reset_on_logout();
+        self.bot_fusion.reset_ui();
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.last_handled_nav_dest = Some(NavDestination::Chats);
         self.reset_content_hub_for_logout_or_account_switch(cx);
@@ -2969,6 +2972,20 @@ impl Render for AppShell {
                 .is_some_and(|ov| ov.read(cx).is_open)
                 && !self.miniapps.is_miniapp_minimized);
         self.sync_compose_state_to_composer(false, cx);
+        let bot_fusion_strip = if show_chat_sidebar && !hide_composer && !is_apple_compose_mode {
+            self.render_bot_fusion_composer_strip(cx)
+        } else {
+            None
+        };
+        let bot_companion_panel = if show_chat_sidebar
+            && !is_apple_compose_mode
+            && self.bot_fusion.companion_open
+            && self.stage.read(cx).active_fabushi_bot.is_some()
+        {
+            Some(self.render_bot_companion_sidepanel(cx))
+        } else {
+            None
+        };
 
         div()
             .id("app-shell-authenticated-root")
@@ -3108,9 +3125,11 @@ impl Render for AppShell {
                                                 })
                                             }),
                                     )
+                                    .when_some(bot_fusion_strip, |el, strip| el.child(strip))
                                     .when(!hide_composer, |el| el.child(self.composer.clone()))
                                     .into_any_element(),
                             )
+                            .when_some(bot_companion_panel, |row, panel| row.child(panel))
                             .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
                     }),
             )

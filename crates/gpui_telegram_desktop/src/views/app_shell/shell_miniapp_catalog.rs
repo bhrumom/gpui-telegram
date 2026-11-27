@@ -478,6 +478,7 @@ impl AppShell {
             insp.set_active_fabushi_bot(active_fab);
             insp_cx.notify();
         });
+        self.refresh_active_bot_fusion_snapshot(cx);
     }
 
     /// Synchronizes attach-menu apps, per-bot `/` commands, bot menu button, Stage pre-start card,
