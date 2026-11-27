@@ -1093,3 +1093,157 @@ fn body_headless_appshell_and_openbot_fusion(cx: &mut App) {
         assert_eq!(s.nav_rail.read(cx).items.len(), 10);
     });
 }
+
+#[test]
+fn test_m6_t2_workflow_canvas_load_graph_json_structural_validation() {
+    let mut canvas = WorkflowCanvasState::with_sample_pipeline();
+    let initial_rev = canvas.revision;
+    let initial_nodes = canvas.graph.nodes.len();
+    let initial_edges = canvas.graph.edges.len();
+
+    // 1. Annotation edge (trigger -> note) rejected cleanly without mutating canvas
+    let annotation_edge = json!({
+        "nodes": [
+            {"id": "n1", "kind": "trigger", "at": {"x": 0.0, "y": 0.0}, "fields": {}},
+            {"id": "note1", "kind": "note", "at": {"x": 200.0, "y": 0.0}, "fields": {}}
+        ],
+        "edges": [
+            {"id": "e1", "from": "n1", "to": "note1", "type": "text"}
+        ],
+        "strokes": []
+    });
+    assert!(
+        canvas.load_graph_json(&annotation_edge).is_err(),
+        "annotation edge must be rejected by load_graph_json"
+    );
+    assert_eq!(canvas.revision, initial_rev);
+    assert_eq!(canvas.graph.nodes.len(), initial_nodes);
+    assert_eq!(canvas.graph.edges.len(), initial_edges);
+
+    // 2. Self-edge (a1 -> a1) rejected cleanly
+    let self_edge = json!({
+        "nodes": [
+            {"id": "a1", "kind": "llm", "at": {"x": 0.0, "y": 0.0}, "fields": {"prompt": "loop"}}
+        ],
+        "edges": [
+            {"id": "e_self", "from": "a1", "to": "a1", "type": "text"}
+        ],
+        "strokes": []
+    });
+    assert!(
+        canvas.load_graph_json(&self_edge).is_err(),
+        "self-edge must be rejected by load_graph_json"
+    );
+    assert_eq!(canvas.revision, initial_rev);
+
+    // 3. Port mismatch (image -> condition) rejected for both image and text edge types
+    for port_type in ["image", "text"] {
+        let port_mismatch = json!({
+            "nodes": [
+                {"id": "img1", "kind": "image", "at": {"x": 0.0, "y": 0.0}, "fields": {}},
+                {"id": "cond1", "kind": "condition", "at": {"x": 240.0, "y": 0.0}, "fields": {"rule": "ok"}}
+            ],
+            "edges": [
+                {"id": "e_port", "from": "img1", "to": "cond1", "type": port_type}
+            ],
+            "strokes": []
+        });
+        assert!(
+            canvas.load_graph_json(&port_mismatch).is_err(),
+            "image -> condition port mismatch ({port_type}) must be rejected"
+        );
+    }
+
+    // 4. Condition edge missing yes/no branch rejected cleanly
+    let missing_branch = json!({
+        "nodes": [
+            {"id": "cond1", "kind": "condition", "at": {"x": 0.0, "y": 0.0}, "fields": {"rule": "ok"}},
+            {"id": "out1", "kind": "output", "at": {"x": 240.0, "y": 0.0}, "fields": {}}
+        ],
+        "edges": [
+            {"id": "e_cond", "from": "cond1", "to": "out1", "type": "text"}
+        ],
+        "strokes": []
+    });
+    assert!(
+        canvas.load_graph_json(&missing_branch).is_err(),
+        "condition edge without yes/no branch must be rejected"
+    );
+
+    // 5. Valid DAG with condition branches + disconnected annotation note accepted
+    let valid_dag = json!({
+        "nodes": [
+            {"id": "t1", "kind": "trigger", "at": {"x": 0.0, "y": 0.0}, "fields": {"trigger": "manual"}},
+            {"id": "c1", "kind": "condition", "at": {"x": 200.0, "y": 0.0}, "fields": {"rule": "ready"}},
+            {"id": "o1", "kind": "output", "at": {"x": 420.0, "y": -60.0}, "fields": {}},
+            {"id": "o2", "kind": "output", "at": {"x": 420.0, "y": 60.0}, "fields": {}},
+            {"id": "note1", "kind": "note", "at": {"x": 0.0, "y": -140.0}, "fields": {"text": "Standalone annotation"}}
+        ],
+        "edges": [
+            {"id": "e1", "from": "t1", "to": "c1", "type": "text"},
+            {"id": "e2", "from": "c1", "to": "o1", "type": "text", "branch": "yes"},
+            {"id": "e3", "from": "c1", "to": "o2", "type": "text", "branch": "no"}
+        ],
+        "strokes": []
+    });
+    canvas
+        .load_graph_json(&valid_dag)
+        .expect("valid DAG with condition branches and standalone note must load");
+    assert_eq!(canvas.graph.nodes.len(), 5);
+    assert_eq!(canvas.graph.edges.len(), 3);
+    assert!(canvas.detect_loop_edges().is_empty());
+
+    // 6. Valid multi-node cycle accepted and loop_edges detected (preserving TEST-T2-OB-F18-02)
+    let cyclic_graph = json!({
+        "nodes": [
+            {"id": "s1", "kind": "llm", "at": {"x": 100.0, "y": 100.0}, "fields": {"prompt": "Step 1"}},
+            {"id": "s2", "kind": "llm", "at": {"x": 360.0, "y": 100.0}, "fields": {"prompt": "Step 2"}}
+        ],
+        "edges": [
+            {"id": "e_fwd", "from": "s1", "to": "s2", "type": "text"},
+            {"id": "e_back", "from": "s2", "to": "s1", "type": "text"}
+        ],
+        "strokes": []
+    });
+    canvas
+        .load_graph_json(&cyclic_graph)
+        .expect("multi-node cyclic graph must load for loop_edges detection");
+    let loops = canvas.detect_loop_edges();
+    assert_eq!(loops, vec!["e_back".to_string()]);
+
+    // 7. End-to-end ui-probe parity: rejects all 4 invalid graphs, accepts cyclic graph with loop_edges
+    let port_mismatch_img = json!({
+        "nodes": [
+            {"id": "img1", "kind": "image", "at": {"x": 0.0, "y": 0.0}, "fields": {}},
+            {"id": "cond1", "kind": "condition", "at": {"x": 240.0, "y": 0.0}, "fields": {"rule": "ok"}}
+        ],
+        "edges": [
+            {"id": "e_port", "from": "img1", "to": "cond1", "type": "image"}
+        ],
+        "strokes": []
+    });
+    let tmp = TempDir::new().expect("tempdir");
+    for bad_graph in [&annotation_edge, &self_edge, &port_mismatch_img, &missing_branch] {
+        let scenario = json!({
+            "scenario": "workflow-canvas-pages",
+            "workflow_graph": bad_graph
+        })
+        .to_string();
+        assert!(
+            evaluate_ui_probe(&scenario, tmp.path(), None).is_err(),
+            "ui-probe workflow-canvas-pages must reject invalid workflow_graph"
+        );
+    }
+    let valid_cycle_scenario = json!({
+        "scenario": "workflow-canvas-pages",
+        "workflow_graph": cyclic_graph
+    })
+    .to_string();
+    let probe_ok = evaluate_ui_probe(&valid_cycle_scenario, tmp.path(), None)
+        .expect("ui-probe workflow-canvas-pages must accept valid multi-node cycle");
+    assert_eq!(
+        probe_ok["pages_probe"]["workflow_canvas"]["loop_edges"],
+        json!(["e_back"])
+    );
+}
+

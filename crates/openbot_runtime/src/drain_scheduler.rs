@@ -2526,26 +2526,27 @@ impl DrainScheduler {
         })
     }
 
+    fn validate_direct_identifier(value: &str, field: &str) -> RuntimeResult<()> {
+        if value.trim().is_empty() || value.trim() != value || !is_identifier(value) {
+            return Err(OpenBotRuntimeError::Validation(format!(
+                "{field} must be a non-empty identifier without leading/trailing whitespace and at most {} characters.",
+                INPUT_LIMITS.identifier
+            )));
+        }
+        Ok(())
+    }
+
     /// Sends a 1:1 member-to-member direct message with order-invariant `dm-<32hex>` SHA-256
-    /// thread ID, rejecting self-DMs, blank payloads, and `> 20,000`-char payloads.
-    pub fn dm_send(&self, mut input: SendDirectMessageInput) -> RuntimeResult<DirectMessage> {
-        if input.sender_member_id.trim().is_empty() || input.recipient_member_id.trim().is_empty() {
-            return Err(OpenBotRuntimeError::Validation(
-                "Direct message sender and recipient member IDs are required.".to_string(),
-            ));
-        }
-        if input.client_message_id.trim().is_empty() {
-            input.client_message_id = format!("dm-msg-{}", Uuid::new_v4());
-        }
+    /// thread ID, rejecting self-DMs, blank/padded/oversized IDs, blank payloads, and `> 20,000`-char payloads.
+    pub fn dm_send(&self, input: SendDirectMessageInput) -> RuntimeResult<DirectMessage> {
+        Self::validate_direct_identifier(&input.sender_member_id, "senderMemberId")?;
+        Self::validate_direct_identifier(&input.recipient_member_id, "recipientMemberId")?;
+        Self::validate_direct_identifier(&input.client_message_id, "clientMessageId")?;
         Ok(self.team_chat_store.send_message(&input)?)
     }
 
     pub fn dm_list(&self, member_id: &str) -> RuntimeResult<Vec<DirectThreadSummary>> {
-        if member_id.trim().is_empty() {
-            return Err(OpenBotRuntimeError::Validation(
-                "Member ID is required to list direct messages.".to_string(),
-            ));
-        }
+        Self::validate_direct_identifier(member_id, "memberId")?;
         Ok(self.team_chat_store.list_threads(member_id)?)
     }
 

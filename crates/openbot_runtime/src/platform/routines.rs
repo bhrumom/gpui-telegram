@@ -327,10 +327,38 @@ impl RoutineEngine {
     }
 
     pub fn save_routine(&self, req: RoutineSaveRequest) -> RuntimeResult<RoutineSaveOutcome> {
-        if !is_identifier(&req.owner_id) {
+        if req.owner_id.trim().is_empty()
+            || req.owner_id.trim() != req.owner_id
+            || !is_identifier(&req.owner_id)
+        {
             return Err(OpenBotRuntimeError::Validation(
-                "invalid routine owner_id".to_string(),
+                "routine owner_id must be a valid non-empty identifier without leading/trailing whitespace"
+                    .to_string(),
             ));
+        }
+        if req.is_channel {
+            match self.database.channel_store().get(&req.owner_id) {
+                Ok(_) => {}
+                Err(StorageError::NotFound(_)) => {
+                    return Err(OpenBotRuntimeError::Validation(format!(
+                        "channel '{}' does not exist",
+                        req.owner_id
+                    )));
+                }
+                Err(err) => return Err(map_storage_error(err)),
+            }
+        } else {
+            let exists = self
+                .roster
+                .get_agent(&req.owner_id)
+                .map_err(map_storage_error)?
+                .is_some();
+            if !exists {
+                return Err(OpenBotRuntimeError::Validation(format!(
+                    "agent '{}' does not exist",
+                    req.owner_id
+                )));
+            }
         }
         let timezone = if req.timezone.trim().is_empty() {
             "UTC".to_string()
@@ -909,11 +937,26 @@ impl RoutineEngine {
                 "invalid_signature: missing webhook HMAC signature".to_string(),
             ));
         }
-        let resolved_secret = if req.secret.is_empty() {
-            self.stored_webhook_secret(&req.routine_id)?
-                .unwrap_or_default()
-        } else {
-            req.secret.clone()
+        let stored_secret = self
+            .stored_webhook_secret(&req.routine_id)?
+            .filter(|s| !s.is_empty());
+        let resolved_secret = match stored_secret {
+            Some(stored) => {
+                if !req.secret.is_empty() && !ct_eq(req.secret.as_bytes(), stored.as_bytes()) {
+                    return Err(OpenBotRuntimeError::Unauthorized(
+                        "invalid_signature: webhook HMAC signature verification failed".to_string(),
+                    ));
+                }
+                stored
+            }
+            None => {
+                if req.secret.is_empty() {
+                    return Err(OpenBotRuntimeError::Unauthorized(
+                        "invalid_signature: webhook secret not configured".to_string(),
+                    ));
+                }
+                req.secret.clone()
+            }
         };
         let now_ms = req.now_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
 

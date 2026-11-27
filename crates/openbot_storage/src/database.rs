@@ -16,7 +16,7 @@ use std::time::Duration;
 use chrono::{SecondsFormat, Utc};
 use parking_lot::ReentrantMutex;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params, types::Value as SqlValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::error::{StorageError, StorageResult};
 use crate::schema_v69::{
-    OpenBotMigrationOptions, assert_quick_check, migrate_openbot_database,
-    read_foreign_key_violations,
+    OpenBotMigrationOptions, assert_quick_check, migrate_openbot_database, read_applied_versions,
+    read_foreign_key_violations, validate_applied_versions,
 };
 
 pub const COLLAPSE_WHITESPACE_FUNCTION: &str = "openbot_collapse_whitespace";
@@ -293,17 +293,65 @@ impl OpenBotDatabase {
         }
 
         let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        let journal_path = PathBuf::from(format!("{}-journal", db_path.display()));
         let closed_cleanly = !wal_path.exists();
+
+        if db_path.exists() {
+            let ro_result = (|| -> StorageResult<()> {
+                let ro_conn = if !wal_path.exists()
+                    && !shm_path.exists()
+                    && !journal_path.exists()
+                    && let Some(raw_path) = db_path.to_str()
+                {
+                    let encoded = raw_path
+                        .replace('%', "%25")
+                        .replace('?', "%3F")
+                        .replace('#', "%23");
+                    let uri = format!("file:{encoded}?mode=ro&immutable=1");
+                    Connection::open_with_flags(
+                        uri,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                            | OpenFlags::SQLITE_OPEN_URI,
+                    )?
+                } else {
+                    Connection::open_with_flags(
+                        &db_path,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    )?
+                };
+                ro_conn.busy_timeout(Duration::from_millis(5_000))?;
+                let versions = read_applied_versions(&ro_conn)?;
+                validate_applied_versions(&versions)?;
+                Ok(())
+            })();
+            match ro_result {
+                Ok(()) => {}
+                Err(StorageError::Sqlite(rusqlite::Error::SqliteFailure(e, _)))
+                    if e.code == ErrorCode::ReadOnly =>
+                {
+                    // Hot rollback journal recovery requires RW access; defer validation
+                    // to the RW connection below before switching to WAL mode.
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
         let conn = Connection::open(&db_path)?;
+        let mut schema_validated = false;
 
         let init_result = (|| -> StorageResult<()> {
             conn.busy_timeout(Duration::from_millis(5_000))?;
             conn.execute_batch(
-                "PRAGMA journal_mode = WAL;\
-                 PRAGMA synchronous = NORMAL;\
+                "PRAGMA synchronous = NORMAL;\
                  PRAGMA foreign_keys = ON;\
                  PRAGMA busy_timeout = 5000;",
             )?;
+            let applied_versions = read_applied_versions(&conn)?;
+            validate_applied_versions(&applied_versions)?;
+            schema_validated = true;
+            conn.execute_batch("PRAGMA journal_mode = WAL;")?;
             register_openbot_scalar_functions(&conn)?;
             migrate_openbot_database(
                 &conn,
@@ -319,7 +367,9 @@ impl OpenBotDatabase {
 
         if let Err(err) = init_result {
             drop(conn);
-            touch_dirty_wal(&wal_path);
+            if schema_validated {
+                touch_dirty_wal(&wal_path);
+            }
             return Err(err);
         }
 

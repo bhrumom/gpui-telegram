@@ -1202,44 +1202,224 @@ fn is_web_scheme(url: &Url) -> bool {
     url.scheme() == "https" || url.scheme() == "http"
 }
 
+fn is_aws_region_label(label: &str) -> bool {
+    let mut parts = label.split('-');
+    let Some(geo) = parts.next() else {
+        return false;
+    };
+    let rest: Vec<&str> = parts.collect();
+    if rest.len() < 2 {
+        return false;
+    }
+    let valid_geo = matches!(
+        geo,
+        "us" | "eu" | "ap" | "ca" | "sa" | "me" | "af" | "il" | "cn" | "mx"
+    );
+    let last_is_num = rest
+        .last()
+        .is_some_and(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()));
+    valid_geo && last_is_num
+}
+
+fn public_suffix_label_count(labels: &[&str]) -> usize {
+    let n = labels.len();
+
+    // 5-label AWS dualstack regional service suffixes (e.g. s3.dualstack.us-east-1.amazonaws.com)
+    if n >= 5
+        && matches!(
+            (
+                labels[n - 5],
+                labels[n - 4],
+                labels[n - 2],
+                labels[n - 1]
+            ),
+            (
+                "s3" | "s3-accesspoint" | "s3-fips",
+                "dualstack",
+                "amazonaws",
+                "com"
+            )
+        )
+        && is_aws_region_label(labels[n - 3])
+    {
+        return 5;
+    }
+
+    // 4-label Azure Storage & AWS regional cloud private suffixes
+    if n >= 4 {
+        let quad = (labels[n - 4], labels[n - 3], labels[n - 2], labels[n - 1]);
+        if matches!(
+            quad,
+            (
+                "blob" | "file" | "queue" | "table" | "web",
+                "core",
+                "windows",
+                "net"
+            )
+        ) {
+            return 4;
+        }
+        if quad.2 == "amazonaws"
+            && quad.3 == "com"
+            && matches!(
+                quad.0,
+                "s3" | "s3-website"
+                    | "s3-accesspoint"
+                    | "s3-fips"
+                    | "s3-control"
+                    | "s3-control-fips"
+                    | "s3-object-lambda"
+                    | "execute-api"
+                    | "lambda-url"
+                    | "elb"
+                    | "compute"
+            )
+            && is_aws_region_label(quad.1)
+        {
+            return 4;
+        }
+        if quad.0 == "lambda-url" && quad.2 == "on" && quad.3 == "aws" && is_aws_region_label(quad.1)
+        {
+            return 4;
+        }
+    }
+
+    // 3-label cloud/private suffixes & regional hyphenated AWS suffixes
+    if n >= 3 {
+        let triple = (labels[n - 3], labels[n - 2], labels[n - 1]);
+        if matches!(
+            triple,
+            ("s3", "amazonaws", "com")
+                | ("s3-website", "amazonaws", "com")
+                | ("storage", "googleapis", "com")
+                | ("commondatastorage", "googleapis", "com")
+                | ("pages", "github", "io")
+                | ("a", "run", "app")
+        ) {
+            return 3;
+        }
+        if triple.1 == "amazonaws"
+            && triple.2 == "com"
+            && (triple.0.starts_with("s3-")
+                || triple.0.starts_with("execute-api-")
+                || triple.0.starts_with("lambda-url-")
+                || triple.0.starts_with("elb-")
+                || triple.0.starts_with("compute-"))
+        {
+            return 3;
+        }
+    }
+
+    // 2-label ICANN multi-part ccTLDs & PSL private multi-tenant hosting suffixes
+    // (`{ allowPrivateDomains: true }`, matching upstream `tldts.getDomain`).
+    if n >= 2 {
+        let pair = (labels[n - 2], labels[n - 1]);
+        let is_two_label_suffix = matches!(
+            pair,
+            // ICANN multi-part ccTLDs
+            ("co" | "org" | "ac" | "gov" | "me" | "net" | "ltd" | "plc" | "sch", "uk")
+                | ("co" | "ne" | "or" | "ac" | "go" | "ed" | "gr" | "ad" | "lg", "jp")
+                | ("com" | "net" | "org" | "edu" | "gov" | "asn" | "id", "au")
+                | ("com" | "net" | "org" | "gov" | "edu", "br")
+                | (
+                    "co" | "org" | "net" | "govt" | "ac" | "gen" | "geek" | "maori" | "school",
+                    "nz"
+                )
+                | (
+                    "co" | "or" | "ne" | "re" | "go" | "ac" | "pe" | "hs" | "ms" | "es" | "sc"
+                        | "kg" | "mil",
+                    "kr"
+                )
+                | ("co" | "org" | "net" | "gov" | "ac" | "edu" | "web" | "nom", "za")
+                | (
+                    "co" | "net" | "org" | "gen" | "firm" | "ind" | "ac" | "edu" | "gov" | "nic"
+                        | "res",
+                    "in"
+                )
+                | ("com" | "org" | "gob" | "edu" | "net", "mx")
+                | ("com" | "org" | "edu" | "gov" | "idv" | "net", "hk")
+                | ("com" | "org" | "edu" | "gov" | "idv" | "net", "tw")
+                | ("com" | "org" | "net" | "gov" | "edu" | "gen" | "biz" | "web", "tr")
+                | ("com" | "org" | "net" | "gob" | "edu" | "tur", "ar")
+                | ("co" | "or" | "ac" | "go" | "web" | "my" | "biz" | "sch", "id")
+                | ("co" | "org" | "ac" | "gov" | "net" | "muni" | "k12", "il")
+                | ("com" | "org" | "net" | "gov" | "edu", "my")
+                | ("com" | "org" | "net" | "gov" | "edu", "ph")
+                | ("com" | "org" | "net" | "gov" | "edu", "vn")
+                | ("com" | "org" | "net" | "gov" | "edu", "sg")
+                | ("com" | "net" | "org" | "gov" | "edu" | "ac", "cn")
+                | ("com" | "org" | "net" | "gov" | "edu", "co")
+                | ("com", "pe" | "ua" | "pk" | "ng" | "eg" | "sa" | "pt" | "gr" | "ru")
+                | ("co" | "or" | "ac" | "go" | "in", "th")
+                | ("co" | "or" | "ac", "ke")
+                | ("com" | "net" | "org", "pl")
+                | ("com" | "nom" | "org", "es")
+                | ("eu" | "us" | "uk" | "de" | "jpn" | "cn" | "br" | "sa" | "za", "com")
+                // PSL private multi-tenant hosting suffixes
+                | ("github" | "gitlab" | "bitbucket" | "ngrok" | "pantheonsite" | "webflow" | "codepen" | "codesandbox" | "stackblitz", "io")
+                | ("pages" | "workers" | "r2" | "fly" | "deno" | "cloudflarepages", "dev")
+                | (
+                    "vercel" | "netlify" | "web" | "railway" | "replit" | "ngrok-free" | "ngrok"
+                        | "streamlit" | "run",
+                    "app"
+                )
+                | ("vercel" | "now" | "surge", "sh")
+                | (
+                    "netlify" | "herokuapp" | "herokudns" | "appspot" | "firebaseapp"
+                        | "amazonaws" | "onrender" | "myshopify" | "trycloudflare"
+                        | "pythonanywhere" | "wpengine" | "blogspot" | "wordpress" | "tumblr"
+                        | "auth0" | "okta" | "zendesk" | "force" | "salesforce-sites"
+                        | "squarespace" | "wixsite" | "substack" | "medium" | "amplifyapp",
+                    "com"
+                )
+                | (
+                    "cloudfront" | "azurewebsites" | "azurestaticapps" | "azureedge" | "cloudapp"
+                        | "fastly" | "ddns" | "serveo" | "cloudfunctions",
+                    "net"
+                )
+                | ("repl" | "supabase" | "carrd", "co")
+                | ("glitch" | "localtunnel", "me")
+                | ("kinsta" | "convex", "cloud")
+                | ("duckdns" | "hopto", "org")
+                | ("supabase", "in")
+                | ("framer", "website")
+                | ("notion", "site")
+                | ("hf", "space")
+                | ("gradio", "live")
+                | ("on", "aws")
+        );
+        if is_two_label_suffix {
+            return 2;
+        }
+    }
+
+    1
+}
+
 fn registrable_domain(host: &str) -> Option<String> {
-    let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if lower.is_empty() {
+    let trimmed = host.trim();
+    let without_fqdn = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    let lower = without_fqdn.to_ascii_lowercase();
+    if lower.is_empty() || lower.starts_with('[') || lower.ends_with(']') {
         return None;
     }
-    let labels: Vec<&str> = lower.split('.').filter(|s| !s.is_empty()).collect();
-    if labels.len() < 2 {
-        return Some(lower);
+    if lower.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let labels: Vec<&str> = lower.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+        return None;
     }
     let last = labels[labels.len() - 1];
-    let second_last = labels[labels.len() - 2];
-    let multi_part_tld = matches!(
-        (second_last, last),
-        ("co", "uk")
-            | ("org", "uk")
-            | ("gov", "uk")
-            | ("ac", "uk")
-            | ("com", "au")
-            | ("net", "au")
-            | ("org", "au")
-            | ("co", "jp")
-            | ("ne", "jp")
-            | ("or", "jp")
-            | ("com", "br")
-            | ("com", "cn")
-            | ("com", "sg")
-            | ("co", "nz")
-    );
-    if multi_part_tld && labels.len() >= 3 {
-        Some(format!(
-            "{}.{}.{}",
-            labels[labels.len() - 3],
-            second_last,
-            last
-        ))
-    } else {
-        Some(format!("{second_last}.{last}"))
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    let suffix_len = public_suffix_label_count(&labels);
+    if labels.len() <= suffix_len {
+        return None;
+    }
+    let start = labels.len() - suffix_len - 1;
+    Some(labels[start..].join("."))
 }
 
 /// Checks whether a stored login website matches an active browser tab origin,
@@ -3099,5 +3279,239 @@ mod tests {
         );
         assert!(matches!(replay, Err(OpenBotRuntimeError::Conflict(_))));
         assert_eq!(vault.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn registrable_domain_and_website_matches_origin_isolate_ips_and_public_suffixes() {
+        // IP literals, numeric TLDs, single-label hosts, empty labels, and bare public suffixes -> None
+        for non_registrable in [
+            "",
+            "localhost",
+            "127.0.0.1",
+            "203.0.0.1",
+            "192.168.1.1",
+            "10.0.1.1",
+            "[::1]",
+            "::1",
+            "2001:db8::1",
+            "1.2.3.400",
+            "foo..bar.com",
+            ".example.com",
+            "example.com..",
+            "co.uk",
+            "co.kr",
+            "co.za",
+            "co.in",
+            "github.io",
+            "pages.github.io",
+            "pages.dev",
+            "vercel.app",
+            "s3.amazonaws.com",
+            "s3.us-east-1.amazonaws.com",
+            "s3-us-west-2.amazonaws.com",
+            "blob.core.windows.net",
+            "storage.googleapis.com",
+        ] {
+            assert_eq!(
+                registrable_domain(non_registrable),
+                None,
+                "expected None for non-registrable host '{non_registrable}'"
+            );
+        }
+
+        // Valid registrable domains (standard, ICANN ccTLD, PSL private multi-tenant, regional cloud, FQDN dot)
+        assert_eq!(
+            registrable_domain("checkout.shop.test"),
+            Some("shop.test".to_string())
+        );
+        assert_eq!(
+            registrable_domain("checkout.shop.test."),
+            Some("shop.test".to_string())
+        );
+        assert_eq!(
+            registrable_domain("checkout.victim.github.io"),
+            Some("victim.github.io".to_string())
+        );
+        assert_eq!(
+            registrable_domain("victim.pages.dev"),
+            Some("victim.pages.dev".to_string())
+        );
+        assert_eq!(
+            registrable_domain("victim.vercel.app"),
+            Some("victim.vercel.app".to_string())
+        );
+        assert_eq!(
+            registrable_domain("victim.s3.amazonaws.com"),
+            Some("victim.s3.amazonaws.com".to_string())
+        );
+        assert_eq!(
+            registrable_domain("victim.s3.us-east-1.amazonaws.com"),
+            Some("victim.s3.us-east-1.amazonaws.com".to_string())
+        );
+        assert_eq!(
+            registrable_domain("victim.s3-us-west-2.amazonaws.com"),
+            Some("victim.s3-us-west-2.amazonaws.com".to_string())
+        );
+        assert_eq!(
+            registrable_domain("victim.blob.core.windows.net"),
+            Some("victim.blob.core.windows.net".to_string())
+        );
+        assert_eq!(
+            registrable_domain("merchant.co.kr"),
+            Some("merchant.co.kr".to_string())
+        );
+        assert_eq!(
+            registrable_domain("merchant.co.za"),
+            Some("merchant.co.za".to_string())
+        );
+        assert_eq!(
+            registrable_domain("merchant.co.in"),
+            Some("merchant.co.in".to_string())
+        );
+
+        // Cross-host exploit pairs MUST NOT match
+        let cross_host_pairs = [
+            ("https://127.0.0.1/pay", "https://203.0.0.1/pay"),
+            ("https://192.168.1.1/pay", "https://10.0.1.1/pay"),
+            ("https://[::1]/login", "https://[2001:db8::1]/login"),
+            ("https://victim.github.io/pay", "https://attacker.github.io/pay"),
+            ("https://victim.pages.dev/pay", "https://attacker.pages.dev/pay"),
+            ("https://victim.vercel.app/pay", "https://attacker.vercel.app/pay"),
+            ("https://victim.s3.amazonaws.com/pay", "https://attacker.s3.amazonaws.com/pay"),
+            (
+                "https://victim.s3.us-east-1.amazonaws.com/pay",
+                "https://attacker.s3.us-east-1.amazonaws.com/pay",
+            ),
+            ("https://merchant.co.kr/pay", "https://attacker.co.kr/pay"),
+            ("https://merchant.co.za/pay", "https://attacker.co.za/pay"),
+            ("https://merchant.co.in/pay", "https://attacker.co.in/pay"),
+            ("https://co.uk/login", "https://victim.co.uk/login"),
+            ("https://github.io/login", "https://victim.github.io/login"),
+        ];
+        for (saved, page) in cross_host_pairs {
+            assert!(
+                !website_matches_origin(saved, page),
+                "cross-host origins MUST NOT match: saved='{saved}' vs page='{page}'"
+            );
+        }
+
+        // Positive controls MUST match
+        let valid_pairs = [
+            ("https://127.0.0.1/pay", "https://127.0.0.1/other"),
+            ("https://[::1]/login", "https://[::1]/dashboard"),
+            ("https://checkout.shop.test/pay", "https://pay.shop.test/confirm"),
+            (
+                "https://checkout.victim.github.io/pay",
+                "https://pay.victim.github.io/confirm",
+            ),
+            (
+                "https://shop.merchant.co.kr/pay",
+                "https://billing.merchant.co.kr/confirm",
+            ),
+            ("https://app.github.io/login", "https://app.github.io/auth"),
+        ];
+        for (saved, page) in valid_pairs {
+            assert!(
+                website_matches_origin(saved, page),
+                "same-origin / same-tenant origins MUST match: saved='{saved}' vs page='{page}'"
+            );
+        }
+
+        // End-to-end VaultService login + Link card isolation
+        let (_dir, vault) = test_vault();
+        let ctx = "x".repeat(120);
+        for (saved_url, evil_url, same_url) in [
+            (
+                "https://127.0.0.1/login",
+                "https://203.0.0.1/login",
+                "https://127.0.0.1/checkout",
+            ),
+            (
+                "https://victim.github.io/login",
+                "https://attacker.github.io/login",
+                "https://checkout.victim.github.io/pay",
+            ),
+            (
+                "https://bank.co.kr/login",
+                "https://evil.co.kr/login",
+                "https://pay.bank.co.kr/checkout",
+            ),
+            (
+                "https://victim.s3.us-east-1.amazonaws.com/pay",
+                "https://attacker.s3.us-east-1.amazonaws.com/pay",
+                "https://sub.victim.s3.us-east-1.amazonaws.com/pay",
+            ),
+        ] {
+            let saved_login = vault
+                .save_item(
+                    VaultSaveInput::Login {
+                        id: None,
+                        website: saved_url.to_string(),
+                        username: "alice".to_string(),
+                        notes: String::new(),
+                        password: Some("SecretPass!123".to_string()),
+                        two_step_key: None,
+                        agents: None,
+                    },
+                    Some("agent-1"),
+                )
+                .expect("save login");
+            assert!(
+                vault
+                    .list_logins(evil_url, Some("agent-1"))
+                    .expect("list evil logins")
+                    .iter()
+                    .all(|l| l.id != saved_login.id()),
+                "list_logins leaked {saved_url} onto {evil_url}"
+            );
+            assert!(
+                matches!(
+                    vault.resolve_login_secret(
+                        saved_login.id(),
+                        evil_url,
+                        SecretFillMethod::Password,
+                        Some("agent-1"),
+                    ),
+                    Err(OpenBotRuntimeError::Forbidden(_))
+                ),
+                "resolve_login_secret allowed {saved_url} onto {evil_url}"
+            );
+            assert!(
+                vault
+                    .resolve_login_secret(
+                        saved_login.id(),
+                        same_url,
+                        SecretFillMethod::Password,
+                        Some("agent-1"),
+                    )
+                    .is_ok(),
+                "resolve_login_secret should succeed for {saved_url} on {same_url}"
+            );
+
+            let card = vault
+                .request_link_payment(LinkPaymentRequest {
+                    amount: 1000,
+                    currency: Some("USD".to_string()),
+                    merchant_name: "Shop".to_string(),
+                    merchant_url: saved_url.to_string(),
+                    context: ctx.clone(),
+                    approved: true,
+                    agent_id: Some("agent-1".to_string()),
+                })
+                .expect("issue link card");
+            assert!(
+                matches!(
+                    vault.get_card_for_fill(&card.card_id, evil_url, Some("agent-1"), true),
+                    Err(OpenBotRuntimeError::Forbidden(_))
+                ),
+                "Link card bound to {saved_url} must be forbidden on {evil_url}"
+            );
+            assert!(
+                vault
+                    .get_card_for_fill(&card.card_id, same_url, Some("agent-1"), true)
+                    .is_ok(),
+                "Link card bound to {saved_url} must still succeed on {same_url} after forbidden rejection"
+            );
+        }
     }
 }

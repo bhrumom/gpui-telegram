@@ -491,7 +491,26 @@ def test_t2_ob_f17_06_archived_channel_blocks_mutations_without_side_effects(
     tid = require_field(extract_list(post, "tasks")[0], "id", expected_type=str)
     mid = require_field(post, "message_id", expected_type=str)
 
-    env.run_cli_json("channel", "archive", "--channel-id", cid)
+    # Upstream openbot/src/backend/channel-service.ts:L731-L734 (channelArchiveRunning) and
+    # TEST-T2-OB-F08-02: archive refuses while a task is running; stop the held task first.
+    env.run_cli_expect_error(
+        "channel",
+        "archive",
+        "--channel-id",
+        cid,
+        error_contains=("running", "stop"),
+    )
+    stopped = unwrap_entity(
+        env.run_cli_json("channel", "stop", "--channel-id", cid, "--task-id", tid),
+        "task",
+    )
+    assert require_field(stopped, "state", expected_type=str) == "paused"
+
+    arch = unwrap_entity(
+        env.run_cli_json("channel", "archive", "--channel-id", cid),
+        "channel",
+    )
+    assert require_field(arch, "archived", expected_type=bool) is True
     snap_before = env.run_cli_json("channel", "get", "--channel-id", cid)
     msgs_before = len(extract_list(snap_before, "messages"))
     tasks_before = len(extract_list(snap_before, "tasks"))

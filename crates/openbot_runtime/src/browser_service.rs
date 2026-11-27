@@ -1041,11 +1041,17 @@ fn resolve_or_upsert_element(
                 })
         }
         BrowserTarget::Css { selector, nth } => {
+            let trimmed = selector.trim();
+            if trimmed.is_empty() {
+                return Err(OpenBotRuntimeError::Validation(
+                    "browser css selector must not be empty".to_string(),
+                ));
+            }
             let matches: Vec<usize> = tab
                 .dom_elements
                 .iter()
                 .enumerate()
-                .filter(|(_, el)| el.selector == *selector)
+                .filter(|(_, el)| el.selector == trimmed)
                 .map(|(i, _)| i)
                 .collect();
             let pick = nth.unwrap_or(0);
@@ -1053,14 +1059,14 @@ fn resolve_or_upsert_element(
                 return Ok(idx);
             }
             let next_ref = format!("e{}", tab.dom_elements.len() + 1);
-            let is_secret = selector.to_ascii_lowercase().contains("password")
-                || selector.to_ascii_lowercase().contains("cc-");
+            let is_secret = trimmed.to_ascii_lowercase().contains("password")
+                || trimmed.to_ascii_lowercase().contains("cc-");
             tab.dom_elements.push(DomElementSnapshot {
                 r#ref: next_ref,
                 tag: default_tag.to_string(),
                 role: default_role.to_string(),
-                name: selector.clone(),
-                selector: selector.clone(),
+                name: trimmed.to_string(),
+                selector: trimmed.to_string(),
                 input_type: if default_tag == "input" {
                     Some(if is_secret { "password" } else { "text" }.to_string())
                 } else {
@@ -1082,13 +1088,14 @@ fn resolve_or_upsert_element(
             exact,
             nth,
         } => {
+            let trimmed_role = role.trim();
             let want_exact = exact.unwrap_or(false);
             let matches: Vec<usize> = tab
                 .dom_elements
                 .iter()
                 .enumerate()
                 .filter(|(_, el)| {
-                    el.role.eq_ignore_ascii_case(role)
+                    el.role.eq_ignore_ascii_case(trimmed_role)
                         && match name {
                             None => true,
                             Some(n) if want_exact => el.name == *n,
@@ -1123,7 +1130,9 @@ fn resolve_or_upsert_element(
             })
         }
         BrowserTarget::Point { x, y } => {
-            if *x < 0.0
+            if !x.is_finite()
+                || !y.is_finite()
+                || *x < 0.0
                 || *y < 0.0
                 || *x > INPUT_LIMITS.browser_coordinate as f64
                 || *y > INPUT_LIMITS.browser_coordinate as f64
@@ -2896,6 +2905,194 @@ fn parse_target_value(val: Option<&Value>) -> RuntimeResult<BrowserTarget> {
     })
 }
 
+fn canonicalize_card_target(field: &str, target: &BrowserTarget) -> RuntimeResult<String> {
+    match target {
+        BrowserTarget::Ref { r#ref, .. } => {
+            if r#ref.trim().is_empty() {
+                return Err(OpenBotRuntimeError::Validation(format!(
+                    "fill_card target '{field}' ref must not be empty"
+                )));
+            }
+            Ok(format!("ref:{}", r#ref))
+        }
+        BrowserTarget::Css { selector, nth } => {
+            let trimmed = selector.trim();
+            if trimmed.is_empty() {
+                return Err(OpenBotRuntimeError::Validation(format!(
+                    "fill_card target '{field}' selector must not be empty"
+                )));
+            }
+            Ok(format!("css:{trimmed}:{}", nth.unwrap_or(0)))
+        }
+        BrowserTarget::Role {
+            role,
+            name,
+            exact,
+            nth,
+        } => {
+            let trimmed_role = role.trim();
+            if trimmed_role.is_empty() {
+                return Err(OpenBotRuntimeError::Validation(format!(
+                    "fill_card target '{field}' role must not be empty"
+                )));
+            }
+            let norm_name = name.as_deref().map(str::trim).unwrap_or("");
+            Ok(format!(
+                "role:{}:{norm_name}:{}:{}",
+                trimmed_role.to_ascii_lowercase(),
+                exact.unwrap_or(false),
+                nth.unwrap_or(0)
+            ))
+        }
+        BrowserTarget::Text { text, exact, nth } => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(OpenBotRuntimeError::Validation(format!(
+                    "fill_card target '{field}' text must not be empty"
+                )));
+            }
+            Ok(format!(
+                "text:{trimmed}:{}:{}",
+                exact.unwrap_or(false),
+                nth.unwrap_or(0)
+            ))
+        }
+        BrowserTarget::Point { x, y } => {
+            if !x.is_finite()
+                || !y.is_finite()
+                || *x < 0.0
+                || *y < 0.0
+                || *x > INPUT_LIMITS.browser_coordinate as f64
+                || *y > INPUT_LIMITS.browser_coordinate as f64
+            {
+                return Err(OpenBotRuntimeError::Validation(
+                    "browser point coordinates out of bounds".to_string(),
+                ));
+            }
+            let nx = if *x == 0.0 { 0.0 } else { *x };
+            let ny = if *y == 0.0 { 0.0 } else { *y };
+            Ok(format!("point:{}:{}", nx.to_bits(), ny.to_bits()))
+        }
+    }
+}
+
+struct ResolvedCardFillIndices {
+    number_idx: usize,
+    security_code_idx: Option<usize>,
+    expiry_idx: Option<usize>,
+    exp_month_idx: Option<usize>,
+    exp_year_idx: Option<usize>,
+    name_on_card_idx: Option<usize>,
+}
+
+fn validate_card_fill_targets(targets: &CardFillTargets) -> RuntimeResult<()> {
+    if targets.expiry.is_some() && (targets.exp_month.is_some() || targets.exp_year.is_some()) {
+        return Err(OpenBotRuntimeError::Validation(
+            "fill_card targets: use expiry, or expMonth and expYear, not both".to_string(),
+        ));
+    }
+    if targets.exp_month.is_some() != targets.exp_year.is_some() {
+        return Err(OpenBotRuntimeError::Validation(
+            "fill_card targets: provide both expMonth and expYear together".to_string(),
+        ));
+    }
+    let default_number = BrowserTarget::Css {
+        selector: "input[autocomplete=cc-number]".to_string(),
+        nth: None,
+    };
+    let default_cvv = BrowserTarget::Css {
+        selector: "input[autocomplete=cc-csc]".to_string(),
+        nth: None,
+    };
+    let effective_targets: [(&str, Option<&BrowserTarget>); 6] = [
+        ("number", Some(targets.number.as_ref().unwrap_or(&default_number))),
+        (
+            "securityCode",
+            Some(targets.security_code.as_ref().unwrap_or(&default_cvv)),
+        ),
+        ("expiry", targets.expiry.as_ref()),
+        ("expMonth", targets.exp_month.as_ref()),
+        ("expYear", targets.exp_year.as_ref()),
+        ("nameOnCard", targets.name_on_card.as_ref()),
+    ];
+    let mut seen_keys = HashSet::new();
+    for (field, target_opt) in effective_targets {
+        if let Some(target) = target_opt {
+            let key = canonicalize_card_target(field, target)?;
+            if !seen_keys.insert(key) {
+                return Err(OpenBotRuntimeError::Validation(
+                    "Each card field needs its own target.".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_card_fill_targets(
+    tab: &mut BrowserTabState,
+    targets: &CardFillTargets,
+    include_security_code: bool,
+) -> RuntimeResult<ResolvedCardFillIndices> {
+    let default_number = BrowserTarget::Css {
+        selector: "input[autocomplete=cc-number]".to_string(),
+        nth: None,
+    };
+    let default_cvv = BrowserTarget::Css {
+        selector: "input[autocomplete=cc-csc]".to_string(),
+        nth: None,
+    };
+    let mut seen_indices = HashSet::new();
+    let mut resolve_unique =
+        |tab: &mut BrowserTabState, target: &BrowserTarget| -> RuntimeResult<usize> {
+            let dom_idx = resolve_or_upsert_element(tab, target, "input", "textbox")?;
+            if !seen_indices.insert(dom_idx) {
+                return Err(OpenBotRuntimeError::Validation(
+                    "Each card field needs its own target.".to_string(),
+                ));
+            }
+            Ok(dom_idx)
+        };
+
+    let number_idx = resolve_unique(tab, targets.number.as_ref().unwrap_or(&default_number))?;
+    let security_code_idx = if include_security_code {
+        Some(resolve_unique(
+            tab,
+            targets.security_code.as_ref().unwrap_or(&default_cvv),
+        )?)
+    } else {
+        None
+    };
+
+    let (expiry_idx, exp_month_idx, exp_year_idx) = if let Some(ref exp_target) = targets.expiry {
+        (Some(resolve_unique(tab, exp_target)?), None, None)
+    } else {
+        let m_idx = match targets.exp_month.as_ref() {
+            Some(m_target) => Some(resolve_unique(tab, m_target)?),
+            None => None,
+        };
+        let y_idx = match targets.exp_year.as_ref() {
+            Some(y_target) => Some(resolve_unique(tab, y_target)?),
+            None => None,
+        };
+        (None, m_idx, y_idx)
+    };
+
+    let name_on_card_idx = match targets.name_on_card.as_ref() {
+        Some(name_target) => Some(resolve_unique(tab, name_target)?),
+        None => None,
+    };
+
+    Ok(ResolvedCardFillIndices {
+        number_idx,
+        security_code_idx,
+        expiry_idx,
+        exp_month_idx,
+        exp_year_idx,
+        name_on_card_idx,
+    })
+}
+
 impl BrowserService {
     /// Zero-knowledge secret fill (`password`, `otp`, or `authenticator`).
     /// Resolves saved secrets from `VaultService` enforcing origin & agent scope match,
@@ -3012,19 +3209,18 @@ impl BrowserService {
     /// Sets `filled_card = true` and `screenshots_blocked = true` exfiltration lock until
     /// main-frame navigation or explicit `reset_exfiltration_lock`.
     pub fn fill_card(&self, req: FillCardRequest) -> RuntimeResult<FillCardResult> {
-        if let Some(ref t) = req.targets {
-            if t.expiry.is_some() && (t.exp_month.is_some() || t.exp_year.is_some()) {
-                return Err(OpenBotRuntimeError::Validation(
-                    "fill_card targets: use expiry, or expMonth and expYear, not both".to_string(),
-                ));
-            }
-        }
+        let targets = req.targets.unwrap_or_default();
+        validate_card_fill_targets(&targets)?;
 
-        let tab_url = {
+        let (tab_url, expected_revision, mut tab_preview) = {
             let guard = self.state.read();
             let idx = Self::find_tab_index(&guard, &req.tab_id)?;
             Self::require_not_takeover_paused(&guard.tabs[idx])?;
-            guard.tabs[idx].url.clone()
+            (
+                guard.tabs[idx].url.clone(),
+                guard.tabs[idx].revision,
+                guard.tabs[idx].clone(),
+            )
         };
 
         let parsed_url = Url::parse(&tab_url).map_err(|_| {
@@ -3039,6 +3235,10 @@ impl BrowserService {
             ));
         }
 
+        // Pre-resolve every effective target on a staged clone and enforce strict DOM-index
+        // uniqueness BEFORE consuming a one-time Link card or recording saved-card fill_sites.
+        let _ = resolve_card_fill_targets(&mut tab_preview, &targets, true)?;
+
         let card = self.vault.get_card_for_fill(
             &req.card_id,
             &tab_url,
@@ -3049,69 +3249,56 @@ impl BrowserService {
         let mut guard = self.state.write();
         let idx = Self::find_tab_index(&guard, &req.tab_id)?;
         Self::require_not_takeover_paused(&guard.tabs[idx])?;
+        if guard.tabs[idx].revision != expected_revision || guard.tabs[idx].url != tab_url {
+            return Err(OpenBotRuntimeError::Conflict(
+                "The card page changed. Take a fresh snapshot.".to_string(),
+            ));
+        }
+
+        let mut next_tab = guard.tabs[idx].clone();
+        let include_cvv = !card.cvv_for_browser_fill().is_empty();
+        let resolved = resolve_card_fill_targets(&mut next_tab, &targets, include_cvv)?;
 
         // Discard any active screen recording before injecting payment card fields.
-        guard.tabs[idx].recording = None;
+        next_tab.recording = None;
 
         let mut filled_fields = Vec::new();
-        let targets = req.targets.unwrap_or_default();
-
-        let number_target = targets.number.unwrap_or_else(|| BrowserTarget::Css {
-            selector: "input[autocomplete=cc-number]".to_string(),
-            nth: None,
-        });
-        let num_idx =
-            resolve_or_upsert_element(&mut guard.tabs[idx], &number_target, "input", "textbox")?;
-        guard.tabs[idx].dom_elements[num_idx].is_secret = true;
-        guard.tabs[idx].dom_elements[num_idx].value = mask_card_last4(&card.last4);
+        next_tab.dom_elements[resolved.number_idx].is_secret = true;
+        next_tab.dom_elements[resolved.number_idx].value = mask_card_last4(&card.last4);
         filled_fields.push("number".to_string());
 
-        if !card.cvv_for_browser_fill().is_empty() {
-            let cvv_target = targets.security_code.unwrap_or_else(|| BrowserTarget::Css {
-                selector: "input[autocomplete=cc-csc]".to_string(),
-                nth: None,
-            });
-            let cvv_idx =
-                resolve_or_upsert_element(&mut guard.tabs[idx], &cvv_target, "input", "textbox")?;
-            guard.tabs[idx].dom_elements[cvv_idx].is_secret = true;
-            guard.tabs[idx].dom_elements[cvv_idx].value = "[redacted]".to_string();
+        if let Some(cvv_idx) = resolved.security_code_idx {
+            next_tab.dom_elements[cvv_idx].is_secret = true;
+            next_tab.dom_elements[cvv_idx].value = "[redacted]".to_string();
             filled_fields.push("securityCode".to_string());
         }
 
-        if let Some(exp_target) = targets.expiry {
-            let e_idx =
-                resolve_or_upsert_element(&mut guard.tabs[idx], &exp_target, "input", "textbox")?;
-            guard.tabs[idx].dom_elements[e_idx].is_secret = true;
-            guard.tabs[idx].dom_elements[e_idx].value = "[redacted]".to_string();
+        if let Some(e_idx) = resolved.expiry_idx {
+            next_tab.dom_elements[e_idx].is_secret = true;
+            next_tab.dom_elements[e_idx].value = "[redacted]".to_string();
             filled_fields.push("expiry".to_string());
         } else {
-            if let Some(m_target) = targets.exp_month {
-                let m_idx =
-                    resolve_or_upsert_element(&mut guard.tabs[idx], &m_target, "input", "textbox")?;
-                guard.tabs[idx].dom_elements[m_idx].is_secret = true;
-                guard.tabs[idx].dom_elements[m_idx].value = "[redacted]".to_string();
+            if let Some(m_idx) = resolved.exp_month_idx {
+                next_tab.dom_elements[m_idx].is_secret = true;
+                next_tab.dom_elements[m_idx].value = "[redacted]".to_string();
                 filled_fields.push("expMonth".to_string());
             }
-            if let Some(y_target) = targets.exp_year {
-                let y_idx =
-                    resolve_or_upsert_element(&mut guard.tabs[idx], &y_target, "input", "textbox")?;
-                guard.tabs[idx].dom_elements[y_idx].is_secret = true;
-                guard.tabs[idx].dom_elements[y_idx].value = "[redacted]".to_string();
+            if let Some(y_idx) = resolved.exp_year_idx {
+                next_tab.dom_elements[y_idx].is_secret = true;
+                next_tab.dom_elements[y_idx].value = "[redacted]".to_string();
                 filled_fields.push("expYear".to_string());
             }
         }
-        if let Some(name_target) = targets.name_on_card {
-            let n_idx =
-                resolve_or_upsert_element(&mut guard.tabs[idx], &name_target, "input", "textbox")?;
-            guard.tabs[idx].dom_elements[n_idx].value = card.name_on_card.clone();
+        if let Some(n_idx) = resolved.name_on_card_idx {
+            next_tab.dom_elements[n_idx].value = card.name_on_card.clone();
             filled_fields.push("nameOnCard".to_string());
         }
 
         // Engage strict exfiltration lock!
-        guard.tabs[idx].filled_card = true;
-        guard.tabs[idx].screenshots_blocked = true;
-        guard.tabs[idx].revision += 1;
-        guard.tabs[idx].console_logs.push(BrowserConsoleEntry {
+        next_tab.filled_card = true;
+        next_tab.screenshots_blocked = true;
+        next_tab.revision += 1;
+        next_tab.console_logs.push(BrowserConsoleEntry {
             level: "info".to_string(),
             text: format!(
                 "fill_card completed ({}); screenshots_blocked=true until navigation",
@@ -3120,6 +3307,7 @@ impl BrowserService {
             timestamp: now_rfc3339_millis(),
         });
 
+        guard.tabs[idx] = next_tab;
         let snapshot = build_snapshot_view(&guard.tabs[idx]);
         self.persist_locked(&guard)?;
 
@@ -3862,4 +4050,145 @@ mod tests {
             )
             .expect("automation resumed");
     }
+
+    #[test]
+    fn fill_card_pre_resolves_targets_and_blocks_point_collisions_before_vault_mutation() {
+        let (_dir, vault, browser) = test_browser();
+        let ctx_110 = "Purchase deterministic test license with strict transactional pre-resolution before Link card consumption!!";
+        let link = vault
+            .request_link_payment(LinkPaymentRequest {
+                amount: 4200,
+                currency: Some("USD".to_string()),
+                merchant_name: "Merchant".to_string(),
+                merchant_url: "https://checkout.merchant.test/pay".to_string(),
+                context: ctx_110.to_string(),
+                approved: true,
+                agent_id: Some("agent-1".to_string()),
+            })
+            .expect("issue link card");
+        let tab = browser
+            .open_tab("https://checkout.merchant.test/pay", Some("agent-1"), None, None, false)
+            .expect("open https");
+
+        let failing_targets = vec![
+            CardFillTargets {
+                number: Some(BrowserTarget::Ref { r#ref: "e999".to_string(), revision: None }),
+                ..Default::default()
+            },
+            CardFillTargets {
+                number: Some(BrowserTarget::Ref { r#ref: " e1 ".to_string(), revision: None }),
+                ..Default::default()
+            },
+            CardFillTargets {
+                number: Some(BrowserTarget::Ref { r#ref: "e1".to_string(), revision: Some(100) }),
+                ..Default::default()
+            },
+            CardFillTargets {
+                number: Some(BrowserTarget::Role {
+                    role: "textbox".to_string(),
+                    name: Some("NoSuchField".to_string()),
+                    exact: None,
+                    nth: None,
+                }),
+                ..Default::default()
+            },
+            CardFillTargets {
+                number: Some(BrowserTarget::Text {
+                    text: "NoSuchText".to_string(),
+                    exact: None,
+                    nth: None,
+                }),
+                ..Default::default()
+            },
+            CardFillTargets {
+                number: Some(BrowserTarget::Ref { r#ref: "e1".to_string(), revision: None }),
+                expiry: Some(BrowserTarget::Point { x: 10.0, y: 20.0 }),
+                ..Default::default()
+            },
+            CardFillTargets {
+                number: Some(BrowserTarget::Point { x: 10.0, y: 20.0 }),
+                expiry: Some(BrowserTarget::Point { x: 30.0, y: 40.0 }),
+                ..Default::default()
+            },
+        ];
+        for targets in failing_targets {
+            let res = browser.fill_card(FillCardRequest {
+                tab_id: tab.tab_id.clone(),
+                card_id: link.card_id.clone(),
+                targets: Some(targets),
+                approved: true,
+                agent_id: Some("agent-1".to_string()),
+                timeout_ms: None,
+            });
+            assert!(res.is_err(), "expected failure before Link card consumption");
+        }
+
+        // Link card MUST still be unconsumed; padded CSS matches e2 without creating e7.
+        let filled = browser
+            .fill_card(FillCardRequest {
+                tab_id: tab.tab_id.clone(),
+                card_id: link.card_id.clone(),
+                targets: Some(CardFillTargets {
+                    number: Some(BrowserTarget::Css {
+                        selector: " input[autocomplete=cc-number] ".to_string(),
+                        nth: None,
+                    }),
+                    ..Default::default()
+                }),
+                approved: true,
+                agent_id: Some("agent-1".to_string()),
+                timeout_ms: None,
+            })
+            .expect("link card must remain unconsumed after pre-resolution failures");
+        assert!(filled.filled_card);
+        assert_eq!(filled.snapshot.elements.len(), 6);
+        assert!(filled.snapshot.elements.iter().all(|el| el.r#ref != "e7"));
+
+        // Saved Vault card: bad target with approved=true must NOT persist fill_sites.
+        let saved = vault
+            .save_item(
+                VaultSaveInput::Card {
+                    id: None,
+                    label: "Saved".to_string(),
+                    name_on_card: "Ada".to_string(),
+                    exp_month: 12,
+                    exp_year: 2029,
+                    billing_contact_id: None,
+                    number: Some("4242424242424242".to_string()),
+                    security_code: Some("123".to_string()),
+                    fill_sites: None,
+                    agents: None,
+                },
+                Some("agent-1"),
+            )
+            .expect("save card");
+        let tab2 = browser
+            .open_tab("https://billing.saved.test/checkout", Some("agent-1"), None, None, false)
+            .expect("open tab2");
+        let bad_saved = browser.fill_card(FillCardRequest {
+            tab_id: tab2.tab_id.clone(),
+            card_id: saved.id().to_string(),
+            targets: Some(CardFillTargets {
+                number: Some(BrowserTarget::Ref { r#ref: "e999".to_string(), revision: None }),
+                ..Default::default()
+            }),
+            approved: true,
+            agent_id: Some("agent-1".to_string()),
+            timeout_ms: None,
+        });
+        assert!(matches!(bad_saved, Err(OpenBotRuntimeError::NotFound(_))));
+        let needs_approval = browser.fill_card(FillCardRequest {
+            tab_id: tab2.tab_id,
+            card_id: saved.id().to_string(),
+            targets: None,
+            approved: false,
+            agent_id: Some("agent-1".to_string()),
+            timeout_ms: None,
+        });
+        assert!(matches!(
+            needs_approval,
+            Err(OpenBotRuntimeError::ApprovalRequired { .. })
+        ));
+    }
 }
+

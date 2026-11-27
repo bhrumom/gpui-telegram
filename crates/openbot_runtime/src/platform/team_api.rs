@@ -32,7 +32,7 @@ use openbot_contracts::channels::{
 use openbot_contracts::conversation::{
     ConversationMessage, ConversationMessageAuthor, ConversationMessageStatus,
 };
-use openbot_contracts::limits::{INPUT_LIMITS, is_bounded_string, utf16_len};
+use openbot_contracts::limits::{INPUT_LIMITS, is_bounded_string, is_identifier, utf16_len};
 use openbot_contracts::team_protocol::{
     TEAM_ABSENT_CAPABILITIES_HEADER, TEAM_APP_VERSION_HEADER, TEAM_CAPABILITY_REGISTRY,
     TEAM_LONG_CAPABILITY_LISTS_CAPABILITY, TEAM_PROTOCOL_V1, TEAM_PROTOCOL_V10,
@@ -854,6 +854,13 @@ async fn handle_create_channel(
         Ok(m) => m,
         Err(err) => return runtime_error_to_response(err),
     };
+    if members.is_empty() {
+        return error_json_response(
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            "At least one channel member is required (members must not be empty).",
+        );
+    }
     let draft = ChannelDraft {
         name: body.name,
         title: body.title.unwrap_or_default(),
@@ -867,10 +874,34 @@ async fn handle_create_channel(
     if let Err(err) = draft.validate_strict(None) {
         return runtime_error_to_response(err.into());
     }
+    let known_agents = match state.database.agent_roster().list_agents() {
+        Ok(agents) => agents,
+        Err(err) => return runtime_error_to_response(err.into()),
+    };
+    let known_ids: HashSet<&str> = known_agents.iter().map(|a| a.id.as_str()).collect();
+    for member in &draft.members {
+        if !known_ids.contains(member.agent_id.as_str()) {
+            return error_json_response(
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+                &format!("Channel member '{}' is unavailable.", member.agent_id),
+            );
+        }
+    }
     let store = ChannelStore::new(state.database.clone());
+    let existing_ids = match store.ids() {
+        Ok(ids) => ids,
+        Err(err) => return runtime_error_to_response(err.into()),
+    };
+    if existing_ids.len() >= INPUT_LIMITS.agents {
+        return runtime_error_to_response(OpenBotRuntimeError::LimitExceeded(format!(
+            "A host can have at most {} channels.",
+            INPUT_LIMITS.agents
+        )));
+    }
     let channel_id = format!("channel-{}", Uuid::new_v4());
     let channel = store.create(&channel_id, draft);
-    match store.commit(
+    let saved = match store.commit(
         &format!("create:{channel_id}"),
         ChannelChange {
             channel,
@@ -879,12 +910,16 @@ async fn handle_create_channel(
             assignments: Vec::new(),
         },
     ) {
-        Ok(saved) => {
-            let _ = state.event_tx.send(());
-            (StatusCode::CREATED, Json(saved)).into_response()
+        Ok(saved) => saved,
+        Err(err) => return runtime_error_to_response(err.into()),
+    };
+    for member in &saved.draft.members {
+        if let Err(err) = store.context(&saved.id, &member.agent_id) {
+            return runtime_error_to_response(err.into());
         }
-        Err(err) => runtime_error_to_response(err.into()),
     }
+    let _ = state.event_tx.send(());
+    (StatusCode::CREATED, Json(saved)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -916,11 +951,59 @@ async fn handle_post_channel_message(
             "Channel message text must be non-empty and within length limits.",
         );
     }
+    let msg_id = match body.message_id {
+        Some(id) => {
+            if let Err(err) = validate_strict_identifier(&id, "messageId") {
+                return runtime_error_to_response(err);
+            }
+            id
+        }
+        None => format!("msg-{}", Uuid::new_v4()),
+    };
+    if let Some(ref id) = body.author_id
+        && let Err(err) = validate_strict_identifier(id, "authorId")
+    {
+        return runtime_error_to_response(err);
+    }
+    if let Some(ref name) = body.author_name
+        && let Err(err) = validate_author_name(name, "authorName")
+    {
+        return runtime_error_to_response(err);
+    }
+    let author = match body.author {
+        Some(author) => {
+            if let Err(err) = validate_strict_identifier(&author.id, "author.id") {
+                return runtime_error_to_response(err);
+            }
+            if let Err(err) = validate_author_name(&author.name, "author.name") {
+                return runtime_error_to_response(err);
+            }
+            author
+        }
+        None => {
+            let author_id = body
+                .author_id
+                .unwrap_or_else(|| SIGNED_OUT_CHANNEL_MEMBER_ID.to_string());
+            let author_name = body.author_name.unwrap_or_else(|| "User".to_string());
+            ChannelMessageAuthor {
+                kind: body.author_kind.unwrap_or(ChannelMessageAuthorKind::Member),
+                id: author_id,
+                name: author_name,
+            }
+        }
+    };
     let store = ChannelStore::new(state.database.clone());
     let channel = match store.get(&channel_id) {
         Ok(c) => c,
         Err(err) => return runtime_error_to_response(err.into()),
     };
+    if channel.archived {
+        return error_json_response(
+            StatusCode::CONFLICT,
+            "channel_archived",
+            crate::channel_service::CHANNEL_ARCHIVED_ERROR,
+        );
+    }
     let next_seq = match state.database.with_conn(|conn| {
         let max_seq: i64 = conn.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM projection_channel_messages WHERE channel_id = ?1",
@@ -933,21 +1016,6 @@ async fn handle_post_channel_message(
         Err(err) => return runtime_error_to_response(err.into()),
     };
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let msg_id = body
-        .message_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("msg-{}", Uuid::new_v4()));
-    let author = body.author.unwrap_or_else(|| ChannelMessageAuthor {
-        kind: body.author_kind.unwrap_or(ChannelMessageAuthorKind::Member),
-        id: body
-            .author_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| SIGNED_OUT_CHANNEL_MEMBER_ID.to_string()),
-        name: body
-            .author_name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "User".to_string()),
-    });
     let conv_author = match author.kind {
         ChannelMessageAuthorKind::Member => ConversationMessageAuthor::User,
         ChannelMessageAuthorKind::Agent => ConversationMessageAuthor::Agent,
@@ -1178,14 +1246,17 @@ async fn handle_list_direct_threads(
     State(state): State<TeamApiState>,
     Query(query): Query<DirectThreadsQuery>,
 ) -> Response {
-    let member_id = query
-        .member_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(SIGNED_OUT_CHANNEL_MEMBER_ID);
+    let member_id = match query.member_id {
+        Some(raw) => {
+            if let Err(err) = validate_strict_identifier(&raw, "memberId") {
+                return runtime_error_to_response(err);
+            }
+            raw
+        }
+        None => SIGNED_OUT_CHANNEL_MEMBER_ID.to_string(),
+    };
     let store = TeamChatStore::new(state.database.clone());
-    match store.list_threads(member_id) {
+    match store.list_threads(&member_id) {
         Ok(threads) => (StatusCode::OK, Json(threads)).into_response(),
         Err(err) => runtime_error_to_response(err.into()),
     }
@@ -1207,15 +1278,30 @@ async fn handle_send_direct_message(
     State(state): State<TeamApiState>,
     Json(body): Json<SendDirectMessageHttpRequest>,
 ) -> Response {
+    if let Err(err) = validate_strict_identifier(&body.recipient_member_id, "recipientMemberId") {
+        return runtime_error_to_response(err);
+    }
+    let sender_member_id = match body.sender_member_id {
+        Some(s) => {
+            if let Err(err) = validate_strict_identifier(&s, "senderMemberId") {
+                return runtime_error_to_response(err);
+            }
+            s
+        }
+        None => SIGNED_OUT_CHANNEL_MEMBER_ID.to_string(),
+    };
+    let client_message_id = match body.client_message_id {
+        Some(s) => {
+            if let Err(err) = validate_strict_identifier(&s, "clientMessageId") {
+                return runtime_error_to_response(err);
+            }
+            s
+        }
+        None => format!("dm-msg-{}", Uuid::new_v4()),
+    };
     let input = SendDirectMessageInput {
-        client_message_id: body
-            .client_message_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("dm-msg-{}", Uuid::new_v4())),
-        sender_member_id: body
-            .sender_member_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| SIGNED_OUT_CHANNEL_MEMBER_ID.to_string()),
+        client_message_id,
+        sender_member_id,
         recipient_member_id: body.recipient_member_id,
         text: body.text,
         created_at: None,
@@ -1291,10 +1377,34 @@ fn orchestration_event_to_sse_frames(ev: &StoredOrchestrationEvent, out: &mut Ve
     }
 }
 
+fn validate_strict_identifier(value: &str, field: &str) -> RuntimeResult<()> {
+    if value.trim().is_empty() || value.trim() != value || !is_identifier(value) {
+        return Err(OpenBotRuntimeError::Validation(format!(
+            "{field} must be a non-empty identifier without leading/trailing whitespace and at most {} characters.",
+            INPUT_LIMITS.identifier
+        )));
+    }
+    Ok(())
+}
+
+fn validate_author_name(value: &str, field: &str) -> RuntimeResult<()> {
+    if value.trim().is_empty()
+        || value.trim() != value
+        || !is_bounded_string(value, INPUT_LIMITS.account_name)
+    {
+        return Err(OpenBotRuntimeError::Validation(format!(
+            "{field} must be non-empty without leading/trailing whitespace and at most {} characters.",
+            INPUT_LIMITS.account_name
+        )));
+    }
+    Ok(())
+}
+
 fn parse_channel_members(raw: &[Value]) -> RuntimeResult<Vec<ChannelMember>> {
     let mut members = Vec::with_capacity(raw.len());
     for item in raw {
         if let Some(s) = item.as_str() {
+            validate_strict_identifier(s, "Channel member agentId")?;
             members.push(ChannelMember {
                 agent_id: s.to_string(),
             });
@@ -1308,6 +1418,7 @@ fn parse_channel_members(raw: &[Value]) -> RuntimeResult<Vec<ChannelMember>> {
                         "Channel member object must contain string agentId.".to_string(),
                     )
                 })?;
+            validate_strict_identifier(aid, "Channel member agentId")?;
             members.push(ChannelMember {
                 agent_id: aid.to_string(),
             });

@@ -2451,3 +2451,141 @@ fn m3_r2_regression_isolated_channel_remember_redirects_without_private_leak() {
         Err(OpenBotRuntimeError::Forbidden(_))
     ));
 }
+
+#[test]
+fn m6_t2_regression_channel_empty_create_rejected_update_and_reassign_member_rules() {
+    let dir = TempDir::new().expect("tempdir");
+    let host = OpenBotHostRuntime::open(dir.path()).expect("open host runtime");
+    let a1 = make_agent(&host, "MemberOne");
+    let a2 = make_agent(&host, "MemberTwo");
+    let outsider = make_agent(&host, "OutsiderThree");
+
+    // 1. Creating a channel with 0 members must fail with Validation mentioning empty/at least/required
+    let empty_err = host
+        .channels()
+        .create(CreateChannelInput {
+            channel_id: None,
+            name: "NoRoster".to_string(),
+            title: String::new(),
+            instructions: String::new(),
+            members: vec![],
+            lead_agent_id: None,
+            isolated: Some(false),
+            browser: None,
+            icon: None,
+            image_url: None,
+            folders: None,
+            operation_id: None,
+        })
+        .expect_err("0-member channel creation must fail");
+    let OpenBotRuntimeError::Validation(empty_msg) = empty_err else {
+        panic!("expected Validation error for 0-member create, got {empty_err:?}");
+    };
+    let empty_lower = empty_msg.to_ascii_lowercase();
+    assert!(
+        empty_lower.contains("at least")
+            && empty_lower.contains("required")
+            && empty_lower.contains("empty"),
+        "unexpected empty-member error: {empty_msg}"
+    );
+
+    // 2. Updating an existing channel to 0 members AND remove_deleted_member on the last member still succeed
+    let solo = host
+        .channels()
+        .create(CreateChannelInput {
+            channel_id: None,
+            name: "Shrinkable".to_string(),
+            title: String::new(),
+            instructions: String::new(),
+            members: vec![ChannelMember { agent_id: a1.id.clone() }],
+            lead_agent_id: Some(a1.id.clone()),
+            isolated: Some(false),
+            browser: None,
+            icon: None,
+            image_url: None,
+            folders: None,
+            operation_id: None,
+        })
+        .expect("create 1-member channel");
+
+    let emptied = host
+        .channels()
+        .update(UpdateChannelInput {
+            channel_id: solo.id.clone(),
+            members: Some(vec![]),
+            lead_agent_id: Some(None),
+            ..Default::default()
+        })
+        .expect("updating existing channel to 0 members must remain allowed");
+    assert!(emptied.draft.members.is_empty());
+
+    let restored = host
+        .channels()
+        .update(UpdateChannelInput {
+            channel_id: solo.id.clone(),
+            members: Some(vec![ChannelMember { agent_id: a1.id.clone() }]),
+            lead_agent_id: Some(Some(a1.id.clone())),
+            ..Default::default()
+        })
+        .expect("re-add member");
+    assert_eq!(restored.draft.members.len(), 1);
+
+    let affected = host
+        .channels()
+        .remove_deleted_member(&a1.id)
+        .expect("remove_deleted_member must allow dropping last member");
+    assert!(affected.iter().any(|c| c.id == solo.id && c.draft.members.is_empty()));
+
+    // 3. Reassigning a task to a non-member must fail with 'not a member' & 'channel member is required'
+    let team = host
+        .channels()
+        .create(CreateChannelInput {
+            channel_id: None,
+            name: "ReassignCheck".to_string(),
+            title: String::new(),
+            instructions: String::new(),
+            members: vec![
+                ChannelMember { agent_id: a1.id.clone() },
+                ChannelMember { agent_id: a2.id.clone() },
+            ],
+            lead_agent_id: Some(a1.id.clone()),
+            isolated: Some(false),
+            browser: None,
+            icon: None,
+            image_url: None,
+            folders: None,
+            operation_id: None,
+        })
+        .expect("create team channel");
+
+    let posted = host
+        .channels()
+        .post(PostChannelMessageInput {
+            channel_id: team.id.clone(),
+            text: "Test reassign validation".to_string(),
+            router_mock: Some(r#"{"agentIds":["m1"]}"#.to_string()),
+            hold_running: true,
+            ..Default::default()
+        })
+        .expect("post held task");
+    let tid = posted.tasks[0].task.id.clone();
+
+    let reassign_err = host
+        .channels()
+        .reassign(ChannelReassignInput {
+            channel_id: team.id.clone(),
+            task_id: tid,
+            recipient_agent_id: outsider.id.clone(),
+            operation_id: None,
+        })
+        .expect_err("reassign to non-member must fail");
+    let OpenBotRuntimeError::Validation(reassign_msg) = reassign_err else {
+        panic!("expected Validation for non-member reassign, got {reassign_err:?}");
+    };
+    let reassign_lower = reassign_msg.to_ascii_lowercase();
+    assert!(
+        reassign_lower.contains("not a member") && reassign_lower.contains("channel member is required"),
+        "unexpected non-member reassign error: {reassign_msg}"
+    );
+}
+

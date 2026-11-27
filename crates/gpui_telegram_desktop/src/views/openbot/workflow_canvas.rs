@@ -485,6 +485,7 @@ impl WorkflowCanvasState {
         if parsed.strokes.len() > WORKFLOW_MAX_STROKES {
             return Err(format!("too many workflow strokes (limit {WORKFLOW_MAX_STROKES})"));
         }
+        parsed.validate().map_err(|e| e.to_string())?;
         self.push_undo_snapshot();
         self.graph = parsed;
         self.tidy_applied = false;

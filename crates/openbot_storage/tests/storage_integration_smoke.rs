@@ -1043,3 +1043,244 @@ fn smoke_6_browser_mcp_json_preferences_and_shared_agent_data_authorizer() {
     ));
     shared.quick_check().unwrap();
 }
+
+#[test]
+fn regression_newer_v70_database_fails_closed_byte_immutable_delete_and_wal() {
+    for journal_mode in ["DELETE", "WAL"] {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join(format!("openbot_{}.db", journal_mode.to_lowercase()));
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm_path = std::path::PathBuf::from(format!("{}-shm", db_path.display()));
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("seed v70 db");
+            let mode: String = conn
+                .query_row(&format!("PRAGMA journal_mode = {journal_mode}"), [], |r| r.get(0))
+                .expect("set journal_mode");
+            assert_eq!(mode.to_ascii_uppercase(), journal_mode);
+            conn.execute(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+                [],
+            )
+            .expect("create schema_migrations");
+            for v in 8..=70 {
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, '2026-01-01T00:00:00Z')",
+                    rusqlite::params![v],
+                )
+                .expect("insert migration version");
+            }
+        }
+
+        let bytes_before = fs::read(&db_path).expect("read db before");
+        assert!(!wal_path.exists(), "{journal_mode}: unexpected pre-existing -wal");
+        assert!(!shm_path.exists(), "{journal_mode}: unexpected pre-existing -shm");
+
+        let err = OpenBotDatabase::open(&db_path).expect_err("v70 db must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::NewerDatabase {
+                    found: 70,
+                    supported: 69
+                }
+            ),
+            "{journal_mode}: expected NewerDatabase(70, 69), got {err:?}"
+        );
+
+        let bytes_after = fs::read(&db_path).expect("read db after");
+        assert_eq!(
+            bytes_after, bytes_before,
+            "{journal_mode}: openbot.db bytes must remain byte-for-byte identical on rejected v70 open"
+        );
+        assert!(
+            !wal_path.exists(),
+            "{journal_mode}: rejected v70 open must not create -wal file"
+        );
+        assert!(
+            !shm_path.exists(),
+            "{journal_mode}: rejected v70 open must not create -shm file"
+        );
+    }
+}
+
+#[test]
+fn regression_shared_agent_data_pinpoint_authorizer_and_mode_diagnostics() {
+    let tmp = TempDir::new().expect("tempdir");
+    let shared = SharedAgentDataDb::open(
+        tmp.path().join("OpenBot").join("Shared").join("Data").join("agent-data.db"),
+    )
+    .expect("open shared db");
+
+    shared
+        .execute(
+            "agent-owner",
+            "CREATE TABLE ledger (id INTEGER PRIMARY KEY, note TEXT)",
+            &[],
+        )
+        .expect("create ledger");
+
+    // Non-owner DROP TABLE / ALTER TABLE record NotTableOwner pinpoint message
+    for ddl in [
+        "DROP TABLE ledger",
+        "ALTER TABLE ledger ADD COLUMN z TEXT",
+    ] {
+        let err = shared
+            .execute("agent-peer", ddl, &[])
+            .expect_err("non-owner DDL must fail");
+        let StorageError::Forbidden(msg) = err else {
+            panic!("expected Forbidden for {ddl}, got {err:?}");
+        };
+        let lower = msg.to_ascii_lowercase();
+        assert!(lower.contains("not authorized"), "missing 'not authorized': {msg}");
+        assert!(lower.contains("authorizer"), "missing 'authorizer': {msg}");
+        assert!(lower.contains("not table owner"), "missing 'not table owner': {msg}");
+        assert!(lower.contains("ledger"), "missing table name: {msg}");
+    }
+
+    // Metadata table DELETE / SELECT record ProtectedMetadataTable pinpoint message
+    for meta in ["_openbot_tables", "openbot_metadata"] {
+        let del_err = shared
+            .execute("agent-owner", &format!("DELETE FROM {meta}"), &[])
+            .expect_err("metadata DELETE must fail");
+        let StorageError::Forbidden(del_msg) = del_err else {
+            panic!("expected Forbidden for DELETE FROM {meta}, got {del_err:?}");
+        };
+        let lower = del_msg.to_ascii_lowercase();
+        assert!(lower.contains("not authorized"), "missing 'not authorized': {del_msg}");
+        assert!(lower.contains("authorizer"), "missing 'authorizer': {del_msg}");
+        assert!(lower.contains("protected system metadata table"), "missing metadata label: {del_msg}");
+        assert!(lower.contains(meta), "missing table name {meta}: {del_msg}");
+        assert!(!lower.contains("no such table"), "must not say no such table: {del_msg}");
+
+        let sel_err = shared
+            .query("agent-owner", &format!("SELECT * FROM {meta}"), &[])
+            .expect_err("metadata SELECT must fail");
+        let StorageError::Forbidden(sel_msg) = sel_err else {
+            panic!("expected Forbidden for SELECT FROM {meta}, got {sel_err:?}");
+        };
+        assert!(sel_msg.to_ascii_lowercase().contains("protected system metadata table"));
+    }
+
+    // ATTACH & PRAGMA return Forbidden with 'not allowed (not available)'
+    for blocked in [
+        "ATTACH DATABASE ':memory:' AS ext",
+        "PRAGMA writable_schema = ON",
+        "VACUUM",
+    ] {
+        let err = shared
+            .execute("agent-owner", blocked, &[])
+            .expect_err("blocked keyword must fail");
+        let StorageError::Forbidden(msg) = err else {
+            panic!("expected Forbidden for {blocked}, got {err:?}");
+        };
+        let lower = msg.to_ascii_lowercase();
+        assert!(lower.contains("not allowed"), "missing 'not allowed': {msg}");
+        assert!(lower.contains("not available"), "missing 'not available': {msg}");
+    }
+
+    // Mode mismatches: INSERT in Read mode and SELECT in Write mode
+    let read_ins_err = shared
+        .query("agent-owner", "INSERT INTO ledger VALUES (1, 'bad')", &[])
+        .expect_err("INSERT in Read mode must fail");
+    let StorageError::Validation(read_ins_msg) = read_ins_err else {
+        panic!("expected Validation for INSERT in Read mode, got {read_ins_err:?}");
+    };
+    let lower_ins = read_ins_msg.to_ascii_lowercase();
+    assert!(lower_ins.contains("write mode"), "missing 'write mode': {read_ins_msg}");
+    assert!(lower_ins.contains("read-only"), "missing 'read-only': {read_ins_msg}");
+
+    let write_sel_err = shared
+        .execute("agent-owner", "SELECT * FROM ledger", &[])
+        .expect_err("SELECT in Write mode must fail");
+    let StorageError::Validation(write_sel_msg) = write_sel_err else {
+        panic!("expected Validation for SELECT in Write mode, got {write_sel_err:?}");
+    };
+    let lower_sel = write_sel_msg.to_ascii_lowercase();
+    assert!(lower_sel.contains("read mode"), "missing 'read mode': {write_sel_msg}");
+    assert!(lower_sel.contains("query_data"), "missing 'query_data': {write_sel_msg}");
+
+    // Forbidden SQLite function via SqlInputError authorizer denial returns StorageError::Forbidden
+    let ext_err = shared
+        .query("agent-owner", "SELECT load_extension('x')", &[])
+        .expect_err("load_extension must be denied by authorizer");
+    let StorageError::Forbidden(ext_msg) = ext_err else {
+        panic!("expected Forbidden for SELECT load_extension('x'), got {ext_err:?}");
+    };
+    let lower_ext = ext_msg.to_ascii_lowercase();
+    assert!(lower_ext.contains("not authorized"), "missing 'not authorized': {ext_msg}");
+    assert!(lower_ext.contains("authorizer"), "missing 'authorizer': {ext_msg}");
+}
+
+#[test]
+fn regression_team_chat_store_strict_identifier_validation_zero_rows() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = OpenBotDatabase::open(tmp.path().join("data").join("openbot.db")).expect("open db");
+    let dms = db.team_chat_store();
+
+    let id_129 = "r".repeat(129);
+    let id_200 = "m".repeat(200);
+    let invalid_cases = [
+        ("   ", "bob", "cm-1"),
+        ("\u{00a0}", "bob", "cm-1"),
+        (" alice ", "bob", "cm-1"),
+        (id_129.as_str(), "bob", "cm-1"),
+        ("alice", "   ", "cm-1"),
+        ("alice", "\u{00a0}bob", "cm-1"),
+        ("alice", " bob ", "cm-1"),
+        ("alice", id_200.as_str(), "cm-1"),
+        ("alice", "bob", ""),
+        ("alice", "bob", "   "),
+        ("alice", "bob", " cm-1 "),
+        ("alice", "bob", id_129.as_str()),
+        ("alice", "bob", id_200.as_str()),
+    ];
+
+    for (sender, recipient, cid) in invalid_cases {
+        let err = dms
+            .send_message(&SendDirectMessageInput {
+                client_message_id: cid.to_string(),
+                sender_member_id: sender.to_string(),
+                recipient_member_id: recipient.to_string(),
+                text: "hello".to_string(),
+                created_at: None,
+            })
+            .expect_err("invalid DM identifier must fail validation");
+        assert!(
+            matches!(err, StorageError::Validation(_)),
+            "expected StorageError::Validation for ({sender:?}, {recipient:?}, {cid:?}), got {err:?}"
+        );
+    }
+
+    let (threads_cnt, msgs_cnt, events_cnt): (i64, i64, i64) = db
+        .with_conn(|conn| {
+            Ok((
+                conn.query_row("SELECT COUNT(*) FROM projection_direct_threads", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM projection_direct_messages", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("query zero-row counts");
+    assert_eq!(threads_cnt, 0);
+    assert_eq!(msgs_cnt, 0);
+    assert_eq!(events_cnt, 0);
+
+    // Exact 128-character boundary succeeds cleanly.
+    let s128 = "a".repeat(128);
+    let r128 = "b".repeat(128);
+    let c128 = "c".repeat(128);
+    let ok = dms
+        .send_message(&SendDirectMessageInput {
+            client_message_id: c128.clone(),
+            sender_member_id: s128.clone(),
+            recipient_member_id: r128.clone(),
+            text: "Exact 128 boundary".to_string(),
+            created_at: None,
+        })
+        .expect("128-char identifiers should succeed");
+    assert_eq!(ok.id, c128);
+    assert_eq!(ok.sender_member_id, s128);
+    assert_eq!(ok.recipient_member_id, r128);
+}
+
+

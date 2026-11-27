@@ -3130,3 +3130,879 @@ fn test_m4_remediation_voice_speed_and_turn_pause_validation() {
     );
 }
 
+#[tokio::test]
+async fn test_m6_t2_team_api_rejects_empty_channel_members_and_archived_channel_writes() {
+    use openbot_runtime::OpenBotHostRuntime;
+    use openbot_runtime::channel_service::CHANNEL_ARCHIVED_ERROR;
+
+    let dir = TempDir::new().expect("create RAII tempfile::TempDir");
+    let runtime = OpenBotHostRuntime::open(dir.path()).expect("open OpenBotHostRuntime");
+    let db = runtime.database().clone();
+    let handle = TeamApiServer::start(
+        db.clone(),
+        runtime.voice().clone(),
+        TeamApiConfig {
+            bind_port: 0,
+            data_dir: dir.path().to_path_buf(),
+            require_auth_token: Some("m6-t2-iter2-token".to_string()),
+        },
+    )
+    .await
+    .expect("start TeamApiServer");
+
+    let client = loopback_http_client();
+    let base = handle.url();
+    let auth = "Bearer m6-t2-iter2-token";
+
+    // 1. POST /v1/channels with members: [] and omitted members must return 400 and create 0 channels
+    for payload in [
+        json!({ "name": "HttpEmptyMembers", "members": [] }),
+        json!({ "name": "HttpOmittedMembers" }),
+    ] {
+        let resp = client
+            .post(format!("{base}/v1/channels"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .json(&payload)
+            .send()
+            .await
+            .expect("POST /v1/channels with empty members");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err_json: Value = resp.json().await.expect("parse 400 JSON");
+        assert_eq!(err_json.get("code"), Some(&json!("validation_error")));
+        assert!(
+            err_json
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|msg| msg.to_ascii_lowercase().contains("member")),
+            "expected member validation error, got {err_json}"
+        );
+    }
+
+    let channel_count_after_empty: i64 = db
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM projection_channels", [], |r| r.get(0))
+                .map_err(Into::into)
+        })
+        .expect("count projection_channels");
+    assert_eq!(
+        channel_count_after_empty, 0,
+        "empty-member POST /v1/channels must create 0 channels"
+    );
+
+    // 2. Create a valid agent, then verify whitespace/padded/ghost members and whitespace DM recipients are rejected with 400 & 0 DB mutations
+    let ag_resp = client
+        .post(format!("{base}/v1/agents"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({ "name": "ArchiveLead", "provider": "codex" }))
+        .send()
+        .await
+        .expect("POST /v1/agents");
+    assert_eq!(ag_resp.status(), StatusCode::CREATED);
+    let ag_val: Value = ag_resp.json().await.expect("parse created agent");
+    let agent_id = ag_val
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("agent id")
+        .to_string();
+
+    let events_before_invalid_creates: i64 = db
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))
+                .map_err(Into::into)
+        })
+        .expect("count orchestration_events before invalid creates");
+
+    let padded_agent_id = format!(" {agent_id} ");
+    for payload in [
+        json!({ "name": "WsSpaces", "members": ["   "] }),
+        json!({ "name": "WsTabNl", "members": ["\t\n"] }),
+        json!({ "name": "ObjWs", "members": [{ "agentId": "   " }] }),
+        json!({ "name": "ObjPadded", "members": [{ "agentId": padded_agent_id }] }),
+        json!({ "name": "MixedWs", "members": ["   ", agent_id] }),
+        json!({ "name": "PaddedAid", "members": [padded_agent_id] }),
+        json!({ "name": "GhostMember", "members": ["ghost-does-not-exist"] }),
+    ] {
+        let resp = client
+            .post(format!("{base}/v1/channels"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .json(&payload)
+            .send()
+            .await
+            .expect("POST /v1/channels with invalid member");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 Bad Request for payload {payload}"
+        );
+        let err_json: Value = resp.json().await.expect("parse 400 JSON");
+        assert_eq!(
+            err_json.get("code"),
+            Some(&json!("validation_error")),
+            "expected validation_error for payload {payload}, got {err_json}"
+        );
+    }
+
+    for dm_payload in [
+        json!({ "recipientMemberId": "   ", "text": "Whitespace DM recipient" }),
+        json!({ "recipientMemberId": "\t\n", "text": "Tab newline DM recipient" }),
+        json!({ "recipientMemberId": " peer-1 ", "text": "Padded DM recipient" }),
+    ] {
+        let dm_resp = client
+            .post(format!("{base}/v1/direct/messages"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .json(&dm_payload)
+            .send()
+            .await
+            .expect("POST /v1/direct/messages with invalid recipient");
+        assert_eq!(
+            dm_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 Bad Request for DM payload {dm_payload}"
+        );
+        let err_json: Value = dm_resp.json().await.expect("parse DM 400 JSON");
+        assert_eq!(
+            err_json.get("code"),
+            Some(&json!("validation_error")),
+            "expected validation_error for DM payload {dm_payload}, got {err_json}"
+        );
+    }
+
+    let (ch_count_after_invalid, dm_threads_after_invalid, dm_msgs_after_invalid, events_after_invalid): (
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = db
+        .with_conn(|conn| {
+            let chs: i64 = conn.query_row("SELECT COUNT(*) FROM projection_channels", [], |r| r.get(0))?;
+            let dm_t: i64 =
+                conn.query_row("SELECT COUNT(*) FROM projection_direct_threads", [], |r| r.get(0))?;
+            let dm_m: i64 =
+                conn.query_row("SELECT COUNT(*) FROM projection_direct_messages", [], |r| r.get(0))?;
+            let evs: i64 = conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))?;
+            Ok((chs, dm_t, dm_m, evs))
+        })
+        .expect("verify zero DB mutations after rejected creates & DMs");
+    assert_eq!(
+        ch_count_after_invalid, 0,
+        "invalid member POST /v1/channels must insert 0 channels"
+    );
+    assert_eq!(
+        dm_threads_after_invalid, 0,
+        "invalid recipient POST /v1/direct/messages must insert 0 direct threads"
+    );
+    assert_eq!(
+        dm_msgs_after_invalid, 0,
+        "invalid recipient POST /v1/direct/messages must insert 0 direct messages"
+    );
+    assert_eq!(
+        events_after_invalid, events_before_invalid_creates,
+        "rejected channel creates and DMs must emit 0 orchestration_events"
+    );
+
+    let ch_resp = client
+        .post(format!("{base}/v1/channels"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({
+            "name": "OpsArchiveTest",
+            "members": [agent_id],
+            "leadAgentId": agent_id
+        }))
+        .send()
+        .await
+        .expect("POST /v1/channels valid");
+    assert_eq!(ch_resp.status(), StatusCode::CREATED);
+    let ch_val: Value = ch_resp.json().await.expect("parse created channel");
+    let channel_id = ch_val
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("channel id")
+        .to_string();
+
+    let first_msg = client
+        .post(format!("{base}/v1/channels/{channel_id}/messages"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({ "text": "Initial active message" }))
+        .send()
+        .await
+        .expect("POST initial message");
+    assert_eq!(first_msg.status(), StatusCode::CREATED);
+
+    // 3. Archive channel and snapshot exact SQLite message & event counts
+    let archived = runtime
+        .channels()
+        .archive(&channel_id, None)
+        .expect("archive channel");
+    assert!(archived.archived);
+
+    let (msg_count_before, event_count_before): (i64, i64) = db
+        .with_conn(|conn| {
+            let msgs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM projection_channel_messages WHERE channel_id = ?1",
+                rusqlite::params![&channel_id],
+                |r| r.get(0),
+            )?;
+            let evs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM orchestration_events",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((msgs, evs))
+        })
+        .expect("snapshot counts before archived write");
+    assert_eq!(msg_count_before, 1);
+
+    // 4. POST /v1/channels/{archived_id}/messages -> 409 Conflict, archived/read-only error, ZERO SQLite mutation
+    let blocked = client
+        .post(format!("{base}/v1/channels/{channel_id}/messages"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({ "text": "Write into archived channel" }))
+        .send()
+        .await
+        .expect("POST message to archived channel");
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    let blocked_json: Value = blocked.json().await.expect("parse 409 JSON");
+    assert_eq!(blocked_json.get("code"), Some(&json!("channel_archived")));
+    let blocked_err = blocked_json
+        .get("error")
+        .and_then(Value::as_str)
+        .expect("error string");
+    assert_eq!(blocked_err, CHANNEL_ARCHIVED_ERROR);
+    assert!(blocked_err.contains("archived"));
+    assert!(blocked_err.contains("read-only"));
+
+    let (msg_count_after, event_count_after): (i64, i64) = db
+        .with_conn(|conn| {
+            let msgs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM projection_channel_messages WHERE channel_id = ?1",
+                rusqlite::params![&channel_id],
+                |r| r.get(0),
+            )?;
+            let evs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM orchestration_events",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((msgs, evs))
+        })
+        .expect("snapshot counts after archived write");
+    assert_eq!(
+        msg_count_after, msg_count_before,
+        "archived POST must leave projection_channel_messages unchanged"
+    );
+    assert_eq!(
+        event_count_after, event_count_before,
+        "archived POST must emit zero orchestration_events"
+    );
+
+    // 5. Restore channel -> HTTP POST resumes cleanly
+    let restored = runtime
+        .channels()
+        .restore(&channel_id, None)
+        .expect("restore channel");
+    assert!(!restored.archived);
+
+    let after_restore = client
+        .post(format!("{base}/v1/channels/{channel_id}/messages"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({ "text": "Message after restore" }))
+        .send()
+        .await
+        .expect("POST message after restore");
+    assert_eq!(after_restore.status(), StatusCode::CREATED);
+
+    let msg_count_restored: i64 = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM projection_channel_messages WHERE channel_id = ?1",
+                rusqlite::params![&channel_id],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .expect("count messages after restore");
+    assert_eq!(msg_count_restored, 2);
+
+    handle.shutdown().await.expect("shutdown TeamApiServer");
+}
+
+#[tokio::test]
+async fn regression_team_api_dm_strict_identifiers_channel_100_cap_contexts_and_author_validation() {
+    use openbot_contracts::limits::INPUT_LIMITS;
+    use openbot_runtime::OpenBotHostRuntime;
+
+    let dir = TempDir::new().expect("tempdir");
+    let runtime = OpenBotHostRuntime::open(dir.path()).expect("open runtime");
+    let db = runtime.database().clone();
+    let handle = TeamApiServer::start(
+        db.clone(),
+        runtime.voice().clone(),
+        TeamApiConfig {
+            bind_port: 0,
+            data_dir: dir.path().to_path_buf(),
+            require_auth_token: Some("m6-t2-iter4-token".to_string()),
+        },
+    )
+    .await
+    .expect("start TeamApiServer");
+
+    let client = loopback_http_client();
+    let base = handle.url();
+    let auth = "Bearer m6-t2-iter4-token";
+
+    let events_before_invalid_dm: i64 = db
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))
+                .map_err(Into::into)
+        })
+        .expect("snapshot events before invalid DMs");
+
+    // 1. Direct Messages: reject >128 chars, blank, and padded recipient/sender/clientMessageId with 400 and 0 DB rows
+    let id_200 = "r".repeat(200);
+    let id_129 = "s".repeat(129);
+    let dm_invalid_payloads = [
+        json!({ "recipientMemberId": id_200, "text": "oversize recipient" }),
+        json!({ "recipientMemberId": id_129, "text": "129 recipient" }),
+        json!({ "senderMemberId": "   ", "recipientMemberId": "peer-a", "text": "blank sender" }),
+        json!({ "senderMemberId": "", "recipientMemberId": "peer-a", "text": "empty sender" }),
+        json!({ "senderMemberId": "\u{00a0}", "recipientMemberId": "peer-a", "text": "nbsp sender" }),
+        json!({ "senderMemberId": " alice ", "recipientMemberId": "peer-a", "text": "padded sender" }),
+        json!({ "senderMemberId": id_200, "recipientMemberId": "peer-a", "text": "oversize sender" }),
+        json!({ "recipientMemberId": "peer-a", "clientMessageId": "   ", "text": "blank cid" }),
+        json!({ "recipientMemberId": "peer-a", "clientMessageId": "", "text": "empty cid" }),
+        json!({ "recipientMemberId": "peer-a", "clientMessageId": " cm-1 ", "text": "padded cid" }),
+        json!({ "recipientMemberId": "peer-a", "clientMessageId": id_200, "text": "oversize cid" }),
+    ];
+    for payload in dm_invalid_payloads {
+        let resp = client
+            .post(format!("{base}/v1/direct/messages"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .json(&payload)
+            .send()
+            .await
+            .expect("POST /v1/direct/messages invalid");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for DM payload {payload}"
+        );
+        let body: Value = resp.json().await.expect("parse DM 400 JSON");
+        assert_eq!(body.get("code"), Some(&json!("validation_error")));
+    }
+
+    let (dm_threads_0, dm_msgs_0, events_0): (i64, i64, i64) = db
+        .with_conn(|conn| {
+            Ok((
+                conn.query_row("SELECT COUNT(*) FROM projection_direct_threads", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM projection_direct_messages", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("check zero DM mutations");
+    assert_eq!((dm_threads_0, dm_msgs_0, events_0), (0, 0, events_before_invalid_dm));
+
+    // Exact 128-char DM identifiers succeed
+    let id_128_a = "a".repeat(128);
+    let id_128_b = "b".repeat(128);
+    let id_128_c = "c".repeat(128);
+    let dm_ok = client
+        .post(format!("{base}/v1/direct/messages"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({
+            "senderMemberId": id_128_a,
+            "recipientMemberId": id_128_b,
+            "clientMessageId": id_128_c,
+            "text": "Valid 128-char boundary DM"
+        }))
+        .send()
+        .await
+        .expect("POST valid 128-char DM");
+    assert_eq!(dm_ok.status(), StatusCode::CREATED);
+
+    // 2. Create an agent and verify POST /v1/channels enforces 100-channel host cap + eager projection_channel_contexts
+    let ag_resp = client
+        .post(format!("{base}/v1/agents"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({ "name": "CapLead", "provider": "codex" }))
+        .send()
+        .await
+        .expect("POST /v1/agents");
+    assert_eq!(ag_resp.status(), StatusCode::CREATED);
+    let ag_val: Value = ag_resp.json().await.expect("agent json");
+    let agent_id = ag_val["id"].as_str().expect("agent id").to_string();
+
+    let mut first_channel_id = String::new();
+    for idx in 0..INPUT_LIMITS.agents {
+        let resp = client
+            .post(format!("{base}/v1/channels"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .json(&json!({
+                "name": format!("HttpCapRoom-{idx:03}"),
+                "members": [agent_id],
+                "leadAgentId": agent_id
+            }))
+            .send()
+            .await
+            .expect("POST /v1/channels within cap");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "channel #{idx} should succeed"
+        );
+        let ch: Value = resp.json().await.expect("channel json");
+        let cid = ch["id"].as_str().expect("channel id").to_string();
+        if idx == 0 {
+            first_channel_id = cid.clone();
+            let ctx_cnt: i64 = db
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM projection_channel_contexts WHERE channel_id = ?1",
+                        rusqlite::params![&cid],
+                        |r| r.get(0),
+                    )
+                    .map_err(Into::into)
+                })
+                .expect("count eager channel contexts");
+            assert_eq!(
+                ctx_cnt, 1,
+                "POST /v1/channels must eagerly initialize projection_channel_contexts for each member"
+            );
+        }
+    }
+
+    let (ch_before_cap, ctx_before_cap, ev_before_cap): (i64, i64, i64) = db
+        .with_conn(|conn| {
+            Ok((
+                conn.query_row("SELECT COUNT(*) FROM projection_channels", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM projection_channel_contexts", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("snapshot before 101st channel");
+    assert_eq!(ch_before_cap, INPUT_LIMITS.agents as i64);
+    assert_eq!(ctx_before_cap, INPUT_LIMITS.agents as i64);
+
+    // 101st channel MUST return 413 limit_exceeded with 0 DB mutations
+    let over_cap = client
+        .post(format!("{base}/v1/channels"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({
+            "name": "HttpCapRoom-101",
+            "members": [agent_id],
+            "leadAgentId": agent_id
+        }))
+        .send()
+        .await
+        .expect("POST 101st /v1/channels");
+    assert_eq!(over_cap.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let over_cap_json: Value = over_cap.json().await.expect("413 JSON");
+    assert_eq!(over_cap_json.get("code"), Some(&json!("limit_exceeded")));
+
+    let (ch_after_cap, ev_after_cap): (i64, i64) = db
+        .with_conn(|conn| {
+            Ok((
+                conn.query_row("SELECT COUNT(*) FROM projection_channels", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("snapshot after 101st channel");
+    assert_eq!(ch_after_cap, ch_before_cap);
+    assert_eq!(ev_after_cap, ev_before_cap);
+
+    // 3. POST /v1/channels/{id}/messages: reject blank/padded/oversize author & messageId with 400 and 0 DB mutations
+    let bad_name_121 = "n".repeat(121);
+    let invalid_msg_payloads = [
+        json!({ "text": "blank author", "author": { "kind": "member", "id": "   ", "name": "   " } }),
+        json!({ "text": "padded author id", "author": { "kind": "member", "id": " u1 ", "name": "Alice" } }),
+        json!({ "text": "blank author name", "author": { "kind": "member", "id": "u1", "name": "   " } }),
+        json!({ "text": "padded author name", "author": { "kind": "member", "id": "u1", "name": " Alice " } }),
+        json!({ "text": "oversize author id", "author": { "kind": "member", "id": id_129, "name": "Alice" } }),
+        json!({ "text": "oversize author name", "author": { "kind": "member", "id": "u1", "name": bad_name_121 } }),
+        json!({ "text": "blank authorId", "authorId": "   " }),
+        json!({ "text": "blank authorName", "authorName": "   " }),
+        json!({ "text": "oversize messageId", "messageId": id_200 }),
+        json!({ "text": "blank messageId", "messageId": "   " }),
+        json!({ "text": "padded messageId", "messageId": " msg-1 " }),
+    ];
+    for payload in invalid_msg_payloads {
+        let resp = client
+            .post(format!("{base}/v1/channels/{first_channel_id}/messages"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .json(&payload)
+            .send()
+            .await
+            .expect("POST invalid channel message");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for channel message payload {payload}"
+        );
+        let body: Value = resp.json().await.expect("400 JSON");
+        assert_eq!(body.get("code"), Some(&json!("validation_error")));
+    }
+
+    let (msg_cnt_after_invalid, ev_after_invalid_msg): (i64, i64) = db
+        .with_conn(|conn| {
+            Ok((
+                conn.query_row("SELECT COUNT(*) FROM projection_channel_messages", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM orchestration_events", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("check zero message mutations");
+    assert_eq!(msg_cnt_after_invalid, 0);
+    assert_eq!(ev_after_invalid_msg, ev_after_cap);
+
+    // Valid explicit author + 128-char messageId succeeds cleanly
+    let valid_msg = client
+        .post(format!("{base}/v1/channels/{first_channel_id}/messages"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&json!({
+            "text": "Valid message with explicit author",
+            "messageId": id_128_c,
+            "author": { "kind": "member", "id": "member-1", "name": "Alice Smith" }
+        }))
+        .send()
+        .await
+        .expect("POST valid channel message");
+    assert_eq!(valid_msg.status(), StatusCode::CREATED);
+
+    handle.shutdown().await.expect("shutdown TeamApiServer");
+}
+
+#[test]
+fn test_ob_f11_iter6_webhook_secret_override_rejected_and_routine_owner_validated() {
+    let env = TestEnv::new();
+    let routines = RoutineEngine::new(env.db.clone());
+    let agent_id = env.create_agent("Iter6RoutineOwner", None);
+
+    // 1. C2-D-I5-3: save_routine rejects empty, whitespace, NBSP, padded, >128 UTF-16, and ghost owners with 0 DB mutations
+    let id_129 = "a".repeat(129);
+    let emoji_65 = "😀".repeat(65);
+    let padded_agent = format!(" {agent_id} ");
+    let invalid_owners = [
+        "",
+        "   ",
+        "\t\n",
+        "\u{00a0}",
+        " ghost-agent ",
+        padded_agent.as_str(),
+        id_129.as_str(),
+        emoji_65.as_str(),
+        "nonexistent-agent-999",
+    ];
+    let anchor = Utc::now().to_rfc3339();
+    for bad_owner in invalid_owners {
+        for is_channel in [false, true] {
+            let err = routines
+                .save_routine(RoutineSaveRequest {
+                    owner_id: bad_owner.to_string(),
+                    routine_id: None,
+                    is_channel,
+                    name: "BadOwnerRoutine".to_string(),
+                    instruction: "Must be rejected".to_string(),
+                    timezone: "UTC".to_string(),
+                    active: true,
+                    schedule: Some(RoutineSchedule::Interval {
+                        amount: 3,
+                        unit: RoutineIntervalUnit::Minutes,
+                        anchor_at: anchor.clone(),
+                    }),
+                    webhook_event_type: None,
+                    webhook_filters: Vec::new(),
+                    webhook_secret: None,
+                    limit_policy: RoutineLimitPolicy::Wait,
+                    missed_policy: RoutineMissedPolicy::Skip,
+                    run_in: RoutineRunPlace::Chat,
+                })
+                .expect_err("invalid or ghost routine owner must be rejected");
+            assert!(
+                matches!(err, OpenBotRuntimeError::Validation(_)),
+                "expected Validation error for owner='{bad_owner:?}' is_channel={is_channel}, got {err:?}"
+            );
+        }
+    }
+
+    let (agent_rt_cnt, chan_rt_cnt): (i64, i64) = env
+        .db
+        .with_conn(|conn| {
+            Ok((
+                conn.query_row("SELECT COUNT(*) FROM projection_agent_routines", [], |r| r.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM projection_channel_routines", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("count routine projections after invalid owners");
+    assert_eq!(agent_rt_cnt, 0);
+    assert_eq!(chan_rt_cnt, 0);
+
+    // 2. C2-D-I5-1: webhook routine with stored secret MUST reject forged caller-supplied secret override
+    let real_secret = "real_secret_999";
+    let hook = routines
+        .save_routine(RoutineSaveRequest {
+            owner_id: agent_id.clone(),
+            routine_id: None,
+            is_channel: false,
+            name: "StrictWebhook".to_string(),
+            instruction: "Run only on authentic HMAC".to_string(),
+            timezone: "UTC".to_string(),
+            active: true,
+            schedule: None,
+            webhook_event_type: None,
+            webhook_filters: Vec::new(),
+            webhook_secret: Some(real_secret.to_string()),
+            limit_policy: RoutineLimitPolicy::Wait,
+            missed_policy: RoutineMissedPolicy::Skip,
+            run_in: RoutineRunPlace::Chat,
+        })
+        .expect("save webhook routine for existing agent");
+
+    let now_ms = Utc::now().timestamp_millis();
+    let ts_sec = (now_ms / 1_000).to_string();
+    let body = br#"{"event":"pwn"}"#;
+    let forged_sig = sign_webhook_body("attacker_secret", &ts_sec, "forge-1", body);
+
+    let err_forged = routines
+        .post_webhook(WebhookPostRequest {
+            owner_id: agent_id.clone(),
+            routine_id: hook.routine_id.clone(),
+            secret: "attacker_secret".to_string(),
+            body: body.to_vec(),
+            signature: forged_sig,
+            timestamp: Some(ts_sec.clone()),
+            delivery_id: Some("forge-1".to_string()),
+            event_type: None,
+            standard_webhooks: false,
+            now_ms: Some(now_ms),
+        })
+        .expect_err("forged --secret override must fail with Unauthorized");
+    assert!(
+        matches!(err_forged, OpenBotRuntimeError::Unauthorized(_)),
+        "expected Unauthorized on forged secret override, got {err_forged:?}"
+    );
+
+    // Even with a valid signature computed from real_secret, a mismatched req.secret MUST be rejected
+    let authentic_sig = sign_webhook_body(real_secret, &ts_sec, "auth-1", body);
+    let err_mismatch_secret = routines
+        .post_webhook(WebhookPostRequest {
+            owner_id: agent_id.clone(),
+            routine_id: hook.routine_id.clone(),
+            secret: "wrong_secret".to_string(),
+            body: body.to_vec(),
+            signature: authentic_sig.clone(),
+            timestamp: Some(ts_sec.clone()),
+            delivery_id: Some("auth-1".to_string()),
+            event_type: None,
+            standard_webhooks: false,
+            now_ms: Some(now_ms),
+        })
+        .expect_err("mismatched req.secret must fail with Unauthorized");
+    assert!(matches!(err_mismatch_secret, OpenBotRuntimeError::Unauthorized(_)));
+
+    let run_count_before: i64 = env
+        .db
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM projection_routine_runs", [], |r| r.get(0))
+                .map_err(Into::into)
+        })
+        .expect("count runs after rejections");
+    assert_eq!(run_count_before, 0, "rejected webhook attempts must leave 0 DB mutations");
+
+    // Authentic signature with omitted (empty) req.secret uses stored secret and succeeds
+    let ok_stored = routines
+        .post_webhook(WebhookPostRequest {
+            owner_id: agent_id.clone(),
+            routine_id: hook.routine_id.clone(),
+            secret: String::new(),
+            body: body.to_vec(),
+            signature: authentic_sig,
+            timestamp: Some(ts_sec.clone()),
+            delivery_id: Some("auth-1".to_string()),
+            event_type: None,
+            standard_webhooks: false,
+            now_ms: Some(now_ms),
+        })
+        .expect("valid stored-secret webhook must succeed");
+    assert!(ok_stored.webhook_verified);
+    assert_eq!(ok_stored.status, "started");
+
+    // Authentic signature with exact matching req.secret also succeeds
+    let authentic_sig_2 = sign_webhook_body(real_secret, &ts_sec, "auth-2", body);
+    let ok_matching = routines
+        .post_webhook(WebhookPostRequest {
+            owner_id: agent_id,
+            routine_id: hook.routine_id,
+            secret: real_secret.to_string(),
+            body: body.to_vec(),
+            signature: authentic_sig_2,
+            timestamp: Some(ts_sec),
+            delivery_id: Some("auth-2".to_string()),
+            event_type: None,
+            standard_webhooks: false,
+            now_ms: Some(now_ms),
+        })
+        .expect("matching secret webhook must succeed");
+    assert!(ok_matching.webhook_verified);
+    assert_eq!(ok_matching.status, "started");
+}
+
+#[tokio::test]
+async fn test_ob_f13_iter6_direct_threads_member_id_validation_and_mixed_channel_author_guard() {
+    let env = TestEnv::new();
+    let db = env.db.clone();
+    let agent_id = env.create_agent("Iter6TeamApiBot", None);
+    let voice = VoiceService::open(db.clone(), env.path()).expect("open VoiceService");
+    let token = "team-iter6-secret-tok";
+    let handle = TeamApiServer::start(
+        db.clone(),
+        voice,
+        TeamApiConfig {
+            bind_port: 0,
+            data_dir: env.path().to_path_buf(),
+            require_auth_token: Some(token.to_string()),
+        },
+    )
+    .await
+    .expect("start TeamApiServer");
+
+    let base = handle.url();
+    let auth = format!("Bearer {token}");
+    let client = loopback_http_client();
+
+    // Seed a private DM from default "local" -> "bob"
+    let dm_resp = client
+        .post(format!("{base}/v1/direct/messages"))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .json(&json!({
+            "recipientMemberId": "bob",
+            "text": "private local thread"
+        }))
+        .send()
+        .await
+        .expect("POST /v1/direct/messages");
+    assert_eq!(dm_resp.status(), StatusCode::CREATED);
+
+    // 1. C2-D-I5-2: Omitted memberId defaults to "local" and returns the seeded thread
+    let default_threads = client
+        .get(format!("{base}/v1/direct/threads"))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .send()
+        .await
+        .expect("GET /v1/direct/threads");
+    assert_eq!(default_threads.status(), StatusCode::OK);
+    let default_json: Vec<Value> = default_threads.json().await.expect("threads json");
+    assert_eq!(default_json.len(), 1);
+    assert_eq!(default_json[0]["otherMemberId"], "bob");
+
+    // Valid explicit memberId=bob returns bob's thread
+    let bob_threads = client
+        .get(format!("{base}/v1/direct/threads?memberId=bob"))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .send()
+        .await
+        .expect("GET /v1/direct/threads?memberId=bob");
+    assert_eq!(bob_threads.status(), StatusCode::OK);
+    let bob_json: Vec<Value> = bob_threads.json().await.expect("bob threads json");
+    assert_eq!(bob_json.len(), 1);
+    assert_eq!(bob_json[0]["otherMemberId"], "local");
+
+    // Explicit invalid memberId query variants MUST return HTTP 400 validation_error (never leak "local")
+    let ascii_129 = "a".repeat(129);
+    let emoji_65_enc = "%F0%9F%98%80".repeat(65);
+    let raw_queries = [
+        "memberId=".to_string(),
+        "memberId=%20%20%20".to_string(),
+        "memberId=%09%0A".to_string(),
+        "memberId=%C2%A0".to_string(),
+        "memberId=%20bob%20".to_string(),
+        format!("memberId={ascii_129}"),
+        format!("memberId={emoji_65_enc}"),
+        "member_id=".to_string(),
+        "member_id=%20%20%20".to_string(),
+    ];
+    for qs in &raw_queries {
+        let resp = client
+            .get(format!("{base}/v1/direct/threads?{qs}"))
+            .header(reqwest::header::AUTHORIZATION, &auth)
+            .send()
+            .await
+            .expect("GET invalid direct/threads");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected HTTP 400 for query '{qs}'"
+        );
+        let body: Value = resp.json().await.expect("400 JSON");
+        assert_eq!(
+            body.get("code"),
+            Some(&json!("validation_error")),
+            "expected validation_error for query '{qs}': {body}"
+        );
+    }
+
+    // 2. Note N2: POST /v1/channels/{id}/messages with valid author + invalid flat authorId/authorName -> HTTP 400, 0 DB delta
+    let ch_resp = client
+        .post(format!("{base}/v1/channels"))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .json(&json!({
+            "name": "MixedAuthorRoom",
+            "members": [agent_id],
+            "leadAgentId": agent_id
+        }))
+        .send()
+        .await
+        .expect("POST /v1/channels");
+    assert_eq!(ch_resp.status(), StatusCode::CREATED);
+    let ch_json: Value = ch_resp.json().await.expect("channel json");
+    let ch_id = ch_json["id"].as_str().expect("channel id");
+
+    let mixed_bad_payloads = [
+        json!({
+            "text": "mixed blank authorId",
+            "author": { "kind": "member", "id": "u1", "name": "Alice" },
+            "authorId": "   "
+        }),
+        json!({
+            "text": "mixed padded authorId",
+            "author": { "kind": "member", "id": "u1", "name": "Alice" },
+            "authorId": " u2 "
+        }),
+        json!({
+            "text": "mixed blank authorName",
+            "author": { "kind": "member", "id": "u1", "name": "Alice" },
+            "authorName": "   "
+        }),
+        json!({
+            "text": "mixed nbsp authorId",
+            "author": { "kind": "member", "id": "u1", "name": "Alice" },
+            "authorId": "\u{00a0}"
+        }),
+    ];
+    for payload in mixed_bad_payloads {
+        let resp = client
+            .post(format!("{base}/v1/channels/{ch_id}/messages"))
+            .header(reqwest::header::AUTHORIZATION, &auth)
+            .json(&payload)
+            .send()
+            .await
+            .expect("POST mixed channel message");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected HTTP 400 for mixed author payload {payload}"
+        );
+        let body: Value = resp.json().await.expect("400 JSON");
+        assert_eq!(body.get("code"), Some(&json!("validation_error")));
+    }
+
+    let msg_cnt: i64 = db
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM projection_channel_messages", [], |r| r.get(0))
+                .map_err(Into::into)
+        })
+        .expect("count channel messages");
+    assert_eq!(msg_cnt, 0, "invalid mixed author payloads must produce 0 DB mutations");
+
+    handle.shutdown().await.expect("shutdown TeamApiServer");
+}
+
+
+

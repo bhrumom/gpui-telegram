@@ -575,7 +575,7 @@ fn run_browser_or_vault_action(
             to_json_val(out, "link-payment")
         }
         "fill-card" => {
-            let targets = match flags.get("--targets") {
+            let mut targets = match flags.get("--targets") {
                 Some(raw) => {
                     let val = parse_json_value(raw, "card fill targets")?;
                     let parsed: CardFillTargets = serde_json::from_value(val).map_err(|e| {
@@ -585,6 +585,36 @@ fn run_browser_or_vault_action(
                 }
                 None => None,
             };
+            if let Some(raw_expiry) = flags.get("--expiry") {
+                validate_cli_card_expiry(raw_expiry)?;
+                targets
+                    .get_or_insert_with(CardFillTargets::default)
+                    .expiry
+                    .get_or_insert_with(|| BrowserTarget::Css {
+                        selector: "input[autocomplete=cc-exp]".to_string(),
+                        nth: None,
+                    });
+            }
+            if let Some(raw_exp_month) = flags.get("--exp-month") {
+                validate_cli_card_exp_month(raw_exp_month)?;
+                targets
+                    .get_or_insert_with(CardFillTargets::default)
+                    .exp_month
+                    .get_or_insert_with(|| BrowserTarget::Css {
+                        selector: "input[autocomplete=cc-exp-month]".to_string(),
+                        nth: None,
+                    });
+            }
+            if let Some(raw_exp_year) = flags.get("--exp-year") {
+                validate_cli_card_exp_year(raw_exp_year)?;
+                targets
+                    .get_or_insert_with(CardFillTargets::default)
+                    .exp_year
+                    .get_or_insert_with(|| BrowserTarget::Css {
+                        selector: "input[autocomplete=cc-exp-year]".to_string(),
+                        nth: None,
+                    });
+            }
             let timeout_ms = match flags.get("--timeout-ms") {
                 Some(raw) => Some(parse_u64_domain(raw, "timeout-ms")?),
                 None => None,
@@ -620,3 +650,77 @@ fn run_browser_or_vault_action(
         ))),
     }
 }
+
+fn is_valid_card_exp_month_part(part: &str) -> bool {
+    (1..=2).contains(&part.len())
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && part
+            .parse::<u16>()
+            .ok()
+            .is_some_and(|m| (1..=12).contains(&m))
+}
+
+fn is_valid_card_exp_year_part(part: &str) -> bool {
+    if !part.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match part.len() {
+        2 => part.parse::<u16>().ok().is_some_and(|y| y <= 99),
+        4 => part
+            .parse::<u16>()
+            .ok()
+            .is_some_and(|y| (2000..=2099).contains(&y)),
+        _ => false,
+    }
+}
+
+fn validate_cli_card_expiry(raw: &str) -> Result<(), CliError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::Validation(
+            "invalid --expiry: value must not be empty".to_string(),
+        ));
+    }
+    let mut parts = trimmed.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(mm), Some(yy), None)
+            if is_valid_card_exp_month_part(mm) && is_valid_card_exp_year_part(yy) =>
+        {
+            Ok(())
+        }
+        _ => Err(CliError::Validation(format!(
+            "invalid --expiry '{raw}': expected MM/YY or MM/YYYY with month 1..=12 and year 00..=99 or 2000..=2099"
+        ))),
+    }
+}
+
+fn validate_cli_card_exp_month(raw: &str) -> Result<(), CliError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::Validation(
+            "invalid --exp-month: value must not be empty".to_string(),
+        ));
+    }
+    if !is_valid_card_exp_month_part(trimmed) {
+        return Err(CliError::Validation(format!(
+            "invalid --exp-month '{raw}': expected 1..=12"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cli_card_exp_year(raw: &str) -> Result<(), CliError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::Validation(
+            "invalid --exp-year: value must not be empty".to_string(),
+        ));
+    }
+    if !is_valid_card_exp_year_part(trimmed) {
+        return Err(CliError::Validation(format!(
+            "invalid --exp-year '{raw}': expected YY (00..=99) or YYYY (2000..=2099)"
+        )));
+    }
+    Ok(())
+}
+

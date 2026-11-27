@@ -6,7 +6,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use openbot_contracts::limits::{INPUT_LIMITS, utf16_len};
+use openbot_contracts::limits::{INPUT_LIMITS, is_identifier, utf16_len};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,6 +39,16 @@ pub fn direct_thread_id(left_member_id: &str, right_member_id: &str) -> String {
     hasher.update(format!("{a}\0{b}").as_bytes());
     let digest = hasher.finalize();
     format!("dm-{}", hex_lower(&digest[..16]))
+}
+
+fn validate_direct_identifier(value: &str, field: &str) -> StorageResult<()> {
+    if value.trim().is_empty() || value.trim() != value || !is_identifier(value) {
+        return Err(StorageError::Validation(format!(
+            "{field} must be a non-empty identifier without leading/trailing whitespace and at most {} characters.",
+            INPUT_LIMITS.identifier
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +414,9 @@ impl TeamChatStore {
     }
 
     pub fn send_message(&self, input: &SendDirectMessageInput) -> StorageResult<DirectMessage> {
+        validate_direct_identifier(&input.sender_member_id, "senderMemberId")?;
+        validate_direct_identifier(&input.recipient_member_id, "recipientMemberId")?;
+        validate_direct_identifier(&input.client_message_id, "clientMessageId")?;
         let text = input.text.trim();
         if text.is_empty() {
             return Err(StorageError::Validation(

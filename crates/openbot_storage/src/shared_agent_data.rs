@@ -425,14 +425,16 @@ fn scan_statement(sql: &str) -> ScannedStatement {
 
 fn refusal_message(keyword: &str) -> Option<&'static str> {
     match keyword {
-        "attach" => {
-            Some("ATTACH is not available. Every table is already in the one shared database.")
-        }
-        "detach" => Some("DETACH is not available."),
-        "vacuum" => Some("VACUUM is not available."),
-        "pragma" => Some("PRAGMA is not available. Use list_tables to read the schema of a table."),
-        "analyze" => Some("ANALYZE is not available."),
-        "reindex" => Some("REINDEX is not available."),
+        "attach" => Some(
+            "ATTACH is not allowed (not available). Every table is already in the one shared database.",
+        ),
+        "detach" => Some("DETACH is not allowed (not available)."),
+        "vacuum" => Some("VACUUM is not allowed (not available)."),
+        "pragma" => Some(
+            "PRAGMA is not allowed (not available). Use list_tables to read the schema of a table.",
+        ),
+        "analyze" => Some("ANALYZE is not allowed (not available)."),
+        "reindex" => Some("REINDEX is not allowed (not available)."),
         "begin" | "commit" | "end" | "rollback" | "savepoint" | "release" => {
             Some("Each call runs one statement in its own transaction.")
         }
@@ -523,12 +525,12 @@ pub fn check_agent_sql(sql: &str, mode: AgentSqlMode) -> StorageResult<String> {
             }
             if is_write_keyword(effective) {
                 return Err(StorageError::validation(format!(
-                    "Use execute_data for {}. query_data only reads.",
+                    "Use execute_data (write mode) for {}. query_data is read-only and only reads.",
                     effective.to_ascii_uppercase()
                 )));
             }
             return Err(StorageError::validation(format!(
-                "{} is not available. query_data runs SELECT.",
+                "{} is not allowed (not available). query_data is read-only and runs SELECT.",
                 effective.to_ascii_uppercase()
             )));
         }
@@ -538,7 +540,7 @@ pub fn check_agent_sql(sql: &str, mode: AgentSqlMode) -> StorageResult<String> {
                     for ident in &scanned.ddl_header_identifiers {
                         if is_metadata_table(ident) || ident.starts_with("sqlite_") {
                             return Err(StorageError::forbidden(
-                                "SQLite internal and OpenBot metadata tables cannot be created, altered, or dropped.",
+                                "Not authorized: SQLite authorizer denied DDL on protected system metadata table. SQLite internal and OpenBot metadata tables cannot be created, altered, or dropped.",
                             ));
                         }
                     }
@@ -547,11 +549,11 @@ pub fn check_agent_sql(sql: &str, mode: AgentSqlMode) -> StorageResult<String> {
             }
             if is_read_keyword(effective) {
                 return Err(StorageError::validation(
-                    "Use query_data to read rows. execute_data changes data.",
+                    "Use query_data (read mode) to read rows. execute_data changes data.",
                 ));
             }
             return Err(StorageError::validation(format!(
-                "{} is not available.",
+                "{} is not allowed (not available).",
                 effective.to_ascii_uppercase()
             )));
         }
@@ -671,10 +673,26 @@ fn is_forbidden_sqlite_dml_table(name: &str, in_ddl: bool) -> bool {
     true
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthorizerDenial {
+    NotTableOwner { table: String },
+    ProtectedMetadataTable { table: String },
+    ProtectedSystemTable { table: String },
+}
+
 pub fn install_shared_db_guards(
     conn: &Connection,
     auth_state: Arc<Mutex<AuthorizerContext>>,
     deadline_state: Arc<Mutex<Option<Instant>>>,
+) -> StorageResult<()> {
+    install_shared_db_guards_with_denial(conn, auth_state, deadline_state, None)
+}
+
+fn install_shared_db_guards_with_denial(
+    conn: &Connection,
+    auth_state: Arc<Mutex<AuthorizerContext>>,
+    deadline_state: Arc<Mutex<Option<Instant>>>,
+    denial_state: Option<Arc<Mutex<Option<AuthorizerDenial>>>>,
 ) -> StorageResult<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
@@ -702,13 +720,13 @@ pub fn install_shared_db_guards(
             } => (agent_id.as_str(), *mode, *in_ddl, table_owners),
         };
 
-        let owned_by_other = |table: &str| -> bool {
-            let lower = table.to_ascii_lowercase();
-            is_metadata_table(&lower)
-                || lower.starts_with("sqlite_")
-                || owners
-                    .get(&lower)
-                    .is_some_and(|owner| owner != caller_id)
+        let record_denial = |denial: AuthorizerDenial| {
+            if let Some(ref state) = denial_state {
+                let mut slot = state.lock();
+                if slot.is_none() {
+                    *slot = Some(denial);
+                }
+            }
         };
 
         match ctx.action {
@@ -749,6 +767,9 @@ pub fn install_shared_db_guards(
             AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
             AuthAction::Read { table_name, .. } => {
                 if is_metadata_table(table_name) {
+                    record_denial(AuthorizerDenial::ProtectedMetadataTable {
+                        table: table_name.to_string(),
+                    });
                     Authorization::Deny
                 } else {
                     Authorization::Allow
@@ -757,10 +778,17 @@ pub fn install_shared_db_guards(
             AuthAction::Insert { table_name }
             | AuthAction::Update { table_name, .. }
             | AuthAction::Delete { table_name } => {
-                if mode == AgentSqlMode::Read
-                    || is_metadata_table(table_name)
-                    || is_forbidden_sqlite_dml_table(table_name, in_ddl)
-                {
+                if is_metadata_table(table_name) {
+                    record_denial(AuthorizerDenial::ProtectedMetadataTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if is_forbidden_sqlite_dml_table(table_name, in_ddl) {
+                    record_denial(AuthorizerDenial::ProtectedSystemTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if mode == AgentSqlMode::Read {
                     Authorization::Deny
                 } else {
                     Authorization::Allow
@@ -769,10 +797,17 @@ pub fn install_shared_db_guards(
             AuthAction::CreateTable { table_name } => {
                 let lower = table_name.to_ascii_lowercase();
                 let internal_seq = in_ddl && lower == "sqlite_sequence";
-                if mode == AgentSqlMode::Read
-                    || is_metadata_table(&lower)
-                    || (lower.starts_with("sqlite_") && !internal_seq)
-                {
+                if is_metadata_table(&lower) {
+                    record_denial(AuthorizerDenial::ProtectedMetadataTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if lower.starts_with("sqlite_") && !internal_seq {
+                    record_denial(AuthorizerDenial::ProtectedSystemTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if mode == AgentSqlMode::Read {
                     Authorization::Deny
                 } else {
                     Authorization::Allow
@@ -786,10 +821,17 @@ pub fn install_shared_db_guards(
                 view_name: table_name,
             } => {
                 let lower = table_name.to_ascii_lowercase();
-                if mode == AgentSqlMode::Read
-                    || is_metadata_table(&lower)
-                    || lower.starts_with("sqlite_")
-                {
+                if is_metadata_table(&lower) {
+                    record_denial(AuthorizerDenial::ProtectedMetadataTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if lower.starts_with("sqlite_") {
+                    record_denial(AuthorizerDenial::ProtectedSystemTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if mode == AgentSqlMode::Read {
                     Authorization::Deny
                 } else {
                     Authorization::Allow
@@ -800,9 +842,17 @@ pub fn install_shared_db_guards(
                 module_name,
             } => {
                 let lower = table_name.to_ascii_lowercase();
-                if mode == AgentSqlMode::Read
-                    || is_metadata_table(&lower)
-                    || lower.starts_with("sqlite_")
+                if is_metadata_table(&lower) {
+                    record_denial(AuthorizerDenial::ProtectedMetadataTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if lower.starts_with("sqlite_") {
+                    record_denial(AuthorizerDenial::ProtectedSystemTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if mode == AgentSqlMode::Read
                     || !matches!(
                         module_name.to_ascii_lowercase().as_str(),
                         "fts5" | "fts5vocab" | "rtree" | "rtreecheck"
@@ -830,7 +880,23 @@ pub fn install_shared_db_guards(
             | AuthAction::CreateTrigger { table_name, .. }
             | AuthAction::DropTrigger { table_name, .. }
             | AuthAction::DropTempTrigger { table_name, .. } => {
-                if mode == AgentSqlMode::Read || owned_by_other(table_name) {
+                let lower = table_name.to_ascii_lowercase();
+                if is_metadata_table(&lower) {
+                    record_denial(AuthorizerDenial::ProtectedMetadataTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if lower.starts_with("sqlite_") {
+                    record_denial(AuthorizerDenial::ProtectedSystemTable {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if owners.get(&lower).is_some_and(|owner| owner != caller_id) {
+                    record_denial(AuthorizerDenial::NotTableOwner {
+                        table: table_name.to_string(),
+                    });
+                    Authorization::Deny
+                } else if mode == AgentSqlMode::Read {
                     Authorization::Deny
                 } else {
                     Authorization::Allow
@@ -852,6 +918,7 @@ struct SharedAgentDataInner {
     conn: Mutex<Connection>,
     auth_state: Arc<Mutex<AuthorizerContext>>,
     deadline_state: Arc<Mutex<Option<Instant>>>,
+    denial_state: Arc<Mutex<Option<AuthorizerDenial>>>,
 }
 
 #[derive(Clone)]
@@ -870,11 +937,13 @@ impl fmt::Debug for SharedAgentDataDb {
 struct ExecutionScopeGuard<'a> {
     auth_state: &'a Mutex<AuthorizerContext>,
     deadline_state: &'a Mutex<Option<Instant>>,
+    denial_state: &'a Mutex<Option<AuthorizerDenial>>,
 }
 
 impl Drop for ExecutionScopeGuard<'_> {
     fn drop(&mut self) {
         *self.deadline_state.lock() = None;
+        *self.denial_state.lock() = None;
         *self.auth_state.lock() = AuthorizerContext::DenyAll;
     }
 }
@@ -998,7 +1067,13 @@ impl SharedAgentDataDb {
 
         let auth_state = Arc::new(Mutex::new(AuthorizerContext::DenyAll));
         let deadline_state = Arc::new(Mutex::new(None));
-        install_shared_db_guards(&conn, Arc::clone(&auth_state), Arc::clone(&deadline_state))?;
+        let denial_state = Arc::new(Mutex::new(None));
+        install_shared_db_guards_with_denial(
+            &conn,
+            Arc::clone(&auth_state),
+            Arc::clone(&deadline_state),
+            Some(Arc::clone(&denial_state)),
+        )?;
 
         Ok(Self {
             inner: Arc::new(SharedAgentDataInner {
@@ -1006,6 +1081,7 @@ impl SharedAgentDataDb {
                 conn: Mutex::new(conn),
                 auth_state,
                 deadline_state,
+                denial_state,
             }),
         })
     }
@@ -1022,7 +1098,13 @@ impl SharedAgentDataDb {
 
         let auth_state = Arc::new(Mutex::new(AuthorizerContext::DenyAll));
         let deadline_state = Arc::new(Mutex::new(None));
-        install_shared_db_guards(&conn, Arc::clone(&auth_state), Arc::clone(&deadline_state))?;
+        let denial_state = Arc::new(Mutex::new(None));
+        install_shared_db_guards_with_denial(
+            &conn,
+            Arc::clone(&auth_state),
+            Arc::clone(&deadline_state),
+            Some(Arc::clone(&denial_state)),
+        )?;
 
         Ok(Self {
             inner: Arc::new(SharedAgentDataInner {
@@ -1030,6 +1112,7 @@ impl SharedAgentDataDb {
                 conn: Mutex::new(conn),
                 auth_state,
                 deadline_state,
+                denial_state,
             }),
         })
     }
@@ -1074,15 +1157,35 @@ fn format_cell_value(value: ValueRef<'_>, max_cell_chars: usize) -> AgentCellVal
     }
 }
 
-fn map_agent_sqlite_error(err: rusqlite::Error, db_path: &Path) -> StorageError {
-    if let rusqlite::Error::SqliteFailure(sqlite_err, ref msg_opt) = err {
-        let raw_msg = msg_opt.as_deref().unwrap_or("");
+fn map_agent_sqlite_error(
+    err: rusqlite::Error,
+    db_path: &Path,
+    denial: Option<AuthorizerDenial>,
+) -> StorageError {
+    let sqlite_info = match &err {
+        rusqlite::Error::SqliteFailure(sqlite_err, msg_opt) => {
+            Some((*sqlite_err, msg_opt.as_deref().unwrap_or("")))
+        }
+        rusqlite::Error::SqlInputError { error, msg, .. } => Some((*error, msg.as_str())),
+        _ => None,
+    };
+    if let Some((sqlite_err, raw_msg)) = sqlite_info {
         if sqlite_err.code == ErrorCode::AuthorizationForStatementDenied
             || raw_msg.to_ascii_lowercase().contains("not authorized")
         {
-            return StorageError::forbidden(
-                "SQLite refused part of this statement. ATTACH, DETACH, PRAGMA, VACUUM, extensions, and TEMP triggers are not available, and a table another agent created cannot be dropped, altered, indexed, or given a trigger.",
-            );
+            let message = match denial {
+                Some(AuthorizerDenial::NotTableOwner { table }) => format!(
+                    "Not authorized: SQLite authorizer denied DDL on table '{table}' because caller is not table owner. A table another agent created cannot be dropped, altered, indexed, or given a trigger."
+                ),
+                Some(AuthorizerDenial::ProtectedMetadataTable { table }) => format!(
+                    "Not authorized: SQLite authorizer denied access to protected system metadata table '{table}'. ATTACH, DETACH, PRAGMA, VACUUM, extensions, and TEMP triggers are not allowed, and a table another agent created cannot be dropped, altered, indexed, or given a trigger."
+                ),
+                Some(AuthorizerDenial::ProtectedSystemTable { table }) => format!(
+                    "Not authorized: SQLite authorizer denied access to protected SQLite system table '{table}'."
+                ),
+                None => "Not authorized: SQLite authorizer denied part of this statement. ATTACH, DETACH, PRAGMA, VACUUM, extensions, and TEMP triggers are not allowed, and a table another agent created cannot be dropped, altered, indexed, or given a trigger.".to_string(),
+            };
+            return StorageError::forbidden(message);
         }
         if sqlite_err.code == ErrorCode::DiskFull {
             return StorageError::limit_exceeded(
@@ -1185,6 +1288,7 @@ fn claim_new_tables_admin(
 
 impl SharedAgentDataDb {
     fn enter_scope(&self, context: AuthorizerContext) -> ExecutionScopeGuard<'_> {
+        *self.inner.denial_state.lock() = None;
         *self.inner.auth_state.lock() = context;
         *self.inner.deadline_state.lock() = Some(
             Instant::now() + Duration::from_millis(AGENT_DATABASE_LIMITS.statement_deadline_ms),
@@ -1192,7 +1296,13 @@ impl SharedAgentDataDb {
         ExecutionScopeGuard {
             auth_state: &self.inner.auth_state,
             deadline_state: &self.inner.deadline_state,
+            denial_state: &self.inner.denial_state,
         }
+    }
+
+    fn map_sqlite_error(&self, err: rusqlite::Error) -> StorageError {
+        let denial = self.inner.denial_state.lock().take();
+        map_agent_sqlite_error(err, &self.inner.db_path, denial)
     }
 
     pub fn list_tables(&self) -> StorageResult<Vec<AgentTableSummary>> {
@@ -1275,7 +1385,7 @@ impl SharedAgentDataDb {
 
         let mut stmt = conn
             .prepare(&checked_sql)
-            .map_err(|e| map_agent_sqlite_error(e, &self.inner.db_path))?;
+            .map_err(|e| self.map_sqlite_error(e))?;
         let columns: Vec<String> = stmt
             .column_names()
             .into_iter()
@@ -1291,14 +1401,14 @@ impl SharedAgentDataDb {
         let col_count = columns.len();
         let mut rows_cursor = stmt
             .query(params_from_iter(bound_params.iter()))
-            .map_err(|e| map_agent_sqlite_error(e, &self.inner.db_path))?;
+            .map_err(|e| self.map_sqlite_error(e))?;
 
         let mut rows_out = Vec::new();
         let mut total_bytes = 0usize;
         let mut truncated = false;
         while let Some(row) = rows_cursor
             .next()
-            .map_err(|e| map_agent_sqlite_error(e, &self.inner.db_path))?
+            .map_err(|e| self.map_sqlite_error(e))?
         {
             if rows_out.len() >= AGENT_DATABASE_LIMITS.max_rows
                 || total_bytes >= AGENT_DATABASE_LIMITS.max_result_bytes
@@ -1310,7 +1420,7 @@ impl SharedAgentDataDb {
             for idx in 0..col_count {
                 let raw = row
                     .get_ref(idx)
-                    .map_err(|e| map_agent_sqlite_error(e, &self.inner.db_path))?;
+                    .map_err(|e| self.map_sqlite_error(e))?;
                 cells.push(format_cell_value(raw, AGENT_DATABASE_LIMITS.max_cell_chars));
             }
             total_bytes += serde_json::to_string(&cells)?.len();
@@ -1372,10 +1482,10 @@ impl SharedAgentDataDb {
             });
             let mut stmt = conn
                 .prepare(&checked_sql)
-                .map_err(|e| map_agent_sqlite_error(e, &self.inner.db_path))?;
+                .map_err(|e| self.map_sqlite_error(e))?;
             let changed = stmt
                 .execute(params_from_iter(bound_params.iter()))
-                .map_err(|e| map_agent_sqlite_error(e, &self.inner.db_path))?;
+                .map_err(|e| self.map_sqlite_error(e))?;
             let rowid = conn.last_insert_rowid();
             (changed, (changed > 0 || ddl_change.is_none()).then_some(rowid))
         };

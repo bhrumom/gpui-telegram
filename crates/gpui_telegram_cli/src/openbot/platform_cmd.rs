@@ -648,15 +648,24 @@ fn run_webhook_post(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result
                 "webhook route for routine '{routine_id}' not found"
             ))
         })?;
-    let secret = flags
-        .get("--secret")
-        .map(str::to_string)
-        .or_else(|| matched.map(|r| r.secret_ciphertext))
-        .ok_or_else(|| {
-            CliError::Validation(format!(
-                "webhook secret for routine '{routine_id}' not found"
-            ))
-        })?;
+    let secret = match flags.get("--secret") {
+        Some(supplied) => {
+            if matched.is_some() && supplied.is_empty() {
+                return Err(CliError::Unauthorized(
+                    "invalid_signature: webhook HMAC signature verification failed".to_string(),
+                ));
+            }
+            supplied.to_string()
+        }
+        None => {
+            if matched.is_none() {
+                return Err(CliError::Validation(format!(
+                    "webhook secret for routine '{routine_id}' not found"
+                )));
+            }
+            String::new()
+        }
+    };
 
     let standard_webhooks = signature.trim().starts_with("v1,");
     let req = WebhookPostRequest {

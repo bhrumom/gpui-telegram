@@ -952,6 +952,11 @@ impl ChannelService {
                 INPUT_LIMITS.agents
             )));
         }
+        if input.members.is_empty() {
+            return Err(OpenBotRuntimeError::Validation(
+                "At least one channel member is required (members must not be empty).".to_string(),
+            ));
+        }
         if input.members.len() > INPUT_LIMITS.agents {
             return Err(OpenBotRuntimeError::LimitExceeded(format!(
                 "A channel can have at most {} members.",
@@ -1588,7 +1593,7 @@ impl ChannelService {
         let live = self.roster.get_agent(agent_id)?.is_some();
         if !in_channel || !live {
             return Err(OpenBotRuntimeError::Validation(format!(
-                "Agent '{agent_id}' is required to be an available member of this channel."
+                "Agent '{agent_id}' is not a member of this channel; an available channel member is required."
             )));
         }
         Ok(())
